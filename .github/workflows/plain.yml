@@ -29,8 +29,8 @@ jobs:
       # Runs wasm build
       - name: Wasm Build
         run: |
-        cargo install wasm-pack
-        wasm-pack build --target web --out-dir static
+          cargo install wasm-pack
+          wasm-pack build --target web --out-dir static
       # Runs cargo build
       - name: Build 
         run: cargo build --verbose
