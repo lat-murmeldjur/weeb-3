@@ -14,29 +14,28 @@ release = false
 crate-type = ["cdylib"]
 
 [dependencies]
-anyhow = "1.0.81"
-futures = "0.3.30"
+anyhow = { git = "https://github.com/dtolnay/anyhow.git" }
 rand = "0.8"
 tracing = { git = "https://github.com/tokio-rs/tracing.git" }
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { git = "https://github.com/tokio-rs/tracing.git" , features = ["env-filter"] }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-axum = "0.7.5"
+axum = { git = "https://github.com/tokio-rs/axum.git" }
 libp2p = { git = "https://github.com/libp2p/rust-libp2p.git", features = [ "ed25519", "macros", "ping", "tokio"] }
 libp2p-webrtc = { git = "https://github.com/libp2p/rust-libp2p.git",  features = ["tokio"] }
 libp2p-tcp = { git = "https://github.com/libp2p/rust-libp2p.git",  features = ["tokio"] }
-rust-embed = { version = "8.3.0", features = ["include-exclude", "interpolate-folder-path"] }
-tokio = { version = "1.37", default-features = false, features = ["macros", "net", "rt", "signal", "rt-multi-thread"] }
-tokio-util = { version = "0.7", features = ["compat"] }
-tower = "0.4"
-tower-http = { version = "0.5.2", features = ["cors"] }
-mime_guess = "2.0.4"
+rust-embed = { git = "https://github.com/pyrossh/rust-embed.git", features = ["include-exclude", "interpolate-folder-path"] }
+tokio = { default-features = false, features = ["macros", "net", "rt", "signal", "rt-multi-thread"] }
+tokio-util = { features = ["compat"] }
+tower = { git = "https://github.com/tower-rs/tower.git" }
+tower-http = { git = "https://github.com/tower-rs/tower-http.git", features = ["cors"] }
+mime_guess = { git = "https://github.com/abonander/mime_guess.git" }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 js-sys = "0.3.69"
 libp2p = { git = "https://github.com/libp2p/rust-libp2p.git", features = [ "ed25519", "macros", "ping", "tokio", "wasm-bindgen"] }
 libp2p-webrtc-websys = { git = "https://github.com/libp2p/rust-libp2p.git" }
-tracing-wasm = "0.2.1"
+tracing-wasm = { git = "https://github.com/old-storyai/tracing-wasm.git" }
 wasm-bindgen = "0.2.90"
 wasm-bindgen-futures = "0.4.42"
 web-sys = { version = "0.3", features = ['Document', 'Element', 'HtmlElement', 'Node', 'Response', 'Window'] }

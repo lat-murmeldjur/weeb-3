@@ -6,7 +6,7 @@ use axum::http::header::CONTENT_TYPE;
 use axum::http::StatusCode;
 use axum::response::{Html, IntoResponse};
 use axum::{http::Method, routing::get, Router};
-use futures::StreamExt;
+use libp2p::futures::StreamExt;
 use libp2p::{
     core::muxing::StreamMuxerBox,
     core::Transport,

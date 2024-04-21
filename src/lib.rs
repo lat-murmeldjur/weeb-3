@@ -1,8 +1,8 @@
 #![cfg(target_arch = "wasm32")]
 
-use futures::StreamExt;
 use js_sys::Date;
 use libp2p::core::Multiaddr;
+use libp2p::futures::StreamExt;
 use libp2p::ping;
 use libp2p::swarm::SwarmEvent;
 use libp2p_webrtc_websys as webrtc_websys;
