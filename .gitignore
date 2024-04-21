@@ -1,0 +1,5 @@
+*/static/*
+target
+Cargo.lock
+
+!*/static/index.html
