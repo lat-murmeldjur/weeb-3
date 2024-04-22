@@ -129,7 +129,7 @@ struct Libp2pEndpoint(Multiaddr);
 /// Our server listens on a random UDP port for the WebRTC transport.
 /// To allow the client to connect, we replace the `__LIBP2P_ENDPOINT__` placeholder with the actual address.
 async fn get_index(
-    State(Libp2pEndpoint(libp2p_endpoint)): State<Libp2pEndpoint>,
+    State(Libp2pEndpoint(_libp2p_endpoint)): State<Libp2pEndpoint>,
 ) -> Result<Html<String>, StatusCode> {
     let content = StaticFiles::get("index.html")
         .ok_or(StatusCode::NOT_FOUND)?
@@ -139,12 +139,12 @@ async fn get_index(
 
     println!(
         "{}",
-        "/ip4/192.168.91.113/tcp/1634/p2p/QmVcvkuRt7Qbdre9B4JK4bPtQWhKZXbbV1b2QVXLQnGz1V"
+        "/ip4/10.138.98.32/udp/6336/webrtc-direct/certhash/uEiABZYVMX2Lnl30RbMVTnFSM2tImmsGTlQjY7VlzodNkBw/p2p/QmVcvkuRt7Qbdre9B4JK4bPtQWhKZXbbV1b2QVXLQnGz1V"
     );
 
     let html = std::str::from_utf8(&content)
         .expect("index.html to be valid utf8")
-        .replace("__LIBP2P_ENDPOINT__", &libp2p_endpoint.to_string());
+        .replace("__LIBP2P_ENDPOINT__", "/ip4/10.138.98.32/udp/6336/webrtc-direct/certhash/uEiABZYVMX2Lnl30RbMVTnFSM2tImmsGTlQjY7VlzodNkBw/p2p/QmVcvkuRt7Qbdre9B4JK4bPtQWhKZXbbV1b2QVXLQnGz1V");
 
     Ok(Html(html))
 }
