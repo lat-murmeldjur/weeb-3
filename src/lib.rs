@@ -1,5 +1,4 @@
 #![cfg(target_arch = "wasm32")]
-
 use js_sys::Date;
 use libp2p::core::Multiaddr;
 use libp2p::futures::StreamExt;
@@ -10,6 +9,9 @@ use std::io;
 use std::time::Duration;
 use wasm_bindgen::prelude::*;
 use web_sys::{Document, HtmlElement};
+
+mod conventions;
+use conventions::a;
 
 #[wasm_bindgen]
 pub async fn run(libp2p_endpoint: String) -> Result<(), JsError> {

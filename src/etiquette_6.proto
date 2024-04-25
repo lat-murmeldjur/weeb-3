@@ -1,0 +1,14 @@
+syntax = "proto3";
+
+package weeb_3.etiquette_6;
+
+message Request {
+  bytes Addr = 1;
+}
+
+message Delivery {
+  bytes Data = 1;
+  bytes Stamp = 2;
+  string Err = 3;
+}
+

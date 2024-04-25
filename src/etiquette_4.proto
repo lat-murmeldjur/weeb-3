@@ -1,0 +1,7 @@
+syntax = "proto3";
+
+package weeb_3.etiquette_4;
+
+message AnnouncePaymentThreshold {
+ bytes PaymentThreshold = 1;
+}

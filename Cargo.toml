@@ -2,10 +2,7 @@
 name = "weeb_3"
 version = "0.0.0"
 edition = "2021"
-authors = ["Weeb_3"]
-description = "Ara ara"
 license = "MIT"
-repository = "https://github.com/weeb_3/weeb_3"
 
 [package.metadata.release]
 release = false
@@ -14,10 +11,16 @@ release = false
 crate-type = ["cdylib"]
 
 [dependencies]
+bytes = { git = "https://github.com/tokio-rs/bytes.git" }
+prost = { git = "https://github.com/tokio-rs/prost.git" }
+prost-types = { git = "https://github.com/tokio-rs/prost.git" }
 anyhow = { git = "https://github.com/dtolnay/anyhow.git" }
 rand = "0.8"
 tracing = { git = "https://github.com/tokio-rs/tracing.git" }
 tracing-subscriber = { git = "https://github.com/tokio-rs/tracing.git" , features = ["env-filter"] }
+
+[build-dependencies]
+prost-build = { git = "https://github.com/tokio-rs/prost.git" }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 axum = { git = "https://github.com/tokio-rs/axum.git" }

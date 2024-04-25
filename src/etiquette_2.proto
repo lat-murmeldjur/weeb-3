@@ -1,0 +1,14 @@
+syntax = "proto3";
+
+package weeb_3.etiquette_2;
+
+message Peers {
+    repeated BzzAddress peers = 1;
+}
+
+message BzzAddress {
+    bytes Underlay = 1;
+    bytes Signature = 2;
+    bytes Overlay = 3;
+    bytes Nonce = 4;
+}

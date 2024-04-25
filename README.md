@@ -18,3 +18,13 @@ cargo run
 ```
 
 3. Open the URL printed in the terminal
+
+## [Notes]
+
+e0 - header
+e1 - handshake
+e2 - hive
+e3 - pingpong
+e4 - pricing
+e5 - pseudosettle
+e6 - retrieval
