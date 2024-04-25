@@ -68,16 +68,11 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    let addr = address.with(Protocol::P2p(*swarm.local_peer_id()));
-
     // Serve .wasm, .js and server multiaddress over HTTP on this address.
-    tokio::spawn(serve(addr));
+    tokio::spawn(serve(address));
 
     loop {
         tokio::select! {
-            swarm_event = swarm.next() => {
-                tracing::trace!(?swarm_event)
-            },
             _ = tokio::signal::ctrl_c() => {
                 break;
             }
@@ -137,14 +132,11 @@ async fn get_index(
 
     println!("gottts");
 
-    println!(
-        "{}",
-        "/ip4/10.138.98.32/udp/6336/webrtc-direct/certhash/uEiABZYVMX2Lnl30RbMVTnFSM2tImmsGTlQjY7VlzodNkBw/p2p/QmVcvkuRt7Qbdre9B4JK4bPtQWhKZXbbV1b2QVXLQnGz1V"
-    );
+    let wrtcd = "/ip4/192.168.0.11/udp/6337/webrtc-direct/certhash/uEiB1N4XSiy3KBWMf2ColdB-rKGMhY3VvE523P-aNWH_xLw/p2p/QmbtmtkRmmozBdTqyz4L8XFBpvAA72kxCRMMz4D7uaVwDG";
 
     let html = std::str::from_utf8(&content)
         .expect("index.html to be valid utf8")
-        .replace("__LIBP2P_ENDPOINT__", "/ip4/10.138.98.32/udp/6336/webrtc-direct/certhash/uEiABZYVMX2Lnl30RbMVTnFSM2tImmsGTlQjY7VlzodNkBw/p2p/QmVcvkuRt7Qbdre9B4JK4bPtQWhKZXbbV1b2QVXLQnGz1V");
+        .replace("__LIBP2P_ENDPOINT__", wrtcd);
 
     Ok(Html(html))
 }
