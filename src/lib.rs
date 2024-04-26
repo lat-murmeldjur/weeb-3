@@ -1,17 +1,27 @@
 #![cfg(target_arch = "wasm32")]
-use js_sys::Date;
-use libp2p::core::Multiaddr;
-use libp2p::futures::StreamExt;
-use libp2p::ping;
-use libp2p::swarm::SwarmEvent;
+use anyhow::{Context, Result};
+use libp2p::{
+    core::Multiaddr,
+    futures::{AsyncReadExt, AsyncWriteExt, StreamExt},
+    multiaddr::Protocol,
+    ping,
+    swarm::SwarmEvent,
+    PeerId, Stream, StreamProtocol,
+};
+use libp2p_stream as stream;
 use libp2p_webrtc_websys as webrtc_websys;
+use rand::RngCore;
 use std::io;
 use std::time::Duration;
+use tracing::level_filters::LevelFilter;
+use tracing_subscriber::EnvFilter;
 use wasm_bindgen::prelude::*;
 use web_sys::{Document, HtmlElement};
 
 mod conventions;
 use conventions::a;
+
+const ECHO_PROTOCOL: StreamProtocol = StreamProtocol::new("/echo");
 
 #[wasm_bindgen]
 pub async fn run(libp2p_endpoint: String) -> Result<(), JsError> {
@@ -51,7 +61,7 @@ pub async fn run(libp2p_endpoint: String) -> Result<(), JsError> {
                 ..
             }) => {
                 tracing::info!("Ping successful: RTT: {rtt:?}, from {peer}");
-                body.append_p(&format!("RTT: {rtt:?} at {}", Date::new_0().to_string()))?;
+                body.append_p(&format!("RTT: {rtt:?}"))?;
             }
             SwarmEvent::ConnectionClosed {
                 cause: Some(cause), ..
@@ -109,4 +119,68 @@ impl Body {
 
 fn js_error(msg: &str) -> JsError {
     io::Error::new(io::ErrorKind::Other, msg).into()
+}
+
+/// A very simple, `async fn`-based connection handler for our custom echo protocol.
+async fn connection_handler(peer: PeerId, mut control: stream::Control) {
+    loop {
+        tokio::time::sleep(Duration::from_secs(1)).await; // Wait a second between echos.
+
+        let stream = match control.open_stream(peer, ECHO_PROTOCOL).await {
+            Ok(stream) => stream,
+            Err(error @ stream::OpenStreamError::UnsupportedProtocol(_)) => {
+                tracing::info!(%peer, %error);
+                return;
+            }
+            Err(error) => {
+                // Other errors may be temporary.
+                // In production, something like an exponential backoff / circuit-breaker may be more appropriate.
+                tracing::debug!(%peer, %error);
+                continue;
+            }
+        };
+
+        if let Err(e) = send(stream).await {
+            tracing::warn!(%peer, "Echo protocol failed: {e}");
+            continue;
+        }
+
+        tracing::info!(%peer, "Echo complete!")
+    }
+}
+
+async fn echo(mut stream: Stream) -> io::Result<usize> {
+    let mut total = 0;
+
+    let mut buf = [0u8; 100];
+
+    loop {
+        let read = stream.read(&mut buf).await?;
+        if read == 0 {
+            return Ok(total);
+        }
+
+        total += read;
+        stream.write_all(&buf[..read]).await?;
+    }
+}
+
+async fn send(mut stream: Stream) -> io::Result<()> {
+    let num_bytes = rand::random::<usize>() % 1000;
+
+    let mut bytes = vec![0; num_bytes];
+    rand::thread_rng().fill_bytes(&mut bytes);
+
+    stream.write_all(&bytes).await?;
+
+    let mut buf = vec![0; num_bytes];
+    stream.read_exact(&mut buf).await?;
+
+    if bytes != buf {
+        return Err(io::Error::new(io::ErrorKind::Other, "incorrect echo"));
+    }
+
+    stream.close().await?;
+
+    Ok(())
 }

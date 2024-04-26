@@ -30,13 +30,14 @@ libp2p-tcp = { git = "https://github.com/libp2p/rust-libp2p.git",  features = ["
 rust-embed = { git = "https://github.com/pyrossh/rust-embed.git", features = ["include-exclude", "interpolate-folder-path"] }
 tokio = { default-features = false, features = ["macros", "net", "rt", "signal", "rt-multi-thread"] }
 tokio-util = { features = ["compat"] }
-tower = { git = "https://github.com/tower-rs/tower.git" }
 tower-http = { git = "https://github.com/tower-rs/tower-http.git", features = ["cors"] }
 mime_guess = { git = "https://github.com/abonander/mime_guess.git" }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-js-sys = "0.3.69"
+tokio = { default-features = false, features = ["time"] }
+futures = { git = "https://github.com/rust-lang/futures-rs.git" }
 libp2p = { git = "https://github.com/libp2p/rust-libp2p.git", features = [ "ecdsa", "ed25519", "macros", "ping", "tokio", "wasm-bindgen"] }
+libp2p-stream = { git = "https://github.com/libp2p/rust-libp2p.git" }
 libp2p-webrtc-websys = { git = "https://github.com/libp2p/rust-libp2p.git" }
 tracing-wasm = { git = "https://github.com/old-storyai/tracing-wasm.git" }
 wasm-bindgen = "0.2.90"
