@@ -12,6 +12,7 @@ use libp2p_stream as stream;
 use libp2p_webrtc_websys as webrtc_websys;
 use rand::RngCore;
 use std::io;
+use std::thread;
 use std::time::Duration;
 use tracing::level_filters::LevelFilter;
 use tracing_subscriber::EnvFilter;
@@ -35,34 +36,42 @@ pub async fn run(libp2p_endpoint: String) -> Result<(), JsError> {
         ping_duration
     ))?;
 
+    let maybe_address = vec![libp2p_endpoint.clone()]
+        .iter()
+        .nth(1)
+        .map(|arg| arg.parse::<Multiaddr>())
+        .transpose()?;
+
     let mut swarm = libp2p::SwarmBuilder::with_new_identity()
         .with_wasm_bindgen()
         .with_other_transport(|key| {
             webrtc_websys::Transport::new(webrtc_websys::Config::new(&key))
         })?
-        .with_behaviour(|_| ping::Behaviour::new(ping::Config::new()))?
+        .with_behaviour(|_| stream::Behaviour::new())?
         .with_swarm_config(|c| c.with_idle_connection_timeout(ping_duration))
         .build();
 
     let addr = libp2p_endpoint.parse::<Multiaddr>()?;
     tracing::info!("Dialing {addr}");
-    swarm.dial(addr)?;
+
+    if let Some(address) = maybe_address {
+        let Some(Protocol::P2p(peer_id)) = address.iter().last() else {
+            panic!("panic!")
+        };
+
+        swarm.dial(address)?;
+
+        connection_handler(peer_id, swarm.behaviour().new_control());
+    }
+
+    //    swarm.dial(addr.clone()).unwrap();
+
+    // let peer_id = swarm.dial_and_wait(addr)?;
+
+    // tokio::spawn(connection_handler(peer_id, swarm.behaviour().new_control()));
 
     loop {
         match swarm.next().await.unwrap() {
-            SwarmEvent::Behaviour(ping::Event { result: Err(e), .. }) => {
-                tracing::error!("Ping failed: {:?}", e);
-
-                break;
-            }
-            SwarmEvent::Behaviour(ping::Event {
-                peer,
-                result: Ok(rtt),
-                ..
-            }) => {
-                tracing::info!("Ping successful: RTT: {rtt:?}, from {peer}");
-                body.append_p(&format!("RTT: {rtt:?}"))?;
-            }
             SwarmEvent::ConnectionClosed {
                 cause: Some(cause), ..
             } => {
