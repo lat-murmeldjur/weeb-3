@@ -12,6 +12,7 @@ use libp2p_stream as stream;
 use libp2p_webrtc_websys as webrtc_websys;
 use rand::RngCore;
 use std::io;
+use std::str::FromStr;
 use std::thread;
 use std::time::Duration;
 use tracing::level_filters::LevelFilter;
@@ -22,7 +23,7 @@ use web_sys::{Document, HtmlElement};
 mod conventions;
 use conventions::a;
 
-const ECHO_PROTOCOL: StreamProtocol = StreamProtocol::new("/echo");
+const HANDSHAKE_PROTOCOL: StreamProtocol = StreamProtocol::new("/handshake");
 
 #[wasm_bindgen]
 pub async fn run(libp2p_endpoint: String) -> Result<(), JsError> {
@@ -36,11 +37,8 @@ pub async fn run(libp2p_endpoint: String) -> Result<(), JsError> {
         ping_duration
     ))?;
 
-    let maybe_address = vec![libp2p_endpoint.clone()]
-        .iter()
-        .nth(1)
-        .map(|arg| arg.parse::<Multiaddr>())
-        .transpose()?;
+    let peer_id =
+        libp2p::PeerId::from_str("QmbtmtkRmmozBdTqyz4L8XFBpvAA72kxCRMMz4D7uaVwDG").unwrap();
 
     let mut swarm = libp2p::SwarmBuilder::with_new_identity()
         .with_wasm_bindgen()
@@ -54,41 +52,25 @@ pub async fn run(libp2p_endpoint: String) -> Result<(), JsError> {
     let addr = libp2p_endpoint.parse::<Multiaddr>()?;
     tracing::info!("Dialing {addr}");
 
-    if let Some(address) = maybe_address {
-        let Some(Protocol::P2p(peer_id)) = address.iter().last() else {
-            panic!("panic!")
-        };
+    body.append_p("Got so far")?;
 
-        swarm.dial(address)?;
+    swarm.dial(addr)?;
 
-        connection_handler(peer_id, swarm.behaviour().new_control());
-    }
+    connection_handler(peer_id, swarm.behaviour().new_control());
 
-    //    swarm.dial(addr.clone()).unwrap();
-
-    // let peer_id = swarm.dial_and_wait(addr)?;
-
-    // tokio::spawn(connection_handler(peer_id, swarm.behaviour().new_control()));
+    body.append_p("Got so far 3")?;
 
     loop {
-        match swarm.next().await.unwrap() {
-            SwarmEvent::ConnectionClosed {
-                cause: Some(cause), ..
-            } => {
-                tracing::info!("Swarm event: {:?}", cause);
+        let event = swarm.next().await.expect("never terminates");
 
-                if let libp2p::swarm::ConnectionError::KeepAliveTimeout = cause {
-                    body.append_p("All done with pinging! ")?;
-
-                    break;
-                }
-                body.append_p(&format!("Connection closed due to: {:?}", cause))?;
+        match event {
+            libp2p::swarm::SwarmEvent::NewListenAddr { address, .. } => {
+                let listen_address = address.with_p2p(*swarm.local_peer_id()).unwrap();
+                tracing::info!(%listen_address);
             }
-            evt => tracing::info!("Swarm event: {:?}", evt),
+            event => tracing::trace!(?event),
         }
     }
-
-    Ok(())
 }
 
 /// Convenience wrapper around the current document body
@@ -135,7 +117,7 @@ async fn connection_handler(peer: PeerId, mut control: stream::Control) {
     loop {
         tokio::time::sleep(Duration::from_secs(1)).await; // Wait a second between echos.
 
-        let stream = match control.open_stream(peer, ECHO_PROTOCOL).await {
+        let stream = match control.open_stream(peer, HANDSHAKE_PROTOCOL).await {
             Ok(stream) => stream,
             Err(error @ stream::OpenStreamError::UnsupportedProtocol(_)) => {
                 tracing::info!(%peer, %error);
@@ -149,7 +131,7 @@ async fn connection_handler(peer: PeerId, mut control: stream::Control) {
             }
         };
 
-        if let Err(e) = send(stream).await {
+        if let Err(e) = ceive_header(stream).await {
             tracing::warn!(%peer, "Echo protocol failed: {e}");
             continue;
         }
@@ -174,20 +156,15 @@ async fn echo(mut stream: Stream) -> io::Result<usize> {
     }
 }
 
-async fn send(mut stream: Stream) -> io::Result<()> {
-    let num_bytes = rand::random::<usize>() % 1000;
+async fn ceive_header(mut stream: Stream) -> io::Result<()> {
+    stream.write_all(&[]).await?;
 
-    let mut bytes = vec![0; num_bytes];
-    rand::thread_rng().fill_bytes(&mut bytes);
-
-    stream.write_all(&bytes).await?;
-
-    let mut buf = vec![0; num_bytes];
+    let mut buf = vec![];
     stream.read_exact(&mut buf).await?;
 
-    if bytes != buf {
-        return Err(io::Error::new(io::ErrorKind::Other, "incorrect echo"));
-    }
+    let buffstring = String::from_utf8(buf).unwrap();
+
+    tracing::info!(buffstring);
 
     stream.close().await?;
 

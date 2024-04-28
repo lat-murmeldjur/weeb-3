@@ -18,6 +18,7 @@ anyhow = { git = "https://github.com/dtolnay/anyhow.git" }
 rand = "0.8"
 tracing = { git = "https://github.com/tokio-rs/tracing.git" }
 tracing-subscriber = { git = "https://github.com/tokio-rs/tracing.git" , features = ["env-filter"] }
+serde = { features = ["derive"] }
 
 [build-dependencies]
 prost-build = { git = "https://github.com/tokio-rs/prost.git" }
