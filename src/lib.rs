@@ -6,7 +6,7 @@ use libp2p::{
     autonat,
     core::Multiaddr,
     futures::{AsyncReadExt, AsyncWriteExt, StreamExt},
-    identify, identity,
+    identity,
     multiaddr::Protocol,
     noise, ping,
     swarm::{NetworkBehaviour, SwarmEvent},
@@ -134,6 +134,42 @@ pub async fn run(libp2p_endpoint: String) -> Result<(), JsError> {
     );
 
     body.append_p("Got so far4")?;
+
+    match swarm.select_next_some().await {
+        SwarmEvent::NewListenAddr { address, .. } => {
+            swarm.listen_on(address.clone());
+            body.append_p(&format!("xoxo {:?}", address))
+        }
+        SwarmEvent::Behaviour(event) => body.append_p(&format!("xoxo {:?}", event)),
+        e => body.append_p(&format!("xoxo {:?}", e)),
+    };
+
+    match swarm.select_next_some().await {
+        SwarmEvent::NewListenAddr { address, .. } => {
+            swarm.listen_on(address.clone());
+            body.append_p(&format!("xoxo {:?}", address))
+        }
+        SwarmEvent::Behaviour(event) => body.append_p(&format!("xoxo {:?}", event)),
+        e => body.append_p(&format!("xoxo {:?}", e)),
+    };
+
+    match swarm.select_next_some().await {
+        SwarmEvent::NewListenAddr { address, .. } => {
+            swarm.listen_on(address.clone());
+            body.append_p(&format!("xoxo {:?}", address))
+        }
+        SwarmEvent::Behaviour(event) => body.append_p(&format!("xoxo {:?}", event)),
+        e => body.append_p(&format!("xoxo {:?}", e)),
+    };
+
+    match swarm.select_next_some().await {
+        SwarmEvent::NewListenAddr { address, .. } => {
+            swarm.listen_on(address.clone());
+            body.append_p(&format!("xoxo {:?}", address))
+        }
+        SwarmEvent::Behaviour(event) => body.append_p(&format!("xoxo {:?}", event)),
+        e => body.append_p(&format!("xoxo {:?}", e)),
+    };
 
     body.append_p("Got so far2")?;
 
@@ -326,7 +362,6 @@ async fn ceive(
 
 #[derive(NetworkBehaviour)]
 struct Behaviour {
-    identify: identify::Behaviour,
     auto_nat: autonat::Behaviour,
     stream: stream::Behaviour,
 }
@@ -334,10 +369,6 @@ struct Behaviour {
 impl Behaviour {
     fn new(local_public_key: identity::PublicKey) -> Self {
         Self {
-            identify: identify::Behaviour::new(identify::Config::new(
-                "/ipfs/0.1.0".into(),
-                local_public_key.clone(),
-            )),
             auto_nat: autonat::Behaviour::new(
                 local_public_key.to_peer_id(),
                 autonat::Config {
