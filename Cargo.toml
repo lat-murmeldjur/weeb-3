@@ -37,10 +37,11 @@ mime_guess = { git = "https://github.com/abonander/mime_guess.git" }
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 tokio = { default-features = false, features = ["time"] }
 futures = { git = "https://github.com/rust-lang/futures-rs.git" }
-libp2p = { git = "https://github.com/libp2p/rust-libp2p.git", features = [ "ecdsa", "ed25519", "macros", "ping", "tokio", "wasm-bindgen"] }
+libp2p = { git = "https://github.com/libp2p/rust-libp2p.git", features = [ "ecdsa", "autonat",  "noise", "yamux", "identify", "ed25519", "macros", "ping", "tokio", "wasm-bindgen"] }
 libp2p-stream = { git = "https://github.com/libp2p/rust-libp2p.git" }
 libp2p-webrtc-websys = { git = "https://github.com/libp2p/rust-libp2p.git" }
 tracing-wasm = { git = "https://github.com/old-storyai/tracing-wasm.git" }
 wasm-bindgen = "0.2.90"
 wasm-bindgen-futures = "0.4.42"
 web-sys = { version = "0.3", features = ['Document', 'Element', 'HtmlElement', 'Node', 'Response', 'Window'] }
+secp256k1 = { git = "https://github.com/rust-bitcoin/rust-secp256k1.git", features = ["rand", "hashes"] }

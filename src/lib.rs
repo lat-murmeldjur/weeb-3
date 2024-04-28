@@ -1,15 +1,22 @@
+#![allow(warnings)] // not today, erosion
 #![cfg(target_arch = "wasm32")]
-use anyhow::{Context, Result};
+
+//use libp2p::core::multiaddr::Protocol;
 use libp2p::{
+    autonat,
     core::Multiaddr,
     futures::{AsyncReadExt, AsyncWriteExt, StreamExt},
+    identify, identity,
     multiaddr::Protocol,
-    ping,
-    swarm::SwarmEvent,
-    PeerId, Stream, StreamProtocol,
+    noise, ping,
+    swarm::{NetworkBehaviour, SwarmEvent},
+    yamux, PeerId, Stream, StreamProtocol,
 };
 use libp2p_stream as stream;
 use libp2p_webrtc_websys as webrtc_websys;
+
+use anyhow::{Context, Result};
+use prost::Message;
 use rand::RngCore;
 use std::io;
 use std::str::FromStr;
@@ -20,10 +27,46 @@ use tracing_subscriber::EnvFilter;
 use wasm_bindgen::prelude::*;
 use web_sys::{Document, HtmlElement};
 
+use secp256k1::hashes::{sha256, Hash};
+use secp256k1::rand::rngs::OsRng;
+use secp256k1::{Message as secMess, Secp256k1};
+
 mod conventions;
 use conventions::a;
 
 const HANDSHAKE_PROTOCOL: StreamProtocol = StreamProtocol::new("/handshake");
+
+pub mod weeb_3 {
+    pub mod etiquette_0 {
+        include!(concat!(env!("OUT_DIR"), "/weeb_3.etiquette_0.rs"));
+    }
+    pub mod etiquette_1 {
+        include!(concat!(env!("OUT_DIR"), "/weeb_3.etiquette_1.rs"));
+    }
+    pub mod etiquette_2 {
+        include!(concat!(env!("OUT_DIR"), "/weeb_3.etiquette_2.rs"));
+    }
+    pub mod etiquette_3 {
+        include!(concat!(env!("OUT_DIR"), "/weeb_3.etiquette_3.rs"));
+    }
+    pub mod etiquette_4 {
+        include!(concat!(env!("OUT_DIR"), "/weeb_3.etiquette_4.rs"));
+    }
+    pub mod etiquette_5 {
+        include!(concat!(env!("OUT_DIR"), "/weeb_3.etiquette_5.rs"));
+    }
+    pub mod etiquette_6 {
+        include!(concat!(env!("OUT_DIR"), "/weeb_3.etiquette_6.rs"));
+    }
+}
+
+use weeb_3::etiquette_0;
+use weeb_3::etiquette_1;
+use weeb_3::etiquette_2;
+use weeb_3::etiquette_3;
+use weeb_3::etiquette_4;
+use weeb_3::etiquette_5;
+use weeb_3::etiquette_6;
 
 #[wasm_bindgen]
 pub async fn run(libp2p_endpoint: String) -> Result<(), JsError> {
@@ -40,25 +83,81 @@ pub async fn run(libp2p_endpoint: String) -> Result<(), JsError> {
     let peer_id =
         libp2p::PeerId::from_str("QmbtmtkRmmozBdTqyz4L8XFBpvAA72kxCRMMz4D7uaVwDG").unwrap();
 
+    let keypair = libp2p::identity::Keypair::ed25519_from_bytes([0; 32]).unwrap();
+
     let mut swarm = libp2p::SwarmBuilder::with_new_identity()
         .with_wasm_bindgen()
         .with_other_transport(|key| {
             webrtc_websys::Transport::new(webrtc_websys::Config::new(&key))
         })?
-        .with_behaviour(|_| stream::Behaviour::new())?
+        .with_behaviour(|key| Behaviour::new(key.public()))?
         .with_swarm_config(|c| c.with_idle_connection_timeout(ping_duration))
         .build();
 
     let addr = libp2p_endpoint.parse::<Multiaddr>()?;
+
+    swarm
+        .behaviour_mut()
+        .auto_nat
+        .add_server(peer_id, Some(addr.clone()));
+
     tracing::info!("Dialing {addr}");
 
+    tracing::info!("asd");
     body.append_p("Got so far")?;
+
+    let mut self_addr: libp2p::core::Multiaddr = libp2p::core::Multiaddr::empty();
 
     swarm.dial(addr)?;
 
-    connection_handler(peer_id, swarm.behaviour().new_control());
+    body.append_p("Got so far2")?;
 
-    body.append_p("Got so far 3")?;
+    for a in swarm.listeners() {
+        self_addr = a.clone();
+        body.append_p(&format!("Yo {:?}:", self_addr.to_string(),))?;
+    }
+
+    for a in swarm.external_addresses() {
+        self_addr = a.clone();
+        body.append_p(&format!("Yo {:?}:", self_addr.to_string(),))?;
+    }
+
+    body.append_p(&format!("Xo {:?}:", self_addr.to_string(),))?;
+
+    body.append_p("Got so far3")?;
+
+    connection_handler(
+        peer_id,
+        swarm.behaviour().stream.new_control(),
+        &self_addr,
+        &keypair,
+    );
+
+    body.append_p("Got so far4")?;
+
+    body.append_p("Got so far2")?;
+
+    for a in swarm.listeners() {
+        self_addr = a.clone();
+        body.append_p(&format!("Yo {:?}:", self_addr.to_string(),))?;
+    }
+
+    for a in swarm.external_addresses() {
+        self_addr = a.clone();
+        body.append_p(&format!("Yo {:?}:", self_addr.to_string(),))?;
+    }
+
+    body.append_p(&format!("Xo {:?}:", self_addr.to_string(),))?;
+
+    body.append_p("Got so far3")?;
+    connection_handler(
+        peer_id,
+        swarm.behaviour().stream.new_control(),
+        &self_addr,
+        &keypair,
+    );
+
+    body.append_p("Got so far4")?;
 
     loop {
         let event = swarm.next().await.expect("never terminates");
@@ -68,9 +167,11 @@ pub async fn run(libp2p_endpoint: String) -> Result<(), JsError> {
                 let listen_address = address.with_p2p(*swarm.local_peer_id()).unwrap();
                 tracing::info!(%listen_address);
             }
-            event => tracing::trace!(?event),
+            event => {}
         }
     }
+
+    Ok(())
 }
 
 /// Convenience wrapper around the current document body
@@ -113,25 +214,35 @@ fn js_error(msg: &str) -> JsError {
 }
 
 /// A very simple, `async fn`-based connection handler for our custom echo protocol.
-async fn connection_handler(peer: PeerId, mut control: stream::Control) {
+async fn connection_handler(
+    peer: PeerId,
+    mut control: stream::Control,
+    a: &libp2p::core::Multiaddr,
+    k: &libp2p::identity::Keypair,
+) {
     loop {
         tokio::time::sleep(Duration::from_secs(1)).await; // Wait a second between echos.
 
         let stream = match control.open_stream(peer, HANDSHAKE_PROTOCOL).await {
             Ok(stream) => stream,
             Err(error @ stream::OpenStreamError::UnsupportedProtocol(_)) => {
+                tracing::info!("casette 1");
+
                 tracing::info!(%peer, %error);
                 return;
             }
             Err(error) => {
                 // Other errors may be temporary.
                 // In production, something like an exponential backoff / circuit-breaker may be more appropriate.
+                tracing::info!("casette 2");
+
                 tracing::debug!(%peer, %error);
                 continue;
             }
         };
 
-        if let Err(e) = ceive_header(stream).await {
+        if let Err(e) = ceive(stream, a.clone(), k.clone()).await {
+            tracing::info!("casette 3");
             tracing::warn!(%peer, "Echo protocol failed: {e}");
             continue;
         }
@@ -156,17 +267,89 @@ async fn echo(mut stream: Stream) -> io::Result<usize> {
     }
 }
 
-async fn ceive_header(mut stream: Stream) -> io::Result<()> {
-    stream.write_all(&[]).await?;
+async fn ceive(
+    mut stream: Stream,
+    a: libp2p::core::Multiaddr,
+    k: libp2p::identity::Keypair,
+) -> io::Result<()> {
+    let empty = etiquette_0::Headers::default();
+
+    let mut bufw = Vec::new();
+    bufw.reserve(empty.encoded_len());
+    // Unwrap is safe, since we have reserved sufficient capacity in the vector.
+    empty.encode(&mut bufw).unwrap();
+
+    stream.write_all(&bufw).await?;
 
     let mut buf = vec![];
     stream.read_exact(&mut buf).await?;
 
-    let buffstring = String::from_utf8(buf).unwrap();
+    let step_0 = etiquette_1::Syn::default();
 
-    tracing::info!(buffstring);
+    let mut bufw_0 = Vec::new();
+    bufw_0.reserve(step_0.encoded_len());
+
+    stream.write_all(&bufw_0).await?;
+
+    let mut buf_discard_0 = vec![];
+    stream.read_exact(&mut buf_discard_0).await?;
+
+    let mut step_1 = etiquette_1::Ack::default();
+
+    let x19prefix = "\x19Ethereum Signed Message:".to_string();
+
+    // go // msg := &pb.Ack{
+    // go //         Address: &pb.BzzAddress{
+    // go //             Underlay:  advertisableUnderlayBytes,
+    // go //             Overlay:   bzzAddress.Overlay.Bytes(),
+    // go //             Signature: bzzAddress.Signature,
+    // go //         },
+    // go //         NetworkID:      s.networkID,
+    // go //         FullNode:       s.fullNode,
+    // go //         Nonce:          s.nonce,
+    // go //         WelcomeMessage: welcomeMessage,
+    // go //     }
+
+    step_1.welcome_message = "...Ara Ara... ^^".to_string();
+
+    let mut step_1_ad = etiquette_1::BzzAddress::default();
+
+    let mut bufw_1 = Vec::new();
+    bufw_1.reserve(step_1.encoded_len());
+
+    stream.write_all(&bufw_1).await?;
 
     stream.close().await?;
 
     Ok(())
+}
+
+#[derive(NetworkBehaviour)]
+struct Behaviour {
+    identify: identify::Behaviour,
+    auto_nat: autonat::Behaviour,
+    stream: stream::Behaviour,
+}
+
+impl Behaviour {
+    fn new(local_public_key: identity::PublicKey) -> Self {
+        Self {
+            identify: identify::Behaviour::new(identify::Config::new(
+                "/ipfs/0.1.0".into(),
+                local_public_key.clone(),
+            )),
+            auto_nat: autonat::Behaviour::new(
+                local_public_key.to_peer_id(),
+                autonat::Config {
+                    retry_interval: Duration::from_secs(10),
+                    refresh_interval: Duration::from_secs(30),
+                    boot_delay: Duration::from_secs(5),
+                    throttle_server_period: Duration::ZERO,
+                    only_global_ips: false,
+                    ..Default::default()
+                },
+            ),
+            stream: stream::Behaviour::new(),
+        }
+    }
 }

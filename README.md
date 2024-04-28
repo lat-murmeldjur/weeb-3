@@ -21,10 +21,17 @@ cargo run
 
 ## [Notes]
 
-e0 - header
-e1 - handshake
-e2 - hive
-e3 - pingpong
-e4 - pricing
-e5 - pseudosettle
-e6 - retrieval
+### More Installed dependencies:
+
+	protoc
+	clang 
+
+### Eqs
+
+	e0 - header
+	e1 - handshake
+	e2 - hive
+	e3 - pingpong
+	e4 - pricing
+	e5 - pseudosettle
+	e6 - retrieval
