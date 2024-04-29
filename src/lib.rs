@@ -6,7 +6,7 @@ use libp2p::{
     autonat,
     core::Multiaddr,
     futures::{AsyncReadExt, AsyncWriteExt, StreamExt},
-    identity,
+    identify, identity,
     multiaddr::Protocol,
     noise, ping,
     swarm::{NetworkBehaviour, SwarmEvent},
@@ -19,6 +19,7 @@ use anyhow::{Context, Result};
 use prost::Message;
 use rand::RngCore;
 use std::io;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::str::FromStr;
 use std::thread;
 use std::time::Duration;
@@ -96,6 +97,8 @@ pub async fn run(libp2p_endpoint: String) -> Result<(), JsError> {
 
     let addr = libp2p_endpoint.parse::<Multiaddr>()?;
 
+    swarm.dial(addr.clone())?;
+
     swarm
         .behaviour_mut()
         .auto_nat
@@ -108,7 +111,23 @@ pub async fn run(libp2p_endpoint: String) -> Result<(), JsError> {
 
     let mut self_addr: libp2p::core::Multiaddr = libp2p::core::Multiaddr::empty();
 
-    swarm.dial(addr)?;
+    let address = loop {
+        if let SwarmEvent::NewListenAddr { address, .. } = swarm.select_next_some().await {
+            if address
+                .iter()
+                .any(|e| e == Protocol::Ip4(Ipv4Addr::LOCALHOST))
+            {
+                body.append_p(
+                    "Ignoring localhost address to make sure the example works in Firefox",
+                );
+                continue;
+            }
+
+            body.append_p(&format!("Jpo {:?}:", address));
+
+            break address;
+        }
+    };
 
     body.append_p("Got so far2")?;
 
@@ -137,35 +156,9 @@ pub async fn run(libp2p_endpoint: String) -> Result<(), JsError> {
 
     match swarm.select_next_some().await {
         SwarmEvent::NewListenAddr { address, .. } => {
-            swarm.listen_on(address.clone());
-            body.append_p(&format!("xoxo {:?}", address))
-        }
-        SwarmEvent::Behaviour(event) => body.append_p(&format!("xoxo {:?}", event)),
-        e => body.append_p(&format!("xoxo {:?}", e)),
-    };
-
-    match swarm.select_next_some().await {
-        SwarmEvent::NewListenAddr { address, .. } => {
-            swarm.listen_on(address.clone());
-            body.append_p(&format!("xoxo {:?}", address))
-        }
-        SwarmEvent::Behaviour(event) => body.append_p(&format!("xoxo {:?}", event)),
-        e => body.append_p(&format!("xoxo {:?}", e)),
-    };
-
-    match swarm.select_next_some().await {
-        SwarmEvent::NewListenAddr { address, .. } => {
-            swarm.listen_on(address.clone());
-            body.append_p(&format!("xoxo {:?}", address))
-        }
-        SwarmEvent::Behaviour(event) => body.append_p(&format!("xoxo {:?}", event)),
-        e => body.append_p(&format!("xoxo {:?}", e)),
-    };
-
-    match swarm.select_next_some().await {
-        SwarmEvent::NewListenAddr { address, .. } => {
-            swarm.listen_on(address.clone());
-            body.append_p(&format!("xoxo {:?}", address))
+            let listen_address = address.with_p2p(*swarm.local_peer_id()).unwrap();
+            swarm.listen_on(listen_address);
+            body.append_p("jp")
         }
         SwarmEvent::Behaviour(event) => body.append_p(&format!("xoxo {:?}", event)),
         e => body.append_p(&format!("xoxo {:?}", e)),
@@ -196,11 +189,12 @@ pub async fn run(libp2p_endpoint: String) -> Result<(), JsError> {
     body.append_p("Got so far4")?;
 
     loop {
-        let event = swarm.next().await.expect("never terminates");
+        let event = swarm.select_next_some().await;
 
         match event {
             libp2p::swarm::SwarmEvent::NewListenAddr { address, .. } => {
                 let listen_address = address.with_p2p(*swarm.local_peer_id()).unwrap();
+                body.append_p("jp");
                 tracing::info!(%listen_address);
             }
             event => {}
@@ -362,6 +356,7 @@ async fn ceive(
 
 #[derive(NetworkBehaviour)]
 struct Behaviour {
+    identify: identify::Behaviour,
     auto_nat: autonat::Behaviour,
     stream: stream::Behaviour,
 }
@@ -369,6 +364,10 @@ struct Behaviour {
 impl Behaviour {
     fn new(local_public_key: identity::PublicKey) -> Self {
         Self {
+            identify: identify::Behaviour::new(identify::Config::new(
+                "/_.../6.3.3".into(),
+                local_public_key.clone(),
+            )),
             auto_nat: autonat::Behaviour::new(
                 local_public_key.to_peer_id(),
                 autonat::Config {
