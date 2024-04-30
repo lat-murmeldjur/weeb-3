@@ -19,6 +19,7 @@ use anyhow::{Context, Result};
 use prost::Message;
 use rand::RngCore;
 use std::io;
+use std::io::Cursor;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::str::FromStr;
 use std::thread;
@@ -35,7 +36,7 @@ use secp256k1::{Message as secMess, Secp256k1};
 mod conventions;
 use conventions::a;
 
-const HANDSHAKE_PROTOCOL: StreamProtocol = StreamProtocol::new("/handshake");
+const HANDSHAKE_PROTOCOL: StreamProtocol = StreamProtocol::new("/swarm/handshake/11.0.0/handshake");
 
 pub mod weeb_3 {
     pub mod etiquette_0 {
@@ -84,9 +85,9 @@ pub async fn run(libp2p_endpoint: String) -> Result<(), JsError> {
     let peer_id =
         libp2p::PeerId::from_str("QmbtmtkRmmozBdTqyz4L8XFBpvAA72kxCRMMz4D7uaVwDG").unwrap();
 
-    let keypair = libp2p::identity::Keypair::ed25519_from_bytes([0; 32]).unwrap();
+    let keypair = libp2p::identity::Keypair::generate_ecdsa();
 
-    let mut swarm = libp2p::SwarmBuilder::with_new_identity()
+    let mut swarm = libp2p::SwarmBuilder::with_existing_identity(keypair.clone())
         .with_wasm_bindgen()
         .with_other_transport(|key| {
             webrtc_websys::Transport::new(webrtc_websys::Config::new(&key))
@@ -97,104 +98,26 @@ pub async fn run(libp2p_endpoint: String) -> Result<(), JsError> {
 
     let addr = libp2p_endpoint.parse::<Multiaddr>()?;
 
-    swarm.dial(addr.clone())?;
-
     swarm
         .behaviour_mut()
         .auto_nat
         .add_server(peer_id, Some(addr.clone()));
 
-    tracing::info!("Dialing {addr}");
-
-    tracing::info!("asd");
-    body.append_p("Got so far")?;
-
-    let mut self_addr: libp2p::core::Multiaddr = libp2p::core::Multiaddr::empty();
-
-    let address = loop {
-        if let SwarmEvent::NewListenAddr { address, .. } = swarm.select_next_some().await {
-            if address
-                .iter()
-                .any(|e| e == Protocol::Ip4(Ipv4Addr::LOCALHOST))
-            {
-                body.append_p(
-                    "Ignoring localhost address to make sure the example works in Firefox",
-                );
-                continue;
-            }
-
-            body.append_p(&format!("Jpo {:?}:", address));
-
-            break address;
-        }
-    };
-
-    body.append_p("Got so far2")?;
-
-    for a in swarm.listeners() {
-        self_addr = a.clone();
-        body.append_p(&format!("Yo {:?}:", self_addr.to_string(),))?;
-    }
-
-    for a in swarm.external_addresses() {
-        self_addr = a.clone();
-        body.append_p(&format!("Yo {:?}:", self_addr.to_string(),))?;
-    }
-
-    body.append_p(&format!("Xo {:?}:", self_addr.to_string(),))?;
-
-    body.append_p("Got so far3")?;
+    swarm.dial(addr.clone())?;
 
     connection_handler(
         peer_id,
         swarm.behaviour().stream.new_control(),
-        &self_addr,
+        &addr.clone(),
         &keypair,
     );
-
-    body.append_p("Got so far4")?;
-
-    match swarm.select_next_some().await {
-        SwarmEvent::NewListenAddr { address, .. } => {
-            let listen_address = address.with_p2p(*swarm.local_peer_id()).unwrap();
-            swarm.listen_on(listen_address);
-            body.append_p("jp")
-        }
-        SwarmEvent::Behaviour(event) => body.append_p(&format!("xoxo {:?}", event)),
-        e => body.append_p(&format!("xoxo {:?}", e)),
-    };
-
-    body.append_p("Got so far2")?;
-
-    for a in swarm.listeners() {
-        self_addr = a.clone();
-        body.append_p(&format!("Yo {:?}:", self_addr.to_string(),))?;
-    }
-
-    for a in swarm.external_addresses() {
-        self_addr = a.clone();
-        body.append_p(&format!("Yo {:?}:", self_addr.to_string(),))?;
-    }
-
-    body.append_p(&format!("Xo {:?}:", self_addr.to_string(),))?;
-
-    body.append_p("Got so far3")?;
-    connection_handler(
-        peer_id,
-        swarm.behaviour().stream.new_control(),
-        &self_addr,
-        &keypair,
-    );
-
-    body.append_p("Got so far4")?;
 
     loop {
-        let event = swarm.select_next_some().await;
+        let event = swarm.next().await.expect("never terminates");
 
         match event {
             libp2p::swarm::SwarmEvent::NewListenAddr { address, .. } => {
                 let listen_address = address.with_p2p(*swarm.local_peer_id()).unwrap();
-                body.append_p("jp");
                 tracing::info!(%listen_address);
             }
             event => {}
@@ -314,17 +237,37 @@ async fn ceive(
     let mut buf = vec![];
     stream.read_exact(&mut buf).await?;
 
-    let step_0 = etiquette_1::Syn::default();
+    let mut step_0 = etiquette_1::Syn::default();
+
+    step_0.observed_underlay = a.clone().to_vec();
 
     let mut bufw_0 = Vec::new();
     bufw_0.reserve(step_0.encoded_len());
 
     stream.write_all(&bufw_0).await?;
 
-    let mut buf_discard_0 = vec![];
-    stream.read_exact(&mut buf_discard_0).await?;
+    let mut buf_nondiscard_0 = vec![];
+    stream.read_exact(&mut buf_nondiscard_0).await?;
+
+    let rec_0 = etiquette_1::Syn::decode(&mut Cursor::new(buf_nondiscard_0)).unwrap();
+
+    let underlay = libp2p::core::Multiaddr::try_from(rec_0.observed_underlay).unwrap();
 
     let mut step_1 = etiquette_1::Ack::default();
+
+    // go //    networkIDBytes := make([]byte, 8)
+    // go //    binary.BigEndian.PutUint64(networkIDBytes, networkID)
+
+    let bID = 10_u64.to_be_bytes();
+
+    // go //    signData := append([]byte("bee-handshake-"), underlay...)
+    // go //    signData = append(signData, overlay...)
+
+    let hsprefix: &[u8] = &"bee-handshake-".to_string().into_bytes();
+
+    let part1: &[u8] = &underlay.to_vec();
+
+    let part2: &[u8] = &underlay.to_vec();
 
     let x19prefix = "\x19Ethereum Signed Message:".to_string();
 
@@ -371,9 +314,10 @@ impl Behaviour {
             auto_nat: autonat::Behaviour::new(
                 local_public_key.to_peer_id(),
                 autonat::Config {
-                    retry_interval: Duration::from_secs(10),
-                    refresh_interval: Duration::from_secs(30),
-                    boot_delay: Duration::from_secs(5),
+                    retry_interval: Duration::from_secs(2),
+                    refresh_interval: Duration::from_secs(5),
+                    use_connected: true,
+                    boot_delay: Duration::from_secs(1),
                     throttle_server_period: Duration::ZERO,
                     only_global_ips: false,
                     ..Default::default()
