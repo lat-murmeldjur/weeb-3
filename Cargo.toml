@@ -35,7 +35,7 @@ tower-http = { git = "https://github.com/tower-rs/tower-http.git", features = ["
 mime_guess = { git = "https://github.com/abonander/mime_guess.git" }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-tokio = { default-features = false, features = ["time"] }
+tokio = { default-features = false, features = ["time", "rt"] }
 futures = { git = "https://github.com/rust-lang/futures-rs.git" }
 libp2p = { git = "https://github.com/libp2p/rust-libp2p.git", features = [ "ecdsa", "autonat",  "noise", "yamux", "identify", "ed25519", "macros", "ping", "tokio", "wasm-bindgen"] }
 libp2p-stream = { git = "https://github.com/libp2p/rust-libp2p.git" }

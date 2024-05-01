@@ -13,6 +13,7 @@ use libp2p::{
     yamux, PeerId, Stream, StreamProtocol,
 };
 use libp2p_stream as stream;
+use libp2p_stream::OpenStreamError;
 use libp2p_webrtc_websys as webrtc_websys;
 
 use anyhow::{Context, Result};
@@ -20,6 +21,7 @@ use prost::Message;
 use rand::RngCore;
 use std::io;
 use std::io::Cursor;
+use std::io::Error;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::str::FromStr;
 use std::thread;
@@ -102,15 +104,23 @@ pub async fn run(libp2p_endpoint: String) -> Result<(), JsError> {
         .behaviour_mut()
         .auto_nat
         .add_server(peer_id, Some(addr.clone()));
+    let mut incoming_streams = swarm
+        .behaviour()
+        .stream
+        .new_control()
+        .accept(HANDSHAKE_PROTOCOL)
+        .unwrap();
 
     swarm.dial(addr.clone())?;
 
-    connection_handler(
+    tokio::spawn(connection_handler(
         peer_id,
         swarm.behaviour().stream.new_control(),
-        &addr.clone(),
-        &keypair,
-    );
+        addr.clone(),
+        keypair.clone(),
+    ));
+
+    body.append_p("got so far 4");
 
     loop {
         let event = swarm.next().await.expect("never terminates");
@@ -120,7 +130,9 @@ pub async fn run(libp2p_endpoint: String) -> Result<(), JsError> {
                 let listen_address = address.with_p2p(*swarm.local_peer_id()).unwrap();
                 tracing::info!(%listen_address);
             }
-            event => {}
+            event => {
+                body.append_p(&format!("c00: {:#?}", event));
+            }
         }
     }
 
@@ -170,54 +182,14 @@ fn js_error(msg: &str) -> JsError {
 async fn connection_handler(
     peer: PeerId,
     mut control: stream::Control,
-    a: &libp2p::core::Multiaddr,
-    k: &libp2p::identity::Keypair,
+    a: libp2p::core::Multiaddr,
+    k: libp2p::identity::Keypair,
 ) {
-    loop {
-        tokio::time::sleep(Duration::from_secs(1)).await; // Wait a second between echos.
+    let protocol_future = async move {
+        let stream = control.open_stream(peer, HANDSHAKE_PROTOCOL).await.unwrap();
 
-        let stream = match control.open_stream(peer, HANDSHAKE_PROTOCOL).await {
-            Ok(stream) => stream,
-            Err(error @ stream::OpenStreamError::UnsupportedProtocol(_)) => {
-                tracing::info!("casette 1");
-
-                tracing::info!(%peer, %error);
-                return;
-            }
-            Err(error) => {
-                // Other errors may be temporary.
-                // In production, something like an exponential backoff / circuit-breaker may be more appropriate.
-                tracing::info!("casette 2");
-
-                tracing::debug!(%peer, %error);
-                continue;
-            }
-        };
-
-        if let Err(e) = ceive(stream, a.clone(), k.clone()).await {
-            tracing::info!("casette 3");
-            tracing::warn!(%peer, "Echo protocol failed: {e}");
-            continue;
-        }
-
-        tracing::info!(%peer, "Echo complete!")
-    }
-}
-
-async fn echo(mut stream: Stream) -> io::Result<usize> {
-    let mut total = 0;
-
-    let mut buf = [0u8; 100];
-
-    loop {
-        let read = stream.read(&mut buf).await?;
-        if read == 0 {
-            return Ok(total);
-        }
-
-        total += read;
-        stream.write_all(&buf[..read]).await?;
-    }
+        ceive(stream, a.clone(), k.clone());
+    };
 }
 
 async fn ceive(
@@ -271,6 +243,11 @@ async fn ceive(
 
     let x19prefix = "\x19Ethereum Signed Message:".to_string();
 
+    let nonce_v: &[u8; 32] = &[
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0,
+    ];
+
     // go // msg := &pb.Ack{
     // go //         Address: &pb.BzzAddress{
     // go //             Underlay:  advertisableUnderlayBytes,
@@ -284,6 +261,9 @@ async fn ceive(
     // go //     }
 
     step_1.welcome_message = "...Ara Ara... ^^".to_string();
+    step_1.network_id = 10 as u64;
+    step_1.full_node = false;
+    step_1.nonce = nonce_v.to_vec();
 
     let mut step_1_ad = etiquette_1::BzzAddress::default();
 
@@ -293,6 +273,9 @@ async fn ceive(
     stream.write_all(&bufw_1).await?;
 
     stream.close().await?;
+
+    let mut buf_nondiscard_2 = vec![];
+    stream.read_exact(&mut buf_nondiscard_2).await?;
 
     Ok(())
 }
@@ -314,10 +297,10 @@ impl Behaviour {
             auto_nat: autonat::Behaviour::new(
                 local_public_key.to_peer_id(),
                 autonat::Config {
-                    retry_interval: Duration::from_secs(2),
-                    refresh_interval: Duration::from_secs(5),
-                    use_connected: true,
-                    boot_delay: Duration::from_secs(1),
+                    retry_interval: Duration::from_secs(20),
+                    refresh_interval: Duration::from_secs(30),
+                    use_connected: false,
+                    boot_delay: Duration::from_secs(10),
                     throttle_server_period: Duration::ZERO,
                     only_global_ips: false,
                     ..Default::default()
