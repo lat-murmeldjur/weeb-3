@@ -132,7 +132,7 @@ async fn get_index(
 
     println!("gottts");
 
-    let wrtcd = "/ip4/151.177.232.203/udp/55819/webrtc-direct/certhash/uEiDGENBLB4Cy__zDC9XXtcg4_TX2G--u7xlRdoKR4OZ7AQ/p2p/QmbtmtkRmmozBdTqyz4L8XFBpvAA72kxCRMMz4D7uaVwDG";
+    let wrtcd = "/ip4/127.0.0.1/udp/31336/webrtc-direct/certhash/uEiA5FIeFdhIVmCtloUljTz3k7oNIbNLUG6E5fGPeI9FbQg/p2p/QmVne42GS4QKBg48bHrmotcC8TjqmMyg2ehkCbstUT5tSN";
 
     let html = std::str::from_utf8(&content)
         .expect("index.html to be valid utf8")

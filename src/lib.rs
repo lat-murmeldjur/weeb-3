@@ -29,9 +29,9 @@ use tracing_subscriber::EnvFilter;
 use wasm_bindgen::prelude::*;
 use web_sys::{Document, HtmlElement};
 
-use secp256k1::hashes::{sha256, Hash};
-use secp256k1::rand::rngs::OsRng;
-use secp256k1::{Message as secMess, Secp256k1};
+// use secp256k1::hashes::{sha256, Hash};
+// use secp256k1::rand::rngs::OsRng;
+// use secp256k1::{Message as secMess, Secp256k1};
 
 mod conventions;
 use conventions::a;
@@ -83,7 +83,7 @@ pub async fn run(libp2p_endpoint: String) -> Result<(), JsError> {
     ))?;
 
     let peer_id =
-        libp2p::PeerId::from_str("QmbtmtkRmmozBdTqyz4L8XFBpvAA72kxCRMMz4D7uaVwDG").unwrap();
+        libp2p::PeerId::from_str("QmVne42GS4QKBg48bHrmotcC8TjqmMyg2ehkCbstUT5tSN").unwrap();
 
     let keypair = libp2p::identity::Keypair::generate_ecdsa();
 
