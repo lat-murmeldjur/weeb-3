@@ -26,8 +26,8 @@ use std::thread;
 use std::time::Duration;
 use tracing::level_filters::LevelFilter;
 use tracing_subscriber::EnvFilter;
-use wasm_bindgen::prelude::*;
-use web_sys::{Document, HtmlElement};
+use wasm_bindgen::{closure, prelude::*, JsValue};
+use web_sys::{console::*, Document, HtmlElement};
 
 // use secp256k1::hashes::{sha256, Hash};
 // use secp256k1::rand::rngs::OsRng;
@@ -72,15 +72,12 @@ use weeb_3::etiquette_6;
 
 #[wasm_bindgen]
 pub async fn run(libp2p_endpoint: String) -> Result<(), JsError> {
-    tracing_wasm::set_as_global_default();
+    // tracing_wasm::set_as_global_default();
 
-    let ping_duration = Duration::from_secs(30);
+    let ping_duration = Duration::from_secs(60);
 
     let body = Body::from_current_window()?;
-    body.append_p(&format!(
-        "Let's ping the rust-libp2p server over WebRTC for {:?}:",
-        ping_duration
-    ))?;
+    body.append_p(&format!("Attempt to establish connection over webrtc"))?;
 
     let peer_id =
         libp2p::PeerId::from_str("QmVne42GS4QKBg48bHrmotcC8TjqmMyg2ehkCbstUT5tSN").unwrap();
@@ -98,10 +95,14 @@ pub async fn run(libp2p_endpoint: String) -> Result<(), JsError> {
 
     let addr = libp2p_endpoint.parse::<Multiaddr>()?;
 
-    swarm
-        .behaviour_mut()
-        .auto_nat
-        .add_server(peer_id, Some(addr.clone()));
+    // swarm        .behaviour_mut()        .auto_nat        .add_server(peer_id, Some(addr.clone()));
+
+    let mut incoming_streams = swarm
+        .behaviour()
+        .stream
+        .new_control()
+        .accept(HANDSHAKE_PROTOCOL)
+        .unwrap();
 
     swarm.dial(addr.clone())?;
 
@@ -111,19 +112,17 @@ pub async fn run(libp2p_endpoint: String) -> Result<(), JsError> {
         &addr.clone(),
         &keypair,
     );
+    //
+    body.append_p(&format!("establish connection over webrtc"))?;
+    web_sys::console::log_1(&JsValue::from("casette 00"));
 
     loop {
         let event = swarm.next().await.expect("never terminates");
-
         match event {
-            libp2p::swarm::SwarmEvent::NewListenAddr { address, .. } => {
-                let listen_address = address.with_p2p(*swarm.local_peer_id()).unwrap();
-                tracing::info!(%listen_address);
-            }
-            event => {}
+            event => web_sys::console::log_1(&JsValue::from(format!("{:#?}", event))),
+            _ => (),
         }
     }
-
     Ok(())
 }
 
@@ -174,33 +173,37 @@ async fn connection_handler(
     k: &libp2p::identity::Keypair,
 ) {
     loop {
+        web_sys::console::log_1(&JsValue::from("casette 100"));
+
         tokio::time::sleep(Duration::from_secs(1)).await; // Wait a second between echos.
 
         let stream = match control.open_stream(peer, HANDSHAKE_PROTOCOL).await {
-            Ok(stream) => stream,
+            Ok(stream) => {
+                web_sys::console::log_1(&JsValue::from("casette 0"));
+                stream
+            }
             Err(error @ stream::OpenStreamError::UnsupportedProtocol(_)) => {
-                tracing::info!("casette 1");
-
-                tracing::info!(%peer, %error);
+                web_sys::console::log_1(&JsValue::from("casette 1"));
+                web_sys::console::log_1(&JsValue::from(format!("{} {}", peer, error)));
                 return;
             }
             Err(error) => {
                 // Other errors may be temporary.
                 // In production, something like an exponential backoff / circuit-breaker may be more appropriate.
-                tracing::info!("casette 2");
+                web_sys::console::log_1(&JsValue::from("casette 2"));
+                web_sys::console::log_1(&JsValue::from(format!("{} {}", peer, error)));
 
-                tracing::debug!(%peer, %error);
                 continue;
             }
         };
 
         if let Err(e) = ceive(stream, a.clone(), k.clone()).await {
-            tracing::info!("casette 3");
-            tracing::warn!(%peer, "Echo protocol failed: {e}");
+            web_sys::console::log_1(&JsValue::from("Handshake protocol failed"));
+            web_sys::console::log_1(&JsValue::from(format!("{}", e)));
             continue;
         }
 
-        tracing::info!(%peer, "Echo complete!")
+        web_sys::console::log_1(&JsValue::from(format!("{} Handshake complete!", peer)));
     }
 }
 
@@ -314,12 +317,12 @@ impl Behaviour {
             auto_nat: autonat::Behaviour::new(
                 local_public_key.to_peer_id(),
                 autonat::Config {
-                    retry_interval: Duration::from_secs(2),
-                    refresh_interval: Duration::from_secs(5),
+                    retry_interval: Duration::from_secs(10),
+                    refresh_interval: Duration::from_secs(30),
                     use_connected: true,
                     boot_delay: Duration::from_secs(1),
                     throttle_server_period: Duration::ZERO,
-                    only_global_ips: false,
+                    only_global_ips: true,
                     ..Default::default()
                 },
             ),
