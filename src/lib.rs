@@ -2,6 +2,8 @@
 #![cfg(target_arch = "wasm32")]
 
 //use libp2p::core::multiaddr::Protocol;
+use anyhow::{Context, Result};
+use futures::join;
 use libp2p::{
     autonat,
     core::Multiaddr,
@@ -14,9 +16,8 @@ use libp2p::{
 };
 use libp2p_stream as stream;
 use libp2p_webrtc_websys as webrtc_websys;
-
-use anyhow::{Context, Result};
 use prost::Message;
+use rand::rngs::OsRng;
 use rand::RngCore;
 use std::io;
 use std::io::Cursor;
@@ -36,7 +37,7 @@ use web_sys::{console::*, Document, HtmlElement};
 mod conventions;
 use conventions::a;
 
-const HANDSHAKE_PROTOCOL: StreamProtocol = StreamProtocol::new("/swarm/handshake/11.0.0/handshake");
+const HANDSHAKE_PROTOCOL: StreamProtocol = StreamProtocol::new("/swarm/handshake/12.0.0/handshake");
 
 pub mod weeb_3 {
     pub mod etiquette_0 {
@@ -71,9 +72,14 @@ use weeb_3::etiquette_5;
 use weeb_3::etiquette_6;
 
 #[wasm_bindgen]
+pub fn init_panic_hook() {
+    console_error_panic_hook::set_once();
+}
+
+#[wasm_bindgen]
 pub async fn run(libp2p_endpoint: String) -> Result<(), JsError> {
     // tracing_wasm::set_as_global_default();
-
+    init_panic_hook();
     let ping_duration = Duration::from_secs(60);
 
     let body = Body::from_current_window()?;
@@ -94,35 +100,37 @@ pub async fn run(libp2p_endpoint: String) -> Result<(), JsError> {
         .build();
 
     let addr = libp2p_endpoint.parse::<Multiaddr>()?;
-
-    // swarm        .behaviour_mut()        .auto_nat        .add_server(peer_id, Some(addr.clone()));
+    let addr2 = libp2p_endpoint.parse::<Multiaddr>()?;
 
     let mut incoming_streams = swarm
-        .behaviour()
+        .behaviour_mut()
         .stream
         .new_control()
         .accept(HANDSHAKE_PROTOCOL)
         .unwrap();
 
+    let keypairs = keypair.clone();
+    let ctrl = swarm.behaviour().stream.new_control();
+
     swarm.dial(addr.clone())?;
 
-    connection_handler(
-        peer_id,
-        swarm.behaviour().stream.new_control(),
-        &addr.clone(),
-        &keypair,
-    );
-    //
     body.append_p(&format!("establish connection over webrtc"))?;
     web_sys::console::log_1(&JsValue::from("casette 00"));
 
-    loop {
-        let event = swarm.next().await.expect("never terminates");
-        match event {
-            event => web_sys::console::log_1(&JsValue::from(format!("{:#?}", event))),
-            _ => (),
+    let conn_handle = async { connection_handler(peer_id, ctrl, &addr2, &keypairs).await };
+
+    let event_handle = async {
+        loop {
+            let event = swarm.next().await.expect("never terminates");
+            match event {
+                event => web_sys::console::log_1(&JsValue::from(format!("{:#?}", event))),
+                _ => (),
+            }
         }
-    }
+    };
+
+    join!(conn_handle, event_handle);
+
     Ok(())
 }
 
@@ -175,8 +183,6 @@ async fn connection_handler(
     loop {
         web_sys::console::log_1(&JsValue::from("casette 100"));
 
-        tokio::time::sleep(Duration::from_secs(1)).await; // Wait a second between echos.
-
         let stream = match control.open_stream(peer, HANDSHAKE_PROTOCOL).await {
             Ok(stream) => {
                 web_sys::console::log_1(&JsValue::from("casette 0"));
@@ -204,22 +210,6 @@ async fn connection_handler(
         }
 
         web_sys::console::log_1(&JsValue::from(format!("{} Handshake complete!", peer)));
-    }
-}
-
-async fn echo(mut stream: Stream) -> io::Result<usize> {
-    let mut total = 0;
-
-    let mut buf = [0u8; 100];
-
-    loop {
-        let read = stream.read(&mut buf).await?;
-        if read == 0 {
-            return Ok(total);
-        }
-
-        total += read;
-        stream.write_all(&buf[..read]).await?;
     }
 }
 
@@ -302,30 +292,24 @@ async fn ceive(
 
 #[derive(NetworkBehaviour)]
 struct Behaviour {
+    autonat: autonat::v2::client::Behaviour,
+    autonat_s: autonat::v2::server::Behaviour,
     identify: identify::Behaviour,
-    auto_nat: autonat::Behaviour,
     stream: stream::Behaviour,
 }
 
 impl Behaviour {
     fn new(local_public_key: identity::PublicKey) -> Self {
         Self {
+            autonat: autonat::v2::client::Behaviour::new(
+                OsRng,
+                autonat::v2::client::Config::default().with_probe_interval(Duration::from_secs(60)),
+            ),
+            autonat_s: autonat::v2::server::Behaviour::new(OsRng),
             identify: identify::Behaviour::new(identify::Config::new(
                 "/_.../6.3.3".into(),
                 local_public_key.clone(),
             )),
-            auto_nat: autonat::Behaviour::new(
-                local_public_key.to_peer_id(),
-                autonat::Config {
-                    retry_interval: Duration::from_secs(10),
-                    refresh_interval: Duration::from_secs(30),
-                    use_connected: true,
-                    boot_delay: Duration::from_secs(1),
-                    throttle_server_period: Duration::ZERO,
-                    only_global_ips: true,
-                    ..Default::default()
-                },
-            ),
             stream: stream::Behaviour::new(),
         }
     }

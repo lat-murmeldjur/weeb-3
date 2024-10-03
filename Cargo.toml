@@ -10,6 +10,9 @@ release = false
 [lib]
 crate-type = ["cdylib"]
 
+[profile.release]
+debug = true
+
 [dependencies]
 anyhow = { git = "https://github.com/dtolnay/anyhow.git" }
 rand = "0.8"
@@ -36,6 +39,7 @@ libp2p-webrtc = { git = "https://github.com/libp2p/rust-libp2p.git",  features =
 libp2p-tcp = { git = "https://github.com/libp2p/rust-libp2p.git",  features = ["tokio"] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
+console_error_panic_hook = { git = "https://github.com/rustwasm/console_error_panic_hook.git" }
 libp2p = { git = "https://github.com/libp2p/rust-libp2p.git", features = [ "ecdsa", "autonat",  "noise", "yamux", "identify", "ed25519", "macros", "ping", "tokio", "wasm-bindgen"] }
 libp2p-webrtc-websys = { git = "https://github.com/libp2p/rust-libp2p.git" }
 libp2p-stream = { git = "https://github.com/libp2p/rust-libp2p.git" }
@@ -43,4 +47,4 @@ tracing-wasm = { git = "https://github.com/old-storyai/tracing-wasm.git" }
 wasm-bindgen = "0.2.90"
 wasm-bindgen-futures = "0.4.42"
 web-sys = { version = "0.3", features = ['console', 'Document', 'Element', 'HtmlElement', 'Node', 'Response', 'Window'] }
-tokio = { version = "1.38.0", default-features = false, features = ["time", "rt"] }
+tokio = { version = "1.38.0", default-features = false, features = ["sync", "macros", "io-util", "rt", "time"] }
