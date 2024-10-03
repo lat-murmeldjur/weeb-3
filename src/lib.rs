@@ -101,6 +101,7 @@ pub async fn run(libp2p_endpoint: String) -> Result<(), JsError> {
 
     let addr = libp2p_endpoint.parse::<Multiaddr>()?;
     let addr2 = libp2p_endpoint.parse::<Multiaddr>()?;
+    swarm.dial(addr.clone()).unwrap();
 
     let mut incoming_streams = swarm
         .behaviour_mut()
@@ -112,14 +113,14 @@ pub async fn run(libp2p_endpoint: String) -> Result<(), JsError> {
     let keypairs = keypair.clone();
     let ctrl = swarm.behaviour().stream.new_control();
 
-    swarm.dial(addr.clone())?;
-
     body.append_p(&format!("establish connection over webrtc"))?;
     web_sys::console::log_1(&JsValue::from("casette 00"));
 
     let conn_handle = async { connection_handler(peer_id, ctrl, &addr2, &keypairs).await };
 
     let event_handle = async {
+        swarm.dial(addr.clone()).unwrap();
+
         loop {
             let event = swarm.next().await.expect("never terminates");
             match event {
@@ -221,48 +222,83 @@ async fn ceive(
     let empty = etiquette_0::Headers::default();
 
     let mut bufw = Vec::new();
-    bufw.reserve(empty.encoded_len());
-    // Unwrap is safe, since we have reserved sufficient capacity in the vector.
-    empty.encode(&mut bufw).unwrap();
 
+    let empty_len = empty.encoded_len();
+
+    bufw.reserve(empty_len + prost::length_delimiter_len(empty_len));
+    // Unwrap is safe, since we have reserved sufficient capacity in the vector.
+    empty.encode_length_delimited(&mut bufw).unwrap();
     stream.write_all(&bufw).await?;
+
+    // stream.flush().await.unwrap();
 
     let mut buf = vec![];
     stream.read_exact(&mut buf).await?;
 
+    // stream.flush().await.unwrap();
+
+    web_sys::console::log_1(&JsValue::from(format!("{:#?}", buf)));
+
     let mut step_0 = etiquette_1::Syn::default();
 
-    step_0.observed_underlay = a.clone().to_vec();
+    step_0.observed_underlay = a.to_string().as_bytes().to_vec(); // a.clone().to_vec();
 
     let mut bufw_0 = Vec::new();
-    bufw_0.reserve(step_0.encoded_len());
+
+    let step_0_len = step_0.encoded_len();
+
+    bufw_0.reserve(step_0_len + prost::length_delimiter_len(step_0_len));
+    step_0.encode_length_delimited(&mut bufw_0).unwrap();
+
+    web_sys::console::log_1(&JsValue::from(a.to_string()));
+
+    //    web_sys::console::log_1(&JsValue::from("cs0"));
+    //    let show = etiquette_1::Syn::decode_length_delimited(&mut Cursor::new(bufw_0.clone()));
+    //    web_sys::console::log_1(&JsValue::from(format!("{:#?}", show)));
+    //
+    //    web_sys::console::log_1(&JsValue::from("cs1"));
 
     stream.write_all(&bufw_0).await?;
+    // stream.flush().await.unwrap();
 
     let mut buf_nondiscard_0 = vec![];
     stream.read_exact(&mut buf_nondiscard_0).await?;
+    // stream.flush().await.unwrap();
+    // web_sys::console::log_1(&JsValue::from(format!("{:#?}", buf_nondiscard_0)));
 
-    let rec_0 = etiquette_1::Syn::decode(&mut Cursor::new(buf_nondiscard_0)).unwrap();
+    let rec_0 = etiquette_1::SynAck::decode(&mut Cursor::new(buf_nondiscard_0)).unwrap();
+    web_sys::console::log_1(&JsValue::from(format!("{:#?}", rec_0)));
 
-    let underlay = libp2p::core::Multiaddr::try_from(rec_0.observed_underlay).unwrap();
-
-    let mut step_1 = etiquette_1::Ack::default();
-
-    // go //    networkIDBytes := make([]byte, 8)
-    // go //    binary.BigEndian.PutUint64(networkIDBytes, networkID)
-
-    let bID = 10_u64.to_be_bytes();
-
-    // go //    signData := append([]byte("bee-handshake-"), underlay...)
-    // go //    signData = append(signData, overlay...)
-
-    let hsprefix: &[u8] = &"bee-handshake-".to_string().into_bytes();
-
-    let part1: &[u8] = &underlay.to_vec();
-
-    let part2: &[u8] = &underlay.to_vec();
-
-    let x19prefix = "\x19Ethereum Signed Message:".to_string();
+    //    let underlay = libp2p::core::Multiaddr::try_from(rec_0.observed_underlay).unwrap();
+    //
+    //    let mut step_1 = etiquette_1::Ack::default();
+    //
+    //    // go //    networkIDBytes := make([]byte, 8)
+    //    // go //    binary.BigEndian.PutUint64(networkIDBytes, networkID)
+    //
+    //    let bID = 10_u64.to_be_bytes();
+    //
+    //    // go //    signData := append([]byte("bee-handshake-"), underlay...)
+    //    // go //    signData = append(signData, overlay...)
+    //
+    //    let hsprefix: &[u8] = &"bee-handshake-".to_string().into_bytes();
+    //
+    //    let part1: &[u8] = &underlay.to_vec();
+    //
+    //    let part2: &[u8] = &underlay.to_vec();
+    //
+    //    let x19prefix = "\x19Ethereum Signed Message:".to_string();
+    //
+    //    step_1.welcome_message = "...Ara Ara... ^^".to_string();
+    //
+    //    let mut step_1_ad = etiquette_1::BzzAddress::default();
+    //
+    //    let mut bufw_1 = Vec::new();
+    //    bufw_1.reserve(step_1.encoded_len());
+    //
+    //    stream.write_all(&bufw_1).await?;
+    //
+    stream.close().await?;
 
     // go // msg := &pb.Ack{
     // go //         Address: &pb.BzzAddress{
@@ -275,17 +311,6 @@ async fn ceive(
     // go //         Nonce:          s.nonce,
     // go //         WelcomeMessage: welcomeMessage,
     // go //     }
-
-    step_1.welcome_message = "...Ara Ara... ^^".to_string();
-
-    let mut step_1_ad = etiquette_1::BzzAddress::default();
-
-    let mut bufw_1 = Vec::new();
-    bufw_1.reserve(step_1.encoded_len());
-
-    stream.write_all(&bufw_1).await?;
-
-    stream.close().await?;
 
     Ok(())
 }

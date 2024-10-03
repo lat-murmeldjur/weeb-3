@@ -21,6 +21,8 @@ use std::time::Duration;
 use tokio::net::TcpListener;
 use tower_http::cors::{Any, CorsLayer};
 
+const wrtcd : &str = "/ip4/192.168.1.40/udp/31336/webrtc-direct/certhash/uEiA0ygGTSmPOMH5e3fFIxrTQqKU3hTdahtUzMZDg3G06lw/p2p/QmVne42GS4QKBg48bHrmotcC8TjqmMyg2ehkCbstUT5tSN";
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let _ = tracing_subscriber::fmt()
@@ -129,8 +131,6 @@ async fn get_index(
     let content = StaticFiles::get("index.html")
         .ok_or(StatusCode::NOT_FOUND)?
         .data;
-
-    let wrtcd = "/ip4/192.168.1.40/udp/31336/webrtc-direct/certhash/uEiBA5D0ogRuw0pIzzDkYM4fZkueicwky8PzLOylzmIa2ig/p2p/QmVne42GS4QKBg48bHrmotcC8TjqmMyg2ehkCbstUT5tSN";
 
     let html = std::str::from_utf8(&content)
         .expect("index.html to be valid utf8")
