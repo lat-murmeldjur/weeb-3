@@ -235,8 +235,16 @@ async fn ceive(
     stream.write_all(&bufw_0).await?;
     stream.flush().await.unwrap();
 
-    let mut buf_nondiscard_0 = vec![0; 1000];
-    stream.read(&mut buf_nondiscard_0).await?;
+    let mut buf_nondiscard_0 = Vec::new();
+    let mut buf_discard_0: [u8; 255] = [0; 255];
+    loop {
+        web_sys::console::log_1(&JsValue::from("reading"));
+        let n = stream.read(&mut buf_discard_0).await?;
+        buf_nondiscard_0.extend_from_slice(&buf_discard_0[..n]);
+        if n < 255 {
+            break;
+        }
+    }
 
     let rec_0 =
         etiquette_1::SynAck::decode_length_delimited(&mut Cursor::new(buf_nondiscard_0)).unwrap();
@@ -244,12 +252,13 @@ async fn ceive(
     web_sys::console::log_1(&JsValue::from(format!("{:#?}", rec_0)));
 
     let underlay = libp2p::core::Multiaddr::try_from(rec_0.syn.unwrap().observed_underlay).unwrap();
-
     let mut step_1 = etiquette_1::Ack::default();
+    step_1.address = Some(etiquette_1::BzzAddress::default());
 
     // go //    networkIDBytes := make([]byte, 8)
     // go //    binary.BigEndian.PutUint64(networkIDBytes, networkID)
 
+    step_1.network_id = 10_u64;
     let bID = 10_u64.to_be_bytes();
 
     // go //    signData := append([]byte("bee-handshake-"), underlay...)
@@ -274,6 +283,7 @@ async fn ceive(
     bufw_1.reserve(step_1_len + prost::length_delimiter_len(step_1_len));
     step_1.encode_length_delimited(&mut bufw_1).unwrap();
     stream.write_all(&bufw_1).await?;
+    stream.flush().await.unwrap();
 
     stream.close().await?;
 
