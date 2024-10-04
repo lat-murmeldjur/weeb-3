@@ -219,29 +219,29 @@ async fn ceive(
     a: libp2p::core::Multiaddr,
     k: libp2p::identity::Keypair,
 ) -> io::Result<()> {
-    let empty = etiquette_0::Headers::default();
-
-    let mut bufw = Vec::new();
-
-    let empty_len = empty.encoded_len();
-
-    bufw.reserve(empty_len + prost::length_delimiter_len(empty_len));
-    // Unwrap is safe, since we have reserved sufficient capacity in the vector.
-    empty.encode_length_delimited(&mut bufw).unwrap();
-    stream.write_all(&bufw).await?;
+    //    let empty = etiquette_0::Headers::default();
+    //
+    //    let mut bufw = Vec::new();
+    //
+    //    let empty_len = empty.encoded_len();
+    //
+    //    bufw.reserve(empty_len + prost::length_delimiter_len(empty_len));
+    //    // Unwrap is safe, since we have reserved sufficient capacity in the vector.
+    //    empty.encode_length_delimited(&mut bufw).unwrap();
+    //    stream.write_all(&bufw).await?;
+    //
+    //    // stream.flush().await.unwrap();
+    //
+    //    let mut buf = vec![];
+    //    stream.read_exact(&mut buf).await?;
 
     // stream.flush().await.unwrap();
 
-    let mut buf = vec![];
-    stream.read_exact(&mut buf).await?;
-
-    // stream.flush().await.unwrap();
-
-    web_sys::console::log_1(&JsValue::from(format!("{:#?}", buf)));
+    //    web_sys::console::log_1(&JsValue::from(format!("{:#?}", buf)));
 
     let mut step_0 = etiquette_1::Syn::default();
 
-    step_0.observed_underlay = a.to_string().as_bytes().to_vec(); // a.clone().to_vec();
+    step_0.observed_underlay = a.clone().to_vec(); // a.clone().to_vec();
 
     let mut bufw_0 = Vec::new();
 
