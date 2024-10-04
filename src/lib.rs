@@ -219,26 +219,6 @@ async fn ceive(
     a: libp2p::core::Multiaddr,
     k: libp2p::identity::Keypair,
 ) -> io::Result<()> {
-    //    let empty = etiquette_0::Headers::default();
-    //
-    //    let mut bufw = Vec::new();
-    //
-    //    let empty_len = empty.encoded_len();
-    //
-    //    bufw.reserve(empty_len + prost::length_delimiter_len(empty_len));
-    //    // Unwrap is safe, since we have reserved sufficient capacity in the vector.
-    //    empty.encode_length_delimited(&mut bufw).unwrap();
-    //    stream.write_all(&bufw).await?;
-    //
-    //    // stream.flush().await.unwrap();
-    //
-    //    let mut buf = vec![];
-    //    stream.read_exact(&mut buf).await?;
-
-    // stream.flush().await.unwrap();
-
-    //    web_sys::console::log_1(&JsValue::from(format!("{:#?}", buf)));
-
     let mut step_0 = etiquette_1::Syn::default();
 
     step_0.observed_underlay = a.clone().to_vec(); // a.clone().to_vec();
@@ -252,52 +232,49 @@ async fn ceive(
 
     web_sys::console::log_1(&JsValue::from(a.to_string()));
 
-    //    web_sys::console::log_1(&JsValue::from("cs0"));
-    //    let show = etiquette_1::Syn::decode_length_delimited(&mut Cursor::new(bufw_0.clone()));
-    //    web_sys::console::log_1(&JsValue::from(format!("{:#?}", show)));
-    //
-    //    web_sys::console::log_1(&JsValue::from("cs1"));
-
     stream.write_all(&bufw_0).await?;
-    // stream.flush().await.unwrap();
+    stream.flush().await.unwrap();
 
-    let mut buf_nondiscard_0 = vec![];
-    stream.read_exact(&mut buf_nondiscard_0).await?;
-    // stream.flush().await.unwrap();
-    // web_sys::console::log_1(&JsValue::from(format!("{:#?}", buf_nondiscard_0)));
+    let mut buf_nondiscard_0 = vec![0; 1000];
+    stream.read(&mut buf_nondiscard_0).await?;
 
-    let rec_0 = etiquette_1::SynAck::decode(&mut Cursor::new(buf_nondiscard_0)).unwrap();
+    let rec_0 =
+        etiquette_1::SynAck::decode_length_delimited(&mut Cursor::new(buf_nondiscard_0)).unwrap();
+
     web_sys::console::log_1(&JsValue::from(format!("{:#?}", rec_0)));
 
-    //    let underlay = libp2p::core::Multiaddr::try_from(rec_0.observed_underlay).unwrap();
-    //
-    //    let mut step_1 = etiquette_1::Ack::default();
-    //
-    //    // go //    networkIDBytes := make([]byte, 8)
-    //    // go //    binary.BigEndian.PutUint64(networkIDBytes, networkID)
-    //
-    //    let bID = 10_u64.to_be_bytes();
-    //
-    //    // go //    signData := append([]byte("bee-handshake-"), underlay...)
-    //    // go //    signData = append(signData, overlay...)
-    //
-    //    let hsprefix: &[u8] = &"bee-handshake-".to_string().into_bytes();
-    //
-    //    let part1: &[u8] = &underlay.to_vec();
-    //
-    //    let part2: &[u8] = &underlay.to_vec();
-    //
-    //    let x19prefix = "\x19Ethereum Signed Message:".to_string();
-    //
-    //    step_1.welcome_message = "...Ara Ara... ^^".to_string();
-    //
-    //    let mut step_1_ad = etiquette_1::BzzAddress::default();
-    //
-    //    let mut bufw_1 = Vec::new();
-    //    bufw_1.reserve(step_1.encoded_len());
-    //
-    //    stream.write_all(&bufw_1).await?;
-    //
+    let underlay = libp2p::core::Multiaddr::try_from(rec_0.syn.unwrap().observed_underlay).unwrap();
+
+    let mut step_1 = etiquette_1::Ack::default();
+
+    // go //    networkIDBytes := make([]byte, 8)
+    // go //    binary.BigEndian.PutUint64(networkIDBytes, networkID)
+
+    let bID = 10_u64.to_be_bytes();
+
+    // go //    signData := append([]byte("bee-handshake-"), underlay...)
+    // go //    signData = append(signData, overlay...)
+
+    let hsprefix: &[u8] = &"bee-handshake-".to_string().into_bytes();
+
+    let part1: &[u8] = &underlay.to_vec();
+
+    let part2: &[u8] = &underlay.to_vec();
+
+    let x19prefix = "\x19Ethereum Signed Message:".to_string();
+
+    step_1.welcome_message = "...Ara Ara... ^^".to_string();
+
+    let mut step_1_ad = etiquette_1::BzzAddress::default();
+
+    let mut bufw_1 = Vec::new();
+
+    let step_1_len = step_1.encoded_len();
+
+    bufw_1.reserve(step_1_len + prost::length_delimiter_len(step_1_len));
+    step_1.encode_length_delimited(&mut bufw_1).unwrap();
+    stream.write_all(&bufw_1).await?;
+
     stream.close().await?;
 
     // go // msg := &pb.Ack{
