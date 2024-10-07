@@ -2,6 +2,13 @@
 #![cfg(target_arch = "wasm32")]
 
 //use libp2p::core::multiaddr::Protocol;
+use alloy::network::EthereumWallet;
+use alloy::primitives::{keccak256, Address};
+use alloy::signers::local::PrivateKeySigner;
+use alloy::signers::Signer;
+
+use byteorder::ByteOrder;
+
 use anyhow::{Context, Result};
 use futures::join;
 use libp2p::{
@@ -88,7 +95,9 @@ pub async fn run(libp2p_endpoint: String) -> Result<(), JsError> {
     let peer_id =
         libp2p::PeerId::from_str("QmVne42GS4QKBg48bHrmotcC8TjqmMyg2ehkCbstUT5tSN").unwrap();
 
-    let keypair = libp2p::identity::Keypair::generate_ecdsa();
+    let keypair = libp2p::identity::Keypair::generate_secp256k1();
+
+    web_sys::console::log_1(&JsValue::from(format!("{:#?}", keypair)));
 
     let mut swarm = libp2p::SwarmBuilder::with_existing_identity(keypair.clone())
         .with_wasm_bindgen()
@@ -230,8 +239,6 @@ async fn ceive(
     bufw_0.reserve(step_0_len + prost::length_delimiter_len(step_0_len));
     step_0.encode_length_delimited(&mut bufw_0).unwrap();
 
-    web_sys::console::log_1(&JsValue::from(a.to_string()));
-
     stream.write_all(&bufw_0).await?;
     stream.flush().await.unwrap();
 
@@ -249,32 +256,76 @@ async fn ceive(
     let rec_0 =
         etiquette_1::SynAck::decode_length_delimited(&mut Cursor::new(buf_nondiscard_0)).unwrap();
 
-    web_sys::console::log_1(&JsValue::from(format!("{:#?}", rec_0)));
-
     let underlay = libp2p::core::Multiaddr::try_from(rec_0.syn.unwrap().observed_underlay).unwrap();
     let mut step_1 = etiquette_1::Ack::default();
-    step_1.address = Some(etiquette_1::BzzAddress::default());
 
     // go //    networkIDBytes := make([]byte, 8)
     // go //    binary.BigEndian.PutUint64(networkIDBytes, networkID)
+    // go //
+    // go // netIDBytes := make([]byte, 8)
+    // go //     binary.LittleEndian.PutUint64(netIDBytes, networkID)
+    // go //     data := append(ethAddr, netIDBytes...)
+    // go //     data = append(data, nonce...)
+    // go //     h, err := LegacyKeccak256(data)
+    // go //     if err != nil {
+    // go //         return swarm.ZeroAddress, err
+    // go //     }
+    // go //     return swarm.NewAddress(h[:]), nil
 
-    step_1.network_id = 10_u64;
     let bID = 10_u64.to_be_bytes();
+    let pk = k.to_protobuf_encoding().unwrap();
+    let signer: PrivateKeySigner = PrivateKeySigner::from_slice(&pk[4..]).unwrap();
+    let wallet = EthereumWallet::from(signer.clone());
+    let addrep = signer.address();
+    let addre = addrep[2..].to_vec();
 
-    // go //    signData := append([]byte("bee-handshake-"), underlay...)
-    // go //    signData = append(signData, overlay...)
+    web_sys::console::log_1(&JsValue::from(format!("S10 {:#?}", addre)));
 
+    let mut bufId: [u8; 8] = [0; 8];
+    byteorder::LittleEndian::write_u64(&mut bufId, 10_u64);
+    let mut byteslice = [addre.as_slice(), &bufId].concat();
+    let nonce: [u8; 32] = [0; 32];
+    let mut byteslice2 = [byteslice, (&nonce).to_vec()].concat();
+    let overlayp = keccak256(byteslice2);
+    let overlay = &overlayp[2..];
+
+    // signer.sign_message(&byteslice2).await.unwrap();
+    // go // networkIDBytes := make([]byte, 8)
+    // go // binary.BigEndian.PutUint64(networkIDBytes, networkID)
+    // go // signData := append([]byte("bee-handshake-"), underlay...)
+    // go // signData = append(signData, overlay...)
+    // go // return append(signData, networkIDBytes...)'
+
+    let x19prefix = "\x19Ethereum Signed Message:\n".to_string().into_bytes();
     let hsprefix: &[u8] = &"bee-handshake-".to_string().into_bytes();
 
-    let part1: &[u8] = &underlay.to_vec();
+    let mut bufId2: [u8; 8] = [0; 8];
+    byteorder::BigEndian::write_u64(&mut bufId2, 10_u64);
+    let mut byteslice_p = [x19prefix, hsprefix.to_vec()].concat();
+    let mut byteslice3 = [byteslice_p, underlay.to_vec()].concat();
+    let mut byteslice4 = [byteslice3, overlay.to_vec()].concat();
+    let mut byteslice5 = [byteslice4, bufId2.to_vec()].concat();
 
-    let part2: &[u8] = &underlay.to_vec();
-
-    let x19prefix = "\x19Ethereum Signed Message:".to_string();
-
-    step_1.welcome_message = "...Ara Ara... ^^".to_string();
+    let signature = signer.sign_message(&byteslice5).await.unwrap();
 
     let mut step_1_ad = etiquette_1::BzzAddress::default();
+
+    step_1_ad.overlay = overlay.to_vec();
+    step_1_ad.underlay = underlay.to_vec();
+    step_1_ad.signature = signature.as_bytes().to_vec();
+
+    web_sys::console::log_1(&JsValue::from(format!(
+        "S11 {:#?}",
+        signature.to_k256().unwrap().to_vec()
+    )));
+    web_sys::console::log_1(&JsValue::from(format!("S12 {:#?}", signature)));
+
+    step_1.address = Some(step_1_ad);
+    step_1.nonce = nonce.to_vec();
+    step_1.network_id = 10_u64;
+    step_1.full_node = false;
+
+    web_sys::console::log_1(&JsValue::from(format!("S13 {:#?}", step_1)));
 
     let mut bufw_1 = Vec::new();
 
