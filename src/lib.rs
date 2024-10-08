@@ -11,6 +11,9 @@ use byteorder::ByteOrder;
 
 use anyhow::{Context, Result};
 use futures::join;
+use libp2p::identity::ecdsa;
+use libp2p::identity::ecdsa::SecretKey;
+use libp2p::identity::*;
 use libp2p::{
     autonat,
     core::Multiaddr,
@@ -95,11 +98,13 @@ pub async fn run(libp2p_endpoint: String) -> Result<(), JsError> {
     let peer_id =
         libp2p::PeerId::from_str("QmVne42GS4QKBg48bHrmotcC8TjqmMyg2ehkCbstUT5tSN").unwrap();
 
-    let keypair = libp2p::identity::Keypair::generate_secp256k1();
+    let secret_key_o = ecdsa::SecretKey::generate();
+    let secret_key = secret_key_o.clone();
+    let keypair: ecdsa::Keypair = secret_key_o.into(); // libp2p::identity::Keypair::generate_ecdsa();
 
     web_sys::console::log_1(&JsValue::from(format!("{:#?}", keypair)));
 
-    let mut swarm = libp2p::SwarmBuilder::with_existing_identity(keypair.clone())
+    let mut swarm = libp2p::SwarmBuilder::with_existing_identity(keypair.clone().into())
         .with_wasm_bindgen()
         .with_other_transport(|key| {
             webrtc_websys::Transport::new(webrtc_websys::Config::new(&key))
@@ -125,7 +130,8 @@ pub async fn run(libp2p_endpoint: String) -> Result<(), JsError> {
     body.append_p(&format!("establish connection over webrtc"))?;
     web_sys::console::log_1(&JsValue::from("casette 00"));
 
-    let conn_handle = async { connection_handler(peer_id, ctrl, &addr2, &keypairs).await };
+    let conn_handle =
+        async { connection_handler(peer_id, ctrl, &addr2, &keypairs.into(), &secret_key).await };
 
     let event_handle = async {
         swarm.dial(addr.clone()).unwrap();
@@ -189,6 +195,7 @@ async fn connection_handler(
     mut control: stream::Control,
     a: &libp2p::core::Multiaddr,
     k: &libp2p::identity::Keypair,
+    pk: &ecdsa::SecretKey,
 ) {
     loop {
         web_sys::console::log_1(&JsValue::from("casette 100"));
@@ -213,7 +220,7 @@ async fn connection_handler(
             }
         };
 
-        if let Err(e) = ceive(stream, a.clone(), k.clone()).await {
+        if let Err(e) = ceive(stream, a.clone(), k.clone(), &pk.clone()).await {
             web_sys::console::log_1(&JsValue::from("Handshake protocol failed"));
             web_sys::console::log_1(&JsValue::from(format!("{}", e)));
             continue;
@@ -227,7 +234,10 @@ async fn ceive(
     mut stream: Stream,
     a: libp2p::core::Multiaddr,
     k: libp2p::identity::Keypair,
+    pk: &ecdsa::SecretKey,
 ) -> io::Result<()> {
+    web_sys::console::log_1(&JsValue::from(format!("{:#?}", pk.to_bytes())));
+
     let mut step_0 = etiquette_1::Syn::default();
 
     step_0.observed_underlay = a.clone().to_vec(); // a.clone().to_vec();
@@ -273,11 +283,11 @@ async fn ceive(
     // go //     return swarm.NewAddress(h[:]), nil
 
     let bID = 10_u64.to_be_bytes();
-    let pk = k.to_protobuf_encoding().unwrap();
-    let signer: PrivateKeySigner = PrivateKeySigner::from_slice(&pk[4..]).unwrap();
+
+    let signer: PrivateKeySigner = PrivateKeySigner::from_slice(&pk.to_bytes()).unwrap();
     let wallet = EthereumWallet::from(signer.clone());
     let addrep = signer.address();
-    let addre = addrep[2..].to_vec();
+    let addre = addrep.to_vec();
 
     web_sys::console::log_1(&JsValue::from(format!("S10 {:#?}", addre)));
 
@@ -287,7 +297,7 @@ async fn ceive(
     let nonce: [u8; 32] = [0; 32];
     let mut byteslice2 = [byteslice, (&nonce).to_vec()].concat();
     let overlayp = keccak256(byteslice2);
-    let overlay = &overlayp[2..];
+    let overlay = &overlayp;
 
     // signer.sign_message(&byteslice2).await.unwrap();
     // go // networkIDBytes := make([]byte, 8)
@@ -301,8 +311,8 @@ async fn ceive(
 
     let mut bufId2: [u8; 8] = [0; 8];
     byteorder::BigEndian::write_u64(&mut bufId2, 10_u64);
-    let mut byteslice_p = [x19prefix, hsprefix.to_vec()].concat();
-    let mut byteslice3 = [byteslice_p, underlay.to_vec()].concat();
+    // let mut byteslice_p = [x19prefix, ].concat();
+    let mut byteslice3 = [hsprefix.to_vec(), underlay.to_vec()].concat();
     let mut byteslice4 = [byteslice3, overlay.to_vec()].concat();
     let mut byteslice5 = [byteslice4, bufId2.to_vec()].concat();
 
