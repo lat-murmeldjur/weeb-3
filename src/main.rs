@@ -21,7 +21,7 @@ use std::time::Duration;
 use tokio::net::TcpListener;
 use tower_http::cors::{Any, CorsLayer};
 
-const wrtcd : &str = "/ip4/127.0.0.1/udp/31336/webrtc-direct/certhash/uEiAVwOnoKTljmgvW0j2T78KDobY6e6I6sdgSGk4Kgy8bhQ/p2p/QmVne42GS4QKBg48bHrmotcC8TjqmMyg2ehkCbstUT5tSN";
+const wrtcd : &str = "/ip4/127.0.0.1/udp/31336/webrtc-direct/certhash/uEiASjheX4D5IpstPAIP6G3zbtTEp2s9GvrDy8GkZyhij8Q/p2p/QmVne42GS4QKBg48bHrmotcC8TjqmMyg2ehkCbstUT5tSN";
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
