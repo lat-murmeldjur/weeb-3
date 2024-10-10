@@ -1,7 +1,5 @@
 #![cfg(target_arch = "wasm32")]
 
-//use libp2p::core::multiaddr::Protocol;
-use alloy::network::EthereumWallet;
 use alloy::primitives::keccak256;
 use alloy::signers::local::PrivateKeySigner;
 use alloy::signers::Signer;
