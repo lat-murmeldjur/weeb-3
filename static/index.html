@@ -12,12 +12,9 @@
         <div id="wrapper">
             <h1>Weeb-3</h1>
         </div>
-
         <script type="module" defer>
-            import init, { run } from "./weeb_3.js"
-
-            await init();
-            run("__LIBP2P_ENDPOINT__"); // This placeholder will be replaced by the server at runtime with the actual listening address.
+            const sekirei = new SharedWorker(new URL("worker.js", import.meta.url), { type: 'module'});
+            sekirei.port.start();
         </script>
     </body>
 </html>

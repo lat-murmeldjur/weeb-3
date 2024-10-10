@@ -46,7 +46,19 @@ libp2p-stream = { git = "https://github.com/libp2p/rust-libp2p.git" }
 tracing-wasm = { git = "https://github.com/old-storyai/tracing-wasm.git" }
 wasm-bindgen = "0.2.90"
 wasm-bindgen-futures = "0.4.42"
-web-sys = { version = "0.3", features = ['console', 'Document', 'Element', 'HtmlElement', 'Node', 'Response', 'Window'] }
+web-sys = { version = "0.3.71", features = [
+  'console',
+  'Document',
+  'Element',
+  'HtmlElement',
+  'HtmlInputElement',
+  'MessageEvent',
+  'Node',
+  'SharedWorker',
+  'Response',
+  'Window',
+  'Worker',
+] }
 tokio = { version = "1.38.0", default-features = false, features = ["sync", "macros", "io-util", "rt", "time"] }
 alloy = { git = "https://github.com/alloy-rs/alloy.git", features = [
     "k256",

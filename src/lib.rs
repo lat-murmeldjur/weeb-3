@@ -1,12 +1,14 @@
 #![cfg(target_arch = "wasm32")]
 
-//use libp2p::core::multiaddr::Protocol;
-use alloy::network::EthereumWallet;
 use alloy::primitives::keccak256;
 use alloy::signers::local::PrivateKeySigner;
 use alloy::signers::Signer;
 
 use byteorder::ByteOrder;
+
+use std::cell::RefCell;
+use std::rc::Rc;
+use wasm_bindgen::prelude::*;
 
 use anyhow::Result;
 use futures::join;
@@ -28,10 +30,15 @@ use std::io::Cursor;
 use std::str::FromStr;
 use std::time::Duration;
 use wasm_bindgen::{prelude::*, JsValue};
-use web_sys::{Document, HtmlElement};
+use web_sys::{console, Document, HtmlElement, HtmlInputElement, MessageEvent, SharedWorker};
 
 // mod conventions;
 // use conventions::a;
+
+#[wasm_bindgen]
+pub struct Sekirei {
+    count: u32,
+}
 
 const HANDSHAKE_PROTOCOL: StreamProtocol = StreamProtocol::new("/swarm/handshake/12.0.0/handshake");
 
@@ -78,8 +85,8 @@ pub async fn run(libp2p_endpoint: String) -> Result<(), JsError> {
     init_panic_hook();
     let ping_duration = Duration::from_secs(60);
 
-    let body = Body::from_current_window()?;
-    body.append_p(&format!("Attempt to establish connection over webrtc"))?;
+    //    let body = Body::from_current_window()?;
+    //    body.append_p(&format!("Attempt to establish connection over webrtc"))?;
 
     let peer_id =
         libp2p::PeerId::from_str("QmVne42GS4QKBg48bHrmotcC8TjqmMyg2ehkCbstUT5tSN").unwrap();
@@ -103,7 +110,7 @@ pub async fn run(libp2p_endpoint: String) -> Result<(), JsError> {
 
     let ctrl = swarm.behaviour().stream.new_control();
 
-    body.append_p(&format!("establish connection over webrtc"))?;
+    // body.append_p(&format!("establish connection over webrtc"))?;
 
     let conn_handle = async { connection_handler(peer_id, ctrl, &addr.clone(), &secret_key).await };
 
