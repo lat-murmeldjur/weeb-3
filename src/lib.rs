@@ -31,7 +31,7 @@ use libp2p::{
 use libp2p_stream as stream;
 
 use wasm_bindgen::{prelude::*, JsValue};
-use web_sys::{Document, HtmlElement};
+use web_sys::{console, Document, HtmlElement, HtmlInputElement, MessageEvent, SharedWorker};
 
 // mod conventions;
 // use conventions::a;
@@ -84,18 +84,18 @@ use weeb_3::etiquette_4;
 
 #[wasm_bindgen]
 pub fn init_panic_hook() {
-    console_error_panic_hook::set_once();
+    // console_error_panic_hook::set_once();
 }
 
 #[wasm_bindgen]
-pub async fn run(libp2p_endpoint: String) -> Result<(), JsError> {
+pub async fn run(_argument: String) -> Result<(), JsError> {
     tracing_wasm::set_as_global_default(); // uncomment to turn on tracing
     init_panic_hook();
 
-    let ping_duration = Duration::from_secs(60);
+    let idle_duration = Duration::from_secs(60);
 
-    let body = Body::from_current_window()?;
-    body.append_p(&format!("Attempt to establish connection over websocket"))?;
+    // let body = Body::from_current_window()?;
+    // body.append_p(&format!("Attempt to establish connection over websocket"))?;
 
     let peer_id =
         libp2p::PeerId::from_str("QmYa9hasbJKBoTpfthcisMPKyGMCidfT1R4VkaRpg14bWP").unwrap();
@@ -117,17 +117,19 @@ pub async fn run(libp2p_endpoint: String) -> Result<(), JsError> {
         .with_behaviour(|key| Behaviour::new(key.public()))?
         .with_swarm_config(|_| {
             libp2p::swarm::Config::with_wasm_executor()
-                .with_idle_connection_timeout(ping_duration)
+                .with_idle_connection_timeout(idle_duration)
                 .with_max_negotiating_inbound_streams(NonZero::new(10000_usize).unwrap().into())
                 .with_per_connection_event_buffer_size(10000_usize)
                 .with_notify_handler_buffer_size(NonZero::new(10000_usize).unwrap().into())
         })
         .build();
 
-    let addr2 = "/ip4/192.168.1.42/tcp/1634/ws/p2p/QmYa9hasbJKBoTpfthcisMPKyGMCidfT1R4VkaRpg14bWP"
+    let addr = "/ip4/192.168.1.42/tcp/1634/ws/p2p/QmYa9hasbJKBoTpfthcisMPKyGMCidfT1R4VkaRpg14bWP"
         .parse::<Multiaddr>()
         .unwrap();
-    swarm.dial(addr2.clone()).unwrap();
+
+    let addr2 = addr.clone();
+    swarm.dial(addr.clone()).unwrap();
 
     let mut ctrl = swarm.behaviour_mut().stream.new_control();
 
@@ -146,14 +148,10 @@ pub async fn run(libp2p_endpoint: String) -> Result<(), JsError> {
         }
     };
 
-    body.append_p(&format!("establish connection over websocket"))?;
-
-    let addr = libp2p_endpoint.parse::<Multiaddr>()?;
+    // body.append_p(&format!("establish connection over websocket"))?;
 
     let conn_handle =
-        async { connection_handler(peer_id, &mut ctrl, &addr.clone(), &secret_key).await };
-
-    // swarm.behaviour_mut().identify.push([peer_id]);
+        async { connection_handler(peer_id, &mut ctrl, &addr2.clone(), &secret_key).await };
 
     let event_handle = async {
         loop {
@@ -391,16 +389,15 @@ impl Behaviour {
         Self {
             autonat: autonat::v2::client::Behaviour::new(
                 OsRng,
-                autonat::v2::client::Config::default().with_probe_interval(Duration::from_secs(3)),
+                autonat::v2::client::Config::default().with_probe_interval(Duration::from_secs(60)),
             ),
             autonat_s: autonat::v2::server::Behaviour::new(OsRng),
             dcutr: dcutr::Behaviour::new(local_public_key.to_peer_id()),
             stream: stream::Behaviour::new(),
             identify: identify::Behaviour::new(
-                identify::Config::new("/weeb".into(), local_public_key.clone())
+                identify::Config::new("/weeb-3".into(), local_public_key.clone())
                     .with_push_listen_addr_updates(true)
-                    // .with_cache_size(10000)
-                    .with_interval(Duration::from_secs(30)), // .with_cache_size(10), //
+                    .with_interval(Duration::from_secs(60)), // .with_cache_size(10), //
             ),
             ping: ping::Behaviour::new(ping::Config::new()),
         }
