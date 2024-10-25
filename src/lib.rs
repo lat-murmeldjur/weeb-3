@@ -1,18 +1,10 @@
 #![cfg(target_arch = "wasm32")]
 // #![allow(warnings)]
 
-use alloy::primitives::keccak256;
-use alloy::signers::local::PrivateKeySigner;
-use alloy::signers::Signer;
-
 use anyhow::Result;
-use byteorder::ByteOrder;
 use futures::join;
-use prost::Message;
 use rand::rngs::OsRng;
 
-use std::io;
-use std::io::Cursor;
 use std::num::NonZero;
 use std::str::FromStr;
 use std::time::Duration;
@@ -21,34 +13,22 @@ use libp2p::{
     autonat,
     core::{self, Multiaddr, Transport},
     dcutr,
-    futures::{AsyncReadExt, AsyncWriteExt, StreamExt},
+    futures::StreamExt,
     identify, identity,
     identity::ecdsa,
     noise, ping,
     swarm::NetworkBehaviour,
-    websocket_websys, yamux, PeerId, Stream, StreamProtocol,
+    websocket_websys, yamux, PeerId, StreamProtocol,
 };
 use libp2p_stream as stream;
 
 use wasm_bindgen::{prelude::*, JsValue};
-use web_sys::{console, Document, HtmlElement, HtmlInputElement, MessageEvent, SharedWorker};
 
 // mod conventions;
 // use conventions::a;
 
-const HANDSHAKE_PROTOCOL: StreamProtocol = StreamProtocol::new("/swarm/handshake/12.0.0/handshake");
-const PRICING_PROTOCOL: StreamProtocol = StreamProtocol::new("/swarm/pricing/1.0.0/pricing");
-
-// const GOSSIP_PROTOCOL: StreamProtocol = StreamProtocol::new("/swarm/hive/1.1.0/peers");
-// const PSEUDOSETTLE_PROTOCOL: StreamProtocol = StreamProtocol::new("/swarm/pseudosettle/1.0.0/pseudosettle");
-// const PINGPONG_PROTOCOL: StreamProtocol = StreamProtocol::new("/swarm/pingpong/1.0.0/pingpong");
-// const SWAP_PROTOCOL: StreamProtocol = StreamProtocol::new("/swarm/swap/1.0.0/swap");
-// const STATUS_PROTOCOL: StreamProtocol = StreamProtocol::new("/swarm/status/1.1.1/status");
-//
-// const PULL_CURSORS_PROTOCOL: StreamProtocol = StreamProtocol::new("/swarm/pullsync/1.4.0/cursors");
-// const PULL_PROTOCOL: StreamProtocol = StreamProtocol::new("/swarm/pullsync/1.4.0/pullsync");
-// const PUSH_PROTOCOL: StreamProtocol = StreamProtocol::new("/swarm/pushsync/1.3.0/pushsync");
-// const RETRIEVAL_PROTOCOL: StreamProtocol = StreamProtocol::new("/swarm/retrieval/1.4.0/retrieval");
+mod handlers;
+use handlers::*;
 
 pub mod weeb_3 {
     pub mod etiquette_0 {
@@ -74,13 +54,18 @@ pub mod weeb_3 {
     }
 }
 
-use weeb_3::etiquette_0;
-use weeb_3::etiquette_1;
-// use weeb_3::etiquette_2;
-// use weeb_3::etiquette_3;
-use weeb_3::etiquette_4;
-// use weeb_3::etiquette_5;
-// use weeb_3::etiquette_6;
+const HANDSHAKE_PROTOCOL: StreamProtocol = StreamProtocol::new("/swarm/handshake/12.0.0/handshake");
+const PRICING_PROTOCOL: StreamProtocol = StreamProtocol::new("/swarm/pricing/1.0.0/pricing");
+
+const GOSSIP_PROTOCOL: StreamProtocol = StreamProtocol::new("/swarm/hive/1.1.0/peers");
+// const PSEUDOSETTLE_PROTOCOL: StreamProtocol = StreamProtocol::new("/swarm/pseudosettle/1.0.0/pseudosettle");
+// const PINGPONG_PROTOCOL: StreamProtocol = StreamProtocol::new("/swarm/pingpong/1.0.0/pingpong");
+// const STATUS_PROTOCOL: StreamProtocol = StreamProtocol::new("/swarm/status/1.1.1/status");
+//
+// const PULL_CURSORS_PROTOCOL: StreamProtocol = StreamProtocol::new("/swarm/pullsync/1.4.0/cursors");
+// const PULL_PROTOCOL: StreamProtocol = StreamProtocol::new("/swarm/pullsync/1.4.0/pullsync");
+// const PUSH_PROTOCOL: StreamProtocol = StreamProtocol::new("/swarm/pushsync/1.3.0/pushsync");
+// const RETRIEVAL_PROTOCOL: StreamProtocol = StreamProtocol::new("/swarm/retrieval/1.4.0/retrieval");
 
 #[wasm_bindgen]
 pub fn init_panic_hook() {
@@ -124,7 +109,7 @@ pub async fn run(_argument: String) -> Result<(), JsError> {
         })
         .build();
 
-    let addr = "/ip4/192.168.1.42/tcp/1634/ws/p2p/QmYa9hasbJKBoTpfthcisMPKyGMCidfT1R4VkaRpg14bWP"
+    let addr = "/ip4/192.168.1.42/tcp/31336/ws/p2p/QmYa9hasbJKBoTpfthcisMPKyGMCidfT1R4VkaRpg14bWP"
         .parse::<Multiaddr>()
         .unwrap();
 
@@ -140,6 +125,13 @@ pub async fn run(_argument: String) -> Result<(), JsError> {
         .accept(PRICING_PROTOCOL)
         .unwrap();
 
+    let mut incoming_gossip_streams = swarm
+        .behaviour_mut()
+        .stream
+        .new_control()
+        .accept(GOSSIP_PROTOCOL)
+        .unwrap();
+
     let pricing_inbound_handle = async move {
         web_sys::console::log_1(&JsValue::from(format!("Opened Pricing handler 1")));
         while let Some((peer, stream)) = incoming_pricing_streams.next().await {
@@ -148,7 +140,13 @@ pub async fn run(_argument: String) -> Result<(), JsError> {
         }
     };
 
-    // body.append_p(&format!("establish connection over websocket"))?;
+    let gossip_inbound_handle = async move {
+        web_sys::console::log_1(&JsValue::from(format!("Opened Gossip handler 1")));
+        while let Some((peer, stream)) = incoming_gossip_streams.next().await {
+            web_sys::console::log_1(&JsValue::from(format!("Entered Gossip handler 1")));
+            gossip_handler(peer, stream).await.unwrap();
+        }
+    };
 
     let conn_handle =
         async { connection_handler(peer_id, &mut ctrl, &addr2.clone(), &secret_key).await };
@@ -163,7 +161,12 @@ pub async fn run(_argument: String) -> Result<(), JsError> {
         }
     };
 
-    join!(event_handle, conn_handle, pricing_inbound_handle);
+    join!(
+        event_handle,
+        conn_handle,
+        gossip_inbound_handle,
+        pricing_inbound_handle,
+    );
 
     web_sys::console::log_1(&JsValue::from(format!("Dropping All handlers")));
 
@@ -197,181 +200,6 @@ async fn connection_handler(
     web_sys::console::log_1(&JsValue::from(format!("{} Handshake complete!", peer)));
 
     web_sys::console::log_1(&JsValue::from(format!("Closing handler 1")));
-}
-
-async fn ceive(
-    stream: &mut Stream,
-    _control: &stream::Control,
-    a: libp2p::core::Multiaddr,
-    pk: &ecdsa::SecretKey,
-) -> io::Result<()> {
-    let mut step_0 = etiquette_1::Syn::default();
-
-    step_0.observed_underlay = a.clone().to_vec();
-
-    let mut bufw_0 = Vec::new();
-
-    let step_0_len = step_0.encoded_len();
-
-    bufw_0.reserve(step_0_len + prost::length_delimiter_len(step_0_len));
-    step_0.encode_length_delimited(&mut bufw_0).unwrap();
-
-    stream.write_all(&bufw_0).await?;
-    stream.flush().await.unwrap();
-
-    let mut buf_nondiscard_0 = Vec::new();
-    let mut buf_discard_0: [u8; 255] = [0; 255];
-    loop {
-        let n = stream.read(&mut buf_discard_0).await?;
-        buf_nondiscard_0.extend_from_slice(&buf_discard_0[..n]);
-        if n < 255 {
-            break;
-        }
-    }
-
-    let rec_0 =
-        etiquette_1::SynAck::decode_length_delimited(&mut Cursor::new(buf_nondiscard_0)).unwrap();
-
-    let underlay = libp2p::core::Multiaddr::try_from(rec_0.syn.unwrap().observed_underlay).unwrap();
-
-    web_sys::console::log_1(&JsValue::from(format!("Got underlay {}!", underlay)));
-
-    let mut step_1 = etiquette_1::Ack::default();
-
-    let signer: PrivateKeySigner = PrivateKeySigner::from_slice(&pk.to_bytes()).unwrap();
-    let addrep = signer.address();
-    let addre = addrep.to_vec();
-
-    let mut bufidl: [u8; 8] = [0; 8];
-    byteorder::LittleEndian::write_u64(&mut bufidl, 10_u64);
-    let byteslice = [addre.as_slice(), &bufidl].concat();
-    let nonce: [u8; 32] = [0; 32];
-    let byteslice2 = [byteslice, (&nonce).to_vec()].concat();
-    let overlayp = keccak256(byteslice2);
-    let overlay = &overlayp;
-
-    let hsprefix: &[u8] = &"bee-handshake-".to_string().into_bytes();
-
-    let mut bufidb: [u8; 8] = [0; 8];
-    byteorder::BigEndian::write_u64(&mut bufidb, 10_u64);
-    let byteslice3 = [hsprefix.to_vec(), underlay.to_vec()].concat();
-    let byteslice4 = [byteslice3, overlay.to_vec()].concat();
-    let byteslice5 = [byteslice4, bufidb.to_vec()].concat();
-
-    let signature = signer.sign_message(&byteslice5).await.unwrap();
-
-    let mut step_1_ad = etiquette_1::BzzAddress::default();
-
-    step_1_ad.overlay = overlay.to_vec();
-    step_1_ad.underlay = underlay.to_vec();
-    step_1_ad.signature = signature.as_bytes().to_vec();
-
-    step_1.address = Some(step_1_ad);
-    step_1.nonce = nonce.to_vec();
-    step_1.network_id = 10_u64;
-    step_1.full_node = false;
-    step_1.welcome_message = "... Ara Ara ...".to_string();
-
-    let mut bufw_1 = Vec::new();
-
-    let step_1_len = step_1.encoded_len();
-
-    bufw_1.reserve(step_1_len + prost::length_delimiter_len(step_1_len));
-    step_1.encode_length_delimited(&mut bufw_1).unwrap();
-    stream.write_all(&bufw_1).await?;
-
-    stream.flush().await.unwrap();
-    stream.close().await.unwrap();
-
-    Ok(())
-}
-
-async fn pricing_handler(_peer: PeerId, mut stream: Stream) -> io::Result<()> {
-    web_sys::console::log_1(&JsValue::from(format!(
-        "Opened Pricing handle 2 for peer !",
-    )));
-
-    let mut buf_nondiscard_0 = Vec::new();
-    let mut buf_discard_0: [u8; 255] = [0; 255];
-    loop {
-        let n = stream.read(&mut buf_discard_0).await?;
-        buf_nondiscard_0.extend_from_slice(&buf_discard_0[..n]);
-        if n < 255 {
-            break;
-        }
-    }
-
-    let empty = etiquette_0::Headers::default();
-
-    let mut buf_empty = Vec::new();
-
-    let empty_len = empty.encoded_len();
-    buf_empty.reserve(empty_len + prost::length_delimiter_len(empty_len));
-    empty.encode_length_delimited(&mut buf_empty).unwrap();
-
-    stream.write_all(&buf_empty).await?;
-    stream.flush().await.unwrap();
-
-    let mut buf_nondiscard_0 = Vec::new();
-    let mut buf_discard_0: [u8; 255] = [0; 255];
-    loop {
-        let n = stream.read(&mut buf_discard_0).await?;
-        buf_nondiscard_0.extend_from_slice(&buf_discard_0[..n]);
-        if n < 255 {
-            break;
-        }
-    }
-
-    let rec_0 = etiquette_4::AnnouncePaymentThreshold::decode_length_delimited(&mut Cursor::new(
-        buf_nondiscard_0,
-    ))
-    .unwrap();
-
-    web_sys::console::log_1(&JsValue::from(format!(
-        "Got AnnouncePaymentThreshold {:#?}!",
-        rec_0
-    )));
-
-    stream.flush().await.unwrap();
-    stream.close().await?;
-
-    Ok(())
-}
-
-struct Body {
-    body: HtmlElement,
-    document: Document,
-}
-
-impl Body {
-    fn from_current_window() -> Result<Self, JsError> {
-        let document = web_sys::window()
-            .ok_or(js_error("no global `window` exists"))?
-            .document()
-            .ok_or(js_error("should have a document on window"))?;
-        let body = document
-            .body()
-            .ok_or(js_error("document should have a body"))?;
-
-        Ok(Self { body, document })
-    }
-
-    fn append_p(&self, msg: &str) -> Result<(), JsError> {
-        let val = self
-            .document
-            .create_element("p")
-            .map_err(|_| js_error("failed to create <p>"))?;
-        val.set_text_content(Some(msg));
-        self.body
-            .append_child(&val)
-            .map_err(|_| js_error("failed to append <p>"))?;
-
-        Ok(())
-    }
-}
-
-fn js_error(msg: &str) -> JsError {
-    io::Error::new(io::ErrorKind::Other, msg).into()
 }
 
 #[derive(NetworkBehaviour)]

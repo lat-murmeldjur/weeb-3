@@ -7,6 +7,10 @@ license = "MIT"
 [package.metadata.release]
 release = false
 
+[[bin]]
+name = "weebery"           # The name of the target.
+path = "src/main.rs"
+
 [lib]
 crate-type = ["cdylib"]
 
