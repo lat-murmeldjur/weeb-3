@@ -2,11 +2,14 @@
 // #![allow(warnings)]
 
 use anyhow::Result;
+use console_error_panic_hook;
 use futures::join;
 use rand::rngs::OsRng;
 
+use std::collections::HashMap;
 use std::num::NonZero;
 use std::str::FromStr;
+use std::sync::mpsc;
 use std::time::Duration;
 
 use libp2p::{
@@ -24,8 +27,8 @@ use libp2p_stream as stream;
 
 use wasm_bindgen::{prelude::*, JsValue};
 
-// mod conventions;
-// use conventions::a;
+mod conventions;
+use conventions::*;
 
 mod handlers;
 use handlers::*;
@@ -54,10 +57,18 @@ pub mod weeb_3 {
     }
 }
 
+// use crate::weeb_3::etiquette_0;
+// use crate::weeb_3::etiquette_1;
+use crate::weeb_3::etiquette_2;
+// use crate::weeb_3::etiquette_3;
+// use crate::weeb_3::etiquette_4;
+// use crate::weeb_3::etiquette_5;
+// use crate::weeb_3::etiquette_6;
+
 const HANDSHAKE_PROTOCOL: StreamProtocol = StreamProtocol::new("/swarm/handshake/12.0.0/handshake");
 const PRICING_PROTOCOL: StreamProtocol = StreamProtocol::new("/swarm/pricing/1.0.0/pricing");
-
 const GOSSIP_PROTOCOL: StreamProtocol = StreamProtocol::new("/swarm/hive/1.1.0/peers");
+
 // const PSEUDOSETTLE_PROTOCOL: StreamProtocol = StreamProtocol::new("/swarm/pseudosettle/1.0.0/pseudosettle");
 // const PINGPONG_PROTOCOL: StreamProtocol = StreamProtocol::new("/swarm/pingpong/1.0.0/pingpong");
 // const STATUS_PROTOCOL: StreamProtocol = StreamProtocol::new("/swarm/status/1.1.1/status");
@@ -69,7 +80,7 @@ const GOSSIP_PROTOCOL: StreamProtocol = StreamProtocol::new("/swarm/hive/1.1.0/p
 
 #[wasm_bindgen]
 pub fn init_panic_hook() {
-    // console_error_panic_hook::set_once();
+    console_error_panic_hook::set_once();
 }
 
 #[wasm_bindgen]
@@ -109,7 +120,7 @@ pub async fn run(_argument: String) -> Result<(), JsError> {
         })
         .build();
 
-    let addr = "/ip4/192.168.1.42/tcp/31336/ws/p2p/QmYa9hasbJKBoTpfthcisMPKyGMCidfT1R4VkaRpg14bWP"
+    let addr = "/ip4/192.168.1.42/tcp/3634/ws/p2p/QmYa9hasbJKBoTpfthcisMPKyGMCidfT1R4VkaRpg14bWP"
         .parse::<Multiaddr>()
         .unwrap();
 
@@ -117,6 +128,8 @@ pub async fn run(_argument: String) -> Result<(), JsError> {
     swarm.dial(addr.clone()).unwrap();
 
     let mut ctrl = swarm.behaviour_mut().stream.new_control();
+
+    let mut ctrl3 = swarm.behaviour_mut().stream.new_control();
 
     let mut incoming_pricing_streams = swarm
         .behaviour_mut()
@@ -140,19 +153,49 @@ pub async fn run(_argument: String) -> Result<(), JsError> {
         }
     };
 
+    // let mut accountingPeers = HashMap::new();
+
+    let (peers_instructions_chan_outgoing, peers_instructions_chan_incoming) = mpsc::channel();
+    let (connections_instructions_chan_outgoing, connections_instructions_chan_incoming) =
+        mpsc::channel::<etiquette_2::BzzAddress>();
+
     let gossip_inbound_handle = async move {
         web_sys::console::log_1(&JsValue::from(format!("Opened Gossip handler 1")));
         while let Some((peer, stream)) = incoming_gossip_streams.next().await {
             web_sys::console::log_1(&JsValue::from(format!("Entered Gossip handler 1")));
-            gossip_handler(peer, stream).await.unwrap();
+            gossip_handler(peer, stream, &peers_instructions_chan_outgoing)
+                .await
+                .unwrap();
         }
     };
 
-    let conn_handle =
-        async { connection_handler(peer_id, &mut ctrl, &addr2.clone(), &secret_key).await };
+    let conn_handle = async {
+        connection_handler(peer_id, &mut ctrl, &addr2.clone(), &secret_key).await;
+    };
+
+    let conn_init_handle = async {};
 
     let event_handle = async {
         loop {
+            let that = connections_instructions_chan_incoming.try_recv();
+            if !that.is_err() {
+                let addr3 = libp2p::core::Multiaddr::try_from(that.unwrap().underlay).unwrap();
+                let id = try_from_multiaddr(&addr3);
+                web_sys::console::log_1(&JsValue::from(format!("Got Id {:#?}", id)));
+                if id.is_some() {
+                    connection_handler(id.expect("not"), &mut ctrl3, &addr3.clone(), &secret_key)
+                        .await;
+                }
+            }
+
+            let paddr = peers_instructions_chan_incoming.try_recv();
+            if !paddr.is_err() {
+                let addr =
+                    libp2p::core::Multiaddr::try_from(paddr.clone().unwrap().underlay).unwrap();
+                swarm.dial(addr).unwrap();
+                connections_instructions_chan_outgoing.send(paddr.unwrap());
+            };
+
             let event = swarm.next().await.unwrap();
             web_sys::console::log_1(&JsValue::from(format!(
                 "Current Event Handled {:#?}",
@@ -164,6 +207,7 @@ pub async fn run(_argument: String) -> Result<(), JsError> {
     join!(
         event_handle,
         conn_handle,
+        conn_init_handle,
         gossip_inbound_handle,
         pricing_inbound_handle,
     );

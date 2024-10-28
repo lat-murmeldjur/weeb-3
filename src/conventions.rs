@@ -1,15 +1,44 @@
 #![cfg(target_arch = "wasm32")]
 
+use std::io;
+
+use libp2p::{Multiaddr, PeerId};
+
+use libp2p::multiaddr::Protocol;
+use wasm_bindgen::{prelude::*, JsValue};
 use web_sys::{Document, HtmlElement};
 
 pub fn a() {}
+
+pub struct ConnectedPeers {}
+
+pub struct PeerFile {
+    peerId: PeerId,
+    overlay: [u8],
+}
+
+pub struct AccountingPeers {}
+
+pub struct PeerAccounting {
+    peerId: PeerId,
+    balance: u64,
+    threshold: u64,
+    refreshment: u64,
+}
+
+pub fn try_from_multiaddr(address: &Multiaddr) -> Option<PeerId> {
+    address.iter().last().and_then(|p| match p {
+        Protocol::P2p(hash) => PeerId::from_multihash(hash.into()).ok(),
+        _ => None,
+    })
+}
 
 pub struct Body {
     body: HtmlElement,
     document: Document,
 }
 
-pub impl Body {
+impl Body {
     fn from_current_window() -> Result<Self, JsError> {
         let document = web_sys::window()
             .ok_or(js_error("no global `window` exists"))?

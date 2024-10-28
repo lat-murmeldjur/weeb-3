@@ -9,6 +9,7 @@ use prost::Message;
 
 use std::io;
 use std::io::Cursor;
+use std::sync::mpsc;
 
 use libp2p::{
     futures::{AsyncReadExt, AsyncWriteExt},
@@ -45,7 +46,6 @@ pub async fn ceive(
     step_0.encode_length_delimited(&mut bufw_0).unwrap();
 
     stream.write_all(&bufw_0).await?;
-    stream.flush().await.unwrap();
 
     let mut buf_nondiscard_0 = Vec::new();
     let mut buf_discard_0: [u8; 255] = [0; 255];
@@ -108,7 +108,6 @@ pub async fn ceive(
     step_1.encode_length_delimited(&mut bufw_1).unwrap();
     stream.write_all(&bufw_1).await?;
 
-    stream.flush().await.unwrap();
     stream.close().await.unwrap();
 
     Ok(())
@@ -166,10 +165,14 @@ pub async fn pricing_handler(_peer: PeerId, mut stream: Stream) -> io::Result<()
     Ok(())
 }
 
-pub async fn gossip_handler(_peer: PeerId, mut stream: Stream) -> io::Result<()> {
-    web_sys::console::log_1(&JsValue::from(format!(
-        "Opened Pricing handle 2 for peer !",
-    )));
+pub async fn gossip_handler(
+    _peer: PeerId,
+    mut stream: Stream,
+    chan: &mpsc::Sender<etiquette_2::BzzAddress>,
+) -> io::Result<()> {
+    web_sys::console::log_1(&JsValue::from(
+        format!("Opened Gossip Handle 2 for peer !",),
+    ));
 
     let mut buf_nondiscard_0 = Vec::new();
     let mut buf_discard_0: [u8; 255] = [0; 255];
@@ -202,8 +205,15 @@ pub async fn gossip_handler(_peer: PeerId, mut stream: Stream) -> io::Result<()>
         }
     }
 
-    let _rec_0 =
+    let rec_0 =
         etiquette_2::Peers::decode_length_delimited(&mut Cursor::new(buf_nondiscard_0)).unwrap();
+
+    web_sys::console::log_1(&JsValue::from(format!("Got Peers Message {:#?}!", rec_0)));
+
+    for peer in rec_0.peers {
+        web_sys::console::log_1(&JsValue::from(format!("Got Peer {:#?}!", peer)));
+        chan.send(peer).unwrap();
+    }
 
     stream.flush().await?;
     stream.close().await?;
