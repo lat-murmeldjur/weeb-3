@@ -1,10 +1,10 @@
 #![cfg(target_arch = "wasm32")]
-#![allow(warnings)]
+// #![allow(warnings)]
 
 use anyhow::Result;
 use console_error_panic_hook;
 use futures::join;
-use num::bigint::BigInt;
+// use num::bigint::BigInt;
 use rand::rngs::OsRng;
 
 use std::collections::HashMap;
@@ -155,8 +155,8 @@ pub async fn run(_argument: String) -> Result<(), JsError> {
         }
     };
 
-    let mut connectedPeers: HashMap<PeerId, PeerFile> = HashMap::new();
-    let mut accountingPeers: HashMap<PeerId, PeerAccounting> = HashMap::new();
+    let mut connected_peers: HashMap<PeerId, PeerFile> = HashMap::new();
+    let mut accounting_peers: HashMap<PeerId, PeerAccounting> = HashMap::new();
 
     let (peers_instructions_chan_outgoing, peers_instructions_chan_incoming) = mpsc::channel();
     let (connections_instructions_chan_outgoing, connections_instructions_chan_incoming) =
@@ -174,8 +174,6 @@ pub async fn run(_argument: String) -> Result<(), JsError> {
         }
     };
 
-    let accounting_handle = async {};
-
     let conn_handle = async {
         connection_handler(
             peer_id,
@@ -186,8 +184,6 @@ pub async fn run(_argument: String) -> Result<(), JsError> {
         )
         .await;
     };
-
-    let conn_init_handle = async {};
 
     let event_handle = async {
         loop {
@@ -213,31 +209,39 @@ pub async fn run(_argument: String) -> Result<(), JsError> {
                 let addr =
                     libp2p::core::Multiaddr::try_from(paddr.clone().unwrap().underlay).unwrap();
                 swarm.dial(addr).unwrap();
-                connections_instructions_chan_outgoing.send(paddr.unwrap());
+                let _ = connections_instructions_chan_outgoing.send(paddr.unwrap());
             };
 
             let incoming_peer = accounting_peer_chan_incoming.try_recv();
             if !incoming_peer.is_err() {
                 // Accounting connect
-                let peerFile: PeerFile = incoming_peer.unwrap();
+                let peer_file: PeerFile = incoming_peer.unwrap();
                 web_sys::console::log_1(&JsValue::from(format!(
                     "Accounting Connecting Peer {:#?} {:#?}!",
-                    peerFile.overlay, peerFile.peerId
+                    peer_file.overlay, peer_file.peer_id
                 )));
-                connectedPeers.insert(peerFile.peerId, peerFile);
+                accounting_peers.insert(
+                    peer_file.peer_id,
+                    PeerAccounting {
+                        balance: 0,
+                        threshold: 0,
+                        refreshment: 0,
+                    },
+                );
+                connected_peers.insert(peer_file.peer_id, peer_file);
             };
 
             let event = swarm.next().await.unwrap();
             match event {
-                (SwarmEvent::ConnectionEstablished {
-                    peer_id,
-                    established_in,
+                SwarmEvent::ConnectionEstablished {
+                    // peer_id,
+                    // established_in,
                     ..
-                }) => {
+                } => {
                     //
                 }
-                (SwarmEvent::ConnectionClosed { peer_id, .. }) => {
-                    connectedPeers.remove(&peer_id);
+                SwarmEvent::ConnectionClosed { peer_id, .. } => {
+                    connected_peers.remove(&peer_id);
                 }
                 _ => {}
             }
@@ -251,10 +255,8 @@ pub async fn run(_argument: String) -> Result<(), JsError> {
     join!(
         event_handle,
         conn_handle,
-        conn_init_handle,
         gossip_inbound_handle,
         pricing_inbound_handle,
-        accounting_handle
     );
 
     web_sys::console::log_1(&JsValue::from(format!("Dropping All handlers")));
@@ -281,7 +283,7 @@ async fn connection_handler(
         }
     };
 
-    if let Err(e) = ceive(peer, &mut stream, &control, a.clone(), &pk.clone(), chan).await {
+    if let Err(e) = ceive(peer, &mut stream, a.clone(), &pk.clone(), chan).await {
         web_sys::console::log_1(&JsValue::from("Handshake protocol failed"));
         web_sys::console::log_1(&JsValue::from(format!("{}", e)));
         return;
@@ -296,9 +298,7 @@ async fn refresh_handler(
     peer: PeerId,
     amount: u64,
     control: &mut stream::Control,
-    a: &libp2p::core::Multiaddr,
-    pk: &ecdsa::SecretKey,
-    chan: &mpsc::Sender<PeerFile>,
+    _chan: &mpsc::Sender<PeerFile>,
 ) {
     let mut stream = match control.open_stream(peer, PSEUDOSETTLE_PROTOCOL).await {
         Ok(stream) => stream,
@@ -312,33 +312,19 @@ async fn refresh_handler(
         }
     };
 
-    if let Err(e) = fresh(
-        peer,
-        amount,
-        &mut stream,
-        &control,
-        a.clone(),
-        &pk.clone(),
-        chan,
-    )
-    .await
-    {
-        web_sys::console::log_1(&JsValue::from("Handshake protocol failed"));
+    if let Err(e) = fresh(peer, amount, &mut stream, _chan).await {
+        web_sys::console::log_1(&JsValue::from("Refresh protocol failed"));
         web_sys::console::log_1(&JsValue::from(format!("{}", e)));
         return;
     }
 
-    web_sys::console::log_1(&JsValue::from(format!("{} Handshake complete!", peer)));
-
-    web_sys::console::log_1(&JsValue::from(format!("Closing handler 1")));
+    web_sys::console::log_1(&JsValue::from(format!("Refresh complete for {}!", peer)));
 }
 
 async fn retrieve_handler(
     peer: PeerId,
     chunk_address: Vec<u8>,
     control: &mut stream::Control,
-    a: &libp2p::core::Multiaddr,
-    pk: &ecdsa::SecretKey,
     chan: &mpsc::Sender<PeerFile>,
 ) {
     let mut stream = match control.open_stream(peer, RETRIEVAL_PROTOCOL).await {
@@ -353,25 +339,13 @@ async fn retrieve_handler(
         }
     };
 
-    if let Err(e) = trieve(
-        peer,
-        chunk_address,
-        &mut stream,
-        &control,
-        a.clone(),
-        &pk.clone(),
-        chan,
-    )
-    .await
-    {
-        web_sys::console::log_1(&JsValue::from("Handshake protocol failed"));
+    if let Err(e) = trieve(peer, chunk_address, &mut stream, chan).await {
+        web_sys::console::log_1(&JsValue::from("Retrieve protocol failed"));
         web_sys::console::log_1(&JsValue::from(format!("{}", e)));
         return;
     }
 
-    web_sys::console::log_1(&JsValue::from(format!("{} Handshake complete!", peer)));
-
-    web_sys::console::log_1(&JsValue::from(format!("Closing handler 1")));
+    web_sys::console::log_1(&JsValue::from(format!("{} Retrieve complete!", peer)));
 }
 
 #[derive(NetworkBehaviour)]

@@ -1,4 +1,4 @@
-#![allow(warnings)]
+// #![allow(warnings)]
 #![cfg(target_arch = "wasm32")]
 
 use std::io;
@@ -6,25 +6,22 @@ use std::io;
 use libp2p::{Multiaddr, PeerId};
 
 use libp2p::multiaddr::Protocol;
-use wasm_bindgen::{prelude::*, JsValue};
+use wasm_bindgen::prelude::*;
 use web_sys::{Document, HtmlElement};
 
-pub fn a() {}
-
-pub struct ConnectedPeers {}
+// pub fn a() {}
 
 #[derive(Debug, Clone)]
 pub struct PeerFile {
-    pub peerId: PeerId,
+    pub peer_id: PeerId,
     pub overlay: Vec<u8>,
 }
 
-pub struct AccountingPeers {}
-
+#[derive(Debug)]
 pub struct PeerAccounting {
-    balance: u64,
-    threshold: u64,
-    refreshment: u64,
+    pub balance: u64,
+    pub threshold: u64,
+    pub refreshment: u64,
 }
 
 pub fn try_from_multiaddr(address: &Multiaddr) -> Option<PeerId> {

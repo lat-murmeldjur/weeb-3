@@ -1,4 +1,4 @@
-#![allow(warnings)]
+// #![allow(warnings)]
 
 use alloy::primitives::keccak256;
 use alloy::signers::local::PrivateKeySigner;
@@ -17,7 +17,6 @@ use libp2p::{
     identity::ecdsa,
     PeerId, Stream,
 };
-use libp2p_stream as stream;
 
 use wasm_bindgen::JsValue;
 
@@ -34,7 +33,6 @@ use crate::weeb_3::etiquette_6;
 pub async fn ceive(
     peer: PeerId,
     stream: &mut Stream,
-    _control: &stream::Control,
     a: libp2p::core::Multiaddr,
     pk: &ecdsa::SecretKey,
     chan: &mpsc::Sender<PeerFile>,
@@ -118,7 +116,7 @@ pub async fn ceive(
     web_sys::console::log_1(&JsValue::from(format!("Connected Peer {:#?}!", peer)));
 
     chan.send(PeerFile {
-        peerId: peer,
+        peer_id: peer,
         overlay: peer_overlay.clone(),
     })
     .unwrap();
@@ -240,10 +238,7 @@ pub async fn fresh(
     peer: PeerId,
     amount: u64,
     stream: &mut Stream,
-    _control: &stream::Control,
-    a: libp2p::core::Multiaddr,
-    pk: &ecdsa::SecretKey,
-    chan: &mpsc::Sender<PeerFile>,
+    _chan: &mpsc::Sender<PeerFile>,
 ) -> io::Result<()> {
     web_sys::console::log_1(&JsValue::from(format!(
         "Opened Refresh Handle 2 for peer !",
@@ -297,8 +292,8 @@ pub async fn fresh(
             .unwrap();
 
     web_sys::console::log_1(&JsValue::from(format!(
-        "Accepted Refresh {:#?}!",
-        rec_0.amount
+        "Accepted Refresh {:#?} from peer {:#?}!",
+        rec_0.amount, peer
     )));
 
     //    chan.send(PeerFile {
@@ -316,10 +311,7 @@ pub async fn trieve(
     peer: PeerId,
     chunk_address: Vec<u8>,
     stream: &mut Stream,
-    _control: &stream::Control,
-    a: libp2p::core::Multiaddr,
-    pk: &ecdsa::SecretKey,
-    chan: &mpsc::Sender<PeerFile>,
+    _chan: &mpsc::Sender<PeerFile>,
 ) -> io::Result<()> {
     web_sys::console::log_1(&JsValue::from(format!(
         "Opened Retrieve Handle 2 for peer !",
@@ -371,7 +363,10 @@ pub async fn trieve(
     let rec_0 =
         etiquette_6::Delivery::decode_length_delimited(&mut Cursor::new(buf_nondiscard_0)).unwrap();
 
-    web_sys::console::log_1(&JsValue::from(format!("Got chunk {:#?}!", rec_0.stamp)));
+    web_sys::console::log_1(&JsValue::from(format!(
+        "Got chunk {:#?} from peer {:#?}!",
+        rec_0.stamp, peer
+    )));
 
     //    chan.send(PeerFile {
     //        peerId: peer,
