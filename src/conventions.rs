@@ -1,3 +1,4 @@
+#![allow(warnings)]
 #![cfg(target_arch = "wasm32")]
 
 use std::io;
@@ -12,15 +13,15 @@ pub fn a() {}
 
 pub struct ConnectedPeers {}
 
+#[derive(Debug, Clone)]
 pub struct PeerFile {
-    peerId: PeerId,
-    overlay: [u8],
+    pub peerId: PeerId,
+    pub overlay: Vec<u8>,
 }
 
 pub struct AccountingPeers {}
 
 pub struct PeerAccounting {
-    peerId: PeerId,
     balance: u64,
     threshold: u64,
     refreshment: u64,

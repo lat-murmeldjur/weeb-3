@@ -1,5 +1,5 @@
 #![cfg(target_arch = "wasm32")]
-// #![allow(warnings)]
+#![allow(warnings)]
 
 use anyhow::Result;
 use console_error_panic_hook;
@@ -20,7 +20,7 @@ use libp2p::{
     identify, identity,
     identity::ecdsa,
     noise, ping,
-    swarm::NetworkBehaviour,
+    swarm::{NetworkBehaviour, SwarmEvent},
     websocket_websys, yamux, PeerId, StreamProtocol,
 };
 use libp2p_stream as stream;
@@ -120,7 +120,7 @@ pub async fn run(_argument: String) -> Result<(), JsError> {
         })
         .build();
 
-    let addr = "/ip4/192.168.1.42/tcp/3634/ws/p2p/QmYa9hasbJKBoTpfthcisMPKyGMCidfT1R4VkaRpg14bWP"
+    let addr = "/ip4/192.168.1.42/tcp/11634/ws/p2p/QmYa9hasbJKBoTpfthcisMPKyGMCidfT1R4VkaRpg14bWP"
         .parse::<Multiaddr>()
         .unwrap();
 
@@ -153,11 +153,14 @@ pub async fn run(_argument: String) -> Result<(), JsError> {
         }
     };
 
-    // let mut accountingPeers = HashMap::new();
+    let mut connectedPeers: HashMap<PeerId, PeerFile> = HashMap::new();
+    let mut accountingPeers: HashMap<PeerId, PeerAccounting> = HashMap::new();
 
     let (peers_instructions_chan_outgoing, peers_instructions_chan_incoming) = mpsc::channel();
     let (connections_instructions_chan_outgoing, connections_instructions_chan_incoming) =
         mpsc::channel::<etiquette_2::BzzAddress>();
+
+    let (accounting_peer_chan_outgoing, accounting_peer_chan_incoming) = mpsc::channel();
 
     let gossip_inbound_handle = async move {
         web_sys::console::log_1(&JsValue::from(format!("Opened Gossip handler 1")));
@@ -169,8 +172,17 @@ pub async fn run(_argument: String) -> Result<(), JsError> {
         }
     };
 
+    let accounting_handle = async {};
+
     let conn_handle = async {
-        connection_handler(peer_id, &mut ctrl, &addr2.clone(), &secret_key).await;
+        connection_handler(
+            peer_id,
+            &mut ctrl,
+            &addr2.clone(),
+            &secret_key,
+            &accounting_peer_chan_outgoing,
+        )
+        .await;
     };
 
     let conn_init_handle = async {};
@@ -183,8 +195,14 @@ pub async fn run(_argument: String) -> Result<(), JsError> {
                 let id = try_from_multiaddr(&addr3);
                 web_sys::console::log_1(&JsValue::from(format!("Got Id {:#?}", id)));
                 if id.is_some() {
-                    connection_handler(id.expect("not"), &mut ctrl3, &addr3.clone(), &secret_key)
-                        .await;
+                    connection_handler(
+                        id.expect("not"),
+                        &mut ctrl3,
+                        &addr3.clone(),
+                        &secret_key,
+                        &accounting_peer_chan_outgoing,
+                    )
+                    .await;
                 }
             }
 
@@ -196,7 +214,31 @@ pub async fn run(_argument: String) -> Result<(), JsError> {
                 connections_instructions_chan_outgoing.send(paddr.unwrap());
             };
 
+            let incoming_peer = accounting_peer_chan_incoming.try_recv();
+            if !incoming_peer.is_err() {
+                // Accounting connect
+                let peerFile: PeerFile = incoming_peer.unwrap();
+                web_sys::console::log_1(&JsValue::from(format!(
+                    "Accounting Connecting Peer {:#?} {:#?}!",
+                    peerFile.overlay, peerFile.peerId
+                )));
+                connectedPeers.insert(peerFile.peerId, peerFile);
+            };
+
             let event = swarm.next().await.unwrap();
+            match event {
+                (SwarmEvent::ConnectionEstablished {
+                    peer_id,
+                    established_in,
+                    ..
+                }) => {
+                    //
+                }
+                (SwarmEvent::ConnectionClosed { peer_id, .. }) => {
+                    connectedPeers.remove(&peer_id);
+                }
+                _ => {}
+            }
             web_sys::console::log_1(&JsValue::from(format!(
                 "Current Event Handled {:#?}",
                 event
@@ -210,6 +252,7 @@ pub async fn run(_argument: String) -> Result<(), JsError> {
         conn_init_handle,
         gossip_inbound_handle,
         pricing_inbound_handle,
+        accounting_handle
     );
 
     web_sys::console::log_1(&JsValue::from(format!("Dropping All handlers")));
@@ -222,6 +265,7 @@ async fn connection_handler(
     control: &mut stream::Control,
     a: &libp2p::core::Multiaddr,
     pk: &ecdsa::SecretKey,
+    chan: &mpsc::Sender<PeerFile>,
 ) {
     let mut stream = match control.open_stream(peer, HANDSHAKE_PROTOCOL).await {
         Ok(stream) => stream,
@@ -235,7 +279,7 @@ async fn connection_handler(
         }
     };
 
-    if let Err(e) = ceive(&mut stream, &control, a.clone(), &pk.clone()).await {
+    if let Err(e) = ceive(peer, &mut stream, &control, a.clone(), &pk.clone(), chan).await {
         web_sys::console::log_1(&JsValue::from("Handshake protocol failed"));
         web_sys::console::log_1(&JsValue::from(format!("{}", e)));
         return;
@@ -265,13 +309,13 @@ impl Behaviour {
             ),
             autonat_s: autonat::v2::server::Behaviour::new(OsRng),
             dcutr: dcutr::Behaviour::new(local_public_key.to_peer_id()),
-            stream: stream::Behaviour::new(),
             identify: identify::Behaviour::new(
                 identify::Config::new("/weeb-3".into(), local_public_key.clone())
                     .with_push_listen_addr_updates(true)
                     .with_interval(Duration::from_secs(60)), // .with_cache_size(10), //
             ),
             ping: ping::Behaviour::new(ping::Config::new()),
+            stream: stream::Behaviour::new(),
         }
     }
 }

@@ -1,4 +1,4 @@
-// #![allow(warnings)]
+#![allow(warnings)]
 
 use alloy::primitives::keccak256;
 use alloy::signers::local::PrivateKeySigner;
@@ -20,6 +20,8 @@ use libp2p_stream as stream;
 
 use wasm_bindgen::JsValue;
 
+use crate::conventions::*;
+
 use crate::weeb_3::etiquette_0;
 use crate::weeb_3::etiquette_1;
 use crate::weeb_3::etiquette_2;
@@ -29,10 +31,12 @@ use crate::weeb_3::etiquette_4;
 // use crate::weeb_3::etiquette_6;
 
 pub async fn ceive(
+    peer: PeerId,
     stream: &mut Stream,
     _control: &stream::Control,
     a: libp2p::core::Multiaddr,
     pk: &ecdsa::SecretKey,
+    chan: &mpsc::Sender<PeerFile>,
 ) -> io::Result<()> {
     let mut step_0 = etiquette_1::Syn::default();
 
@@ -61,6 +65,8 @@ pub async fn ceive(
         etiquette_1::SynAck::decode_length_delimited(&mut Cursor::new(buf_nondiscard_0)).unwrap();
 
     let underlay = libp2p::core::Multiaddr::try_from(rec_0.syn.unwrap().observed_underlay).unwrap();
+
+    let peer_overlay = rec_0.ack.unwrap().address.unwrap().overlay;
 
     web_sys::console::log_1(&JsValue::from(format!("Got underlay {}!", underlay)));
 
@@ -107,6 +113,14 @@ pub async fn ceive(
     bufw_1.reserve(step_1_len + prost::length_delimiter_len(step_1_len));
     step_1.encode_length_delimited(&mut bufw_1).unwrap();
     stream.write_all(&bufw_1).await?;
+
+    web_sys::console::log_1(&JsValue::from(format!("Connected Peer {:#?}!", peer)));
+
+    chan.send(PeerFile {
+        peerId: peer,
+        overlay: peer_overlay.clone(),
+    })
+    .unwrap();
 
     stream.close().await.unwrap();
 
