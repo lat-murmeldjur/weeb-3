@@ -5,6 +5,7 @@ use alloy::signers::local::PrivateKeySigner;
 use alloy::signers::Signer;
 
 use byteorder::ByteOrder;
+use num::BigUint;
 use prost::Message;
 
 use std::io;
@@ -27,8 +28,8 @@ use crate::weeb_3::etiquette_1;
 use crate::weeb_3::etiquette_2;
 // use crate::weeb_3::etiquette_3;
 use crate::weeb_3::etiquette_4;
-// use crate::weeb_3::etiquette_5;
-// use crate::weeb_3::etiquette_6;
+use crate::weeb_3::etiquette_5;
+use crate::weeb_3::etiquette_6;
 
 pub async fn ceive(
     peer: PeerId,
@@ -231,6 +232,154 @@ pub async fn gossip_handler(
 
     stream.flush().await?;
     stream.close().await?;
+
+    Ok(())
+}
+
+pub async fn fresh(
+    peer: PeerId,
+    amount: u64,
+    stream: &mut Stream,
+    _control: &stream::Control,
+    a: libp2p::core::Multiaddr,
+    pk: &ecdsa::SecretKey,
+    chan: &mpsc::Sender<PeerFile>,
+) -> io::Result<()> {
+    web_sys::console::log_1(&JsValue::from(format!(
+        "Opened Refresh Handle 2 for peer !",
+    )));
+
+    let empty = etiquette_0::Headers::default();
+
+    let mut buf_empty = Vec::new();
+
+    let empty_len = empty.encoded_len();
+    buf_empty.reserve(empty_len + prost::length_delimiter_len(empty_len));
+    empty.encode_length_delimited(&mut buf_empty).unwrap();
+
+    stream.write_all(&buf_empty).await?;
+    stream.flush().await.unwrap();
+
+    let mut buf_nondiscard_0 = Vec::new();
+    let mut buf_discard_0: [u8; 255] = [0; 255];
+    loop {
+        let n = stream.read(&mut buf_discard_0).await?;
+        buf_nondiscard_0.extend_from_slice(&buf_discard_0[..n]);
+        if n < 255 {
+            break;
+        }
+    }
+
+    let mut step_1 = etiquette_5::Payment::default();
+
+    step_1.amount = BigUint::from(amount).to_bytes_be();
+
+    let mut bufw_1 = Vec::new();
+
+    let step_1_len = step_1.encoded_len();
+
+    bufw_1.reserve(step_1_len + prost::length_delimiter_len(step_1_len));
+    step_1.encode_length_delimited(&mut bufw_1).unwrap();
+    stream.write_all(&bufw_1).await?;
+
+    let mut buf_nondiscard_0 = Vec::new();
+    let mut buf_discard_0: [u8; 255] = [0; 255];
+    loop {
+        let n = stream.read(&mut buf_discard_0).await?;
+        buf_nondiscard_0.extend_from_slice(&buf_discard_0[..n]);
+        if n < 255 {
+            break;
+        }
+    }
+
+    let rec_0 =
+        etiquette_5::PaymentAck::decode_length_delimited(&mut Cursor::new(buf_nondiscard_0))
+            .unwrap();
+
+    web_sys::console::log_1(&JsValue::from(format!(
+        "Accepted Refresh {:#?}!",
+        rec_0.amount
+    )));
+
+    //    chan.send(PeerFile {
+    //        peerId: peer,
+    //        overlay: peer_overlay.clone(),
+    //    })
+    //    .unwrap();
+
+    stream.close().await.unwrap();
+
+    Ok(())
+}
+
+pub async fn trieve(
+    peer: PeerId,
+    chunk_address: Vec<u8>,
+    stream: &mut Stream,
+    _control: &stream::Control,
+    a: libp2p::core::Multiaddr,
+    pk: &ecdsa::SecretKey,
+    chan: &mpsc::Sender<PeerFile>,
+) -> io::Result<()> {
+    web_sys::console::log_1(&JsValue::from(format!(
+        "Opened Retrieve Handle 2 for peer !",
+    )));
+
+    let empty = etiquette_0::Headers::default();
+
+    let mut buf_empty = Vec::new();
+
+    let empty_len = empty.encoded_len();
+    buf_empty.reserve(empty_len + prost::length_delimiter_len(empty_len));
+    empty.encode_length_delimited(&mut buf_empty).unwrap();
+
+    stream.write_all(&buf_empty).await?;
+    stream.flush().await.unwrap();
+
+    let mut buf_nondiscard_0 = Vec::new();
+    let mut buf_discard_0: [u8; 255] = [0; 255];
+    loop {
+        let n = stream.read(&mut buf_discard_0).await?;
+        buf_nondiscard_0.extend_from_slice(&buf_discard_0[..n]);
+        if n < 255 {
+            break;
+        }
+    }
+
+    let mut step_1 = etiquette_6::Request::default();
+
+    step_1.addr = chunk_address;
+
+    let mut bufw_1 = Vec::new();
+
+    let step_1_len = step_1.encoded_len();
+
+    bufw_1.reserve(step_1_len + prost::length_delimiter_len(step_1_len));
+    step_1.encode_length_delimited(&mut bufw_1).unwrap();
+    stream.write_all(&bufw_1).await?;
+
+    let mut buf_nondiscard_0 = Vec::new();
+    let mut buf_discard_0: [u8; 255] = [0; 255];
+    loop {
+        let n = stream.read(&mut buf_discard_0).await?;
+        buf_nondiscard_0.extend_from_slice(&buf_discard_0[..n]);
+        if n < 255 {
+            break;
+        }
+    }
+
+    let rec_0 =
+        etiquette_6::Delivery::decode_length_delimited(&mut Cursor::new(buf_nondiscard_0)).unwrap();
+
+    web_sys::console::log_1(&JsValue::from(format!("Got chunk {:#?}!", rec_0.stamp)));
+
+    //    chan.send(PeerFile {
+    //        peerId: peer,
+    //        overlay: peer_overlay.clone(),
+    //    })
+    //    .unwrap();
+
+    stream.close().await.unwrap();
 
     Ok(())
 }

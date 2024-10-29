@@ -4,6 +4,7 @@
 use anyhow::Result;
 use console_error_panic_hook;
 use futures::join;
+use num::bigint::BigInt;
 use rand::rngs::OsRng;
 
 use std::collections::HashMap;
@@ -68,15 +69,16 @@ use crate::weeb_3::etiquette_2;
 const HANDSHAKE_PROTOCOL: StreamProtocol = StreamProtocol::new("/swarm/handshake/12.0.0/handshake");
 const PRICING_PROTOCOL: StreamProtocol = StreamProtocol::new("/swarm/pricing/1.0.0/pricing");
 const GOSSIP_PROTOCOL: StreamProtocol = StreamProtocol::new("/swarm/hive/1.1.0/peers");
+const PSEUDOSETTLE_PROTOCOL: StreamProtocol =
+    StreamProtocol::new("/swarm/pseudosettle/1.0.0/pseudosettle");
+const RETRIEVAL_PROTOCOL: StreamProtocol = StreamProtocol::new("/swarm/retrieval/1.4.0/retrieval");
 
-// const PSEUDOSETTLE_PROTOCOL: StreamProtocol = StreamProtocol::new("/swarm/pseudosettle/1.0.0/pseudosettle");
 // const PINGPONG_PROTOCOL: StreamProtocol = StreamProtocol::new("/swarm/pingpong/1.0.0/pingpong");
 // const STATUS_PROTOCOL: StreamProtocol = StreamProtocol::new("/swarm/status/1.1.1/status");
 //
 // const PULL_CURSORS_PROTOCOL: StreamProtocol = StreamProtocol::new("/swarm/pullsync/1.4.0/cursors");
 // const PULL_PROTOCOL: StreamProtocol = StreamProtocol::new("/swarm/pullsync/1.4.0/pullsync");
 // const PUSH_PROTOCOL: StreamProtocol = StreamProtocol::new("/swarm/pushsync/1.3.0/pushsync");
-// const RETRIEVAL_PROTOCOL: StreamProtocol = StreamProtocol::new("/swarm/retrieval/1.4.0/retrieval");
 
 #[wasm_bindgen]
 pub fn init_panic_hook() {
@@ -280,6 +282,88 @@ async fn connection_handler(
     };
 
     if let Err(e) = ceive(peer, &mut stream, &control, a.clone(), &pk.clone(), chan).await {
+        web_sys::console::log_1(&JsValue::from("Handshake protocol failed"));
+        web_sys::console::log_1(&JsValue::from(format!("{}", e)));
+        return;
+    }
+
+    web_sys::console::log_1(&JsValue::from(format!("{} Handshake complete!", peer)));
+
+    web_sys::console::log_1(&JsValue::from(format!("Closing handler 1")));
+}
+
+async fn refresh_handler(
+    peer: PeerId,
+    amount: u64,
+    control: &mut stream::Control,
+    a: &libp2p::core::Multiaddr,
+    pk: &ecdsa::SecretKey,
+    chan: &mpsc::Sender<PeerFile>,
+) {
+    let mut stream = match control.open_stream(peer, PSEUDOSETTLE_PROTOCOL).await {
+        Ok(stream) => stream,
+        Err(error @ stream::OpenStreamError::UnsupportedProtocol(_)) => {
+            web_sys::console::log_1(&JsValue::from(format!("{} {}", peer, error)));
+            return;
+        }
+        Err(error) => {
+            web_sys::console::log_1(&JsValue::from(format!("{} {}", peer, error)));
+            return;
+        }
+    };
+
+    if let Err(e) = fresh(
+        peer,
+        amount,
+        &mut stream,
+        &control,
+        a.clone(),
+        &pk.clone(),
+        chan,
+    )
+    .await
+    {
+        web_sys::console::log_1(&JsValue::from("Handshake protocol failed"));
+        web_sys::console::log_1(&JsValue::from(format!("{}", e)));
+        return;
+    }
+
+    web_sys::console::log_1(&JsValue::from(format!("{} Handshake complete!", peer)));
+
+    web_sys::console::log_1(&JsValue::from(format!("Closing handler 1")));
+}
+
+async fn retrieve_handler(
+    peer: PeerId,
+    chunk_address: Vec<u8>,
+    control: &mut stream::Control,
+    a: &libp2p::core::Multiaddr,
+    pk: &ecdsa::SecretKey,
+    chan: &mpsc::Sender<PeerFile>,
+) {
+    let mut stream = match control.open_stream(peer, RETRIEVAL_PROTOCOL).await {
+        Ok(stream) => stream,
+        Err(error @ stream::OpenStreamError::UnsupportedProtocol(_)) => {
+            web_sys::console::log_1(&JsValue::from(format!("{} {}", peer, error)));
+            return;
+        }
+        Err(error) => {
+            web_sys::console::log_1(&JsValue::from(format!("{} {}", peer, error)));
+            return;
+        }
+    };
+
+    if let Err(e) = trieve(
+        peer,
+        chunk_address,
+        &mut stream,
+        &control,
+        a.clone(),
+        &pk.clone(),
+        chan,
+    )
+    .await
+    {
         web_sys::console::log_1(&JsValue::from("Handshake protocol failed"));
         web_sys::console::log_1(&JsValue::from(format!("{}", e)));
         return;

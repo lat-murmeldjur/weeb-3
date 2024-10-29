@@ -48,6 +48,7 @@ libp2p = { git = "https://github.com/libp2p/rust-libp2p.git", features = [ "dcut
 libp2p-stream = { git = "https://github.com/libp2p/rust-libp2p.git" }
 tracing-wasm = { git = "https://github.com/old-storyai/tracing-wasm.git" }
 # serde = { git = "https://github.com/serde-rs/serde.git", features = ["derive"] }
+num = { git = "https://github.com/rust-num/num.git" }
 wasm-bindgen = "0.2.90"
 wasm-bindgen-futures = "0.4.42"
 web-sys = { version = "0.3.71", features = [
