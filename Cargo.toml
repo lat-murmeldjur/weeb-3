@@ -58,11 +58,11 @@ libp2p = { git = "https://github.com/libp2p/rust-libp2p.git", features = [
 "yamux" 
 ] }
 libp2p-stream = { git = "https://github.com/libp2p/rust-libp2p.git" }
-tracing-wasm = { git = "https://github.com/old-storyai/tracing-wasm.git" }
 # serde = { git = "https://github.com/serde-rs/serde.git", features = ["derive"] }
 wasm-bindgen = "0.2.90"
 wasm-bindgen-futures = "0.4.42"
-web-sys = { version = "0.3.71", features = [
+js-sys = { version = "0.3.72" }
+web-sys = { version = "0.3.72", features = [
   'console',
   'Document',
   'Element',
@@ -75,6 +75,7 @@ web-sys = { version = "0.3.71", features = [
   'Window',
   'Worker',
 ] }
+tracing-wasm = { git = "https://github.com/old-storyai/tracing-wasm.git" }
 alloy = { git = "https://github.com/alloy-rs/alloy.git", features = [
     "k256",
     "network",

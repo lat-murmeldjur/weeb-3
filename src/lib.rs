@@ -32,6 +32,9 @@ use wasm_bindgen::{prelude::*, JsValue};
 mod conventions;
 use conventions::*;
 
+mod accounting;
+use accounting::*;
+
 mod handlers;
 use handlers::*;
 
@@ -228,7 +231,8 @@ pub async fn run(_argument: String) -> Result<(), JsError> {
                         Mutex::new(PeerAccounting {
                             balance: 0,
                             threshold: 0,
-                            refreshment: 0,
+                            reserve: 0,
+                            refreshment: 0.0,
                         }),
                     );
                 }

@@ -21,7 +21,8 @@ pub struct PeerFile {
 pub struct PeerAccounting {
     pub balance: u64,
     pub threshold: u64,
-    pub refreshment: u64,
+    pub reserve: u64,
+    pub refreshment: f64,
 }
 
 pub fn try_from_multiaddr(address: &Multiaddr) -> Option<PeerId> {
