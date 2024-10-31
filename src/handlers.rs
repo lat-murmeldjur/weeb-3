@@ -67,7 +67,7 @@ pub async fn ceive(
 
     let peer_overlay = rec_0.ack.unwrap().address.unwrap().overlay;
 
-    web_sys::console::log_1(&JsValue::from(format!("Got underlay {}!", underlay)));
+    // web_sys::console::log_1(&JsValue::from(format!("Got underlay {}!", underlay)));
 
     let mut step_1 = etiquette_1::Ack::default();
 
@@ -221,10 +221,10 @@ pub async fn gossip_handler(
     let rec_0 =
         etiquette_2::Peers::decode_length_delimited(&mut Cursor::new(buf_nondiscard_0)).unwrap();
 
-    web_sys::console::log_1(&JsValue::from(format!("Got Peers Message {:#?}!", rec_0)));
+    // web_sys::console::log_1(&JsValue::from(format!("Got Peers Message {:#?}!", rec_0)));
 
     for peer in rec_0.peers {
-        web_sys::console::log_1(&JsValue::from(format!("Got Peer {:#?}!", peer)));
+        // web_sys::console::log_1(&JsValue::from(format!("Got Peer {:#?}!", peer)));
         chan.send(peer).unwrap();
     }
 

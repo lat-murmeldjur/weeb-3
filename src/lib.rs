@@ -4,13 +4,14 @@
 use anyhow::Result;
 use console_error_panic_hook;
 use futures::join;
-// use num::bigint::BigInt;
 use rand::rngs::OsRng;
+// use num::bigint::BigInt;
 
 use std::collections::HashMap;
 use std::num::NonZero;
 use std::str::FromStr;
 use std::sync::mpsc;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use libp2p::{
@@ -122,6 +123,16 @@ pub async fn run(_argument: String) -> Result<(), JsError> {
         })
         .build();
 
+    let mut connected_peers: HashMap<PeerId, PeerFile> = HashMap::new();
+    let mut overlay_peers: HashMap<String, PeerId> = HashMap::new();
+    let mut accounting_peers: HashMap<PeerId, Mutex<PeerAccounting>> = HashMap::new();
+
+    let (peers_instructions_chan_outgoing, peers_instructions_chan_incoming) = mpsc::channel();
+    let (connections_instructions_chan_outgoing, connections_instructions_chan_incoming) =
+        mpsc::channel::<etiquette_2::BzzAddress>();
+
+    let (accounting_peer_chan_outgoing, accounting_peer_chan_incoming) = mpsc::channel();
+
     let addr = "/ip4/192.168.1.42/tcp/11634/ws/p2p/QmYa9hasbJKBoTpfthcisMPKyGMCidfT1R4VkaRpg14bWP"
         .parse::<Multiaddr>()
         .unwrap();
@@ -130,7 +141,6 @@ pub async fn run(_argument: String) -> Result<(), JsError> {
     swarm.dial(addr.clone()).unwrap();
 
     let mut ctrl = swarm.behaviour_mut().stream.new_control();
-
     let mut ctrl3 = swarm.behaviour_mut().stream.new_control();
 
     let mut incoming_pricing_streams = swarm
@@ -154,15 +164,6 @@ pub async fn run(_argument: String) -> Result<(), JsError> {
             pricing_handler(peer, stream).await.unwrap();
         }
     };
-
-    let mut connected_peers: HashMap<PeerId, PeerFile> = HashMap::new();
-    let mut accounting_peers: HashMap<PeerId, PeerAccounting> = HashMap::new();
-
-    let (peers_instructions_chan_outgoing, peers_instructions_chan_incoming) = mpsc::channel();
-    let (connections_instructions_chan_outgoing, connections_instructions_chan_incoming) =
-        mpsc::channel::<etiquette_2::BzzAddress>();
-
-    let (accounting_peer_chan_outgoing, accounting_peer_chan_incoming) = mpsc::channel();
 
     let gossip_inbound_handle = async move {
         web_sys::console::log_1(&JsValue::from(format!("Opened Gossip handler 1")));
@@ -216,18 +217,22 @@ pub async fn run(_argument: String) -> Result<(), JsError> {
             if !incoming_peer.is_err() {
                 // Accounting connect
                 let peer_file: PeerFile = incoming_peer.unwrap();
-                web_sys::console::log_1(&JsValue::from(format!(
-                    "Accounting Connecting Peer {:#?} {:#?}!",
-                    peer_file.overlay, peer_file.peer_id
-                )));
-                accounting_peers.insert(
-                    peer_file.peer_id,
-                    PeerAccounting {
-                        balance: 0,
-                        threshold: 0,
-                        refreshment: 0,
-                    },
-                );
+                let ol = hex::encode(peer_file.overlay.clone());
+                if !accounting_peers.contains_key(&peer_file.peer_id) {
+                    web_sys::console::log_1(&JsValue::from(format!(
+                        "Accounting Connecting Peer {:#?} {:#?}!",
+                        ol, peer_file.peer_id
+                    )));
+                    accounting_peers.insert(
+                        peer_file.peer_id,
+                        Mutex::new(PeerAccounting {
+                            balance: 0,
+                            threshold: 0,
+                            refreshment: 0,
+                        }),
+                    );
+                }
+                overlay_peers.insert(ol, peer_file.peer_id);
                 connected_peers.insert(peer_file.peer_id, peer_file);
             };
 
@@ -241,7 +246,9 @@ pub async fn run(_argument: String) -> Result<(), JsError> {
                     //
                 }
                 SwarmEvent::ConnectionClosed { peer_id, .. } => {
+                    overlay_peers.remove(&hex::encode(connected_peers.get(&peer_id).unwrap().overlay.clone()));
                     connected_peers.remove(&peer_id);
+                    accounting_peers.remove(&peer_id);
                 }
                 _ => {}
             }

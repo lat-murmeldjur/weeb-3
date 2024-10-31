@@ -44,11 +44,22 @@ libp2p-tcp = { git = "https://github.com/libp2p/rust-libp2p.git",  features = ["
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 console_error_panic_hook = { git = "https://github.com/rustwasm/console_error_panic_hook.git" }
-libp2p = { git = "https://github.com/libp2p/rust-libp2p.git", features = [ "dcutr", "ecdsa", "secp256k1", "autonat", "noise", "yamux", "identify", "macros", "ping", "wasm-bindgen", "websocket-websys"] }
+libp2p = { git = "https://github.com/libp2p/rust-libp2p.git", features = [ 
+"autonat", 
+"dcutr", 
+"ecdsa", 
+"identify", 
+"macros", 
+"noise", 
+"ping",
+"secp256k1", 
+"wasm-bindgen", 
+"websocket-websys",
+"yamux" 
+] }
 libp2p-stream = { git = "https://github.com/libp2p/rust-libp2p.git" }
 tracing-wasm = { git = "https://github.com/old-storyai/tracing-wasm.git" }
 # serde = { git = "https://github.com/serde-rs/serde.git", features = ["derive"] }
-num = { git = "https://github.com/rust-num/num.git" }
 wasm-bindgen = "0.2.90"
 wasm-bindgen-futures = "0.4.42"
 web-sys = { version = "0.3.71", features = [
@@ -70,3 +81,5 @@ alloy = { git = "https://github.com/alloy-rs/alloy.git", features = [
     "signer-local",
 ] }
 byteorder = { git = "https://github.com/BurntSushi/byteorder" }
+num = { git = "https://github.com/rust-num/num.git" }
+hex = { git = "https://github.com/KokaKiwi/rust-hex.git" }
