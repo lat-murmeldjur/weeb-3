@@ -12,12 +12,18 @@ use js_sys::Date;
 
 use crate::conventions::PeerAccounting;
 
-const refreshRate: u64 = 1000000;
+const refreshRate: u64 = 320000;
 
-pub fn reserve(a: Mutex<PeerAccounting>, amount: u64, chan: &mpsc::Sender<(PeerId, u64)>) -> bool {
+pub fn set_payment_threshold(a: &Mutex<PeerAccounting>, amount: u64) {
+    let mut account = a.lock().unwrap();
+    account.threshold = amount;
+}
+
+pub fn reserve(a: &Mutex<PeerAccounting>, amount: u64, chan: &mpsc::Sender<(PeerId, u64)>) -> bool {
     let mut account = a.lock().unwrap();
     if account.balance > refreshRate && account.refreshment + 1000.0 < Date::now() {
         // start refreshing
+        account.refreshment = Date::now();
         chan.send((account.id.clone(), account.threshold));
     }
     if account.reserve + account.balance + amount < account.threshold {
@@ -27,7 +33,7 @@ pub fn reserve(a: Mutex<PeerAccounting>, amount: u64, chan: &mpsc::Sender<(PeerI
     return false;
 }
 
-pub fn apply_credit(a: Mutex<PeerAccounting>, amount: u64) {
+pub fn apply_credit(a: &Mutex<PeerAccounting>, amount: u64) {
     let mut account = a.lock().unwrap();
     account.balance += amount;
     if account.reserve > amount {
@@ -46,7 +52,7 @@ pub fn apply_refreshment(a: &Mutex<PeerAccounting>, amount: u64) {
     account.balance = 0;
 }
 
-pub fn cancel_reserve(a: Mutex<PeerAccounting>, amount: u64) {
+pub fn cancel_reserve(a: &Mutex<PeerAccounting>, amount: u64) {
     let mut account = a.lock().unwrap();
     if account.reserve > amount {
         account.reserve -= amount;

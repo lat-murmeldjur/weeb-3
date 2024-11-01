@@ -5,7 +5,7 @@ use alloy::signers::local::PrivateKeySigner;
 use alloy::signers::Signer;
 
 use byteorder::ByteOrder;
-use num::BigUint;
+use num::{BigUint, ToPrimitive};
 use prost::Message;
 
 use std::io;
@@ -126,7 +126,11 @@ pub async fn ceive(
     Ok(())
 }
 
-pub async fn pricing_handler(_peer: PeerId, mut stream: Stream) -> io::Result<()> {
+pub async fn pricing_handler(
+    peer: PeerId,
+    mut stream: Stream,
+    chan: &mpsc::Sender<(PeerId, u64)>,
+) -> io::Result<()> {
     web_sys::console::log_1(&JsValue::from(format!(
         "Opened Pricing handle 2 for peer !",
     )));
@@ -171,6 +175,12 @@ pub async fn pricing_handler(_peer: PeerId, mut stream: Stream) -> io::Result<()
         "Got AnnouncePaymentThreshold {:#?}!",
         rec_0
     )));
+
+    let pt = BigUint::from_bytes_be(&rec_0.payment_threshold)
+        .to_u64()
+        .unwrap();
+
+    chan.send((peer, pt));
 
     stream.flush().await.unwrap();
     stream.close().await?;
@@ -241,7 +251,8 @@ pub async fn fresh(
     chan: &mpsc::Sender<(PeerId, u64)>,
 ) -> io::Result<()> {
     web_sys::console::log_1(&JsValue::from(format!(
-        "Opened Refresh Handle 2 for peer !",
+        "Opened Refresh Handle 2 for peer ! {}",
+        amount
     )));
 
     let empty = etiquette_0::Headers::default();
@@ -291,13 +302,15 @@ pub async fn fresh(
         etiquette_5::PaymentAck::decode_length_delimited(&mut Cursor::new(buf_nondiscard_0))
             .unwrap();
 
+    let refr_am = BigUint::from_bytes_be(&rec_0.amount).to_u64().unwrap();
+
     web_sys::console::log_1(&JsValue::from(format!(
         "Accepted Refresh {:#?} from peer {:#?}!",
-        rec_0.amount, peer
+        refr_am, peer
     )));
 
     if amount > 0 {
-        chan.send((peer, amount)).unwrap();
+        chan.send((peer, refr_am)).unwrap();
     }
 
     stream.close().await.unwrap();
@@ -309,7 +322,7 @@ pub async fn trieve(
     peer: PeerId,
     chunk_address: Vec<u8>,
     stream: &mut Stream,
-    _chan: &mpsc::Sender<PeerFile>,
+    chan: &mpsc::Sender<Vec<u8>>,
 ) -> io::Result<()> {
     web_sys::console::log_1(&JsValue::from(format!(
         "Opened Retrieve Handle 2 for peer !",
@@ -366,11 +379,7 @@ pub async fn trieve(
         rec_0.stamp, peer
     )));
 
-    //    chan.send(PeerFile {
-    //        peerId: peer,
-    //        overlay: peer_overlay.clone(),
-    //    })
-    //    .unwrap();
+    chan.send(rec_0.data).unwrap();
 
     stream.close().await.unwrap();
 

@@ -28,6 +28,7 @@ use libp2p::{
 };
 use libp2p_stream as stream;
 
+use js_sys::Date;
 use wasm_bindgen::{prelude::*, JsValue};
 
 mod conventions;
@@ -137,6 +138,9 @@ pub async fn run(_argument: String) -> Result<(), JsError> {
         mpsc::channel::<etiquette_2::BzzAddress>();
 
     let (accounting_peer_chan_outgoing, accounting_peer_chan_incoming) = mpsc::channel();
+
+    let (pricing_chan_outgoing, pricing_chan_incoming) = mpsc::channel::<(PeerId, u64)>();
+
     let (refreshment_instructions_chan_outgoing, refreshment_instructions_chan_incoming) =
         mpsc::channel::<(PeerId, u64)>();
 
@@ -152,6 +156,7 @@ pub async fn run(_argument: String) -> Result<(), JsError> {
     let mut ctrl = swarm.behaviour_mut().stream.new_control();
     let mut ctrl3 = swarm.behaviour_mut().stream.new_control();
     let mut ctrl4 = swarm.behaviour_mut().stream.new_control();
+    let mut ctrl5 = swarm.behaviour_mut().stream.new_control();
 
     let mut incoming_pricing_streams = swarm
         .behaviour_mut()
@@ -171,7 +176,9 @@ pub async fn run(_argument: String) -> Result<(), JsError> {
         web_sys::console::log_1(&JsValue::from(format!("Opened Pricing handler 1")));
         while let Some((peer, stream)) = incoming_pricing_streams.next().await {
             web_sys::console::log_1(&JsValue::from(format!("Entered Pricing handler 1")));
-            pricing_handler(peer, stream).await.unwrap();
+            pricing_handler(peer, stream, &pricing_chan_outgoing)
+                .await
+                .unwrap();
         }
     };
 
@@ -197,11 +204,40 @@ pub async fn run(_argument: String) -> Result<(), JsError> {
     };
 
     let event_handle = async {
+        let mut timelast = Date::now();
         loop {
+            let timenow = Date::now();
+            if timelast + 1000.0 < timenow {
+                timelast = timenow;
+                web_sys::console::log_1(&JsValue::from(format!(
+                    "Retrieve Chunk attempt {:#?}",
+                    timenow
+                )));
+                retrieve_chunk(
+                    hex::decode("3ab408eea4f095bde55c1caeeac8e7fcff49477660f0a28f652f0a6d9c60d05f")
+                        .unwrap(),
+                    &mut ctrl5,
+                    &overlay_peers,
+                    &accounting_peers,
+                    &refreshment_instructions_chan_outgoing,
+                )
+                .await;
+            }
+
+            let pt_in = pricing_chan_incoming.try_recv();
+            if !pt_in.is_err() {
+                let (peer, amount) = pt_in.unwrap();
+                let accounting = accounting_peers.lock().unwrap();
+                let accountingPeer = accounting.get(&peer).unwrap();
+                set_payment_threshold(accountingPeer, amount);
+            }
+
             let re_out = refreshment_instructions_chan_incoming.try_recv();
             if !re_out.is_err() {
+                web_sys::console::log_1(&JsValue::from(format!("Refresh attempt")));
+
                 let (peer, amount) = re_out.unwrap();
-                refresh_handler(peer, amount, &mut ctrl4, &refreshment_chan_outgoing);
+                refresh_handler(peer, amount, &mut ctrl4, &refreshment_chan_outgoing).await;
             }
 
             let re_in = refreshment_chan_incoming.try_recv();
@@ -361,7 +397,7 @@ async fn retrieve_handler(
     peer: PeerId,
     chunk_address: Vec<u8>,
     control: &mut stream::Control,
-    chan: &mpsc::Sender<PeerFile>,
+    chan: &mpsc::Sender<Vec<u8>>,
 ) {
     let mut stream = match control.open_stream(peer, RETRIEVAL_PROTOCOL).await {
         Ok(stream) => stream,
@@ -412,4 +448,65 @@ impl Behaviour {
             stream: stream::Behaviour::new(),
         }
     }
+}
+
+async fn retrieve_chunk(
+    chunk_address: Vec<u8>,
+    control: &mut stream::Control,
+    peers: &HashMap<String, PeerId>,
+    accounting: &Mutex<HashMap<PeerId, Mutex<PeerAccounting>>>,
+    refresh_chan: &mpsc::Sender<(PeerId, u64)>,
+) {
+    let mut overlay = "".to_string();
+    let mut peer_id = libp2p::PeerId::random();
+
+    for (ov, id) in peers.iter() {
+        overlay = ov.clone();
+        peer_id = *id;
+        break;
+    }
+
+    {
+        let accounting_peers = accounting.lock().unwrap();
+        let accounting_peer = accounting_peers.get(&peer_id).unwrap();
+        reserve(accounting_peer, 320000, refresh_chan);
+    }
+
+    let (chunk_out, chunk_in) = mpsc::channel::<Vec<u8>>();
+
+    retrieve_handler(peer_id, chunk_address, control, &chunk_out).await;
+
+    let chunk_data = chunk_in.try_recv();
+    if !chunk_data.is_err() {
+        let accounting_peers = accounting.lock().unwrap();
+        let accounting_peer = accounting_peers.get(&peer_id).unwrap();
+        apply_credit(accounting_peer, 320000);
+    } else {
+        let accounting_peers = accounting.lock().unwrap();
+        let accounting_peer = accounting_peers.get(&peer_id).unwrap();
+        cancel_reserve(accounting_peer, 320000)
+    }
+
+    web_sys::console::log_1(&JsValue::from(format!(
+        "Successfully retrieved chunk {:#?} from peer {:#?}!",
+        chunk_data.unwrap(),
+        peer_id
+    )));
+
+    // make skiplist
+    // make overdraftlist
+
+    // loop
+    // // loop
+    // // // get closest address
+    // //
+    // // // get price
+    // //
+    // // // reserve
+    // // // exit loop on success
+    // //
+
+    // // retrieve attempt
+    // // cancel reserve
+    // // credit and exit loop on success
 }
