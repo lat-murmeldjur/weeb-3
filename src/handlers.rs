@@ -1,4 +1,4 @@
-// #![allow(warnings)]
+#![allow(warnings)]
 
 use alloy::primitives::keccak256;
 use alloy::signers::local::PrivateKeySigner;
@@ -238,7 +238,7 @@ pub async fn fresh(
     peer: PeerId,
     amount: u64,
     stream: &mut Stream,
-    _chan: &mpsc::Sender<PeerFile>,
+    chan: &mpsc::Sender<(PeerId, u64)>,
 ) -> io::Result<()> {
     web_sys::console::log_1(&JsValue::from(format!(
         "Opened Refresh Handle 2 for peer !",
@@ -296,11 +296,9 @@ pub async fn fresh(
         rec_0.amount, peer
     )));
 
-    //    chan.send(PeerFile {
-    //        peerId: peer,
-    //        overlay: peer_overlay.clone(),
-    //    })
-    //    .unwrap();
+    if amount > 0 {
+        chan.send((peer, amount)).unwrap();
+    }
 
     stream.close().await.unwrap();
 

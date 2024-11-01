@@ -1,4 +1,4 @@
-// #![allow(warnings)]
+#![allow(warnings)]
 #![cfg(target_arch = "wasm32")]
 
 use std::io;
@@ -23,6 +23,7 @@ pub struct PeerAccounting {
     pub threshold: u64,
     pub reserve: u64,
     pub refreshment: f64,
+    pub id: PeerId,
 }
 
 pub fn try_from_multiaddr(address: &Multiaddr) -> Option<PeerId> {

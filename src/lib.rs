@@ -1,5 +1,5 @@
 #![cfg(target_arch = "wasm32")]
-// #![allow(warnings)]
+#![allow(warnings)]
 
 use anyhow::Result;
 use console_error_panic_hook;
@@ -11,6 +11,7 @@ use std::collections::HashMap;
 use std::num::NonZero;
 use std::str::FromStr;
 use std::sync::mpsc;
+use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -128,13 +129,18 @@ pub async fn run(_argument: String) -> Result<(), JsError> {
 
     let mut connected_peers: HashMap<PeerId, PeerFile> = HashMap::new();
     let mut overlay_peers: HashMap<String, PeerId> = HashMap::new();
-    let mut accounting_peers: HashMap<PeerId, Mutex<PeerAccounting>> = HashMap::new();
+    let mut accounting_peers: Mutex<HashMap<PeerId, Mutex<PeerAccounting>>> =
+        Mutex::new(HashMap::new());
 
     let (peers_instructions_chan_outgoing, peers_instructions_chan_incoming) = mpsc::channel();
     let (connections_instructions_chan_outgoing, connections_instructions_chan_incoming) =
         mpsc::channel::<etiquette_2::BzzAddress>();
 
     let (accounting_peer_chan_outgoing, accounting_peer_chan_incoming) = mpsc::channel();
+    let (refreshment_instructions_chan_outgoing, refreshment_instructions_chan_incoming) =
+        mpsc::channel::<(PeerId, u64)>();
+
+    let (refreshment_chan_outgoing, refreshment_chan_incoming) = mpsc::channel::<(PeerId, u64)>();
 
     let addr = "/ip4/192.168.1.42/tcp/11634/ws/p2p/QmYa9hasbJKBoTpfthcisMPKyGMCidfT1R4VkaRpg14bWP"
         .parse::<Multiaddr>()
@@ -145,6 +151,7 @@ pub async fn run(_argument: String) -> Result<(), JsError> {
 
     let mut ctrl = swarm.behaviour_mut().stream.new_control();
     let mut ctrl3 = swarm.behaviour_mut().stream.new_control();
+    let mut ctrl4 = swarm.behaviour_mut().stream.new_control();
 
     let mut incoming_pricing_streams = swarm
         .behaviour_mut()
@@ -191,6 +198,20 @@ pub async fn run(_argument: String) -> Result<(), JsError> {
 
     let event_handle = async {
         loop {
+            let re_out = refreshment_instructions_chan_incoming.try_recv();
+            if !re_out.is_err() {
+                let (peer, amount) = re_out.unwrap();
+                refresh_handler(peer, amount, &mut ctrl4, &refreshment_chan_outgoing);
+            }
+
+            let re_in = refreshment_chan_incoming.try_recv();
+            if !re_in.is_err() {
+                let (peer, amount) = re_in.unwrap();
+                let accounting = accounting_peers.lock().unwrap();
+                let accountingPeer = accounting.get(&peer).unwrap();
+                apply_refreshment(accountingPeer, amount);
+            }
+
             let that = connections_instructions_chan_incoming.try_recv();
             if !that.is_err() {
                 let addr3 = libp2p::core::Multiaddr::try_from(that.unwrap().underlay).unwrap();
@@ -221,21 +242,24 @@ pub async fn run(_argument: String) -> Result<(), JsError> {
                 // Accounting connect
                 let peer_file: PeerFile = incoming_peer.unwrap();
                 let ol = hex::encode(peer_file.overlay.clone());
-                if !accounting_peers.contains_key(&peer_file.peer_id) {
+                let mut accounting = accounting_peers.lock().unwrap();
+                if !accounting.contains_key(&peer_file.peer_id) {
                     web_sys::console::log_1(&JsValue::from(format!(
                         "Accounting Connecting Peer {:#?} {:#?}!",
                         ol, peer_file.peer_id
                     )));
-                    accounting_peers.insert(
+                    accounting.insert(
                         peer_file.peer_id,
                         Mutex::new(PeerAccounting {
                             balance: 0,
                             threshold: 0,
                             reserve: 0,
                             refreshment: 0.0,
+                            id: peer_file.peer_id,
                         }),
                     );
                 }
+
                 overlay_peers.insert(ol, peer_file.peer_id);
                 connected_peers.insert(peer_file.peer_id, peer_file);
             };
@@ -252,7 +276,8 @@ pub async fn run(_argument: String) -> Result<(), JsError> {
                 SwarmEvent::ConnectionClosed { peer_id, .. } => {
                     overlay_peers.remove(&hex::encode(connected_peers.get(&peer_id).unwrap().overlay.clone()));
                     connected_peers.remove(&peer_id);
-                    accounting_peers.remove(&peer_id);
+                    let mut accounting = accounting_peers.lock().unwrap();
+                    accounting.remove(&peer_id);
                 }
                 _ => {}
             }
@@ -309,7 +334,7 @@ async fn refresh_handler(
     peer: PeerId,
     amount: u64,
     control: &mut stream::Control,
-    _chan: &mpsc::Sender<PeerFile>,
+    chan: &mpsc::Sender<(PeerId, u64)>,
 ) {
     let mut stream = match control.open_stream(peer, PSEUDOSETTLE_PROTOCOL).await {
         Ok(stream) => stream,
@@ -323,7 +348,7 @@ async fn refresh_handler(
         }
     };
 
-    if let Err(e) = fresh(peer, amount, &mut stream, _chan).await {
+    if let Err(e) = fresh(peer, amount, &mut stream, chan).await {
         web_sys::console::log_1(&JsValue::from("Refresh protocol failed"));
         web_sys::console::log_1(&JsValue::from(format!("{}", e)));
         return;
