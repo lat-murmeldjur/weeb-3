@@ -336,90 +336,6 @@ pub async fn run(_argument: String) -> Result<(), JsError> {
     Ok(())
 }
 
-async fn connection_handler(
-    peer: PeerId,
-    control: &mut stream::Control,
-    a: &libp2p::core::Multiaddr,
-    pk: &ecdsa::SecretKey,
-    chan: &mpsc::Sender<PeerFile>,
-) {
-    let mut stream = match control.open_stream(peer, HANDSHAKE_PROTOCOL).await {
-        Ok(stream) => stream,
-        Err(error @ stream::OpenStreamError::UnsupportedProtocol(_)) => {
-            web_sys::console::log_1(&JsValue::from(format!("{} {}", peer, error)));
-            return;
-        }
-        Err(error) => {
-            web_sys::console::log_1(&JsValue::from(format!("{} {}", peer, error)));
-            return;
-        }
-    };
-
-    if let Err(e) = ceive(peer, &mut stream, a.clone(), &pk.clone(), chan).await {
-        web_sys::console::log_1(&JsValue::from("Handshake protocol failed"));
-        web_sys::console::log_1(&JsValue::from(format!("{}", e)));
-        return;
-    }
-
-    web_sys::console::log_1(&JsValue::from(format!("{} Handshake complete!", peer)));
-
-    web_sys::console::log_1(&JsValue::from(format!("Closing handler 1")));
-}
-
-async fn refresh_handler(
-    peer: PeerId,
-    amount: u64,
-    control: &mut stream::Control,
-    chan: &mpsc::Sender<(PeerId, u64)>,
-) {
-    let mut stream = match control.open_stream(peer, PSEUDOSETTLE_PROTOCOL).await {
-        Ok(stream) => stream,
-        Err(error @ stream::OpenStreamError::UnsupportedProtocol(_)) => {
-            web_sys::console::log_1(&JsValue::from(format!("{} {}", peer, error)));
-            return;
-        }
-        Err(error) => {
-            web_sys::console::log_1(&JsValue::from(format!("{} {}", peer, error)));
-            return;
-        }
-    };
-
-    if let Err(e) = fresh(peer, amount, &mut stream, chan).await {
-        web_sys::console::log_1(&JsValue::from("Refresh protocol failed"));
-        web_sys::console::log_1(&JsValue::from(format!("{}", e)));
-        return;
-    }
-
-    web_sys::console::log_1(&JsValue::from(format!("Refresh complete for {}!", peer)));
-}
-
-async fn retrieve_handler(
-    peer: PeerId,
-    chunk_address: Vec<u8>,
-    control: &mut stream::Control,
-    chan: &mpsc::Sender<Vec<u8>>,
-) {
-    let mut stream = match control.open_stream(peer, RETRIEVAL_PROTOCOL).await {
-        Ok(stream) => stream,
-        Err(error @ stream::OpenStreamError::UnsupportedProtocol(_)) => {
-            web_sys::console::log_1(&JsValue::from(format!("{} {}", peer, error)));
-            return;
-        }
-        Err(error) => {
-            web_sys::console::log_1(&JsValue::from(format!("{} {}", peer, error)));
-            return;
-        }
-    };
-
-    if let Err(e) = trieve(peer, chunk_address, &mut stream, chan).await {
-        web_sys::console::log_1(&JsValue::from("Retrieve protocol failed"));
-        web_sys::console::log_1(&JsValue::from(format!("{}", e)));
-        return;
-    }
-
-    web_sys::console::log_1(&JsValue::from(format!("{} Retrieve complete!", peer)));
-}
-
 #[derive(NetworkBehaviour)]
 struct Behaviour {
     autonat: autonat::v2::client::Behaviour,
@@ -466,10 +382,17 @@ async fn retrieve_chunk(
         break;
     }
 
+    let req_price = price(overlay, &chunk_address);
+
+    web_sys::console::log_1(&JsValue::from(format!(
+        "Reserve price {:#?} for chunk {:#?} from peer {:#?}!",
+        req_price, chunk_address, peer_id
+    )));
+
     {
         let accounting_peers = accounting.lock().unwrap();
         let accounting_peer = accounting_peers.get(&peer_id).unwrap();
-        reserve(accounting_peer, 320000, refresh_chan);
+        reserve(accounting_peer, req_price, refresh_chan);
     }
 
     let (chunk_out, chunk_in) = mpsc::channel::<Vec<u8>>();
@@ -480,11 +403,11 @@ async fn retrieve_chunk(
     if !chunk_data.is_err() {
         let accounting_peers = accounting.lock().unwrap();
         let accounting_peer = accounting_peers.get(&peer_id).unwrap();
-        apply_credit(accounting_peer, 320000);
+        apply_credit(accounting_peer, req_price);
     } else {
         let accounting_peers = accounting.lock().unwrap();
         let accounting_peer = accounting_peers.get(&peer_id).unwrap();
-        cancel_reserve(accounting_peer, 320000)
+        cancel_reserve(accounting_peer, req_price)
     }
 
     web_sys::console::log_1(&JsValue::from(format!(

@@ -10,9 +10,9 @@ use libp2p::PeerId;
 
 use js_sys::Date;
 
-use crate::conventions::PeerAccounting;
+use crate::conventions::{get_proximity, PeerAccounting};
 
-const refreshRate: u64 = 320000;
+const refreshRate: u64 = 450000;
 
 pub fn set_payment_threshold(a: &Mutex<PeerAccounting>, amount: u64) {
     let mut account = a.lock().unwrap();
@@ -59,4 +59,11 @@ pub fn cancel_reserve(a: &Mutex<PeerAccounting>, amount: u64) {
         return;
     }
     account.reserve = 0;
+}
+
+pub fn price(peer_overlay: String, chunk_address: &Vec<u8>) -> u64 {
+    // return uint64(swarm.MaxPO-swarm.Proximity(peer.Bytes(), chunk.Bytes())+1) * pricer.poPrice
+
+    let po = get_proximity(&peer_overlay.as_bytes().to_vec(), &chunk_address);
+    return ((u64::from(crate::conventions::max_po) - u64::from(po)) * 10000).into();
 }

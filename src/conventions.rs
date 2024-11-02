@@ -9,6 +9,8 @@ use libp2p::multiaddr::Protocol;
 use wasm_bindgen::prelude::*;
 use web_sys::{Document, HtmlElement};
 
+pub const max_po: u8 = 31;
+
 // pub fn a() {}
 
 #[derive(Debug, Clone)]
@@ -67,4 +69,48 @@ impl Body {
 
 fn js_error(msg: &str) -> JsError {
     io::Error::new(io::ErrorKind::Other, msg).into()
+}
+
+pub fn get_proximity(one: &Vec<u8>, other: &Vec<u8>) -> u8 {
+    let mut b: usize = (max_po / 4 + 1).into();
+
+    if b > one.len() {
+        b = one.len();
+    }
+
+    if b > other.len() {
+        b = one.len();
+    }
+
+    let m: usize = 8;
+    for i in 0..b {
+        let oxo = one[i] ^ other[i];
+
+        for j in 0..m {
+            if (oxo >> (7 - j)) & 0x01 != 0 {
+                return (i * 8 + j).try_into().unwrap();
+            }
+            //            if (oxo>>(7-j))&0x01 != 0 {
+            //                return i*8 + j
+            //            }
+        }
+    }
+    return max_po;
+
+    //    if l := uint8(len(one)); b > l {
+    //        b = l
+    //    }
+    //    if l := uint8(len(other)); b > l {
+    //        b = l
+    //    }
+    //    var m uint8 = 8
+    //    for i := uint8(0); i < b; i++ {
+    //        oxo := one[i] ^ other[i]
+    //        for j := uint8(0); j < m; j++ {
+    //            if (oxo>>(7-j))&0x01 != 0 {
+    //                return i*8 + j
+    //            }
+    //        }
+    //    }
+    //    return MaxPO
 }

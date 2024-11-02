@@ -12,6 +12,7 @@ use std::io;
 use std::io::Cursor;
 use std::sync::mpsc;
 
+use crate::stream;
 use libp2p::{
     futures::{AsyncReadExt, AsyncWriteExt},
     identity::ecdsa,
@@ -29,6 +30,10 @@ use crate::weeb_3::etiquette_2;
 use crate::weeb_3::etiquette_4;
 use crate::weeb_3::etiquette_5;
 use crate::weeb_3::etiquette_6;
+
+use crate::HANDSHAKE_PROTOCOL;
+use crate::PSEUDOSETTLE_PROTOCOL;
+use crate::RETRIEVAL_PROTOCOL;
 
 pub async fn ceive(
     peer: PeerId,
@@ -384,4 +389,88 @@ pub async fn trieve(
     stream.close().await.unwrap();
 
     Ok(())
+}
+
+pub async fn connection_handler(
+    peer: PeerId,
+    control: &mut stream::Control,
+    a: &libp2p::core::Multiaddr,
+    pk: &ecdsa::SecretKey,
+    chan: &mpsc::Sender<PeerFile>,
+) {
+    let mut stream = match control.open_stream(peer, HANDSHAKE_PROTOCOL).await {
+        Ok(stream) => stream,
+        Err(error @ stream::OpenStreamError::UnsupportedProtocol(_)) => {
+            web_sys::console::log_1(&JsValue::from(format!("{} {}", peer, error)));
+            return;
+        }
+        Err(error) => {
+            web_sys::console::log_1(&JsValue::from(format!("{} {}", peer, error)));
+            return;
+        }
+    };
+
+    if let Err(e) = ceive(peer, &mut stream, a.clone(), &pk.clone(), chan).await {
+        web_sys::console::log_1(&JsValue::from("Handshake protocol failed"));
+        web_sys::console::log_1(&JsValue::from(format!("{}", e)));
+        return;
+    }
+
+    web_sys::console::log_1(&JsValue::from(format!("{} Handshake complete!", peer)));
+
+    web_sys::console::log_1(&JsValue::from(format!("Closing handler 1")));
+}
+
+pub async fn refresh_handler(
+    peer: PeerId,
+    amount: u64,
+    control: &mut stream::Control,
+    chan: &mpsc::Sender<(PeerId, u64)>,
+) {
+    let mut stream = match control.open_stream(peer, PSEUDOSETTLE_PROTOCOL).await {
+        Ok(stream) => stream,
+        Err(error @ stream::OpenStreamError::UnsupportedProtocol(_)) => {
+            web_sys::console::log_1(&JsValue::from(format!("{} {}", peer, error)));
+            return;
+        }
+        Err(error) => {
+            web_sys::console::log_1(&JsValue::from(format!("{} {}", peer, error)));
+            return;
+        }
+    };
+
+    if let Err(e) = fresh(peer, amount, &mut stream, chan).await {
+        web_sys::console::log_1(&JsValue::from("Refresh protocol failed"));
+        web_sys::console::log_1(&JsValue::from(format!("{}", e)));
+        return;
+    }
+
+    web_sys::console::log_1(&JsValue::from(format!("Refresh complete for {}!", peer)));
+}
+
+pub async fn retrieve_handler(
+    peer: PeerId,
+    chunk_address: Vec<u8>,
+    control: &mut stream::Control,
+    chan: &mpsc::Sender<Vec<u8>>,
+) {
+    let mut stream = match control.open_stream(peer, RETRIEVAL_PROTOCOL).await {
+        Ok(stream) => stream,
+        Err(error @ stream::OpenStreamError::UnsupportedProtocol(_)) => {
+            web_sys::console::log_1(&JsValue::from(format!("{} {}", peer, error)));
+            return;
+        }
+        Err(error) => {
+            web_sys::console::log_1(&JsValue::from(format!("{} {}", peer, error)));
+            return;
+        }
+    };
+
+    if let Err(e) = trieve(peer, chunk_address, &mut stream, chan).await {
+        web_sys::console::log_1(&JsValue::from("Retrieve protocol failed"));
+        web_sys::console::log_1(&JsValue::from(format!("{}", e)));
+        return;
+    }
+
+    web_sys::console::log_1(&JsValue::from(format!("{} Retrieve complete!", peer)));
 }
