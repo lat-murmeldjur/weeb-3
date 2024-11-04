@@ -373,47 +373,57 @@ async fn retrieve_chunk(
     accounting: &Mutex<HashMap<PeerId, Mutex<PeerAccounting>>>,
     refresh_chan: &mpsc::Sender<(PeerId, u64)>,
 ) {
-    let mut overlay = "".to_string();
-    let mut peer_id = libp2p::PeerId::random();
+    let mut closest_overlay = "".to_string();
+    let mut closest_peer_id = libp2p::PeerId::random();
+    let mut current_max_po = 0;
 
     for (ov, id) in peers.iter() {
-        overlay = ov.clone();
-        peer_id = *id;
-        break;
+        let current_po = get_proximity(&chunk_address, &hex::decode(&ov).unwrap());
+
+        web_sys::console::log_1(&JsValue::from(format!(
+            "Got PO {:#?} for chunk {:#?} to peer {:#?}!",
+            current_po, chunk_address, ov
+        )));
+
+        if current_po >= current_max_po {
+            closest_overlay = ov.clone();
+            closest_peer_id = *id;
+            current_max_po = current_po;
+        }
     }
 
-    let req_price = price(overlay, &chunk_address);
+    let req_price = price(closest_overlay, &chunk_address);
 
     web_sys::console::log_1(&JsValue::from(format!(
         "Reserve price {:#?} for chunk {:#?} from peer {:#?}!",
-        req_price, chunk_address, peer_id
+        req_price, chunk_address, closest_peer_id
     )));
 
     {
         let accounting_peers = accounting.lock().unwrap();
-        let accounting_peer = accounting_peers.get(&peer_id).unwrap();
+        let accounting_peer = accounting_peers.get(&closest_peer_id).unwrap();
         reserve(accounting_peer, req_price, refresh_chan);
     }
 
     let (chunk_out, chunk_in) = mpsc::channel::<Vec<u8>>();
 
-    retrieve_handler(peer_id, chunk_address, control, &chunk_out).await;
+    retrieve_handler(closest_peer_id, chunk_address, control, &chunk_out).await;
 
     let chunk_data = chunk_in.try_recv();
     if !chunk_data.is_err() {
         let accounting_peers = accounting.lock().unwrap();
-        let accounting_peer = accounting_peers.get(&peer_id).unwrap();
+        let accounting_peer = accounting_peers.get(&closest_peer_id).unwrap();
         apply_credit(accounting_peer, req_price);
     } else {
         let accounting_peers = accounting.lock().unwrap();
-        let accounting_peer = accounting_peers.get(&peer_id).unwrap();
+        let accounting_peer = accounting_peers.get(&closest_peer_id).unwrap();
         cancel_reserve(accounting_peer, req_price)
     }
 
     web_sys::console::log_1(&JsValue::from(format!(
         "Successfully retrieved chunk {:#?} from peer {:#?}!",
         chunk_data.unwrap(),
-        peer_id
+        closest_peer_id
     )));
 
     // make skiplist
