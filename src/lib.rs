@@ -127,8 +127,8 @@ pub async fn run(_argument: String) -> Result<(), JsError> {
         })
         .build();
 
-    let mut connected_peers: HashMap<PeerId, PeerFile> = HashMap::new();
-    let mut overlay_peers: HashMap<String, PeerId> = HashMap::new();
+    let mut connected_peers: Mutex<HashMap<PeerId, PeerFile>> = Mutex::new(HashMap::new());
+    let mut overlay_peers: Mutex<HashMap<String, PeerId>> = Mutex::new(HashMap::new());
     let accounting_peers: Mutex<HashMap<PeerId, Mutex<PeerAccounting>>> =
         Mutex::new(HashMap::new());
 
@@ -205,121 +205,153 @@ pub async fn run(_argument: String) -> Result<(), JsError> {
     let event_handle = async {
         let mut timelast = Date::now();
         loop {
-            let timenow = Date::now();
-            if timelast + 1000.0 < timenow {
-                timelast = timenow;
-                web_sys::console::log_1(&JsValue::from(format!(
-                    "Retrieve Chunk attempt {:#?}",
-                    timenow
-                )));
-                retrieve_chunk(
-                    hex::decode("3ab408eea4f095bde55c1caeeac8e7fcff49477660f0a28f652f0a6d9c60d05f")
+            let k0 = async {
+                let timenow = Date::now();
+                if timelast + 1000.0 < timenow {
+                    web_sys::console::log_1(&JsValue::from(format!(
+                        "Time Elapsed Since Last Attempt {}",
+                        timenow - timelast
+                    )));
+                    timelast = timenow;
+                    web_sys::console::log_1(&JsValue::from(format!(
+                        "Retrieve Chunk Attempt {:#?}",
+                        timenow
+                    )));
+                    retrieve_chunk(
+                        hex::decode(
+                            "3ab408eea4f095bde55c1caeeac8e7fcff49477660f0a28f652f0a6d9c60d05f",
+                        )
                         .unwrap(),
-                    &mut ctrl5,
-                    &overlay_peers,
-                    &accounting_peers,
-                    &refreshment_instructions_chan_outgoing,
-                )
-                .await;
-            }
-
-            let pt_in = pricing_chan_incoming.try_recv();
-            if !pt_in.is_err() {
-                let (peer, amount) = pt_in.unwrap();
-                let accounting = accounting_peers.lock().unwrap();
-                let accounting_peer = accounting.get(&peer).unwrap();
-                set_payment_threshold(accounting_peer, amount);
-            }
-
-            let re_out = refreshment_instructions_chan_incoming.try_recv();
-            if !re_out.is_err() {
-                web_sys::console::log_1(&JsValue::from(format!("Refresh attempt")));
-
-                let (peer, amount) = re_out.unwrap();
-                refresh_handler(peer, amount, &mut ctrl4, &refreshment_chan_outgoing).await;
-            }
-
-            let re_in = refreshment_chan_incoming.try_recv();
-            if !re_in.is_err() {
-                let (peer, amount) = re_in.unwrap();
-                let accounting = accounting_peers.lock().unwrap();
-                let accounting_peer = accounting.get(&peer).unwrap();
-                apply_refreshment(accounting_peer, amount);
-            }
-
-            let that = connections_instructions_chan_incoming.try_recv();
-            if !that.is_err() {
-                let addr3 = libp2p::core::Multiaddr::try_from(that.unwrap().underlay).unwrap();
-                let id = try_from_multiaddr(&addr3);
-                web_sys::console::log_1(&JsValue::from(format!("Got Id {:#?}", id)));
-                if id.is_some() {
-                    connection_handler(
-                        id.expect("not"),
-                        &mut ctrl3,
-                        &addr3.clone(),
-                        &secret_key,
-                        &accounting_peer_chan_outgoing,
+                        &mut ctrl5,
+                        &overlay_peers,
+                        &accounting_peers,
+                        &refreshment_instructions_chan_outgoing,
                     )
                     .await;
                 }
-            }
-
-            let paddr = peers_instructions_chan_incoming.try_recv();
-            if !paddr.is_err() {
-                let addr =
-                    libp2p::core::Multiaddr::try_from(paddr.clone().unwrap().underlay).unwrap();
-                swarm.dial(addr).unwrap();
-                let _ = connections_instructions_chan_outgoing.send(paddr.unwrap());
+            };
+            let k1 = async {
+                while let pt_in = pricing_chan_incoming.try_recv() {
+                    if !pt_in.is_err() {
+                        let (peer, amount) = pt_in.unwrap();
+                        let accounting = accounting_peers.lock().unwrap();
+                        let accounting_peer = accounting.get(&peer).unwrap();
+                        set_payment_threshold(accounting_peer, amount);
+                    } else {
+                        break;
+                    }
+                }
+            };
+            let k2 = async {
+                let re_out = refreshment_instructions_chan_incoming.try_recv();
+                if !re_out.is_err() {
+                    web_sys::console::log_1(&JsValue::from(format!("Refresh attempt")));
+                    let (peer, amount) = re_out.unwrap();
+                    refresh_handler(peer, amount, &mut ctrl4, &refreshment_chan_outgoing).await;
+                }
+            };
+            let k3 = async {
+                let re_in = refreshment_chan_incoming.try_recv();
+                if !re_in.is_err() {
+                    let (peer, amount) = re_in.unwrap();
+                    let accounting = accounting_peers.lock().unwrap();
+                    let accounting_peer = accounting.get(&peer).unwrap();
+                    apply_refreshment(accounting_peer, amount);
+                }
+            };
+            let k4 = async {
+                let that = connections_instructions_chan_incoming.try_recv();
+                if !that.is_err() {
+                    let addr3 = libp2p::core::Multiaddr::try_from(that.unwrap().underlay).unwrap();
+                    let id = try_from_multiaddr(&addr3);
+                    web_sys::console::log_1(&JsValue::from(format!("Got Id {:#?}", id)));
+                    if id.is_some() {
+                        connection_handler(
+                            id.expect("not"),
+                            &mut ctrl3,
+                            &addr3.clone(),
+                            &secret_key,
+                            &accounting_peer_chan_outgoing,
+                        )
+                        .await;
+                    }
+                }
+            };
+            let k5 = async {
+                let incoming_peer = accounting_peer_chan_incoming.try_recv();
+                if !incoming_peer.is_err() {
+                    // Accounting connect
+                    let peer_file: PeerFile = incoming_peer.unwrap();
+                    let ol = hex::encode(peer_file.overlay.clone());
+                    {
+                        let mut accounting = accounting_peers.lock().unwrap();
+                        if !accounting.contains_key(&peer_file.peer_id) {
+                            web_sys::console::log_1(&JsValue::from(format!(
+                                "Accounting Connecting Peer {:#?} {:#?}!",
+                                ol, peer_file.peer_id
+                            )));
+                            accounting.insert(
+                                peer_file.peer_id,
+                                Mutex::new(PeerAccounting {
+                                    balance: 0,
+                                    threshold: 0,
+                                    reserve: 0,
+                                    refreshment: 0.0,
+                                    id: peer_file.peer_id,
+                                }),
+                            );
+                        }
+                    }
+                    {
+                        let mut overlay_peers_map = overlay_peers.lock().unwrap();
+                        overlay_peers_map.insert(ol, peer_file.peer_id);
+                    }
+                    {
+                        let mut connected_peers_map = connected_peers.lock().unwrap();
+                        connected_peers_map.insert(peer_file.peer_id, peer_file);
+                    }
+                };
+            };
+            let k6 = async {
+                let event = swarm.next().await.unwrap();
+                match event {
+                    SwarmEvent::ConnectionEstablished {
+                        // peer_id,
+                        // established_in,
+                        ..
+                    } => {
+                        //
+                    }
+                    SwarmEvent::ConnectionClosed { peer_id, .. } => {
+                        {
+                            let mut connected_peers_map = connected_peers.lock().unwrap();
+                            let mut overlay_peers_map = overlay_peers.lock().unwrap();
+                            overlay_peers_map.remove(&hex::encode(connected_peers_map.get(&peer_id).unwrap().overlay.clone()));
+                            connected_peers_map.remove(&peer_id);
+                        }
+                        let mut accounting = accounting_peers.lock().unwrap();
+                        accounting.remove(&peer_id);
+                    }
+                    _ => {}
+                }
+                web_sys::console::log_1(&JsValue::from(format!(
+                    "Current Event Handled {:#?}",
+                    event
+                )));
+                while let paddr = peers_instructions_chan_incoming.try_recv() {
+                    if !paddr.is_err() {
+                        let addr =
+                            libp2p::core::Multiaddr::try_from(paddr.clone().unwrap().underlay)
+                                .unwrap();
+                        swarm.dial(addr).unwrap();
+                        let _ = connections_instructions_chan_outgoing.send(paddr.unwrap());
+                    } else {
+                        break;
+                    };
+                }
             };
 
-            let incoming_peer = accounting_peer_chan_incoming.try_recv();
-            if !incoming_peer.is_err() {
-                // Accounting connect
-                let peer_file: PeerFile = incoming_peer.unwrap();
-                let ol = hex::encode(peer_file.overlay.clone());
-                let mut accounting = accounting_peers.lock().unwrap();
-                if !accounting.contains_key(&peer_file.peer_id) {
-                    web_sys::console::log_1(&JsValue::from(format!(
-                        "Accounting Connecting Peer {:#?} {:#?}!",
-                        ol, peer_file.peer_id
-                    )));
-                    accounting.insert(
-                        peer_file.peer_id,
-                        Mutex::new(PeerAccounting {
-                            balance: 0,
-                            threshold: 0,
-                            reserve: 0,
-                            refreshment: 0.0,
-                            id: peer_file.peer_id,
-                        }),
-                    );
-                }
-
-                overlay_peers.insert(ol, peer_file.peer_id);
-                connected_peers.insert(peer_file.peer_id, peer_file);
-            };
-
-            let event = swarm.next().await.unwrap();
-            match event {
-                SwarmEvent::ConnectionEstablished {
-                    // peer_id,
-                    // established_in,
-                    ..
-                } => {
-                    //
-                }
-                SwarmEvent::ConnectionClosed { peer_id, .. } => {
-                    overlay_peers.remove(&hex::encode(connected_peers.get(&peer_id).unwrap().overlay.clone()));
-                    connected_peers.remove(&peer_id);
-                    let mut accounting = accounting_peers.lock().unwrap();
-                    accounting.remove(&peer_id);
-                }
-                _ => {}
-            }
-            web_sys::console::log_1(&JsValue::from(format!(
-                "Current Event Handled {:#?}",
-                event
-            )));
+            join!(k0, k1, k2, k3, k4, k5, k6);
         }
     };
 
@@ -359,7 +391,7 @@ impl Behaviour {
                     .with_push_listen_addr_updates(true)
                     .with_interval(Duration::from_secs(60)), // .with_cache_size(10), //
             ),
-            ping: ping::Behaviour::new(ping::Config::new()),
+            ping: ping::Behaviour::new(ping::Config::new().with_interval(Duration::from_secs(1))),
             stream: stream::Behaviour::new(),
         }
     }
@@ -368,7 +400,7 @@ impl Behaviour {
 async fn retrieve_chunk(
     chunk_address: Vec<u8>,
     control: &mut stream::Control,
-    peers: &HashMap<String, PeerId>,
+    peers: &Mutex<HashMap<String, PeerId>>,
     accounting: &Mutex<HashMap<PeerId, Mutex<PeerAccounting>>>,
     refresh_chan: &mpsc::Sender<(PeerId, u64)>,
 ) {
@@ -378,7 +410,8 @@ async fn retrieve_chunk(
     let mut closest_peer_id = libp2p::PeerId::random();
     let mut current_max_po = 0;
 
-    for (ov, id) in peers.iter() {
+    let peers_map = peers.lock().unwrap();
+    for (ov, id) in peers_map.iter() {
         let current_po = get_proximity(&chunk_address, &hex::decode(&ov).unwrap());
 
         web_sys::console::log_1(&JsValue::from(format!(
