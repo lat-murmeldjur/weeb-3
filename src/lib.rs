@@ -243,74 +243,87 @@ pub async fn run(_argument: String) -> Result<(), JsError> {
                 }
             };
             let k2 = async {
-                let re_out = refreshment_instructions_chan_incoming.try_recv();
-                if !re_out.is_err() {
-                    web_sys::console::log_1(&JsValue::from(format!("Refresh attempt")));
-                    let (peer, amount) = re_out.unwrap();
-                    refresh_handler(peer, amount, &mut ctrl4, &refreshment_chan_outgoing).await;
+                while let re_out = refreshment_instructions_chan_incoming.try_recv() {
+                    if !re_out.is_err() {
+                        web_sys::console::log_1(&JsValue::from(format!("Refresh attempt")));
+                        let (peer, amount) = re_out.unwrap();
+                        refresh_handler(peer, amount, &mut ctrl4, &refreshment_chan_outgoing).await;
+                    } else {
+                        break;
+                    }
                 }
             };
             let k3 = async {
-                let re_in = refreshment_chan_incoming.try_recv();
-                if !re_in.is_err() {
-                    let (peer, amount) = re_in.unwrap();
-                    let accounting = accounting_peers.lock().unwrap();
-                    let accounting_peer = accounting.get(&peer).unwrap();
-                    apply_refreshment(accounting_peer, amount);
+                while let re_in = refreshment_chan_incoming.try_recv() {
+                    if !re_in.is_err() {
+                        let (peer, amount) = re_in.unwrap();
+                        let accounting = accounting_peers.lock().unwrap();
+                        let accounting_peer = accounting.get(&peer).unwrap();
+                        apply_refreshment(accounting_peer, amount);
+                    } else {
+                        break;
+                    }
                 }
             };
             let k4 = async {
-                let that = connections_instructions_chan_incoming.try_recv();
-                if !that.is_err() {
-                    let addr3 = libp2p::core::Multiaddr::try_from(that.unwrap().underlay).unwrap();
-                    let id = try_from_multiaddr(&addr3);
-                    web_sys::console::log_1(&JsValue::from(format!("Got Id {:#?}", id)));
-                    if id.is_some() {
-                        connection_handler(
-                            id.expect("not"),
-                            &mut ctrl3,
-                            &addr3.clone(),
-                            &secret_key,
-                            &accounting_peer_chan_outgoing,
-                        )
-                        .await;
+                while let that = connections_instructions_chan_incoming.try_recv() {
+                    if !that.is_err() {
+                        let addr3 =
+                            libp2p::core::Multiaddr::try_from(that.unwrap().underlay).unwrap();
+                        let id = try_from_multiaddr(&addr3);
+                        web_sys::console::log_1(&JsValue::from(format!("Got Id {:#?}", id)));
+                        if id.is_some() {
+                            connection_handler(
+                                id.expect("not"),
+                                &mut ctrl3,
+                                &addr3.clone(),
+                                &secret_key,
+                                &accounting_peer_chan_outgoing,
+                            )
+                            .await;
+                        }
+                    } else {
+                        break;
                     }
                 }
             };
             let k5 = async {
-                let incoming_peer = accounting_peer_chan_incoming.try_recv();
-                if !incoming_peer.is_err() {
-                    // Accounting connect
-                    let peer_file: PeerFile = incoming_peer.unwrap();
-                    let ol = hex::encode(peer_file.overlay.clone());
-                    {
-                        let mut accounting = accounting_peers.lock().unwrap();
-                        if !accounting.contains_key(&peer_file.peer_id) {
-                            web_sys::console::log_1(&JsValue::from(format!(
-                                "Accounting Connecting Peer {:#?} {:#?}!",
-                                ol, peer_file.peer_id
-                            )));
-                            accounting.insert(
-                                peer_file.peer_id,
-                                Mutex::new(PeerAccounting {
-                                    balance: 0,
-                                    threshold: 0,
-                                    reserve: 0,
-                                    refreshment: 0.0,
-                                    id: peer_file.peer_id,
-                                }),
-                            );
+                while let incoming_peer = accounting_peer_chan_incoming.try_recv() {
+                    if !incoming_peer.is_err() {
+                        // Accounting connect
+                        let peer_file: PeerFile = incoming_peer.unwrap();
+                        let ol = hex::encode(peer_file.overlay.clone());
+                        {
+                            let mut accounting = accounting_peers.lock().unwrap();
+                            if !accounting.contains_key(&peer_file.peer_id) {
+                                web_sys::console::log_1(&JsValue::from(format!(
+                                    "Accounting Connecting Peer {:#?} {:#?}!",
+                                    ol, peer_file.peer_id
+                                )));
+                                accounting.insert(
+                                    peer_file.peer_id,
+                                    Mutex::new(PeerAccounting {
+                                        balance: 0,
+                                        threshold: 0,
+                                        reserve: 0,
+                                        refreshment: 0.0,
+                                        id: peer_file.peer_id,
+                                    }),
+                                );
+                            }
                         }
+                        {
+                            let mut overlay_peers_map = overlay_peers.lock().unwrap();
+                            overlay_peers_map.insert(ol, peer_file.peer_id);
+                        }
+                        {
+                            let mut connected_peers_map = connected_peers.lock().unwrap();
+                            connected_peers_map.insert(peer_file.peer_id, peer_file);
+                        }
+                    } else {
+                        break;
                     }
-                    {
-                        let mut overlay_peers_map = overlay_peers.lock().unwrap();
-                        overlay_peers_map.insert(ol, peer_file.peer_id);
-                    }
-                    {
-                        let mut connected_peers_map = connected_peers.lock().unwrap();
-                        connected_peers_map.insert(peer_file.peer_id, peer_file);
-                    }
-                };
+                }
             };
             let k6 = async {
                 let event = swarm.next().await.unwrap();
