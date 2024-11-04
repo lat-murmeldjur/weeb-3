@@ -325,6 +325,7 @@ pub async fn run(_argument: String) -> Result<(), JsError> {
                     }
                 }
             };
+
             let k6 = async {
                 let event = swarm.next().await.unwrap();
                 match event {
@@ -369,8 +370,8 @@ pub async fn run(_argument: String) -> Result<(), JsError> {
     };
 
     join!(
-        event_handle,
         conn_handle,
+        event_handle,
         gossip_inbound_handle,
         pricing_inbound_handle,
     );
@@ -448,8 +449,12 @@ async fn retrieve_chunk(
 
     {
         let accounting_peers = accounting.lock().unwrap();
-        let accounting_peer = accounting_peers.get(&closest_peer_id).unwrap();
-        reserve(accounting_peer, req_price, refresh_chan);
+        if accounting_peers.contains_key(&closest_peer_id) {
+            let accounting_peer = accounting_peers.get(&closest_peer_id).unwrap();
+            reserve(accounting_peer, req_price, refresh_chan);
+        } else {
+            return;
+        }
     }
 
     let (chunk_out, chunk_in) = mpsc::channel::<Vec<u8>>();
@@ -459,19 +464,29 @@ async fn retrieve_chunk(
     let chunk_data = chunk_in.try_recv();
     if !chunk_data.is_err() {
         let accounting_peers = accounting.lock().unwrap();
-        let accounting_peer = accounting_peers.get(&closest_peer_id).unwrap();
-        apply_credit(accounting_peer, req_price);
+        if accounting_peers.contains_key(&closest_peer_id) {
+            let accounting_peer = accounting_peers.get(&closest_peer_id).unwrap();
+            apply_credit(accounting_peer, req_price);
+        }
     } else {
         let accounting_peers = accounting.lock().unwrap();
-        let accounting_peer = accounting_peers.get(&closest_peer_id).unwrap();
-        cancel_reserve(accounting_peer, req_price)
+        if accounting_peers.contains_key(&closest_peer_id) {
+            let accounting_peer = accounting_peers.get(&closest_peer_id).unwrap();
+            cancel_reserve(accounting_peer, req_price)
+        }
     }
 
-    web_sys::console::log_1(&JsValue::from(format!(
-        "Successfully retrieved chunk {:#?} from peer {:#?}!",
-        chunk_data.unwrap(),
-        closest_peer_id
-    )));
+    let cd = match chunk_data {
+        Ok(x) => x,
+        Err(x) => vec![],
+    };
+
+    if cd.len() > 0 {
+        web_sys::console::log_1(&JsValue::from(format!(
+            "Successfully retrieved chunk {:#?} from peer {:#?}!",
+            cd, closest_peer_id
+        )));
+    }
 
     let timeend = Date::now();
 
