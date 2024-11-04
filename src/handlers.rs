@@ -1,4 +1,4 @@
-#![allow(warnings)]
+// #![allow(warnings)]
 
 use alloy::primitives::keccak256;
 use alloy::signers::local::PrivateKeySigner;
@@ -185,7 +185,7 @@ pub async fn pricing_handler(
         .to_u64()
         .unwrap();
 
-    chan.send((peer, pt));
+    let _ = chan.send((peer, pt));
 
     stream.flush().await.unwrap();
     stream.close().await?;

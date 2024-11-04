@@ -1,9 +1,8 @@
+// #![allow(warnings)]
 #![cfg(target_arch = "wasm32")]
-#![allow(warnings)]
 
 use anyhow::Result;
 use console_error_panic_hook;
-use futures::join;
 use rand::rngs::OsRng;
 // use num::bigint::BigInt;
 
@@ -11,10 +10,10 @@ use std::collections::HashMap;
 use std::num::NonZero;
 use std::str::FromStr;
 use std::sync::mpsc;
-use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
 
+use libp2p::futures::join;
 use libp2p::{
     autonat,
     core::{self, Multiaddr, Transport},
@@ -130,7 +129,7 @@ pub async fn run(_argument: String) -> Result<(), JsError> {
 
     let mut connected_peers: HashMap<PeerId, PeerFile> = HashMap::new();
     let mut overlay_peers: HashMap<String, PeerId> = HashMap::new();
-    let mut accounting_peers: Mutex<HashMap<PeerId, Mutex<PeerAccounting>>> =
+    let accounting_peers: Mutex<HashMap<PeerId, Mutex<PeerAccounting>>> =
         Mutex::new(HashMap::new());
 
     let (peers_instructions_chan_outgoing, peers_instructions_chan_incoming) = mpsc::channel();
@@ -228,8 +227,8 @@ pub async fn run(_argument: String) -> Result<(), JsError> {
             if !pt_in.is_err() {
                 let (peer, amount) = pt_in.unwrap();
                 let accounting = accounting_peers.lock().unwrap();
-                let accountingPeer = accounting.get(&peer).unwrap();
-                set_payment_threshold(accountingPeer, amount);
+                let accounting_peer = accounting.get(&peer).unwrap();
+                set_payment_threshold(accounting_peer, amount);
             }
 
             let re_out = refreshment_instructions_chan_incoming.try_recv();
@@ -244,8 +243,8 @@ pub async fn run(_argument: String) -> Result<(), JsError> {
             if !re_in.is_err() {
                 let (peer, amount) = re_in.unwrap();
                 let accounting = accounting_peers.lock().unwrap();
-                let accountingPeer = accounting.get(&peer).unwrap();
-                apply_refreshment(accountingPeer, amount);
+                let accounting_peer = accounting.get(&peer).unwrap();
+                apply_refreshment(accounting_peer, amount);
             }
 
             let that = connections_instructions_chan_incoming.try_recv();
@@ -373,6 +372,8 @@ async fn retrieve_chunk(
     accounting: &Mutex<HashMap<PeerId, Mutex<PeerAccounting>>>,
     refresh_chan: &mpsc::Sender<(PeerId, u64)>,
 ) {
+    let timestart = Date::now();
+
     let mut closest_overlay = "".to_string();
     let mut closest_peer_id = libp2p::PeerId::random();
     let mut current_max_po = 0;
@@ -424,6 +425,13 @@ async fn retrieve_chunk(
         "Successfully retrieved chunk {:#?} from peer {:#?}!",
         chunk_data.unwrap(),
         closest_peer_id
+    )));
+
+    let timeend = Date::now();
+
+    web_sys::console::log_1(&JsValue::from(format!(
+        "Retrieve time duration {} ms!",
+        timeend - timestart
     )));
 
     // make skiplist

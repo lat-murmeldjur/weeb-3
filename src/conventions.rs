@@ -9,7 +9,7 @@ use libp2p::multiaddr::Protocol;
 use wasm_bindgen::prelude::*;
 use web_sys::{Document, HtmlElement};
 
-pub const max_po: u8 = 31;
+pub const MAX_PO: u8 = 31;
 
 // pub fn a() {}
 
@@ -72,7 +72,7 @@ fn js_error(msg: &str) -> JsError {
 }
 
 pub fn get_proximity(one: &Vec<u8>, other: &Vec<u8>) -> u8 {
-    let mut b: usize = (max_po / 4 + 1).into();
+    let mut b: usize = (MAX_PO / 4 + 1).into();
 
     if b > one.len() {
         b = one.len();
@@ -95,7 +95,7 @@ pub fn get_proximity(one: &Vec<u8>, other: &Vec<u8>) -> u8 {
             //            }
         }
     }
-    return max_po;
+    return MAX_PO;
 
     //    if l := uint8(len(one)); b > l {
     //        b = l
