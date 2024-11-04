@@ -96,7 +96,7 @@ pub async fn run(_argument: String) -> Result<(), JsError> {
     init_panic_hook();
 
     let idle_duration = Duration::from_secs(60);
-
+    let interruptor = 700.0;
     // let body = Body::from_current_window()?;
     // body.append_p(&format!("Attempt to establish connection over websocket"))?;
 
@@ -202,70 +202,70 @@ pub async fn run(_argument: String) -> Result<(), JsError> {
         .await;
     };
 
+    let swarm_event_handle = async {
+        loop {
+            let event = swarm.next().await.unwrap();
+            match event {
+                    SwarmEvent::ConnectionEstablished {
+                        // peer_id,
+                        // established_in,
+                        ..
+                    } => {
+                        //
+                    }
+                    SwarmEvent::ConnectionClosed { peer_id, .. } => {
+                        {
+                            let mut connected_peers_map = connected_peers.lock().unwrap();
+                            let mut overlay_peers_map = overlay_peers.lock().unwrap();
+                            overlay_peers_map.remove(&hex::encode(connected_peers_map.get(&peer_id).unwrap().overlay.clone()));
+                            connected_peers_map.remove(&peer_id);
+                        }
+                        let mut accounting = accounting_peers.lock().unwrap();
+                        accounting.remove(&peer_id);
+                    }
+                    _ => {}
+                }
+            web_sys::console::log_1(&JsValue::from(format!(
+                "Current Event Handled {:#?}",
+                event
+            )));
+            while let paddr = peers_instructions_chan_incoming.try_recv() {
+                if !paddr.is_err() {
+                    let addr =
+                        libp2p::core::Multiaddr::try_from(paddr.clone().unwrap().underlay).unwrap();
+                    swarm.dial(addr).unwrap();
+                    let _ = connections_instructions_chan_outgoing.send(paddr.unwrap());
+                } else {
+                    break;
+                };
+            }
+        }
+    };
+
     let event_handle = async {
         let mut timelast = Date::now();
+        let mut interrupt_last = Date::now();
         loop {
+            let timenow = Date::now();
+            let seg = timenow - interrupt_last;
+            if seg < interruptor {
+                web_sys::console::log_1(&JsValue::from(format!(
+                    "Relaxing loop for {}",
+                    interruptor - seg
+                )));
+                async_std::task::sleep(Duration::from_millis((interruptor - seg) as u64)).await;
+            }
+            let timenow = Date::now();
+            interrupt_last = timenow;
+
+            // only used for retr prototype progress
+            let timelast_r = timelast;
+            if timelast + 1000.0 < timenow {
+                timelast = timenow
+            }
+            //
+
             let k0 = async {
-                let timenow = Date::now();
-                if timelast + 1000.0 < timenow {
-                    web_sys::console::log_1(&JsValue::from(format!(
-                        "Time Elapsed Since Last Attempt {}",
-                        timenow - timelast
-                    )));
-                    timelast = timenow;
-                    web_sys::console::log_1(&JsValue::from(format!(
-                        "Retrieve Chunk Attempt {:#?}",
-                        timenow
-                    )));
-                    retrieve_chunk(
-                        hex::decode(
-                            "3ab408eea4f095bde55c1caeeac8e7fcff49477660f0a28f652f0a6d9c60d05f",
-                        )
-                        .unwrap(),
-                        &mut ctrl5,
-                        &overlay_peers,
-                        &accounting_peers,
-                        &refreshment_instructions_chan_outgoing,
-                    )
-                    .await;
-                }
-            };
-            let k1 = async {
-                while let pt_in = pricing_chan_incoming.try_recv() {
-                    if !pt_in.is_err() {
-                        let (peer, amount) = pt_in.unwrap();
-                        let accounting = accounting_peers.lock().unwrap();
-                        let accounting_peer = accounting.get(&peer).unwrap();
-                        set_payment_threshold(accounting_peer, amount);
-                    } else {
-                        break;
-                    }
-                }
-            };
-            let k2 = async {
-                while let re_out = refreshment_instructions_chan_incoming.try_recv() {
-                    if !re_out.is_err() {
-                        web_sys::console::log_1(&JsValue::from(format!("Refresh attempt")));
-                        let (peer, amount) = re_out.unwrap();
-                        refresh_handler(peer, amount, &mut ctrl4, &refreshment_chan_outgoing).await;
-                    } else {
-                        break;
-                    }
-                }
-            };
-            let k3 = async {
-                while let re_in = refreshment_chan_incoming.try_recv() {
-                    if !re_in.is_err() {
-                        let (peer, amount) = re_in.unwrap();
-                        let accounting = accounting_peers.lock().unwrap();
-                        let accounting_peer = accounting.get(&peer).unwrap();
-                        apply_refreshment(accounting_peer, amount);
-                    } else {
-                        break;
-                    }
-                }
-            };
-            let k4 = async {
                 while let that = connections_instructions_chan_incoming.try_recv() {
                     if !that.is_err() {
                         let addr3 =
@@ -287,7 +287,8 @@ pub async fn run(_argument: String) -> Result<(), JsError> {
                     }
                 }
             };
-            let k5 = async {
+
+            let k1 = async {
                 while let incoming_peer = accounting_peer_chan_incoming.try_recv() {
                     if !incoming_peer.is_err() {
                         // Accounting connect
@@ -326,52 +327,78 @@ pub async fn run(_argument: String) -> Result<(), JsError> {
                 }
             };
 
-            let k6 = async {
-                let event = swarm.next().await.unwrap();
-                match event {
-                    SwarmEvent::ConnectionEstablished {
-                        // peer_id,
-                        // established_in,
-                        ..
-                    } => {
-                        //
-                    }
-                    SwarmEvent::ConnectionClosed { peer_id, .. } => {
-                        {
-                            let mut connected_peers_map = connected_peers.lock().unwrap();
-                            let mut overlay_peers_map = overlay_peers.lock().unwrap();
-                            overlay_peers_map.remove(&hex::encode(connected_peers_map.get(&peer_id).unwrap().overlay.clone()));
-                            connected_peers_map.remove(&peer_id);
-                        }
-                        let mut accounting = accounting_peers.lock().unwrap();
-                        accounting.remove(&peer_id);
-                    }
-                    _ => {}
-                }
-                web_sys::console::log_1(&JsValue::from(format!(
-                    "Current Event Handled {:#?}",
-                    event
-                )));
-                while let paddr = peers_instructions_chan_incoming.try_recv() {
-                    if !paddr.is_err() {
-                        let addr =
-                            libp2p::core::Multiaddr::try_from(paddr.clone().unwrap().underlay)
-                                .unwrap();
-                        swarm.dial(addr).unwrap();
-                        let _ = connections_instructions_chan_outgoing.send(paddr.unwrap());
-                    } else {
-                        break;
-                    };
+            let k2 = async {
+                let timenow = Date::now();
+                if timelast_r + 1000.0 < timenow {
+                    web_sys::console::log_1(&JsValue::from(format!(
+                        "Time Elapsed Since Last Attempt {}",
+                        timenow - timelast
+                    )));
+                    timelast = timenow;
+                    web_sys::console::log_1(&JsValue::from(format!(
+                        "Retrieve Chunk Attempt {:#?}",
+                        timenow
+                    )));
+                    retrieve_chunk(
+                        hex::decode(
+                            "3ab408eea4f095bde55c1caeeac8e7fcff49477660f0a28f652f0a6d9c60d05f",
+                        )
+                        .unwrap(),
+                        &mut ctrl5,
+                        &overlay_peers,
+                        &accounting_peers,
+                        &refreshment_instructions_chan_outgoing,
+                    )
+                    .await;
                 }
             };
 
-            join!(k0, k1, k2, k3, k4, k5, k6);
+            let k3 = async {
+                while let pt_in = pricing_chan_incoming.try_recv() {
+                    if !pt_in.is_err() {
+                        let (peer, amount) = pt_in.unwrap();
+                        let accounting = accounting_peers.lock().unwrap();
+                        let accounting_peer = accounting.get(&peer).unwrap();
+                        set_payment_threshold(accounting_peer, amount);
+                    } else {
+                        break;
+                    }
+                }
+            };
+
+            let k4 = async {
+                while let re_out = refreshment_instructions_chan_incoming.try_recv() {
+                    if !re_out.is_err() {
+                        web_sys::console::log_1(&JsValue::from(format!("Refresh attempt")));
+                        let (peer, amount) = re_out.unwrap();
+                        refresh_handler(peer, amount, &mut ctrl4, &refreshment_chan_outgoing).await;
+                    } else {
+                        break;
+                    }
+                }
+            };
+
+            let k5 = async {
+                while let re_in = refreshment_chan_incoming.try_recv() {
+                    if !re_in.is_err() {
+                        let (peer, amount) = re_in.unwrap();
+                        let accounting = accounting_peers.lock().unwrap();
+                        let accounting_peer = accounting.get(&peer).unwrap();
+                        apply_refreshment(accounting_peer, amount);
+                    } else {
+                        break;
+                    }
+                }
+            };
+
+            join!(k0, k1, k2, k3, k4, k5);
         }
     };
 
     join!(
         conn_handle,
         event_handle,
+        swarm_event_handle,
         gossip_inbound_handle,
         pricing_inbound_handle,
     );
@@ -405,7 +432,7 @@ impl Behaviour {
                     .with_push_listen_addr_updates(true)
                     .with_interval(Duration::from_secs(60)), // .with_cache_size(10), //
             ),
-            ping: ping::Behaviour::new(ping::Config::new().with_interval(Duration::from_secs(1))),
+            ping: ping::Behaviour::new(ping::Config::new().with_interval(Duration::from_secs(100))),
             stream: stream::Behaviour::new(),
         }
     }

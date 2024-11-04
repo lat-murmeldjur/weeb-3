@@ -40,6 +40,7 @@ libp2p-webrtc = { git = "https://github.com/libp2p/rust-libp2p.git",  features =
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 console_error_panic_hook = { git = "https://github.com/rustwasm/console_error_panic_hook.git" }
+async-std = { git = "https://github.com/async-rs/async-std.git" }
 libp2p = { git = "https://github.com/libp2p/rust-libp2p.git", features = [ 
 "autonat", 
 "dcutr", 
