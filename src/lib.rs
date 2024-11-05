@@ -96,7 +96,7 @@ pub async fn run(_argument: String) -> Result<(), JsError> {
     init_panic_hook();
 
     let idle_duration = Duration::from_secs(60);
-    let interruptor = 700.0;
+    let interruptor = 128.0;
     // let body = Body::from_current_window()?;
     // body.append_p(&format!("Attempt to establish connection over websocket"))?;
 
@@ -127,8 +127,8 @@ pub async fn run(_argument: String) -> Result<(), JsError> {
         })
         .build();
 
-    let mut connected_peers: Mutex<HashMap<PeerId, PeerFile>> = Mutex::new(HashMap::new());
-    let mut overlay_peers: Mutex<HashMap<String, PeerId>> = Mutex::new(HashMap::new());
+    let connected_peers: Mutex<HashMap<PeerId, PeerFile>> = Mutex::new(HashMap::new());
+    let overlay_peers: Mutex<HashMap<String, PeerId>> = Mutex::new(HashMap::new());
     let accounting_peers: Mutex<HashMap<PeerId, Mutex<PeerAccounting>>> =
         Mutex::new(HashMap::new());
 
@@ -204,6 +204,21 @@ pub async fn run(_argument: String) -> Result<(), JsError> {
 
     let swarm_event_handle = async {
         loop {
+            while let paddr = peers_instructions_chan_incoming.try_recv() {
+                web_sys::console::log_1(&JsValue::from(format!(
+                    "Current Conn Handled {:#?}",
+                    paddr
+                )));
+                if !paddr.is_err() {
+                    let addr4 =
+                        libp2p::core::Multiaddr::try_from(paddr.clone().unwrap().underlay).unwrap();
+                    swarm.dial(addr4).unwrap();
+                    let _ = connections_instructions_chan_outgoing.send(paddr.unwrap());
+                } else {
+                    break;
+                };
+            }
+
             let event = swarm.next().await.unwrap();
             match event {
                     SwarmEvent::ConnectionEstablished {
@@ -217,11 +232,18 @@ pub async fn run(_argument: String) -> Result<(), JsError> {
                         {
                             let mut connected_peers_map = connected_peers.lock().unwrap();
                             let mut overlay_peers_map = overlay_peers.lock().unwrap();
-                            overlay_peers_map.remove(&hex::encode(connected_peers_map.get(&peer_id).unwrap().overlay.clone()));
-                            connected_peers_map.remove(&peer_id);
+                            if connected_peers_map.contains_key(&peer_id) {
+                                let ol0 = hex::encode(connected_peers_map.get(&peer_id).unwrap().overlay.clone());
+                                if overlay_peers_map.contains_key(&ol0) {
+                                    overlay_peers_map.remove(&ol0);
+                                };
+                                connected_peers_map.remove(&peer_id);
+                            };
                         }
                         let mut accounting = accounting_peers.lock().unwrap();
-                        accounting.remove(&peer_id);
+                        if accounting.contains_key(&peer_id) {
+                            accounting.remove(&peer_id);
+                        };
                     }
                     _ => {}
                 }
@@ -229,16 +251,6 @@ pub async fn run(_argument: String) -> Result<(), JsError> {
                 "Current Event Handled {:#?}",
                 event
             )));
-            while let paddr = peers_instructions_chan_incoming.try_recv() {
-                if !paddr.is_err() {
-                    let addr =
-                        libp2p::core::Multiaddr::try_from(paddr.clone().unwrap().underlay).unwrap();
-                    swarm.dial(addr).unwrap();
-                    let _ = connections_instructions_chan_outgoing.send(paddr.unwrap());
-                } else {
-                    break;
-                };
-            }
         }
     };
 
@@ -250,7 +262,7 @@ pub async fn run(_argument: String) -> Result<(), JsError> {
             let seg = timenow - interrupt_last;
             if seg < interruptor {
                 web_sys::console::log_1(&JsValue::from(format!(
-                    "Relaxing loop for {}",
+                    "Ease event handle loop for {}",
                     interruptor - seg
                 )));
                 async_std::task::sleep(Duration::from_millis((interruptor - seg) as u64)).await;
@@ -260,7 +272,8 @@ pub async fn run(_argument: String) -> Result<(), JsError> {
 
             // only used for retr prototype progress
             let timelast_r = timelast;
-            if timelast + 1000.0 < timenow {
+
+            if timelast + interruptor < timenow {
                 timelast = timenow
             }
             //
@@ -329,10 +342,10 @@ pub async fn run(_argument: String) -> Result<(), JsError> {
 
             let k2 = async {
                 let timenow = Date::now();
-                if timelast_r + 1000.0 < timenow {
+                if timelast_r + interruptor < timenow {
                     web_sys::console::log_1(&JsValue::from(format!(
                         "Time Elapsed Since Last Attempt {}",
-                        timenow - timelast
+                        timenow - timelast_r
                     )));
                     timelast = timenow;
                     web_sys::console::log_1(&JsValue::from(format!(
@@ -432,7 +445,7 @@ impl Behaviour {
                     .with_push_listen_addr_updates(true)
                     .with_interval(Duration::from_secs(60)), // .with_cache_size(10), //
             ),
-            ping: ping::Behaviour::new(ping::Config::new().with_interval(Duration::from_secs(100))),
+            ping: ping::Behaviour::new(ping::Config::new().with_interval(Duration::from_secs(16))),
             stream: stream::Behaviour::new(),
         }
     }
@@ -478,7 +491,10 @@ async fn retrieve_chunk(
         let accounting_peers = accounting.lock().unwrap();
         if accounting_peers.contains_key(&closest_peer_id) {
             let accounting_peer = accounting_peers.get(&closest_peer_id).unwrap();
-            reserve(accounting_peer, req_price, refresh_chan);
+            let allowed = reserve(accounting_peer, req_price, refresh_chan);
+            if !allowed {
+                return;
+            }
         } else {
             return;
         }
@@ -505,7 +521,7 @@ async fn retrieve_chunk(
 
     let cd = match chunk_data {
         Ok(x) => x,
-        Err(x) => vec![],
+        Err(_x) => vec![],
     };
 
     if cd.len() > 0 {

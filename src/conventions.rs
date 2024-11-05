@@ -90,27 +90,7 @@ pub fn get_proximity(one: &Vec<u8>, other: &Vec<u8>) -> u8 {
             if (oxo >> (7 - j)) & 0x01 != 0 {
                 return (i * 8 + j).try_into().unwrap();
             }
-            //            if (oxo>>(7-j))&0x01 != 0 {
-            //                return i*8 + j
-            //            }
         }
     }
     return MAX_PO;
-
-    //    if l := uint8(len(one)); b > l {
-    //        b = l
-    //    }
-    //    if l := uint8(len(other)); b > l {
-    //        b = l
-    //    }
-    //    var m uint8 = 8
-    //    for i := uint8(0); i < b; i++ {
-    //        oxo := one[i] ^ other[i]
-    //        for j := uint8(0); j < m; j++ {
-    //            if (oxo>>(7-j))&0x01 != 0 {
-    //                return i*8 + j
-    //            }
-    //        }
-    //    }
-    //    return MaxPO
 }

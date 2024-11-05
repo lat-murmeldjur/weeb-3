@@ -65,8 +65,15 @@ pub async fn ceive(
         }
     }
 
-    let rec_0 =
-        etiquette_1::SynAck::decode_length_delimited(&mut Cursor::new(buf_nondiscard_0)).unwrap();
+    let rec_0_u = etiquette_1::SynAck::decode_length_delimited(&mut Cursor::new(buf_nondiscard_0));
+
+    let rec_0 = match rec_0_u {
+        Ok(x) => x,
+        Err(_x) => {
+            let _ = stream.close().await;
+            return Ok(());
+        }
+    };
 
     let underlay = libp2p::core::Multiaddr::try_from(rec_0.syn.unwrap().observed_underlay).unwrap();
 
@@ -118,6 +125,7 @@ pub async fn ceive(
     step_1.encode_length_delimited(&mut bufw_1).unwrap();
     stream.write_all(&bufw_1).await?;
 
+    let _ = stream.close().await;
     web_sys::console::log_1(&JsValue::from(format!("Connected Peer {:#?}!", peer)));
 
     chan.send(PeerFile {
@@ -125,8 +133,6 @@ pub async fn ceive(
         overlay: peer_overlay.clone(),
     })
     .unwrap();
-
-    stream.close().await.unwrap();
 
     Ok(())
 }
@@ -159,7 +165,7 @@ pub async fn pricing_handler(
     empty.encode_length_delimited(&mut buf_empty).unwrap();
 
     stream.write_all(&buf_empty).await?;
-    stream.flush().await.unwrap();
+    let _ = stream.flush().await;
 
     let mut buf_nondiscard_0 = Vec::new();
     let mut buf_discard_0: [u8; 255] = [0; 255];
@@ -171,10 +177,19 @@ pub async fn pricing_handler(
         }
     }
 
-    let rec_0 = etiquette_4::AnnouncePaymentThreshold::decode_length_delimited(&mut Cursor::new(
+    let _ = stream.flush().await;
+    let _ = stream.close().await;
+
+    let rec_0_u = etiquette_4::AnnouncePaymentThreshold::decode_length_delimited(&mut Cursor::new(
         buf_nondiscard_0,
-    ))
-    .unwrap();
+    ));
+
+    let rec_0 = match rec_0_u {
+        Ok(x) => x,
+        Err(_x) => {
+            return Ok(());
+        }
+    };
 
     web_sys::console::log_1(&JsValue::from(format!(
         "Got AnnouncePaymentThreshold {:#?}!",
@@ -186,9 +201,6 @@ pub async fn pricing_handler(
         .unwrap();
 
     let _ = chan.send((peer, pt));
-
-    stream.flush().await.unwrap();
-    stream.close().await?;
 
     Ok(())
 }
@@ -221,7 +233,7 @@ pub async fn gossip_handler(
     empty.encode_length_delimited(&mut buf_empty).unwrap();
 
     stream.write_all(&buf_empty).await?;
-    stream.flush().await.unwrap();
+    let _ = stream.flush().await;
 
     let mut buf_nondiscard_0 = Vec::new();
     let mut buf_discard_0: [u8; 255] = [0; 255];
@@ -233,18 +245,27 @@ pub async fn gossip_handler(
         }
     }
 
-    let rec_0 =
-        etiquette_2::Peers::decode_length_delimited(&mut Cursor::new(buf_nondiscard_0)).unwrap();
+    let _ = stream.flush().await;
+    let _ = stream.close().await;
+
+    let rec_0_u = etiquette_2::Peers::decode_length_delimited(&mut Cursor::new(buf_nondiscard_0));
+
+    let rec_0 = match rec_0_u {
+        Ok(x) => x,
+        Err(_x) => {
+            return Ok(());
+        }
+    };
 
     // web_sys::console::log_1(&JsValue::from(format!("Got Peers Message {:#?}!", rec_0)));
 
     for peer in rec_0.peers {
-        // web_sys::console::log_1(&JsValue::from(format!("Got Peer {:#?}!", peer)));
+        web_sys::console::log_1(&JsValue::from(format!(
+            "Got Peer {:#?}!",
+            hex::encode(&peer.overlay)
+        )));
         chan.send(peer).unwrap();
     }
-
-    stream.flush().await?;
-    stream.close().await?;
 
     Ok(())
 }
@@ -269,7 +290,7 @@ pub async fn fresh(
     empty.encode_length_delimited(&mut buf_empty).unwrap();
 
     stream.write_all(&buf_empty).await?;
-    stream.flush().await.unwrap();
+    let _ = stream.flush().await;
 
     let mut buf_nondiscard_0 = Vec::new();
     let mut buf_discard_0: [u8; 255] = [0; 255];
@@ -303,9 +324,16 @@ pub async fn fresh(
         }
     }
 
-    let rec_0 =
-        etiquette_5::PaymentAck::decode_length_delimited(&mut Cursor::new(buf_nondiscard_0))
-            .unwrap();
+    let _ = stream.close().await;
+    let rec_0_u =
+        etiquette_5::PaymentAck::decode_length_delimited(&mut Cursor::new(buf_nondiscard_0));
+
+    let rec_0 = match rec_0_u {
+        Ok(x) => x,
+        Err(_x) => {
+            return Ok(());
+        }
+    };
 
     let refr_am = BigUint::from_bytes_be(&rec_0.amount).to_u64().unwrap();
 
@@ -317,8 +345,6 @@ pub async fn fresh(
     if amount > 0 {
         chan.send((peer, refr_am)).unwrap();
     }
-
-    stream.close().await.unwrap();
 
     Ok(())
 }
@@ -342,7 +368,7 @@ pub async fn trieve(
     empty.encode_length_delimited(&mut buf_empty).unwrap();
 
     stream.write_all(&buf_empty).await?;
-    stream.flush().await.unwrap();
+    let _ = stream.flush().await;
 
     let mut buf_nondiscard_0 = Vec::new();
     let mut buf_discard_0: [u8; 255] = [0; 255];
@@ -376,8 +402,17 @@ pub async fn trieve(
         }
     }
 
-    let rec_0 =
-        etiquette_6::Delivery::decode_length_delimited(&mut Cursor::new(buf_nondiscard_0)).unwrap();
+    let _ = stream.close().await;
+
+    let rec_0_u =
+        etiquette_6::Delivery::decode_length_delimited(&mut Cursor::new(buf_nondiscard_0));
+
+    let rec_0 = match rec_0_u {
+        Ok(x) => x,
+        Err(_x) => {
+            return Ok(());
+        }
+    };
 
     web_sys::console::log_1(&JsValue::from(format!(
         "Got chunk {:#?} from peer {:#?}!",
@@ -385,8 +420,6 @@ pub async fn trieve(
     )));
 
     chan.send(rec_0.data).unwrap();
-
-    stream.close().await.unwrap();
 
     Ok(())
 }
