@@ -1,4 +1,4 @@
-// #![allow(warnings)]
+#![allow(warnings)]
 #![cfg(target_arch = "wasm32")]
 
 use anyhow::Result;
@@ -85,6 +85,10 @@ const RETRIEVAL_PROTOCOL: StreamProtocol = StreamProtocol::new("/swarm/retrieval
 // const PULL_PROTOCOL: StreamProtocol = StreamProtocol::new("/swarm/pullsync/1.4.0/pullsync");
 // const PUSH_PROTOCOL: StreamProtocol = StreamProtocol::new("/swarm/pushsync/1.3.0/pushsync");
 
+const RETRIEVE_ROUND_TIME: f64 = 1000.0;
+const EVENT_LOOP_INTERRUPTOR: f64 = 200.0;
+const PROTO_LOOP_INTERRUPTOR: f64 = 100.0;
+
 #[wasm_bindgen]
 pub fn init_panic_hook() {
     console_error_panic_hook::set_once();
@@ -96,7 +100,7 @@ pub async fn run(_argument: String) -> Result<(), JsError> {
     init_panic_hook();
 
     let idle_duration = Duration::from_secs(60);
-    let interruptor = 128.0;
+
     // let body = Body::from_current_window()?;
     // body.append_p(&format!("Attempt to establish connection over websocket"))?;
 
@@ -260,12 +264,15 @@ pub async fn run(_argument: String) -> Result<(), JsError> {
         loop {
             let timenow = Date::now();
             let seg = timenow - interrupt_last;
-            if seg < interruptor {
+            if seg < EVENT_LOOP_INTERRUPTOR {
                 web_sys::console::log_1(&JsValue::from(format!(
                     "Ease event handle loop for {}",
-                    interruptor - seg
+                    EVENT_LOOP_INTERRUPTOR - seg
                 )));
-                async_std::task::sleep(Duration::from_millis((interruptor - seg) as u64)).await;
+                async_std::task::sleep(Duration::from_millis(
+                    (EVENT_LOOP_INTERRUPTOR - seg) as u64,
+                ))
+                .await;
             }
             let timenow = Date::now();
             interrupt_last = timenow;
@@ -273,14 +280,16 @@ pub async fn run(_argument: String) -> Result<(), JsError> {
             // only used for retr prototype progress
             let timelast_r = timelast;
 
-            if timelast + interruptor < timenow {
+            if timelast + EVENT_LOOP_INTERRUPTOR < timenow {
                 timelast = timenow
             }
             //
 
             let k0 = async {
+                web_sys::console::log_1(&JsValue::from(format!("Got frih")));
                 while let that = connections_instructions_chan_incoming.try_recv() {
                     if !that.is_err() {
+                        web_sys::console::log_1(&JsValue::from(format!("Got frih2")));
                         let addr3 =
                             libp2p::core::Multiaddr::try_from(that.unwrap().underlay).unwrap();
                         let id = try_from_multiaddr(&addr3);
@@ -340,32 +349,6 @@ pub async fn run(_argument: String) -> Result<(), JsError> {
                 }
             };
 
-            let k2 = async {
-                let timenow = Date::now();
-                if timelast_r + interruptor < timenow {
-                    web_sys::console::log_1(&JsValue::from(format!(
-                        "Time Elapsed Since Last Attempt {}",
-                        timenow - timelast_r
-                    )));
-                    timelast = timenow;
-                    web_sys::console::log_1(&JsValue::from(format!(
-                        "Retrieve Chunk Attempt {:#?}",
-                        timenow
-                    )));
-                    retrieve_chunk(
-                        hex::decode(
-                            "3ab408eea4f095bde55c1caeeac8e7fcff49477660f0a28f652f0a6d9c60d05f",
-                        )
-                        .unwrap(),
-                        &mut ctrl5,
-                        &overlay_peers,
-                        &accounting_peers,
-                        &refreshment_instructions_chan_outgoing,
-                    )
-                    .await;
-                }
-            };
-
             let k3 = async {
                 while let pt_in = pricing_chan_incoming.try_recv() {
                     if !pt_in.is_err() {
@@ -384,7 +367,21 @@ pub async fn run(_argument: String) -> Result<(), JsError> {
                     if !re_out.is_err() {
                         web_sys::console::log_1(&JsValue::from(format!("Refresh attempt")));
                         let (peer, amount) = re_out.unwrap();
-                        refresh_handler(peer, amount, &mut ctrl4, &refreshment_chan_outgoing).await;
+                        let mut daten = Date::now();
+                        let datenow = Date::now();
+                        {
+                            let accounting = accounting_peers.lock().unwrap();
+                            let accounting_peer_lock = accounting.get(&peer).unwrap();
+                            let mut accounting_peer = accounting_peer_lock.lock().unwrap();
+                            daten = accounting_peer.refreshment;
+                            if datenow > accounting_peer.refreshment + 1000.0 {
+                                accounting_peer.refreshment = datenow;
+                            }
+                        }
+                        if datenow > daten + 1000.0 {
+                            refresh_handler(peer, amount, &mut ctrl4, &refreshment_chan_outgoing)
+                                .await;
+                        }
                     } else {
                         break;
                     }
@@ -404,13 +401,55 @@ pub async fn run(_argument: String) -> Result<(), JsError> {
                 }
             };
 
-            join!(k0, k1, k2, k3, k4, k5);
+            join!(k0, k1, k3, k4, k5);
+        }
+    };
+
+    let k2_handle = async {
+        let mut timelast = Date::now();
+        let mut interrupt_last = Date::now();
+
+        loop {
+            let timenow = Date::now();
+            let seg = timenow - timelast;
+            if seg < PROTO_LOOP_INTERRUPTOR {
+                web_sys::console::log_1(&JsValue::from(format!(
+                    "Ease proto event handle loop for {}",
+                    PROTO_LOOP_INTERRUPTOR - seg
+                )));
+                async_std::task::sleep(Duration::from_millis(
+                    (PROTO_LOOP_INTERRUPTOR - seg) as u64,
+                ))
+                .await;
+            }
+            let timenow = Date::now();
+            interrupt_last = timenow;
+
+            web_sys::console::log_1(&JsValue::from(format!(
+                "Time Elapsed Since Last Attempt {}",
+                timenow - timelast
+            )));
+            timelast = timenow;
+            web_sys::console::log_1(&JsValue::from(format!(
+                "Retrieve Chunk Attempt {:#?}",
+                timenow
+            )));
+            retrieve_chunk(
+                hex::decode("3ab408eea4f095bde55c1caeeac8e7fcff49477660f0a28f652f0a6d9c60d05f")
+                    .unwrap(),
+                &mut ctrl5,
+                &overlay_peers,
+                &accounting_peers,
+                &refreshment_instructions_chan_outgoing,
+            )
+            .await;
         }
     };
 
     join!(
         conn_handle,
         event_handle,
+        k2_handle,
         swarm_event_handle,
         gossip_inbound_handle,
         pricing_inbound_handle,
@@ -459,48 +498,114 @@ async fn retrieve_chunk(
     refresh_chan: &mpsc::Sender<(PeerId, u64)>,
 ) {
     let timestart = Date::now();
+    let mut skiplist: HashMap<PeerId, _> = HashMap::new();
+    let mut overdraftlist: HashMap<PeerId, _> = HashMap::new();
 
     let mut closest_overlay = "".to_string();
     let mut closest_peer_id = libp2p::PeerId::random();
+
+    let mut seer = true;
+    let mut selected = false;
+    let mut round_commence = Date::now();
     let mut current_max_po = 0;
 
-    let peers_map = peers.lock().unwrap();
-    for (ov, id) in peers_map.iter() {
-        let current_po = get_proximity(&chunk_address, &hex::decode(&ov).unwrap());
+    while seer {
+        closest_overlay = "".to_string();
+        closest_peer_id = libp2p::PeerId::random();
+        current_max_po = 0;
+        selected = false;
+        {
+            let peers_map = peers.lock().unwrap();
+            for (ov, id) in peers_map.iter() {
+                if skiplist.contains_key(id) {
+                    continue;
+                }
+                let current_po = get_proximity(&chunk_address, &hex::decode(&ov).unwrap());
+
+                if current_po >= current_max_po {
+                    selected = true;
+                    closest_overlay = ov.clone();
+                    closest_peer_id = id.clone();
+                    current_max_po = current_po;
+                }
+            }
+        }
+        if selected {
+            skiplist.insert(closest_peer_id, "");
+            web_sys::console::log_1(&JsValue::from(format!(
+                "Selected peer {:#?}!",
+                closest_peer_id
+            )));
+        } else {
+            if overdraftlist.is_empty() {
+                return;
+            } else {
+                for (k, _v) in overdraftlist.iter() {
+                    let _ = refresh_chan.send((k.clone(), 10 * crate::accounting::REFRESH_RATE));
+                    skiplist.remove(k);
+                }
+                overdraftlist.clear();
+
+                let round_now = Date::now();
+
+                let seg = round_now - round_commence;
+                if seg < RETRIEVE_ROUND_TIME {
+                    web_sys::console::log_1(&JsValue::from(format!(
+                        "Ease retrieve overdraft retries loop for {}",
+                        RETRIEVE_ROUND_TIME - seg
+                    )));
+                    async_std::task::sleep(Duration::from_millis(
+                        (RETRIEVE_ROUND_TIME - seg) as u64,
+                    ))
+                    .await;
+                }
+
+                round_commence = Date::now();
+
+                continue;
+            }
+        }
+
+        let req_price = price(closest_overlay.clone(), &chunk_address);
 
         web_sys::console::log_1(&JsValue::from(format!(
-            "Got PO {:#?} for chunk {:#?} to peer {:#?}!",
-            current_po, chunk_address, ov
+            "Reserve price {:#?} for chunk {:#?} from peer {:#?}!",
+            req_price, chunk_address, closest_peer_id
         )));
 
-        if current_po >= current_max_po {
-            closest_overlay = ov.clone();
-            closest_peer_id = *id;
-            current_max_po = current_po;
-        }
-    }
-
-    let req_price = price(closest_overlay, &chunk_address);
-
-    web_sys::console::log_1(&JsValue::from(format!(
-        "Reserve price {:#?} for chunk {:#?} from peer {:#?}!",
-        req_price, chunk_address, closest_peer_id
-    )));
-
-    {
-        let accounting_peers = accounting.lock().unwrap();
-        if accounting_peers.contains_key(&closest_peer_id) {
-            let accounting_peer = accounting_peers.get(&closest_peer_id).unwrap();
-            let allowed = reserve(accounting_peer, req_price, refresh_chan);
-            if !allowed {
+        {
+            let accounting_peers = accounting.lock().unwrap();
+            if accounting_peers.contains_key(&closest_peer_id) {
+                let accounting_peer = accounting_peers.get(&closest_peer_id).unwrap();
+                let allowed = reserve(accounting_peer, req_price, refresh_chan);
+                if !allowed {
+                    web_sys::console::log_1(&JsValue::from(format!(
+                        "Overdraft for peer {}",
+                        closest_peer_id
+                    )));
+                    overdraftlist.insert(closest_peer_id, "");
+                    continue;
+                } else {
+                    web_sys::console::log_1(&JsValue::from(format!(
+                        "Selected peer with reserve {}!",
+                        closest_peer_id
+                    )));
+                    seer = false;
+                }
+            } else {
                 return;
             }
-        } else {
-            return;
         }
     }
 
+    let req_price = price(closest_overlay.clone(), &chunk_address);
+
     let (chunk_out, chunk_in) = mpsc::channel::<Vec<u8>>();
+
+    web_sys::console::log_1(&JsValue::from(format!(
+        "Actually retrieving for peer {}!",
+        closest_peer_id
+    )));
 
     retrieve_handler(closest_peer_id, chunk_address, control, &chunk_out).await;
 
@@ -537,21 +642,4 @@ async fn retrieve_chunk(
         "Retrieve time duration {} ms!",
         timeend - timestart
     )));
-
-    // make skiplist
-    // make overdraftlist
-
-    // loop
-    // // loop
-    // // // get closest address
-    // //
-    // // // get price
-    // //
-    // // // reserve
-    // // // exit loop on success
-    // //
-
-    // // retrieve attempt
-    // // cancel reserve
-    // // credit and exit loop on success
 }

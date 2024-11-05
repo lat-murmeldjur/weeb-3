@@ -1,4 +1,4 @@
-// #![allow(warnings)]
+#![allow(warnings)]
 #![cfg(target_arch = "wasm32")]
 
 use std::sync::mpsc;
@@ -10,8 +10,8 @@ use js_sys::Date;
 
 use crate::conventions::{get_proximity, PeerAccounting};
 
-const REFRESH_RATE: u64 = 450000;
-const PO_PRICE: u64 = 10000;
+pub const REFRESH_RATE: u64 = 450000;
+pub const PO_PRICE: u64 = 10000;
 
 pub fn set_payment_threshold(a: &Mutex<PeerAccounting>, amount: u64) {
     let mut account = a.lock().unwrap();
@@ -22,7 +22,6 @@ pub fn reserve(a: &Mutex<PeerAccounting>, amount: u64, chan: &mpsc::Sender<(Peer
     let mut account = a.lock().unwrap();
     if account.balance > REFRESH_RATE && account.refreshment + 1000.0 < Date::now() {
         // start refreshing
-        account.refreshment = Date::now();
         let _ = chan.send((account.id.clone(), account.threshold));
     }
     if account.reserve + account.balance + amount < account.threshold {
