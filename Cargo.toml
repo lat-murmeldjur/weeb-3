@@ -63,6 +63,10 @@ web-sys = { version = "0.3.72", features = [
   'console',
   'Document',
   'Element',
+  'EventListener',
+  'MessagePort',
+  'HtmlButtonElement',
+  'HtmlParagraphElement',
   'HtmlElement',
   'HtmlInputElement',
   'MessageEvent',
@@ -71,6 +75,8 @@ web-sys = { version = "0.3.72", features = [
   'Response',
   'Window',
   'Worker',
+  'WorkerOptions',
+  'WorkerType',
 ] }
 tracing-wasm = { git = "https://github.com/old-storyai/tracing-wasm.git" }
 alloy = { git = "https://github.com/alloy-rs/alloy.git", features = [

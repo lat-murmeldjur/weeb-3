@@ -7,7 +7,7 @@ use libp2p::{Multiaddr, PeerId};
 
 use libp2p::multiaddr::Protocol;
 use wasm_bindgen::prelude::*;
-use web_sys::{Document, HtmlElement};
+use web_sys::{Document, EventListener, HtmlButtonElement, HtmlElement, HtmlParagraphElement};
 
 pub const MAX_PO: u8 = 31;
 
@@ -41,7 +41,7 @@ pub struct Body {
 }
 
 impl Body {
-    fn from_current_window() -> Result<Self, JsError> {
+    pub fn from_current_window() -> Result<Self, JsError> {
         let document = web_sys::window()
             .ok_or(js_error("no global `window` exists"))?
             .document()
@@ -53,7 +53,7 @@ impl Body {
         Ok(Self { body, document })
     }
 
-    fn append_p(&self, msg: &str) -> Result<(), JsError> {
+    pub fn append_p(&self, msg: &str) -> Result<(), JsError> {
         let val = self
             .document
             .create_element("p")
