@@ -21,11 +21,9 @@ use libp2p::{
     autonat,
     core::{self, Multiaddr, Transport},
     dcutr,
-    futures::join,
-    futures::StreamExt,
+    futures::{join, select_biased, StreamExt},
     identify, identity,
-    identity::ecdsa,
-    identity::ecdsa::SecretKey,
+    identity::{ecdsa, ecdsa::SecretKey},
     noise, ping,
     swarm::{NetworkBehaviour, SwarmEvent},
     websocket_websys, yamux, PeerId, StreamProtocol, Swarm,
@@ -34,7 +32,9 @@ use libp2p_stream as stream;
 
 use js_sys::Date;
 use wasm_bindgen::{prelude::*, JsValue};
-use web_sys::{console, HtmlElement, HtmlInputElement, MessageEvent, SharedWorker, Worker};
+use web_sys::{
+    console, HtmlElement, HtmlInputElement, MessageEvent, MessagePort, SharedWorker, Worker,
+};
 
 mod conventions;
 use conventions::*;
@@ -118,33 +118,21 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
     ));
 
     // Pass the worker to the function which sets up the `oninput` callback.
-
     body.append_p(&format!("Initializing interface:"))?;
+    {
+        let worker_handle_2 = &*worker_handle.borrow();
+        let port = worker_handle_2.port();
+        let _qxy = port.start();
+    }
 
-    setup_input_oninput_callback(worker_handle);
-
-    console::log_1(&"Created a new worker from within Wasm".into());
-
-    Ok(())
-
-    // body.append_p(&format!("RTT: {rtt:?} at {}", Date::new_0().to_string()))?;
-}
-
-fn setup_input_oninput_callback(worker: Rc<RefCell<web_sys::SharedWorker>>) {
     let document = web_sys::window().unwrap().document().unwrap();
 
-    // If our `onmessage` callback should stay valid after exiting from the
-    // `oninput` closure scope, we need to either forget it (so it is not
-    // destroyed) or store it somewhere. To avoid leaking memory every time we
-    // want to receive a response from the worker, we move a handle into the
-    // `oninput` closure to which we will always attach the last `onmessage`
-    // callback. The initial value will not be used and we silence the warning.
     #[allow(unused_assignments)]
     let mut persistent_callback_handle = get_on_msg_callback();
 
     let callback =
         wasm_bindgen::closure::Closure::<dyn FnMut(web_sys::MessageEvent)>::new(move |msg| {
-            console::log_1(&"oninput callback triggered".into());
+            console::log_1(&"yyeyyyoninput callback triggered".into());
             let document = web_sys::window().unwrap().document().unwrap();
 
             let input_field = document
@@ -158,18 +146,20 @@ fn setup_input_oninput_callback(worker: Rc<RefCell<web_sys::SharedWorker>>) {
             // worker. Otherwise clear the result field.
             match input_field.value().parse::<String>() {
                 Ok(text) => {
-                    console::log_1(&"oninput callback string".into());
+                    console::log_1(&"yyeyyy oninput callback string".into());
                     // Access worker behind shared handle, following the interior
                     // mutability pattern.
-                    let worker_handle = &*worker.borrow();
-                    let _ = worker_handle.port().post_message(&text.into());
+                    let worker_handle_2 = worker_handle.borrow();
+                    let _ = worker_handle_2.port().post_message(&text.into());
                     persistent_callback_handle = get_on_msg_callback();
 
                     // Since the worker returns the message asynchronously, we
                     // attach a callback to be triggered when the worker returns.
-                    worker_handle
+                    worker_handle_2
                         .port()
                         .set_onmessage(Some(persistent_callback_handle.as_ref().unchecked_ref()));
+
+                    console::log_1(&"yyeyyy oninput callback happened".into());
                 }
                 Err(_) => {
                     document
@@ -177,12 +167,11 @@ fn setup_input_oninput_callback(worker: Rc<RefCell<web_sys::SharedWorker>>) {
                         .expect("#resultField should exist")
                         .dyn_ref::<HtmlElement>()
                         .expect("#resultField should be a HtmlElement")
-                        .set_inner_text("");
+                        .set_inner_text("insxyk");
                 }
             }
         });
 
-    // Attach the closure as `oninput` callback to the input field.
     document
         .get_element_by_id("inputString")
         .expect("#inputString should exist")
@@ -190,18 +179,22 @@ fn setup_input_oninput_callback(worker: Rc<RefCell<web_sys::SharedWorker>>) {
         .expect("#inputString should be a HtmlInputElement")
         .set_oninput(Some(callback.as_ref().unchecked_ref()));
 
-    // Leaks memory.
-    callback.forget();
+    // port.set_onmessage(Some(sender_closure.as_ref().unchecked_ref()));
+
+    body.append_p(&format!("Created a new worker from within Wasm"))?;
+
+    loop {
+        async_std::task::sleep(Duration::from_secs(10)).await
+    }
+
+    Ok(())
+
+    // body.append_p(&format!("RTT: {rtt:?} at {}", Date::new_0().to_string()))?;
 }
 
 fn get_on_msg_callback() -> Closure<dyn FnMut(MessageEvent)> {
     Closure::new(move |event: MessageEvent| {
-        console::log_2(&"Received response: ".into(), &event.data());
-
-        let result = match event.data().as_bool().unwrap() {
-            true => "...even...",
-            false => "...odd...",
-        };
+        web_sys::console::log_2(&"Received response: ".into(), &event.data());
 
         let document = web_sys::window().unwrap().document().unwrap();
         document
@@ -209,7 +202,7 @@ fn get_on_msg_callback() -> Closure<dyn FnMut(MessageEvent)> {
             .expect("#resultField should exist")
             .dyn_ref::<HtmlElement>()
             .expect("#resultField should be a HtmlInputElement")
-            .set_inner_text(result);
+            .set_inner_text(&format!("{:#?}", event.data()));
     })
 }
 
@@ -220,13 +213,21 @@ pub struct Sekirei {
     connected_peers: Mutex<HashMap<PeerId, PeerFile>>,
     overlay_peers: Mutex<HashMap<String, PeerId>>,
     accounting_peers: Mutex<HashMap<PeerId, Mutex<PeerAccounting>>>,
+    message_ports: Mutex<Vec<MessagePort>>,
 }
 
 #[wasm_bindgen]
 impl Sekirei {
+    pub fn echo(_st: String) -> String {
+        web_sys::console::log_1(&JsValue::from(format!("Echoing {:#?}", _st)));
+        return _st;
+    }
+
     pub fn new(_st: String) -> Sekirei {
         // tracing_wasm::set_as_global_default(); // uncomment to turn on tracing
         // init_panic_hook();
+
+        web_sys::console::log_1(&JsValue::from(format!("sydh {:#?}", _st)));
 
         let idle_duration = Duration::from_secs(60);
 
@@ -280,6 +281,7 @@ impl Sekirei {
             connected_peers: connected_peers,
             overlay_peers: overlay_peers,
             accounting_peers: accounting_peers,
+            message_ports: Mutex::new(vec![]),
         };
     }
 
