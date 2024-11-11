@@ -94,9 +94,9 @@ const RETRIEVAL_PROTOCOL: StreamProtocol = StreamProtocol::new("/swarm/retrieval
 // const PULL_PROTOCOL: StreamProtocol = StreamProtocol::new("/swarm/pullsync/1.4.0/pullsync");
 // const PUSH_PROTOCOL: StreamProtocol = StreamProtocol::new("/swarm/pushsync/1.3.0/pushsync");
 
-const RETRIEVE_ROUND_TIME: f64 = 600.0;
-const EVENT_LOOP_INTERRUPTOR: f64 = 500.0;
-const PROTO_LOOP_INTERRUPTOR: f64 = 500.0;
+const RETRIEVE_ROUND_TIME: f64 = 200.0;
+const EVENT_LOOP_INTERRUPTOR: f64 = 200.0;
+const PROTO_LOOP_INTERRUPTOR: f64 = 200.0;
 
 #[wasm_bindgen]
 pub fn init_panic_hook() {
@@ -208,24 +208,72 @@ fn get_on_msg_callback() -> Closure<dyn FnMut(MessageEvent)> {
 
 #[wasm_bindgen]
 pub struct Sekirei {
-    swarm: Swarm<Behaviour>,
-    secret_key: SecretKey,
+    swarm: Mutex<Swarm<Behaviour>>,
+    secret_key: Mutex<SecretKey>,
+    wings: Mutex<Wings>,
+    message_port: (
+        mpsc::Sender<(Vec<u8>, mpsc::Sender<Vec<u8>>)>,
+        mpsc::Receiver<(Vec<u8>, mpsc::Sender<Vec<u8>>)>,
+    ),
+}
+
+#[wasm_bindgen]
+pub struct Wings {
     connected_peers: Mutex<HashMap<PeerId, PeerFile>>,
     overlay_peers: Mutex<HashMap<String, PeerId>>,
     accounting_peers: Mutex<HashMap<PeerId, Mutex<PeerAccounting>>>,
-    message_ports: Mutex<Vec<MessagePort>>,
 }
 
 #[wasm_bindgen]
 impl Sekirei {
+    pub async fn acquire(&self, address: String) -> Vec<u8> {
+        let (chan_out, chan_in) = mpsc::channel::<Vec<u8>>();
+        let _ = self
+            .message_port
+            .0
+            .send((hex::decode(address).unwrap(), chan_out));
+
+        let mut timelast = Date::now();
+        // 3ab408eea4f095bde55c1caeeac8e7fcff49477660f0a28f652f0a6d9c60d05f
+        let k0 = async {
+            let mut timelast = Date::now();
+            while let that = chan_in.try_recv() {
+                let timenow = Date::now();
+                timelast = timenow;
+                if !that.is_err() {
+                    return that.unwrap();
+                }
+
+                let timenow = Date::now();
+                let seg = timenow - timelast;
+                if seg < EVENT_LOOP_INTERRUPTOR {
+                    //                web_sys::console::log_1(&JsValue::from(format!(
+                    //                    "Ease event handle loop for {}",
+                    //                    EVENT_LOOP_INTERRUPTOR - seg
+                    //                )));
+                    async_std::task::sleep(Duration::from_millis(
+                        (EVENT_LOOP_INTERRUPTOR - seg) as u64,
+                    ))
+                    .await;
+                };
+            }
+
+            return vec![];
+        };
+
+        let result = k0.await;
+
+        return result;
+    }
+
     pub fn echo(_st: String) -> String {
         web_sys::console::log_1(&JsValue::from(format!("Echoing {:#?}", _st)));
         return _st;
     }
 
     pub fn new(_st: String) -> Sekirei {
-        // tracing_wasm::set_as_global_default(); // uncomment to turn on tracing
-        // init_panic_hook();
+        tracing_wasm::set_as_global_default(); // uncomment to turn on tracing
+        init_panic_hook();
 
         web_sys::console::log_1(&JsValue::from(format!("sydh {:#?}", _st)));
 
@@ -275,17 +323,25 @@ impl Sekirei {
         let accounting_peers: Mutex<HashMap<PeerId, Mutex<PeerAccounting>>> =
             Mutex::new(HashMap::new());
 
+        let (m_out, m_in) = mpsc::channel::<(Vec<u8>, mpsc::Sender<Vec<u8>>)>();
+
         return Sekirei {
-            swarm: swarm,
-            secret_key: secret_key,
-            connected_peers: connected_peers,
-            overlay_peers: overlay_peers,
-            accounting_peers: accounting_peers,
-            message_ports: Mutex::new(vec![]),
+            secret_key: Mutex::new(secret_key),
+            swarm: Mutex::new(swarm),
+            wings: Mutex::new(Wings {
+                connected_peers: connected_peers,
+                overlay_peers: overlay_peers,
+                accounting_peers: accounting_peers,
+            }),
+            message_port: (m_out, m_in),
         };
     }
 
-    pub async fn run(&mut self, _st: String) -> () {
+    pub async fn run(&self, _st: String) -> () {
+        init_panic_hook();
+
+        let mut wings = self.wings.lock().unwrap();
+
         let peer_id =
             libp2p::PeerId::from_str("QmYa9hasbJKBoTpfthcisMPKyGMCidfT1R4VkaRpg14bWP").unwrap();
 
@@ -308,21 +364,20 @@ impl Sekirei {
         let (refreshment_chan_outgoing, refreshment_chan_incoming) =
             mpsc::channel::<(PeerId, u64)>();
 
-        let mut ctrl = self.swarm.behaviour_mut().stream.new_control();
-        let mut ctrl3 = self.swarm.behaviour_mut().stream.new_control();
-        let mut ctrl4 = self.swarm.behaviour_mut().stream.new_control();
-        let mut ctrl5 = self.swarm.behaviour_mut().stream.new_control();
+        let mut swarm = self.swarm.lock().unwrap();
+        let mut ctrl = swarm.behaviour_mut().stream.new_control();
+        let mut ctrl3 = swarm.behaviour_mut().stream.new_control();
+        let mut ctrl4 = swarm.behaviour_mut().stream.new_control();
+        let mut ctrl5 = swarm.behaviour_mut().stream.new_control();
 
-        let mut incoming_pricing_streams = self
-            .swarm
+        let mut incoming_pricing_streams = swarm
             .behaviour_mut()
             .stream
             .new_control()
             .accept(PRICING_PROTOCOL)
             .unwrap();
 
-        let mut incoming_gossip_streams = self
-            .swarm
+        let mut incoming_gossip_streams = swarm
             .behaviour_mut()
             .stream
             .new_control()
@@ -354,7 +409,7 @@ impl Sekirei {
                 peer_id,
                 &mut ctrl,
                 &addr2.clone(),
-                &self.secret_key,
+                &self.secret_key.lock().unwrap(),
                 &accounting_peer_chan_outgoing,
             )
             .await;
@@ -371,14 +426,14 @@ impl Sekirei {
                         let addr4 =
                             libp2p::core::Multiaddr::try_from(paddr.clone().unwrap().underlay)
                                 .unwrap();
-                        self.swarm.dial(addr4).unwrap();
+                        swarm.dial(addr4).unwrap();
                         let _ = connections_instructions_chan_outgoing.send(paddr.unwrap());
                     } else {
                         break;
                     };
                 }
 
-                let event = self.swarm.next().await.unwrap();
+                let event = swarm.next().await.unwrap();
                 match event {
                     SwarmEvent::ConnectionEstablished {
                         // peer_id,
@@ -389,8 +444,8 @@ impl Sekirei {
                     }
                     SwarmEvent::ConnectionClosed { peer_id, .. } => {
                         {
-                            let mut connected_peers_map = self.connected_peers.lock().unwrap();
-                            let mut overlay_peers_map = self.overlay_peers.lock().unwrap();
+                            let mut connected_peers_map = wings.connected_peers.lock().unwrap();
+                            let mut overlay_peers_map = wings.overlay_peers.lock().unwrap();
                             if connected_peers_map.contains_key(&peer_id) {
                                 let ol0 = hex::encode(connected_peers_map.get(&peer_id).unwrap().overlay.clone());
                                 if overlay_peers_map.contains_key(&ol0) {
@@ -399,7 +454,7 @@ impl Sekirei {
                                 connected_peers_map.remove(&peer_id);
                             };
                         }
-                        let mut accounting = self.accounting_peers.lock().unwrap();
+                        let mut accounting = wings.accounting_peers.lock().unwrap();
                         if accounting.contains_key(&peer_id) {
                             accounting.remove(&peer_id);
                         };
@@ -451,7 +506,7 @@ impl Sekirei {
                                     id.expect("not"),
                                     &mut ctrl3,
                                     &addr3.clone(),
-                                    &self.secret_key,
+                                    &self.secret_key.lock().unwrap(),
                                     &accounting_peer_chan_outgoing,
                                 )
                                 .await;
@@ -469,7 +524,7 @@ impl Sekirei {
                             let peer_file: PeerFile = incoming_peer.unwrap();
                             let ol = hex::encode(peer_file.overlay.clone());
                             {
-                                let mut accounting = self.accounting_peers.lock().unwrap();
+                                let mut accounting = wings.accounting_peers.lock().unwrap();
                                 if !accounting.contains_key(&peer_file.peer_id) {
                                     web_sys::console::log_1(&JsValue::from(format!(
                                         "Accounting Connecting Peer {:#?} {:#?}!",
@@ -488,11 +543,11 @@ impl Sekirei {
                                 }
                             }
                             {
-                                let mut overlay_peers_map = self.overlay_peers.lock().unwrap();
+                                let mut overlay_peers_map = wings.overlay_peers.lock().unwrap();
                                 overlay_peers_map.insert(ol, peer_file.peer_id);
                             }
                             {
-                                let mut connected_peers_map = self.connected_peers.lock().unwrap();
+                                let mut connected_peers_map = wings.connected_peers.lock().unwrap();
                                 connected_peers_map.insert(peer_file.peer_id, peer_file);
                             }
                         } else {
@@ -501,11 +556,11 @@ impl Sekirei {
                     }
                 };
 
-                let k3 = async {
+                let k2 = async {
                     while let pt_in = pricing_chan_incoming.try_recv() {
                         if !pt_in.is_err() {
                             let (peer, amount) = pt_in.unwrap();
-                            let accounting = self.accounting_peers.lock().unwrap();
+                            let accounting = wings.accounting_peers.lock().unwrap();
                             let accounting_peer = accounting.get(&peer).unwrap();
                             set_payment_threshold(accounting_peer, amount);
                         } else {
@@ -514,7 +569,7 @@ impl Sekirei {
                     }
                 };
 
-                let k4 = async {
+                let k3 = async {
                     while let re_out = refreshment_instructions_chan_incoming.try_recv() {
                         if !re_out.is_err() {
                             web_sys::console::log_1(&JsValue::from(format!("Refresh attempt")));
@@ -522,7 +577,7 @@ impl Sekirei {
                             let mut daten = Date::now();
                             let datenow = Date::now();
                             {
-                                let accounting = self.accounting_peers.lock().unwrap();
+                                let accounting = wings.accounting_peers.lock().unwrap();
                                 let accounting_peer_lock = accounting.get(&peer).unwrap();
                                 let mut accounting_peer = accounting_peer_lock.lock().unwrap();
                                 daten = accounting_peer.refreshment;
@@ -545,11 +600,11 @@ impl Sekirei {
                     }
                 };
 
-                let k5 = async {
+                let k4 = async {
                     while let re_in = refreshment_chan_incoming.try_recv() {
                         if !re_in.is_err() {
                             let (peer, amount) = re_in.unwrap();
-                            let accounting = self.accounting_peers.lock().unwrap();
+                            let accounting = wings.accounting_peers.lock().unwrap();
                             let accounting_peer = accounting.get(&peer).unwrap();
                             apply_refreshment(accounting_peer, amount);
                         } else {
@@ -558,15 +613,43 @@ impl Sekirei {
                     }
                 };
 
-                join!(k0, k1, k3, k4, k5);
+                join!(k0, k1, k2, k3, k4);
             }
         };
 
-        let k2_handle = async {
+        let retrieve_handle = async {
             let mut timelast = Date::now();
-            let mut interrupt_last = Date::now();
-
             loop {
+                // web_sys::console::log_1(&JsValue::from(format!(
+                //     "Time Elapsed Since Last Attempt {}",
+                //     timenow - timelast
+                // )));
+                // timelast = timenow;
+                // web_sys::console::log_1(&JsValue::from(format!(
+                //     "Retrieve Chunk Attempt {:#?}",
+                //     timenow
+                // )));
+                while let incoming_request = self.message_port.1.try_recv() {
+                    if !incoming_request.is_err() {
+                        web_sys::console::log_1(&JsValue::from(format!("retrieve triggered")));
+                        let (n, chan) = incoming_request.unwrap();
+                        let chunk_data = retrieve_chunk(
+                            n,
+                            &mut ctrl5,
+                            &wings.overlay_peers,
+                            &wings.accounting_peers,
+                            &refreshment_instructions_chan_outgoing,
+                        )
+                        .await;
+                        web_sys::console::log_1(&JsValue::from(format!(
+                            "Writing response to interface request"
+                        )));
+                        chan.send(chunk_data).unwrap();
+                    } else {
+                        break;
+                    }
+                }
+
                 let timenow = Date::now();
                 let seg = timenow - timelast;
                 if seg < PROTO_LOOP_INTERRUPTOR {
@@ -579,34 +662,14 @@ impl Sekirei {
                     ))
                     .await;
                 }
-                let timenow = Date::now();
-                interrupt_last = timenow;
-
-                // web_sys::console::log_1(&JsValue::from(format!(
-                //     "Time Elapsed Since Last Attempt {}",
-                //     timenow - timelast
-                // )));
-                // timelast = timenow;
-                // web_sys::console::log_1(&JsValue::from(format!(
-                //     "Retrieve Chunk Attempt {:#?}",
-                //     timenow
-                // )));
-                retrieve_chunk(
-                    hex::decode("3ab408eea4f095bde55c1caeeac8e7fcff49477660f0a28f652f0a6d9c60d05f")
-                        .unwrap(),
-                    &mut ctrl5,
-                    &self.overlay_peers,
-                    &self.accounting_peers,
-                    &refreshment_instructions_chan_outgoing,
-                )
-                .await;
+                timelast = Date::now();
             }
         };
 
         join!(
             conn_handle,
             event_handle,
-            k2_handle,
+            retrieve_handle,
             swarm_event_handle,
             gossip_inbound_handle,
             pricing_inbound_handle,
@@ -617,6 +680,7 @@ impl Sekirei {
         ()
     }
 }
+
 #[derive(NetworkBehaviour)]
 struct Behaviour {
     autonat: autonat::v2::client::Behaviour,

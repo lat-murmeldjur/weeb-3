@@ -15,10 +15,11 @@ self.onconnect = async function (event) {
      
   const port = event.ports[0];
 
-  port.onmessage = function (e) {
+  port.onmessage = async function (e) {
     console.log(e.data)
-    const workerResult = Sekirei.echo(e.data);
-    port.postMessage(workerResult);
+    // const workerResult = Sekirei.echo(e.data);
+    var workerResultPromise = sekirei.acquire(e.data);
+    port.postMessage(await workerResultPromise);
   };
 };
 

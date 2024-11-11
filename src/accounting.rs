@@ -59,7 +59,7 @@ pub fn cancel_reserve(a: &Mutex<PeerAccounting>, amount: u64) {
     account.reserve = 0;
 }
 
-pub fn price(peer_overlay: String, chunk_address: &Vec<u8>) -> u64 {
+pub fn price(peer_overlay: &String, chunk_address: &Vec<u8>) -> u64 {
     // return uint64(swarm.MaxPO-swarm.Proximity(peer.Bytes(), chunk.Bytes())+1) * pricer.PO_PRICE
 
     let po = get_proximity(&hex::decode(peer_overlay).unwrap(), &chunk_address);

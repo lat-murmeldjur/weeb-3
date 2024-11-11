@@ -41,7 +41,7 @@ pub async fn retrieve_chunk(
     peers: &Mutex<HashMap<String, PeerId>>,
     accounting: &Mutex<HashMap<PeerId, Mutex<PeerAccounting>>>,
     refresh_chan: &mpsc::Sender<(PeerId, u64)>,
-) {
+) -> Vec<u8> {
     let timestart = Date::now();
     let mut skiplist: HashMap<PeerId, _> = HashMap::new();
     let mut overdraftlist: HashMap<PeerId, _> = HashMap::new();
@@ -90,7 +90,7 @@ pub async fn retrieve_chunk(
                 )));
             } else {
                 if overdraftlist.is_empty() {
-                    return;
+                    return vec![];
                 } else {
                     for (k, _v) in overdraftlist.iter() {
                         let _ =
@@ -119,7 +119,7 @@ pub async fn retrieve_chunk(
                 }
             }
 
-            let req_price = price(closest_overlay.clone(), &chunk_address);
+            let req_price = price(&closest_overlay, &chunk_address);
 
             web_sys::console::log_1(&JsValue::from(format!(
                 "Reserve price {:#?} for chunk {:#?} from peer {:#?}!",
@@ -149,12 +149,12 @@ pub async fn retrieve_chunk(
                         seer = false;
                     }
                 } else {
-                    return;
+                    return vec![];
                 }
             }
         }
 
-        let req_price = price(closest_overlay.clone(), &chunk_address);
+        let req_price = price(&closest_overlay, &chunk_address);
 
         let (chunk_out, chunk_in) = mpsc::channel::<Vec<u8>>();
 
@@ -211,4 +211,6 @@ pub async fn retrieve_chunk(
         "Retrieve time duration {} ms!",
         timeend - timestart
     )));
+
+    return cd;
 }
