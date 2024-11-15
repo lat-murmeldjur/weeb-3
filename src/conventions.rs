@@ -86,7 +86,11 @@ pub fn get_proximity(one: &Vec<u8>, other: &Vec<u8>) -> u8 {
     }
 
     if b > other.len() {
-        b = one.len();
+        b = other.len();
+    }
+
+    if b == 0 {
+        return 0;
     }
 
     let m: usize = 8;
@@ -104,6 +108,10 @@ pub fn get_proximity(one: &Vec<u8>, other: &Vec<u8>) -> u8 {
 
 pub fn valid_cac(chunk_content: &Vec<u8>, address: &Vec<u8>) -> bool {
     //
+    if chunk_content.len() < SPAN_SIZE {
+        return false;
+    }
+
     let (mut something, mut something2) = chunk_content.split_at(SPAN_SIZE);
 
     let usomething: u64 = u64::from_le_bytes(something.try_into().unwrap());

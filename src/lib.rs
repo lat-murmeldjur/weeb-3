@@ -202,7 +202,7 @@ fn get_on_msg_callback() -> Closure<dyn FnMut(MessageEvent)> {
             .expect("#resultField should exist")
             .dyn_ref::<HtmlElement>()
             .expect("#resultField should be a HtmlInputElement")
-            .set_inner_text(&format!("{:#?}", event.data()));
+            .set_inner_text(&format!("{:#?}", event));
     })
 }
 
@@ -228,10 +228,13 @@ pub struct Wings {
 impl Sekirei {
     pub async fn acquire(&self, address: String) -> Vec<u8> {
         let (chan_out, chan_in) = mpsc::channel::<Vec<u8>>();
-        let _ = self
-            .message_port
-            .0
-            .send((hex::decode(address).unwrap(), chan_out));
+        let valaddr_0 = hex::decode(address);
+        let mut valaddr = match valaddr_0 {
+            Ok(hex) => hex,
+            _ => return vec![],
+        };
+
+        let _ = self.message_port.0.send((valaddr, chan_out));
 
         let mut timelast = Date::now();
         // 3ab408eea4f095bde55c1caeeac8e7fcff49477660f0a28f652f0a6d9c60d05f
