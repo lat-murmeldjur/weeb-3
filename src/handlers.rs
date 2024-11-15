@@ -414,12 +414,14 @@ pub async fn trieve(
         }
     };
 
+    let rec_1 = rec_0.data;
+
     web_sys::console::log_1(&JsValue::from(format!(
         "Got chunk {:#?} from peer {:#?}!",
         rec_0.stamp, peer
     )));
 
-    chan.send(rec_0.data).unwrap();
+    chan.send(rec_1).unwrap();
 
     Ok(())
 }

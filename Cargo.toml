@@ -87,3 +87,4 @@ alloy = { git = "https://github.com/alloy-rs/alloy.git", features = [
 byteorder = { git = "https://github.com/BurntSushi/byteorder" }
 num = { git = "https://github.com/rust-num/num.git" }
 hex = { git = "https://github.com/KokaKiwi/rust-hex.git" }
+zerocopy = { git = "https://github.com/google/zerocopy.git" }

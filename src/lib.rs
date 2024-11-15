@@ -266,11 +266,6 @@ impl Sekirei {
         return result;
     }
 
-    pub fn echo(_st: String) -> String {
-        web_sys::console::log_1(&JsValue::from(format!("Echoing {:#?}", _st)));
-        return _st;
-    }
-
     pub fn new(_st: String) -> Sekirei {
         tracing_wasm::set_as_global_default(); // uncomment to turn on tracing
         init_panic_hook();
@@ -472,29 +467,6 @@ impl Sekirei {
             let mut timelast = Date::now();
             let mut interrupt_last = Date::now();
             loop {
-                let timenow = Date::now();
-                let seg = timenow - interrupt_last;
-                if seg < EVENT_LOOP_INTERRUPTOR {
-                    //                web_sys::console::log_1(&JsValue::from(format!(
-                    //                    "Ease event handle loop for {}",
-                    //                    EVENT_LOOP_INTERRUPTOR - seg
-                    //                )));
-                    async_std::task::sleep(Duration::from_millis(
-                        (EVENT_LOOP_INTERRUPTOR - seg) as u64,
-                    ))
-                    .await;
-                }
-                let timenow = Date::now();
-                interrupt_last = timenow;
-
-                // only used for retr prototype progress
-                let timelast_r = timelast;
-
-                if timelast + EVENT_LOOP_INTERRUPTOR < timenow {
-                    timelast = timenow
-                }
-                //
-
                 let k0 = async {
                     while let that = connections_instructions_chan_incoming.try_recv() {
                         if !that.is_err() {
@@ -614,27 +586,41 @@ impl Sekirei {
                 };
 
                 join!(k0, k1, k2, k3, k4);
+
+                let timenow = Date::now();
+                let seg = timenow - interrupt_last;
+                if seg < EVENT_LOOP_INTERRUPTOR {
+                    //                web_sys::console::log_1(&JsValue::from(format!(
+                    //                    "Ease event handle loop for {}",
+                    //                    EVENT_LOOP_INTERRUPTOR - seg
+                    //                )));
+                    async_std::task::sleep(Duration::from_millis(
+                        (EVENT_LOOP_INTERRUPTOR - seg) as u64,
+                    ))
+                    .await;
+                }
+                let timenow = Date::now();
+                interrupt_last = timenow;
+
+                // only used for retr prototype progress
+                let timelast_r = timelast;
+
+                if timelast + EVENT_LOOP_INTERRUPTOR < timenow {
+                    timelast = timenow
+                }
+                //
             }
         };
 
         let retrieve_handle = async {
             let mut timelast = Date::now();
             loop {
-                // web_sys::console::log_1(&JsValue::from(format!(
-                //     "Time Elapsed Since Last Attempt {}",
-                //     timenow - timelast
-                // )));
-                // timelast = timenow;
-                // web_sys::console::log_1(&JsValue::from(format!(
-                //     "Retrieve Chunk Attempt {:#?}",
-                //     timenow
-                // )));
                 while let incoming_request = self.message_port.1.try_recv() {
                     if !incoming_request.is_err() {
                         web_sys::console::log_1(&JsValue::from(format!("retrieve triggered")));
                         let (n, chan) = incoming_request.unwrap();
                         let chunk_data = retrieve_chunk(
-                            n,
+                            &n,
                             &mut ctrl5,
                             &wings.overlay_peers,
                             &wings.accounting_peers,
@@ -644,6 +630,7 @@ impl Sekirei {
                         web_sys::console::log_1(&JsValue::from(format!(
                             "Writing response to interface request"
                         )));
+
                         chan.send(chunk_data).unwrap();
                     } else {
                         break;
@@ -654,7 +641,7 @@ impl Sekirei {
                 let seg = timenow - timelast;
                 if seg < PROTO_LOOP_INTERRUPTOR {
                     // web_sys::console::log_1(&JsValue::from(format!(
-                    //     "Ease proto event handle loop for {}",
+                    //     "Ease retrieve handle loop for {}",
                     //     PROTO_LOOP_INTERRUPTOR - seg
                     // )));
                     async_std::task::sleep(Duration::from_millis(

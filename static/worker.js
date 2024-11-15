@@ -17,7 +17,6 @@ self.onconnect = async function (event) {
 
   port.onmessage = async function (e) {
     console.log(e.data)
-    // const workerResult = Sekirei.echo(e.data);
     var workerResultPromise = sekirei.acquire(e.data);
     port.postMessage(await workerResultPromise);
   };

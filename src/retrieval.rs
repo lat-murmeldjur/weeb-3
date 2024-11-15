@@ -17,6 +17,10 @@ use crate::{
     // // // // // // // //
     stream,
     // // // // // // // //
+    valid_cac,
+    // // // // // // // //
+    valid_soc,
+    // // // // // // // //
     Date,
     // // // // // // // //
     Duration,
@@ -36,7 +40,7 @@ use crate::{
 };
 
 pub async fn retrieve_chunk(
-    chunk_address: Vec<u8>,
+    chunk_address: &Vec<u8>,
     control: &mut stream::Control,
     peers: &Mutex<HashMap<String, PeerId>>,
     accounting: &Mutex<HashMap<PeerId, Mutex<PeerAccounting>>>,
@@ -122,7 +126,7 @@ pub async fn retrieve_chunk(
             let req_price = price(&closest_overlay, &chunk_address);
 
             web_sys::console::log_1(&JsValue::from(format!(
-                "Reserve price {:#?} for chunk {:#?} from peer {:#?}!",
+                "Attempt to reserve price {:#?} for chunk {:#?} from peer {:#?}!",
                 req_price, chunk_address, closest_peer_id
             )));
 
@@ -140,16 +144,13 @@ pub async fn retrieve_chunk(
                             closest_peer_id
                         )));
                         overdraftlist.insert(closest_peer_id, "");
-                        continue;
                     } else {
                         web_sys::console::log_1(&JsValue::from(format!(
-                            "Selected peer with reserve {}!",
+                            "Selected peer with successful reserve {}!",
                             closest_peer_id
                         )));
                         seer = false;
                     }
-                } else {
-                    return vec![];
                 }
             }
         }
@@ -211,6 +212,19 @@ pub async fn retrieve_chunk(
         "Retrieve time duration {} ms!",
         timeend - timestart
     )));
+
+    web_sys::console::log_1(&JsValue::from(format!(
+        "Chunk content: {:#?} ",
+        String::from_utf8(cd.clone())
+    )));
+
+    let contaddrd = valid_cac(&cd, chunk_address);
+    if !contaddrd {
+        let socd = valid_soc(&cd, chunk_address);
+        if !socd {
+            return vec![];
+        }
+    }
 
     return cd;
 }
