@@ -19,16 +19,11 @@
             <div id="resultField"></div>
         </div>
     
-
         <script type="module" defer>
-            import init, { interweeb } from "./weeb_3.js"
-            
-            // const sekirei = new SharedWorker(new URL("worker.js", import.meta.url), { type: 'module'});
-            // sekirei.port.start();
-        
-            await init();
-            interweeb("3"); // This placeholder will be replaced by the server at runtime with the actual listening address.
 
+            import init, { interweeb } from "./weeb_3.js"
+            await init();
+            interweeb("3");
 
         </script>
     </body>

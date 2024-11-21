@@ -60,6 +60,8 @@ wasm-bindgen = "0.2.90"
 wasm-bindgen-futures = "0.4.42"
 js-sys = { version = "0.3.72" }
 web-sys = { version = "0.3.72", features = [
+  'Blob',
+  'BlobPropertyBag',
   'console',
   'Document',
   'Element',
@@ -69,10 +71,12 @@ web-sys = { version = "0.3.72", features = [
   'HtmlParagraphElement',
   'HtmlElement',
   'HtmlInputElement',
+  'Location',
   'MessageEvent',
   'Node',
   'SharedWorker',
   'Response',
+  'Url',
   'Window',
   'Worker',
   'WorkerOptions',
