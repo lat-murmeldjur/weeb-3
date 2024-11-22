@@ -30,7 +30,7 @@ use libp2p::{
 };
 use libp2p_stream as stream;
 
-use js_sys::{Date, Uint8Array};
+use js_sys::Date;
 use wasm_bindgen::{prelude::*, JsValue};
 use web_sys::{
     console, HtmlElement, HtmlInputElement, MessageEvent, MessagePort, SharedWorker, Worker,
@@ -105,57 +105,11 @@ pub fn init_panic_hook() {
 
 #[wasm_bindgen]
 pub async fn interweeb(_st: String) -> Result<(), JsError> {
-    tracing_wasm::set_as_global_default(); // uncomment to turn on tracing
-    init_panic_hook();
-
     let body = Body::from_current_window()?;
     body.append_p(&format!("Initiating weeb worker:"))?;
 
-    let window = web_sys::window().unwrap();
-    let document = window.document().unwrap();
-    let location = window
-        .location()
-        .host()
-        .ok()
-        .unwrap_or("localhost:8080".to_string());
-
-    let blob = r#"import init, { Sekirei } from "http://{{weeb}}/weeb_3.js";
-var sekirei;
-
-self.onconnect = async function (event) {
-
-  await init();
-
-  if (sekirei == undefined){
-    console.log('Wings');  
-    sekirei = Sekirei.new("");
-    sekirei.run("");
-  }
-
-  console.log("Clouds")
-     
-  const port = event.ports[0];
-
-  port.onmessage = async function (e) {
-    console.log(e.data)
-    var workerResultPromise = sekirei.acquire(e.data);
-    port.postMessage(await workerResultPromise);
-  };
-};
-"#
-    .replace("{{weeb}}", &location);
-
-    let json_jsvalue = JsValue::from_str(&blob);
-    let json_jsvalue_array = js_sys::Array::from_iter(std::iter::once(json_jsvalue));
-    let mut props = web_sys::BlobPropertyBag::new();
-    props.set_type("application/javascript");
-
-    let blobfile_0 = web_sys::Blob::new_with_str_sequence_and_options(&json_jsvalue_array, &props);
-    let blobfile = blobfile_0.unwrap();
-    let wjs = web_sys::Url::create_object_url_with_blob(&blobfile).unwrap();
-
     let worker_handle = Rc::new(RefCell::new(
-        SharedWorker::new_with_worker_options(&wjs, &{
+        SharedWorker::new_with_worker_options("./worker.js", &{
             let opts = web_sys::WorkerOptions::new();
             opts.set_type(web_sys::WorkerType::Module);
             opts
@@ -170,6 +124,8 @@ self.onconnect = async function (event) {
         let port = worker_handle_2.port();
         let _qxy = port.start();
     }
+
+    let document = web_sys::window().unwrap().document().unwrap();
 
     #[allow(unused_assignments)]
     let mut persistent_callback_handle = get_on_msg_callback();
@@ -237,11 +193,8 @@ self.onconnect = async function (event) {
 }
 
 fn get_on_msg_callback() -> Closure<dyn FnMut(MessageEvent)> {
-    Closure::new(move |event_0: MessageEvent| {
-        //
-        let event = Uint8Array::new(&event_0.data());
-
-        web_sys::console::log_1(&format!("Received response: {:#?} ", &event.to_vec()).into());
+    Closure::new(move |event: MessageEvent| {
+        web_sys::console::log_2(&"Received response: ".into(), &event.data());
 
         let document = web_sys::window().unwrap().document().unwrap();
         document
@@ -249,7 +202,7 @@ fn get_on_msg_callback() -> Closure<dyn FnMut(MessageEvent)> {
             .expect("#resultField should exist")
             .dyn_ref::<HtmlElement>()
             .expect("#resultField should be a HtmlInputElement")
-            .set_inner_text(&format!("{:#?}", &event.to_vec()));
+            .set_inner_text(&format!("{:#?}", event));
     })
 }
 
