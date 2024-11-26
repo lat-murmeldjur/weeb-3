@@ -13,7 +13,6 @@ use std::num::NonZero;
 use std::rc::Rc;
 use std::str::FromStr;
 use std::sync::mpsc;
-use std::sync::mpsc::channel;
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -21,7 +20,7 @@ use libp2p::{
     autonat,
     core::{self, Multiaddr, Transport},
     dcutr,
-    futures::{join, select_biased, StreamExt},
+    futures::{join, StreamExt},
     identify, identity,
     identity::{ecdsa, ecdsa::SecretKey},
     noise, ping,
@@ -32,9 +31,7 @@ use libp2p_stream as stream;
 
 use js_sys::Date;
 use wasm_bindgen::{prelude::*, JsValue};
-use web_sys::{
-    console, HtmlElement, HtmlInputElement, MessageEvent, MessagePort, SharedWorker, Worker,
-};
+use web_sys::{console, HtmlElement, HtmlInputElement, MessageEvent, SharedWorker};
 
 mod conventions;
 use conventions::*;
@@ -131,7 +128,7 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
     let mut persistent_callback_handle = get_on_msg_callback();
 
     let callback =
-        wasm_bindgen::closure::Closure::<dyn FnMut(web_sys::MessageEvent)>::new(move |msg| {
+        wasm_bindgen::closure::Closure::<dyn FnMut(web_sys::MessageEvent)>::new(move |_msg| {
             console::log_1(&"yyeyyyoninput callback triggered".into());
             let document = web_sys::window().unwrap().document().unwrap();
 
@@ -179,17 +176,13 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
         .expect("#inputString should be a HtmlInputElement")
         .set_oninput(Some(callback.as_ref().unchecked_ref()));
 
-    // port.set_onmessage(Some(sender_closure.as_ref().unchecked_ref()));
-
     body.append_p(&format!("Created a new worker from within Wasm"))?;
 
     loop {
-        async_std::task::sleep(Duration::from_secs(10)).await
+        async_std::task::sleep(Duration::from_secs(60)).await
     }
 
     Ok(())
-
-    // body.append_p(&format!("RTT: {rtt:?} at {}", Date::new_0().to_string()))?;
 }
 
 fn get_on_msg_callback() -> Closure<dyn FnMut(MessageEvent)> {
@@ -229,14 +222,13 @@ impl Sekirei {
     pub async fn acquire(&self, address: String) -> Vec<u8> {
         let (chan_out, chan_in) = mpsc::channel::<Vec<u8>>();
         let valaddr_0 = hex::decode(address);
-        let mut valaddr = match valaddr_0 {
+        let valaddr = match valaddr_0 {
             Ok(hex) => hex,
             _ => return vec![],
         };
 
         let _ = self.message_port.0.send((valaddr, chan_out));
 
-        let mut timelast = Date::now();
         // 3ab408eea4f095bde55c1caeeac8e7fcff49477660f0a28f652f0a6d9c60d05f
         let k0 = async {
             let mut timelast = Date::now();
@@ -270,7 +262,7 @@ impl Sekirei {
     }
 
     pub fn new(_st: String) -> Sekirei {
-        tracing_wasm::set_as_global_default(); // uncomment to turn on tracing
+        // tracing_wasm::set_as_global_default(); // uncomment to turn on tracing
         init_panic_hook();
 
         web_sys::console::log_1(&JsValue::from(format!("sydh {:#?}", _st)));
@@ -279,9 +271,6 @@ impl Sekirei {
 
         // let body = Body::from_current_window()?;
         // body.append_p(&format!("Attempt to establish connection over websocket"))?;
-
-        let peer_id =
-            libp2p::PeerId::from_str("QmYa9hasbJKBoTpfthcisMPKyGMCidfT1R4VkaRpg14bWP").unwrap();
 
         let secret_key_o = ecdsa::SecretKey::generate();
         let secret_key = secret_key_o.clone();
@@ -309,11 +298,10 @@ impl Sekirei {
             .build();
 
         let addr =
-            "/ip4/192.168.1.42/tcp/11634/ws/p2p/QmYa9hasbJKBoTpfthcisMPKyGMCidfT1R4VkaRpg14bWP"
+            "/ip4/192.168.100.251/tcp/11634/ws/p2p/QmYa9hasbJKBoTpfthcisMPKyGMCidfT1R4VkaRpg14bWP"
                 .parse::<Multiaddr>()
                 .unwrap();
 
-        let addr2 = addr.clone();
         swarm.dial(addr.clone()).unwrap();
 
         let connected_peers: Mutex<HashMap<PeerId, PeerFile>> = Mutex::new(HashMap::new());
@@ -338,13 +326,13 @@ impl Sekirei {
     pub async fn run(&self, _st: String) -> () {
         init_panic_hook();
 
-        let mut wings = self.wings.lock().unwrap();
+        let wings = self.wings.lock().unwrap();
 
         let peer_id =
             libp2p::PeerId::from_str("QmYa9hasbJKBoTpfthcisMPKyGMCidfT1R4VkaRpg14bWP").unwrap();
 
         let addr2 =
-            "/ip4/192.168.1.42/tcp/11634/ws/p2p/QmYa9hasbJKBoTpfthcisMPKyGMCidfT1R4VkaRpg14bWP"
+            "/ip4/192.168.100.251/tcp/11634/ws/p2p/QmYa9hasbJKBoTpfthcisMPKyGMCidfT1R4VkaRpg14bWP"
                 .parse::<Multiaddr>()
                 .unwrap();
 
@@ -604,9 +592,6 @@ impl Sekirei {
                 }
                 let timenow = Date::now();
                 interrupt_last = timenow;
-
-                // only used for retr prototype progress
-                let timelast_r = timelast;
 
                 if timelast + EVENT_LOOP_INTERRUPTOR < timenow {
                     timelast = timenow

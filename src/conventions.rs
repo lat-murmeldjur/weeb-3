@@ -1,24 +1,32 @@
-#![allow(warnings)]
+// #![allow(warnings)]
 #![cfg(target_arch = "wasm32")]
 
+use std::collections::HashMap;
 use std::io;
 
-use zerocopy::IntoByteSlice;
-
-use alloy::primitives::{keccak256, FixedBytes};
+use alloy::primitives::keccak256;
 
 use libp2p::multiaddr::Protocol;
 use libp2p::{Multiaddr, PeerId};
 
 use wasm_bindgen::prelude::*;
-use web_sys::{
-    console, Document, EventListener, HtmlButtonElement, HtmlElement, HtmlParagraphElement,
-};
+use web_sys::{Document, HtmlElement};
+
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct Entry {
+    pub reference: String,
+    pub meta: HashMap<String, String>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct Manifest {
+    pub entries: HashMap<String, Entry>,
+}
 
 pub const MAX_PO: u8 = 31;
 pub const SPAN_SIZE: usize = 8;
-
-// pub fn a() {}
 
 #[derive(Debug, Clone)]
 pub struct PeerFile {
@@ -112,7 +120,7 @@ pub fn valid_cac(chunk_content: &Vec<u8>, address: &Vec<u8>) -> bool {
         return false;
     }
 
-    let (mut something, mut something2) = chunk_content.split_at(SPAN_SIZE);
+    let (something, something2) = chunk_content.split_at(SPAN_SIZE);
 
     let usomething: u64 = u64::from_le_bytes(something.try_into().unwrap());
 
@@ -167,7 +175,7 @@ pub fn hasher_0(content_in: &Vec<u8>) -> Vec<u8> {
     let padding = 4096 - (content.len() - DIFF);
     let zerobyte: u8 = 0;
 
-    for i in 0..padding {
+    for _ in 0..padding {
         content.push(zerobyte)
     }
 
@@ -182,7 +190,7 @@ pub fn hasher_0(content_in: &Vec<u8>) -> Vec<u8> {
 pub fn hasher_1(content_in: &Vec<u8>, length: usize) -> Vec<u8> {
     let mut lengthof = length;
     let mut coefficient = 1;
-    let mut content_holder = content_in.clone();
+    let content_holder = content_in.clone();
     let mut content_holder_2 = vec![];
     let mut content_holder_3 = vec![];
 
@@ -221,7 +229,7 @@ pub fn hasher_1(content_in: &Vec<u8>, length: usize) -> Vec<u8> {
     return content_holder_2[0].clone();
 }
 
-pub fn valid_soc(chunk_content: &Vec<u8>, address: &Vec<u8>) -> bool {
+pub fn valid_soc(_chunk_content: &Vec<u8>, _address: &Vec<u8>) -> bool {
     //
     return false;
     //

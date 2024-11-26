@@ -1,4 +1,4 @@
-#![allow(warnings)]
+// #![allow(warnings)]
 #![cfg(target_arch = "wasm32")]
 
 use std::sync::mpsc;

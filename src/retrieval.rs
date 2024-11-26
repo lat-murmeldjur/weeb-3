@@ -1,4 +1,4 @@
-#![allow(warnings)]
+// #![allow(warnings)]
 
 use crate::{
     apply_credit,
@@ -39,6 +39,8 @@ use crate::{
     // // // // // // // //
 };
 
+use serde_json::Value;
+
 pub async fn retrieve_chunk(
     chunk_address: &Vec<u8>,
     control: &mut stream::Control,
@@ -53,7 +55,6 @@ pub async fn retrieve_chunk(
     let mut closest_overlay = "".to_string();
     let mut closest_peer_id = libp2p::PeerId::random();
 
-    let mut seer = true;
     let mut selected = false;
     let mut round_commence = Date::now();
     let mut current_max_po = 0;
@@ -63,7 +64,7 @@ pub async fn retrieve_chunk(
     let mut cd = vec![];
 
     while error_count < max_error {
-        seer = true;
+        let mut seer = true;
 
         while seer {
             closest_overlay = "".to_string();
@@ -192,7 +193,7 @@ pub async fn retrieve_chunk(
         // chan send?
 
         match chunk_data {
-            Ok(x) => {
+            Ok(_x) => {
                 break;
             }
             _ => {}
@@ -226,5 +227,36 @@ pub async fn retrieve_chunk(
         }
     }
 
+    let obfuscation_key = &cd[8..40];
+    web_sys::console::log_1(&JsValue::from(format!(
+        "obfuscation_key: {:#?} ",
+        obfuscation_key
+    )));
+    let mf_version = &cd[40..71];
+    web_sys::console::log_1(&JsValue::from(format!("mf_version: {:#?} ", mf_version)));
+
+    let ref_size = &cd[71];
+    web_sys::console::log_1(&JsValue::from(format!("ref_size: {:#?} ", ref_size)));
+
+    let ref_delimiter = (72 + ref_size) as usize;
+    let actual_reference = &cd[72..ref_delimiter];
+    web_sys::console::log_1(&JsValue::from(format!(
+        "actual_reference: {:#?}",
+        actual_reference
+    )));
+
+    let index_delimiter = (ref_delimiter + 32) as usize;
+    let index = &cd[ref_delimiter..index_delimiter];
+    web_sys::console::log_1(&JsValue::from(format!("index: {:#?}", index)));
+
+    let v0: HashMap<&str, Value> =
+        serde_json::from_slice(&cd[index_delimiter..]).unwrap_or(HashMap::new());
+
+    // let mut v = Manifest::deserialize(MapDeserializer::new(stuff.into_iter())).unwrap();
+
+    web_sys::console::log_1(&JsValue::from(format!("Chunk content deser: {:#?} ", v0)));
+
     return cd;
 }
+
+// 3ab408eea4f095bde55c1caeeac8e7fcff49477660f0a28f652f0a6d9c60d05f

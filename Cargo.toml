@@ -22,6 +22,9 @@ anyhow = { git = "https://github.com/dtolnay/anyhow.git" }
 rand = "0.8"
 prost = { git = "https://github.com/tokio-rs/prost.git" }
 prost-types = { git = "https://github.com/tokio-rs/prost.git" }
+serde = { git = "https://github.com/serde-rs/serde.git", features = ["derive"] }
+serde_json = { git = "https://github.com/serde-rs/json.git" }
+#json = { git = "https://github.com/maciejhirsz/json-rust.git" }
 tracing = { git = "https://github.com/tokio-rs/tracing.git" }
 tracing-subscriber = { git = "https://github.com/tokio-rs/tracing.git" , features = ["env-filter"] }
 
@@ -39,8 +42,12 @@ libp2p = { git = "https://github.com/libp2p/rust-libp2p.git", features = [ "ecds
 libp2p-webrtc = { git = "https://github.com/libp2p/rust-libp2p.git",  features = [ "tokio"] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-console_error_panic_hook = { git = "https://github.com/rustwasm/console_error_panic_hook.git" }
+alloy = { git = "https://github.com/alloy-rs/alloy.git", features = [
+    "k256",
+    "signer-local",
+] }
 async-std = { git = "https://github.com/async-rs/async-std.git" }
+console_error_panic_hook = { git = "https://github.com/rustwasm/console_error_panic_hook.git" }
 libp2p = { git = "https://github.com/libp2p/rust-libp2p.git", features = [ 
 "autonat", 
 "dcutr", 
@@ -55,7 +62,6 @@ libp2p = { git = "https://github.com/libp2p/rust-libp2p.git", features = [
 "yamux" 
 ] }
 libp2p-stream = { git = "https://github.com/libp2p/rust-libp2p.git" }
-# serde = { git = "https://github.com/serde-rs/serde.git", features = ["derive"] }
 wasm-bindgen = "0.2.90"
 wasm-bindgen-futures = "0.4.42"
 js-sys = { version = "0.3.72" }
@@ -79,11 +85,6 @@ web-sys = { version = "0.3.72", features = [
   'WorkerType',
 ] }
 tracing-wasm = { git = "https://github.com/old-storyai/tracing-wasm.git" }
-alloy = { git = "https://github.com/alloy-rs/alloy.git", features = [
-    "k256",
-    "network",
-    "signer-local",
-] }
 byteorder = { git = "https://github.com/BurntSushi/byteorder" }
 num = { git = "https://github.com/rust-num/num.git" }
 hex = { git = "https://github.com/KokaKiwi/rust-hex.git" }
