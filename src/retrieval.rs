@@ -249,8 +249,47 @@ pub async fn retrieve_chunk(
     let index = &cd[ref_delimiter..index_delimiter];
     web_sys::console::log_1(&JsValue::from(format!("index: {:#?}", index)));
 
-    let v0: HashMap<&str, Value> =
-        serde_json::from_slice(&cd[index_delimiter..]).unwrap_or(HashMap::new());
+    // fork parts
+
+    let mut fork_start_current = index_delimiter;
+
+    let fork_type = &cd[fork_start_current];
+    web_sys::console::log_1(&JsValue::from(format!("fork_type: {:#?}", fork_type)));
+
+    let fork_prefix_length = &cd[fork_start_current + 1];
+    web_sys::console::log_1(&JsValue::from(format!(
+        "fork_prefix_length: {:#?}",
+        fork_prefix_length
+    )));
+
+    let fork_prefix_delimiter = fork_start_current + 2 + 30;
+    let fork_prefix = &cd[fork_start_current + 2..fork_prefix_delimiter];
+    web_sys::console::log_1(&JsValue::from(format!("fork_prefix: {:#?}", fork_prefix)));
+
+    let fork_reference = &cd[fork_prefix_delimiter..fork_prefix_delimiter + 32];
+    web_sys::console::log_1(&JsValue::from(format!(
+        "fork_reference: {:#?}",
+        fork_reference
+    )));
+
+    let fork_metadata_bytesize: [u8; 2] = cd
+        [fork_prefix_delimiter + 32..fork_prefix_delimiter + 34]
+        .try_into()
+        .unwrap();
+    web_sys::console::log_1(&JsValue::from(format!(
+        "fork_metadata_bytesize: {:#?}",
+        fork_metadata_bytesize
+    )));
+
+    let calc = u16::from_be_bytes(fork_metadata_bytesize) as usize;
+
+    let fork_metadata_delimiter = fork_prefix_delimiter + 34 + calc;
+    let fork_metadata = &cd[fork_prefix_delimiter + 34..fork_metadata_delimiter];
+    web_sys::console::log_1(&JsValue::from(format!(
+        "fork_metadata: {:#?}",
+        fork_metadata
+    )));
+    let v0: Value = serde_json::from_slice(fork_metadata).unwrap_or("nil".into());
 
     // let mut v = Manifest::deserialize(MapDeserializer::new(stuff.into_iter())).unwrap();
 
