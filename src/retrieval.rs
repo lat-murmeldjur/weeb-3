@@ -272,8 +272,10 @@ pub async fn retrieve_chunk(
         // chan send?
 
         match chunk_data {
-            Ok(_x) => {
-                break;
+            Ok(x) => {
+                if x.len() > 0 {
+                    break;
+                }
             }
             _ => {}
         };
@@ -312,3 +314,4 @@ pub async fn retrieve_chunk(
 // 3ab408eea4f095bde55c1caeeac8e7fcff49477660f0a28f652f0a6d9c60d05f
 // ef30a6c57b0c14d6dc7d7e035b41a88cd48440a50e920eaefa3e1620da11eca8
 // 07f7a2e36a1e481de0da16f5e0647a1a11cf6a6c6fcaf89d367a7d63dbbbc8e7 ( d61aa6bbb728ab89f427d4c01d455845f44ef188fb701681b35a918fdc19a19f )
+// 6dd3f101738f58d3e51f1c914723a226e6180538fed7f1f6bf10089de834e82e ( d213da296b93456148b5a971adb9e8d571daf77a6b6f5c3b997198587ca35960 )
