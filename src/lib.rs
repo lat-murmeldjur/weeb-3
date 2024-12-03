@@ -20,7 +20,7 @@ use libp2p::{
     autonat,
     core::{self, Multiaddr, Transport},
     dcutr,
-    futures::{join, StreamExt},
+    futures::{future::join_all, join, StreamExt},
     identify, identity,
     identity::{ecdsa, ecdsa::SecretKey},
     noise, ping,
@@ -298,7 +298,7 @@ impl Sekirei {
             .build();
 
         let addr =
-            "/ip4/192.168.100.251/tcp/11634/ws/p2p/QmYa9hasbJKBoTpfthcisMPKyGMCidfT1R4VkaRpg14bWP"
+            "/ip4/192.168.0.104/tcp/11634/ws/p2p/QmYa9hasbJKBoTpfthcisMPKyGMCidfT1R4VkaRpg14bWP"
                 .parse::<Multiaddr>()
                 .unwrap();
 
@@ -332,7 +332,7 @@ impl Sekirei {
             libp2p::PeerId::from_str("QmYa9hasbJKBoTpfthcisMPKyGMCidfT1R4VkaRpg14bWP").unwrap();
 
         let addr2 =
-            "/ip4/192.168.100.251/tcp/11634/ws/p2p/QmYa9hasbJKBoTpfthcisMPKyGMCidfT1R4VkaRpg14bWP"
+            "/ip4/192.168.0.104/tcp/11634/ws/p2p/QmYa9hasbJKBoTpfthcisMPKyGMCidfT1R4VkaRpg14bWP"
                 .parse::<Multiaddr>()
                 .unwrap();
 
@@ -350,11 +350,15 @@ impl Sekirei {
         let (refreshment_chan_outgoing, refreshment_chan_incoming) =
             mpsc::channel::<(PeerId, u64)>();
 
+        let (chunk_retrieve_chan_outgoing, chunk_retrieve_chan_incoming) =
+            mpsc::channel::<(Vec<u8>, mpsc::Sender<Vec<u8>>)>();
+
         let mut swarm = self.swarm.lock().unwrap();
         let mut ctrl = swarm.behaviour_mut().stream.new_control();
         let mut ctrl3 = swarm.behaviour_mut().stream.new_control();
         let mut ctrl4 = swarm.behaviour_mut().stream.new_control();
         let mut ctrl5 = swarm.behaviour_mut().stream.new_control();
+        let mut ctrl6 = swarm.behaviour_mut().stream.new_control();
 
         let mut incoming_pricing_streams = swarm
             .behaviour_mut()
@@ -607,12 +611,13 @@ impl Sekirei {
                     if !incoming_request.is_err() {
                         web_sys::console::log_1(&JsValue::from(format!("retrieve triggered")));
                         let (n, chan) = incoming_request.unwrap();
-                        let chunk_data = retrieve_chunk(
+                        let chunk_data = retrieve_data(
                             &n,
                             &mut ctrl5,
                             &wings.overlay_peers,
                             &wings.accounting_peers,
                             &refreshment_instructions_chan_outgoing,
+                            &chunk_retrieve_chan_outgoing,
                         )
                         .await;
                         web_sys::console::log_1(&JsValue::from(format!(
@@ -624,6 +629,55 @@ impl Sekirei {
                         break;
                     }
                 }
+
+                let timenow = Date::now();
+                let seg = timenow - timelast;
+                if seg < PROTO_LOOP_INTERRUPTOR {
+                    // web_sys::console::log_1(&JsValue::from(format!(
+                    //     "Ease retrieve handle loop for {}",
+                    //     PROTO_LOOP_INTERRUPTOR - seg
+                    // )));
+                    async_std::task::sleep(Duration::from_millis(
+                        (PROTO_LOOP_INTERRUPTOR - seg) as u64,
+                    ))
+                    .await;
+                }
+                timelast = Date::now();
+            }
+        };
+
+        let retrieve_chunk_handle = async {
+            let mut timelast = Date::now();
+            loop {
+                let mut request_joiner = Vec::new();
+
+                while let incoming_request = chunk_retrieve_chan_incoming.try_recv() {
+                    if !incoming_request.is_err() {
+                        let handle = async {
+                            let mut ctrl9 = ctrl6.clone();
+                            web_sys::console::log_1(&JsValue::from(format!("retrieve triggered")));
+                            let (n, chan) = incoming_request.unwrap();
+                            let chunk_data = retrieve_chunk(
+                                &n,
+                                &mut ctrl9,
+                                &wings.overlay_peers,
+                                &wings.accounting_peers,
+                                &refreshment_instructions_chan_outgoing,
+                            )
+                            .await;
+                            web_sys::console::log_1(&JsValue::from(format!(
+                                "Writing response to retrieve request"
+                            )));
+
+                            chan.send(chunk_data).unwrap();
+                        };
+                        request_joiner.push(handle);
+                    } else {
+                        break;
+                    }
+                }
+
+                join_all(request_joiner).await;
 
                 let timenow = Date::now();
                 let seg = timenow - timelast;

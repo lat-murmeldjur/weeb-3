@@ -1,4 +1,4 @@
-// #![allow(warnings)]
+#![allow(warnings)]
 
 use crate::{
     apply_credit,
@@ -6,6 +6,8 @@ use crate::{
     cancel_reserve,
     // // // // // // // //
     get_proximity,
+    // // // // // // // //
+    join_all,
     // // // // // // // //
     mpsc,
     // // // // // // // //
@@ -39,7 +41,84 @@ use crate::{
     // // // // // // // //
 };
 
+use libp2p::futures::{stream::FuturesUnordered, Future, StreamExt};
 use serde_json::Value;
+use std::pin::Pin;
+
+pub async fn retrieve_data(
+    chunk_address: &Vec<u8>,
+    control: &mut stream::Control,
+    peers: &Mutex<HashMap<String, PeerId>>,
+    accounting: &Mutex<HashMap<PeerId, Mutex<PeerAccounting>>>,
+    refresh_chan: &mpsc::Sender<(PeerId, u64)>,
+    chunk_retrieve_chan: &mpsc::Sender<(Vec<u8>, mpsc::Sender<Vec<u8>>)>,
+) -> Vec<u8> {
+    let orig = retrieve_chunk(chunk_address, control, peers, accounting, refresh_chan).await;
+    let span = u64::from_le_bytes(orig[0..8].try_into().unwrap_or([0; 8]));
+    if span <= 4096 {
+        return orig;
+    }
+
+    if (orig.len() - 8) % 32 != 0 {
+        return vec![];
+    }
+
+    // let mut data: Vec<u8> = vec![0; span as usize];
+    let mut joiner = FuturesUnordered::new(); // ::<dyn Future<Output = Vec<u8>>> // ::<Pin<Box<dyn Future<Output = (Vec<u8>, usize)>>>>
+
+    let subs = (orig.len() - 8) / 32;
+
+    let mut content_holder_2: Vec<Vec<u8>> = vec![];
+
+    for i in 0..subs {
+        content_holder_2.push((&orig[8 + i * 32..8 + (i + 1) * 32]).to_vec());
+    }
+
+    for (i, addr) in content_holder_2.iter().enumerate() {
+        let index = i;
+        let address = addr.clone();
+        let mut ctrl = control.clone();
+        let handle = async move {
+            return (
+                retrieve_data(
+                    &address,
+                    &mut ctrl,
+                    peers,
+                    accounting,
+                    refresh_chan,
+                    chunk_retrieve_chan,
+                )
+                .await,
+                index.clone(),
+            );
+        };
+        joiner.push(handle);
+    }
+
+    let mut content_holder_3: HashMap<usize, Vec<u8>> = HashMap::new();
+
+    while let Some((result0, result1)) = joiner.next().await {
+        content_holder_3.insert(result1, result0);
+    }
+
+    // let results: Vec<(Vec<u8>, usize)> = joiner.collect().await;
+    // for result in results.iter() {
+    //     content_holder_3.insert(result.1, result.0);
+    // }
+
+    let mut data: Vec<u8> = Vec::new();
+    for i in 0..subs {
+        match content_holder_3.get(&i) {
+            Some(mut data0) => {
+                let mut data1 = data0.clone();
+                data.append(&mut data1);
+            }
+            None => return vec![],
+        }
+    }
+
+    return data;
+}
 
 pub async fn retrieve_chunk(
     chunk_address: &Vec<u8>,
@@ -227,75 +306,9 @@ pub async fn retrieve_chunk(
         }
     }
 
-    let obfuscation_key = &cd[8..40];
-    web_sys::console::log_1(&JsValue::from(format!(
-        "obfuscation_key: {:#?} ",
-        obfuscation_key
-    )));
-    let mf_version = &cd[40..71];
-    web_sys::console::log_1(&JsValue::from(format!("mf_version: {:#?} ", mf_version)));
-
-    let ref_size = &cd[71];
-    web_sys::console::log_1(&JsValue::from(format!("ref_size: {:#?} ", ref_size)));
-
-    let ref_delimiter = (72 + ref_size) as usize;
-    let actual_reference = &cd[72..ref_delimiter];
-    web_sys::console::log_1(&JsValue::from(format!(
-        "actual_reference: {:#?}",
-        actual_reference
-    )));
-
-    let index_delimiter = (ref_delimiter + 32) as usize;
-    let index = &cd[ref_delimiter..index_delimiter];
-    web_sys::console::log_1(&JsValue::from(format!("index: {:#?}", index)));
-
-    // fork parts
-
-    let mut fork_start_current = index_delimiter;
-
-    let fork_type = &cd[fork_start_current];
-    web_sys::console::log_1(&JsValue::from(format!("fork_type: {:#?}", fork_type)));
-
-    let fork_prefix_length = &cd[fork_start_current + 1];
-    web_sys::console::log_1(&JsValue::from(format!(
-        "fork_prefix_length: {:#?}",
-        fork_prefix_length
-    )));
-
-    let fork_prefix_delimiter = fork_start_current + 2 + 30;
-    let fork_prefix = &cd[fork_start_current + 2..fork_prefix_delimiter];
-    web_sys::console::log_1(&JsValue::from(format!("fork_prefix: {:#?}", fork_prefix)));
-
-    let fork_reference = &cd[fork_prefix_delimiter..fork_prefix_delimiter + 32];
-    web_sys::console::log_1(&JsValue::from(format!(
-        "fork_reference: {:#?}",
-        fork_reference
-    )));
-
-    let fork_metadata_bytesize: [u8; 2] = cd
-        [fork_prefix_delimiter + 32..fork_prefix_delimiter + 34]
-        .try_into()
-        .unwrap();
-    web_sys::console::log_1(&JsValue::from(format!(
-        "fork_metadata_bytesize: {:#?}",
-        fork_metadata_bytesize
-    )));
-
-    let calc = u16::from_be_bytes(fork_metadata_bytesize) as usize;
-
-    let fork_metadata_delimiter = fork_prefix_delimiter + 34 + calc;
-    let fork_metadata = &cd[fork_prefix_delimiter + 34..fork_metadata_delimiter];
-    web_sys::console::log_1(&JsValue::from(format!(
-        "fork_metadata: {:#?}",
-        fork_metadata
-    )));
-    let v0: Value = serde_json::from_slice(fork_metadata).unwrap_or("nil".into());
-
-    // let mut v = Manifest::deserialize(MapDeserializer::new(stuff.into_iter())).unwrap();
-
-    web_sys::console::log_1(&JsValue::from(format!("Chunk content deser: {:#?} ", v0)));
-
     return cd;
 }
 
 // 3ab408eea4f095bde55c1caeeac8e7fcff49477660f0a28f652f0a6d9c60d05f
+// ef30a6c57b0c14d6dc7d7e035b41a88cd48440a50e920eaefa3e1620da11eca8
+// 07f7a2e36a1e481de0da16f5e0647a1a11cf6a6c6fcaf89d367a7d63dbbbc8e7 ( d61aa6bbb728ab89f427d4c01d455845f44ef188fb701681b35a918fdc19a19f )
