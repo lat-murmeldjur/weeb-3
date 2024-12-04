@@ -272,8 +272,17 @@ pub async fn retrieve_chunk(
         // chan send?
 
         match chunk_data {
-            Ok(x) => {
-                if x.len() > 0 {
+            Ok(_x) => {
+                let contaddrd = valid_cac(&cd, chunk_address);
+                if !contaddrd {
+                    let socd = valid_soc(&cd, chunk_address);
+                    if !socd {
+                        error_count += 1;
+                        cd = vec![];
+                    } else {
+                        break;
+                    }
+                } else {
                     break;
                 }
             }
@@ -299,14 +308,6 @@ pub async fn retrieve_chunk(
         "Chunk content: {:#?} ",
         String::from_utf8(cd.clone())
     )));
-
-    let contaddrd = valid_cac(&cd, chunk_address);
-    if !contaddrd {
-        let socd = valid_soc(&cd, chunk_address);
-        if !socd {
-            return vec![];
-        }
-    }
 
     return cd;
 }
