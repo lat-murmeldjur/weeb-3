@@ -5,6 +5,8 @@ use crate::{
     // // // // // // // //
     cancel_reserve,
     // // // // // // // //
+    encode_resource,
+    // // // // // // // //
     get_proximity,
     // // // // // // // //
     join_all,
@@ -41,9 +43,105 @@ use crate::{
     // // // // // // // //
 };
 
+use async_std::task;
 use libp2p::futures::{stream::FuturesUnordered, Future, StreamExt};
 use serde_json::Value;
 use std::pin::Pin;
+
+pub async fn retrieve_resource(
+    chunk_address: &Vec<u8>,
+    control: &mut stream::Control,
+    peers: &Mutex<HashMap<String, PeerId>>,
+    accounting: &Mutex<HashMap<PeerId, Mutex<PeerAccounting>>>,
+    refresh_chan: &mpsc::Sender<(PeerId, u64)>,
+    chunk_retrieve_chan: &mpsc::Sender<(Vec<u8>, mpsc::Sender<Vec<u8>>)>,
+) -> Vec<u8> {
+    let cd = retrieve_data(
+        chunk_address,
+        control,
+        peers,
+        accounting,
+        refresh_chan,
+        chunk_retrieve_chan,
+    )
+    .await;
+
+    let obfuscation_key = &cd[8..40];
+    let mf_version = &cd[40..71];
+
+    let ref_size = &cd[71];
+
+    let ref_delimiter = (72 + ref_size) as usize;
+    let actual_reference = &cd[72..ref_delimiter];
+    web_sys::console::log_1(&JsValue::from(format!(
+        "actual_reference: {:#?}",
+        actual_reference
+    )));
+
+    let index_delimiter = (ref_delimiter + 32) as usize;
+    let index = &cd[ref_delimiter..index_delimiter];
+    web_sys::console::log_1(&JsValue::from(format!("index: {:x?}", index)));
+
+    // fork parts
+
+    let mut fork_start_current = index_delimiter;
+
+    let fork_type = &cd[fork_start_current];
+
+    let fork_prefix_length = &cd[fork_start_current + 1];
+    let fork_prefix_delimiter = fork_start_current + 2 + 30;
+    let fork_prefix = &cd[fork_start_current + 2..fork_prefix_delimiter];
+
+    let fork_reference = &cd[fork_prefix_delimiter..fork_prefix_delimiter + 32];
+    web_sys::console::log_1(&JsValue::from(format!(
+        "fork_reference: {:#?}",
+        fork_reference
+    )));
+
+    //    let metadata_q0 = retrieve_data(
+    //        &fork_reference.to_vec(),
+    //        control,
+    //        peers,
+    //        accounting,
+    //        refresh_chan,
+    //        chunk_retrieve_chan,
+    //    )
+    //    .await;
+
+    let fork_metadata_bytesize: [u8; 2] = cd
+        [fork_prefix_delimiter + 32..fork_prefix_delimiter + 34]
+        .try_into()
+        .unwrap();
+
+    let calc_metadata_bytesize = u16::from_be_bytes(fork_metadata_bytesize) as usize;
+    let fork_metadata_delimiter = fork_prefix_delimiter + 34 + calc_metadata_bytesize;
+
+    let fork_metadata = &cd[fork_prefix_delimiter + 34..fork_metadata_delimiter];
+
+    let v0: Value = serde_json::from_slice(fork_metadata).unwrap_or("nil".into());
+
+    web_sys::console::log_1(&JsValue::from(format!("chunk content deser: {:#?} ", v0)));
+    let str0 = v0.get("website-index-document").unwrap().as_str().unwrap();
+    web_sys::console::log_1(&JsValue::from(format!("index document: {:#?} ", str0)));
+
+    let data_address = hex::decode(str0).unwrap();
+    web_sys::console::log_1(&JsValue::from(format!(
+        "data address: {:#?} ",
+        data_address
+    )));
+
+    let data = retrieve_data(
+        &data_address,
+        control,
+        peers,
+        accounting,
+        refresh_chan,
+        chunk_retrieve_chan,
+    )
+    .await;
+
+    return encode_resource(data, str0.to_string());
+}
 
 pub async fn retrieve_data(
     chunk_address: &Vec<u8>,
@@ -62,6 +160,8 @@ pub async fn retrieve_data(
     if (orig.len() - 8) % 32 != 0 {
         return vec![];
     }
+
+    // task::yield_now().await;
 
     // let mut data: Vec<u8> = vec![0; span as usize];
     let mut joiner = FuturesUnordered::new(); // ::<dyn Future<Output = Vec<u8>>> // ::<Pin<Box<dyn Future<Output = (Vec<u8>, usize)>>>>
@@ -292,8 +392,8 @@ pub async fn retrieve_chunk(
 
     if cd.len() > 0 {
         web_sys::console::log_1(&JsValue::from(format!(
-            "Successfully retrieved chunk {:#?} from peer {:#?}!",
-            cd, closest_peer_id
+            "Successfully retrieved chunk from peer {:#?}!",
+            closest_peer_id
         )));
     }
 
@@ -302,11 +402,6 @@ pub async fn retrieve_chunk(
     web_sys::console::log_1(&JsValue::from(format!(
         "Retrieve time duration {} ms!",
         timeend - timestart
-    )));
-
-    web_sys::console::log_1(&JsValue::from(format!(
-        "Chunk content: {:#?} ",
-        String::from_utf8(cd.clone())
     )));
 
     return cd;

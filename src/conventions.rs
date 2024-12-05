@@ -124,28 +124,9 @@ pub fn valid_cac(chunk_content: &Vec<u8>, address: &Vec<u8>) -> bool {
 
     let usomething: u64 = u64::from_le_bytes(something.try_into().unwrap());
 
-    web_sys::console::log_1(&JsValue::from(format!(
-        "Chunk content span type check {:#?}!",
-        usomething,
-    )));
-
-    web_sys::console::log_1(&JsValue::from(format!(
-        "Chunk content hash type check {:#?}!",
-        address,
-    )));
-
     let contenthash = hasher_0(&something2.to_vec());
 
-    web_sys::console::log_1(&JsValue::from(format!(
-        "Chunk content hash type 1 {:#?}!",
-        contenthash,
-    )));
-
     let chunk_address = keccak256([something, &contenthash].concat()).to_vec();
-    web_sys::console::log_1(&JsValue::from(format!(
-        "Chunk content hash type 2 {:#?}!",
-        chunk_address,
-    )));
 
     if *chunk_address == **address {
         web_sys::console::log_1(&JsValue::from(format!(
@@ -218,14 +199,6 @@ pub fn hasher_1(content_in: &Vec<u8>, length: usize) -> Vec<u8> {
         content_holder_3 = vec![];
     }
 
-    if content_holder_2.len() > 1 {
-        web_sys::console::log_1(&JsValue::from(format!(
-            "Chunk content level type panic {:#?} {:#?} !",
-            content_holder_2.len(),
-            coefficient
-        )));
-    }
-
     return content_holder_2[0].clone();
 }
 
@@ -236,3 +209,16 @@ pub fn valid_soc(_chunk_content: &Vec<u8>, _address: &Vec<u8>) -> bool {
 }
 
 // 3ab408eea4f095bde55c1caeeac8e7fcff49477660f0a28f652f0a6d9c60d05f
+pub fn encode_resource(data: Vec<u8>, str0: String) -> Vec<u8> {
+    let str_b = str0.as_bytes();
+    let len_b: u64 = str_b.len().try_into().unwrap();
+    let a = len_b.to_le_bytes();
+    [a.as_slice(), str_b, &data].concat()
+}
+
+pub fn decode_resource(encoded_data: Vec<u8>) -> (Vec<u8>, String) {
+    let string_length: usize = u64::from_le_bytes(encoded_data[0..8].try_into().unwrap()) as usize;
+    let string = String::from_utf8(encoded_data[8..8 + string_length].to_vec()).unwrap();
+    let data = encoded_data[8 + string_length..].to_vec();
+    (data, string)
+}
