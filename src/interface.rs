@@ -5,7 +5,10 @@ use std::time::Duration;
 
 use js_sys::{Date, Uint8Array};
 use wasm_bindgen::{closure::Closure, prelude::wasm_bindgen, JsCast, JsError, JsValue};
-use web_sys::{console, HtmlElement, HtmlInputElement, MessageEvent, SharedWorker};
+use web_sys::{
+    console, Blob, BlobPropertyBag, Element, HtmlElement, HtmlInputElement, MessageEvent,
+    SharedWorker, Url,
+};
 
 #[wasm_bindgen]
 pub async fn interweeb(_st: String) -> Result<(), JsError> {
@@ -96,15 +99,38 @@ fn get_on_msg_callback() -> Closure<dyn FnMut(MessageEvent)> {
     Closure::new(move |event: MessageEvent| {
         let (data, string) = decode_resource(Uint8Array::new(&event.data()).to_vec());
 
-        web_sys::console::log_2(&"Received data: ".into(), &JsValue::from(data));
-        web_sys::console::log_2(&"Received string: ".into(), &JsValue::from(&string));
+        let mut props = BlobPropertyBag::new();
+        props.set_type(&string);
+        let blob =
+            Blob::new_with_u8_slice_sequence_and_options(&JsValue::from(data), &props).unwrap();
+        let blob_url = web_sys::Url::create_object_url_with_blob(&blob).unwrap();
+
+        let new_element = create_element_wmt(blob, blob_url);
+
+        // web_sys::console::log_2(&"Received data: ".into(), &JsValue::from(data));
+        // web_sys::console::log_2(&"Received string: ".into(), &JsValue::from(&string));
 
         let document = web_sys::window().unwrap().document().unwrap();
-        document
+
+        let r = document
             .get_element_by_id("resultField")
             .expect("#resultField should exist")
             .dyn_ref::<HtmlElement>()
-            .expect("#resultField should be a HtmlInputElement")
-            .set_inner_text(&format!("{:#?}", string));
+            .unwrap()
+            .append_child(&new_element)
+            .unwrap();
     })
+}
+
+fn create_element_wmt(blob: Blob, blob_url: String) -> Element {
+    let document = web_sys::window().unwrap().document().unwrap();
+    if blob.type_() == "image/jpg" {
+        let i = document.create_element("img").unwrap();
+        i.set_attribute("src", &blob_url);
+        return i;
+    }
+
+    let e = document.create_element("div").unwrap();
+    e.set_inner_html("type not implemented");
+    e
 }

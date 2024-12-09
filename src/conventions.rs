@@ -129,10 +129,10 @@ pub fn valid_cac(chunk_content: &Vec<u8>, address: &Vec<u8>) -> bool {
     let chunk_address = keccak256([something, &contenthash].concat()).to_vec();
 
     if *chunk_address == **address {
-        web_sys::console::log_1(&JsValue::from(format!(
-            "Chunk content address correct {:?}!",
-            chunk_address,
-        )));
+        // web_sys::console::log_1(&JsValue::from(format!(
+        //     "Chunk content address correct {:?}!",
+        //     chunk_address,
+        // )));
 
         return true;
     }

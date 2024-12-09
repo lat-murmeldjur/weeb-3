@@ -201,7 +201,7 @@ impl Sekirei {
             .build();
 
         let addr =
-            "/ip4/192.168.0.104/tcp/11634/ws/p2p/QmYa9hasbJKBoTpfthcisMPKyGMCidfT1R4VkaRpg14bWP"
+            "/ip4/192.168.0.105/tcp/11634/ws/p2p/QmYa9hasbJKBoTpfthcisMPKyGMCidfT1R4VkaRpg14bWP"
                 .parse::<Multiaddr>()
                 .unwrap();
 
@@ -235,7 +235,7 @@ impl Sekirei {
             libp2p::PeerId::from_str("QmYa9hasbJKBoTpfthcisMPKyGMCidfT1R4VkaRpg14bWP").unwrap();
 
         let addr2 =
-            "/ip4/192.168.0.104/tcp/11634/ws/p2p/QmYa9hasbJKBoTpfthcisMPKyGMCidfT1R4VkaRpg14bWP"
+            "/ip4/192.168.0.105/tcp/11634/ws/p2p/QmYa9hasbJKBoTpfthcisMPKyGMCidfT1R4VkaRpg14bWP"
                 .parse::<Multiaddr>()
                 .unwrap();
 
@@ -319,7 +319,7 @@ impl Sekirei {
                         let addr4 =
                             libp2p::core::Multiaddr::try_from(paddr.clone().unwrap().underlay)
                                 .unwrap();
-                        swarm.dial(addr4).unwrap();
+                        swarm.dial(addr4).unwrap_or(());
                         let _ = connections_instructions_chan_outgoing.send(paddr.unwrap());
                     } else {
                         break;
