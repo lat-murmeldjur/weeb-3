@@ -364,11 +364,12 @@ pub async fn retrieve_data(
     // }
 
     let mut data: Vec<u8> = Vec::new();
+    data.append(&mut orig[0..8].to_vec());
     for i in 0..subs {
         match content_holder_3.get(&i) {
             Some(mut data0) => {
                 let mut data1 = data0.clone();
-                data.append(&mut data1);
+                data.append(&mut data1[8..].to_vec());
             }
             None => return vec![],
         }
