@@ -297,7 +297,7 @@ pub async fn retrieve_resource(
     )
     .await;
 
-    return encode_resource(data, mime);
+    return encode_resource(data[8..].to_vec(), mime);
 }
 
 pub async fn retrieve_data(

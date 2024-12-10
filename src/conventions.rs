@@ -208,7 +208,6 @@ pub fn valid_soc(_chunk_content: &Vec<u8>, _address: &Vec<u8>) -> bool {
     //
 }
 
-// 3ab408eea4f095bde55c1caeeac8e7fcff49477660f0a28f652f0a6d9c60d05f
 pub fn encode_resource(data: Vec<u8>, str0: String) -> Vec<u8> {
     let str_b = str0.as_bytes();
     let len_b: u64 = str_b.len().try_into().unwrap();
