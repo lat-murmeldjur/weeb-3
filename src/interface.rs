@@ -1,4 +1,4 @@
-use crate::{decode_resource, Body};
+use crate::{decode_resource, init_panic_hook, Body};
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::mpsc;
@@ -13,8 +13,9 @@ use web_sys::{
 
 #[wasm_bindgen]
 pub async fn interweeb(_st: String) -> Result<(), JsError> {
+    init_panic_hook();
+
     let body = Body::from_current_window()?;
-    // body.append_p(&format!("Initiating weeb worker:"))?;
 
     let (r_out, r_in) = mpsc::channel::<Vec<u8>>();
 
@@ -27,8 +28,6 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
         .unwrap(),
     ));
 
-    // Pass the worker to the function which sets up the `oninput` callback.
-    // body.append_p(&format!("Initializing interface:"))?;
     {
         let worker_handle_2 = &*worker_handle.borrow();
         let port = worker_handle_2.port();
@@ -145,10 +144,14 @@ fn get_on_msg_callback(r_out: mpsc::Sender<Vec<u8>>) -> Closure<dyn FnMut(Messag
 
 fn create_element_wmt(tmype: String, blob_url: String) -> Element {
     let document = web_sys::window().unwrap().document().unwrap();
-    if tmype == "image/jpg" {
+    if tmype.starts_with("image/") {
         let i = document.create_element("img").unwrap();
         let _ = i.set_attribute("src", &blob_url);
         return i;
+    } else if tmype == "undefined" {
+        let e = document.create_element("div").unwrap();
+        e.set_inner_html("not found");
+        return e;
     }
 
     let e = document.create_element("div").unwrap();

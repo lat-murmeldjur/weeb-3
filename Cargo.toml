@@ -21,12 +21,8 @@ debug = true
 anyhow = { git = "https://github.com/dtolnay/anyhow.git" }
 rand = "0.8"
 prost = { git = "https://github.com/tokio-rs/prost.git" }
-prost-types = { git = "https://github.com/tokio-rs/prost.git" }
 serde = { git = "https://github.com/serde-rs/serde.git", features = ["derive"] }
 serde_json = { git = "https://github.com/serde-rs/json.git" }
-#json = { git = "https://github.com/maciejhirsz/json-rust.git" }
-tracing = { git = "https://github.com/tokio-rs/tracing.git" }
-tracing-subscriber = { git = "https://github.com/tokio-rs/tracing.git" , features = ["env-filter"] }
 
 [build-dependencies]
 prost-build = { git = "https://github.com/tokio-rs/prost.git" }
@@ -35,7 +31,6 @@ prost-build = { git = "https://github.com/tokio-rs/prost.git" }
 axum = { git = "https://github.com/tokio-rs/axum.git" }
 rust-embed = { git = "https://github.com/pyrossh/rust-embed.git", features = ["include-exclude", "interpolate-folder-path"] }
 tokio = { version = "1.38.0", default-features = false, features = ["macros", "net", "rt", "signal", "rt-multi-thread"] }
-tokio-util = { version = "0.7.11", features = ["compat"] }
 tower-http = { git = "https://github.com/tower-rs/tower-http.git", features = ["cors"] }
 mime_guess = { git = "https://github.com/abonander/mime_guess.git" }
 libp2p = { git = "https://github.com/libp2p/rust-libp2p.git", features = [ "ecdsa", "ed25519", "macros", "ping", "tokio"] }
@@ -62,7 +57,7 @@ libp2p = { git = "https://github.com/libp2p/rust-libp2p.git", features = [
 "yamux" 
 ] }
 libp2p-stream = { git = "https://github.com/libp2p/rust-libp2p.git" }
-wasm-bindgen = "0.2.90"
+wasm-bindgen = "0.2.99"
 wasm-bindgen-futures = "0.4.42"
 js-sys = { version = "0.3.72" }
 web-sys = { version = "0.3.72", features = [
@@ -87,8 +82,8 @@ web-sys = { version = "0.3.72", features = [
   'WorkerOptions',
   'WorkerType',
 ] }
-tracing-wasm = { git = "https://github.com/old-storyai/tracing-wasm.git" }
 byteorder = { git = "https://github.com/BurntSushi/byteorder" }
 num = { git = "https://github.com/rust-num/num.git" }
 hex = { git = "https://github.com/KokaKiwi/rust-hex.git" }
-zerocopy = { git = "https://github.com/google/zerocopy.git" }
+#tracing-wasm = { git = "https://github.com/old-storyai/tracing-wasm.git" }
+

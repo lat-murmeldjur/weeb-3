@@ -60,6 +60,14 @@ pub async fn retrieve_resource(
     )
     .await;
 
+    if cd.len() == 0 {
+        return encode_resource(vec![], "undefined".to_string());
+    }
+
+    if cd.len() < 72 {
+        return encode_resource(cd[8..].to_vec(), "application/octet-stream".to_string());
+    }
+
     let obfuscation_key = &cd[8..40];
     let enc_obfuscation_key = hex::encode(obfuscation_key);
     web_sys::console::log_1(&JsValue::from(format!(
@@ -69,6 +77,13 @@ pub async fn retrieve_resource(
 
     let mf_version = &cd[40..71];
     let enc_mf_version = hex::encode(mf_version);
+
+    if enc_mf_version != "5768b3b6a7db56d21d1abff40d41cebfc83448fed8d7e9b06ec0d3b073f28f"
+        && enc_mf_version != "025184789d63635766d78c41900196b57d7400875ebe4d9b5d1e76bd9652a9"
+    {
+        return encode_resource(cd[8..].to_vec(), "application/octet-stream".to_string());
+    }
+
     web_sys::console::log_1(&JsValue::from(format!("mf_version: {}", enc_mf_version)));
     let ref_size = cd[71];
     let enc_ref_size = hex::encode(&[ref_size]);
@@ -284,6 +299,10 @@ pub async fn retrieve_resource(
     )
     .await;
 
+    if data.len() < 8 {
+        return encode_resource(vec![], "undefined".to_string());
+    }
+
     return encode_resource(data[8..].to_vec(), mime);
 }
 
@@ -296,6 +315,10 @@ pub async fn retrieve_data(
     // chunk_retrieve_chan: &mpsc::Sender<(Vec<u8>, mpsc::Sender<Vec<u8>>)>,
 ) -> Vec<u8> {
     let orig = retrieve_chunk(chunk_address, control, peers, accounting, refresh_chan).await;
+    if orig.len() < 8 {
+        return vec![];
+    }
+
     let span = u64::from_le_bytes(orig[0..8].try_into().unwrap_or([0; 8]));
     if span <= 4096 {
         return orig;
@@ -307,7 +330,6 @@ pub async fn retrieve_data(
 
     // task::yield_now().await;
 
-    // let mut data: Vec<u8> = vec![0; span as usize];
     let mut joiner = FuturesUnordered::new(); // ::<dyn Future<Output = Vec<u8>>> // ::<Pin<Box<dyn Future<Output = (Vec<u8>, usize)>>>>
 
     let subs = (orig.len() - 8) / 32;
@@ -355,7 +377,11 @@ pub async fn retrieve_data(
     for i in 0..subs {
         match content_holder_3.get(&i) {
             Some(data0) => {
-                data.append(&mut data0[8..].to_vec());
+                if data0.len() > 0 {
+                    data.append(&mut data0[8..].to_vec());
+                } else {
+                    return vec![];
+                }
             }
             None => return vec![],
         }
@@ -561,4 +587,5 @@ pub async fn retrieve_chunk(
 // 6dd3f101738f58d3e51f1c914723a226e6180538fed7f1f6bf10089de834e82e ( d213da296b93456148b5a971adb9e8d571daf77a6b6f5c3b997198587ca35960 )
 // 908fb0f1f4b1a173f422bdbf35e9cc9ba0dae0799ff688978c6077df7ad57f54
 // 595f0537cebc3d0ea0d145d19297ae793d9b01ab560d07f6583b8b9dc39cecb3
+// 9540c03a36fbacb12a8fdb3ab1fbda7e43958bef44fb965bca5521053d7dfd89
 // fork_reference
