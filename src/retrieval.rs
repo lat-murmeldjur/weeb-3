@@ -1,5 +1,3 @@
-#![allow(warnings)]
-
 use crate::{
     apply_credit,
     // // // // // // // //
@@ -8,8 +6,6 @@ use crate::{
     encode_resource,
     // // // // // // // //
     get_proximity,
-    // // // // // // // //
-    join_all,
     // // // // // // // //
     mpsc,
     // // // // // // // //
@@ -43,10 +39,8 @@ use crate::{
     // // // // // // // //
 };
 
-use async_std::task;
-use libp2p::futures::{stream::FuturesUnordered, Future, StreamExt};
+use libp2p::futures::{stream::FuturesUnordered, StreamExt};
 use serde_json::Value;
-use std::pin::Pin;
 
 pub async fn retrieve_resource(
     chunk_address: &Vec<u8>,
@@ -54,7 +48,7 @@ pub async fn retrieve_resource(
     peers: &Mutex<HashMap<String, PeerId>>,
     accounting: &Mutex<HashMap<PeerId, Mutex<PeerAccounting>>>,
     refresh_chan: &mpsc::Sender<(PeerId, u64)>,
-    chunk_retrieve_chan: &mpsc::Sender<(Vec<u8>, mpsc::Sender<Vec<u8>>)>,
+    // chunk_retrieve_chan: &mpsc::Sender<(Vec<u8>, mpsc::Sender<Vec<u8>>)>,
 ) -> Vec<u8> {
     let cd = retrieve_data(
         chunk_address,
@@ -62,7 +56,7 @@ pub async fn retrieve_resource(
         peers,
         accounting,
         refresh_chan,
-        chunk_retrieve_chan,
+        // chunk_retrieve_chan,
     )
     .await;
 
@@ -95,6 +89,7 @@ pub async fn retrieve_resource(
 
     // fork parts
 
+    #[allow(unused_assignments)]
     let mut data_address = vec![];
 
     let mut fork_start_current = index_delimiter;
@@ -122,15 +117,6 @@ pub async fn retrieve_resource(
             "fork_reference: {}",
             enc_fork_reference
         )));
-        //    let metadata_q0 = retrieve_data(
-        //        &fork_reference.to_vec(),
-        //        control,
-        //        peers,
-        //        accounting,
-        //        refresh_chan,
-        //        chunk_retrieve_chan,
-        //    )
-        //    .await;
 
         let fork_metadata_bytesize: [u8; 2] = cd
             [fork_prefix_delimiter + 32..fork_prefix_delimiter + 34]
@@ -167,7 +153,8 @@ pub async fn retrieve_resource(
         fork_start_current = fork_metadata_delimiter;
     }
 
-    let mut mime = "".to_string();
+    #[allow(unused_assignments)]
+    let mut mime = String::new();
 
     {
         let fork_type = cd[fork_start_current];
@@ -199,7 +186,7 @@ pub async fn retrieve_resource(
             peers,
             accounting,
             refresh_chan,
-            chunk_retrieve_chan,
+            // chunk_retrieve_chan,
         )
         .await;
 
@@ -252,7 +239,7 @@ pub async fn retrieve_resource(
                 peers,
                 accounting,
                 refresh_chan,
-                chunk_retrieve_chan,
+                // chunk_retrieve_chan,
             )
             .await;
 
@@ -293,7 +280,7 @@ pub async fn retrieve_resource(
         peers,
         accounting,
         refresh_chan,
-        chunk_retrieve_chan,
+        // chunk_retrieve_chan,
     )
     .await;
 
@@ -306,7 +293,7 @@ pub async fn retrieve_data(
     peers: &Mutex<HashMap<String, PeerId>>,
     accounting: &Mutex<HashMap<PeerId, Mutex<PeerAccounting>>>,
     refresh_chan: &mpsc::Sender<(PeerId, u64)>,
-    chunk_retrieve_chan: &mpsc::Sender<(Vec<u8>, mpsc::Sender<Vec<u8>>)>,
+    // chunk_retrieve_chan: &mpsc::Sender<(Vec<u8>, mpsc::Sender<Vec<u8>>)>,
 ) -> Vec<u8> {
     let orig = retrieve_chunk(chunk_address, control, peers, accounting, refresh_chan).await;
     let span = u64::from_le_bytes(orig[0..8].try_into().unwrap_or([0; 8]));
@@ -343,7 +330,7 @@ pub async fn retrieve_data(
                     peers,
                     accounting,
                     refresh_chan,
-                    chunk_retrieve_chan,
+                    // chunk_retrieve_chan,
                 )
                 .await,
                 index.clone(),
@@ -367,9 +354,8 @@ pub async fn retrieve_data(
     data.append(&mut orig[0..8].to_vec());
     for i in 0..subs {
         match content_holder_3.get(&i) {
-            Some(mut data0) => {
-                let mut data1 = data0.clone();
-                data.append(&mut data1[8..].to_vec());
+            Some(data0) => {
+                data.append(&mut data0[8..].to_vec());
             }
             None => return vec![],
         }
@@ -392,9 +378,13 @@ pub async fn retrieve_chunk(
     let mut closest_overlay = "".to_string();
     let mut closest_peer_id = libp2p::PeerId::random();
 
+    #[allow(unused_assignments)]
     let mut selected = false;
     let mut round_commence = Date::now();
+
+    #[allow(unused_assignments)]
     let mut current_max_po = 0;
+
     let mut error_count = 0;
     let mut max_error = 8;
 

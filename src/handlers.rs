@@ -1,5 +1,3 @@
-// #![allow(warnings)]
-
 use alloy::primitives::keccak256;
 use alloy::signers::local::PrivateKeySigner;
 use alloy::signers::Signer;

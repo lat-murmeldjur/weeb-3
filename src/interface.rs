@@ -4,11 +4,11 @@ use std::rc::Rc;
 use std::sync::mpsc;
 use std::time::Duration;
 
-use js_sys::{Array, Date, Uint8Array};
+use js_sys::{Array, Uint8Array};
 use wasm_bindgen::{closure::Closure, prelude::wasm_bindgen, JsCast, JsError, JsValue};
 use web_sys::{
     console, Blob, BlobPropertyBag, Element, HtmlElement, HtmlInputElement, MessageEvent,
-    SharedWorker, Url,
+    SharedWorker,
 };
 
 #[wasm_bindgen]
@@ -92,12 +92,13 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
     body.append_p(&format!("Created a new worker from within Wasm"))?;
 
     loop {
+        #[allow(irrefutable_let_patterns)]
         while let data0 = r_in.try_recv() {
             if !data0.is_err() {
                 let (data, string) = decode_resource(data0.unwrap());
                 web_sys::console::log_1(&JsValue::from(format!("data length {:#?}", data.len())));
 
-                let mut props = BlobPropertyBag::new();
+                let props = BlobPropertyBag::new();
                 props.set_type(&string);
 
                 let data2: Uint8Array = JsValue::from(data).into();
@@ -115,7 +116,7 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
 
                 let document = web_sys::window().unwrap().document().unwrap();
 
-                let r = document
+                let _r = document
                     .get_element_by_id("resultField")
                     .expect("#resultField should exist")
                     .dyn_ref::<HtmlElement>()
@@ -131,38 +132,14 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
         async_std::task::sleep(Duration::from_millis(600)).await
     }
 
+    #[allow(unreachable_code)]
     Ok(())
 }
 
 fn get_on_msg_callback(r_out: mpsc::Sender<Vec<u8>>) -> Closure<dyn FnMut(MessageEvent)> {
     let r_out2 = r_out.clone();
     Closure::new(move |event: MessageEvent| {
-        r_out2.send(Uint8Array::new(&event.data()).to_vec());
-
-        //        let (data, string) = decode_resource(Uint8Array::new(&event.data()).to_vec());
-        //        let mut props = BlobPropertyBag::new();
-        //
-        //        props.set_type(&string);
-        //        let blob = Blob::new_with_buffer_source_sequence_and_options(
-        //            &Array::from_iter([Uint8Array::from(data.as_slice()).buffer()]),
-        //            &props,
-        //        )
-        //        .unwrap();
-        //        let blob_url = web_sys::Url::create_object_url_with_blob(&blob).unwrap();
-        //        let new_element = create_element_wmt(blob, blob_url);
-        //
-        //        // web_sys::console::log_2(&"Received data: ".into(), &JsValue::from(data));
-        //        // web_sys::console::log_2(&"Received string: ".into(), &JsValue::from(&string));
-        //
-        //        let document = web_sys::window().unwrap().document().unwrap();
-        //
-        //        let r = document
-        //            .get_element_by_id("resultField")
-        //            .expect("#resultField should exist")
-        //            .dyn_ref::<HtmlElement>()
-        //            .unwrap()
-        //            .append_child(&new_element)
-        //            .unwrap();
+        let _ = r_out2.send(Uint8Array::new(&event.data()).to_vec());
     })
 }
 
@@ -170,7 +147,7 @@ fn create_element_wmt(tmype: String, blob_url: String) -> Element {
     let document = web_sys::window().unwrap().document().unwrap();
     if tmype == "image/jpg" {
         let i = document.create_element("img").unwrap();
-        i.set_attribute("src", &blob_url);
+        let _ = i.set_attribute("src", &blob_url);
         return i;
     }
 

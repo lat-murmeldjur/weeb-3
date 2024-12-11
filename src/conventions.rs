@@ -1,4 +1,3 @@
-// #![allow(warnings)]
 #![cfg(target_arch = "wasm32")]
 
 use std::collections::HashMap;
@@ -121,8 +120,6 @@ pub fn valid_cac(chunk_content: &Vec<u8>, address: &Vec<u8>) -> bool {
     }
 
     let (something, something2) = chunk_content.split_at(SPAN_SIZE);
-
-    let usomething: u64 = u64::from_le_bytes(something.try_into().unwrap());
 
     let contenthash = hasher_0(&something2.to_vec());
 

@@ -1,16 +1,11 @@
-#![allow(warnings)]
 #![cfg(target_arch = "wasm32")]
 
 use anyhow::Result;
 use console_error_panic_hook;
 use rand::rngs::OsRng;
 
-// use num::bigint::BigInt;
-
-use std::cell::RefCell;
 use std::collections::HashMap;
 use std::num::NonZero;
-use std::rc::Rc;
 use std::str::FromStr;
 use std::sync::mpsc;
 use std::sync::Mutex;
@@ -20,7 +15,11 @@ use libp2p::{
     autonat,
     core::{self, Multiaddr, Transport},
     dcutr,
-    futures::{future::join_all, join, StreamExt},
+    futures::{
+        //future::join_all,
+        join,
+        StreamExt,
+    },
     identify, identity,
     identity::{ecdsa, ecdsa::SecretKey},
     noise, ping,
@@ -42,7 +41,6 @@ mod handlers;
 use handlers::*;
 
 mod interface;
-use interface::*;
 
 mod retrieval;
 use retrieval::*;
@@ -134,7 +132,8 @@ impl Sekirei {
 
         // 3ab408eea4f095bde55c1caeeac8e7fcff49477660f0a28f652f0a6d9c60d05f
         let k0 = async {
-            let mut timelast = Date::now();
+            let mut timelast: f64;
+            #[allow(irrefutable_let_patterns)]
             while let that = chan_in.try_recv() {
                 let timenow = Date::now();
                 timelast = timenow;
@@ -179,7 +178,7 @@ impl Sekirei {
         let secret_key = secret_key_o.clone();
         let keypair: ecdsa::Keypair = secret_key_o.into();
 
-        let mut swarm = libp2p::SwarmBuilder::with_existing_identity(keypair.clone().into())
+        let swarm = libp2p::SwarmBuilder::with_existing_identity(keypair.clone().into())
             .with_wasm_bindgen()
             .with_other_transport(|key| {
                 websocket_websys::Transport::default()
@@ -199,13 +198,6 @@ impl Sekirei {
                     .with_notify_handler_buffer_size(NonZero::new(10000_usize).unwrap().into())
             })
             .build();
-
-        let addr =
-            "/ip4/192.168.0.105/tcp/11634/ws/p2p/QmYa9hasbJKBoTpfthcisMPKyGMCidfT1R4VkaRpg14bWP"
-                .parse::<Multiaddr>()
-                .unwrap();
-
-        swarm.dial(addr.clone()).unwrap();
 
         let connected_peers: Mutex<HashMap<PeerId, PeerFile>> = Mutex::new(HashMap::new());
         let overlay_peers: Mutex<HashMap<String, PeerId>> = Mutex::new(HashMap::new());
@@ -234,11 +226,6 @@ impl Sekirei {
         let peer_id =
             libp2p::PeerId::from_str("QmYa9hasbJKBoTpfthcisMPKyGMCidfT1R4VkaRpg14bWP").unwrap();
 
-        let addr2 =
-            "/ip4/192.168.0.105/tcp/11634/ws/p2p/QmYa9hasbJKBoTpfthcisMPKyGMCidfT1R4VkaRpg14bWP"
-                .parse::<Multiaddr>()
-                .unwrap();
-
         let (peers_instructions_chan_outgoing, peers_instructions_chan_incoming) = mpsc::channel();
         let (connections_instructions_chan_outgoing, connections_instructions_chan_incoming) =
             mpsc::channel::<etiquette_2::BzzAddress>();
@@ -253,15 +240,14 @@ impl Sekirei {
         let (refreshment_chan_outgoing, refreshment_chan_incoming) =
             mpsc::channel::<(PeerId, u64)>();
 
-        let (chunk_retrieve_chan_outgoing, chunk_retrieve_chan_incoming) =
-            mpsc::channel::<(Vec<u8>, mpsc::Sender<Vec<u8>>)>();
+        // let (chunk_retrieve_chan_outgoing, chunk_retrieve_chan_incoming) =
+        //     mpsc::channel::<(Vec<u8>, mpsc::Sender<Vec<u8>>)>();
 
         let mut swarm = self.swarm.lock().unwrap();
         let mut ctrl = swarm.behaviour_mut().stream.new_control();
         let mut ctrl3 = swarm.behaviour_mut().stream.new_control();
         let mut ctrl4 = swarm.behaviour_mut().stream.new_control();
         let mut ctrl5 = swarm.behaviour_mut().stream.new_control();
-        let mut ctrl6 = swarm.behaviour_mut().stream.new_control();
 
         let mut incoming_pricing_streams = swarm
             .behaviour_mut()
@@ -297,11 +283,18 @@ impl Sekirei {
             }
         };
 
+        let addr2 =
+            "/ip4/192.168.0.104/tcp/11634/ws/p2p/QmYa9hasbJKBoTpfthcisMPKyGMCidfT1R4VkaRpg14bWP"
+                .parse::<Multiaddr>()
+                .unwrap();
+
+        swarm.dial(addr2.clone()).unwrap();
+
         let conn_handle = async {
             connection_handler(
                 peer_id,
                 &mut ctrl,
-                &addr2.clone(),
+                &addr2,
                 &self.secret_key.lock().unwrap(),
                 &accounting_peer_chan_outgoing,
             )
@@ -310,6 +303,7 @@ impl Sekirei {
 
         let swarm_event_handle = async {
             loop {
+                #[allow(irrefutable_let_patterns)]
                 while let paddr = peers_instructions_chan_incoming.try_recv() {
                     web_sys::console::log_1(&JsValue::from(format!(
                         "Current Conn Handled {:#?}",
@@ -366,6 +360,7 @@ impl Sekirei {
             let mut interrupt_last = Date::now();
             loop {
                 let k0 = async {
+                    #[allow(irrefutable_let_patterns)]
                     while let that = connections_instructions_chan_incoming.try_recv() {
                         if !that.is_err() {
                             let addr3 =
@@ -388,6 +383,7 @@ impl Sekirei {
                 };
 
                 let k1 = async {
+                    #[allow(irrefutable_let_patterns)]
                     while let incoming_peer = accounting_peer_chan_incoming.try_recv() {
                         if !incoming_peer.is_err() {
                             // Accounting connect
@@ -427,6 +423,7 @@ impl Sekirei {
                 };
 
                 let k2 = async {
+                    #[allow(irrefutable_let_patterns)]
                     while let pt_in = pricing_chan_incoming.try_recv() {
                         if !pt_in.is_err() {
                             let (peer, amount) = pt_in.unwrap();
@@ -440,10 +437,12 @@ impl Sekirei {
                 };
 
                 let k3 = async {
+                    #[allow(irrefutable_let_patterns)]
                     while let re_out = refreshment_instructions_chan_incoming.try_recv() {
                         if !re_out.is_err() {
                             web_sys::console::log_1(&JsValue::from(format!("Refresh attempt")));
                             let (peer, amount) = re_out.unwrap();
+                            #[allow(unused_assignments)]
                             let mut daten = Date::now();
                             let datenow = Date::now();
                             {
@@ -471,6 +470,7 @@ impl Sekirei {
                 };
 
                 let k4 = async {
+                    #[allow(irrefutable_let_patterns)]
                     while let re_in = refreshment_chan_incoming.try_recv() {
                         if !re_in.is_err() {
                             let (peer, amount) = re_in.unwrap();
@@ -510,6 +510,7 @@ impl Sekirei {
         let retrieve_handle = async {
             let mut timelast = Date::now();
             loop {
+                #[allow(irrefutable_let_patterns)]
                 while let incoming_request = self.message_port.1.try_recv() {
                     if !incoming_request.is_err() {
                         web_sys::console::log_1(&JsValue::from(format!("retrieve triggered")));
@@ -520,7 +521,7 @@ impl Sekirei {
                             &wings.overlay_peers,
                             &wings.accounting_peers,
                             &refreshment_instructions_chan_outgoing,
-                            &chunk_retrieve_chan_outgoing,
+                            // &chunk_retrieve_chan_outgoing,
                         )
                         .await;
                         web_sys::console::log_1(&JsValue::from(format!(
@@ -549,54 +550,55 @@ impl Sekirei {
             }
         };
 
-        let retrieve_chunk_handle = async {
-            let mut timelast = Date::now();
-            loop {
-                let mut request_joiner = Vec::new();
-
-                while let incoming_request = chunk_retrieve_chan_incoming.try_recv() {
-                    if !incoming_request.is_err() {
-                        let handle = async {
-                            let mut ctrl9 = ctrl6.clone();
-                            web_sys::console::log_1(&JsValue::from(format!("retrieve triggered")));
-                            let (n, chan) = incoming_request.unwrap();
-                            let chunk_data = retrieve_chunk(
-                                &n,
-                                &mut ctrl9,
-                                &wings.overlay_peers,
-                                &wings.accounting_peers,
-                                &refreshment_instructions_chan_outgoing,
-                            )
-                            .await;
-                            web_sys::console::log_1(&JsValue::from(format!(
-                                "Writing response to retrieve request"
-                            )));
-
-                            chan.send(chunk_data).unwrap();
-                        };
-                        request_joiner.push(handle);
-                    } else {
-                        break;
-                    }
-                }
-
-                join_all(request_joiner).await;
-
-                let timenow = Date::now();
-                let seg = timenow - timelast;
-                if seg < PROTO_LOOP_INTERRUPTOR {
-                    // web_sys::console::log_1(&JsValue::from(format!(
-                    //     "Ease retrieve handle loop for {}",
-                    //     PROTO_LOOP_INTERRUPTOR - seg
-                    // )));
-                    async_std::task::sleep(Duration::from_millis(
-                        (PROTO_LOOP_INTERRUPTOR - seg) as u64,
-                    ))
-                    .await;
-                }
-                timelast = Date::now();
-            }
-        };
+        //        let retrieve_chunk_handle = async {
+        //            let mut timelast = Date::now();
+        //            loop {
+        //                let mut request_joiner = Vec::new();
+        //
+        //                #[allow(irrefutable_let_patterns)]
+        //                while let incoming_request = chunk_retrieve_chan_incoming.try_recv() {
+        //                    if !incoming_request.is_err() {
+        //                        let handle = async {
+        //                            let mut ctrl9 = ctrl6.clone();
+        //                            web_sys::console::log_1(&JsValue::from(format!("retrieve triggered")));
+        //                            let (n, chan) = incoming_request.unwrap();
+        //                            let chunk_data = retrieve_chunk(
+        //                                &n,
+        //                                &mut ctrl9,
+        //                                &wings.overlay_peers,
+        //                                &wings.accounting_peers,
+        //                                &refreshment_instructions_chan_outgoing,
+        //                            )
+        //                            .await;
+        //                            web_sys::console::log_1(&JsValue::from(format!(
+        //                                "Writing response to retrieve request"
+        //                            )));
+        //
+        //                            chan.send(chunk_data).unwrap();
+        //                        };
+        //                        request_joiner.push(handle);
+        //                    } else {
+        //                        break;
+        //                    }
+        //                }
+        //
+        //                join_all(request_joiner).await;
+        //
+        //                let timenow = Date::now();
+        //                let seg = timenow - timelast;
+        //                if seg < PROTO_LOOP_INTERRUPTOR {
+        //                    // web_sys::console::log_1(&JsValue::from(format!(
+        //                    //     "Ease retrieve handle loop for {}",
+        //                    //     PROTO_LOOP_INTERRUPTOR - seg
+        //                    // )));
+        //                    async_std::task::sleep(Duration::from_millis(
+        //                        (PROTO_LOOP_INTERRUPTOR - seg) as u64,
+        //                    ))
+        //                    .await;
+        //                }
+        //                timelast = Date::now();
+        //            }
+        //        };
 
         join!(
             conn_handle,
