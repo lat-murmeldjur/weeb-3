@@ -144,17 +144,14 @@ fn get_on_msg_callback(r_out: mpsc::Sender<Vec<u8>>) -> Closure<dyn FnMut(Messag
 
 fn create_element_wmt(tmype: String, blob_url: String) -> Element {
     let document = web_sys::window().unwrap().document().unwrap();
-    if tmype.starts_with("image/") {
-        let i = document.create_element("img").unwrap();
-        let _ = i.set_attribute("src", &blob_url);
-        return i;
-    } else if tmype == "undefined" {
+    if tmype == "undefined" {
         let e = document.create_element("div").unwrap();
-        e.set_inner_html("not found");
+        e.set_inner_html("Not found");
         return e;
     }
 
-    let e = document.create_element("div").unwrap();
-    e.set_inner_html("type not implemented");
-    e
+    let i = document.create_element("embed").unwrap();
+    let _ = i.set_attribute("src", &blob_url);
+    let _ = i.set_attribute("type", &tmype);
+    return i;
 }
