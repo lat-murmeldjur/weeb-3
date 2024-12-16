@@ -7,6 +7,8 @@ use crate::{
     // // // // // // // //
     get_proximity,
     // // // // // // // //
+    manifest::interpret_manifest,
+    // // // // // // // //
     mpsc,
     // // // // // // // //
     price,
@@ -40,7 +42,6 @@ use crate::{
 };
 
 use libp2p::futures::{stream::FuturesUnordered, StreamExt};
-use serde_json::Value;
 
 pub async fn retrieve_resource(
     chunk_address: &Vec<u8>,
@@ -48,7 +49,7 @@ pub async fn retrieve_resource(
     peers: &Mutex<HashMap<String, PeerId>>,
     accounting: &Mutex<HashMap<PeerId, Mutex<PeerAccounting>>>,
     refresh_chan: &mpsc::Sender<(PeerId, u64)>,
-    // chunk_retrieve_chan: &mpsc::Sender<(Vec<u8>, mpsc::Sender<Vec<u8>>)>,
+    data_retrieve_chan: &mpsc::Sender<(Vec<u8>, mpsc::Sender<Vec<u8>>)>,
 ) -> Vec<u8> {
     let cd = retrieve_data(
         chunk_address,
@@ -56,252 +57,11 @@ pub async fn retrieve_resource(
         peers,
         accounting,
         refresh_chan,
-        // chunk_retrieve_chan,
+        //
     )
     .await;
 
-    if cd.len() == 0 {
-        return encode_resource(vec![], "undefined".to_string());
-    }
-
-    if cd.len() < 72 {
-        return encode_resource(cd[8..].to_vec(), "application/octet-stream".to_string());
-    }
-
-    let obfuscation_key = &cd[8..40];
-    let enc_obfuscation_key = hex::encode(obfuscation_key);
-    web_sys::console::log_1(&JsValue::from(format!(
-        "obfuscation_key: {}",
-        enc_obfuscation_key
-    )));
-
-    let mf_version = &cd[40..71];
-    let enc_mf_version = hex::encode(mf_version);
-
-    if enc_mf_version != "5768b3b6a7db56d21d1abff40d41cebfc83448fed8d7e9b06ec0d3b073f28f"
-        && enc_mf_version != "025184789d63635766d78c41900196b57d7400875ebe4d9b5d1e76bd9652a9"
-    {
-        return encode_resource(cd[8..].to_vec(), "application/octet-stream".to_string());
-    }
-
-    web_sys::console::log_1(&JsValue::from(format!("mf_version: {}", enc_mf_version)));
-    let ref_size = cd[71];
-    let enc_ref_size = hex::encode(&[ref_size]);
-    web_sys::console::log_1(&JsValue::from(format!("ref_size: {}", enc_ref_size)));
-
-    let ref_delimiter = (72 + ref_size) as usize;
-    let actual_reference = &cd[72..ref_delimiter];
-    let enc_actual_reference = hex::encode(actual_reference);
-    web_sys::console::log_1(&JsValue::from(format!(
-        "actual_reference: {}",
-        enc_actual_reference
-    )));
-
-    let index_delimiter = (ref_delimiter + 32) as usize;
-    let index = &cd[ref_delimiter..index_delimiter];
-    let enc_index = hex::encode(index);
-    web_sys::console::log_1(&JsValue::from(format!("index: {}", enc_index)));
-
-    // fork parts
-
-    #[allow(unused_assignments)]
-    let mut data_address = vec![];
-
-    let mut fork_start_current = index_delimiter;
-
-    {
-        let fork_type = cd[fork_start_current];
-        let enc_fork_type = hex::encode(&[fork_type]);
-        web_sys::console::log_1(&JsValue::from(format!("fork_type: {}", enc_fork_type)));
-
-        let fork_prefix_length = cd[fork_start_current + 1];
-        let enc_fork_prefix_length = hex::encode(&[fork_prefix_length]);
-        web_sys::console::log_1(&JsValue::from(format!(
-            "fork_prefix_length: {}",
-            enc_fork_prefix_length
-        )));
-
-        let fork_prefix_delimiter = fork_start_current + 2 + 30;
-        let fork_prefix = &cd[fork_start_current + 2..fork_prefix_delimiter];
-        let enc_fork_prefix = hex::encode(fork_prefix);
-        web_sys::console::log_1(&JsValue::from(format!("fork_prefix: {}", enc_fork_prefix)));
-
-        let fork_reference = &cd[fork_prefix_delimiter..fork_prefix_delimiter + 32];
-        let enc_fork_reference = hex::encode(fork_reference);
-        web_sys::console::log_1(&JsValue::from(format!(
-            "fork_reference: {}",
-            enc_fork_reference
-        )));
-
-        let fork_metadata_bytesize: [u8; 2] = cd
-            [fork_prefix_delimiter + 32..fork_prefix_delimiter + 34]
-            .try_into()
-            .unwrap();
-
-        let calc_metadata_bytesize = u16::from_be_bytes(fork_metadata_bytesize) as usize;
-        web_sys::console::log_1(&JsValue::from(format!(
-            "calc_metadata_bytesize: {} ",
-            calc_metadata_bytesize
-        )));
-
-        let fork_metadata_delimiter = fork_prefix_delimiter + 34 + calc_metadata_bytesize;
-
-        let fork_metadata = &cd[fork_prefix_delimiter + 34..fork_metadata_delimiter];
-        let enc_fork_metadata = hex::encode(fork_metadata);
-        web_sys::console::log_1(&JsValue::from(format!(
-            "fork_metadata: {}",
-            enc_fork_metadata
-        )));
-
-        let v0: Value = serde_json::from_slice(fork_metadata).unwrap_or("nil".into());
-        web_sys::console::log_1(&JsValue::from(format!("metadata json: {:#?} ", v0)));
-
-        let str0 = v0.get("website-index-document").unwrap().as_str().unwrap();
-        web_sys::console::log_1(&JsValue::from(format!("index document: {:#?} ", str0)));
-
-        data_address = hex::decode(str0).unwrap();
-        web_sys::console::log_1(&JsValue::from(format!(
-            "data_address: {:#?} ",
-            data_address
-        )));
-
-        fork_start_current = fork_metadata_delimiter;
-    }
-
-    #[allow(unused_assignments)]
-    let mut mime = String::new();
-
-    {
-        let fork_type = cd[fork_start_current];
-        let enc_fork_type = hex::encode(&[fork_type]);
-        web_sys::console::log_1(&JsValue::from(format!("fork_type: {}", enc_fork_type)));
-
-        let fork_prefix_length = cd[fork_start_current + 1];
-        let enc_fork_prefix_length = hex::encode(&[fork_prefix_length]);
-        web_sys::console::log_1(&JsValue::from(format!(
-            "fork_prefix_length: {}",
-            enc_fork_prefix_length
-        )));
-
-        let fork_prefix_delimiter = fork_start_current + 2 + 30;
-        let fork_prefix = &cd[fork_start_current + 2..fork_prefix_delimiter];
-        let enc_fork_prefix = hex::encode(fork_prefix);
-        web_sys::console::log_1(&JsValue::from(format!("fork_prefix: {}", enc_fork_prefix)));
-
-        let fork_reference = &cd[fork_prefix_delimiter..fork_prefix_delimiter + 32];
-        let enc_fork_reference = hex::encode(fork_reference);
-        web_sys::console::log_1(&JsValue::from(format!(
-            "fork_reference: {}",
-            enc_fork_reference
-        )));
-
-        let mdata = retrieve_data(
-            &fork_reference.to_vec(),
-            control,
-            peers,
-            accounting,
-            refresh_chan,
-            // chunk_retrieve_chan,
-        )
-        .await;
-
-        {
-            let ref_size = mdata[71];
-            let enc_ref_size = hex::encode(&[ref_size]);
-            web_sys::console::log_1(&JsValue::from(format!("ref_size: {}", enc_ref_size)));
-
-            let ref_delimiter = (72 + ref_size) as usize;
-            let actual_reference = &mdata[72..ref_delimiter];
-            let enc_actual_reference = hex::encode(actual_reference);
-            web_sys::console::log_1(&JsValue::from(format!(
-                "actual_reference: {}",
-                enc_actual_reference
-            )));
-
-            let index_delimiter = (ref_delimiter + 32) as usize;
-            let index = &mdata[ref_delimiter..index_delimiter];
-            let enc_index = hex::encode(index);
-            web_sys::console::log_1(&JsValue::from(format!("index: {}", enc_index)));
-
-            let mfork_start_current = index_delimiter;
-
-            let fork_type = mdata[mfork_start_current];
-            let enc_fork_type = hex::encode(&[fork_type]);
-            web_sys::console::log_1(&JsValue::from(format!("fork_type: {}", enc_fork_type)));
-
-            let fork_prefix_length = mdata[mfork_start_current + 1];
-            let enc_fork_prefix_length = hex::encode(&[fork_prefix_length]);
-            web_sys::console::log_1(&JsValue::from(format!(
-                "fork_prefix_length: {}",
-                enc_fork_prefix_length
-            )));
-
-            let fork_prefix_delimiter = mfork_start_current + 2 + 30;
-            let fork_prefix = &mdata[mfork_start_current + 2..fork_prefix_delimiter];
-            let enc_fork_prefix = hex::encode(fork_prefix);
-            web_sys::console::log_1(&JsValue::from(format!("fork_prefix: {}", enc_fork_prefix)));
-
-            let fork_reference2 = &mdata[fork_prefix_delimiter..fork_prefix_delimiter + 32];
-            let enc_fork_reference = hex::encode(fork_reference);
-            web_sys::console::log_1(&JsValue::from(format!(
-                "fork_reference: {}",
-                enc_fork_reference
-            )));
-
-            let mdata2 = retrieve_data(
-                &fork_reference2.to_vec(),
-                control,
-                peers,
-                accounting,
-                refresh_chan,
-                // chunk_retrieve_chan,
-            )
-            .await;
-
-            web_sys::console::log_1(&JsValue::from(format!("mdata2.len(): {}", mdata2.len())));
-
-            {
-                let fork_metadata_bytesize: [u8; 2] = mdata2[200..202].try_into().unwrap();
-
-                let calc_metadata_bytesize = u16::from_be_bytes(fork_metadata_bytesize) as usize;
-                web_sys::console::log_1(&JsValue::from(format!(
-                    "calc_metadata_bytesize: {} ",
-                    calc_metadata_bytesize
-                )));
-
-                let fork_metadata_delimiter = 202 + calc_metadata_bytesize;
-
-                let fork_metadata = &mdata2[202..fork_metadata_delimiter];
-                let enc_fork_metadata = hex::encode(fork_metadata);
-                web_sys::console::log_1(&JsValue::from(format!(
-                    "fork_metadata: {}",
-                    enc_fork_metadata
-                )));
-
-                let v1: Value = serde_json::from_slice(fork_metadata).unwrap_or("nil".into());
-                web_sys::console::log_1(&JsValue::from(format!("metadata json: {:#?} ", v1)));
-
-                let str1 = v1.get("Content-Type").unwrap().as_str().unwrap();
-                web_sys::console::log_1(&JsValue::from(format!("index document: {:#?} ", str1)));
-
-                mime = str1.to_string();
-            }
-        }
-    }
-
-    let data = retrieve_data(
-        &data_address,
-        control,
-        peers,
-        accounting,
-        refresh_chan,
-        // chunk_retrieve_chan,
-    )
-    .await;
-
-    if data.len() < 8 {
-        return encode_resource(vec![], "undefined".to_string());
-    }
+    let (data, mime) = interpret_manifest(&cd, data_retrieve_chan).await;
 
     return encode_resource(data[8..].to_vec(), mime);
 }
@@ -588,4 +348,11 @@ pub async fn retrieve_chunk(
 // 908fb0f1f4b1a173f422bdbf35e9cc9ba0dae0799ff688978c6077df7ad57f54
 // 595f0537cebc3d0ea0d145d19297ae793d9b01ab560d07f6583b8b9dc39cecb3
 // 9540c03a36fbacb12a8fdb3ab1fbda7e43958bef44fb965bca5521053d7dfd89
-// fork_reference
+
+//
+// 9372d6006de7d4dcc054191e2bae19acb13f8e199ecdb12afa7d55eab4c12599
+// 358d47f9e1b2e99d2f20166ea1c70387949a2e78b286e1636649b95857bca617
+// 46e8c135283b21e78b135a526c72c3f6f2cbf3aee31087f3fba1f332b5739a1c
+// 02943a6a3d69ff8dda5016b24b7fbf69908dfe058a4647d23d8d69daff838494
+//
+// 17618f9a17eac7fa5bba2bc0705ae33fc242a1e1c069b7f1b4f310f5125e812c

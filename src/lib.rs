@@ -16,7 +16,7 @@ use libp2p::{
     core::{self, Multiaddr, Transport},
     dcutr,
     futures::{
-        //future::join_all,
+        future::join_all, //
         join,
         StreamExt,
     },
@@ -41,6 +41,8 @@ mod handlers;
 use handlers::*;
 
 mod interface;
+
+mod manifest;
 
 mod retrieval;
 use retrieval::*;
@@ -77,7 +79,7 @@ use crate::weeb_3::etiquette_2;
 // use crate::weeb_3::etiquette_5;
 // use crate::weeb_3::etiquette_6;
 
-const HANDSHAKE_PROTOCOL: StreamProtocol = StreamProtocol::new("/swarm/handshake/12.0.0/handshake");
+const HANDSHAKE_PROTOCOL: StreamProtocol = StreamProtocol::new("/swarm/handshake/13.0.0/handshake");
 const PRICING_PROTOCOL: StreamProtocol = StreamProtocol::new("/swarm/pricing/1.0.0/pricing");
 const GOSSIP_PROTOCOL: StreamProtocol = StreamProtocol::new("/swarm/hive/1.1.0/peers");
 const PSEUDOSETTLE_PROTOCOL: StreamProtocol =
@@ -91,9 +93,9 @@ const RETRIEVAL_PROTOCOL: StreamProtocol = StreamProtocol::new("/swarm/retrieval
 // const PULL_PROTOCOL: StreamProtocol = StreamProtocol::new("/swarm/pullsync/1.4.0/pullsync");
 // const PUSH_PROTOCOL: StreamProtocol = StreamProtocol::new("/swarm/pushsync/1.3.0/pushsync");
 
-const RETRIEVE_ROUND_TIME: f64 = 200.0;
-const EVENT_LOOP_INTERRUPTOR: f64 = 200.0;
-const PROTO_LOOP_INTERRUPTOR: f64 = 200.0;
+const RETRIEVE_ROUND_TIME: f64 = 600.0;
+const EVENT_LOOP_INTERRUPTOR: f64 = 600.0;
+const PROTO_LOOP_INTERRUPTOR: f64 = 600.0;
 
 #[wasm_bindgen]
 pub fn init_panic_hook() {
@@ -240,14 +242,15 @@ impl Sekirei {
         let (refreshment_chan_outgoing, refreshment_chan_incoming) =
             mpsc::channel::<(PeerId, u64)>();
 
-        // let (chunk_retrieve_chan_outgoing, chunk_retrieve_chan_incoming) =
-        //     mpsc::channel::<(Vec<u8>, mpsc::Sender<Vec<u8>>)>();
+        let (data_retrieve_chan_outgoing, data_retrieve_chan_incoming) =
+            mpsc::channel::<(Vec<u8>, mpsc::Sender<Vec<u8>>)>();
 
         let mut swarm = self.swarm.lock().unwrap();
         let mut ctrl = swarm.behaviour_mut().stream.new_control();
         let mut ctrl3 = swarm.behaviour_mut().stream.new_control();
         let mut ctrl4 = swarm.behaviour_mut().stream.new_control();
         let mut ctrl5 = swarm.behaviour_mut().stream.new_control();
+        let ctrl6 = swarm.behaviour_mut().stream.new_control();
 
         let mut incoming_pricing_streams = swarm
             .behaviour_mut()
@@ -521,7 +524,7 @@ impl Sekirei {
                             &wings.overlay_peers,
                             &wings.accounting_peers,
                             &refreshment_instructions_chan_outgoing,
-                            // &chunk_retrieve_chan_outgoing,
+                            &data_retrieve_chan_outgoing,
                         )
                         .await;
                         web_sys::console::log_1(&JsValue::from(format!(
@@ -550,60 +553,61 @@ impl Sekirei {
             }
         };
 
-        //        let retrieve_chunk_handle = async {
-        //            let mut timelast = Date::now();
-        //            loop {
-        //                let mut request_joiner = Vec::new();
-        //
-        //                #[allow(irrefutable_let_patterns)]
-        //                while let incoming_request = chunk_retrieve_chan_incoming.try_recv() {
-        //                    if !incoming_request.is_err() {
-        //                        let handle = async {
-        //                            let mut ctrl9 = ctrl6.clone();
-        //                            web_sys::console::log_1(&JsValue::from(format!("retrieve triggered")));
-        //                            let (n, chan) = incoming_request.unwrap();
-        //                            let chunk_data = retrieve_chunk(
-        //                                &n,
-        //                                &mut ctrl9,
-        //                                &wings.overlay_peers,
-        //                                &wings.accounting_peers,
-        //                                &refreshment_instructions_chan_outgoing,
-        //                            )
-        //                            .await;
-        //                            web_sys::console::log_1(&JsValue::from(format!(
-        //                                "Writing response to retrieve request"
-        //                            )));
-        //
-        //                            chan.send(chunk_data).unwrap();
-        //                        };
-        //                        request_joiner.push(handle);
-        //                    } else {
-        //                        break;
-        //                    }
-        //                }
-        //
-        //                join_all(request_joiner).await;
-        //
-        //                let timenow = Date::now();
-        //                let seg = timenow - timelast;
-        //                if seg < PROTO_LOOP_INTERRUPTOR {
-        //                    // web_sys::console::log_1(&JsValue::from(format!(
-        //                    //     "Ease retrieve handle loop for {}",
-        //                    //     PROTO_LOOP_INTERRUPTOR - seg
-        //                    // )));
-        //                    async_std::task::sleep(Duration::from_millis(
-        //                        (PROTO_LOOP_INTERRUPTOR - seg) as u64,
-        //                    ))
-        //                    .await;
-        //                }
-        //                timelast = Date::now();
-        //            }
-        //        };
+        let retrieve_data_handle = async {
+            let mut timelast = Date::now();
+            loop {
+                let mut request_joiner = Vec::new();
+
+                #[allow(irrefutable_let_patterns)]
+                while let incoming_request = data_retrieve_chan_incoming.try_recv() {
+                    if !incoming_request.is_err() {
+                        let handle = async {
+                            let mut ctrl9 = ctrl6.clone();
+                            web_sys::console::log_1(&JsValue::from(format!("retrieve triggered")));
+                            let (n, chan) = incoming_request.unwrap();
+                            let chunk_data = retrieve_data(
+                                &n,
+                                &mut ctrl9,
+                                &wings.overlay_peers,
+                                &wings.accounting_peers,
+                                &refreshment_instructions_chan_outgoing,
+                            )
+                            .await;
+                            web_sys::console::log_1(&JsValue::from(format!(
+                                "Writing response to retrieve request"
+                            )));
+
+                            chan.send(chunk_data).unwrap();
+                        };
+                        request_joiner.push(handle);
+                    } else {
+                        break;
+                    }
+                }
+
+                join_all(request_joiner).await;
+
+                let timenow = Date::now();
+                let seg = timenow - timelast;
+                if seg < PROTO_LOOP_INTERRUPTOR {
+                    // web_sys::console::log_1(&JsValue::from(format!(
+                    //     "Ease retrieve handle loop for {}",
+                    //     PROTO_LOOP_INTERRUPTOR - seg
+                    // )));
+                    async_std::task::sleep(Duration::from_millis(
+                        (PROTO_LOOP_INTERRUPTOR - seg) as u64,
+                    ))
+                    .await;
+                }
+                timelast = Date::now();
+            }
+        };
 
         join!(
             conn_handle,
             event_handle,
             retrieve_handle,
+            retrieve_data_handle,
             swarm_event_handle,
             gossip_inbound_handle,
             pricing_inbound_handle,
