@@ -169,8 +169,6 @@ impl Sekirei {
         // tracing_wasm::set_as_global_default(); // uncomment to turn on tracing
         init_panic_hook();
 
-        web_sys::console::log_1(&JsValue::from(format!("sydh {:#?}", _st)));
-
         let idle_duration = Duration::from_secs(60);
 
         // let body = Body::from_current_window()?;
@@ -245,26 +243,33 @@ impl Sekirei {
         let (data_retrieve_chan_outgoing, data_retrieve_chan_incoming) =
             mpsc::channel::<(Vec<u8>, mpsc::Sender<Vec<u8>>)>();
 
-        let mut swarm = self.swarm.lock().unwrap();
-        let mut ctrl = swarm.behaviour_mut().stream.new_control();
-        let mut ctrl3 = swarm.behaviour_mut().stream.new_control();
-        let mut ctrl4 = swarm.behaviour_mut().stream.new_control();
-        let mut ctrl5 = swarm.behaviour_mut().stream.new_control();
-        let ctrl6 = swarm.behaviour_mut().stream.new_control();
+        let mut ctrl;
+        let mut incoming_pricing_streams;
+        let mut incoming_gossip_streams;
 
-        let mut incoming_pricing_streams = swarm
-            .behaviour_mut()
-            .stream
-            .new_control()
-            .accept(PRICING_PROTOCOL)
-            .unwrap();
+        {
+            let mut swarm = self.swarm.lock().unwrap();
+            ctrl = swarm.behaviour_mut().stream.new_control();
 
-        let mut incoming_gossip_streams = swarm
-            .behaviour_mut()
-            .stream
-            .new_control()
-            .accept(GOSSIP_PROTOCOL)
-            .unwrap();
+            incoming_pricing_streams = swarm
+                .behaviour_mut()
+                .stream
+                .new_control()
+                .accept(PRICING_PROTOCOL)
+                .unwrap();
+
+            incoming_gossip_streams = swarm
+                .behaviour_mut()
+                .stream
+                .new_control()
+                .accept(GOSSIP_PROTOCOL)
+                .unwrap();
+        }
+
+        let mut ctrl3 = ctrl.clone();
+        let mut ctrl4 = ctrl.clone();
+        let mut ctrl5 = ctrl.clone();
+        let ctrl6 = ctrl.clone();
 
         let pricing_inbound_handle = async move {
             web_sys::console::log_1(&JsValue::from(format!("Opened Pricing handler 1")));
@@ -286,14 +291,25 @@ impl Sekirei {
             }
         };
 
-        let addr2 =
-            "/ip4/192.168.0.104/tcp/11634/ws/p2p/QmYa9hasbJKBoTpfthcisMPKyGMCidfT1R4VkaRpg14bWP"
+        let conn_handle = async {
+            let addr2 =
+            "/ip4/192.168.0.105/tcp/11634/ws/p2p/QmYa9hasbJKBoTpfthcisMPKyGMCidfT1R4VkaRpg14bWP"
                 .parse::<Multiaddr>()
                 .unwrap();
 
-        swarm.dial(addr2.clone()).unwrap();
+            let mut bootnode_connected = false;
+            while bootnode_connected == false {
+                {
+                    let mut swarm = self.swarm.lock().unwrap();
+                    bootnode_connected = match swarm.dial(addr2.clone()) {
+                        Ok(()) => true,
+                        _ => false,
+                    };
+                }
+                async_std::task::sleep(Duration::from_millis((EVENT_LOOP_INTERRUPTOR) as u64))
+                    .await;
+            }
 
-        let conn_handle = async {
             connection_handler(
                 peer_id,
                 &mut ctrl,
@@ -306,6 +322,7 @@ impl Sekirei {
 
         let swarm_event_handle = async {
             loop {
+                let mut swarm = self.swarm.lock().unwrap();
                 #[allow(irrefutable_let_patterns)]
                 while let paddr = peers_instructions_chan_incoming.try_recv() {
                     web_sys::console::log_1(&JsValue::from(format!(
@@ -643,7 +660,7 @@ impl Behaviour {
                     .with_push_listen_addr_updates(true)
                     .with_interval(Duration::from_secs(60)), // .with_cache_size(10), //
             ),
-            ping: ping::Behaviour::new(ping::Config::new().with_interval(Duration::from_secs(16))),
+            ping: ping::Behaviour::new(ping::Config::new().with_interval(Duration::from_secs(1))),
             stream: stream::Behaviour::new(),
         }
     }

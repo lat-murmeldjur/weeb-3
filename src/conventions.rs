@@ -157,11 +157,6 @@ pub fn hasher_0(content_in: &Vec<u8>) -> Vec<u8> {
         content.push(zerobyte)
     }
 
-    web_sys::console::log_1(&JsValue::from(format!(
-        "Hasher length type {:#?}!",
-        content.len(),
-    )));
-
     return hasher_1(&content, content.len());
 }
 
