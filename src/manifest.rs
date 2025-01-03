@@ -16,19 +16,25 @@ pub struct Fork {
     pub data: Vec<u8>,
     pub mime: String,
     pub filename: String,
+    pub path: String,
 }
 
 pub async fn interpret_manifest(
+    path_prefix_heritance: String,
     cd: &Vec<u8>,
     data_retrieve_chan: &mpsc::Sender<(Vec<u8>, mpsc::Sender<Vec<u8>>)>,
 ) -> Vec<Fork> {
-    web_sys::console::log_1(&JsValue::from("manifest interpret"));
+    web_sys::console::log_1(&JsValue::from(format!(
+        "manifest interpret: {}",
+        path_prefix_heritance
+    )));
 
     if cd.len() == 0 {
         return vec![Fork {
             data: vec![],
             mime: "undefined".to_string(),
             filename: "not found".to_string(),
+            path: "not found".to_string(),
         }];
     }
 
@@ -37,6 +43,7 @@ pub async fn interpret_manifest(
             data: cd.to_vec(),
             mime: "application/octet-stream".to_string(),
             filename: "unknown00".to_string(),
+            path: "unknown00".to_string(),
         }];
     }
 
@@ -55,6 +62,7 @@ pub async fn interpret_manifest(
             data: cd.to_vec(),
             mime: "application/octet-stream".to_string(),
             filename: "unknown01".to_string(),
+            path: "unknown01".to_string(),
         }];
     }
 
@@ -97,6 +105,23 @@ pub async fn interpret_manifest(
         let enc_fork_type = hex::encode(&[fork_type]);
         web_sys::console::log_1(&JsValue::from(format!("enc_fork_type: {}", enc_fork_type)));
 
+        let fork_prefix_length = cd[fork_start_current + 1];
+        let enc_fork_prefix_length = hex::encode(&[fork_prefix_length]);
+        web_sys::console::log_1(&JsValue::from(format!(
+            "fork_prefix_length: {}",
+            enc_fork_prefix_length
+        )));
+
+        let fork_prefix = &cd[fork_start + 2..fork_start + 2 + (fork_prefix_length as usize)];
+        let enc_fork_prefix = hex::encode(fork_prefix);
+        web_sys::console::log_1(&JsValue::from(format!("fork_prefix: {}", enc_fork_prefix)));
+
+        let string_fork_prefix = String::from_utf8(fork_prefix.to_vec()).unwrap_or("".to_string());
+        web_sys::console::log_1(&JsValue::from(format!(
+            "string_fork_prefix: {}",
+            string_fork_prefix
+        )));
+
         let fork_prefix_delimiter = fork_start + 32;
         let fork_reference_delimiter = fork_prefix_delimiter + (ref_size as usize);
         let fork_reference = &cd[fork_prefix_delimiter..fork_reference_delimiter];
@@ -138,8 +163,12 @@ pub async fn interpret_manifest(
             let str1 = match str0 {
                 Some(str0) => str0.as_str().unwrap(),
                 _ => {
+                    let mut bequeath: String = String::new();
+                    bequeath.push_str(&path_prefix_heritance);
+                    bequeath.push_str(&string_fork_prefix);
+
                     let mut appendix_0 =
-                        Box::pin(interpret_manifest(&ref_data, data_retrieve_chan)).await;
+                        Box::pin(interpret_manifest(bequeath, &ref_data, data_retrieve_chan)).await;
                     parts.append(&mut appendix_0);
                     continue;
                 }
@@ -160,16 +189,25 @@ pub async fn interpret_manifest(
             )
             .await;
 
+            let mut path_0: String = String::new();
+            path_0.push_str(&path_prefix_heritance);
+            path_0.push_str(&string_fork_prefix);
+
             parts.push(Fork {
                 data: actual_data.to_vec(),
                 mime: mime_0,
                 filename: filename_0,
+                path: path_0,
             });
         }
 
         if fork_type & 16 == 0 {
             fork_start_current = fork_start + 32 + (ref_size as usize);
-            let mut appendix_0 = Box::pin(interpret_manifest(&ref_data, data_retrieve_chan)).await;
+            let mut bequeath: String = String::new();
+            bequeath.push_str(&path_prefix_heritance);
+            bequeath.push_str(&string_fork_prefix);
+            let mut appendix_0 =
+                Box::pin(interpret_manifest(bequeath, &ref_data, data_retrieve_chan)).await;
             parts.append(&mut appendix_0);
         }
     }

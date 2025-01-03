@@ -61,12 +61,13 @@ pub async fn retrieve_resource(
     )
     .await;
 
-    let data_vector = interpret_manifest(&cd, data_retrieve_chan).await;
+    let data_vector = interpret_manifest("".to_string(), &cd, data_retrieve_chan).await;
 
     for f in &data_vector {
         web_sys::console::log_1(&JsValue::from(format!("Part_d: {:#?} ", f.data)));
         web_sys::console::log_1(&JsValue::from(format!("Part_m: {} ", f.mime)));
         web_sys::console::log_1(&JsValue::from(format!("Part_f: {} ", f.filename)));
+        web_sys::console::log_1(&JsValue::from(format!("Part_p: {} ", f.path)));
     }
 
     if data_vector.len() == 0 {
