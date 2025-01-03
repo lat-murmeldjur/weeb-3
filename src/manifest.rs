@@ -86,9 +86,16 @@ pub async fn interpret_manifest(
     let mut fork_start_current = index_delimiter;
 
     while cd.len() > fork_start_current {
+        web_sys::console::log_1(&JsValue::from(format!(
+            "looparams: {} {}",
+            cd.len(),
+            fork_start_current
+        )));
+
         let fork_start = fork_start_current;
         let fork_type = cd[fork_start_current];
         let enc_fork_type = hex::encode(&[fork_type]);
+        web_sys::console::log_1(&JsValue::from(format!("enc_fork_type: {}", enc_fork_type)));
 
         let fork_prefix_delimiter = fork_start + 32;
         let fork_reference_delimiter = fork_prefix_delimiter + (ref_size as usize);
@@ -101,13 +108,7 @@ pub async fn interpret_manifest(
 
         let ref_data = get_data(fork_reference.to_vec(), data_retrieve_chan).await;
 
-        if enc_fork_type == "04" {
-            fork_start_current = fork_start + 32 + (ref_size as usize);
-            let mut appendix_0 = Box::pin(interpret_manifest(&ref_data, data_retrieve_chan)).await;
-            parts.append(&mut appendix_0);
-        }
-
-        if enc_fork_type == "12" {
+        if fork_type & 16 == 16 {
             let fork_metadata_bytesize: [u8; 2] = cd
                 [fork_reference_delimiter..fork_reference_delimiter + 2]
                 .try_into()
@@ -164,6 +165,12 @@ pub async fn interpret_manifest(
                 mime: mime_0,
                 filename: filename_0,
             });
+        }
+
+        if fork_type & 16 == 0 {
+            fork_start_current = fork_start + 32 + (ref_size as usize);
+            let mut appendix_0 = Box::pin(interpret_manifest(&ref_data, data_retrieve_chan)).await;
+            parts.append(&mut appendix_0);
         }
     }
 

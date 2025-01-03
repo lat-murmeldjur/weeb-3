@@ -4,7 +4,7 @@ use anyhow::Result;
 use console_error_panic_hook;
 use rand::rngs::OsRng;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::num::NonZero;
 use std::str::FromStr;
 use std::sync::mpsc;
@@ -118,6 +118,7 @@ pub struct Wings {
     connected_peers: Mutex<HashMap<PeerId, PeerFile>>,
     overlay_peers: Mutex<HashMap<String, PeerId>>,
     accounting_peers: Mutex<HashMap<PeerId, Mutex<PeerAccounting>>>,
+    ongoing_refreshments: Mutex<HashSet<PeerId>>,
 }
 
 #[wasm_bindgen]
@@ -203,6 +204,7 @@ impl Sekirei {
         let overlay_peers: Mutex<HashMap<String, PeerId>> = Mutex::new(HashMap::new());
         let accounting_peers: Mutex<HashMap<PeerId, Mutex<PeerAccounting>>> =
             Mutex::new(HashMap::new());
+        let ongoing_refreshments: Mutex<HashSet<PeerId>> = Mutex::new(HashSet::new());
 
         let (m_out, m_in) = mpsc::channel::<(Vec<u8>, mpsc::Sender<Vec<u8>>)>();
 
@@ -213,6 +215,7 @@ impl Sekirei {
                 connected_peers: connected_peers,
                 overlay_peers: overlay_peers,
                 accounting_peers: accounting_peers,
+                ongoing_refreshments: ongoing_refreshments,
             }),
             message_port: (m_out, m_in),
         };
@@ -267,7 +270,7 @@ impl Sekirei {
         }
 
         let mut ctrl3 = ctrl.clone();
-        let mut ctrl4 = ctrl.clone();
+        let ctrl4 = ctrl.clone();
         let mut ctrl5 = ctrl.clone();
         let ctrl6 = ctrl.clone();
 
@@ -457,11 +460,19 @@ impl Sekirei {
                 };
 
                 let k3 = async {
+                    let mut refresh_joiner = Vec::new();
+
                     #[allow(irrefutable_let_patterns)]
                     while let re_out = refreshment_instructions_chan_incoming.try_recv() {
                         if !re_out.is_err() {
                             web_sys::console::log_1(&JsValue::from(format!("Refresh attempt")));
                             let (peer, amount) = re_out.unwrap();
+                            {
+                                let map = wings.ongoing_refreshments.lock().unwrap();
+                                if map.contains(&peer) {
+                                    continue;
+                                }
+                            }
                             #[allow(unused_assignments)]
                             let mut daten = Date::now();
                             let datenow = Date::now();
@@ -475,18 +486,23 @@ impl Sekirei {
                                 }
                             }
                             if datenow > daten + 1000.0 {
-                                refresh_handler(
-                                    peer,
-                                    amount,
-                                    &mut ctrl4,
-                                    &refreshment_chan_outgoing,
-                                )
-                                .await;
+                                {
+                                    let mut map = wings.ongoing_refreshments.lock().unwrap();
+                                    map.insert(peer);
+                                }
+                                let mut ctrl7 = ctrl4.clone();
+                                let rco = refreshment_chan_outgoing.clone();
+                                let handle = async move {
+                                    refresh_handler(peer, amount, &mut ctrl7, &rco).await;
+                                };
+                                refresh_joiner.push(handle);
                             }
                         } else {
                             break;
                         }
                     }
+
+                    join_all(refresh_joiner).await;
                 };
 
                 let k4 = async {
@@ -494,9 +510,15 @@ impl Sekirei {
                     while let re_in = refreshment_chan_incoming.try_recv() {
                         if !re_in.is_err() {
                             let (peer, amount) = re_in.unwrap();
-                            let accounting = wings.accounting_peers.lock().unwrap();
-                            let accounting_peer = accounting.get(&peer).unwrap();
-                            apply_refreshment(accounting_peer, amount);
+                            {
+                                let accounting = wings.accounting_peers.lock().unwrap();
+                                let accounting_peer = accounting.get(&peer).unwrap();
+                                apply_refreshment(accounting_peer, amount);
+                            }
+                            let mut map = wings.ongoing_refreshments.lock().unwrap();
+                            if map.contains(&peer) {
+                                map.remove(&peer);
+                            }
                         } else {
                             break;
                         }
@@ -660,7 +682,7 @@ impl Behaviour {
                     .with_push_listen_addr_updates(true)
                     .with_interval(Duration::from_secs(60)), // .with_cache_size(10), //
             ),
-            ping: ping::Behaviour::new(ping::Config::new().with_interval(Duration::from_secs(1))),
+            ping: ping::Behaviour::new(ping::Config::new().with_interval(Duration::from_secs(5))),
             stream: stream::Behaviour::new(),
         }
     }
