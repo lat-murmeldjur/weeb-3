@@ -3,7 +3,7 @@ use crate::{
     // // // // // // // //
     cancel_reserve,
     // // // // // // // //
-    encode_resource,
+    encode_resources,
     // // // // // // // //
     get_proximity,
     // // // // // // // //
@@ -62,22 +62,30 @@ pub async fn retrieve_resource(
     .await;
 
     let data_vector = interpret_manifest("".to_string(), &cd, data_retrieve_chan).await;
+    let mut data_vector_e: Vec<(Vec<u8>, String, String)> = vec![];
 
     for f in &data_vector {
-        web_sys::console::log_1(&JsValue::from(format!("Part_d: {:#?} ", f.data)));
+        web_sys::console::log_1(&JsValue::from(format!("Part_d: {:#?}", f.data)));
         web_sys::console::log_1(&JsValue::from(format!("Part_m: {} ", f.mime)));
         web_sys::console::log_1(&JsValue::from(format!("Part_f: {} ", f.filename)));
         web_sys::console::log_1(&JsValue::from(format!("Part_p: {} ", f.path)));
+        data_vector_e.push((f.data[8..].to_vec(), f.mime.clone(), f.path.clone()));
     }
 
-    if data_vector.len() == 0 {
-        return encode_resource(vec![], "not found".to_string());
+    if data_vector_e.len() == 0 {
+        return encode_resources(vec![(
+            vec![],
+            "not found".to_string(),
+            "not found".to_string(),
+        )]);
     }
 
-    return encode_resource(
-        data_vector[0].data[8..].to_vec(),
-        data_vector[0].mime.clone(),
-    );
+    web_sys::console::log_1(&JsValue::from(format!(
+        "vector_len: {:#?} ",
+        data_vector_e.len()
+    )));
+
+    return encode_resources(data_vector_e);
 }
 
 pub async fn retrieve_data(

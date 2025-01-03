@@ -1,4 +1,4 @@
-use crate::{decode_resource, init_panic_hook, Body};
+use crate::{decode_resources, init_panic_hook, Body};
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::mpsc;
@@ -94,35 +94,45 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
         #[allow(irrefutable_let_patterns)]
         while let data0 = r_in.try_recv() {
             if !data0.is_err() {
-                let (data, string) = decode_resource(data0.unwrap());
-                web_sys::console::log_1(&JsValue::from(format!("data length {:#?}", data.len())));
+                let data = decode_resources(data0.unwrap());
+                web_sys::console::log_1(&JsValue::from(format!(
+                    "data array length {:#?}",
+                    data.len()
+                )));
 
-                let props = BlobPropertyBag::new();
-                props.set_type(&string);
+                if data.len() == 1 {
+                    web_sys::console::log_1(&JsValue::from(format!(
+                        "data length {:#?}",
+                        data[0].0.len()
+                    )));
 
-                let data2: Uint8Array = JsValue::from(data).into();
-                let bytes = Array::new();
-                bytes.push(&data2);
+                    let props = BlobPropertyBag::new();
+                    props.set_type(&data[0].1);
 
-                let blob = Blob::new_with_u8_array_sequence_and_options(&bytes, &props).unwrap();
+                    let data2: Uint8Array = JsValue::from(data[0].0.clone()).into();
+                    let bytes = Array::new();
+                    bytes.push(&data2);
 
-                let blob_url = web_sys::Url::create_object_url_with_blob(&blob).unwrap();
+                    let blob =
+                        Blob::new_with_u8_array_sequence_and_options(&bytes, &props).unwrap();
 
-                let new_element = create_element_wmt(blob.type_(), blob_url);
+                    let blob_url = web_sys::Url::create_object_url_with_blob(&blob).unwrap();
 
-                // web_sys::console::log_2(&"Received data: ".into(), &JsValue::from(data));
-                // web_sys::console::log_2(&"Received string: ".into(), &JsValue::from(&string));
+                    let new_element = create_element_wmt(blob.type_(), blob_url);
 
-                let document = web_sys::window().unwrap().document().unwrap();
+                    // web_sys::console::log_2(&"Received data: ".into(), &JsValue::from(data));
+                    // web_sys::console::log_2(&"Received string: ".into(), &JsValue::from(&string));
 
-                let _r = document
-                    .get_element_by_id("resultField")
-                    .expect("#resultField should exist")
-                    .dyn_ref::<HtmlElement>()
-                    .unwrap()
-                    .append_child(&new_element)
-                    .unwrap();
+                    let document = web_sys::window().unwrap().document().unwrap();
 
+                    let _r = document
+                        .get_element_by_id("resultField")
+                        .expect("#resultField should exist")
+                        .dyn_ref::<HtmlElement>()
+                        .unwrap()
+                        .append_child(&new_element)
+                        .unwrap();
+                }
                 //
             } else {
                 break;
