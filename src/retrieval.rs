@@ -65,7 +65,7 @@ pub async fn retrieve_resource(
     let mut data_vector_e: Vec<(Vec<u8>, String, String)> = vec![];
 
     for f in &data_vector {
-        web_sys::console::log_1(&JsValue::from(format!("Part_d: {:#?}", f.data)));
+        web_sys::console::log_1(&JsValue::from(format!("Part_d: {:#?}", f.data.len())));
         web_sys::console::log_1(&JsValue::from(format!("Part_m: {} ", f.mime)));
         web_sys::console::log_1(&JsValue::from(format!("Part_f: {} ", f.filename)));
         web_sys::console::log_1(&JsValue::from(format!("Part_p: {} ", f.path)));

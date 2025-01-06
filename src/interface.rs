@@ -4,18 +4,54 @@ use std::rc::Rc;
 use std::sync::mpsc;
 use std::time::Duration;
 
-use js_sys::{Array, Uint8Array};
-use wasm_bindgen::{closure::Closure, prelude::wasm_bindgen, JsCast, JsError, JsValue};
+use js_sys::{Array, Date, Uint8Array};
+use wasm_bindgen::{closure::Closure, prelude::*, JsCast, JsError, JsValue};
+use wasm_bindgen_futures::JsFuture;
 use web_sys::{
-    console, Blob, BlobPropertyBag, Element, HtmlElement, HtmlInputElement, MessageEvent,
-    SharedWorker,
+    console, Blob, BlobPropertyBag, Cache, Element, HtmlElement, HtmlInputElement, MessageEvent,
+    Request, RequestInit, Response, SharedWorker,
 };
 
 #[wasm_bindgen]
 pub async fn interweeb(_st: String) -> Result<(), JsError> {
     init_panic_hook();
 
+    let window = &web_sys::window().unwrap();
+
+    let host = window
+        .document()
+        .unwrap()
+        .location()
+        .unwrap()
+        .href()
+        .unwrap();
+
+    web_sys::console::log_1(&JsValue::from(format!("host {:#?}", host)));
+
+    let host2 = window
+        .document()
+        .unwrap()
+        .location()
+        .unwrap()
+        .origin()
+        .unwrap();
+
+    web_sys::console::log_1(&JsValue::from(format!("host2 {:#?}", host2)));
+
     let body = Body::from_current_window()?;
+
+    let date = Date::now();
+
+    let cache_promise = web_sys::window()
+        .unwrap()
+        .caches()
+        .unwrap()
+        .open(&date.to_string());
+    let cache = JsFuture::from(cache_promise)
+        .await
+        .unwrap()
+        .dyn_into::<Cache>()
+        .unwrap();
 
     let (r_out, r_in) = mpsc::channel::<Vec<u8>>();
 
@@ -132,6 +168,72 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
                         .unwrap()
                         .append_child(&new_element)
                         .unwrap();
+                } else {
+                    let date3 = Date::now().to_string();
+
+                    for (data3, mime3, path3) in data {
+                        let props = BlobPropertyBag::new();
+                        props.set_type(&mime3);
+
+                        let data2: Uint8Array = JsValue::from(data3).into();
+                        let bytes = Array::new();
+                        bytes.push(&data2);
+
+                        let blob =
+                            Blob::new_with_u8_array_sequence_and_options(&bytes, &props).unwrap();
+
+                        let blob_url = web_sys::Url::create_object_url_with_blob(&blob).unwrap();
+
+                        let opts = RequestInit::new();
+                        opts.set_method("GET");
+
+                        let request = Request::new_with_str_and_init(&blob_url, &opts).unwrap();
+
+                        let window = web_sys::window().unwrap();
+                        let resp_value = JsFuture::from(window.fetch_with_request(&request))
+                            .await
+                            .unwrap();
+
+                        assert!(resp_value.is_instance_of::<Response>());
+                        let resp: Response = resp_value.dyn_into().unwrap();
+
+                        let sep = "/".to_string();
+                        let mut path03 = host2.clone();
+                        path03.push_str(&sep);
+                        path03.push_str(&date3);
+                        path03.push_str(&sep);
+                        path03.push_str(&path3);
+
+                        let _ = JsFuture::from(cache.put_with_str(&path03, &resp)).await;
+
+                        let new_element = create_element_wmt(mime3, path03);
+
+                        let document = web_sys::window().unwrap().document().unwrap();
+
+                        let _r = document
+                            .get_element_by_id("resultField")
+                            .expect("#resultField should exist")
+                            .dyn_ref::<HtmlElement>()
+                            .unwrap()
+                            .append_child(&new_element)
+                            .unwrap();
+                    }
+
+                    //                    let mut path03 = host2.clone();
+                    //                    path03.push_str(&date3);
+                    //                    path03.push_str("/index.html");
+                    //
+                    //                    let new_element = create_element_wmt("text/html".to_string(), path03);
+                    //
+                    //                    let document = web_sys::window().unwrap().document().unwrap();
+                    //
+                    //                    let _r = document
+                    //                        .get_element_by_id("resultField")
+                    //                        .expect("#resultField should exist")
+                    //                        .dyn_ref::<HtmlElement>()
+                    //                        .unwrap()
+                    //                        .append_child(&new_element)
+                    //                        .unwrap();
                 }
                 //
             } else {

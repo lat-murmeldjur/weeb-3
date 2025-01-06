@@ -1,9 +1,20 @@
 use anyhow::Result;
+use rand::thread_rng;
+
+use std::net::IpAddr;
+use std::net::Ipv4Addr;
+use std::net::SocketAddr;
+use std::time::Duration;
+
+use tower_http::cors::{Any, CorsLayer};
+
 use axum::extract::{Path, State};
 use axum::http::header::CONTENT_TYPE;
 use axum::http::StatusCode;
 use axum::response::{Html, IntoResponse};
 use axum::{http::Method, routing::get, Router};
+use axum_server::tls_rustls::RustlsConfig;
+
 use libp2p::futures::StreamExt;
 use libp2p::{
     core::muxing::StreamMuxerBox,
@@ -13,11 +24,6 @@ use libp2p::{
     swarm::SwarmEvent,
 };
 use libp2p_webrtc as webrtc;
-use rand::thread_rng;
-use std::net::Ipv4Addr;
-use std::time::Duration;
-use tokio::net::TcpListener;
-use tower_http::cors::{Any, CorsLayer};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -81,24 +87,34 @@ pub(crate) async fn serve(libp2p_transport: Multiaddr) {
         panic!("Expected 1st protocol to be IP4")
     };
 
+    let config = RustlsConfig::from_pem_file("static/cert.pem", "static/key.pem")
+        .await
+        .unwrap();
+
     let server = Router::new()
         .route("/", get(get_index))
         .route("/index.html", get(get_index))
         .route("/{path}", get(get_static_file))
         .with_state(Libp2pEndpoint(libp2p_transport))
         .layer(
-            // allow cors
             CorsLayer::new()
                 .allow_origin(Any)
                 .allow_methods([Method::GET]),
         );
 
-    axum::serve(
-        TcpListener::bind((listen_addr, 8080)).await.unwrap(),
-        server.into_make_service(),
-    )
-    .await
-    .unwrap();
+    let socket = SocketAddr::new(IpAddr::V4(listen_addr), 8080);
+
+    axum_server::bind_rustls(socket, config)
+        .serve(server.into_make_service())
+        .await
+        .unwrap();
+
+    // axum::serve(
+    //     TcpListener::bind((listen_addr, 8080)).await.unwrap(),
+    //     server.into_make_service(),
+    // )
+    // .await
+    // .unwrap();
 }
 
 #[derive(Clone)]

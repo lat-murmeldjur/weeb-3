@@ -200,35 +200,6 @@ pub fn valid_soc(_chunk_content: &Vec<u8>, _address: &Vec<u8>) -> bool {
     //
 }
 
-pub fn encode_resource(data: Vec<u8>, str0: String) -> Vec<u8> {
-    let str_b = str0.as_bytes();
-    let len_b: u64 = str_b.len() as u64;
-    let a = len_b.to_le_bytes();
-    [a.as_slice(), str_b, &data].concat()
-}
-
-pub fn decode_resource(encoded_data: Vec<u8>) -> (Vec<u8>, String) {
-    if encoded_data.len() < 8 {
-        return (vec![], "undefined".to_string());
-    };
-
-    let string_length: usize =
-        u64::from_le_bytes(encoded_data[0..8].try_into().unwrap_or([0; 8])) as usize;
-
-    if encoded_data.len() < 8 + string_length {
-        return (vec![], "undefined".to_string());
-    };
-
-    let string =
-        String::from_utf8(encoded_data[8..8 + string_length].to_vec()).unwrap_or("".to_string());
-
-    let mut data = Vec::new();
-    if encoded_data.len() > 8 + string_length {
-        data = encoded_data[8 + string_length..].to_vec();
-    };
-    (data, string)
-}
-
 pub fn encode_resources(data_array: Vec<(Vec<u8>, String, String)>) -> Vec<u8> {
     let mut output = vec![];
     for (data, str0, str1) in data_array {
@@ -315,7 +286,7 @@ pub fn decode_resources(encoded_data: Vec<u8>) -> Vec<(Vec<u8>, String, String)>
                 .unwrap_or([0; 8]),
         ) as usize;
 
-        let mut data = Vec::new();
+        let data: Vec<u8>;
         start = data_start + 8 + data_length;
         if encoded_data.len() > data_start + 8 {
             data = encoded_data[data_start + 8..start].to_vec();
