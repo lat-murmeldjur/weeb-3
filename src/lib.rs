@@ -481,7 +481,7 @@ impl Sekirei {
                                 let accounting_peer_lock = accounting.get(&peer).unwrap();
                                 let mut accounting_peer = accounting_peer_lock.lock().unwrap();
                                 daten = accounting_peer.refreshment;
-                                if datenow > accounting_peer.refreshment + 00.0 {
+                                if datenow > accounting_peer.refreshment + 1000.0 {
                                     accounting_peer.refreshment = datenow;
                                 }
                             }

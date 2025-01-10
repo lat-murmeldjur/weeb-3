@@ -21,6 +21,8 @@ class Code_One {
 
 		if ( build[0] && wbuild[0]) {
 
+			clientele('cp', ['./static/{index.html,weeb_3.js,weeb_3_bg.wasm,worker.js}', './docs/'], count);
+
 			var mist = gitcoal(w1);
 			var dome = gitcoal(w2);
 			temporas(w3);
