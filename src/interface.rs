@@ -20,11 +20,12 @@ use web_sys::{
     RequestInit,
     Response,
     // ResponseInit,
+    ServiceWorker,
     SharedWorker,
 };
 
 #[wasm_bindgen]
-pub async fn interweeb(_st: String) -> Result<(), JsError> {
+pub async fn interweeb(service: ServiceWorker) -> Result<(), JsError> {
     init_panic_hook();
 
     let window = &web_sys::window().unwrap();
@@ -40,15 +41,6 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
     web_sys::console::log_1(&JsValue::from(format!("host2 {:#?}", host2)));
 
     let body = Body::from_current_window()?;
-
-    // let date = Date::now();
-
-    let cache_promise = web_sys::window().unwrap().caches().unwrap().open("--");
-    let cache = JsFuture::from(cache_promise)
-        .await
-        .unwrap()
-        .dyn_into::<Cache>()
-        .unwrap();
 
     let (r_out, r_in) = mpsc::channel::<Vec<u8>>();
 
@@ -206,7 +198,9 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
                         let resp: Response = resp_value.dyn_into().unwrap();
 
                         let request03 = Request::new_with_str_and_init(&path03, &opts).unwrap();
-                        let _ = JsFuture::from(cache.put_with_request(&request03, &resp)).await;
+                        // let _ = JsFuture::from(cache.put_with_request(&request03, &resp)).await;
+
+                        let _ = service.post_message(&resp.into());
 
                         let new_element = create_element_wmt(mime3, path03);
 

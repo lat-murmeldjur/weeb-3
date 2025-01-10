@@ -3,6 +3,12 @@ const putInCache = async (request, response) => {
   await cache.put(request, response);
 };
 
+let data;
+self.addEventListener('message', function(event) {
+  data = event.data
+  console.log(data);
+})
+
 const cacheFirst = async (request) => {
   const responseFromCache = await caches.match(request);
   if (responseFromCache) {
