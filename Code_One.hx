@@ -20,8 +20,11 @@ class Code_One {
 		clientele('cargo', ['build'], count, build);
 
 		if ( build[0] && wbuild[0]) {
-
-			clientele('cp', ['./static/{index.html,weeb_3.js,weeb_3_bg.wasm,worker.js,service.js}', './docs/'], count);
+			clientele('cp', [ './static/index.html', './docs/' ], count);
+			clientele('cp', [ './static/weeb_3.js', './docs/' ], count);
+			clientele('cp', [ './static/weeb_3_bg.wasm', './docs/' ], count);
+			clientele('cp', [ './static/worker.js', './docs/' ], count);
+			clientele('cp', [ './static/service.js', './docs/' ], count);
 
 			var mist = gitcoal(w1);
 			var dome = gitcoal(w2);
