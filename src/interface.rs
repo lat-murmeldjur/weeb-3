@@ -8,8 +8,19 @@ use js_sys::{Array, Date, Uint8Array};
 use wasm_bindgen::{closure::Closure, prelude::*, JsCast, JsError, JsValue};
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{
-    console, Blob, BlobPropertyBag, Cache, Element, HtmlElement, HtmlInputElement, MessageEvent,
-    Request, RequestInit, Response, ResponseInit, SharedWorker,
+    console,
+    Blob,
+    BlobPropertyBag,
+    Cache,
+    Element,
+    HtmlElement,
+    HtmlInputElement,
+    MessageEvent,
+    Request,
+    RequestInit,
+    Response,
+    // ResponseInit,
+    SharedWorker,
 };
 
 #[wasm_bindgen]
@@ -30,13 +41,9 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
 
     let body = Body::from_current_window()?;
 
-    let date = Date::now();
+    // let date = Date::now();
 
-    let cache_promise = web_sys::window()
-        .unwrap()
-        .caches()
-        .unwrap()
-        .open(&date.to_string());
+    let cache_promise = web_sys::window().unwrap().caches().unwrap().open("--");
     let cache = JsFuture::from(cache_promise)
         .await
         .unwrap()
@@ -162,10 +169,17 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
                     let date3 = Date::now().to_string();
                     for (data3, mime3, path3) in data {
                         let opts = RequestInit::new();
-                        opts.set_method("GET");
-                        // opts.set_cache(RequestCache::new(4));
 
-                        let dlen = data3.len().to_string();
+                        opts.set_method("GET");
+
+                        let req_headers = web_sys::Headers::new().unwrap();
+                        let _ = req_headers
+                            .append("Referrer-Policy", "strict-origin-when-cross-origin");
+                        // let _ = req_headers.append("access-control-allow-origin", "*");
+                        // let _ = req_headers.append("Cache-Control", "public, max-age=6000000");
+                        opts.set_headers(&req_headers);
+
+                        // let dlen = data3.len().to_string();
 
                         let sep = "/".to_string();
                         let mut path03 = host2.clone();
@@ -174,81 +188,25 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
                         path03.push_str(&sep);
                         path03.push_str(&path3);
 
-                        let request = Request::new_with_str_and_init(&path03, &opts).unwrap();
+                        let props = BlobPropertyBag::new();
+                        props.set_type(&mime3);
+                        let data2: Uint8Array = JsValue::from(data3).into();
+                        let bytes = Array::new();
+                        bytes.push(&data2);
+                        let blob =
+                            Blob::new_with_u8_array_sequence_and_options(&bytes, &props).unwrap();
+                        let blob_url = web_sys::Url::create_object_url_with_blob(&blob).unwrap();
 
-                        web_sys::console::log_1(&JsValue::from(format!("request {:#?}", request)));
+                        let request = Request::new_with_str_and_init(&blob_url, &opts).unwrap();
+                        let window = web_sys::window().unwrap();
+                        let resp_value = JsFuture::from(window.fetch_with_request(&request))
+                            .await
+                            .unwrap();
+                        assert!(resp_value.is_instance_of::<Response>());
+                        let resp: Response = resp_value.dyn_into().unwrap();
 
-                        let init = ResponseInit::new();
-                        let headers = web_sys::Headers::new().unwrap();
-                        let _ = headers.append("Content-Type", &mime3);
-                        let _ = headers.append("access-control-allow-origin", "*");
-                        // let _ = headers.append(
-                        //     "vary",
-                        //     "origin, access-control-request-method, access-control-request-headers",
-                        // );
-                        let _ = headers.append(
-                             "Cache-Control",
-                             "public, max-age=6000000, stale-while-revalidate=6000000, s-maxage=6000000",
-                         );
-                        let _ = headers.append("Content-Length", &dlen);
-
-                        let _ = headers.append(
-                            "access-control-allow-headers",
-                            "Cache-Control, Content-Type, Content-Length",
-                        );
-                        let _ =
-                            headers.append("access-control-allow-methods", "GET, HEAD, OPTIONS");
-                        let _ = headers.append("access-control-allow-origin", "*");
-                        let _ = headers.append(
-                            "access-control-expose-headers",
-                            "Cache-Control, Content-Type, Content-Length",
-                        );
-
-                        init.set_headers(&headers);
-                        init.set_status(200);
-
-                        let resp: Response = Response::new_with_opt_u8_array_and_init(
-                            Some(&mut data3.clone()),
-                            &init,
-                        )
-                        .unwrap();
-
-                        web_sys::console::log_1(&JsValue::from(format!(
-                            "response_type {:#?}",
-                            resp.type_()
-                        )));
-                        web_sys::console::log_1(&JsValue::from(format!(
-                            "response_url {:#?}",
-                            resp.url()
-                        )));
-                        web_sys::console::log_1(&JsValue::from(format!(
-                            "response_redirected {:#?}",
-                            resp.redirected()
-                        )));
-                        web_sys::console::log_1(&JsValue::from(format!(
-                            "response_status {:#?}",
-                            resp.status()
-                        )));
-                        web_sys::console::log_1(&JsValue::from(format!(
-                            "response_headers {:#?}",
-                            resp.headers()
-                        )));
-                        web_sys::console::log_1(&JsValue::from(format!(
-                            "response_body {:#?}",
-                            resp.body()
-                        )));
-
-                        let resp2 = resp.dyn_into::<JsValue>().unwrap();
-
-                        let _ = js_sys::Reflect::set(
-                            &resp2,
-                            &JsValue::from("type"),
-                            &JsValue::from("Basic"),
-                        );
-
-                        let resp3 = resp2.dyn_ref::<Response>().unwrap();
-
-                        let _ = JsFuture::from(cache.put_with_str(&path03, &resp3)).await;
+                        let request03 = Request::new_with_str_and_init(&path03, &opts).unwrap();
+                        let _ = JsFuture::from(cache.put_with_request(&request03, &resp)).await;
 
                         let new_element = create_element_wmt(mime3, path03);
 
