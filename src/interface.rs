@@ -11,7 +11,6 @@ use web_sys::{
     console,
     Blob,
     BlobPropertyBag,
-    Cache,
     Element,
     HtmlElement,
     HtmlInputElement,
@@ -29,6 +28,8 @@ pub async fn interweeb(service: ServiceWorker) -> Result<(), JsError> {
     init_panic_hook();
 
     let window = &web_sys::window().unwrap();
+
+    let service2 = window.navigator().service_worker().controller().unwrap();
 
     let host2 = window
         .document()
@@ -197,10 +198,12 @@ pub async fn interweeb(service: ServiceWorker) -> Result<(), JsError> {
                         assert!(resp_value.is_instance_of::<Response>());
                         let resp: Response = resp_value.dyn_into().unwrap();
 
-                        let request03 = Request::new_with_str_and_init(&path03, &opts).unwrap();
+                        let _request03 = Request::new_with_str_and_init(&path03, &opts).unwrap();
                         // let _ = JsFuture::from(cache.put_with_request(&request03, &resp)).await;
 
-                        let _ = service.post_message(&resp.into());
+                        let _ = service.post_message(&resp.clone().unwrap().into());
+                        let _ = service2.post_message(&JsValue::from("yeehaa").into());
+                        let _ = service2.post_message(&resp.into());
 
                         let new_element = create_element_wmt(mime3, path03);
 
