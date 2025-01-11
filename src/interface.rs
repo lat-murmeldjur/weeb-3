@@ -30,6 +30,8 @@ pub async fn interweeb(service: ServiceWorker) -> Result<(), JsError> {
     let window = &web_sys::window().unwrap();
 
     let service2 = window.navigator().service_worker().controller().unwrap();
+    let _ = service.post_message(&JsValue::from("yeehaa").into());
+    let _ = service2.post_message(&JsValue::from("yeehaaa").into());
 
     let host2 = window
         .document()
@@ -202,7 +204,6 @@ pub async fn interweeb(service: ServiceWorker) -> Result<(), JsError> {
                         // let _ = JsFuture::from(cache.put_with_request(&request03, &resp)).await;
 
                         let _ = service.post_message(&resp.clone().unwrap().into());
-                        let _ = service2.post_message(&JsValue::from("yeehaa").into());
                         let _ = service2.post_message(&resp.into());
 
                         let new_element = create_element_wmt(mime3, path03);
