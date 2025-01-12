@@ -3,7 +3,7 @@ const putInCache = async (request, response) => {
   await cache.put(request, response);
 };
 
-self.addEventListener('message', function(event) {
+self.addEventListener('message', async function(event) {
   let asset0 = new Blob([event.data.data0], {type: event.data.mime0});
   await putInCache(event.data.path0, asset0);
   console.log(event);
