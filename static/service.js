@@ -21,8 +21,10 @@ self.addEventListener('message', async function(event) {
 })
 
 const cacheFirst = async (request) => {
-  const responseFromCache = await caches.match(request);
-  console.log(responseFromCache);
+  const cache = await caches.open('default0');
+  console.log("req0: ", request);
+  const responseFromCache = await cache.match(request);
+  console.log("respc: ", responseFromCache);
   if (responseFromCache) {
     return responseFromCache;
   }
