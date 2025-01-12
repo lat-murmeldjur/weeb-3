@@ -25,7 +25,7 @@ use web_sys::{
 };
 
 #[wasm_bindgen]
-pub async fn interweeb(service: ServiceWorker) -> Result<(), JsError> {
+pub async fn interweeb(_st: String) -> Result<(), JsError> {
     init_panic_hook();
 
     let window = &web_sys::window().unwrap();
@@ -227,7 +227,6 @@ pub async fn interweeb(service: ServiceWorker) -> Result<(), JsError> {
                         let _request03 = Request::new_with_str_and_init(&path03, &opts).unwrap();
                         // let _ = JsFuture::from(cache.put_with_request(&request03, &resp)).await;
 
-                        let _ = service.post_message(&resp.clone().unwrap().into());
                         let _ = service_worker.post_message(&resp.into());
 
                         let new_element = create_element_wmt(mime3, path03);
