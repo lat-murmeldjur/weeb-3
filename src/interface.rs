@@ -20,6 +20,7 @@ use web_sys::{
     Response,
     // ResponseInit,
     ServiceWorker,
+    ServiceWorkerRegistration,
     SharedWorker,
 };
 
@@ -28,10 +29,6 @@ pub async fn interweeb(service: ServiceWorker) -> Result<(), JsError> {
     init_panic_hook();
 
     let window = &web_sys::window().unwrap();
-
-    let service2 = window.navigator().service_worker().controller().unwrap();
-    let _ = service.post_message(&JsValue::from("yeehaa").into());
-    let _ = service2.post_message(&JsValue::from("yeehaaa").into());
 
     let host2 = window
         .document()
@@ -42,6 +39,33 @@ pub async fn interweeb(service: ServiceWorker) -> Result<(), JsError> {
         .unwrap();
 
     web_sys::console::log_1(&JsValue::from(format!("host2 {:#?}", host2)));
+
+    let service2 = web_sys::window().unwrap().navigator().service_worker();
+
+    match JsFuture::from(service2.register("./service.js")).await {
+        Ok(registration) => {
+            let _ = JsFuture::from(
+                registration
+                    .unchecked_into::<ServiceWorkerRegistration>()
+                    .update()
+                    .unwrap(),
+            )
+            .await;
+            let _ = JsFuture::from(service2.ready().unwrap_throw()).await;
+        }
+        Err(err) => {
+            console::warn_1(&err);
+        }
+    }
+
+    let registration: ServiceWorkerRegistration = JsFuture::from(service2.get_registration())
+        .await
+        .unwrap_throw()
+        .unchecked_into();
+    let service_worker = registration.active().unwrap_throw();
+    service_worker
+        .post_message(&JsValue::from(format!("from host2 {:#?}", host2)))
+        .unwrap_throw();
 
     let body = Body::from_current_window()?;
 
@@ -204,7 +228,7 @@ pub async fn interweeb(service: ServiceWorker) -> Result<(), JsError> {
                         // let _ = JsFuture::from(cache.put_with_request(&request03, &resp)).await;
 
                         let _ = service.post_message(&resp.clone().unwrap().into());
-                        let _ = service2.post_message(&resp.into());
+                        let _ = service_worker.post_message(&resp.into());
 
                         let new_element = create_element_wmt(mime3, path03);
 

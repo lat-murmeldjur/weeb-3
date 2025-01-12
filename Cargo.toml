@@ -83,6 +83,7 @@ web-sys = { version = "0.3.72", features = [
   'Node',
   'ServiceWorker',
   'ServiceWorkerContainer',
+  'ServiceWorkerRegistration',
   'SharedWorker',
   'ReadableStream',
   'Request',

@@ -5,7 +5,8 @@ const putInCache = async (request, response) => {
 
 let data;
 self.addEventListener('message', function(event) {
-  data = event.data
+  console.log(event);
+  data = event.data;
   console.log(data);
 })
 
