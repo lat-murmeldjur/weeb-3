@@ -253,8 +253,6 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
                             &JsValue::from_str(&path03),
                         );
 
-                        let _ = service_worker0
-                            .post_message(&JsValue::from(format!("from host2 {:#?}", host2)));
                         let _ = service_worker0.post_message(&JsValue::from(msgobj));
 
                         let new_element = create_element_wmt(mime3, path03);
