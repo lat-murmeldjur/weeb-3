@@ -6,9 +6,16 @@ const putInCache = async (request, response) => {
 self.addEventListener('message', async function(event) {
   let asset0 = new Blob([event.data.data0], {type: event.data.mime0});
 
+  const reqHeaders = new Headers();
+  reqHeaders.set("Cache-Control", "private");
+  const options = {
+    headers: reqHeaders,
+  };
+
+  const request0 = new Request(event.data.path0, options);
   const response0 = new Response(asset0, { headers: { contentType: event.data.mime0 } });
 
-  await putInCache(event.data.path0, response0);
+  await putInCache(request0, response0);
   console.log(event);
 })
 
