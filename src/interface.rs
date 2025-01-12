@@ -229,6 +229,8 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
                         let sep = "/".to_string();
                         let mut path03 = host2.clone();
                         path03.push_str(&sep);
+                        path03.push_str(&"weeb-3".to_string());
+                        path03.push_str(&sep);
                         path03.push_str(&date3);
                         path03.push_str(&sep);
                         path03.push_str(&path3);
