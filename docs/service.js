@@ -14,7 +14,7 @@ self.addEventListener('message', async function(event) {
   };
 
   const request0 = new Request(event.data.path0, options);
-  const response0 = new Response(asset0, { headers: { contentType: event.data.mime0 } });
+  const response0 = new Response(asset0, { headers: { 'Content-Type': event.data.mime0, 'Content-Length': event.data.data0.length } });
 
   await putInCache(request0, response0);
   console.log(event);
