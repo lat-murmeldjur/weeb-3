@@ -280,26 +280,19 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
                                 got = true;
                             }
                         }
+
+                        let new_element = create_element_wmt(mime3, path03);
+
+                        let document = web_sys::window().unwrap().document().unwrap();
+
+                        let _r = document
+                            .get_element_by_id("resultField")
+                            .expect("#resultField should exist")
+                            .dyn_ref::<HtmlElement>()
+                            .unwrap()
+                            .append_child(&new_element)
+                            .unwrap();
                     }
-
-                    let sep = "/".to_string();
-                    let mut path00 = host2.clone();
-                    path00.push_str(&sep);
-                    path00.push_str(&date3);
-                    path00.push_str(&sep);
-                    path00.push_str(&"index.html".to_string());
-
-                    let new_element = create_ielement_wmt(path00);
-
-                    let document = web_sys::window().unwrap().document().unwrap();
-
-                    let _r = document
-                        .get_element_by_id("resultField")
-                        .expect("#resultField should exist")
-                        .dyn_ref::<HtmlElement>()
-                        .unwrap()
-                        .append_child(&new_element)
-                        .unwrap();
 
                     //                    let mut path03 = host2.clone();
                     //                    path03.push_str(&date3);
@@ -347,13 +340,5 @@ fn create_element_wmt(tmype: String, blob_url: String) -> Element {
     let i = document.create_element("embed").unwrap();
     let _ = i.set_attribute("src", &blob_url);
     let _ = i.set_attribute("type", &tmype);
-    return i;
-}
-
-fn create_ielement_wmt(blob_url: String) -> Element {
-    let document = web_sys::window().unwrap().document().unwrap();
-
-    let i = document.create_element("iframe").unwrap();
-    let _ = i.set_attribute("src", &blob_url);
     return i;
 }
