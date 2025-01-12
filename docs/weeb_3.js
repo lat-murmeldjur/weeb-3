@@ -218,7 +218,7 @@ export function init_panic_hook() {
 }
 
 function __wbg_adapter_30(arg0, arg1, arg2) {
-    wasm.closure164_externref_shim(arg0, arg1, arg2);
+    wasm.closure311_externref_shim(arg0, arg1, arg2);
 }
 
 function __wbg_adapter_33(arg0, arg1) {
@@ -800,6 +800,10 @@ function __wbg_get_imports() {
         const ret = false;
         return ret;
     };
+    imports.wbg.__wbindgen_closure_wrapper1050 = function(arg0, arg1, arg2) {
+        const ret = makeMutClosure(arg0, arg1, 312, __wbg_adapter_30);
+        return ret;
+    };
     imports.wbg.__wbindgen_closure_wrapper1587 = function(arg0, arg1, arg2) {
         const ret = makeMutClosure(arg0, arg1, 604, __wbg_adapter_33);
         return ret;
@@ -822,10 +826,6 @@ function __wbg_get_imports() {
     };
     imports.wbg.__wbindgen_closure_wrapper3809 = function(arg0, arg1, arg2) {
         const ret = makeMutClosure(arg0, arg1, 1322, __wbg_adapter_46);
-        return ret;
-    };
-    imports.wbg.__wbindgen_closure_wrapper647 = function(arg0, arg1, arg2) {
-        const ret = makeMutClosure(arg0, arg1, 165, __wbg_adapter_30);
         return ret;
     };
     imports.wbg.__wbindgen_debug_string = function(arg0, arg1) {

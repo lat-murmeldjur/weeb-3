@@ -40,33 +40,33 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
 
     web_sys::console::log_1(&JsValue::from(format!("host2 {:#?}", host2)));
 
-    let service2 = web_sys::window().unwrap().navigator().service_worker();
-
-    match JsFuture::from(service2.register("./service.js")).await {
-        Ok(registration) => {
-            let _ = JsFuture::from(
-                registration
-                    .unchecked_into::<ServiceWorkerRegistration>()
-                    .update()
-                    .unwrap(),
-            )
-            .await;
-            let _ = JsFuture::from(service2.ready().unwrap()).await;
-        }
-        Err(err) => {
-            console::warn_1(&err);
-        }
-    }
-
-    let registration: ServiceWorkerRegistration = JsFuture::from(service2.get_registration())
-        .await
-        .unwrap()
-        .unchecked_into();
-    let service_worker = registration.active().unwrap();
-    service_worker
-        .post_message(&JsValue::from(format!("from host2 {:#?}", host2)))
-        .unwrap();
-
+    //    let service2 = web_sys::window().unwrap().navigator().service_worker();
+    //
+    //    match JsFuture::from(service2.register("./service.js")).await {
+    //        Ok(registration) => {
+    //            let _ = JsFuture::from(
+    //                registration
+    //                    .unchecked_into::<ServiceWorkerRegistration>()
+    //                    .update()
+    //                    .unwrap(),
+    //            )
+    //            .await;
+    //            let _ = JsFuture::from(service2.ready().unwrap()).await;
+    //        }
+    //        Err(err) => {
+    //            console::warn_1(&err);
+    //        }
+    //    }
+    //
+    //    let registration: ServiceWorkerRegistration = JsFuture::from(service2.get_registration())
+    //        .await
+    //        .unwrap()
+    //        .unchecked_into();
+    //    let service_worker = registration.active().unwrap();
+    //    service_worker
+    //        .post_message(&JsValue::from(format!("from host2 {:#?}", host2)))
+    //        .unwrap();
+    //
     let body = Body::from_current_window()?;
 
     let (r_out, r_in) = mpsc::channel::<Vec<u8>>();
@@ -187,6 +187,31 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
                 } else {
                     let date3 = Date::now().to_string();
 
+                    let service0 = web_sys::window().unwrap().navigator().service_worker();
+
+                    match JsFuture::from(service0.register("./service.js")).await {
+                        Ok(registration) => {
+                            let _ = JsFuture::from(
+                                registration
+                                    .unchecked_into::<ServiceWorkerRegistration>()
+                                    .update()
+                                    .unwrap(),
+                            )
+                            .await;
+                            let _ = JsFuture::from(service0.ready().unwrap()).await;
+                        }
+                        Err(err) => {
+                            console::warn_1(&err);
+                        }
+                    }
+
+                    let registration0: ServiceWorkerRegistration =
+                        JsFuture::from(service0.get_registration())
+                            .await
+                            .unwrap()
+                            .unchecked_into();
+                    let service_worker0 = registration0.active().unwrap();
+
                     for (data3, mime3, path3) in data {
                         let opts = RequestInit::new();
 
@@ -228,7 +253,7 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
                             &JsValue::from_str(&path03),
                         );
 
-                        let _ = service_worker.post_message(&JsValue::from(msgobj));
+                        let _ = service_worker0.post_message(&JsValue::from(msgobj));
 
                         let mut got = false;
 
