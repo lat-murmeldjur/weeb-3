@@ -152,7 +152,19 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
                     data.len()
                 )));
 
-                if data.len() == 1 {
+                if data.len() == 0 {
+                    let new_element = create_element_wmt("undefined".to_string(), "".to_string());
+
+                    let document = web_sys::window().unwrap().document().unwrap();
+
+                    let _r = document
+                        .get_element_by_id("resultField")
+                        .expect("#resultField should exist")
+                        .dyn_ref::<HtmlElement>()
+                        .unwrap()
+                        .append_child(&new_element)
+                        .unwrap();
+                } else if data.len() == 1 {
                     web_sys::console::log_1(&JsValue::from(format!(
                         "data length {:#?}",
                         data[0].0.len()
@@ -355,7 +367,7 @@ fn create_ielement(indx: String) -> Element {
 
     let i = document.create_element("iframe").unwrap();
     let _ = i.set_attribute("src", &indx);
-    let _ = i.set_attribute("width", "90");
-    let _ = i.set_attribute("height", "90");
+    let _ = i.set_attribute("width", "90%");
+    let _ = i.set_attribute("height", "90%");
     return i;
 }
