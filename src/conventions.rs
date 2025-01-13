@@ -200,8 +200,15 @@ pub fn valid_soc(_chunk_content: &Vec<u8>, _address: &Vec<u8>) -> bool {
     //
 }
 
-pub fn encode_resources(data_array: Vec<(Vec<u8>, String, String)>) -> Vec<u8> {
+pub fn encode_resources(data_array: Vec<(Vec<u8>, String, String)>, indx: String) -> Vec<u8> {
     let mut output = vec![];
+
+    let str_i = indx.as_bytes();
+    let len_i: u64 = str_i.len() as u64;
+    let i = len_i.to_le_bytes();
+
+    output.append(&mut [i.as_slice(), str_i].concat());
+
     for (data, str0, str1) in data_array {
         let str_b = str0.as_bytes();
         let len_b: u64 = str_b.len() as u64;
@@ -230,9 +237,9 @@ pub fn encode_resources(data_array: Vec<(Vec<u8>, String, String)>) -> Vec<u8> {
     output
 }
 
-pub fn decode_resources(encoded_data: Vec<u8>) -> Vec<(Vec<u8>, String, String)> {
-    let mut start = 0;
+pub fn decode_resources(encoded_data: Vec<u8>) -> (Vec<(Vec<u8>, String, String)>, String) {
     let mut output: Vec<(Vec<u8>, String, String)> = vec![];
+    let mut ind = "".to_string();
 
     web_sys::console::log_1(&JsValue::from(format!(
         "encoded_data_len: {:#?} ",
@@ -240,8 +247,19 @@ pub fn decode_resources(encoded_data: Vec<u8>) -> Vec<(Vec<u8>, String, String)>
     )));
 
     if encoded_data.len() < 8 {
-        return vec![];
+        return (vec![], ind);
     };
+
+    let indx_length: usize =
+        u64::from_le_bytes(encoded_data[0..8].try_into().unwrap_or([0; 8])) as usize;
+
+    let mut start = 8 + indx_length;
+
+    if encoded_data.len() < start {
+        return (vec![], ind);
+    };
+
+    ind = String::from_utf8(encoded_data[8..start].to_vec()).unwrap_or("".to_string());
 
     while start < encoded_data.len() {
         let string0_length: usize =
@@ -251,14 +269,14 @@ pub fn decode_resources(encoded_data: Vec<u8>) -> Vec<(Vec<u8>, String, String)>
         let string1_start = start + 8 + string0_length;
 
         if encoded_data.len() < string1_start {
-            return vec![];
+            return (vec![], ind);
         };
 
         let string0 = String::from_utf8(encoded_data[start + 8..string1_start].to_vec())
             .unwrap_or("".to_string());
 
         if encoded_data.len() < string1_start + 8 {
-            return vec![];
+            return (vec![], ind);
         };
 
         let string1_length: usize = u64::from_le_bytes(
@@ -270,14 +288,14 @@ pub fn decode_resources(encoded_data: Vec<u8>) -> Vec<(Vec<u8>, String, String)>
         let data_start = string1_start + 8 + string1_length;
 
         if encoded_data.len() < string1_start {
-            return vec![];
+            return (vec![], ind);
         };
 
         let string1 = String::from_utf8(encoded_data[string1_start + 8..data_start].to_vec())
             .unwrap_or("".to_string());
 
         if encoded_data.len() < data_start + 8 {
-            return vec![];
+            return (vec![], ind);
         };
 
         let data_length: usize = u64::from_le_bytes(
@@ -291,10 +309,10 @@ pub fn decode_resources(encoded_data: Vec<u8>) -> Vec<(Vec<u8>, String, String)>
         if encoded_data.len() > data_start + 8 {
             data = encoded_data[data_start + 8..start].to_vec();
         } else {
-            return vec![];
+            return (vec![], ind);
         };
 
         output.push((data, string0, string1));
     }
-    output
+    (output, ind)
 }

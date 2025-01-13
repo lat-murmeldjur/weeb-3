@@ -23,28 +23,36 @@ pub async fn interpret_manifest(
     path_prefix_heritance: String,
     cd: &Vec<u8>,
     data_retrieve_chan: &mpsc::Sender<(Vec<u8>, mpsc::Sender<Vec<u8>>)>,
-) -> Vec<Fork> {
+) -> (Vec<Fork>, String) {
     web_sys::console::log_1(&JsValue::from(format!(
         "manifest interpret: {}",
         path_prefix_heritance
     )));
 
+    let mut ind: String = "".to_string();
+
     if cd.len() == 0 {
-        return vec![Fork {
-            data: vec![],
-            mime: "undefined".to_string(),
-            filename: "not found".to_string(),
-            path: "not found".to_string(),
-        }];
+        return (
+            vec![Fork {
+                data: vec![],
+                mime: "undefined".to_string(),
+                filename: "not found".to_string(),
+                path: "not found".to_string(),
+            }],
+            ind,
+        );
     }
 
     if cd.len() < 72 {
-        return vec![Fork {
-            data: cd.to_vec(),
-            mime: "application/octet-stream".to_string(),
-            filename: "unknown00".to_string(),
-            path: "unknown00".to_string(),
-        }];
+        return (
+            vec![Fork {
+                data: cd.to_vec(),
+                mime: "application/octet-stream".to_string(),
+                filename: "unknown00".to_string(),
+                path: "unknown00".to_string(),
+            }],
+            ind,
+        );
     }
 
     // commented out for later use
@@ -58,12 +66,15 @@ pub async fn interpret_manifest(
     if enc_mf_version != "5768b3b6a7db56d21d1abff40d41cebfc83448fed8d7e9b06ec0d3b073f28f"
         && enc_mf_version != "025184789d63635766d78c41900196b57d7400875ebe4d9b5d1e76bd9652a9"
     {
-        return vec![Fork {
-            data: cd.to_vec(),
-            mime: "application/octet-stream".to_string(),
-            filename: "unknown01".to_string(),
-            path: "unknown01".to_string(),
-        }];
+        return (
+            vec![Fork {
+                data: cd.to_vec(),
+                mime: "application/octet-stream".to_string(),
+                filename: "unknown01".to_string(),
+                path: "unknown01".to_string(),
+            }],
+            ind,
+        );
     }
 
     //    web_sys::console::log_1(&JsValue::from(format!("mf_version: {}", enc_mf_version)));
@@ -158,6 +169,12 @@ pub async fn interpret_manifest(
             let v1: Value = serde_json::from_slice(fork_metadata).unwrap_or("nil".into());
             web_sys::console::log_1(&JsValue::from(format!("metadata json: {:#?} ", v1)));
 
+            let str0i = v1.get("website-index-document");
+            match str0i {
+                Some(str0i) => ind = str0i.as_str().unwrap().to_string(),
+                _ => (),
+            };
+
             let str0 = v1.get("Content-Type");
 
             let str1 = match str0 {
@@ -167,7 +184,7 @@ pub async fn interpret_manifest(
                     bequeath.push_str(&path_prefix_heritance);
                     bequeath.push_str(&string_fork_prefix);
 
-                    let mut appendix_0 =
+                    let (mut appendix_0, _discard) =
                         Box::pin(interpret_manifest(bequeath, &ref_data, data_retrieve_chan)).await;
                     parts.append(&mut appendix_0);
                     continue;
@@ -206,13 +223,13 @@ pub async fn interpret_manifest(
             let mut bequeath: String = String::new();
             bequeath.push_str(&path_prefix_heritance);
             bequeath.push_str(&string_fork_prefix);
-            let mut appendix_0 =
+            let (mut appendix_0, _discard) =
                 Box::pin(interpret_manifest(bequeath, &ref_data, data_retrieve_chan)).await;
             parts.append(&mut appendix_0);
         }
     }
 
-    return parts;
+    return (parts, ind);
 }
 
 pub async fn get_data(

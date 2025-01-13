@@ -19,7 +19,7 @@ use web_sys::{
     RequestInit,
     Response,
     // ResponseInit,
-    ServiceWorker,
+    // ServiceWorker,
     ServiceWorkerRegistration,
     SharedWorker,
 };
@@ -146,7 +146,7 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
         #[allow(irrefutable_let_patterns)]
         while let data0 = r_in.try_recv() {
             if !data0.is_err() {
-                let data = decode_resources(data0.unwrap());
+                let (data, indx) = decode_resources(data0.unwrap());
                 web_sys::console::log_1(&JsValue::from(format!(
                     "data array length {:#?}",
                     data.len()
@@ -220,11 +220,7 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
                         let req_headers = web_sys::Headers::new().unwrap();
                         let _ = req_headers
                             .append("Referrer-Policy", "strict-origin-when-cross-origin");
-                        // let _ = req_headers.append("access-control-allow-origin", "*");
-                        // let _ = req_headers.append("Cache-Control", "public, max-age=6000000");
                         opts.set_headers(&req_headers);
-
-                        // let dlen = data3.len().to_string();
 
                         let sep = "/".to_string();
                         let mut path03 = host2.clone();
@@ -241,7 +237,7 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
                         let bytes = Array::new();
                         bytes.push(&data2);
 
-                        let mut msgobj = js_sys::Object::new();
+                        let msgobj = js_sys::Object::new();
 
                         let _ = js_sys::Reflect::set(&msgobj, &JsValue::from_str("data0"), &bytes);
                         let _ = js_sys::Reflect::set(
@@ -282,19 +278,28 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
                                 got = true;
                             }
                         }
-
-                        let new_element = create_element_wmt(mime3, path03);
-
-                        let document = web_sys::window().unwrap().document().unwrap();
-
-                        let _r = document
-                            .get_element_by_id("resultField")
-                            .expect("#resultField should exist")
-                            .dyn_ref::<HtmlElement>()
-                            .unwrap()
-                            .append_child(&new_element)
-                            .unwrap();
                     }
+
+                    let sep = "/".to_string();
+                    let mut path00 = host2.clone();
+                    path00.push_str(&sep);
+                    path00.push_str(&"weeb-3".to_string());
+                    path00.push_str(&sep);
+                    path00.push_str(&date3);
+                    path00.push_str(&sep);
+                    path00.push_str(&indx);
+
+                    let new_element = create_ielement(path00);
+
+                    let document = web_sys::window().unwrap().document().unwrap();
+
+                    let _r = document
+                        .get_element_by_id("resultField")
+                        .expect("#resultField should exist")
+                        .dyn_ref::<HtmlElement>()
+                        .unwrap()
+                        .append_child(&new_element)
+                        .unwrap();
 
                     //                    let mut path03 = host2.clone();
                     //                    path03.push_str(&date3);
@@ -342,5 +347,15 @@ fn create_element_wmt(tmype: String, blob_url: String) -> Element {
     let i = document.create_element("embed").unwrap();
     let _ = i.set_attribute("src", &blob_url);
     let _ = i.set_attribute("type", &tmype);
+    return i;
+}
+
+fn create_ielement(indx: String) -> Element {
+    let document = web_sys::window().unwrap().document().unwrap();
+
+    let i = document.create_element("iframe").unwrap();
+    let _ = i.set_attribute("src", &indx);
+    let _ = i.set_attribute("width", "90");
+    let _ = i.set_attribute("height", "90");
     return i;
 }

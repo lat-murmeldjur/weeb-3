@@ -557,7 +557,7 @@ impl Sekirei {
                     if !incoming_request.is_err() {
                         web_sys::console::log_1(&JsValue::from(format!("retrieve triggered")));
                         let (n, chan) = incoming_request.unwrap();
-                        let chunk_data = retrieve_resource(
+                        let encoded_data = retrieve_resource(
                             &n,
                             &mut ctrl5,
                             &wings.overlay_peers,
@@ -570,7 +570,7 @@ impl Sekirei {
                             "Writing response to interface request"
                         )));
 
-                        chan.send(chunk_data).unwrap();
+                        chan.send(encoded_data).unwrap();
                     } else {
                         break;
                     }

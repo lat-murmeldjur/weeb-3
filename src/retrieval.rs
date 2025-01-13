@@ -61,7 +61,7 @@ pub async fn retrieve_resource(
     )
     .await;
 
-    let data_vector = interpret_manifest("".to_string(), &cd, data_retrieve_chan).await;
+    let (data_vector, index) = interpret_manifest("".to_string(), &cd, data_retrieve_chan).await;
     let mut data_vector_e: Vec<(Vec<u8>, String, String)> = vec![];
 
     for f in &data_vector {
@@ -69,15 +69,16 @@ pub async fn retrieve_resource(
         web_sys::console::log_1(&JsValue::from(format!("Part_m: {} ", f.mime)));
         web_sys::console::log_1(&JsValue::from(format!("Part_f: {} ", f.filename)));
         web_sys::console::log_1(&JsValue::from(format!("Part_p: {} ", f.path)));
-        data_vector_e.push((f.data[8..].to_vec(), f.mime.clone(), f.path.clone()));
+        if f.data.len() > 8 {
+            data_vector_e.push((f.data[8..].to_vec(), f.mime.clone(), f.path.clone()));
+        };
     }
 
     if data_vector_e.len() == 0 {
-        return encode_resources(vec![(
-            vec![],
-            "not found".to_string(),
-            "not found".to_string(),
-        )]);
+        return encode_resources(
+            vec![(vec![], "not found".to_string(), "not found".to_string())],
+            index,
+        );
     }
 
     web_sys::console::log_1(&JsValue::from(format!(
@@ -85,7 +86,7 @@ pub async fn retrieve_resource(
         data_vector_e.len()
     )));
 
-    return encode_resources(data_vector_e);
+    return encode_resources(data_vector_e, index);
 }
 
 pub async fn retrieve_data(
