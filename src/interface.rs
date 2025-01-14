@@ -18,10 +18,9 @@ use web_sys::{
     Request,
     RequestInit,
     Response,
-    // ResponseInit,
-    // ServiceWorker,
     ServiceWorkerRegistration,
     SharedWorker,
+    //
 };
 
 #[wasm_bindgen]
@@ -76,8 +75,6 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
                 .dyn_ref::<HtmlInputElement>()
                 .expect("#inputString should be a HtmlInputElement");
 
-            // If the value in the field can be parsed to a `i32`, send it to the
-            // worker. Otherwise clear the result field.
             match input_field.value().parse::<String>() {
                 Ok(text) => {
                     console::log_1(&"oninput callback string".into());
@@ -135,7 +132,7 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
                         .expect("#resultField should exist")
                         .dyn_ref::<HtmlElement>()
                         .unwrap()
-                        .append_child(&new_element)
+                        .prepend_with_node_1(&new_element)
                         .unwrap();
                 } else if data.len() == 1 {
                     web_sys::console::log_1(&JsValue::from(format!(
@@ -157,9 +154,6 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
 
                     let new_element = create_element_wmt(blob.type_(), blob_url);
 
-                    // web_sys::console::log_2(&"Received data: ".into(), &JsValue::from(data));
-                    // web_sys::console::log_2(&"Received string: ".into(), &JsValue::from(&string));
-
                     let document = web_sys::window().unwrap().document().unwrap();
 
                     let _r = document
@@ -167,7 +161,7 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
                         .expect("#resultField should exist")
                         .dyn_ref::<HtmlElement>()
                         .unwrap()
-                        .append_child(&new_element)
+                        .prepend_with_node_1(&new_element)
                         .unwrap();
                 } else {
                     let date3 = Date::now().to_string();
@@ -305,24 +299,8 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
                         .expect("#resultField should exist")
                         .dyn_ref::<HtmlElement>()
                         .unwrap()
-                        .append_child(&new_element)
+                        .prepend_with_node_1(&new_element)
                         .unwrap();
-
-                    //                    let mut path03 = host2.clone();
-                    //                    path03.push_str(&date3);
-                    //                    path03.push_str("/index.html");
-                    //
-                    //                    let new_element = create_element_wmt("text/html".to_string(), path03);
-                    //
-                    //                    let document = web_sys::window().unwrap().document().unwrap();
-                    //
-                    //                    let _r = document
-                    //                        .get_element_by_id("resultField")
-                    //                        .expect("#resultField should exist")
-                    //                        .dyn_ref::<HtmlElement>()
-                    //                        .unwrap()
-                    //                        .append_child(&new_element)
-                    //                        .unwrap();
                 }
                 //
             } else {
@@ -370,12 +348,12 @@ fn create_ielement(indx: String) -> Element {
 fn service_worker_missing() {
     let document = web_sys::window().unwrap().document().unwrap();
     let errod = document.create_element("div").unwrap();
-    errod.set_inner_html("Service worker required and not found. Loading websites requires accessing weeb-3 via https with valid certificate");
+    errod.set_inner_html("Service worker required and not found. Loading websites from swarm requires accessing weeb-3 via https through secure certificate.");
     let _r = document
         .get_element_by_id("resultField")
         .expect("#resultField should exist")
         .dyn_ref::<HtmlElement>()
         .unwrap()
-        .append_child(&errod)
+        .prepend_with_node_1(&errod)
         .unwrap();
 }
