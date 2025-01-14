@@ -682,7 +682,7 @@ impl Behaviour {
                     .with_push_listen_addr_updates(true)
                     .with_interval(Duration::from_secs(60)), // .with_cache_size(10), //
             ),
-            ping: ping::Behaviour::new(ping::Config::new().with_interval(Duration::from_secs(3))),
+            ping: ping::Behaviour::new(ping::Config::new().with_interval(Duration::from_secs(60))),
             stream: stream::Behaviour::new(),
         }
     }

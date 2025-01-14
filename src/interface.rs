@@ -40,33 +40,6 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
 
     web_sys::console::log_1(&JsValue::from(format!("host2 {:#?}", host2)));
 
-    //    let service2 = web_sys::window().unwrap().navigator().service_worker();
-    //
-    //    match JsFuture::from(service2.register("./service.js")).await {
-    //        Ok(registration) => {
-    //            let _ = JsFuture::from(
-    //                registration
-    //                    .unchecked_into::<ServiceWorkerRegistration>()
-    //                    .update()
-    //                    .unwrap(),
-    //            )
-    //            .await;
-    //            let _ = JsFuture::from(service2.ready().unwrap()).await;
-    //        }
-    //        Err(err) => {
-    //            console::warn_1(&err);
-    //        }
-    //    }
-    //
-    //    let registration: ServiceWorkerRegistration = JsFuture::from(service2.get_registration())
-    //        .await
-    //        .unwrap()
-    //        .unchecked_into();
-    //    let service_worker = registration.active().unwrap();
-    //    service_worker
-    //        .post_message(&JsValue::from(format!("from host2 {:#?}", host2)))
-    //        .unwrap();
-    //
     let body = Body::from_current_window()?;
 
     let (r_out, r_in) = mpsc::channel::<Vec<u8>>();
@@ -217,12 +190,34 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
                         }
                     }
 
-                    let registration0: ServiceWorkerRegistration =
-                        JsFuture::from(service0.get_registration())
-                            .await
-                            .unwrap()
-                            .unchecked_into();
-                    let service_worker0 = registration0.active().unwrap();
+                    let registration0 = JsFuture::from(service0.get_registration()).await;
+
+                    let registration1: ServiceWorkerRegistration = match registration0 {
+                        Ok(registration) => {
+                            let reg = registration.dyn_into();
+                            match reg {
+                                Ok(reg) => reg,
+                                _ => {
+                                    service_worker_missing();
+                                    continue;
+                                }
+                            }
+                        }
+                        _ => {
+                            service_worker_missing();
+                            continue;
+                        }
+                    };
+
+                    let service_worker0 = registration1.active();
+
+                    let service_worker1 = match service_worker0 {
+                        Some(service_worker) => service_worker,
+                        _ => {
+                            service_worker_missing();
+                            continue;
+                        }
+                    };
 
                     for (data3, mime3, path3) in data {
                         let opts = RequestInit::new();
@@ -263,7 +258,7 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
                             &JsValue::from_str(&path03),
                         );
 
-                        let _ = service_worker0.post_message(&JsValue::from(msgobj));
+                        let _ = service_worker1.post_message(&JsValue::from(msgobj));
 
                         let mut got = false;
 
@@ -370,4 +365,17 @@ fn create_ielement(indx: String) -> Element {
     let _ = i.set_attribute("width", "90%");
     let _ = i.set_attribute("height", "90%");
     return i;
+}
+
+fn service_worker_missing() {
+    let document = web_sys::window().unwrap().document().unwrap();
+    let errod = document.create_element("div").unwrap();
+    errod.set_inner_html("Service worker required and not found. Loading websites requires accessing weeb-3 via https with valid certificate");
+    let _r = document
+        .get_element_by_id("resultField")
+        .expect("#resultField should exist")
+        .dyn_ref::<HtmlElement>()
+        .unwrap()
+        .append_child(&errod)
+        .unwrap();
 }

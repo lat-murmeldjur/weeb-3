@@ -9,13 +9,12 @@ use serde_json::Value;
 
 use js_sys::Date;
 use std::sync::mpsc;
-use wasm_bindgen::JsValue;
 
 pub struct Fork {
     //    metadata: Value,
     pub data: Vec<u8>,
     pub mime: String,
-    pub filename: String,
+    // pub filename: String,
     pub path: String,
 }
 
@@ -24,11 +23,6 @@ pub async fn interpret_manifest(
     cd: &Vec<u8>,
     data_retrieve_chan: &mpsc::Sender<(Vec<u8>, mpsc::Sender<Vec<u8>>)>,
 ) -> (Vec<Fork>, String) {
-    web_sys::console::log_1(&JsValue::from(format!(
-        "manifest interpret: {}",
-        path_prefix_heritance
-    )));
-
     let mut ind: String = "".to_string();
 
     if cd.len() == 0 {
@@ -36,7 +30,7 @@ pub async fn interpret_manifest(
             vec![Fork {
                 data: vec![],
                 mime: "undefined".to_string(),
-                filename: "not found".to_string(),
+                // filename: "not found".to_string(),
                 path: "not found".to_string(),
             }],
             ind,
@@ -48,7 +42,7 @@ pub async fn interpret_manifest(
             vec![Fork {
                 data: cd.to_vec(),
                 mime: "application/octet-stream".to_string(),
-                filename: "unknown00".to_string(),
+                // filename: "unknown00".to_string(),
                 path: "unknown00".to_string(),
             }],
             ind,
@@ -70,33 +64,20 @@ pub async fn interpret_manifest(
             vec![Fork {
                 data: cd.to_vec(),
                 mime: "application/octet-stream".to_string(),
-                filename: "unknown01".to_string(),
+                // filename: "unknown01".to_string(),
                 path: "unknown01".to_string(),
             }],
             ind,
         );
     }
 
-    //    web_sys::console::log_1(&JsValue::from(format!("mf_version: {}", enc_mf_version)));
-
     let ref_size = cd[71];
 
-    //    let enc_ref_size = hex::encode(&[ref_size]);
-    //    web_sys::console::log_1(&JsValue::from(format!("ref_size: {}", enc_ref_size)));
-
     let ref_delimiter = (72 + ref_size) as usize;
-    let actual_reference = &cd[72..ref_delimiter];
-
-    let enc_actual_reference = hex::encode(actual_reference);
-    web_sys::console::log_1(&JsValue::from(format!(
-        "actual_reference: {}",
-        enc_actual_reference
-    )));
+    // let actual_reference = &cd[72..ref_delimiter];
 
     let index_delimiter = (ref_delimiter + 32) as usize;
-    let index = &cd[ref_delimiter..index_delimiter];
-    let enc_index = hex::encode(index);
-    web_sys::console::log_1(&JsValue::from(format!("index: {}", enc_index)));
+    // let index = &cd[ref_delimiter..index_delimiter];
 
     // fork parts
 
@@ -105,42 +86,18 @@ pub async fn interpret_manifest(
     let mut fork_start_current = index_delimiter;
 
     while cd.len() > fork_start_current {
-        web_sys::console::log_1(&JsValue::from(format!(
-            "looparams: {} {}",
-            cd.len(),
-            fork_start_current
-        )));
-
         let fork_start = fork_start_current;
         let fork_type = cd[fork_start_current];
-        let enc_fork_type = hex::encode(&[fork_type]);
-        web_sys::console::log_1(&JsValue::from(format!("enc_fork_type: {}", enc_fork_type)));
 
         let fork_prefix_length = cd[fork_start_current + 1];
-        let enc_fork_prefix_length = hex::encode(&[fork_prefix_length]);
-        web_sys::console::log_1(&JsValue::from(format!(
-            "fork_prefix_length: {}",
-            enc_fork_prefix_length
-        )));
 
         let fork_prefix = &cd[fork_start + 2..fork_start + 2 + (fork_prefix_length as usize)];
-        let enc_fork_prefix = hex::encode(fork_prefix);
-        web_sys::console::log_1(&JsValue::from(format!("fork_prefix: {}", enc_fork_prefix)));
 
         let string_fork_prefix = String::from_utf8(fork_prefix.to_vec()).unwrap_or("".to_string());
-        web_sys::console::log_1(&JsValue::from(format!(
-            "string_fork_prefix: {}",
-            string_fork_prefix
-        )));
 
         let fork_prefix_delimiter = fork_start + 32;
         let fork_reference_delimiter = fork_prefix_delimiter + (ref_size as usize);
         let fork_reference = &cd[fork_prefix_delimiter..fork_reference_delimiter];
-        let enc_fork_reference = hex::encode(fork_reference);
-        web_sys::console::log_1(&JsValue::from(format!(
-            "fork_reference: {}",
-            enc_fork_reference
-        )));
 
         let ref_data = get_data(fork_reference.to_vec(), data_retrieve_chan).await;
 
@@ -151,23 +108,13 @@ pub async fn interpret_manifest(
                 .unwrap();
 
             let calc_metadata_bytesize = u16::from_be_bytes(fork_metadata_bytesize) as usize;
-            web_sys::console::log_1(&JsValue::from(format!(
-                "calc_metadata_bytesize: {} ",
-                calc_metadata_bytesize
-            )));
 
             let fork_metadata_delimiter = fork_reference_delimiter + 2 + calc_metadata_bytesize;
             fork_start_current = fork_metadata_delimiter;
 
             let fork_metadata = &cd[fork_reference_delimiter + 2..fork_metadata_delimiter];
-            let enc_fork_metadata = hex::encode(fork_metadata);
-            web_sys::console::log_1(&JsValue::from(format!(
-                "fork_metadata: {}",
-                enc_fork_metadata
-            )));
 
             let v1: Value = serde_json::from_slice(fork_metadata).unwrap_or("nil".into());
-            web_sys::console::log_1(&JsValue::from(format!("metadata json: {:#?} ", v1)));
 
             let str0i = v1.get("website-index-document");
             match str0i {
@@ -191,13 +138,10 @@ pub async fn interpret_manifest(
                 }
             };
 
-            web_sys::console::log_1(&JsValue::from(format!("Content-Type: {:#?} ", str1)));
-
-            let str2 = v1.get("Filename").unwrap().as_str().unwrap();
-            web_sys::console::log_1(&JsValue::from(format!("Filename: {:#?} ", str2)));
+            // let str2 = v1.get("Filename").unwrap().as_str().unwrap();
 
             let mime_0 = str1.to_string();
-            let filename_0 = str2.to_string();
+            // let filename_0 = str2.to_string();
 
             let ref_size_a = ref_data[71];
             let actual_data = get_data(
@@ -213,7 +157,7 @@ pub async fn interpret_manifest(
             parts.push(Fork {
                 data: actual_data.to_vec(),
                 mime: mime_0,
-                filename: filename_0,
+                // filename: filename_0,
                 path: path_0,
             });
         }

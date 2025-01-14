@@ -29,7 +29,7 @@ use crate::{
     // // // // // // // //
     HashMap,
     // // // // // // // //
-    JsValue,
+    HashSet,
     // // // // // // // //
     Mutex,
     // // // // // // // //
@@ -65,10 +65,6 @@ pub async fn retrieve_resource(
     let mut data_vector_e: Vec<(Vec<u8>, String, String)> = vec![];
 
     for f in &data_vector {
-        web_sys::console::log_1(&JsValue::from(format!("Part_d: {:#?}", f.data.len())));
-        web_sys::console::log_1(&JsValue::from(format!("Part_m: {} ", f.mime)));
-        web_sys::console::log_1(&JsValue::from(format!("Part_f: {} ", f.filename)));
-        web_sys::console::log_1(&JsValue::from(format!("Part_p: {} ", f.path)));
         if f.data.len() > 8 {
             data_vector_e.push((f.data[8..].to_vec(), f.mime.clone(), f.path.clone()));
         };
@@ -80,11 +76,6 @@ pub async fn retrieve_resource(
             index,
         );
     }
-
-    web_sys::console::log_1(&JsValue::from(format!(
-        "vector_len: {:#?} ",
-        data_vector_e.len()
-    )));
 
     return encode_resources(data_vector_e, index);
 }
@@ -180,9 +171,8 @@ pub async fn retrieve_chunk(
     accounting: &Mutex<HashMap<PeerId, Mutex<PeerAccounting>>>,
     refresh_chan: &mpsc::Sender<(PeerId, u64)>,
 ) -> Vec<u8> {
-    let timestart = Date::now();
-    let mut skiplist: HashMap<PeerId, _> = HashMap::new();
-    let mut overdraftlist: HashMap<PeerId, _> = HashMap::new();
+    let mut skiplist: HashSet<PeerId> = HashSet::new();
+    let mut overdraftlist: HashSet<PeerId> = HashSet::new();
 
     let mut closest_overlay = "".to_string();
     let mut closest_peer_id = libp2p::PeerId::random();
@@ -210,9 +200,10 @@ pub async fn retrieve_chunk(
             {
                 let peers_map = peers.lock().unwrap();
                 for (ov, id) in peers_map.iter() {
-                    if skiplist.contains_key(id) {
+                    if skiplist.contains(id) {
                         continue;
                     }
+
                     let current_po = get_proximity(&chunk_address, &hex::decode(&ov).unwrap());
 
                     if current_po >= current_max_po {
@@ -224,16 +215,12 @@ pub async fn retrieve_chunk(
                 }
             }
             if selected {
-                skiplist.insert(closest_peer_id, "");
-                // web_sys::console::log_1(&JsValue::from(format!(
-                //     "Selected peer {:#?}!",
-                //     closest_peer_id
-                // )));
+                skiplist.insert(closest_peer_id);
             } else {
                 if overdraftlist.is_empty() {
                     return vec![];
                 } else {
-                    for (k, _v) in overdraftlist.iter() {
+                    for k in overdraftlist.iter() {
                         let _ =
                             refresh_chan.send((k.clone(), 10 * crate::accounting::REFRESH_RATE));
                         skiplist.remove(k);
@@ -244,10 +231,6 @@ pub async fn retrieve_chunk(
 
                     let seg = round_now - round_commence;
                     if seg < RETRIEVE_ROUND_TIME {
-                        // web_sys::console::log_1(&JsValue::from(format!(
-                        //     "Ease retrieve overdraft retries loop for {}",
-                        //     RETRIEVE_ROUND_TIME - seg
-                        // )));
                         async_std::task::sleep(Duration::from_millis(
                             (RETRIEVE_ROUND_TIME - seg) as u64,
                         ))
@@ -262,11 +245,6 @@ pub async fn retrieve_chunk(
 
             let req_price = price(&closest_overlay, &chunk_address);
 
-            //            web_sys::console::log_1(&JsValue::from(format!(
-            //                "Attempt to reserve price {:#?} for chunk {:#?} from peer {:#?}!",
-            //                req_price, chunk_address, closest_peer_id
-            //            )));
-
             {
                 let accounting_peers = accounting.lock().unwrap();
                 if max_error > accounting_peers.len() {
@@ -276,16 +254,8 @@ pub async fn retrieve_chunk(
                     let accounting_peer = accounting_peers.get(&closest_peer_id).unwrap();
                     let allowed = reserve(accounting_peer, req_price, refresh_chan);
                     if !allowed {
-                        // web_sys::console::log_1(&JsValue::from(format!(
-                        //     "Overdraft for peer {}",
-                        //     closest_peer_id
-                        // )));
-                        overdraftlist.insert(closest_peer_id, "");
+                        overdraftlist.insert(closest_peer_id);
                     } else {
-                        // web_sys::console::log_1(&JsValue::from(format!(
-                        //     "Selected peer with successful reserve {}!",
-                        //     closest_peer_id
-                        // )));
                         seer = false;
                     }
                 }
@@ -295,11 +265,6 @@ pub async fn retrieve_chunk(
         let req_price = price(&closest_overlay, &chunk_address);
 
         let (chunk_out, chunk_in) = mpsc::channel::<Vec<u8>>();
-
-        // web_sys::console::log_1(&JsValue::from(format!(
-        //     "Actually retrieving for peer {}!",
-        //     closest_peer_id
-        // )));
 
         retrieve_handler(closest_peer_id, chunk_address.clone(), control, &chunk_out).await;
 
@@ -346,20 +311,6 @@ pub async fn retrieve_chunk(
             _ => {}
         };
     }
-
-    if cd.len() > 0 {
-        // web_sys::console::log_1(&JsValue::from(format!(
-        //     "Successfully retrieved chunk from peer {:#?}!",
-        //     closest_peer_id
-        // )));
-    }
-
-    let timeend = Date::now();
-
-    web_sys::console::log_1(&JsValue::from(format!(
-        "Retrieve time duration {} ms!",
-        timeend - timestart
-    )));
 
     return cd;
 }
