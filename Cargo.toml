@@ -43,6 +43,7 @@ alloy = { git = "https://github.com/alloy-rs/alloy.git", features = [
     "k256",
     "signer-local",
 ] }
+alloy-signer-local = { git = "https://github.com/alloy-rs/alloy.git" }
 async-std = { git = "https://github.com/async-rs/async-std.git" }
 console_error_panic_hook = { git = "https://github.com/rustwasm/console_error_panic_hook.git" }
 libp2p = { git = "https://github.com/libp2p/rust-libp2p.git", features = [ 

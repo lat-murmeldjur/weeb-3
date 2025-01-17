@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::io;
 
 use alloy::primitives::keccak256;
+use alloy::primitives::{normalize_v, PrimitiveSignature as Signature};
 
 use libp2p::multiaddr::Protocol;
 use libp2p::{Multiaddr, PeerId};
@@ -126,11 +127,6 @@ pub fn valid_cac(chunk_content: &Vec<u8>, address: &Vec<u8>) -> bool {
     let chunk_address = keccak256([something, &contenthash].concat()).to_vec();
 
     if *chunk_address == **address {
-        // web_sys::console::log_1(&JsValue::from(format!(
-        //     "Chunk content address correct {:?}!",
-        //     chunk_address,
-        // )));
-
         return true;
     }
 
@@ -194,8 +190,43 @@ pub fn hasher_1(content_in: &Vec<u8>, length: usize) -> Vec<u8> {
     return content_holder_2[0].clone();
 }
 
-pub fn valid_soc(_chunk_content: &Vec<u8>, _address: &Vec<u8>) -> bool {
+pub fn valid_soc(chunk_content: &Vec<u8>, address: &Vec<u8>) -> bool {
     //
+
+    if chunk_content.len() < 97 + 40 {
+        return false;
+    }
+    let soc_address = chunk_content[0..32].to_vec();
+    let soc_signature = chunk_content[32..97].to_vec();
+
+    let wrapped_content = chunk_content[97 + 32..].to_vec();
+    let wrapped_address = chunk_content[97..97 + 32].to_vec();
+
+    if !valid_cac(&wrapped_content, &wrapped_address) {
+        return false;
+    };
+
+    let to_sign = keccak256([soc_address.clone(), wrapped_address].concat()).to_vec();
+    let parity: bool = match normalize_v(soc_signature[0] as u64) {
+        Some(par) => par,
+        _ => {
+            return false;
+        }
+    };
+    let sig = Signature::from_bytes_and_parity(&soc_signature[1..], parity);
+
+    let owner = match sig.recover_address_from_msg(to_sign) {
+        Ok(ow) => ow,
+        _ => {
+            return false;
+        }
+    };
+
+    let address_constructed = keccak256([soc_address, owner.as_slice().to_vec()].concat()).to_vec();
+
+    if *address == address_constructed {
+        return true;
+    };
     return false;
     //
 }
