@@ -253,32 +253,6 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
                         );
 
                         let _ = service_worker1.post_message(&JsValue::from(msgobj));
-
-                        let mut got = false;
-
-                        while !got {
-                            async_std::task::sleep(Duration::from_millis(600)).await;
-
-                            let opts = RequestInit::new();
-                            opts.set_method("GET");
-                            let request = Request::new_with_str_and_init(&path03, &opts).unwrap();
-                            let window = web_sys::window().unwrap();
-                            let resp_value = JsFuture::from(window.fetch_with_request(&request))
-                                .await
-                                .unwrap();
-                            assert!(resp_value.is_instance_of::<Response>());
-
-                            let resp: Response = resp_value.dyn_into().unwrap();
-
-                            web_sys::console::log_1(&JsValue::from(format!(
-                                "got {:#?}",
-                                resp.status()
-                            )));
-
-                            if resp.status() == 200 {
-                                got = true;
-                            }
-                        }
                     }
 
                     let sep = "/".to_string();
@@ -289,6 +263,32 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
                     path00.push_str(&date3);
                     path00.push_str(&sep);
                     path00.push_str(&indx);
+
+                    let mut got = false;
+
+                    while !got {
+                        async_std::task::sleep(Duration::from_millis(600)).await;
+
+                        let opts = RequestInit::new();
+                        opts.set_method("GET");
+                        let request = Request::new_with_str_and_init(&path00, &opts).unwrap();
+                        let window = web_sys::window().unwrap();
+                        let resp_value = JsFuture::from(window.fetch_with_request(&request))
+                            .await
+                            .unwrap();
+                        assert!(resp_value.is_instance_of::<Response>());
+
+                        let resp: Response = resp_value.dyn_into().unwrap();
+
+                        web_sys::console::log_1(&JsValue::from(format!(
+                            "got {:#?}",
+                            resp.status()
+                        )));
+
+                        if resp.status() == 200 {
+                            got = true;
+                        }
+                    }
 
                     let new_element = create_ielement(path00);
 
