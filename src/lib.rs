@@ -296,7 +296,7 @@ impl Sekirei {
 
         let conn_handle = async {
             let addr2 =
-            "/ip4/192.168.0.105/tcp/11634/ws/p2p/QmYa9hasbJKBoTpfthcisMPKyGMCidfT1R4VkaRpg14bWP"
+            "/ip4/192.168.0.104/tcp/11634/ws/p2p/QmYa9hasbJKBoTpfthcisMPKyGMCidfT1R4VkaRpg14bWP"
                 .parse::<Multiaddr>()
                 .unwrap();
 
@@ -682,7 +682,7 @@ impl Behaviour {
                     .with_push_listen_addr_updates(true)
                     .with_interval(Duration::from_secs(60)), // .with_cache_size(10), //
             ),
-            ping: ping::Behaviour::new(ping::Config::new().with_interval(Duration::from_secs(60))),
+            ping: ping::Behaviour::new(ping::Config::new().with_interval(Duration::from_secs(3))),
             stream: stream::Behaviour::new(),
         }
     }

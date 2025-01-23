@@ -1,5 +1,9 @@
 use crate::{
     //
+    get_feed_address,
+    //
+    JsValue,
+    //
     RETRIEVE_ROUND_TIME,
 };
 
@@ -38,6 +42,8 @@ pub async fn interpret_manifest(
     }
 
     if cd.len() < 72 {
+        web_sys::console::log_1(&JsValue::from(format!("returning early 0")));
+
         return (
             vec![Fork {
                 data: cd.to_vec(),
@@ -60,6 +66,7 @@ pub async fn interpret_manifest(
     if enc_mf_version != "5768b3b6a7db56d21d1abff40d41cebfc83448fed8d7e9b06ec0d3b073f28f"
         && enc_mf_version != "025184789d63635766d78c41900196b57d7400875ebe4d9b5d1e76bd9652a9"
     {
+        web_sys::console::log_1(&JsValue::from(format!("returning early 1")));
         return (
             vec![Fork {
                 data: cd.to_vec(),
@@ -88,16 +95,27 @@ pub async fn interpret_manifest(
     while cd.len() > fork_start_current {
         let fork_start = fork_start_current;
         let fork_type = cd[fork_start_current];
+        let enc_fork_type = hex::encode(&[fork_type]);
+        web_sys::console::log_1(&JsValue::from(format!("enc_fork_type: {}", enc_fork_type)));
 
         let fork_prefix_length = cd[fork_start_current + 1];
 
         let fork_prefix = &cd[fork_start + 2..fork_start + 2 + (fork_prefix_length as usize)];
 
         let string_fork_prefix = String::from_utf8(fork_prefix.to_vec()).unwrap_or("".to_string());
+        web_sys::console::log_1(&JsValue::from(format!(
+            "string_fork_prefix: {}",
+            string_fork_prefix
+        )));
 
         let fork_prefix_delimiter = fork_start + 32;
         let fork_reference_delimiter = fork_prefix_delimiter + (ref_size as usize);
         let fork_reference = &cd[fork_prefix_delimiter..fork_reference_delimiter];
+        let enc_fork_reference = hex::encode(fork_reference);
+        web_sys::console::log_1(&JsValue::from(format!(
+            "fork_reference: {}",
+            enc_fork_reference
+        )));
 
         let ref_data = get_data(fork_reference.to_vec(), data_retrieve_chan).await;
 
@@ -113,8 +131,49 @@ pub async fn interpret_manifest(
             fork_start_current = fork_metadata_delimiter;
 
             let fork_metadata = &cd[fork_reference_delimiter + 2..fork_metadata_delimiter];
+            let enc_fork_metadata = hex::encode(fork_metadata);
+            web_sys::console::log_1(&JsValue::from(format!(
+                "fork_metadata: {}",
+                enc_fork_metadata
+            )));
 
             let v1: Value = serde_json::from_slice(fork_metadata).unwrap_or("nil".into());
+            web_sys::console::log_1(&JsValue::from(format!("metadata json: {:#?} ", v1)));
+
+            let mut feed = false;
+            let mut owner: String = "".to_string();
+            let mut topic: String = "".to_string();
+
+            let str0f0 = v1.get("swarm-feed-owner");
+            match str0f0 {
+                Some(str0f0) => {
+                    owner = str0f0.as_str().unwrap().to_string();
+                    let str0f1 = v1.get("swarm-feed-topic");
+                    match str0f1 {
+                        Some(str0f1) => {
+                            topic = str0f1.as_str().unwrap().to_string();
+                            feed = true;
+                        }
+                        _ => (),
+                    }
+                }
+                _ => (),
+            };
+
+            if feed {
+                let feed_address = get_feed_address(owner, topic, 0);
+                let feed_data_soc = get_data(feed_address, data_retrieve_chan).await;
+                let feed_data_content =
+                    get_data(feed_data_soc[16..48].to_vec(), data_retrieve_chan).await;
+
+                let (mut appendix_0, _discard) = Box::pin(interpret_manifest(
+                    "".to_string(),
+                    &feed_data_content,
+                    data_retrieve_chan,
+                ))
+                .await;
+                parts.append(&mut appendix_0);
+            }
 
             let str0i = v1.get("website-index-document");
             match str0i {

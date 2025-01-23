@@ -31,6 +31,8 @@ use crate::{
     // // // // // // // //
     HashSet,
     // // // // // // // //
+    JsValue,
+    // // // // // // // //
     Mutex,
     // // // // // // // //
     PeerAccounting,
@@ -171,6 +173,7 @@ pub async fn retrieve_chunk(
     accounting: &Mutex<HashMap<PeerId, Mutex<PeerAccounting>>>,
     refresh_chan: &mpsc::Sender<(PeerId, u64)>,
 ) -> Vec<u8> {
+    let mut soc = false;
     let mut skiplist: HashSet<PeerId> = HashSet::new();
     let mut overdraftlist: HashSet<PeerId> = HashSet::new();
 
@@ -297,8 +300,9 @@ pub async fn retrieve_chunk(
             Ok(_x) => {
                 let contaddrd = valid_cac(&cd, chunk_address);
                 if !contaddrd {
-                    let socd = valid_soc(&cd, chunk_address);
-                    if !socd {
+                    soc = valid_soc(&cd, chunk_address);
+                    if !soc {
+                        web_sys::console::log_1(&JsValue::from(format!("invalid Soc!")));
                         error_count += 1;
                         cd = vec![];
                     } else {
@@ -310,6 +314,10 @@ pub async fn retrieve_chunk(
             }
             _ => {}
         };
+    }
+
+    if soc && cd.len() >= 97 + 8 {
+        return (&cd[97..]).to_vec();
     }
 
     return cd;
@@ -335,4 +343,6 @@ pub async fn retrieve_chunk(
 //
 // 17618f9a17eac7fa5bba2bc0705ae33fc242a1e1c069b7f1b4f310f5125e812c
 // 17618f9a17eac7fa5bba2bc0705ae33fc242a1e1c069b7f1b4f310f5125e812c
+//
+// c85d8a29aa330c0521910729abfae181ce3d1fbd39d31b2b6664530fb94ab4e5
 //
