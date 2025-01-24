@@ -1,18 +1,15 @@
+use std::sync::mpsc;
+
 use crate::{
+    //
+    get_data,
     //
     get_feed_address,
     //
     JsValue,
-    //
-    RETRIEVE_ROUND_TIME,
 };
 
-use std::time::Duration;
-
 use serde_json::Value;
-
-use js_sys::Date;
-use std::sync::mpsc;
 
 pub struct Fork {
     //    metadata: Value,
@@ -25,7 +22,7 @@ pub struct Fork {
 pub async fn interpret_manifest(
     path_prefix_heritance: String,
     cd: &Vec<u8>,
-    data_retrieve_chan: &mpsc::Sender<(Vec<u8>, mpsc::Sender<Vec<u8>>)>,
+    data_retrieve_chan: &mpsc::Sender<(Vec<u8>, u8, mpsc::Sender<Vec<u8>>)>,
 ) -> (Vec<Fork>, String) {
     let mut ind: String = "".to_string();
     let mut ind_set = false;
@@ -243,36 +240,4 @@ pub async fn interpret_manifest(
     }
 
     return (parts, ind);
-}
-
-pub async fn get_data(
-    data_address: Vec<u8>,
-    data_retrieve_chan: &mpsc::Sender<(Vec<u8>, mpsc::Sender<Vec<u8>>)>,
-) -> Vec<u8> {
-    let (chan_out, chan_in) = mpsc::channel::<Vec<u8>>();
-    data_retrieve_chan.send((data_address, chan_out)).unwrap();
-
-    let k0 = async {
-        let mut timelast: f64;
-        #[allow(irrefutable_let_patterns)]
-        while let that = chan_in.try_recv() {
-            timelast = Date::now();
-            if !that.is_err() {
-                return that.unwrap();
-            }
-
-            let timenow = Date::now();
-            let seg = timenow - timelast;
-            if seg < RETRIEVE_ROUND_TIME {
-                async_std::task::sleep(Duration::from_millis((RETRIEVE_ROUND_TIME - seg) as u64))
-                    .await;
-            };
-        }
-
-        return vec![];
-    };
-
-    let result = k0.await;
-
-    return result;
 }

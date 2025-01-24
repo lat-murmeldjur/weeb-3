@@ -244,7 +244,7 @@ impl Sekirei {
             mpsc::channel::<(PeerId, u64)>();
 
         let (data_retrieve_chan_outgoing, data_retrieve_chan_incoming) =
-            mpsc::channel::<(Vec<u8>, mpsc::Sender<Vec<u8>>)>();
+            mpsc::channel::<(Vec<u8>, u8, mpsc::Sender<Vec<u8>>)>();
 
         let mut ctrl;
         let mut incoming_pricing_streams;
@@ -271,7 +271,6 @@ impl Sekirei {
 
         let mut ctrl3 = ctrl.clone();
         let ctrl4 = ctrl.clone();
-        let mut ctrl5 = ctrl.clone();
         let ctrl6 = ctrl.clone();
 
         let pricing_inbound_handle = async move {
@@ -557,15 +556,8 @@ impl Sekirei {
                     if !incoming_request.is_err() {
                         web_sys::console::log_1(&JsValue::from(format!("retrieve triggered")));
                         let (n, chan) = incoming_request.unwrap();
-                        let encoded_data = retrieve_resource(
-                            &n,
-                            &mut ctrl5,
-                            &wings.overlay_peers,
-                            &wings.accounting_peers,
-                            &refreshment_instructions_chan_outgoing,
-                            &data_retrieve_chan_outgoing,
-                        )
-                        .await;
+                        let encoded_data =
+                            retrieve_resource(&n, &data_retrieve_chan_outgoing).await;
                         web_sys::console::log_1(&JsValue::from(format!(
                             "Writing response to interface request"
                         )));
@@ -603,20 +595,37 @@ impl Sekirei {
                         let handle = async {
                             let mut ctrl9 = ctrl6.clone();
                             web_sys::console::log_1(&JsValue::from(format!("retrieve triggered")));
-                            let (n, chan) = incoming_request.unwrap();
-                            let chunk_data = retrieve_data(
-                                &n,
-                                &mut ctrl9,
-                                &wings.overlay_peers,
-                                &wings.accounting_peers,
-                                &refreshment_instructions_chan_outgoing,
-                            )
-                            .await;
-                            web_sys::console::log_1(&JsValue::from(format!(
-                                "Writing response to retrieve request"
-                            )));
+                            let (n, mode, chan) = incoming_request.unwrap();
+                            if mode == 1 {
+                                let chunk_data = retrieve_data(
+                                    &n,
+                                    &mut ctrl9,
+                                    &wings.overlay_peers,
+                                    &wings.accounting_peers,
+                                    &refreshment_instructions_chan_outgoing,
+                                )
+                                .await;
+                                web_sys::console::log_1(&JsValue::from(format!(
+                                    "Writing response to retrieve request"
+                                )));
 
-                            chan.send(chunk_data).unwrap();
+                                chan.send(chunk_data).unwrap();
+                            }
+                            if mode == 0 {
+                                let chunk_data = retrieve_chunk(
+                                    &n,
+                                    &mut ctrl9,
+                                    &wings.overlay_peers,
+                                    &wings.accounting_peers,
+                                    &refreshment_instructions_chan_outgoing,
+                                )
+                                .await;
+                                web_sys::console::log_1(&JsValue::from(format!(
+                                    "Writing response to retrieve request"
+                                )));
+
+                                chan.send(chunk_data).unwrap();
+                            }
                         };
                         request_joiner.push(handle);
                     } else {

@@ -15,9 +15,7 @@ use web_sys::{
     HtmlElement,
     HtmlInputElement,
     MessageEvent,
-    Request,
     RequestInit,
-    Response,
     ServiceWorkerRegistration,
     SharedWorker,
     //

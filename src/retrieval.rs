@@ -47,21 +47,9 @@ use libp2p::futures::{stream::FuturesUnordered, StreamExt};
 
 pub async fn retrieve_resource(
     chunk_address: &Vec<u8>,
-    control: &mut stream::Control,
-    peers: &Mutex<HashMap<String, PeerId>>,
-    accounting: &Mutex<HashMap<PeerId, Mutex<PeerAccounting>>>,
-    refresh_chan: &mpsc::Sender<(PeerId, u64)>,
-    data_retrieve_chan: &mpsc::Sender<(Vec<u8>, mpsc::Sender<Vec<u8>>)>,
+    data_retrieve_chan: &mpsc::Sender<(Vec<u8>, u8, mpsc::Sender<Vec<u8>>)>,
 ) -> Vec<u8> {
-    let cd = retrieve_data(
-        chunk_address,
-        control,
-        peers,
-        accounting,
-        refresh_chan,
-        //
-    )
-    .await;
+    let cd = get_data(chunk_address.to_vec(), data_retrieve_chan).await;
 
     let (data_vector, index) = interpret_manifest("".to_string(), &cd, data_retrieve_chan).await;
     let mut data_vector_e: Vec<(Vec<u8>, String, String)> = vec![];
@@ -88,7 +76,7 @@ pub async fn retrieve_data(
     peers: &Mutex<HashMap<String, PeerId>>,
     accounting: &Mutex<HashMap<PeerId, Mutex<PeerAccounting>>>,
     refresh_chan: &mpsc::Sender<(PeerId, u64)>,
-    // chunk_retrieve_chan: &mpsc::Sender<(Vec<u8>, mpsc::Sender<Vec<u8>>)>,
+    // chunk_retrieve_chan: &mpsc::Sender<(Vec<u8>, u8, mpsc::Sender<Vec<u8>>)>,
 ) -> Vec<u8> {
     let orig = retrieve_chunk(chunk_address, control, peers, accounting, refresh_chan).await;
     if orig.len() < 8 {
@@ -142,11 +130,6 @@ pub async fn retrieve_data(
     while let Some((result0, result1)) = joiner.next().await {
         content_holder_3.insert(result1, result0);
     }
-
-    // let results: Vec<(Vec<u8>, usize)> = joiner.collect().await;
-    // for result in results.iter() {
-    //     content_holder_3.insert(result.1, result.0);
-    // }
 
     let mut data: Vec<u8> = Vec::new();
     data.append(&mut orig[0..8].to_vec());
@@ -321,6 +304,40 @@ pub async fn retrieve_chunk(
     }
 
     return cd;
+}
+
+pub async fn get_data(
+    data_address: Vec<u8>,
+    data_retrieve_chan: &mpsc::Sender<(Vec<u8>, u8, mpsc::Sender<Vec<u8>>)>,
+) -> Vec<u8> {
+    let (chan_out, chan_in) = mpsc::channel::<Vec<u8>>();
+    data_retrieve_chan
+        .send((data_address, 1, chan_out))
+        .unwrap();
+
+    let k0 = async {
+        let mut timelast: f64;
+        #[allow(irrefutable_let_patterns)]
+        while let that = chan_in.try_recv() {
+            timelast = Date::now();
+            if !that.is_err() {
+                return that.unwrap();
+            }
+
+            let timenow = Date::now();
+            let seg = timenow - timelast;
+            if seg < RETRIEVE_ROUND_TIME {
+                async_std::task::sleep(Duration::from_millis((RETRIEVE_ROUND_TIME - seg) as u64))
+                    .await;
+            };
+        }
+
+        return vec![];
+    };
+
+    let result = k0.await;
+
+    return result;
 }
 
 //
