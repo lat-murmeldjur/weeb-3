@@ -179,8 +179,16 @@ pub async fn retrieve_chunk(
 
     while error_count < max_error {
         let mut seer = true;
+        web_sys::console::log_1(&JsValue::from(format!(
+            "loop 0 {} {}",
+            error_count, max_error
+        )));
 
         while seer {
+            web_sys::console::log_1(&JsValue::from(format!(
+                "loop 00 {} {}",
+                error_count, max_error
+            )));
             closest_overlay = "".to_string();
             closest_peer_id = libp2p::PeerId::random();
             current_max_po = 0;
@@ -257,13 +265,7 @@ pub async fn retrieve_chunk(
         retrieve_handler(closest_peer_id, chunk_address.clone(), control, &chunk_out).await;
 
         let chunk_data = chunk_in.try_recv();
-        if !chunk_data.is_err() {
-            let accounting_peers = accounting.lock().unwrap();
-            if accounting_peers.contains_key(&closest_peer_id) {
-                let accounting_peer = accounting_peers.get(&closest_peer_id).unwrap();
-                apply_credit(accounting_peer, req_price);
-            }
-        } else {
+        if chunk_data.is_err() {
             let accounting_peers = accounting.lock().unwrap();
             if accounting_peers.contains_key(&closest_peer_id) {
                 let accounting_peer = accounting_peers.get(&closest_peer_id).unwrap();
@@ -275,6 +277,11 @@ pub async fn retrieve_chunk(
             Ok(ref x) => x.clone(),
             Err(_x) => {
                 error_count += 1;
+                let accounting_peers = accounting.lock().unwrap();
+                if accounting_peers.contains_key(&closest_peer_id) {
+                    let accounting_peer = accounting_peers.get(&closest_peer_id).unwrap();
+                    cancel_reserve(accounting_peer, req_price)
+                }
                 vec![]
             }
         };
@@ -289,11 +296,26 @@ pub async fn retrieve_chunk(
                     if !soc {
                         web_sys::console::log_1(&JsValue::from(format!("invalid Soc!")));
                         error_count += 1;
+                        let accounting_peers = accounting.lock().unwrap();
+                        if accounting_peers.contains_key(&closest_peer_id) {
+                            let accounting_peer = accounting_peers.get(&closest_peer_id).unwrap();
+                            cancel_reserve(accounting_peer, req_price)
+                        }
                         cd = vec![];
                     } else {
+                        let accounting_peers = accounting.lock().unwrap();
+                        if accounting_peers.contains_key(&closest_peer_id) {
+                            let accounting_peer = accounting_peers.get(&closest_peer_id).unwrap();
+                            apply_credit(accounting_peer, req_price);
+                        }
                         break;
                     }
                 } else {
+                    let accounting_peers = accounting.lock().unwrap();
+                    if accounting_peers.contains_key(&closest_peer_id) {
+                        let accounting_peer = accounting_peers.get(&closest_peer_id).unwrap();
+                        apply_credit(accounting_peer, req_price);
+                    }
                     break;
                 }
             }
@@ -400,8 +422,9 @@ pub async fn seek_latest_feed_update(
             let j = lower_bound + i;
             let feed_update_address = get_feed_address(&owner, &topic, j);
             let handle = async move {
+                web_sys::console::log_1(&JsValue::from(format!("dispatching {}", j)));
                 //
-                (get_chunk(feed_update_address, data_retrieve_chan).await, j)
+                return (get_chunk(feed_update_address, data_retrieve_chan).await, j);
             };
             joiner.push(handle);
 
@@ -415,6 +438,11 @@ pub async fn seek_latest_feed_update(
         // receive results, update scores
 
         while let Some((result0, result1)) = joiner.next().await {
+            web_sys::console::log_1(&JsValue::from(format!(
+                "receiving {} with len: {}",
+                result1,
+                result0.len()
+            )));
             if result0.len() == 0 && smallest_not_found > result1 {
                 smallest_not_found = result1;
             }
@@ -422,6 +450,8 @@ pub async fn seek_latest_feed_update(
                 largest_found = result1;
             }
         }
+
+        web_sys::console::log_1(&JsValue::from("exat"));
 
         // if _exact_ frontier found return corresponding data
 
