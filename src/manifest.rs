@@ -4,7 +4,7 @@ use crate::{
     //
     get_data,
     //
-    get_feed_address,
+    seek_latest_feed_update,
     //
     JsValue,
 };
@@ -159,8 +159,8 @@ pub async fn interpret_manifest(
             };
 
             if feed {
-                let feed_address = get_feed_address(owner, topic, 0);
-                let feed_data_soc = get_data(feed_address, data_retrieve_chan).await;
+                let feed_data_soc =
+                    seek_latest_feed_update(owner, topic, data_retrieve_chan, 8).await;
                 let feed_data_content =
                     get_data(feed_data_soc[16..48].to_vec(), data_retrieve_chan).await;
 

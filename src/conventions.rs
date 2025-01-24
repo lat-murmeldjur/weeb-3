@@ -233,7 +233,7 @@ pub fn valid_soc(chunk_content: &Vec<u8>, address: &Vec<u8>) -> bool {
     //
 }
 
-pub fn get_feed_address(owner: String, topic: String, index: u64) -> Vec<u8> {
+pub fn get_feed_address(owner: &String, topic: &String, index: u64) -> Vec<u8> {
     let index_bytes = index.to_le_bytes().to_vec();
     let owner_bytes = hex::decode(owner).unwrap();
     let topic_bytes = hex::decode(topic).unwrap();

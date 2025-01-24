@@ -5,6 +5,8 @@ use crate::{
     // // // // // // // //
     encode_resources,
     // // // // // // // //
+    get_feed_address,
+    // // // // // // // //
     get_proximity,
     // // // // // // // //
     manifest::interpret_manifest,
@@ -338,6 +340,125 @@ pub async fn get_data(
     let result = k0.await;
 
     return result;
+}
+
+pub async fn get_chunk(
+    data_address: Vec<u8>,
+    data_retrieve_chan: &mpsc::Sender<(Vec<u8>, u8, mpsc::Sender<Vec<u8>>)>,
+) -> Vec<u8> {
+    let (chan_out, chan_in) = mpsc::channel::<Vec<u8>>();
+    data_retrieve_chan
+        .send((data_address, 0, chan_out))
+        .unwrap();
+
+    let k0 = async {
+        let mut timelast: f64;
+        #[allow(irrefutable_let_patterns)]
+        while let that = chan_in.try_recv() {
+            timelast = Date::now();
+            if !that.is_err() {
+                return that.unwrap();
+            }
+
+            let timenow = Date::now();
+            let seg = timenow - timelast;
+            if seg < RETRIEVE_ROUND_TIME {
+                async_std::task::sleep(Duration::from_millis((RETRIEVE_ROUND_TIME - seg) as u64))
+                    .await;
+            };
+        }
+
+        return vec![];
+    };
+
+    let result = k0.await;
+
+    return result;
+}
+
+pub async fn seek_latest_feed_update(
+    owner: String,
+    topic: String,
+    data_retrieve_chan: &mpsc::Sender<(Vec<u8>, u8, mpsc::Sender<Vec<u8>>)>,
+    redundancy: u8,
+) -> Vec<u8> {
+    let mut largest_found = 0;
+    let mut smallest_not_found = u64::MAX;
+    let mut lower_bound = 0;
+    let mut upper_bound = 2_u64.pow(redundancy.into());
+    let mut _exact_ = false;
+
+    while !_exact_ {
+        let angle = upper_bound - lower_bound;
+        let mut joiner = FuturesUnordered::new(); // ::<dyn Future<Output = Vec<u8>>> // ::<Pin<Box<dyn Future<Output = (Vec<u8>, usize)>>>>
+
+        let mut i = 0;
+
+        // dispatch probes
+
+        while lower_bound + i <= upper_bound {
+            let j = lower_bound + i;
+            let feed_update_address = get_feed_address(&owner, &topic, j);
+            let handle = async move {
+                //
+                (get_chunk(feed_update_address, data_retrieve_chan).await, j)
+            };
+            joiner.push(handle);
+
+            if i == 0 || angle <= (redundancy as u64) {
+                i += 1;
+            } else {
+                i *= 2;
+            }
+        }
+
+        // receive results, update scores
+
+        while let Some((result0, result1)) = joiner.next().await {
+            if result0.len() == 0 && smallest_not_found > result1 {
+                smallest_not_found = result1;
+            }
+            if result0.len() > 0 && largest_found < result1 {
+                largest_found = result1;
+            }
+        }
+
+        // if _exact_ frontier found return corresponding data
+
+        if largest_found + 1 == smallest_not_found {
+            return get_data(
+                get_feed_address(&owner, &topic, largest_found),
+                data_retrieve_chan,
+            )
+            .await;
+        }
+
+        // search above previous record height
+
+        lower_bound = largest_found + 1;
+
+        // if smallest not found update was higher than current zone lower bound, narrow search between these values
+
+        if smallest_not_found > lower_bound {
+            upper_bound = smallest_not_found;
+        } else {
+            // exit if largest found stayed zero and smallest not found is also zero
+
+            if smallest_not_found == 0 && largest_found == 0 {
+                return vec![];
+            }
+
+            // if we had a missing update below the record found height, discard hole and start from scratch regarding potential height
+
+            smallest_not_found = u64::MAX;
+
+            // set upper bound to search redundancy based limit
+
+            upper_bound = lower_bound + 2_u64.pow(redundancy.into());
+        }
+    }
+
+    return vec![];
 }
 
 //
