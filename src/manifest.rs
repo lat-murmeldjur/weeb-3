@@ -208,24 +208,27 @@ pub async fn interpret_manifest(
 
             let mime_0 = str1.to_string();
             // let filename_0 = str2.to_string();
+            if ref_data.len() > 71 {
+                let ref_size_a = ref_data[71];
+                if ref_data.len() > 72 + (ref_size_a as usize) {
+                    let actual_data = get_data(
+                        ref_data[72..72 + (ref_size_a as usize)].to_vec(),
+                        data_retrieve_chan,
+                    )
+                    .await;
 
-            let ref_size_a = ref_data[71];
-            let actual_data = get_data(
-                ref_data[72..72 + (ref_size_a as usize)].to_vec(),
-                data_retrieve_chan,
-            )
-            .await;
+                    let mut path_0: String = String::new();
+                    path_0.push_str(&path_prefix_heritance);
+                    path_0.push_str(&string_fork_prefix);
 
-            let mut path_0: String = String::new();
-            path_0.push_str(&path_prefix_heritance);
-            path_0.push_str(&string_fork_prefix);
-
-            parts.push(Fork {
-                data: actual_data.to_vec(),
-                mime: mime_0,
-                // filename: filename_0,
-                path: path_0,
-            });
+                    parts.push(Fork {
+                        data: actual_data.to_vec(),
+                        mime: mime_0,
+                        // filename: filename_0,
+                        path: path_0,
+                    });
+                }
+            }
         }
 
         if fork_type & 16 == 0 {

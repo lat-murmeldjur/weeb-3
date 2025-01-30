@@ -327,11 +327,11 @@ impl Sekirei {
                 let mut swarm = self.swarm.lock().unwrap();
                 #[allow(irrefutable_let_patterns)]
                 while let paddr = peers_instructions_chan_incoming.try_recv() {
-                    web_sys::console::log_1(&JsValue::from(format!(
-                        "Current Conn Handled {:#?}",
-                        paddr
-                    )));
                     if !paddr.is_err() {
+                        web_sys::console::log_1(&JsValue::from(format!(
+                            "Current Conn Handled {:#?}",
+                            paddr
+                        )));
                         let addr4 =
                             libp2p::core::Multiaddr::try_from(paddr.clone().unwrap().underlay)
                                 .unwrap();
@@ -342,38 +342,42 @@ impl Sekirei {
                     };
                 }
 
-                let event = swarm.next().await.unwrap();
-                match event {
-                    SwarmEvent::ConnectionEstablished {
-                        // peer_id,
-                        // established_in,
-                        ..
-                    } => {
-                        //
-                    }
-                    SwarmEvent::ConnectionClosed { peer_id, .. } => {
-                        {
-                            let mut connected_peers_map = wings.connected_peers.lock().unwrap();
-                            let mut overlay_peers_map = wings.overlay_peers.lock().unwrap();
-                            if connected_peers_map.contains_key(&peer_id) {
-                                let ol0 = hex::encode(connected_peers_map.get(&peer_id).unwrap().overlay.clone());
-                                if overlay_peers_map.contains_key(&ol0) {
-                                    overlay_peers_map.remove(&ol0);
+                let event =
+                    async_std::future::timeout(Duration::from_millis(600), swarm.next()).await;
+
+                if !event.is_err() {
+                    web_sys::console::log_1(&JsValue::from(format!(
+                        "Current Event Handled {:#?}",
+                        event
+                    )));
+                    match event.unwrap() {
+                        Some(SwarmEvent::ConnectionEstablished {
+                            // peer_id,
+                            // established_in,
+                            ..
+                        }) => {
+                            //
+                        }
+                        Some(SwarmEvent::ConnectionClosed { peer_id, .. }) => {
+                            {
+                                let mut connected_peers_map = wings.connected_peers.lock().unwrap();
+                                let mut overlay_peers_map = wings.overlay_peers.lock().unwrap();
+                                if connected_peers_map.contains_key(&peer_id) {
+                                    let ol0 = hex::encode(connected_peers_map.get(&peer_id).unwrap().overlay.clone());
+                                    if overlay_peers_map.contains_key(&ol0) {
+                                        overlay_peers_map.remove(&ol0);
+                                    };
+                                    connected_peers_map.remove(&peer_id);
                                 };
-                                connected_peers_map.remove(&peer_id);
+                            }
+                            let mut accounting = wings.accounting_peers.lock().unwrap();
+                            if accounting.contains_key(&peer_id) {
+                                accounting.remove(&peer_id);
                             };
                         }
-                        let mut accounting = wings.accounting_peers.lock().unwrap();
-                        if accounting.contains_key(&peer_id) {
-                            accounting.remove(&peer_id);
-                        };
+                        _ => {}
                     }
-                    _ => {}
                 }
-                web_sys::console::log_1(&JsValue::from(format!(
-                    "Current Event Handled {:#?}",
-                    event
-                )));
             }
         };
 
@@ -691,7 +695,7 @@ impl Behaviour {
                     .with_push_listen_addr_updates(true)
                     .with_interval(Duration::from_secs(60)), // .with_cache_size(10), //
             ),
-            ping: ping::Behaviour::new(ping::Config::new().with_interval(Duration::from_secs(3))),
+            ping: ping::Behaviour::new(ping::Config::new().with_interval(Duration::from_secs(50))),
             stream: stream::Behaviour::new(),
         }
     }

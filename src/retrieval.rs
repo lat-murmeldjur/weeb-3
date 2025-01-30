@@ -94,7 +94,7 @@ pub async fn retrieve_data(
         return vec![];
     }
 
-    // task::yield_now().await;
+    async_std::task::yield_now().await;
 
     let mut joiner = FuturesUnordered::new(); // ::<dyn Future<Output = Vec<u8>>> // ::<Pin<Box<dyn Future<Output = (Vec<u8>, usize)>>>>
 
@@ -411,6 +411,8 @@ pub async fn seek_latest_feed_update(
     let mut _exact_ = false;
 
     while !_exact_ {
+        async_std::task::yield_now().await;
+
         let angle = upper_bound - lower_bound;
         let mut joiner = FuturesUnordered::new(); // ::<dyn Future<Output = Vec<u8>>> // ::<Pin<Box<dyn Future<Output = (Vec<u8>, usize)>>>>
 
@@ -513,4 +515,4 @@ pub async fn seek_latest_feed_update(
 // 17618f9a17eac7fa5bba2bc0705ae33fc242a1e1c069b7f1b4f310f5125e812c
 //
 // c85d8a29aa330c0521910729abfae181ce3d1fbd39d31b2b6664530fb94ab4e5
-//
+// 743e99f3888774cade3996f0a378f6d99378c255ab1bf25ccc5ccd345723c186
