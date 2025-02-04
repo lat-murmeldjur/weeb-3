@@ -1,6 +1,5 @@
 #![cfg(target_arch = "wasm32")]
 
-use anyhow::Result;
 use console_error_panic_hook;
 use rand::rngs::OsRng;
 
