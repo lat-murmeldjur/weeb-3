@@ -226,7 +226,7 @@ impl Sekirei {
         let wings = self.wings.lock().unwrap();
 
         let peer_id =
-            libp2p::PeerId::from_str("QmYa9hasbJKBoTpfthcisMPKyGMCidfT1R4VkaRpg14bWP").unwrap();
+            libp2p::PeerId::from_str("QmPxeVPawnzvhsSaiZ1pphPYhWMroiPS3VdiDXRtzrbJXA").unwrap();
 
         let (peers_instructions_chan_outgoing, peers_instructions_chan_incoming) = mpsc::channel();
         let (connections_instructions_chan_outgoing, connections_instructions_chan_incoming) =
@@ -294,7 +294,7 @@ impl Sekirei {
 
         let conn_handle = async {
             let addr2 =
-            "/ip4/192.168.0.104/tcp/11634/ws/p2p/QmYa9hasbJKBoTpfthcisMPKyGMCidfT1R4VkaRpg14bWP"
+            "/ip4/192.168.0.102/tcp/11634/ws/p2p/QmPxeVPawnzvhsSaiZ1pphPYhWMroiPS3VdiDXRtzrbJXA"
                 .parse::<Multiaddr>()
                 .unwrap();
 
