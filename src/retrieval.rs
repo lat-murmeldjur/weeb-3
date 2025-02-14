@@ -1,4 +1,5 @@
 use crate::{
+    // // // // // // // //
     apply_credit,
     // // // // // // // //
     cancel_reserve,
@@ -45,6 +46,10 @@ use crate::{
     // // // // // // // //
 };
 
+use byteorder::ByteOrder;
+
+use alloy::primitives::keccak256;
+
 use libp2p::futures::{stream::FuturesUnordered, StreamExt};
 
 pub async fn retrieve_resource(
@@ -90,7 +95,9 @@ pub async fn retrieve_data(
         return orig;
     }
 
-    if (orig.len() - 8) % 32 != 0 {
+    let address_length = chunk_address.len();
+
+    if (orig.len() - 8) % address_length != 0 {
         return vec![];
     }
 
@@ -98,12 +105,13 @@ pub async fn retrieve_data(
 
     let mut joiner = FuturesUnordered::new(); // ::<dyn Future<Output = Vec<u8>>> // ::<Pin<Box<dyn Future<Output = (Vec<u8>, usize)>>>>
 
-    let subs = (orig.len() - 8) / 32;
+    let subs = (orig.len() - 8) / address_length;
 
     let mut content_holder_2: Vec<Vec<u8>> = vec![];
 
     for i in 0..subs {
-        content_holder_2.push((&orig[8 + i * 32..8 + (i + 1) * 32]).to_vec());
+        content_holder_2
+            .push((&orig[8 + i * address_length..8 + (i + 1) * address_length]).to_vec());
     }
 
     for (i, addr) in content_holder_2.iter().enumerate() {
@@ -158,6 +166,16 @@ pub async fn retrieve_chunk(
     accounting: &Mutex<HashMap<PeerId, Mutex<PeerAccounting>>>,
     refresh_chan: &mpsc::Sender<(PeerId, u64)>,
 ) -> Vec<u8> {
+    let mut caddr: Vec<u8> = chunk_address.to_vec();
+    let mut encrey = vec![];
+    let mut encred = false;
+
+    if chunk_address.len() == 64 {
+        caddr = (&chunk_address[0..32]).to_vec();
+        encrey = (&chunk_address[32..64]).to_vec();
+        encred = true;
+    }
+
     let mut soc = false;
     let mut skiplist: HashSet<PeerId> = HashSet::new();
     let mut overdraftlist: HashSet<PeerId> = HashSet::new();
@@ -179,16 +197,8 @@ pub async fn retrieve_chunk(
 
     while error_count < max_error {
         let mut seer = true;
-        web_sys::console::log_1(&JsValue::from(format!(
-            "loop 0 {} {}",
-            error_count, max_error
-        )));
 
         while seer {
-            web_sys::console::log_1(&JsValue::from(format!(
-                "loop 00 {} {}",
-                error_count, max_error
-            )));
             closest_overlay = "".to_string();
             closest_peer_id = libp2p::PeerId::random();
             current_max_po = 0;
@@ -200,7 +210,7 @@ pub async fn retrieve_chunk(
                         continue;
                     }
 
-                    let current_po = get_proximity(&chunk_address, &hex::decode(&ov).unwrap());
+                    let current_po = get_proximity(&caddr, &hex::decode(&ov).unwrap());
 
                     if current_po >= current_max_po {
                         selected = true;
@@ -239,7 +249,7 @@ pub async fn retrieve_chunk(
                 }
             }
 
-            let req_price = price(&closest_overlay, &chunk_address);
+            let req_price = price(&closest_overlay, &caddr);
 
             {
                 let accounting_peers = accounting.lock().unwrap();
@@ -258,11 +268,11 @@ pub async fn retrieve_chunk(
             }
         }
 
-        let req_price = price(&closest_overlay, &chunk_address);
+        let req_price = price(&closest_overlay, &caddr);
 
         let (chunk_out, chunk_in) = mpsc::channel::<Vec<u8>>();
 
-        retrieve_handler(closest_peer_id, chunk_address.clone(), control, &chunk_out).await;
+        retrieve_handler(closest_peer_id, caddr.clone(), control, &chunk_out).await;
 
         let chunk_data = chunk_in.try_recv();
         if chunk_data.is_err() {
@@ -290,9 +300,10 @@ pub async fn retrieve_chunk(
 
         match chunk_data {
             Ok(_x) => {
-                let contaddrd = valid_cac(&cd, chunk_address);
+                let contaddrd = valid_cac(&cd, &caddr);
+
                 if !contaddrd {
-                    soc = valid_soc(&cd, chunk_address);
+                    soc = valid_soc(&cd, &caddr);
                     if !soc {
                         web_sys::console::log_1(&JsValue::from(format!("invalid Soc!")));
                         error_count += 1;
@@ -323,11 +334,71 @@ pub async fn retrieve_chunk(
         };
     }
 
+    if encred {
+        let cd0 = decrypt(&cd, encrey);
+
+        if soc && cd0.len() >= 97 + 8 {
+            return (&cd0[97..]).to_vec();
+        }
+
+        return cd0;
+    }
+
     if soc && cd.len() >= 97 + 8 {
         return (&cd[97..]).to_vec();
     }
 
     return cd;
+}
+
+pub fn decrypt(cd: &Vec<u8>, encrey: Vec<u8>) -> Vec<u8> {
+    let spancred = (&cd[0..8]).to_vec();
+    let concred = (&cd[8..]).to_vec();
+    let creylen = encrey.len();
+
+    let mut spanbytes: Vec<u8> = vec![];
+    let mut spansegmentkey0: [u8; 4] = [0; 4];
+    byteorder::LittleEndian::write_u32(&mut spansegmentkey0, (4096 / creylen) as u32);
+    let spansegmentkey1 =
+        keccak256(keccak256([encrey.clone(), spansegmentkey0.to_vec()].concat()).to_vec()).to_vec();
+
+    for j in 0..8 {
+        spanbytes.push(spancred[j] ^ spansegmentkey1[j])
+    }
+
+    let mut content: Vec<u8> = vec![];
+    let mut done = false;
+    let mut i = 0;
+    while !done {
+        let mut k = creylen;
+        if k > concred.len() - (i * creylen) {
+            k = concred.len() - (i * creylen);
+        };
+
+        let mut contentsegmentkey0: [u8; 4] = [0; 4];
+        byteorder::LittleEndian::write_u32(&mut contentsegmentkey0, i as u32);
+        let contentsegmentkey1 = keccak256(keccak256(
+            [encrey.clone(), contentsegmentkey0.to_vec()].concat(),
+        ))
+        .to_vec();
+
+        for j in (i * creylen)..(i * creylen + k) {
+            content.push(concred[j] ^ contentsegmentkey1[j - i * creylen])
+        }
+
+        i += 1;
+
+        if !(i * creylen < concred.len()) {
+            done = true;
+        }
+    }
+
+    web_sys::console::log_1(&JsValue::from(format!(
+        "decrypted chunk with len: {}",
+        u64::from_le_bytes(spanbytes.clone().try_into().unwrap())
+    )));
+
+    return [spanbytes, content].concat();
 }
 
 pub async fn get_data(
@@ -520,3 +591,5 @@ pub async fn seek_latest_feed_update(
 //
 // c744b9670f372f2b0a3f2600fe16fc04c1a3ee4aff6bd9d09e0230abee0b5ec7
 // 9f2a74cdaad2654660bb95b3e29354696b25d492072110ef091d48434e1d76eed80e865888dd5686ada4acc4528dec8925298a7c818cd758dc95c31c0687acb6
+//
+// a018d027eeb247872ef8b77966baa34b644adeccfdf62f41382714e912632ddbfbabb83b217431f66f872f2bfb2ecb001935152c1c380b1200574c6a3ea03541

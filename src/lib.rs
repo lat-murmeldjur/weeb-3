@@ -226,7 +226,8 @@ impl Sekirei {
         let wings = self.wings.lock().unwrap();
 
         let peer_id =
-            libp2p::PeerId::from_str("QmPxeVPawnzvhsSaiZ1pphPYhWMroiPS3VdiDXRtzrbJXA").unwrap();
+            libp2p::PeerId::from_str("QmaniMaU5kNYzk7pQPWnBmB7Qp1o28FUW9cG4xVC4tGJbK").unwrap();
+        // libp2p::PeerId::from_str("QmPxeVPawnzvhsSaiZ1pphPYhWMroiPS3VdiDXRtzrbJXA").unwrap();
 
         let (peers_instructions_chan_outgoing, peers_instructions_chan_incoming) = mpsc::channel();
         let (connections_instructions_chan_outgoing, connections_instructions_chan_incoming) =
@@ -294,7 +295,7 @@ impl Sekirei {
 
         let conn_handle = async {
             let addr2 =
-            "/ip4/192.168.0.102/tcp/11634/ws/p2p/QmPxeVPawnzvhsSaiZ1pphPYhWMroiPS3VdiDXRtzrbJXA"
+            "/ip4/192.168.0.101/tcp/18634/ws/p2p/QmaniMaU5kNYzk7pQPWnBmB7Qp1o28FUW9cG4xVC4tGJbK"
                 .parse::<Multiaddr>()
                 .unwrap();
 
@@ -341,8 +342,11 @@ impl Sekirei {
                     };
                 }
 
-                let event =
-                    async_std::future::timeout(Duration::from_millis(600), swarm.next()).await;
+                let event = async_std::future::timeout(
+                    Duration::from_millis(EVENT_LOOP_INTERRUPTOR as u64),
+                    swarm.next(),
+                )
+                .await;
 
                 if !event.is_err() {
                     web_sys::console::log_1(&JsValue::from(format!(

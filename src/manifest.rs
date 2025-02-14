@@ -27,7 +27,10 @@ pub async fn interpret_manifest(
     let mut ind: String = "".to_string();
     let mut ind_set = false;
 
+    web_sys::console::log_1(&JsValue::from(format!("interpreting manifest")));
+
     if cd.len() == 0 {
+        web_sys::console::log_1(&JsValue::from(format!("returning early 00")));
         return (
             vec![Fork {
                 data: vec![],
@@ -55,8 +58,8 @@ pub async fn interpret_manifest(
 
     // commented out for later use
 
-    //    let obfuscation_key = &cd[8..40];
-    //    let enc_obfuscation_key = hex::encode(obfuscation_key);
+    let obfuscation_key = &cd[8..40];
+    let enc_obfuscation_key = hex::encode(obfuscation_key);
 
     let mf_version = &cd[40..71];
     let enc_mf_version = hex::encode(mf_version);
