@@ -335,12 +335,16 @@ pub async fn retrieve_chunk(
     }
 
     if encred {
-        let cd0 = decrypt(&cd, encrey);
-
-        if soc && cd0.len() >= 97 + 8 {
-            return (&cd0[97..]).to_vec();
+        if soc {
+            let cd00 = decrypt(&(&cd[97..]).to_vec(), encrey);
+            if cd00.len() >= 8 {
+                return cd00;
+            } else {
+                return vec![];
+            }
         }
 
+        let cd0 = decrypt(&cd, encrey);
         return cd0;
     }
 
@@ -398,7 +402,11 @@ pub fn decrypt(cd: &Vec<u8>, encrey: Vec<u8>) -> Vec<u8> {
         u64::from_le_bytes(spanbytes.clone().try_into().unwrap())
     )));
 
-    return [spanbytes, content].concat();
+    return [
+        spanbytes.clone(),
+        content[..u64::from_le_bytes(spanbytes.try_into().unwrap()) as usize].to_vec(),
+    ]
+    .concat();
 }
 
 pub async fn get_data(
