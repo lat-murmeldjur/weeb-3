@@ -21,7 +21,7 @@ pub struct Fork {
 
 pub async fn interpret_manifest(
     path_prefix_heritance: String,
-    cd: &Vec<u8>,
+    cd0: &Vec<u8>,
     data_retrieve_chan: &mpsc::Sender<(Vec<u8>, u8, mpsc::Sender<Vec<u8>>)>,
 ) -> (Vec<Fork>, String) {
     let mut ind: String = "".to_string();
@@ -29,7 +29,7 @@ pub async fn interpret_manifest(
 
     web_sys::console::log_1(&JsValue::from(format!("interpreting manifest")));
 
-    if cd.len() == 0 {
+    if cd0.len() == 0 {
         web_sys::console::log_1(&JsValue::from(format!("returning early 00")));
         return (
             vec![Fork {
@@ -42,12 +42,12 @@ pub async fn interpret_manifest(
         );
     }
 
-    if cd.len() < 72 {
-        web_sys::console::log_1(&JsValue::from(format!("returning early 0")));
+    if cd0.len() < 72 {
+        web_sys::console::log_1(&JsValue::from(format!("returning early 01")));
 
         return (
             vec![Fork {
-                data: cd.to_vec(),
+                data: cd0.to_vec(),
                 mime: "application/octet-stream".to_string(),
                 // filename: "unknown00".to_string(),
                 path: "unknown00".to_string(),
@@ -56,18 +56,49 @@ pub async fn interpret_manifest(
         );
     }
 
-    // commented out for later use
-
-    let obfuscation_key = &cd[8..40];
+    let obfuscation_key = &cd0[8..40];
     let enc_obfuscation_key = hex::encode(obfuscation_key);
+    web_sys::console::log_1(&JsValue::from(format!(
+        "obfuscation_key: {}",
+        enc_obfuscation_key
+    )));
+
+    let mut cd = (&cd0[..40]).to_vec();
+
+    if enc_obfuscation_key != "0000000000000000000000000000000000000000000000000000000000000000" {
+        web_sys::console::log_1(&JsValue::from(format!("deobfuscating manifest")));
+
+        let creylen = obfuscation_key.len();
+        let mut done = false;
+        let mut i = 0;
+        while !done {
+            let mut k = creylen;
+            if k > cd0.len() - (40 + i * creylen) {
+                k = cd0.len() - (40 + i * creylen);
+            };
+
+            for j in (40 + i * creylen)..(40 + i * creylen + k) {
+                cd.push(cd0[j] ^ obfuscation_key[j - 40 - i * creylen]);
+            }
+
+            i += 1;
+
+            if !(40 + i * creylen < cd0.len()) {
+                done = true;
+            }
+        }
+    } else {
+        cd = cd0.to_vec();
+    }
 
     let mf_version = &cd[40..71];
     let enc_mf_version = hex::encode(mf_version);
+    web_sys::console::log_1(&JsValue::from(format!("mf_version: {}", enc_mf_version)));
 
     if enc_mf_version != "5768b3b6a7db56d21d1abff40d41cebfc83448fed8d7e9b06ec0d3b073f28f"
         && enc_mf_version != "025184789d63635766d78c41900196b57d7400875ebe4d9b5d1e76bd9652a9"
     {
-        web_sys::console::log_1(&JsValue::from(format!("returning early 1")));
+        web_sys::console::log_1(&JsValue::from(format!("returning early 0")));
         return (
             vec![Fork {
                 data: cd.to_vec(),
@@ -80,12 +111,21 @@ pub async fn interpret_manifest(
     }
 
     let ref_size = cd[71];
+    let enc_ref_size = hex::encode(&[ref_size]);
+    web_sys::console::log_1(&JsValue::from(format!("ref_size: {}", enc_ref_size)));
 
     let ref_delimiter = (72 + ref_size) as usize;
-    // let actual_reference = &cd[72..ref_delimiter];
+    let actual_reference = &cd[72..ref_delimiter];
+    let enc_actual_reference = hex::encode(actual_reference);
+    web_sys::console::log_1(&JsValue::from(format!(
+        "actual_reference: {}",
+        enc_actual_reference
+    )));
 
     let index_delimiter = (ref_delimiter + 32) as usize;
-    // let index = &cd[ref_delimiter..index_delimiter];
+    let index = &cd[ref_delimiter..index_delimiter];
+    let enc_index = hex::encode(index);
+    web_sys::console::log_1(&JsValue::from(format!("index: {}", enc_index)));
 
     // fork parts
 
@@ -118,6 +158,10 @@ pub async fn interpret_manifest(
             enc_fork_reference
         )));
 
+        web_sys::console::log_1(&JsValue::from(format!(
+            "getting_data: {}",
+            enc_fork_reference
+        )));
         let ref_data = get_data(fork_reference.to_vec(), data_retrieve_chan).await;
 
         if fork_type & 16 == 16 {
@@ -164,6 +208,7 @@ pub async fn interpret_manifest(
             if feed {
                 let feed_data_soc =
                     seek_latest_feed_update(owner, topic, data_retrieve_chan, 8).await;
+                web_sys::console::log_1(&JsValue::from(format!("getting_data_soc...:",)));
                 let feed_data_content =
                     get_data(feed_data_soc[16..48].to_vec(), data_retrieve_chan).await;
 
@@ -214,6 +259,10 @@ pub async fn interpret_manifest(
             if ref_data.len() > 71 {
                 let ref_size_a = ref_data[71];
                 if ref_data.len() > 72 + (ref_size_a as usize) {
+                    web_sys::console::log_1(&JsValue::from(format!(
+                        "getting_data1: {}",
+                        hex::encode(ref_data[72..72 + (ref_size_a as usize)].to_vec())
+                    )));
                     let actual_data = get_data(
                         ref_data[72..72 + (ref_size_a as usize)].to_vec(),
                         data_retrieve_chan,
