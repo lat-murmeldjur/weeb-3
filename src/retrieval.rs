@@ -166,6 +166,11 @@ pub async fn retrieve_chunk(
     accounting: &Mutex<HashMap<PeerId, Mutex<PeerAccounting>>>,
     refresh_chan: &mpsc::Sender<(PeerId, u64)>,
 ) -> Vec<u8> {
+    web_sys::console::log_1(&JsValue::from(format!(
+        "getting_chunk: {}",
+        hex::encode(&chunk_address)
+    )));
+
     let mut caddr: Vec<u8> = chunk_address.to_vec();
     let mut encrey = vec![];
     let mut encred = false;
@@ -356,6 +361,10 @@ pub async fn retrieve_chunk(
 }
 
 pub fn decrypt(cd: &Vec<u8>, encrey: Vec<u8>) -> Vec<u8> {
+    if cd.len() < 8 {
+        return vec![];
+    }
+
     let spancred = (&cd[0..8]).to_vec();
     let concred = (&cd[8..]).to_vec();
     let creylen = encrey.len();
@@ -397,16 +406,31 @@ pub fn decrypt(cd: &Vec<u8>, encrey: Vec<u8>) -> Vec<u8> {
         }
     }
 
+    let mut span_decrypted = u64::from_le_bytes(spanbytes.clone().try_into().unwrap());
+
+    if span_decrypted > 4096 {
+        let mut done = false;
+        let mut i = 0;
+        span_decrypted = 0;
+        while !done {
+            if hex::encode(&content[i*64..(i+1)*64]) != "0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a" && (i+1)*64 < content.len(){
+                i += 1;
+                span_decrypted += 64;
+            } else {
+                web_sys::console::log_1(&JsValue::from(format!(
+                    "stopped searching for end of encrypted chunk"
+                )));
+                done = true;
+            }
+        }
+    };
+
     web_sys::console::log_1(&JsValue::from(format!(
         "decrypted chunk with len: {}",
-        u64::from_le_bytes(spanbytes.clone().try_into().unwrap())
+        span_decrypted
     )));
 
-    return [
-        spanbytes.clone(),
-        content[..u64::from_le_bytes(spanbytes.try_into().unwrap()) as usize].to_vec(),
-    ]
-    .concat();
+    return [spanbytes, content[..span_decrypted as usize].to_vec()].concat();
 }
 
 pub async fn get_data(

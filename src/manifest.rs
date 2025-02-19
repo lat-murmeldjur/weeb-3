@@ -26,6 +26,7 @@ pub async fn interpret_manifest(
 ) -> (Vec<Fork>, String) {
     let mut ind: String = "".to_string();
     let mut ind_set = false;
+    let mut manifest_encrypted = false;
 
     web_sys::console::log_1(&JsValue::from(format!("interpreting manifest")));
 
@@ -66,6 +67,7 @@ pub async fn interpret_manifest(
     let mut cd = (&cd0[..40]).to_vec();
 
     if enc_obfuscation_key != "0000000000000000000000000000000000000000000000000000000000000000" {
+        manifest_encrypted = true;
         web_sys::console::log_1(&JsValue::from(format!("deobfuscating manifest")));
 
         let creylen = obfuscation_key.len();
@@ -157,11 +159,11 @@ pub async fn interpret_manifest(
             "fork_reference: {}",
             enc_fork_reference
         )));
-
         web_sys::console::log_1(&JsValue::from(format!(
             "getting_data: {}",
             enc_fork_reference
         )));
+
         let ref_data = get_data(fork_reference.to_vec(), data_retrieve_chan).await;
 
         if fork_type & 16 == 16 {
@@ -208,7 +210,8 @@ pub async fn interpret_manifest(
             if feed {
                 let feed_data_soc =
                     seek_latest_feed_update(owner, topic, data_retrieve_chan, 8).await;
-                web_sys::console::log_1(&JsValue::from(format!("getting_data_soc...:",)));
+
+                web_sys::console::log_1(&JsValue::from(format!("getting_data_soc...:")));
                 let feed_data_content =
                     get_data(feed_data_soc[16..48].to_vec(), data_retrieve_chan).await;
 
@@ -258,16 +261,63 @@ pub async fn interpret_manifest(
             // let filename_0 = str2.to_string();
             if ref_data.len() > 71 {
                 let ref_size_a = ref_data[71];
+                let enc_ref_size_a = hex::encode(&[ref_size_a]);
+                web_sys::console::log_1(&JsValue::from(format!("ref_size_a: {}", enc_ref_size_a)));
+
                 if ref_data.len() > 72 + (ref_size_a as usize) {
+                    let mut actual_data_address = ref_data[72..72 + (ref_size_a as usize)].to_vec();
+
+                    web_sys::console::log_1(&JsValue::from(format!(
+                        "getting_data0: {}",
+                        hex::encode(&actual_data_address)
+                    )));
+
+                    if manifest_encrypted {
+                        let ref_data_obfuscation_key = &ref_data[8..40];
+                        let enc_ref_data_obfuscation_key = hex::encode(obfuscation_key);
+                        web_sys::console::log_1(&JsValue::from(format!(
+                            "ref_obfuscation_key: {}",
+                            enc_ref_data_obfuscation_key
+                        )));
+                        let mut ref_data0 = (&ref_data[..40]).to_vec();
+
+                        web_sys::console::log_1(&JsValue::from(format!(
+                            "deobfuscating referred manifest"
+                        )));
+
+                        let ref_creylen = ref_data_obfuscation_key.len();
+                        let mut done = false;
+                        let mut i = 0;
+                        while !done {
+                            let mut k = ref_creylen;
+                            if k > ref_data.len() - (40 + i * ref_creylen) {
+                                k = ref_data.len() - (40 + i * ref_creylen);
+                            };
+
+                            for j in (40 + i * ref_creylen)..(40 + i * ref_creylen + k) {
+                                ref_data0.push(
+                                    ref_data[j]
+                                        ^ ref_data_obfuscation_key[j - 40 - i * ref_creylen],
+                                );
+                            }
+
+                            i += 1;
+
+                            if !(40 + i * ref_creylen < ref_data.len()) {
+                                done = true;
+                            }
+                        }
+
+                        let ref_size_a0 = ref_data0[71];
+                        actual_data_address = ref_data0[72..72 + (ref_size_a0 as usize)].to_vec();
+                    }
+
                     web_sys::console::log_1(&JsValue::from(format!(
                         "getting_data1: {}",
-                        hex::encode(ref_data[72..72 + (ref_size_a as usize)].to_vec())
+                        hex::encode(&actual_data_address)
                     )));
-                    let actual_data = get_data(
-                        ref_data[72..72 + (ref_size_a as usize)].to_vec(),
-                        data_retrieve_chan,
-                    )
-                    .await;
+
+                    let actual_data = get_data(actual_data_address, data_retrieve_chan).await;
 
                     let mut path_0: String = String::new();
                     path_0.push_str(&path_prefix_heritance);
