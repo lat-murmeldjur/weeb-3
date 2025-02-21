@@ -166,11 +166,6 @@ pub async fn retrieve_chunk(
     accounting: &Mutex<HashMap<PeerId, Mutex<PeerAccounting>>>,
     refresh_chan: &mpsc::Sender<(PeerId, u64)>,
 ) -> Vec<u8> {
-    web_sys::console::log_1(&JsValue::from(format!(
-        "getting_chunk: {}",
-        hex::encode(&chunk_address)
-    )));
-
     let mut caddr: Vec<u8> = chunk_address.to_vec();
     let mut encrey = vec![];
     let mut encred = false;
@@ -310,7 +305,11 @@ pub async fn retrieve_chunk(
                 if !contaddrd {
                     soc = valid_soc(&cd, &caddr);
                     if !soc {
-                        web_sys::console::log_1(&JsValue::from(format!("invalid Soc!")));
+                        web_sys::console::log_1(&JsValue::from(format!(
+                            "invalid as Soc&Cac with len {} for address {}!",
+                            cd.len(),
+                            hex::encode(chunk_address)
+                        )));
                         error_count += 1;
                         let accounting_peers = accounting.lock().unwrap();
                         if accounting_peers.contains_key(&closest_peer_id) {
@@ -409,26 +408,23 @@ pub fn decrypt(cd: &Vec<u8>, encrey: Vec<u8>) -> Vec<u8> {
     let mut span_decrypted = u64::from_le_bytes(spanbytes.clone().try_into().unwrap());
 
     if span_decrypted > 4096 {
-        let mut done = false;
-        let mut i = 0;
-        span_decrypted = 0;
-        while !done {
-            if hex::encode(&content[i*64..(i+1)*64]) != "0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a" && (i+1)*64 < content.len(){
-                i += 1;
-                span_decrypted += 64;
+        let mut done0 = false;
+        let mut carry_span = 4096_u64;
+        while !done0 {
+            let k = span_decrypted / carry_span;
+            let mut l0 = span_decrypted % carry_span;
+            if l0 > 0 {
+                l0 = 1;
+            }
+
+            if k + l0 <= 64 {
+                done0 = true;
+                span_decrypted = (k + l0) * 64;
             } else {
-                web_sys::console::log_1(&JsValue::from(format!(
-                    "stopped searching for end of encrypted chunk"
-                )));
-                done = true;
+                carry_span *= 64;
             }
         }
     };
-
-    web_sys::console::log_1(&JsValue::from(format!(
-        "decrypted chunk with len: {}",
-        span_decrypted
-    )));
 
     return [spanbytes, content[..span_decrypted as usize].to_vec()].concat();
 }
@@ -555,8 +551,6 @@ pub async fn seek_latest_feed_update(
                 largest_found = result1;
             }
         }
-
-        web_sys::console::log_1(&JsValue::from("exat"));
 
         // if _exact_ frontier found return corresponding data
 

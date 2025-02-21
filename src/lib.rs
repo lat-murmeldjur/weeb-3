@@ -328,10 +328,10 @@ impl Sekirei {
                 #[allow(irrefutable_let_patterns)]
                 while let paddr = peers_instructions_chan_incoming.try_recv() {
                     if !paddr.is_err() {
-                        web_sys::console::log_1(&JsValue::from(format!(
-                            "Current Conn Handled {:#?}",
-                            paddr
-                        )));
+                        // web_sys::console::log_1(&JsValue::from(format!(
+                        //     "Current Conn Handled {:#?}",
+                        //     paddr
+                        // )));
                         let addr4 =
                             libp2p::core::Multiaddr::try_from(paddr.clone().unwrap().underlay)
                                 .unwrap();
@@ -349,10 +349,10 @@ impl Sekirei {
                 .await;
 
                 if !event.is_err() {
-                    web_sys::console::log_1(&JsValue::from(format!(
-                        "Current Event Handled {:#?}",
-                        event
-                    )));
+                    // web_sys::console::log_1(&JsValue::from(format!(
+                    //     "Current Event Handled {:#?}",
+                    //     event
+                    // )));
                     match event.unwrap() {
                         Some(SwarmEvent::ConnectionEstablished {
                             // peer_id,
