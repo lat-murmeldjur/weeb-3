@@ -130,11 +130,7 @@ impl Sekirei {
         let valaddr_0 = hex::decode(&address);
         let valaddr = match valaddr_0 {
             Ok(hex) => hex,
-            _ => {
-                // ens
-                prt(address).await;
-                return vec![];
-            }
+            _ => prt(address, "".to_string()).await,
         };
 
         let _ = self.message_port.0.send((valaddr, chan_out));
@@ -230,7 +226,7 @@ impl Sekirei {
     pub async fn run(&self, _st: String) -> () {
         init_panic_hook();
 
-        prt("".to_string()).await;
+        prt("".to_string(), "".to_string()).await;
 
         let wings = self.wings.lock().unwrap();
 
