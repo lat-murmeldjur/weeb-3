@@ -46,6 +46,9 @@ mod manifest;
 mod retrieval;
 use retrieval::*;
 
+mod ens;
+use ens::*;
+
 pub mod weeb_3 {
     pub mod etiquette_0 {
         include!(concat!(env!("OUT_DIR"), "/weeb_3.etiquette_0.rs"));
@@ -124,10 +127,14 @@ pub struct Wings {
 impl Sekirei {
     pub async fn acquire(&self, address: String) -> Vec<u8> {
         let (chan_out, chan_in) = mpsc::channel::<Vec<u8>>();
-        let valaddr_0 = hex::decode(address);
+        let valaddr_0 = hex::decode(&address);
         let valaddr = match valaddr_0 {
             Ok(hex) => hex,
-            _ => return vec![],
+            _ => {
+                // ens
+                prt(address).await;
+                return vec![];
+            }
         };
 
         let _ = self.message_port.0.send((valaddr, chan_out));
@@ -222,6 +229,8 @@ impl Sekirei {
 
     pub async fn run(&self, _st: String) -> () {
         init_panic_hook();
+
+        prt("".to_string()).await;
 
         let wings = self.wings.lock().unwrap();
 

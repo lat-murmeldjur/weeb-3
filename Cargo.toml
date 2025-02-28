@@ -1,7 +1,7 @@
 [package]
 name = "weeb_3"
 version = "0.0.0"
-edition = "2021"
+edition = "2024"
 license = "MIT"
 
 [package.metadata.release]
@@ -39,6 +39,7 @@ libp2p = { git = "https://github.com/libp2p/rust-libp2p.git", features = [ "ecds
 libp2p-webrtc = { git = "https://github.com/libp2p/rust-libp2p.git",  features = [ "tokio"] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
+ethers = { git = "https://github.com/gakonst/ethers-rs.git" }
 alloy = { git = "https://github.com/alloy-rs/alloy.git", features = [
     "k256",
     "signer-local",
@@ -104,4 +105,3 @@ byteorder = { git = "https://github.com/BurntSushi/byteorder" }
 num = { git = "https://github.com/rust-num/num.git" }
 hex = { git = "https://github.com/KokaKiwi/rust-hex.git" }
 #tracing-wasm = { git = "https://github.com/old-storyai/tracing-wasm.git" }
-

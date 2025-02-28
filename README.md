@@ -87,7 +87,7 @@ Currently - due to the blocking - non-blocking nature of the async framework, an
 The aforementioned architecture further depends on the following code modules:
 - The protocol handlers for handshake, hive, pricing, pseudosettle and retrieval (src/handlers.rs)
 - The accounting functions, such as calculating chunk prices, reserving, crediting, refreshing (src/accounting.rs)
-- The retrieval logic such as selecting peers to retrieve chunks from, joining files or triggering manifest interpretations (src/retrieval.rs)
+- The retrieval logic such as selecting peers to retrieve chunks from, decrypting chunks, joining files and triggering manifest interpretations (src/retrieval.rs)
 - The manifest interpretation logic (src/manifest.rs)
 - Common methods and struct declarations including DOM manipulation, calculating proximity orders, validating content addressed and single owner chunks, calculating feed addresses, and encoding/decoding resource groups to communicate through byte channels e.g. towards the interface (src/conventions.rs)
 
@@ -107,7 +107,6 @@ This service worker is only enabled by the browser if the browser detects that t
 
 - Adding text input fields to the interface for selecting bootnode address, RPC node address, and swarm network id, to enable switching between networks, e.g. mainnet, testnet or other custom networks.
 - Adding functionality to the service worker to enable triggering requests towards the shared worker, to retrieve resources when swarm references are present in a website, alternatively, achieving the same by overwriting navigation bar contents when an onclick event is detected to be a swarm reference
-- Adding the swarm manifest encryption feature
 - Simultaneous manifest fork lookups  
 - Adding the swarm ACT feature
 - ENS lookups 
