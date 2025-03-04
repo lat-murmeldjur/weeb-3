@@ -8,12 +8,14 @@ use web3::transports::eip_1193::{Eip1193, Provider};
 
 use js_sys::{Array, Date, Uint8Array};
 use wasm_bindgen::{closure::Closure, prelude::*, JsCast, JsError, JsValue};
-use wasm_bindgen_futures::JsFuture;
+
+use wasm_bindgen_futures::{spawn_local, JsFuture};
 use web_sys::{
     console,
     Blob,
     BlobPropertyBag,
     Element,
+    HtmlButtonElement,
     HtmlElement,
     HtmlInputElement,
     MessageEvent,
@@ -26,23 +28,6 @@ use web_sys::{
 #[wasm_bindgen]
 pub async fn interweeb(_st: String) -> Result<(), JsError> {
     init_panic_hook();
-
-    {
-        let provider = Provider::default().unwrap().unwrap();
-
-        let transport = Eip1193::new(provider);
-        let web3 = web3::Web3::new(transport);
-        let accounts = web3.eth().request_accounts().await.unwrap();
-
-        for account in accounts {
-            let balance = web3.eth().balance(account, None).await.unwrap();
-
-            web_sys::console::log_1(&JsValue::from(format!(
-                "Balance of {:?}: {}",
-                account, balance
-            )));
-        }
-    }
 
     let window = &web_sys::window().unwrap();
 
@@ -126,6 +111,37 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
         .dyn_ref::<HtmlInputElement>()
         .expect("#inputString should be a HtmlInputElement")
         .set_oninput(Some(callback.as_ref().unchecked_ref()));
+
+    let callback2 =
+        wasm_bindgen::closure::Closure::<dyn FnMut(web_sys::MessageEvent)>::new(move |_msg| {
+            console::log_1(&"uploadGetBatch callback triggered".into());
+
+            spawn_local(async {
+                {
+                    let provider = Provider::default().unwrap().unwrap();
+
+                    let transport = Eip1193::new(provider);
+                    let web3 = web3::Web3::new(transport);
+                    let accounts = web3.eth().request_accounts().await.unwrap();
+
+                    for account in accounts {
+                        let balance = web3.eth().balance(account, None).await.unwrap();
+
+                        web_sys::console::log_1(&JsValue::from(format!(
+                            "Balance of {:?}: {}",
+                            account, balance
+                        )));
+                    }
+                }
+            });
+        });
+
+    document
+        .get_element_by_id("uploadGetBatch")
+        .expect("#uploadGetBatch should exist")
+        .dyn_ref::<HtmlButtonElement>()
+        .expect("#uploadGetBatch should be a HtmlInputElement")
+        .set_onclick(Some(callback2.as_ref().unchecked_ref()));
 
     body.append_p(&format!("Created a new worker from within Wasm"))?;
 
