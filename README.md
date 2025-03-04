@@ -89,6 +89,7 @@ The aforementioned architecture further depends on the following code modules:
 - The accounting functions, such as calculating chunk prices, reserving, crediting, refreshing (src/accounting.rs)
 - The retrieval logic such as selecting peers to retrieve chunks from, decrypting chunks, joining files and triggering manifest interpretations (src/retrieval.rs)
 - The manifest interpretation logic (src/manifest.rs)
+- The ENS contenthash resolution logic (src/ens.rs)
 - Common methods and struct declarations including DOM manipulation, calculating proximity orders, validating content addressed and single owner chunks, calculating feed addresses, and encoding/decoding resource groups to communicate through byte channels e.g. towards the interface (src/conventions.rs)
 
 ### The Service Worker
@@ -109,7 +110,6 @@ This service worker is only enabled by the browser if the browser detects that t
 - Adding functionality to the service worker to enable triggering requests towards the shared worker, to retrieve resources when swarm references are present in a website, alternatively, achieving the same by overwriting navigation bar contents when an onclick event is detected to be a swarm reference
 - Simultaneous manifest fork lookups  
 - Adding the swarm ACT feature
-- ENS lookups 
 - Wallet related functionality such as cheques and buying storage space on swarm to enable uploads, engaging in pushsync
 - Browser-side caching of retrieved data through indexeddb or other forms of local storage
 - Developing security of origin separation between swarm websites loaded

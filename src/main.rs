@@ -96,6 +96,10 @@ pub(crate) async fn serve(libp2p_transport: Multiaddr) {
         .route("/weeb_3_bg.wasm", get(get_static_file_weeb_3_bg_wasm))
         .route("/worker.js", get(get_static_file_worker_js))
         .route("/service.js", get(get_static_file_service_js))
+        .route(
+            "/snippets/web3-0742d85b024bb6f5/inline0.js",
+            get(get_static_file_web3_export_js),
+        )
         .layer(
             CorsLayer::new()
                 .allow_origin(Any)
@@ -160,6 +164,17 @@ async fn get_static_file_service_js() -> Result<impl IntoResponse, StatusCode> {
         .ok_or(StatusCode::NOT_FOUND)?
         .data;
     let content_type = mime_guess::from_path("service.js")
+        .first_or_octet_stream()
+        .to_string();
+
+    Ok(([(CONTENT_TYPE, content_type)], content))
+}
+
+async fn get_static_file_web3_export_js() -> Result<impl IntoResponse, StatusCode> {
+    let content = StaticFiles::get("snippets/web3-0742d85b024bb6f5/inline0.js")
+        .ok_or(StatusCode::NOT_FOUND)?
+        .data;
+    let content_type = mime_guess::from_path("snippets/web3-0742d85b024bb6f5/inline0.js")
         .first_or_octet_stream()
         .to_string();
 

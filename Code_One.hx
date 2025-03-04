@@ -25,6 +25,8 @@ class Code_One {
 			clientele('cp', [ './static/weeb_3_bg.wasm', './docs/' ], count);
 			clientele('cp', [ './static/worker.js', './docs/' ], count);
 			clientele('cp', [ './static/service.js', './docs/' ], count);
+			clientele('mkdir', [ '-p', './docs/snippets/web3-0742d85b024bb6f5' ], count);
+			clientele('cp', [ './static/snippets/web3-0742d85b024bb6f5/inline0.js', './docs/snippets/web3-0742d85b024bb6f5/inline0.js' ], count);
 
 			var mist = gitcoal(w1);
 			var dome = gitcoal(w2);
