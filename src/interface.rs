@@ -1,10 +1,15 @@
 use crate::{decode_resources, init_panic_hook, Body};
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::str::FromStr;
 use std::sync::mpsc;
 use std::time::Duration;
 
-use web3::transports::eip_1193::{Eip1193, Provider};
+use web3::{
+    contract::{Contract, Options},
+    transports::eip_1193::{Eip1193, Provider},
+    types::{Address, U256},
+};
 
 use js_sys::{Array, Date, Uint8Array};
 use wasm_bindgen::{closure::Closure, prelude::*, JsCast, JsError, JsValue};
@@ -24,6 +29,8 @@ use web_sys::{
     SharedWorker,
     //
 };
+
+use alloy::{network::EthereumWallet, primitives::keccak256, signers::local::PrivateKeySigner};
 
 #[wasm_bindgen]
 pub async fn interweeb(_st: String) -> Result<(), JsError> {
@@ -122,16 +129,85 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
 
                     let transport = Eip1193::new(provider);
                     let web3 = web3::Web3::new(transport);
-                    let accounts = web3.eth().request_accounts().await.unwrap();
+                    let accounts = match web3.eth().request_accounts().await {
+                        Ok(aok) => aok,
+                        _ => return,
+                    };
 
-                    for account in accounts {
-                        let balance = web3.eth().balance(account, None).await.unwrap();
-
+                    for account in &accounts {
+                        let balance = web3.eth().balance(*account, None).await.unwrap();
                         web_sys::console::log_1(&JsValue::from(format!(
                             "Balance of {:?}: {}",
                             account, balance
                         )));
                     }
+
+                    let contract_address =
+                        match Address::from_str("cdfdC3752caaA826fE62531E0000C40546eC56A6") {
+                            Ok(aok) => aok,
+                            _ => return,
+                        };
+
+                    let contract = match Contract::from_json(
+                        web3.eth(),
+                        contract_address,
+                        include_bytes!("./postagestamp.json"),
+                    ) {
+                        Ok(aok) => aok,
+                        _ => return,
+                    };
+
+                    let stamp_signer_key = keccak256("Key To Be Persisted In Browser Localstore");
+                    let stamp_signer: PrivateKeySigner =
+                        match PrivateKeySigner::from_bytes(&stamp_signer_key) {
+                            Ok(aok) => aok,
+                            _ => return,
+                        };
+                    let _wallet = EthereumWallet::from(stamp_signer.clone());
+                    let wallet_address = stamp_signer.address();
+                    let wallet_address_bytes: [u8; 20] = *wallet_address.as_ref();
+
+                    web_sys::console::log_1(&JsValue::from(format!(
+                        "StampSigner len {:#?}",
+                        wallet_address_bytes.len()
+                    )));
+
+                    //    function createBatch(
+                    //        address _owner,
+                    //        uint256 _initialBalancePerChunk,
+                    //        uint8 _depth,
+                    //        uint8 _bucketDepth,
+                    //        bytes32 _nonce,
+                    //        bool _immutable
+                    //    ) external whenNotPaused returns (bytes32)
+                    let result_cc: U256 = contract
+                        .query("validChunkCount", (), None, Options::default(), None)
+                        .await
+                        .unwrap();
+
+                    web_sys::console::log_1(&JsValue::from(format!(
+                        "Valid chunk count {}",
+                        result_cc
+                    )));
+
+                    let tx = contract
+                        .call(
+                            "createBatch",
+                            (
+                                Address::from(wallet_address_bytes),
+                                U256::from(1000000000_u32),
+                                17_u8,
+                                16_u8,
+                                [0_u8; 32],
+                                false,
+                            ),
+                            accounts[0],
+                            Options::default(),
+                        )
+                        .await
+                        .unwrap();
+
+                    web_sys::console::log_1(&JsValue::from(format!("createBatch tx {}", tx)));
                 }
             });
         });
