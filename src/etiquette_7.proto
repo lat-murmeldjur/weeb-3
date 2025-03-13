@@ -1,0 +1,17 @@
+syntax = "proto3";
+
+package weeb_3.etiquette_7;
+
+message Delivery {
+  bytes Address = 1;
+  bytes Data = 2;
+  bytes Stamp = 3;
+}
+
+message Receipt {
+  bytes Address = 1;
+  bytes Signature = 2;
+  bytes Nonce = 3;
+  string Err = 4;
+  uint32 StorageRadius = 5;
+}

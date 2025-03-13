@@ -28,9 +28,11 @@ use crate::weeb_3::etiquette_2;
 use crate::weeb_3::etiquette_4;
 use crate::weeb_3::etiquette_5;
 use crate::weeb_3::etiquette_6;
+use crate::weeb_3::etiquette_7;
 
 use crate::HANDSHAKE_PROTOCOL;
 use crate::PSEUDOSETTLE_PROTOCOL;
+use crate::PUSHSYNC_PROTOCOL;
 use crate::RETRIEVAL_PROTOCOL;
 
 pub async fn ceive(
@@ -506,4 +508,119 @@ pub async fn retrieve_handler(
     }
 
     web_sys::console::log_1(&JsValue::from(format!("{} Retrieve complete!", peer)));
+}
+
+pub async fn pushsync_handler(
+    peer: PeerId,
+    chunk_address: Vec<u8>,
+    chunk_content: Vec<u8>,
+    chunk_stamp: Vec<u8>,
+    control: &mut stream::Control,
+    chan: &mpsc::Sender<Vec<u8>>,
+) {
+    let mut stream = match control.open_stream(peer, PUSHSYNC_PROTOCOL).await {
+        Ok(stream) => stream,
+        Err(error @ stream::OpenStreamError::UnsupportedProtocol(_)) => {
+            web_sys::console::log_1(&JsValue::from(format!("{} {}", peer, error)));
+            return;
+        }
+        Err(error) => {
+            web_sys::console::log_1(&JsValue::from(format!("{} {}", peer, error)));
+            return;
+        }
+    };
+
+    if let Err(e) = sync(
+        peer,
+        chunk_address,
+        chunk_content,
+        chunk_stamp,
+        &mut stream,
+        chan,
+    )
+    .await
+    {
+        web_sys::console::log_1(&JsValue::from("Pushsync protocol failed"));
+        web_sys::console::log_1(&JsValue::from(format!("{}", e)));
+        return;
+    }
+
+    web_sys::console::log_1(&JsValue::from(format!("{} Pushsync complete!", peer)));
+}
+
+pub async fn sync(
+    peer: PeerId,
+    chunk_address: Vec<u8>,
+    chunk_content: Vec<u8>,
+    chunk_stamp: Vec<u8>,
+    stream: &mut Stream,
+    chan: &mpsc::Sender<Vec<u8>>,
+) -> io::Result<()> {
+    web_sys::console::log_1(&JsValue::from(format!(
+        "Opened Pushsync Handle 2 for peer !",
+    )));
+
+    let empty = etiquette_0::Headers::default();
+    let mut buf_empty = Vec::new();
+
+    let empty_len = empty.encoded_len();
+    buf_empty.reserve(empty_len + prost::length_delimiter_len(empty_len));
+    empty.encode_length_delimited(&mut buf_empty).unwrap();
+
+    stream.write_all(&buf_empty).await?;
+    let _ = stream.flush().await;
+
+    let mut buf_nondiscard_0 = Vec::new();
+    let mut buf_discard_0: [u8; 255] = [0; 255];
+    loop {
+        let n = stream.read(&mut buf_discard_0).await?;
+        buf_nondiscard_0.extend_from_slice(&buf_discard_0[..n]);
+        if n < 255 {
+            break;
+        }
+    }
+
+    let mut step_1 = etiquette_7::Delivery::default();
+
+    step_1.address = chunk_address;
+    step_1.data = chunk_content;
+    step_1.stamp = chunk_stamp;
+
+    let mut bufw_1 = Vec::new();
+
+    let step_1_len = step_1.encoded_len();
+
+    bufw_1.reserve(step_1_len + prost::length_delimiter_len(step_1_len));
+    step_1.encode_length_delimited(&mut bufw_1).unwrap();
+    stream.write_all(&bufw_1).await?;
+
+    let mut buf_nondiscard_0 = Vec::new();
+    let mut buf_discard_0: [u8; 255] = [0; 255];
+    loop {
+        let n = stream.read(&mut buf_discard_0).await?;
+        buf_nondiscard_0.extend_from_slice(&buf_discard_0[..n]);
+        if n < 255 {
+            break;
+        }
+    }
+
+    let _ = stream.close().await;
+
+    let rec_0_u = etiquette_7::Receipt::decode_length_delimited(&mut Cursor::new(buf_nondiscard_0));
+
+    let rec_0 = match rec_0_u {
+        Ok(x) => x,
+        Err(_x) => {
+            return Ok(());
+        }
+    };
+
+    web_sys::console::log_1(&JsValue::from(format!(
+        "Got receipt {:#?} from peer {:#?}!",
+        rec_0.address, peer
+    )));
+
+    chan.send(rec_0.address).unwrap();
+
+    Ok(())
 }
