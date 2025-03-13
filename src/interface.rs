@@ -142,11 +142,26 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
                         )));
                     }
 
+                    let token_contract_address =
+                        match Address::from_str("543dDb01Ba47acB11de34891cD86B675F04840db") {
+                            Ok(aok) => aok,
+                            _ => return,
+                        };
+
                     let contract_address =
                         match Address::from_str("cdfdC3752caaA826fE62531E0000C40546eC56A6") {
                             Ok(aok) => aok,
                             _ => return,
                         };
+
+                    let token_contract = match Contract::from_json(
+                        web3.eth(),
+                        token_contract_address,
+                        include_bytes!("./sbzz.json"),
+                    ) {
+                        Ok(aok) => aok,
+                        _ => return,
+                    };
 
                     let contract = match Contract::from_json(
                         web3.eth(),
@@ -190,6 +205,59 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
                         result_cc
                     )));
 
+                    // expiredBatchesExist()
+
+                    let mut expire = true;
+
+                    while expire {
+                        let expire0 = contract
+                            .query("expiredBatchesExist", (), None, Options::default(), None)
+                            .await
+                            .unwrap();
+
+                        web_sys::console::log_1(&JsValue::from(format!(
+                            "expiredBatchesExist {}",
+                            expire0
+                        )));
+
+                        if expire0 {
+                            let tx0 = contract
+                                .call(
+                                    "expireLimited",
+                                    (U256::from(5),),
+                                    accounts[0],
+                                    Options::default(),
+                                )
+                                .await
+                                .unwrap();
+
+                            web_sys::console::log_1(&JsValue::from(format!(
+                                "expirelimited tx0 {}",
+                                hex::encode(tx0.as_bytes())
+                            )));
+                        } else {
+                            expire = false;
+                        }
+                    }
+
+                    let tx00 = token_contract
+                        .call_with_confirmations(
+                            "approve",
+                            (contract_address, U256::from(131072000000000_u64)),
+                            accounts[0],
+                            Options::default(),
+                            2,
+                        )
+                        .await
+                        .unwrap();
+
+                    web_sys::console::log_1(&JsValue::from(format!(
+                        "Approve tx {}",
+                        hex::encode(tx00.transaction_hash.as_bytes())
+                    )));
+
+                    // 131072000000000
+
                     let tx = contract
                         .call(
                             "createBatch",
@@ -208,6 +276,11 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
                         .unwrap();
 
                     web_sys::console::log_1(&JsValue::from(format!("createBatch tx {}", tx)));
+                    // 3fe6be6469d63f18bef2076d0e1945f619a6dad733baffd7ebe95e098ca9567b
+                    web_sys::console::log_1(&JsValue::from(format!(
+                        "createBatch tx 2 {}",
+                        hex::encode(tx.as_bytes())
+                    )));
                 }
             });
         });
