@@ -46,6 +46,9 @@ mod manifest;
 mod retrieval;
 use retrieval::*;
 
+mod upload;
+use upload::*;
+
 mod ens;
 use ens::*;
 

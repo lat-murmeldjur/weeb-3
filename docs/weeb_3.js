@@ -220,7 +220,7 @@ export function init_panic_hook() {
 }
 
 function __wbg_adapter_54(arg0, arg1) {
-    wasm._dyn_core__ops__function__FnMut_____Output___R_as_wasm_bindgen__closure__WasmClosure___describe__invoke__h2286f1c06d39ab69(arg0, arg1);
+    wasm._dyn_core__ops__function__FnMut_____Output___R_as_wasm_bindgen__closure__WasmClosure___describe__invoke__h928c9d0852cb0379(arg0, arg1);
 }
 
 function __wbg_adapter_57(arg0, arg1, arg2) {
@@ -232,7 +232,7 @@ function __wbg_adapter_64(arg0, arg1, arg2) {
 }
 
 function __wbg_adapter_67(arg0, arg1) {
-    wasm._dyn_core__ops__function__FnMut_____Output___R_as_wasm_bindgen__closure__WasmClosure___describe__invoke__ha9ec58db603707c8(arg0, arg1);
+    wasm._dyn_core__ops__function__FnMut_____Output___R_as_wasm_bindgen__closure__WasmClosure___describe__invoke__h2af6e569278dcc05(arg0, arg1);
 }
 
 function __wbg_adapter_313(arg0, arg1, arg2, arg3) {
