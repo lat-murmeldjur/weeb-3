@@ -75,6 +75,8 @@ web-sys = { version = "0.3.72", features = [
   'Document',
   'Element',
   'EventListener',
+  'File',
+  'FileList',
   'MessagePort',
   'Headers',
   'HtmlButtonElement',

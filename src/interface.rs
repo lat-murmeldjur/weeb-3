@@ -289,8 +289,43 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
         .get_element_by_id("uploadGetBatch")
         .expect("#uploadGetBatch should exist")
         .dyn_ref::<HtmlButtonElement>()
-        .expect("#uploadGetBatch should be a HtmlInputElement")
+        .expect("#uploadGetBatch should be a HtmlButtonElement")
         .set_onclick(Some(callback2.as_ref().unchecked_ref()));
+
+    let callback3 =
+        wasm_bindgen::closure::Closure::<dyn FnMut(web_sys::MessageEvent)>::new(move |_msg| {
+            let document = web_sys::window().unwrap().document().unwrap();
+
+            let file_input = document
+                .get_element_by_id("uploadFileSelect")
+                .expect("#uploadFileSelect should exist");
+
+            let file_input = file_input
+                .dyn_ref::<HtmlInputElement>()
+                .expect("#uploadFileSelect should be a HtmlInputElement");
+
+            let file0 = match file_input.files() {
+                Some(aok) => aok,
+                _ => return,
+            };
+
+            let file = match file0.item(0) {
+                Some(aok) => aok,
+                _ => return,
+            };
+
+            web_sys::console::log_1(&JsValue::from(format!(
+                "selected file length {:#?}",
+                file.size()
+            )));
+        });
+
+    document
+        .get_element_by_id("uploadFile")
+        .expect("#uploadFile should exist")
+        .dyn_ref::<HtmlButtonElement>()
+        .expect("#uploadFile should be a HtmlButtonElement")
+        .set_onclick(Some(callback3.as_ref().unchecked_ref()));
 
     body.append_p(&format!("Created a new worker from within Wasm"))?;
 

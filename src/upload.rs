@@ -4,8 +4,9 @@ use alloy::signers::Signer;
 
 use js_sys::Date;
 
+pub async fn f0() {}
+
 pub async fn stamp_chunk(
-    //
     // stamp_signer: Signer,
     batch_id: Vec<u8>,
     // batch_buckets: HashMap<u32, u32>
@@ -45,16 +46,4 @@ pub async fn stamp_chunk(
     let stamp = [batch_id, index_bytes, timestamp_bytes.to_vec(), signature].concat();
 
     stamp
-    //    if n := copy(buf, s.batchID); n != 32 {
-    //        return nil, ErrInvalidBatchID
-    //    }
-    //    if n := copy(buf[32:40], s.index); n != 8 {
-    //        return nil, ErrInvalidBatchIndex
-    //    }
-    //    if n := copy(buf[40:48], s.timestamp); n != 8 {
-    //        return nil, ErrInvalidBatchTimestamp
-    //    }
-    //    if n := copy(buf[48:], s.sig); n != 65 {
-    //        return nil, ErrInvalidBatchSignature
-    //    }
 }
