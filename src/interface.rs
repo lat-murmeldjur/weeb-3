@@ -52,7 +52,7 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
 
     let (r_out, r_in) = mpsc::channel::<Vec<u8>>();
 
-    let worker_handle = Rc::new(RefCell::new(
+    let worker_handle0 = Rc::new(RefCell::new(
         SharedWorker::new_with_worker_options("./worker.js", &{
             let opts = web_sys::WorkerOptions::new();
             opts.set_type(web_sys::WorkerType::Module);
@@ -60,6 +60,9 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
         })
         .unwrap(),
     ));
+
+    let worker_handle = worker_handle0.clone();
+    let worker_handle3 = worker_handle0.clone();
 
     {
         let worker_handle_2 = &*worker_handle.borrow();
@@ -71,6 +74,10 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
 
     #[allow(unused_assignments)]
     let mut persistent_callback_handle = get_on_msg_callback(r_out.clone());
+    let mut persistent_callback_handle3 = get_on_msg_callback(r_out.clone());
+
+    let r_out0 = r_out.clone();
+    let r_out3 = r_out.clone();
 
     let callback =
         wasm_bindgen::closure::Closure::<dyn FnMut(web_sys::MessageEvent)>::new(move |_msg| {
@@ -91,7 +98,7 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
                     // mutability pattern.
                     let worker_handle_2 = worker_handle.borrow();
                     let _ = worker_handle_2.port().post_message(&text.into());
-                    persistent_callback_handle = get_on_msg_callback(r_out.clone());
+                    persistent_callback_handle = get_on_msg_callback(r_out0.clone());
 
                     // Since the worker returns the message asynchronously, we
                     // attach a callback to be triggered when the worker returns.
@@ -294,6 +301,8 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
 
     let callback3 =
         wasm_bindgen::closure::Closure::<dyn FnMut(web_sys::MessageEvent)>::new(move |_msg| {
+            console::log_1(&"oninput file callback".into());
+
             let document = web_sys::window().unwrap().document().unwrap();
 
             let file_input = document
@@ -318,6 +327,18 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
                 "selected file length {:#?}",
                 file.size()
             )));
+
+            let worker_handle_2 = worker_handle3.borrow();
+            let _ = worker_handle_2.port().post_message(&file.into());
+            persistent_callback_handle3 = get_on_msg_callback(r_out3.clone());
+
+            // Since the worker returns the message asynchronously, we
+            // attach a callback to be triggered when the worker returns.
+            worker_handle_2
+                .port()
+                .set_onmessage(Some(persistent_callback_handle3.as_ref().unchecked_ref()));
+
+            console::log_1(&"oninput file callback happened".into());
         });
 
     document

@@ -29,6 +29,7 @@ use libp2p_stream as stream;
 
 use js_sys::Date;
 use wasm_bindgen::{prelude::*, JsValue};
+use web_sys::File;
 
 mod accounting;
 use accounting::*;
@@ -132,6 +133,12 @@ pub struct Wings {
 
 #[wasm_bindgen]
 impl Sekirei {
+    pub async fn post_upload(&self, file: File) -> Vec<u8> {
+        web_sys::console::log_1(&JsValue::from(format!("File size {}", file.size())));
+
+        return vec![];
+    }
+
     pub async fn acquire(&self, address: String) -> Vec<u8> {
         let (chan_out, chan_in) = mpsc::channel::<Vec<u8>>();
         let valaddr_0 = hex::decode(&address);
