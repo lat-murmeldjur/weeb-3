@@ -27,7 +27,7 @@ use libp2p::{
 };
 use libp2p_stream as stream;
 
-use js_sys::Date;
+use js_sys::{Date, Uint8Array};
 use wasm_bindgen::{prelude::*, JsValue};
 use web_sys::File;
 
@@ -48,7 +48,7 @@ mod retrieval;
 use retrieval::*;
 
 mod upload;
-// use upload::*;
+use upload::*;
 
 mod ens;
 use ens::*;
@@ -121,6 +121,10 @@ pub struct Sekirei {
         mpsc::Sender<(Vec<u8>, mpsc::Sender<Vec<u8>>)>,
         mpsc::Receiver<(Vec<u8>, mpsc::Sender<Vec<u8>>)>,
     ),
+    upload_port: (
+        mpsc::Sender<(String, String, Vec<u8>, bool, mpsc::Sender<Vec<u8>>)>,
+        mpsc::Receiver<(String, String, Vec<u8>, bool, mpsc::Sender<Vec<u8>>)>,
+    ),
 }
 
 #[wasm_bindgen]
@@ -133,10 +137,65 @@ pub struct Wings {
 
 #[wasm_bindgen]
 impl Sekirei {
-    pub async fn post_upload(&self, file: File) -> Vec<u8> {
+    pub async fn post_upload(&self, file: File, encryption: bool) -> Vec<u8> {
         web_sys::console::log_1(&JsValue::from(format!("File size {}", file.size())));
 
-        return vec![];
+        let (chan_out, chan_in) = mpsc::channel::<Vec<u8>>();
+
+        let f_name = file.name();
+        let f_type = file.type_();
+
+        let content_buf = wasm_bindgen_futures::JsFuture::from(file.array_buffer())
+            .await
+            .unwrap();
+
+        let content_u8a = Uint8Array::new(&content_buf);
+
+        let content: Vec<u8> = content_u8a.to_vec();
+
+        let _ = self
+            .upload_port
+            .0
+            .send((f_name, f_type, content, false, chan_out));
+
+        let k0 = async {
+            let mut timelast: f64;
+            #[allow(irrefutable_let_patterns)]
+            while let that = chan_in.try_recv() {
+                let timenow = Date::now();
+                timelast = timenow;
+                if !that.is_err() {
+                    return that.unwrap();
+                }
+
+                let timenow = Date::now();
+                let seg = timenow - timelast;
+                if seg < EVENT_LOOP_INTERRUPTOR {
+                    async_std::task::sleep(Duration::from_millis(
+                        (EVENT_LOOP_INTERRUPTOR - seg) as u64,
+                    ))
+                    .await;
+                };
+            }
+
+            return vec![];
+        };
+
+        let result = k0.await;
+
+        return encode_resources(
+            vec![(
+                format!(
+                    "upload result: returned address displayed here: {}",
+                    hex::encode(result)
+                )
+                .as_bytes()
+                .to_vec(),
+                "text/plain".to_string(),
+                "... result ...".to_string(),
+            )],
+            "... result ...".to_string(),
+        );
     }
 
     pub async fn acquire(&self, address: String) -> Vec<u8> {
@@ -223,6 +282,8 @@ impl Sekirei {
         let ongoing_refreshments: Mutex<HashSet<PeerId>> = Mutex::new(HashSet::new());
 
         let (m_out, m_in) = mpsc::channel::<(Vec<u8>, mpsc::Sender<Vec<u8>>)>();
+        let (u_out, u_in) =
+            mpsc::channel::<(String, String, Vec<u8>, bool, mpsc::Sender<Vec<u8>>)>();
 
         return Sekirei {
             secret_key: Mutex::new(secret_key),
@@ -234,6 +295,7 @@ impl Sekirei {
                 ongoing_refreshments: ongoing_refreshments,
             }),
             message_port: (m_out, m_in),
+            upload_port: (u_out, u_in),
         };
     }
 
@@ -263,6 +325,9 @@ impl Sekirei {
             mpsc::channel::<(PeerId, u64)>();
 
         let (data_retrieve_chan_outgoing, data_retrieve_chan_incoming) =
+            mpsc::channel::<(Vec<u8>, u8, mpsc::Sender<Vec<u8>>)>();
+
+        let (data_upload_chan_outgoing, data_upload_chan_incoming) =
             mpsc::channel::<(Vec<u8>, u8, mpsc::Sender<Vec<u8>>)>();
 
         let mut ctrl;
@@ -610,6 +675,39 @@ impl Sekirei {
             }
         };
 
+        let push_handle = async {
+            let mut timelast = Date::now();
+            loop {
+                #[allow(irrefutable_let_patterns)]
+                while let incoming_request = self.upload_port.1.try_recv() {
+                    if !incoming_request.is_err() {
+                        web_sys::console::log_1(&JsValue::from(format!("push triggered")));
+                        let (name, mime, content, enc, chan) = incoming_request.unwrap();
+                        let push_reference =
+                            upload_resource(name, mime, enc, &content, &data_upload_chan_outgoing)
+                                .await;
+                        web_sys::console::log_1(&JsValue::from(format!(
+                            "Writing response to interface push request"
+                        )));
+
+                        chan.send(push_reference).unwrap();
+                    } else {
+                        break;
+                    }
+                }
+
+                let timenow = Date::now();
+                let seg = timenow - timelast;
+                if seg < PROTO_LOOP_INTERRUPTOR {
+                    async_std::task::sleep(Duration::from_millis(
+                        (PROTO_LOOP_INTERRUPTOR - seg) as u64,
+                    ))
+                    .await;
+                }
+                timelast = Date::now();
+            }
+        };
+
         let retrieve_data_handle = async {
             let mut timelast = Date::now();
             loop {
@@ -677,11 +775,78 @@ impl Sekirei {
             }
         };
 
+        let push_data_handle = async {
+            let mut timelast = Date::now();
+            loop {
+                let mut request_joiner = Vec::new();
+
+                #[allow(irrefutable_let_patterns)]
+                while let incoming_request = data_upload_chan_incoming.try_recv() {
+                    if !incoming_request.is_err() {
+                        let handle = async {
+                            let mut ctrl9 = ctrl6.clone();
+                            web_sys::console::log_1(&JsValue::from(format!("push triggered")));
+                            let (n, mode, chan) = incoming_request.unwrap();
+                            if mode == 1 {
+                                let data_reference = push_data(
+                                    &n,
+                                    true,
+                                    &mut ctrl9,
+                                    &wings.overlay_peers,
+                                    &wings.accounting_peers,
+                                    &refreshment_instructions_chan_outgoing,
+                                )
+                                .await;
+                                web_sys::console::log_1(&JsValue::from(format!(
+                                    "Writing response to encrypted push data request"
+                                )));
+
+                                chan.send(data_reference).unwrap();
+                            }
+                            if mode == 0 {
+                                let chunk_reference = push_data(
+                                    &n,
+                                    false,
+                                    &mut ctrl9,
+                                    &wings.overlay_peers,
+                                    &wings.accounting_peers,
+                                    &refreshment_instructions_chan_outgoing,
+                                )
+                                .await;
+                                web_sys::console::log_1(&JsValue::from(format!(
+                                    "Writing response to unencrypted push data request"
+                                )));
+
+                                chan.send(chunk_reference).unwrap();
+                            }
+                        };
+                        request_joiner.push(handle);
+                    } else {
+                        break;
+                    }
+                }
+
+                join_all(request_joiner).await;
+
+                let timenow = Date::now();
+                let seg = timenow - timelast;
+                if seg < PROTO_LOOP_INTERRUPTOR {
+                    async_std::task::sleep(Duration::from_millis(
+                        (PROTO_LOOP_INTERRUPTOR - seg) as u64,
+                    ))
+                    .await;
+                }
+                timelast = Date::now();
+            }
+        };
+
         join!(
             conn_handle,
             event_handle,
             retrieve_handle,
+            push_handle,
             retrieve_data_handle,
+            push_data_handle,
             swarm_event_handle,
             gossip_inbound_handle,
             pricing_inbound_handle,

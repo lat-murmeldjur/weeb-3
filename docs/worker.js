@@ -17,8 +17,8 @@ self.onconnect = async function (event) {
 
   port.onmessage = async function (e) {
     console.log(e.data)
-    if (e.data instanceof File) {
-      var workerResultPromise0 = sekirei.post_upload(e.data);
+    if (e.data.type0 == "file") {
+      var workerResultPromise0 = sekirei.post_upload(e.data.file0, e.data.encryption0);
       port.postMessage(await workerResultPromise0);
     } else {
       var workerResultPromise = sekirei.acquire(e.data);

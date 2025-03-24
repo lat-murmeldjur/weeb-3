@@ -328,8 +328,25 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
                 file.size()
             )));
 
+            // let content_u8a = Uint8Array::new(&content_buf);
+
+            let msgobj = js_sys::Object::new();
+
+            let _ = js_sys::Reflect::set(
+                &msgobj,
+                &JsValue::from_str("type0"),
+                &JsValue::from_str("file"),
+            );
+            let _ = js_sys::Reflect::set(&msgobj, &JsValue::from_str("file0"), &file);
+
+            let _ = js_sys::Reflect::set(
+                &msgobj,
+                &JsValue::from_str("encryption0"),
+                &JsValue::from_bool(false),
+            );
+
             let worker_handle_2 = worker_handle3.borrow();
-            let _ = worker_handle_2.port().post_message(&file.into());
+            let _ = worker_handle_2.port().post_message(&msgobj);
             persistent_callback_handle3 = get_on_msg_callback(r_out3.clone());
 
             // Since the worker returns the message asynchronously, we
@@ -340,7 +357,6 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
 
             console::log_1(&"oninput file callback happened".into());
         });
-
     document
         .get_element_by_id("uploadFile")
         .expect("#uploadFile should exist")
