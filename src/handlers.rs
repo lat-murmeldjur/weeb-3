@@ -516,7 +516,7 @@ pub async fn pushsync_handler(
     chunk_content: Vec<u8>,
     chunk_stamp: Vec<u8>,
     control: &mut stream::Control,
-    chan: &mpsc::Sender<Vec<u8>>,
+    chan: &mpsc::Sender<(Vec<u8>, Vec<u8>, Vec<u8>)>,
 ) {
     let mut stream = match control.open_stream(peer, PUSHSYNC_PROTOCOL).await {
         Ok(stream) => stream,
@@ -554,7 +554,7 @@ pub async fn sync(
     chunk_content: Vec<u8>,
     chunk_stamp: Vec<u8>,
     stream: &mut Stream,
-    chan: &mpsc::Sender<Vec<u8>>,
+    chan: &mpsc::Sender<(Vec<u8>, Vec<u8>, Vec<u8>)>,
 ) -> io::Result<()> {
     web_sys::console::log_1(&JsValue::from(format!(
         "Opened Pushsync Handle 2 for peer !",
@@ -620,7 +620,8 @@ pub async fn sync(
         rec_0.address, peer
     )));
 
-    chan.send(rec_0.address).unwrap();
+    chan.send((rec_0.address, rec_0.signature, rec_0.nonce))
+        .unwrap();
 
     Ok(())
 }

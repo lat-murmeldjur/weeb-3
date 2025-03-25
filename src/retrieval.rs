@@ -42,7 +42,7 @@ use crate::{
     // // // // // // // //
     PeerId,
     // // // // // // // //
-    RETRIEVE_ROUND_TIME,
+    PROTOCOL_ROUND_TIME,
     // // // // // // // //
 };
 
@@ -236,9 +236,9 @@ pub async fn retrieve_chunk(
                     let round_now = Date::now();
 
                     let seg = round_now - round_commence;
-                    if seg < RETRIEVE_ROUND_TIME {
+                    if seg < PROTOCOL_ROUND_TIME {
                         async_std::task::sleep(Duration::from_millis(
-                            (RETRIEVE_ROUND_TIME - seg) as u64,
+                            (PROTOCOL_ROUND_TIME - seg) as u64,
                         ))
                         .await;
                     }
@@ -449,8 +449,8 @@ pub async fn get_data(
 
             let timenow = Date::now();
             let seg = timenow - timelast;
-            if seg < RETRIEVE_ROUND_TIME {
-                async_std::task::sleep(Duration::from_millis((RETRIEVE_ROUND_TIME - seg) as u64))
+            if seg < PROTOCOL_ROUND_TIME {
+                async_std::task::sleep(Duration::from_millis((PROTOCOL_ROUND_TIME - seg) as u64))
                     .await;
             };
         }
@@ -483,8 +483,8 @@ pub async fn get_chunk(
 
             let timenow = Date::now();
             let seg = timenow - timelast;
-            if seg < RETRIEVE_ROUND_TIME {
-                async_std::task::sleep(Duration::from_millis((RETRIEVE_ROUND_TIME - seg) as u64))
+            if seg < PROTOCOL_ROUND_TIME {
+                async_std::task::sleep(Duration::from_millis((PROTOCOL_ROUND_TIME - seg) as u64))
                     .await;
             };
         }

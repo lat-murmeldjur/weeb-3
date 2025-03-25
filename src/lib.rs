@@ -103,7 +103,7 @@ const PUSHSYNC_PROTOCOL: StreamProtocol = StreamProtocol::new("/swarm/pushsync/1
 // const PULL_PROTOCOL: StreamProtocol = StreamProtocol::new("/swarm/pullsync/1.4.0/pullsync");
 // const PUSH_PROTOCOL: StreamProtocol = StreamProtocol::new("/swarm/pushsync/1.3.0/pushsync");
 
-const RETRIEVE_ROUND_TIME: f64 = 600.0;
+const PROTOCOL_ROUND_TIME: f64 = 600.0;
 const EVENT_LOOP_INTERRUPTOR: f64 = 600.0;
 const PROTO_LOOP_INTERRUPTOR: f64 = 600.0;
 
@@ -379,7 +379,7 @@ impl Sekirei {
 
         let conn_handle = async {
             let addr2 =
-            "/ip4/192.168.0.101/tcp/18634/ws/p2p/QmaniMaU5kNYzk7pQPWnBmB7Qp1o28FUW9cG4xVC4tGJbK"
+            "/ip4/192.168.100.66/tcp/18634/ws/p2p/QmaniMaU5kNYzk7pQPWnBmB7Qp1o28FUW9cG4xVC4tGJbK"
                 .parse::<Multiaddr>()
                 .unwrap();
 

@@ -283,7 +283,14 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
                         .unwrap();
 
                     web_sys::console::log_1(&JsValue::from(format!("createBatch tx {}", tx)));
-                    // 3fe6be6469d63f18bef2076d0e1945f619a6dad733baffd7ebe95e098ca9567b
+
+                    // tx 0x538ea062d293a809915336eff3bb5010dc742c0ab6ac12b510992aafb4a68ffb
+                    // id 0xb57e46b067d21cede7432900215423e82c97823b733219b7f42e73017562a96d
+                    // owner : 0x4d10dDf65bCCB88C458607b4fF64AA808c31C53c
+                    // depth : 17
+                    // bucketDepth : 16
+                    // immutableFlag : False
+
                     web_sys::console::log_1(&JsValue::from(format!(
                         "createBatch tx 2 {}",
                         hex::encode(tx.as_bytes())
