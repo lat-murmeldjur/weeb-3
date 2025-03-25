@@ -205,12 +205,29 @@ pub async fn push_chunk(
     let mut data0 = data.to_vec().clone();
 
     if encryption {
-        let encrey = keccak256(rand::random::<f64>().to_string());
+        let mut encreysource = vec![];
 
+        for i in 0..256 {
+            encreysource.push(rand::random::<u8>());
+        }
+
+        let encrey = keccak256(encreysource);
         data0 = encrypt(span as u64, data, encrey.to_vec());
     }
 
-    let chunk_address = content_address(data0);
+    let caddr = content_address(data0);
+
+    //
+
+    //    // stamp_signer: Signer,
+    //    batch_id: Vec<u8>,
+    //    // batch_buckets: HashMap<u32, u32>
+    //    chunk_address: Vec<u8>,
+    //    //
+
+    //
+
+    // stamp_chunk();
 
     return vec![];
 }
@@ -220,8 +237,15 @@ pub fn encrypt(span: u64, cd: &Vec<u8>, encrey: Vec<u8>) -> Vec<u8> {
         return vec![];
     }
 
+    let padding_length = 4096 - cd.len();
+    let mut padding = vec![];
+
+    for i in 0..padding_length {
+        padding.push(rand::random::<u8>());
+    }
+
     let spancred = span.to_le_bytes().to_vec();
-    let concred = (&cd[..]).to_vec();
+    let concred = ([&cd[..], &padding].concat()).to_vec();
     let creylen = encrey.len();
 
     let mut spanbytes: Vec<u8> = vec![];
@@ -261,26 +285,5 @@ pub fn encrypt(span: u64, cd: &Vec<u8>, encrey: Vec<u8>) -> Vec<u8> {
         }
     }
 
-    let mut span_decrypted = u64::from_le_bytes(spanbytes.clone().try_into().unwrap());
-
-    if span_decrypted > 4096 {
-        let mut done0 = false;
-        let mut carry_span = 4096_u64;
-        while !done0 {
-            let k = span_decrypted / carry_span;
-            let mut l0 = span_decrypted % carry_span;
-            if l0 > 0 {
-                l0 = 1;
-            }
-
-            if k + l0 <= 64 {
-                done0 = true;
-                span_decrypted = (k + l0) * 64;
-            } else {
-                carry_span *= 64;
-            }
-        }
-    };
-
-    return [spanbytes, content[..span_decrypted as usize].to_vec()].concat();
+    return [spanbytes, content[..].to_vec()].concat();
 }
