@@ -203,12 +203,12 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
                     //        bool _immutable
                     //    ) external whenNotPaused returns (bytes32)
                     let result_cc: U256 = contract
-                        .query("validChunkCount", (), None, Options::default(), None)
+                        .query("currentTotalOutPayment", (), None, Options::default(), None)
                         .await
                         .unwrap();
 
                     web_sys::console::log_1(&JsValue::from(format!(
-                        "Valid chunk count {}",
+                        "currentTotalOutPayment (minimum valid balance) {}",
                         result_cc
                     )));
 
@@ -250,7 +250,7 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
                     let tx00 = token_contract
                         .call_with_confirmations(
                             "approve",
-                            (contract_address, U256::from(131072000000000_u64)),
+                            (contract_address, U256::from(13107200000000000_u64)),
                             accounts[0],
                             Options::default(),
                             2,
@@ -270,10 +270,10 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
                             "createBatch",
                             (
                                 Address::from(wallet_address_bytes),
-                                U256::from(1000000000_u32),
+                                U256::from(100000000000_u64),
                                 17_u8,
                                 16_u8,
-                                [0_u8; 32],
+                                [1_u8; 32],
                                 false,
                             ),
                             accounts[0],
@@ -354,6 +354,7 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
 
             let worker_handle_2 = worker_handle3.borrow();
             let _ = worker_handle_2.port().post_message(&msgobj);
+
             persistent_callback_handle3 = get_on_msg_callback(r_out3.clone());
 
             // Since the worker returns the message asynchronously, we

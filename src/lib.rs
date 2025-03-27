@@ -3,6 +3,8 @@
 use console_error_panic_hook;
 use rand::rngs::OsRng;
 
+use async_std::sync::Arc;
+
 use std::collections::{HashMap, HashSet};
 use std::num::NonZero;
 use std::str::FromStr;
@@ -156,7 +158,7 @@ impl Sekirei {
         let _ = self
             .upload_port
             .0
-            .send((f_name, f_type, content, false, chan_out));
+            .send((f_name, f_type, content, encryption, chan_out));
 
         let k0 = async {
             let mut timelast: f64;
@@ -186,8 +188,9 @@ impl Sekirei {
         return encode_resources(
             vec![(
                 format!(
-                    "upload result: returned address displayed here: {}",
-                    hex::encode(result)
+                    "upload result: returned address displayed here: {} {}",
+                    hex::encode(&result),
+                    hex::encode([0_u8; 4])
                 )
                 .as_bytes()
                 .to_vec(),
@@ -379,7 +382,7 @@ impl Sekirei {
 
         let conn_handle = async {
             let addr2 =
-            "/ip4/192.168.100.66/tcp/18634/ws/p2p/QmaniMaU5kNYzk7pQPWnBmB7Qp1o28FUW9cG4xVC4tGJbK"
+            "/ip4/192.168.0.107/tcp/18634/ws/p2p/QmaniMaU5kNYzk7pQPWnBmB7Qp1o28FUW9cG4xVC4tGJbK"
                 .parse::<Multiaddr>()
                 .unwrap();
 
@@ -787,10 +790,20 @@ impl Sekirei {
                             let mut ctrl9 = ctrl6.clone();
                             web_sys::console::log_1(&JsValue::from(format!("push triggered")));
                             let (n, mode, chan) = incoming_request.unwrap();
+
                             if mode == 1 {
+                                let batch_id =
+        hex::decode("c30dd1d557008751a4c49d1d16210bac9331eebce2adf48d2f057887306e6ec0").unwrap();
+                                let batch_buckets: Arc<Mutex<HashMap<u32, u32>>> =
+                                    Arc::new(Mutex::new(HashMap::new()));
+                                let batch_bucket_limit = 1_u32;
+
                                 let data_reference = push_data(
                                     &n,
                                     true,
+                                    batch_id,
+                                    batch_buckets,
+                                    batch_bucket_limit,
                                     &mut ctrl9,
                                     &wings.overlay_peers,
                                     &wings.accounting_peers,
@@ -804,9 +817,18 @@ impl Sekirei {
                                 chan.send(data_reference).unwrap();
                             }
                             if mode == 0 {
+                                let batch_id =
+        hex::decode("c30dd1d557008751a4c49d1d16210bac9331eebce2adf48d2f057887306e6ec0").unwrap();
+                                let batch_buckets: Arc<Mutex<HashMap<u32, u32>>> =
+                                    Arc::new(Mutex::new(HashMap::new()));
+                                let batch_bucket_limit = 1_u32;
+
                                 let chunk_reference = push_data(
                                     &n,
                                     false,
+                                    batch_id,
+                                    batch_buckets,
+                                    batch_bucket_limit,
                                     &mut ctrl9,
                                     &wings.overlay_peers,
                                     &wings.accounting_peers,
