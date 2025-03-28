@@ -58,6 +58,8 @@ pub async fn retrieve_resource(
 ) -> Vec<u8> {
     let cd = get_data(chunk_address.to_vec(), data_retrieve_chan).await;
 
+    web_sys::console::log_1(&JsValue::from(format!("Initial length {:#?}", cd.len())));
+
     let (data_vector, index) = interpret_manifest("".to_string(), &cd, data_retrieve_chan).await;
     let mut data_vector_e: Vec<(Vec<u8>, String, String)> = vec![];
 
@@ -68,6 +70,8 @@ pub async fn retrieve_resource(
     }
 
     if data_vector_e.len() == 0 {
+        web_sys::console::log_1(&JsValue::from(format!("Unable to retrieve resource 0")));
+
         return encode_resources(
             vec![(vec![], "not found".to_string(), "not found".to_string())],
             index,
@@ -224,6 +228,10 @@ pub async fn retrieve_chunk(
                 skiplist.insert(closest_peer_id);
             } else {
                 if overdraftlist.is_empty() {
+                    web_sys::console::log_1(&JsValue::from(format!(
+                        "unable to retrieve chunk {} - odl empty",
+                        hex::encode(chunk_address)
+                    )));
                     return vec![];
                 } else {
                     for k in overdraftlist.iter() {
@@ -292,6 +300,10 @@ pub async fn retrieve_chunk(
                     let accounting_peer = accounting_peers.get(&closest_peer_id).unwrap();
                     cancel_reserve(accounting_peer, req_price)
                 }
+                web_sys::console::log_1(&JsValue::from(format!(
+                    "unable to retrieve chunk {} - chunk empty",
+                    hex::encode(chunk_address)
+                )));
                 vec![]
             }
         };
@@ -316,6 +328,11 @@ pub async fn retrieve_chunk(
                             let accounting_peer = accounting_peers.get(&closest_peer_id).unwrap();
                             cancel_reserve(accounting_peer, req_price)
                         }
+                        web_sys::console::log_1(&JsValue::from(format!(
+                            "unable to retrieve chunk {} - chunk empty 2",
+                            hex::encode(chunk_address)
+                        )));
+
                         cd = vec![];
                     } else {
                         let accounting_peers = accounting.lock().unwrap();
@@ -326,6 +343,11 @@ pub async fn retrieve_chunk(
                         break;
                     }
                 } else {
+                    web_sys::console::log_1(&JsValue::from(format!(
+                        "cac chunk span length {}",
+                        u64::from_be_bytes(cd[0..8].try_into().unwrap())
+                    )));
+
                     let accounting_peers = accounting.lock().unwrap();
                     if accounting_peers.contains_key(&closest_peer_id) {
                         let accounting_peer = accounting_peers.get(&closest_peer_id).unwrap();
@@ -339,11 +361,16 @@ pub async fn retrieve_chunk(
     }
 
     if encred {
+        web_sys::console::log_1(&JsValue::from(format!("encryption detected")));
         if soc {
             let cd00 = decrypt(&(&cd[97..]).to_vec(), encrey);
             if cd00.len() >= 8 {
                 return cd00;
             } else {
+                web_sys::console::log_1(&JsValue::from(format!(
+                    "unable to retrieve chunk {} - encrypted chunk empty",
+                    hex::encode(chunk_address)
+                )));
                 return vec![];
             }
         }
@@ -355,7 +382,12 @@ pub async fn retrieve_chunk(
     if soc && cd.len() >= 97 + 8 {
         return (&cd[97..]).to_vec();
     }
-
+    if cd.len() == 0 {
+        web_sys::console::log_1(&JsValue::from(format!(
+            "unable to retrieve chunk {} - chunk empty 3",
+            hex::encode(chunk_address)
+        )));
+    }
     return cd;
 }
 

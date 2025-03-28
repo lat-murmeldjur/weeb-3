@@ -382,7 +382,7 @@ impl Sekirei {
 
         let conn_handle = async {
             let addr2 =
-            "/ip4/192.168.0.107/tcp/18634/ws/p2p/QmaniMaU5kNYzk7pQPWnBmB7Qp1o28FUW9cG4xVC4tGJbK"
+            "/ip4/192.168.0.104/tcp/18634/ws/p2p/QmaniMaU5kNYzk7pQPWnBmB7Qp1o28FUW9cG4xVC4tGJbK"
                 .parse::<Multiaddr>()
                 .unwrap();
 

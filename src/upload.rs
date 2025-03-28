@@ -317,7 +317,7 @@ pub async fn push_data(
         )));
 
         let k = push_chunk(
-            data.len(),
+            span_length,
             &data_capstone,
             encryption,
             batch_id,
@@ -363,7 +363,10 @@ pub async fn push_chunk(
     }
 
     //
-    let mut data0 = data.to_vec().clone();
+    let data00 = data.to_vec();
+
+    #[allow(unused_assignments)]
+    let mut data0: Vec<u8> = vec![];
 
     if encryption {
         let mut encreysource = vec![];
@@ -374,6 +377,10 @@ pub async fn push_chunk(
 
         let encrey = keccak256(encreysource);
         data0 = encrypt(span as u64, data, encrey.to_vec());
+    } else {
+        data0 = [(span as u64).to_le_bytes().to_vec(), data00]
+            .concat()
+            .to_vec();
     }
 
     let caddr = content_address(data0.clone());

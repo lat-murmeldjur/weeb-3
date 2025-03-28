@@ -91,7 +91,7 @@ pub async fn interpret_manifest(
     {
         return (
             vec![Fork {
-                data: cd.to_vec(),
+                data: cd0.to_vec(),
                 mime: "application/octet-stream".to_string(),
                 // filename: "unknown01".to_string(),
                 path: "unknown01".to_string(),
