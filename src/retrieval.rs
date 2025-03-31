@@ -58,8 +58,6 @@ pub async fn retrieve_resource(
 ) -> Vec<u8> {
     let cd = get_data(chunk_address.to_vec(), data_retrieve_chan).await;
 
-    web_sys::console::log_1(&JsValue::from(format!("Initial length {:#?}", cd.len())));
-
     let (data_vector, index) = interpret_manifest("".to_string(), &cd, data_retrieve_chan).await;
     let mut data_vector_e: Vec<(Vec<u8>, String, String)> = vec![];
 
@@ -70,7 +68,9 @@ pub async fn retrieve_resource(
     }
 
     if data_vector_e.len() == 0 {
-        web_sys::console::log_1(&JsValue::from(format!("Unable to retrieve resource 0")));
+        web_sys::console::log_1(&JsValue::from(format!(
+            "Unable to retrieve resource case 0"
+        )));
 
         return encode_resources(
             vec![(vec![], "not found".to_string(), "not found".to_string())],
@@ -229,7 +229,7 @@ pub async fn retrieve_chunk(
             } else {
                 if overdraftlist.is_empty() {
                     web_sys::console::log_1(&JsValue::from(format!(
-                        "unable to retrieve chunk {} - odl empty",
+                        "unable to retrieve chunk {} - no more peers to try",
                         hex::encode(chunk_address)
                     )));
                     return vec![];
@@ -301,7 +301,7 @@ pub async fn retrieve_chunk(
                     cancel_reserve(accounting_peer, req_price)
                 }
                 web_sys::console::log_1(&JsValue::from(format!(
-                    "unable to retrieve chunk {} - chunk empty",
+                    "unable to retrieve chunk {} error",
                     hex::encode(chunk_address)
                 )));
                 vec![]
@@ -329,7 +329,7 @@ pub async fn retrieve_chunk(
                             cancel_reserve(accounting_peer, req_price)
                         }
                         web_sys::console::log_1(&JsValue::from(format!(
-                            "unable to retrieve chunk {} - chunk empty 2",
+                            "unable to retrieve chunk {} - content validity error",
                             hex::encode(chunk_address)
                         )));
 
@@ -343,11 +343,6 @@ pub async fn retrieve_chunk(
                         break;
                     }
                 } else {
-                    web_sys::console::log_1(&JsValue::from(format!(
-                        "cac chunk span length {}",
-                        u64::from_be_bytes(cd[0..8].try_into().unwrap())
-                    )));
-
                     let accounting_peers = accounting.lock().unwrap();
                     if accounting_peers.contains_key(&closest_peer_id) {
                         let accounting_peer = accounting_peers.get(&closest_peer_id).unwrap();
@@ -361,14 +356,13 @@ pub async fn retrieve_chunk(
     }
 
     if encred {
-        web_sys::console::log_1(&JsValue::from(format!("encryption detected")));
         if soc {
             let cd00 = decrypt(&(&cd[97..]).to_vec(), encrey);
             if cd00.len() >= 8 {
                 return cd00;
             } else {
                 web_sys::console::log_1(&JsValue::from(format!(
-                    "unable to retrieve chunk {} - encrypted chunk empty",
+                    "unable to retrieve chunk {} - encrypted chunk no content",
                     hex::encode(chunk_address)
                 )));
                 return vec![];
@@ -384,7 +378,7 @@ pub async fn retrieve_chunk(
     }
     if cd.len() == 0 {
         web_sys::console::log_1(&JsValue::from(format!(
-            "unable to retrieve chunk {} - chunk empty 3",
+            "unable to retrieve chunk {} - chunk empty",
             hex::encode(chunk_address)
         )));
     }
@@ -555,8 +549,6 @@ pub async fn seek_latest_feed_update(
             let j = lower_bound + i;
             let feed_update_address = get_feed_address(&owner, &topic, j);
             let handle = async move {
-                web_sys::console::log_1(&JsValue::from(format!("dispatching {}", j)));
-                //
                 return (get_chunk(feed_update_address, data_retrieve_chan).await, j);
             };
             joiner.push(handle);
@@ -571,11 +563,6 @@ pub async fn seek_latest_feed_update(
         // receive results, update scores
 
         while let Some((result0, result1)) = joiner.next().await {
-            web_sys::console::log_1(&JsValue::from(format!(
-                "receiving {} with len: {}",
-                result1,
-                result0.len()
-            )));
             if result0.len() == 0 && smallest_not_found > result1 {
                 smallest_not_found = result1;
             }
@@ -651,3 +638,5 @@ pub async fn seek_latest_feed_update(
 // 9f2a74cdaad2654660bb95b3e29354696b25d492072110ef091d48434e1d76eed80e865888dd5686ada4acc4528dec8925298a7c818cd758dc95c31c0687acb6
 //
 // a018d027eeb247872ef8b77966baa34b644adeccfdf62f41382714e912632ddbfbabb83b217431f66f872f2bfb2ecb001935152c1c380b1200574c6a3ea03541
+//
+// 595f0537cebc3d0ea0d145d19297ae793d9b01ab560d07f6583b8b9dc39cecb3

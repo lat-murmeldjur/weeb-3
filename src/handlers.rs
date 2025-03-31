@@ -350,7 +350,7 @@ pub async fn fresh(
 }
 
 pub async fn trieve(
-    peer: PeerId,
+    _peer: PeerId,
     chunk_address: Vec<u8>,
     stream: &mut Stream,
     chan: &mpsc::Sender<Vec<u8>>,
@@ -416,10 +416,10 @@ pub async fn trieve(
 
     let rec_1 = rec_0.data;
 
-    web_sys::console::log_1(&JsValue::from(format!(
-        "Got chunk {:#?} from peer {:#?}!",
-        rec_0.stamp, peer
-    )));
+    // web_sys::console::log_1(&JsValue::from(format!(
+    //     "Got chunk {:#?} from peer {:#?}!",
+    //     hex::encode(chunk_address), peer
+    // )));
 
     chan.send(rec_1).unwrap();
 
@@ -507,7 +507,7 @@ pub async fn retrieve_handler(
         return;
     }
 
-    web_sys::console::log_1(&JsValue::from(format!("{} Retrieve complete!", peer)));
+    // web_sys::console::log_1(&JsValue::from(format!("{} Retrieve complete!", peer)));
 }
 
 pub async fn pushsync_handler(

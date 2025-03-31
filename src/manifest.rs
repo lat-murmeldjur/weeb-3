@@ -85,6 +85,7 @@ pub async fn interpret_manifest(
 
     let mf_version = &cd[40..71];
     let enc_mf_version = hex::encode(mf_version);
+    web_sys::console::log_1(&JsValue::from(format!("mf_version: {}", enc_mf_version)));
 
     if enc_mf_version != "5768b3b6a7db56d21d1abff40d41cebfc83448fed8d7e9b06ec0d3b073f28f"
         && enc_mf_version != "025184789d63635766d78c41900196b57d7400875ebe4d9b5d1e76bd9652a9"
@@ -101,8 +102,24 @@ pub async fn interpret_manifest(
     }
 
     let ref_size = cd[71];
+    web_sys::console::log_1(&JsValue::from(format!("ref_size: {}", ref_size)));
+
     let ref_delimiter = (72 + ref_size) as usize;
     let index_delimiter = (ref_delimiter + 32) as usize;
+
+    if ref_size > 0 {
+        let manifest_reference = &cd[72..ref_delimiter];
+        web_sys::console::log_1(&JsValue::from(format!(
+            "manifest_reference: {}",
+            hex::encode(manifest_reference)
+        )));
+    }
+
+    let index_bytes = &cd[ref_delimiter..index_delimiter];
+    web_sys::console::log_1(&JsValue::from(format!(
+        "forks_index_bytes: {}",
+        hex::encode(index_bytes)
+    )));
 
     // fork parts
 
@@ -113,20 +130,37 @@ pub async fn interpret_manifest(
     while cd.len() > fork_start_current {
         let fork_start = fork_start_current;
         let fork_type = cd[fork_start_current];
+        web_sys::console::log_1(&JsValue::from(format!(
+            "fork_type: {}",
+            hex::encode(&[fork_type])
+        )));
 
         let fork_prefix_length = cd[fork_start_current + 1];
+        web_sys::console::log_1(&JsValue::from(format!(
+            "fork_prefix_length: {}",
+            hex::encode(&[fork_prefix_length])
+        )));
 
         let fork_prefix = &cd[fork_start + 2..fork_start + 2 + (fork_prefix_length as usize)];
-
         let string_fork_prefix = String::from_utf8(fork_prefix.to_vec()).unwrap_or("".to_string());
+        web_sys::console::log_1(&JsValue::from(format!(
+            "string_fork_prefix: {}",
+            hex::encode(&string_fork_prefix)
+        )));
 
         let fork_prefix_delimiter = fork_start + 32;
         let fork_reference_delimiter = fork_prefix_delimiter + (ref_size as usize);
         let fork_reference = &cd[fork_prefix_delimiter..fork_reference_delimiter];
+        web_sys::console::log_1(&JsValue::from(format!(
+            "fork_reference: {}",
+            hex::encode(fork_reference)
+        )));
 
         let ref_data = get_data(fork_reference.to_vec(), data_retrieve_chan).await;
 
         if fork_type & 16 == 16 {
+            web_sys::console::log_1(&JsValue::from(format!("fork_type: metadata",)));
+
             let fork_metadata_bytesize: [u8; 2] = cd
                 [fork_reference_delimiter..fork_reference_delimiter + 2]
                 .try_into()
@@ -174,6 +208,10 @@ pub async fn interpret_manifest(
                 let feed_data_content =
                     get_data(feed_data_soc[16..48].to_vec(), data_retrieve_chan).await;
 
+                web_sys::console::log_1(&JsValue::from(format!(
+                    "dispatch interpret manifest for reference in feed head soc ",
+                )));
+
                 let (mut appendix_0, _nondiscard) = Box::pin(interpret_manifest(
                     "".to_string(),
                     &feed_data_content,
@@ -207,6 +245,10 @@ pub async fn interpret_manifest(
                     bequeath.push_str(&path_prefix_heritance);
                     bequeath.push_str(&string_fork_prefix);
 
+                    web_sys::console::log_1(&JsValue::from(format!(
+                        "dispatch interpret manifest for with metadata fork reference with no content type",
+                    )));
+
                     let (mut appendix_0, _discard) =
                         Box::pin(interpret_manifest(bequeath, &ref_data, data_retrieve_chan)).await;
                     parts.append(&mut appendix_0);
@@ -219,6 +261,10 @@ pub async fn interpret_manifest(
             let mime_0 = str1.to_string();
             // let filename_0 = str2.to_string();
             if ref_data.len() > 71 {
+                web_sys::console::log_1(&JsValue::from(format!(
+                    "inline interpret manifest for with metadata fork reference with content type",
+                )));
+
                 let mut ref_data0 = (&ref_data[..40]).to_vec();
                 let mut ref_size_a = ref_data[71];
 
@@ -257,6 +303,11 @@ pub async fn interpret_manifest(
                         actual_data_address = ref_data0[72..72 + (ref_size_a as usize)].to_vec();
                     }
 
+                    web_sys::console::log_1(&JsValue::from(format!(
+                        "metadata_fork_reference_with_content_type_data_address {}",
+                        hex::encode(&actual_data_address)
+                    )));
+
                     let actual_data = get_data(actual_data_address, data_retrieve_chan).await;
 
                     let mut path_0: String = String::new();
@@ -274,10 +325,15 @@ pub async fn interpret_manifest(
         }
 
         if fork_type & 16 == 0 {
+            web_sys::console::log_1(&JsValue::from(format!("fork_type: no metadata",)));
+
             fork_start_current = fork_start + 32 + (ref_size as usize);
             let mut bequeath: String = String::new();
             bequeath.push_str(&path_prefix_heritance);
             bequeath.push_str(&string_fork_prefix);
+            web_sys::console::log_1(&JsValue::from(format!(
+                "dispatch interpret manifest for fork with no metadata",
+            )));
             let (mut appendix_0, _discard) =
                 Box::pin(interpret_manifest(bequeath, &ref_data, data_retrieve_chan)).await;
             parts.append(&mut appendix_0);

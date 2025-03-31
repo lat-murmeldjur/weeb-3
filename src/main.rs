@@ -26,6 +26,14 @@ use libp2p_webrtc as webrtc;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    //rustls::crypto::aws_lc_rs::default_provider()
+    //    .install_default()
+    //    .unwrap();
+
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .unwrap();
+
     let mut swarm = libp2p::SwarmBuilder::with_new_identity()
         .with_tokio()
         .with_other_transport(|id_keys| {

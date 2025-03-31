@@ -46,6 +46,8 @@ mod interface;
 
 mod manifest;
 
+mod manifest_upload;
+
 mod retrieval;
 use retrieval::*;
 
@@ -652,9 +654,6 @@ impl Sekirei {
                         let (n, chan) = incoming_request.unwrap();
                         let encoded_data =
                             retrieve_resource(&n, &data_retrieve_chan_outgoing).await;
-                        web_sys::console::log_1(&JsValue::from(format!(
-                            "Writing response to interface request"
-                        )));
 
                         chan.send(encoded_data).unwrap();
                     } else {
@@ -665,10 +664,6 @@ impl Sekirei {
                 let timenow = Date::now();
                 let seg = timenow - timelast;
                 if seg < PROTO_LOOP_INTERRUPTOR {
-                    // web_sys::console::log_1(&JsValue::from(format!(
-                    //     "Ease retrieve handle loop for {}",
-                    //     PROTO_LOOP_INTERRUPTOR - seg
-                    // )));
                     async_std::task::sleep(Duration::from_millis(
                         (PROTO_LOOP_INTERRUPTOR - seg) as u64,
                     ))
@@ -732,9 +727,6 @@ impl Sekirei {
                                     &refreshment_instructions_chan_outgoing,
                                 )
                                 .await;
-                                web_sys::console::log_1(&JsValue::from(format!(
-                                    "Writing response to retrieve request"
-                                )));
 
                                 chan.send(chunk_data).unwrap();
                             }
@@ -747,9 +739,6 @@ impl Sekirei {
                                     &refreshment_instructions_chan_outgoing,
                                 )
                                 .await;
-                                web_sys::console::log_1(&JsValue::from(format!(
-                                    "Writing response to retrieve request"
-                                )));
 
                                 chan.send(chunk_data).unwrap();
                             }

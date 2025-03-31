@@ -6,13 +6,9 @@ use crate::{
     //    // // // // // // // //
     content_address,
     //    // // // // // // // //
-    //    encode_resources,
-    //    // // // // // // // //
-    //    get_feed_address,
-    //    // // // // // // // //
     get_proximity,
     //    // // // // // // // //
-    //    manifest::interpret_manifest,
+    manifest_upload::create_manifest,
     //    // // // // // // // //
     mpsc,
     //    // // // // // // // //
@@ -23,10 +19,6 @@ use crate::{
     reserve,
     //    // // // // // // // //
     stream,
-    //    // // // // // // // //
-    //    valid_cac,
-    //    // // // // // // // //
-    //    valid_soc,
     //    // // // // // // // //
     Date,
     //    // // // // // // // //
