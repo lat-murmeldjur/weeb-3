@@ -37,6 +37,7 @@ use crate::RETRIEVAL_PROTOCOL;
 
 pub async fn ceive(
     peer: PeerId,
+    network_id: u64,
     stream: &mut Stream,
     a: libp2p::core::Multiaddr,
     pk: &ecdsa::SecretKey,
@@ -113,7 +114,7 @@ pub async fn ceive(
 
     step_1.address = Some(step_1_ad);
     step_1.nonce = nonce.to_vec();
-    step_1.network_id = 10_u64;
+    step_1.network_id = network_id;
     step_1.full_node = false;
     step_1.welcome_message = "... Ara Ara ...".to_string();
 
@@ -428,32 +429,35 @@ pub async fn trieve(
 
 pub async fn connection_handler(
     peer: PeerId,
+    network_id: u64,
     control: &mut stream::Control,
     a: &libp2p::core::Multiaddr,
     pk: &ecdsa::SecretKey,
     chan: &mpsc::Sender<PeerFile>,
-) {
+) -> bool {
     let mut stream = match control.open_stream(peer, HANDSHAKE_PROTOCOL).await {
         Ok(stream) => stream,
         Err(error @ stream::OpenStreamError::UnsupportedProtocol(_)) => {
             web_sys::console::log_1(&JsValue::from(format!("{} {}", peer, error)));
-            return;
+            return false;
         }
         Err(error) => {
             web_sys::console::log_1(&JsValue::from(format!("{} {}", peer, error)));
-            return;
+            return false;
         }
     };
 
-    if let Err(e) = ceive(peer, &mut stream, a.clone(), &pk.clone(), chan).await {
+    if let Err(e) = ceive(peer, network_id, &mut stream, a.clone(), &pk.clone(), chan).await {
         web_sys::console::log_1(&JsValue::from("Handshake protocol failed"));
         web_sys::console::log_1(&JsValue::from(format!("{}", e)));
-        return;
+        return false;
     }
 
     web_sys::console::log_1(&JsValue::from(format!("{} Handshake complete!", peer)));
 
     web_sys::console::log_1(&JsValue::from(format!("Closing handler 1")));
+
+    return true;
 }
 
 pub async fn refresh_handler(

@@ -2,10 +2,10 @@ use crate::{
     //
     manifest::Fork,
     //
-    JsValue,
+    // JsValue,
 };
 
-use serde_json::Value;
+// use serde_json::Value;
 
 // pub struct Fork {
 //     //    metadata: Value,
@@ -15,7 +15,7 @@ use serde_json::Value;
 //     pub path: String,
 // }
 
-pub async fn create_manifest(obfuscated: bool, encrypted: bool, forks: Vec<Fork>) -> Vec<u8> {
+pub async fn create_manifest(obfuscated: bool, encrypted: bool, _forks: Vec<Fork>) -> Vec<u8> {
     let mut manifest_bytes_vec: Vec<u8> = vec![];
 
     for _ in 0..32 {
@@ -29,13 +29,12 @@ pub async fn create_manifest(obfuscated: bool, encrypted: bool, forks: Vec<Fork>
     manifest_bytes_vec.append(
         &mut hex::decode("5768b3b6a7db56d21d1abff40d41cebfc83448fed8d7e9b06ec0d3b073f28f").unwrap(),
     );
-
+    let mut ref_length: u8 = 32;
     if encrypted {
-        manifest_bytes_vec.push(64_u8)
-    } else {
-        manifest_bytes_vec.push(32_u8)
+        ref_length = 64;
     }
-    for _ in 0..32 {
+
+    for _ in 0..ref_length {
         manifest_bytes_vec.push(0_u8);
     }
 

@@ -15,7 +15,21 @@
         </div>
 
         <div id="wrapper">
-            <h1>Navigation</h1>
+            <h2>Settings</h2>
+            <div>
+                <label>Swarm Bootnode Multiaddress</label>
+            </div>
+            <div>
+                <input type="text" id="bootNodeMASettings" value="/ip4/192.168.0.100/tcp/11634/ws/p2p/QmPxeVPawnzvhsSaiZ1pphPYhWMroiPS3VdiDXRtzrbJXA" size="90">
+            </div>
+            <div>
+                <label>Swarm Network Id</label>
+            </div>
+            <div>
+                <input type="number" id="networkIDSettings" value="10" min="0" max="65535">
+                <button id="networkSet">... Change network settings ...</button>
+            </div>
+            <h2>Navigation</h2>
             <input type="text" id="inputString" placeholder="Enter Swarm Hash or ENS site domain to display" size="64">
             <button id="uploadGetBatch">... Get Space on Swarm for Uploads ...</button>
             <input id="uploadFileSelect" type="file">... Select File to Upload on Swarm ...</input>

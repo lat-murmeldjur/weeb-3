@@ -63,6 +63,7 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
 
     let worker_handle = worker_handle0.clone();
     let worker_handle3 = worker_handle0.clone();
+    let worker_handle4 = worker_handle0.clone();
 
     {
         let worker_handle_2 = &*worker_handle.borrow();
@@ -75,9 +76,11 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
     #[allow(unused_assignments)]
     let mut persistent_callback_handle = get_on_msg_callback(r_out.clone());
     let mut persistent_callback_handle3 = get_on_msg_callback(r_out.clone());
+    let mut persistent_callback_handle4 = get_on_msg_callback(r_out.clone());
 
     let r_out0 = r_out.clone();
     let r_out3 = r_out.clone();
+    let r_out4 = r_out.clone();
 
     let callback =
         wasm_bindgen::closure::Closure::<dyn FnMut(web_sys::MessageEvent)>::new(move |_msg| {
@@ -365,12 +368,87 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
 
             console::log_1(&"oninput file callback happened".into());
         });
+
     document
         .get_element_by_id("uploadFile")
         .expect("#uploadFile should exist")
         .dyn_ref::<HtmlButtonElement>()
         .expect("#uploadFile should be a HtmlButtonElement")
         .set_onclick(Some(callback3.as_ref().unchecked_ref()));
+
+    let callback4 =
+        wasm_bindgen::closure::Closure::<dyn FnMut(web_sys::MessageEvent)>::new(move |_msg| {
+            console::log_1(&"oninput bootnode callback".into());
+
+            let document = web_sys::window().unwrap().document().unwrap();
+
+            let bootnode_input = document
+                .get_element_by_id("bootNodeMASettings")
+                .expect("#bootNodeMASettings should exist");
+
+            let bootnode_input = bootnode_input
+                .dyn_ref::<HtmlInputElement>()
+                .expect("#bootNodeMASettings should be a HtmlInputElement");
+
+            web_sys::console::log_1(&"g0 bootnode change triggered".into());
+            match bootnode_input.value().parse::<String>() {
+                Ok(bootnode_address) => {
+                    web_sys::console::log_1(&"g1 bootnode change triggered".into());
+
+                    let network_id_input = document
+                        .get_element_by_id("networkIDSettings")
+                        .expect("#networkIDSettings should exist");
+
+                    let network_id_input = network_id_input
+                        .dyn_ref::<HtmlInputElement>()
+                        .expect("#networkIDSettings should be a HtmlInputElement");
+
+                    let msgobj = js_sys::Object::new();
+                    let _ = js_sys::Reflect::set(
+                        &msgobj,
+                        &JsValue::from_str("type0"),
+                        &JsValue::from_str("bootnode_settings"),
+                    );
+                    let _ = js_sys::Reflect::set(
+                        &msgobj,
+                        &JsValue::from_str("bootnode_address0"),
+                        &JsValue::from_str(&bootnode_address),
+                    );
+
+                    match network_id_input.value().parse::<String>() {
+                        Ok(network_id) => {
+                            web_sys::console::log_1(&"g2 bootnode change triggered".into());
+                            let _ = js_sys::Reflect::set(
+                                &msgobj,
+                                &JsValue::from_str("network_id0"),
+                                &JsValue::from_str(&network_id),
+                            );
+
+                            let worker_handle_4 = worker_handle4.borrow();
+                            let _ = worker_handle_4.port().post_message(&msgobj);
+
+                            persistent_callback_handle4 = get_on_msg_callback(r_out4.clone());
+
+                            // Since the worker returns the message asynchronously, we
+                            // attach a callback to be triggered when the worker returns.
+                            worker_handle_4.port().set_onmessage(Some(
+                                persistent_callback_handle4.as_ref().unchecked_ref(),
+                            ));
+                        }
+                        _ => {}
+                    };
+                }
+                _ => {}
+            };
+            console::log_1(&"oninput network settings callback happened".into());
+        });
+
+    document
+        .get_element_by_id("networkSet")
+        .expect("#networkSet should exist")
+        .dyn_ref::<HtmlButtonElement>()
+        .expect("#networkSet should be a HtmlButtonElement")
+        .set_onclick(Some(callback4.as_ref().unchecked_ref()));
 
     body.append_p(&format!("Created a new worker from within Wasm"))?;
 

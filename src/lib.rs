@@ -7,9 +7,7 @@ use async_std::sync::Arc;
 
 use std::collections::{HashMap, HashSet};
 use std::num::NonZero;
-use std::str::FromStr;
-use std::sync::mpsc;
-use std::sync::Mutex;
+use std::sync::{mpsc, Mutex};
 use std::time::Duration;
 
 use libp2p::{
@@ -103,7 +101,7 @@ const PUSHSYNC_PROTOCOL: StreamProtocol = StreamProtocol::new("/swarm/pushsync/1
 // const PINGPONG_PROTOCOL: StreamProtocol = StreamProtocol::new("/swarm/pingpong/1.0.0/pingpong");
 // const STATUS_PROTOCOL: StreamProtocol = StreamProtocol::new("/swarm/status/1.1.1/status");
 //
-// const PULL_CURSORS_PROTOCOL: StreamProtocol = StreamProtocol::new("/swarm/pullsync/1.4.0/cursors");
+// const PULL_CURSORS_PROTOCOL: StreamProtocol = StreamProtocol:: "/swarm/pullsync/1.4.0/cursors");
 // const PULL_PROTOCOL: StreamProtocol = StreamProtocol::new("/swarm/pullsync/1.4.0/pullsync");
 // const PUSH_PROTOCOL: StreamProtocol = StreamProtocol::new("/swarm/pushsync/1.3.0/pushsync");
 
@@ -118,7 +116,7 @@ pub fn init_panic_hook() {
 
 #[wasm_bindgen]
 pub struct Sekirei {
-    swarm: Mutex<Swarm<Behaviour>>,
+    swarm: Arc<Mutex<Swarm<Behaviour>>>,
     secret_key: Mutex<SecretKey>,
     wings: Mutex<Wings>,
     message_port: (
@@ -129,6 +127,11 @@ pub struct Sekirei {
         mpsc::Sender<(String, String, Vec<u8>, bool, mpsc::Sender<Vec<u8>>)>,
         mpsc::Receiver<(String, String, Vec<u8>, bool, mpsc::Sender<Vec<u8>>)>,
     ),
+    bootnode_port: (
+        mpsc::Sender<(String, mpsc::Sender<String>)>,
+        mpsc::Receiver<(String, mpsc::Sender<String>)>,
+    ),
+    network_id: Mutex<u64>,
 }
 
 #[wasm_bindgen]
@@ -141,6 +144,60 @@ pub struct Wings {
 
 #[wasm_bindgen]
 impl Sekirei {
+    pub async fn change_bootnode_address(&self, address: String, _id: String) -> Vec<u8> {
+        let parse_id = _id.parse::<u64>();
+
+        match parse_id {
+            Ok(parsed_id) => {
+                web_sys::console::log_1(&JsValue::from(format!("Parsed network id {}", parsed_id)));
+                let mut nid = self.network_id.lock().unwrap();
+                *nid = parsed_id;
+            }
+            _ => {}
+        };
+
+        web_sys::console::log_1(&"bootnode change triggered".into());
+
+        let (chan_out, chan_in) = mpsc::channel::<String>();
+        let _ = self.bootnode_port.0.send((address, chan_out));
+
+        let k0 = async {
+            let mut timelast: f64;
+            #[allow(irrefutable_let_patterns)]
+            while let that = chan_in.try_recv() {
+                let timenow = Date::now();
+                timelast = timenow;
+                if !that.is_err() {
+                    return that.unwrap();
+                }
+
+                let timenow = Date::now();
+                let seg = timenow - timelast;
+                if seg < EVENT_LOOP_INTERRUPTOR {
+                    async_std::task::sleep(Duration::from_millis(
+                        (EVENT_LOOP_INTERRUPTOR - seg) as u64,
+                    ))
+                    .await;
+                };
+            }
+
+            return "".to_string();
+        };
+
+        let result = k0.await;
+
+        return encode_resources(
+            vec![(
+                format!("Bootnode connect status: {}", result)
+                    .as_bytes()
+                    .to_vec(),
+                "text/plain".to_string(),
+                "... result ...".to_string(),
+            )],
+            "... result ...".to_string(),
+        );
+    }
+
     pub async fn post_upload(&self, file: File, encryption: bool) -> Vec<u8> {
         web_sys::console::log_1(&JsValue::from(format!("File size {}", file.size())));
 
@@ -289,10 +346,11 @@ impl Sekirei {
         let (m_out, m_in) = mpsc::channel::<(Vec<u8>, mpsc::Sender<Vec<u8>>)>();
         let (u_out, u_in) =
             mpsc::channel::<(String, String, Vec<u8>, bool, mpsc::Sender<Vec<u8>>)>();
+        let (b_out, b_in) = mpsc::channel::<(String, mpsc::Sender<String>)>();
 
         return Sekirei {
             secret_key: Mutex::new(secret_key),
-            swarm: Mutex::new(swarm),
+            swarm: Arc::new(Mutex::new(swarm)),
             wings: Mutex::new(Wings {
                 connected_peers: connected_peers,
                 overlay_peers: overlay_peers,
@@ -301,6 +359,8 @@ impl Sekirei {
             }),
             message_port: (m_out, m_in),
             upload_port: (u_out, u_in),
+            bootnode_port: (b_out, b_in),
+            network_id: Mutex::new(10_u64),
         };
     }
 
@@ -310,10 +370,6 @@ impl Sekirei {
         prt("".to_string(), "".to_string()).await;
 
         let wings = self.wings.lock().unwrap();
-
-        let peer_id =
-            libp2p::PeerId::from_str("QmaniMaU5kNYzk7pQPWnBmB7Qp1o28FUW9cG4xVC4tGJbK").unwrap();
-        // libp2p::PeerId::from_str("QmPxeVPawnzvhsSaiZ1pphPYhWMroiPS3VdiDXRtzrbJXA").unwrap();
 
         let (peers_instructions_chan_outgoing, peers_instructions_chan_incoming) = mpsc::channel();
         let (connections_instructions_chan_outgoing, connections_instructions_chan_incoming) =
@@ -335,7 +391,7 @@ impl Sekirei {
         let (data_upload_chan_outgoing, data_upload_chan_incoming) =
             mpsc::channel::<(Vec<u8>, u8, mpsc::Sender<Vec<u8>>)>();
 
-        let mut ctrl;
+        let ctrl;
         let mut incoming_pricing_streams;
         let mut incoming_gossip_streams;
 
@@ -382,38 +438,9 @@ impl Sekirei {
             }
         };
 
-        let conn_handle = async {
-            let addr2 =
-            "/ip4/192.168.0.104/tcp/18634/ws/p2p/QmaniMaU5kNYzk7pQPWnBmB7Qp1o28FUW9cG4xVC4tGJbK"
-                .parse::<Multiaddr>()
-                .unwrap();
-
-            let mut bootnode_connected = false;
-            while bootnode_connected == false {
-                {
-                    let mut swarm = self.swarm.lock().unwrap();
-                    bootnode_connected = match swarm.dial(addr2.clone()) {
-                        Ok(()) => true,
-                        _ => false,
-                    };
-                }
-                async_std::task::sleep(Duration::from_millis((EVENT_LOOP_INTERRUPTOR) as u64))
-                    .await;
-            }
-
-            connection_handler(
-                peer_id,
-                &mut ctrl,
-                &addr2,
-                &self.secret_key.lock().unwrap(),
-                &accounting_peer_chan_outgoing,
-            )
-            .await;
-        };
-
         let swarm_event_handle = async {
+            let mut swarm = self.swarm.lock().unwrap();
             loop {
-                let mut swarm = self.swarm.lock().unwrap();
                 #[allow(irrefutable_let_patterns)]
                 while let paddr = peers_instructions_chan_incoming.try_recv() {
                     if !paddr.is_err() {
@@ -421,10 +448,13 @@ impl Sekirei {
                         //     "Current Conn Handled {:#?}",
                         //     paddr
                         // )));
+
                         let addr4 =
                             libp2p::core::Multiaddr::try_from(paddr.clone().unwrap().underlay)
                                 .unwrap();
+
                         swarm.dial(addr4).unwrap_or(());
+
                         let _ = connections_instructions_chan_outgoing.send(paddr.unwrap());
                     } else {
                         break;
@@ -470,6 +500,42 @@ impl Sekirei {
                         _ => {}
                     }
                 }
+
+                #[allow(irrefutable_let_patterns)]
+                while let bootnode_change = self.bootnode_port.1.try_recv() {
+                    if !bootnode_change.is_err() {
+                        let (baddr, chan) = bootnode_change.unwrap();
+
+                        let addr33 = match baddr.parse::<Multiaddr>() {
+                            Ok(aok) => aok,
+                            _ => {
+                                let _ =
+                                    chan.send("parse multiaddress for bootnode failed".to_string());
+                                break;
+                            }
+                        };
+
+                        // let bn_id: PeerId = match try_from_multiaddr(&addr33.clone()) {
+                        //     Some(aok) => aok,
+                        //     _ => {
+                        //         let _ = chan.send("parse peerid for bootnode failed".to_string());
+                        //         break;
+                        //     }
+                        // };
+
+                        let _ = swarm.dial(addr33.clone());
+
+                        let _ = chan.send("dialing bootnode".to_string());
+
+                        let mut bzzaddr = etiquette_2::BzzAddress::default();
+
+                        bzzaddr.underlay = addr33.to_vec();
+
+                        let _ = connections_instructions_chan_outgoing.send(bzzaddr);
+                    } else {
+                        break;
+                    }
+                }
             }
         };
 
@@ -484,9 +550,16 @@ impl Sekirei {
                             let addr3 =
                                 libp2p::core::Multiaddr::try_from(that.unwrap().underlay).unwrap();
                             let id = try_from_multiaddr(&addr3);
+                            let nid: u64;
+                            {
+                                let nid0 = self.network_id.lock().unwrap();
+                                nid = *nid0;
+                            }
+
                             if id.is_some() {
                                 connection_handler(
                                     id.expect("not"),
+                                    nid,
                                     &mut ctrl3,
                                     &addr3.clone(),
                                     &self.secret_key.lock().unwrap(),
@@ -852,7 +925,6 @@ impl Sekirei {
         };
 
         join!(
-            conn_handle,
             event_handle,
             retrieve_handle,
             push_handle,
