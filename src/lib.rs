@@ -442,20 +442,56 @@ impl Sekirei {
             let mut swarm = self.swarm.lock().unwrap();
             loop {
                 #[allow(irrefutable_let_patterns)]
-                while let paddr = peers_instructions_chan_incoming.try_recv() {
-                    if !paddr.is_err() {
+                while let paddr0 = peers_instructions_chan_incoming.try_recv() {
+                    if !paddr0.is_err() {
                         // web_sys::console::log_1(&JsValue::from(format!(
                         //     "Current Conn Handled {:#?}",
                         //     paddr
                         // )));
 
-                        let addr4 =
-                            libp2p::core::Multiaddr::try_from(paddr.clone().unwrap().underlay)
-                                .unwrap();
+                        let paddr = match paddr0 {
+                            Ok(aok) => aok,
+                            _ => {
+                                break;
+                            }
+                        };
 
-                        swarm.dial(addr4).unwrap_or(());
+                        let addr4 = match libp2p::core::Multiaddr::try_from(paddr.clone().underlay)
+                        {
+                            Ok(aok) => aok,
+                            _ => {
+                                break;
+                            }
+                        };
 
-                        let _ = connections_instructions_chan_outgoing.send(paddr.unwrap());
+                        let prck = addr4.protocol_stack();
+                        let mut ws = false;
+                        for p in prck {
+                            if p == "ws" {
+                                ws = true;
+                            }
+                        }
+
+                        if !ws {
+                            let addr40 = addr4.to_string().replace("/p2p/", "/ws/p2p/");
+
+                            let addr41 = match addr40.parse::<Multiaddr>() {
+                                Ok(aok) => aok,
+                                _ => {
+                                    break;
+                                }
+                            };
+
+                            let _ = swarm.dial(addr41.clone());
+
+                            let mut bzzaddr = etiquette_2::BzzAddress::default();
+                            bzzaddr.underlay = addr41.to_vec();
+
+                            let _ = connections_instructions_chan_outgoing.send(bzzaddr);
+                        } else {
+                            let _ = swarm.dial(addr4);
+                            let _ = connections_instructions_chan_outgoing.send(paddr);
+                        }
                     } else {
                         break;
                     };

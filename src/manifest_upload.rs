@@ -15,6 +15,7 @@ use crate::{
 //     pub path: String,
 // }
 
+#[allow(dead_code)]
 pub async fn create_manifest(obfuscated: bool, encrypted: bool, _forks: Vec<Fork>) -> Vec<u8> {
     let mut manifest_bytes_vec: Vec<u8> = vec![];
 
