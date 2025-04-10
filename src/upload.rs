@@ -8,7 +8,7 @@ use crate::{
     //    // // // // // // // //
     get_proximity,
     //    // // // // // // // //
-    // manifest_upload::create_manifest,
+    manifest_upload::{create_manifest, Node},
     //    // // // // // // // //
     mpsc,
     //    // // // // // // // //
@@ -111,8 +111,8 @@ pub async fn stamp_chunk(
 }
 
 pub async fn upload_resource(
-    _name: String,
-    _mime: String,
+    name0: String,
+    mime0: String,
     encryption: bool,
     data: &Vec<u8>,
     data_upload_chan: &mpsc::Sender<(Vec<u8>, u8, mpsc::Sender<Vec<u8>>)>,
@@ -127,7 +127,25 @@ pub async fn upload_resource(
         hex::encode(&core_reference)
     )));
 
-    return core_reference;
+    // return core_reference;
+
+    let core_manifest = create_manifest(
+        encryption,
+        encryption,
+        vec![Node {
+            data: core_reference.clone(), // pub data: Vec<u8>, // repurposed as address
+            mime: mime0,                  // pub mime: String,
+            _filename: name0.clone(),     // pub filename: String,
+            path: name0.clone(),          // pub path: String,
+        }], // forks
+        vec![], // data_forks
+        vec![], // reference
+        name0,  // index
+        data_upload_chan,
+    )
+    .await;
+
+    return upload_data(core_manifest, encryption, data_upload_chan).await;
 
     // alternatively, unpack .tar.gz and upload all files
     // {

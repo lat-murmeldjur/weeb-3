@@ -452,7 +452,7 @@ impl Sekirei {
                         let paddr = match paddr0 {
                             Ok(aok) => aok,
                             _ => {
-                                break;
+                                continue;
                             }
                         };
 
@@ -460,7 +460,19 @@ impl Sekirei {
                         {
                             Ok(aok) => aok,
                             _ => {
-                                break;
+                                continue;
+                            }
+                        };
+
+                        match try_from_multiaddr(&addr4.clone()) {
+                            Some(aok) => {
+                                let connected_peers_map = wings.connected_peers.lock().unwrap();
+                                if connected_peers_map.contains_key(&aok) {
+                                    continue;
+                                }
+                            }
+                            _ => {
+                                continue;
                             }
                         };
 
@@ -478,7 +490,7 @@ impl Sekirei {
                             let addr41 = match addr40.parse::<Multiaddr>() {
                                 Ok(aok) => aok,
                                 _ => {
-                                    break;
+                                    continue;
                                 }
                             };
 

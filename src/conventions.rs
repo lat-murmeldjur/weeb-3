@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::io;
 
 use alloy::primitives::keccak256;
-use alloy::primitives::{normalize_v, PrimitiveSignature as Signature};
+use alloy::primitives::{normalize_v, Signature};
 
 use libp2p::multiaddr::Protocol;
 use libp2p::{Multiaddr, PeerId};

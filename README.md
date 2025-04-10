@@ -22,6 +22,16 @@ Note this server uses an unsecure self-signed certificate to provide https, whic
 
 ## [Notes]
 
+### Tested - Supported Browsers
+
+- Chrome (on Windows 11)
+- Brave (on Windows 11)
+
+Chrome on Android is not supported yet, as it lacks the feature "Shared Web Worker" requiring a fall-back not yet in place.
+
+Testing and modifying for other browsers is planned following base feature set completion.
+
+
 ### How it works (architectural overview)
 
 The weeb-3 client consists of several logical components:

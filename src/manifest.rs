@@ -128,6 +128,12 @@ pub async fn interpret_manifest(
     let mut fork_start_current = index_delimiter;
 
     while cd.len() > fork_start_current {
+        web_sys::console::log_1(&JsValue::from(format!(
+            "fork_start/len: {}  / {}",
+            fork_start_current,
+            cd.len(),
+        )));
+
         let fork_start = fork_start_current;
         let fork_type = cd[fork_start_current];
         web_sys::console::log_1(&JsValue::from(format!(
@@ -144,8 +150,9 @@ pub async fn interpret_manifest(
         let fork_prefix = &cd[fork_start + 2..fork_start + 2 + (fork_prefix_length as usize)];
         let string_fork_prefix = String::from_utf8(fork_prefix.to_vec()).unwrap_or("".to_string());
         web_sys::console::log_1(&JsValue::from(format!(
-            "string_fork_prefix: {}",
-            hex::encode(&string_fork_prefix)
+            "string_fork_prefix: {} {}",
+            hex::encode(&string_fork_prefix),
+            string_fork_prefix
         )));
 
         let fork_prefix_delimiter = fork_start + 32;
