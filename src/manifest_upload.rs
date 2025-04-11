@@ -97,7 +97,8 @@ pub async fn create_manifest(
         manifest_bytes_vec.len()
     )));
 
-    let mut root_fork_reference = vec![];
+    let mut fork_bases: Vec<Vec<u8>> = vec![];
+    let mut fork_bases_virtual: Vec<Vec<u8>> = vec![];
 
     for forks0 in &forks {
         let path0 = forks0.path.clone();
@@ -108,20 +109,21 @@ pub async fn create_manifest(
         let mut vforks: Vec<String> = vec![];
         let mut section_begin;
         let mut section_end;
-        let mut partial_section = path0.len() % 15;
+        let mut partial_section = path0.len() % 30;
         if partial_section > 0 {
             partial_section = 1;
         }
-        for i in 0..(path0.len() / 15) + partial_section {
-            section_begin = i * 15;
-            section_end = (i + 1) * 15;
-            if (i + 1) * 15 > path0.len() {
+        for i in 0..(path0.len() / 30) + partial_section {
+            section_begin = i * 30;
+            section_end = (i + 1) * 30;
+            if (i + 1) * 30 > path0.len() {
                 section_end = path0.len();
             }
             vforks.push(path0[section_begin..section_end].to_string())
         }
 
-        let mut current_data_reference = data_address0;
+        let mut current_data_reference: Vec<u8> = data_address0;
+        let mut current_fork: Vec<u8>;
 
         let value_final = serde_json::to_vec(&json!({
                 "Content-Type": mime0,
@@ -152,26 +154,31 @@ pub async fn create_manifest(
                 current_metadata = value_final.clone();
             }
 
-            let current_fork =
-                create_fork(vforks[i].clone(), current_data_reference, current_metadata).await;
-
-            let current_manifest = Box::pin(create_manifest(
-                obfuscated,
-                encrypted,
-                vec![],             // forks
-                vec![current_fork], // data_forks
-                vec![],             // reference
-                "".to_string(),     // inde
-                data_upload_chan,
-            ))
+            current_fork = create_fork(
+                vforks[i].clone(),
+                current_data_reference.clone(),
+                current_metadata,
+            )
             .await;
 
-            current_data_reference =
-                upload_data(current_manifest, encrypted, data_upload_chan).await;
-            //
-        }
+            if i > 0 {
+                let current_manifest = Box::pin(create_manifest(
+                    obfuscated,
+                    encrypted,
+                    vec![],             // forks
+                    vec![current_fork], // data_forks
+                    vec![],             // reference
+                    "".to_string(),     // inde
+                    data_upload_chan,
+                ))
+                .await;
 
-        root_fork_reference = current_data_reference;
+                current_data_reference =
+                    upload_data(current_manifest, encrypted, data_upload_chan).await;
+            } else {
+                fork_bases.push(current_fork);
+            }
+        }
     }
 
     if forks.len() > 0 {
@@ -180,7 +187,10 @@ pub async fn create_manifest(
         }))
         .unwrap();
 
-        let mut root_fork = create_fork("/".to_string(), root_fork_reference, root_metadata).await;
+        let stub_reference = upload_data(create_stub().await, encrypted, data_upload_chan).await;
+
+        let mut root_fork = create_fork("/".to_string(), stub_reference, root_metadata).await;
+        fork_bases_virtual.push(root_fork[0..3].to_vec());
         manifest_bytes_vec.append(&mut root_fork);
     }
 
@@ -193,6 +203,10 @@ pub async fn create_manifest(
         manifest_bytes_vec.append(&mut f1.clone());
     }
 
+    for f2 in &fork_bases {
+        manifest_bytes_vec.append(&mut f2.clone());
+    }
+
     web_sys::console::log_1(&JsValue::from(format!(
         "Manifest length after data node forks: {}",
         manifest_bytes_vec.len()
@@ -202,13 +216,23 @@ pub async fn create_manifest(
 
     let mut bits_as_bytes = [0_u8; 32];
 
-    for f0 in forks {
-        let b: u8 = f0.path.as_bytes()[0];
+    for f1 in data_forks {
+        let b: u8 = f1[2];
+
+        web_sys::console::log_1(&JsValue::from(format!("######## {}", b)));
+
         bits_as_bytes[(b / 8) as usize] |= 1 << (b % 8);
     }
 
-    for f1 in data_forks {
-        let b: u8 = f1[2];
+    for f2 in fork_bases {
+        let b: u8 = f2[2];
+
+        bits_as_bytes[(b / 8) as usize] |= 1 << (b % 8);
+    }
+
+    for f3 in fork_bases_virtual {
+        let b: u8 = f3[2];
+
         bits_as_bytes[(b / 8) as usize] |= 1 << (b % 8);
     }
 
@@ -260,11 +284,11 @@ pub async fn create_fork(path: String, reference: Vec<u8>, metadata: Vec<u8>) ->
     }
     if metadata.len() > 0 {
         let xl0 = 2 + metadata.len();
-        let mut xl1 = xl0 % 16;
+        let mut xl1 = xl0 % 32;
         if xl1 > 0 {
             xl1 = 1;
         }
-        let xl = xl0 + 32 * xl1 - (xl0 % 16);
+        let xl = xl0 + 32 * xl1 - (xl0 % 32);
 
         node.append(&mut ((xl - 2) as u16).to_be_bytes().to_vec());
 
@@ -277,6 +301,26 @@ pub async fn create_fork(path: String, reference: Vec<u8>, metadata: Vec<u8>) ->
     }
 
     return node;
+}
+
+pub async fn create_stub() -> Vec<u8> {
+    let mut manifest_bytes_vec: Vec<u8> = vec![];
+
+    for _ in 0..32 {
+        manifest_bytes_vec.push(0_u8);
+    }
+
+    manifest_bytes_vec.append(
+        &mut hex::decode("5768b3b6a7db56d21d1abff40d41cebfc83448fed8d7e9b06ec0d3b073f28f").unwrap(),
+    );
+
+    manifest_bytes_vec.push(0_u8);
+
+    for _ in 0..32 {
+        manifest_bytes_vec.push(0_u8);
+    }
+
+    return manifest_bytes_vec;
 }
 
 // nodeType <1 byte>

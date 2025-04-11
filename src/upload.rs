@@ -136,11 +136,11 @@ pub async fn upload_resource(
             data: core_reference.clone(), // pub data: Vec<u8>, // repurposed as address
             mime: mime0,                  // pub mime: String,
             _filename: name0.clone(),     // pub filename: String,
-            path: name0.clone(),          // pub path: String,
+            path: hex::encode(core_reference.clone()), // pub path: String,
         }], // forks
-        vec![], // data_forks
-        vec![], // reference
-        name0,  // index
+        vec![],                      // data_forks
+        vec![],                      // reference
+        hex::encode(core_reference), // index
         data_upload_chan,
     )
     .await;
