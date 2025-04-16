@@ -6,9 +6,12 @@ use rand::rngs::OsRng;
 use async_std::sync::Arc;
 
 use std::collections::{HashMap, HashSet};
+use std::io::Read;
 use std::num::NonZero;
 use std::sync::{mpsc, Mutex};
 use std::time::Duration;
+
+use tar::Archive;
 
 use libp2p::{
     autonat,
@@ -124,8 +127,8 @@ pub struct Sekirei {
         mpsc::Receiver<(Vec<u8>, mpsc::Sender<Vec<u8>>)>,
     ),
     upload_port: (
-        mpsc::Sender<(String, String, Vec<u8>, bool, mpsc::Sender<Vec<u8>>)>,
-        mpsc::Receiver<(String, String, Vec<u8>, bool, mpsc::Sender<Vec<u8>>)>,
+        mpsc::Sender<(Vec<(String, String, Vec<u8>)>, bool, mpsc::Sender<Vec<u8>>)>,
+        mpsc::Receiver<(Vec<(String, String, Vec<u8>)>, bool, mpsc::Sender<Vec<u8>>)>,
     ),
     bootnode_port: (
         mpsc::Sender<(String, mpsc::Sender<String>)>,
@@ -206,6 +209,10 @@ impl Sekirei {
         let f_name = file.name();
         let f_type = file.type_();
 
+        web_sys::console::log_1(&JsValue::from(format!("File type {}", f_type)));
+
+        let mut fvec0: Vec<(String, String, Vec<u8>)> = vec![];
+
         let content_buf = wasm_bindgen_futures::JsFuture::from(file.array_buffer())
             .await
             .unwrap();
@@ -214,10 +221,51 @@ impl Sekirei {
 
         let content: Vec<u8> = content_u8a.to_vec();
 
-        let _ = self
-            .upload_port
-            .0
-            .send((f_name, f_type, content, encryption, chan_out));
+        if f_type == "application/x-tar" || f_type == "application/tar" {
+            // let tar = GzDecoder::new(file);
+            let mut archive = Archive::new(&content[..]);
+
+            for f0 in archive.entries().unwrap() {
+                let mut f01 = match f0 {
+                    Ok(aok) => aok,
+                    _ => continue,
+                };
+
+                let f02path = f01.path();
+
+                let f01path = match f02path {
+                    Ok(mut aok) => aok.to_mut().clone(),
+                    _ => continue,
+                };
+
+                let f0path = match f01path.into_os_string().into_string() {
+                    Ok(aok) => aok,
+                    _ => continue,
+                };
+
+                web_sys::console::log_1(&JsValue::from(format!("File size {}", f01.size())));
+                web_sys::console::log_1(&JsValue::from(format!("File path {}", f0path)));
+
+                let mime0 = match mime_guess::from_path(&f0path).first_raw() {
+                    Some(aok) => aok.to_string(),
+                    _ => continue,
+                };
+                // let mut fc0;
+                //copy(&mut f0, &mut fc0).unwrap();
+
+                let mut data0: Vec<u8> = vec![];
+
+                let _ = f01.read_to_end(&mut data0);
+
+                web_sys::console::log_1(&JsValue::from(format!("File size {}", data0.len())));
+
+                fvec0.push((f0path, mime0, data0))
+            }
+        } else {
+            fvec0.push((f_name, f_type, content));
+        }
+
+        let _ = self.upload_port.0.send((fvec0, encryption, chan_out));
 
         let k0 = async {
             let mut timelast: f64;
@@ -345,7 +393,7 @@ impl Sekirei {
 
         let (m_out, m_in) = mpsc::channel::<(Vec<u8>, mpsc::Sender<Vec<u8>>)>();
         let (u_out, u_in) =
-            mpsc::channel::<(String, String, Vec<u8>, bool, mpsc::Sender<Vec<u8>>)>();
+            mpsc::channel::<(Vec<(String, String, Vec<u8>)>, bool, mpsc::Sender<Vec<u8>>)>();
         let (b_out, b_in) = mpsc::channel::<(String, mpsc::Sender<String>)>();
 
         return Sekirei {
@@ -600,8 +648,8 @@ impl Sekirei {
                             let id = try_from_multiaddr(&addr3);
                             let nid: u64;
                             {
-                                let nid0 = self.network_id.lock().unwrap();
-                                nid = *nid0;
+                                let nid0 = self.network_id.lock().unwrap().clone();
+                                nid = nid0;
                             }
 
                             if id.is_some() {
@@ -801,9 +849,19 @@ impl Sekirei {
                 while let incoming_request = self.upload_port.1.try_recv() {
                     if !incoming_request.is_err() {
                         web_sys::console::log_1(&JsValue::from(format!("push triggered")));
-                        let (name, mime, content, enc, chan) = incoming_request.unwrap();
+                        let (file0, enc, chan) = incoming_request.unwrap();
+                        let mut res0: Vec<Resource> = vec![];
+                        for f in file0 {
+                            res0.push(Resource {
+                                path0: f.0,
+                                mime0: f.1,
+                                data: f.2,
+                                data_address: vec![],
+                            })
+                        }
+
                         let push_reference =
-                            upload_resource(name, mime, enc, &content, &data_upload_chan_outgoing)
+                            upload_resource(res0, enc, "".to_string(), &data_upload_chan_outgoing)
                                 .await;
                         web_sys::console::log_1(&JsValue::from(format!(
                             "Writing response to interface push request"

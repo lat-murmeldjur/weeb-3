@@ -110,37 +110,60 @@ pub async fn stamp_chunk(
     stamp
 }
 
+pub struct Resource {
+    pub path0: String,
+    pub mime0: String,
+    pub data: Vec<u8>,
+    pub data_address: Vec<u8>,
+}
+
 pub async fn upload_resource(
-    name0: String,
-    mime0: String,
+    resource0: Vec<Resource>,
     encryption: bool,
-    data: &Vec<u8>,
+    mut index: String,
     data_upload_chan: &mpsc::Sender<(Vec<u8>, u8, mpsc::Sender<Vec<u8>>)>,
 ) -> Vec<u8> {
     //
+    let mut node0: Vec<Node> = vec![];
 
-    // upload core file
-    let core_reference = upload_data(data.to_vec(), encryption, data_upload_chan).await;
+    for mut r0 in resource0 {
+        web_sys::console::log_1(&JsValue::from(format!("Attempt uploading resource!",)));
 
-    web_sys::console::log_1(&JsValue::from(format!(
-        "Upload resource returning {:#?}!",
-        hex::encode(&core_reference)
-    )));
+        // upload core file
+        let core_reference = upload_data(r0.data.to_vec(), encryption, data_upload_chan).await;
+
+        if r0.path0.len() == 0 {
+            r0.path0 = hex::encode(&core_reference);
+        }
+
+        if index.len() == 0 {
+            index = r0.path0.clone();
+        };
+
+        web_sys::console::log_1(&JsValue::from(format!(
+            "Upload resource returning {:#?}!",
+            hex::encode(&core_reference)
+        )));
+
+        r0.data_address = core_reference;
+
+        node0.push(Node {
+            data: r0.data_address.clone(), // pub data: Vec<u8>, // repurposed as address
+            mime: r0.mime0.clone(),        // pub mime: String,
+            _filename: r0.path0.clone(),   // pub filename: String,
+            path: r0.path0.clone(),        // pub path: String,
+        })
+    }
 
     // return core_reference;
 
     let core_manifest = create_manifest(
         encryption,
         encryption,
-        vec![Node {
-            data: core_reference.clone(), // pub data: Vec<u8>, // repurposed as address
-            mime: mime0,                  // pub mime: String,
-            _filename: name0.clone(),     // pub filename: String,
-            path: hex::encode(core_reference.clone()), // pub path: String,
-        }], // forks
-        vec![],                      // data_forks
-        vec![],                      // reference
-        hex::encode(core_reference), // index
+        node0,  // forks
+        vec![], // data_forks
+        vec![], // reference
+        index,  // index
         data_upload_chan,
     )
     .await;

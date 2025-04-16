@@ -111,3 +111,5 @@ num = { git = "https://github.com/rust-num/num.git" }
 hex = { git = "https://github.com/KokaKiwi/rust-hex.git" }
 #tracing-wasm = { git = "https://github.com/old-storyai/tracing-wasm.git" }
 web3 = { git = "https://github.com/tomusdrw/rust-web3.git", default-features = false, features = ["http-rustls-tls", "wasm", "eip-1193"] }
+tar = { git = "https://github.com/alexcrichton/tar-rs.git" }
+mime_guess = { git = "https://github.com/abonander/mime_guess.git" }
