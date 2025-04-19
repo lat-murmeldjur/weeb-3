@@ -127,8 +127,16 @@ pub struct Sekirei {
         mpsc::Receiver<(Vec<u8>, mpsc::Sender<Vec<u8>>)>,
     ),
     upload_port: (
-        mpsc::Sender<(Vec<(String, String, Vec<u8>)>, bool, mpsc::Sender<Vec<u8>>)>,
-        mpsc::Receiver<(Vec<(String, String, Vec<u8>)>, bool, mpsc::Sender<Vec<u8>>)>,
+        mpsc::Sender<(
+            Vec<(String, String, String, Vec<u8>)>,
+            bool,
+            mpsc::Sender<Vec<u8>>,
+        )>,
+        mpsc::Receiver<(
+            Vec<(String, String, String, Vec<u8>)>,
+            bool,
+            mpsc::Sender<Vec<u8>>,
+        )>,
     ),
     bootnode_port: (
         mpsc::Sender<(String, mpsc::Sender<String>)>,
@@ -207,11 +215,15 @@ impl Sekirei {
         let (chan_out, chan_in) = mpsc::channel::<Vec<u8>>();
 
         let f_name = file.name();
-        let f_type = file.type_();
+        let f_type0 = file.type_();
+        let f_type: String = match f_type0.starts_with("text/") {
+            true => f_type0 + "; charset=utf-8",
+            false => f_type0,
+        };
 
         web_sys::console::log_1(&JsValue::from(format!("File type {}", f_type)));
 
-        let mut fvec0: Vec<(String, String, Vec<u8>)> = vec![];
+        let mut fvec0: Vec<(String, String, String, Vec<u8>)> = vec![];
 
         let content_buf = wasm_bindgen_futures::JsFuture::from(file.array_buffer())
             .await
@@ -231,38 +243,58 @@ impl Sekirei {
                     _ => continue,
                 };
 
-                let f02path = f01.path();
+                let entry_header0 = f01.header();
+                let entry_type_file0 = entry_header0.entry_type().is_file();
 
-                let f01path = match f02path {
-                    Ok(mut aok) => aok.to_mut().clone(),
-                    _ => continue,
-                };
+                if entry_type_file0 {
+                    let f02path = f01.path();
 
-                let f0path = match f01path.into_os_string().into_string() {
-                    Ok(aok) => aok,
-                    _ => continue,
-                };
+                    let f01path = match f02path {
+                        Ok(mut aok) => aok.to_mut().clone(),
+                        _ => continue,
+                    };
 
-                web_sys::console::log_1(&JsValue::from(format!("File size {}", f01.size())));
-                web_sys::console::log_1(&JsValue::from(format!("File path {}", f0path)));
+                    let fname0 = match f01path.file_name() {
+                        Some(aok) => match aok.to_os_string().into_string() {
+                            Ok(aok0) => aok0,
+                            _ => continue,
+                        },
+                        _ => continue,
+                    };
 
-                let mime0 = match mime_guess::from_path(&f0path).first_raw() {
-                    Some(aok) => aok.to_string(),
-                    _ => continue,
-                };
-                // let mut fc0;
-                //copy(&mut f0, &mut fc0).unwrap();
+                    let f0path = match f01path.into_os_string().into_string() {
+                        Ok(aok) => aok.strip_prefix("./").unwrap_or(&aok).to_string(),
+                        _ => continue,
+                    };
 
-                let mut data0: Vec<u8> = vec![];
+                    web_sys::console::log_1(&JsValue::from(format!("File size {}", f01.size())));
+                    web_sys::console::log_1(&JsValue::from(format!("File path {}", f0path)));
+                    web_sys::console::log_1(&JsValue::from(format!(
+                        "Entry type file: {}",
+                        entry_type_file0
+                    )));
 
-                let _ = f01.read_to_end(&mut data0);
+                    let mime0 = match mime_guess::from_path(&f0path).first_raw() {
+                        Some(aok) => match aok.to_string().starts_with("text/") {
+                            true => aok.to_string() + "; charset=utf-8",
+                            false => aok.to_string(),
+                        },
+                        _ => continue,
+                    };
+                    // let mut fc0;
+                    //copy(&mut f0, &mut fc0).unwrap();
 
-                web_sys::console::log_1(&JsValue::from(format!("File size {}", data0.len())));
+                    let mut data0: Vec<u8> = vec![];
 
-                fvec0.push((f0path, mime0, data0))
+                    let _ = f01.read_to_end(&mut data0);
+
+                    web_sys::console::log_1(&JsValue::from(format!("File size {}", data0.len())));
+
+                    fvec0.push((f0path, fname0, mime0, data0))
+                }
             }
         } else {
-            fvec0.push((f_name, f_type, content));
+            fvec0.push((f_name, "".to_string(), f_type, content));
         }
 
         let _ = self.upload_port.0.send((fvec0, encryption, chan_out));
@@ -392,8 +424,11 @@ impl Sekirei {
         let ongoing_refreshments: Mutex<HashSet<PeerId>> = Mutex::new(HashSet::new());
 
         let (m_out, m_in) = mpsc::channel::<(Vec<u8>, mpsc::Sender<Vec<u8>>)>();
-        let (u_out, u_in) =
-            mpsc::channel::<(Vec<(String, String, Vec<u8>)>, bool, mpsc::Sender<Vec<u8>>)>();
+        let (u_out, u_in) = mpsc::channel::<(
+            Vec<(String, String, String, Vec<u8>)>,
+            bool,
+            mpsc::Sender<Vec<u8>>,
+        )>();
         let (b_out, b_in) = mpsc::channel::<(String, mpsc::Sender<String>)>();
 
         return Sekirei {
@@ -854,15 +889,21 @@ impl Sekirei {
                         for f in file0 {
                             res0.push(Resource {
                                 path0: f.0,
-                                mime0: f.1,
-                                data: f.2,
+                                filename0: f.1,
+                                mime0: f.2,
+                                data: f.3,
                                 data_address: vec![],
                             })
                         }
 
-                        let push_reference =
-                            upload_resource(res0, enc, "".to_string(), &data_upload_chan_outgoing)
-                                .await;
+                        let push_reference = upload_resource(
+                            res0,
+                            enc,
+                            "index.html".to_string(),
+                            "404.html".to_string(),
+                            &data_upload_chan_outgoing,
+                        )
+                        .await;
                         web_sys::console::log_1(&JsValue::from(format!(
                             "Writing response to interface push request"
                         )));

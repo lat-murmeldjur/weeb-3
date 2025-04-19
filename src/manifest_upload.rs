@@ -4,15 +4,18 @@ use crate::{
     //
     upload_data,
     //
+    HashMap,
+    //
     JsValue,
 };
 
 use serde_json::json;
 
+#[derive(Clone)]
 pub struct Node {
     pub data: Vec<u8>, // repurposed as address
     pub mime: String,
-    pub _filename: String,
+    pub filename: String,
     pub path: String,
 }
 
@@ -20,13 +23,22 @@ pub struct Node {
 pub async fn create_manifest(
     obfuscated: bool,
     encrypted: bool,
-    forks: Vec<Node>,
+    input_forks: Vec<Node>,
     data_forks: Vec<Vec<u8>>,
     reference: Vec<u8>,
+    root_manifest: bool,
+    first_node_cutoff: usize,
     index: String,
+    errordoc: String,
     data_upload_chan: &mpsc::Sender<(Vec<u8>, u8, mpsc::Sender<Vec<u8>>)>,
 ) -> Vec<u8> {
     let mut manifest_bytes_vec: Vec<u8> = vec![];
+
+    let mut forks = input_forks.clone();
+
+    forks.sort_by(|a, b| alphanumeric_sort::compare_path(&a.path, &b.path));
+
+    let flen = forks.len();
 
     for _ in 0..32 {
         if !obfuscated {
@@ -100,94 +112,191 @@ pub async fn create_manifest(
     let mut fork_bases: Vec<Vec<u8>> = vec![];
     let mut fork_bases_virtual: Vec<Vec<u8>> = vec![];
 
-    for forks0 in &forks {
-        let path0 = forks0.path.clone();
-        let mime0 = forks0.mime.clone();
-        // let filename0 = forks0.filename.clone();
-        let data_address0 = forks0.data.clone();
+    if forks.len() > 0 {
+        let mut fork_groups0: HashMap<String, Vec<Node>> = HashMap::new();
 
-        let mut vforks: Vec<String> = vec![];
-        let mut section_begin;
-        let mut section_end;
-        let mut partial_section = path0.len() % 30;
-        if partial_section > 0 {
-            partial_section = 1;
-        }
-        for i in 0..(path0.len() / 30) + partial_section {
-            section_begin = i * 30;
-            section_end = (i + 1) * 30;
-            if (i + 1) * 30 > path0.len() {
-                section_end = path0.len();
-            }
-            vforks.push(path0[section_begin..section_end].to_string())
+        for forks0 in &forks {
+            let path0 = forks0.path.clone();
+            let leading_char = path0[0..1].to_string();
+            fork_groups0
+                .entry(leading_char)
+                .or_insert(vec![])
+                .push(forks0.clone());
         }
 
-        let mut current_data_reference: Vec<u8> = data_address0;
-        let mut current_fork: Vec<u8>;
+        let mut fork_groups1: HashMap<String, Vec<Node>> = HashMap::new();
 
-        let value_final = serde_json::to_vec(&json!({
-                "Content-Type": mime0,
-                "Filename": hex::encode(&forks0.data.clone()),
-        }))
-        .unwrap();
-
-        let tip_mf = Box::pin(create_manifest(
-            obfuscated,
-            encrypted,
-            vec![],                 // forks
-            vec![],                 // data_forks
-            current_data_reference, // reference
-            "".to_string(),         // inde
-            data_upload_chan,
-        ))
-        .await;
-
-        current_data_reference = upload_data(tip_mf, encrypted, data_upload_chan).await;
-        web_sys::console::log_1(&JsValue::from(format!("vfll {}", vforks.len())));
-        for j in 0..vforks.len() {
-            let i = vforks.len() - 1 - j;
-            web_sys::console::log_1(&JsValue::from(format!("vfl {}", i)));
-
-            //
-            let mut current_metadata = vec![];
-            if i == vforks.len() - 1 {
-                current_metadata = value_final.clone();
+        for (_leading_char, forkgroup0) in fork_groups0.into_iter() {
+            let mut common_prefix = forkgroup0[0].path.clone();
+            for fork0 in &forkgroup0 {
+                while !fork0.path.starts_with(&common_prefix) {
+                    common_prefix.pop(); // Shorten the prefix
+                }
             }
 
-            current_fork = create_fork(
-                vforks[i].clone(),
-                current_data_reference.clone(),
-                current_metadata,
-            )
-            .await;
+            fork_groups1.insert(common_prefix, forkgroup0);
+        }
 
-            if i > 0 {
-                let current_manifest = Box::pin(create_manifest(
+        let mut cutoff_first_indicator = 0;
+        for (common_prefix, forkgroup1) in fork_groups1.into_iter() {
+            cutoff_first_indicator += 1;
+            if forkgroup1.len() == 1 {
+                let forks0 = &forkgroup1[0];
+
+                let mut vforks: Vec<String> = vec![];
+
+                let path0: String = match cutoff_first_indicator == 1 && first_node_cutoff > 0 {
+                    true => forks0.path.clone(),
+                    false => {
+                        if forks0.path.len() > 30 - (first_node_cutoff) {
+                            vforks.push(forks0.path[0..30 - (first_node_cutoff % 30)].to_string());
+                            forks0.path[30 - (first_node_cutoff % 30)..].to_string()
+                        } else {
+                            forks0.path.clone()
+                        }
+                    }
+                };
+
+                let mime0 = forks0.mime.clone();
+                // let filename0 = forks0.filename.clone();
+                let data_address0 = forks0.data.clone();
+
+                let mut section_begin;
+                let mut section_end;
+                let mut partial_section = path0.len() % 30;
+                if partial_section > 0 {
+                    partial_section = 1;
+                }
+                for i in 0..(path0.len() / 30) + partial_section {
+                    section_begin = i * 30;
+                    section_end = (i + 1) * 30;
+                    if (i + 1) * 30 > path0.len() {
+                        section_end = path0.len();
+                    }
+                    vforks.push(path0[section_begin..section_end].to_string())
+                }
+
+                let mut current_data_reference: Vec<u8> = data_address0;
+                let mut current_fork: Vec<u8>;
+
+                let value_final = serde_json::to_vec(&json!({
+                        "Content-Type": mime0,
+                        "Filename": &forks0.filename.clone(),
+                }))
+                .unwrap();
+
+                let tip_mf = Box::pin(create_manifest(
                     obfuscated,
                     encrypted,
-                    vec![],             // forks
-                    vec![current_fork], // data_forks
-                    vec![],             // reference
-                    "".to_string(),     // inde
+                    vec![],                 // forks
+                    vec![],                 // data_forks
+                    current_data_reference, // reference
+                    false,                  // root manifest
+                    0,                      // weird string prefix cutoff for first element
+                    "".to_string(),         // index
+                    "".to_string(),         // errordoc
                     data_upload_chan,
                 ))
                 .await;
 
-                current_data_reference =
-                    upload_data(current_manifest, encrypted, data_upload_chan).await;
+                current_data_reference = upload_data(tip_mf, encrypted, data_upload_chan).await;
+                web_sys::console::log_1(&JsValue::from(format!("vfll {}", vforks.len())));
+                for j in 0..vforks.len() {
+                    let i = vforks.len() - 1 - j;
+                    web_sys::console::log_1(&JsValue::from(format!("vfl {}", i)));
+
+                    //
+                    let mut current_metadata = vec![];
+                    if i == vforks.len() - 1 {
+                        current_metadata = value_final.clone();
+                    }
+
+                    current_fork = create_fork(
+                        vforks[i].clone(),
+                        current_data_reference.clone(),
+                        current_metadata,
+                    )
+                    .await;
+
+                    if i > 0 {
+                        let current_manifest = Box::pin(create_manifest(
+                            obfuscated,
+                            encrypted,
+                            vec![],             // forks
+                            vec![current_fork], // data_forks
+                            vec![],             // reference
+                            false,              // root manifest
+                            0,                  // weird string prefix cutoff for first element
+                            "".to_string(),     // index
+                            "".to_string(),     // errordoc
+                            data_upload_chan,
+                        ))
+                        .await;
+
+                        current_data_reference =
+                            upload_data(current_manifest, encrypted, data_upload_chan).await;
+                    } else {
+                        fork_bases.push(current_fork);
+                    }
+                }
             } else {
-                fork_bases.push(current_fork);
+                let mut forkgroup2: Vec<Node> = vec![];
+                for fork0 in forkgroup1 {
+                    forkgroup2.push(Node {
+                        data: fork0.data,
+                        mime: fork0.mime,
+                        filename: fork0.filename,
+                        path: fork0.path[common_prefix.len()..].to_string(),
+                    });
+                }
+
+                let group_manifest = Box::pin(create_manifest(
+                    obfuscated,
+                    encrypted,
+                    forkgroup2,                              // forks
+                    vec![],                                  // data_forks
+                    vec![],                                  // reference
+                    false,                                   // root manifest
+                    first_node_cutoff + common_prefix.len(), // weird string prefix cutoff for first element
+                    "".to_string(),                          // index
+                    "".to_string(),                          // errordoc
+                    data_upload_chan,
+                ))
+                .await;
+
+                let group_data_reference =
+                    upload_data(group_manifest, encrypted, data_upload_chan).await;
+
+                let group_fork =
+                    create_fork(common_prefix, group_data_reference.clone(), vec![]).await;
+
+                fork_bases.push(group_fork);
             }
         }
     }
 
-    if forks.len() > 0 {
+    if root_manifest {
         let root_metadata = serde_json::to_vec(&json!({
             "website-index-document": index,
+            "website-error-document": errordoc,
         }))
         .unwrap();
 
-        let stub_reference = upload_data(create_stub().await, encrypted, data_upload_chan).await;
+        let mut stub_ref_size: u8 = 0;
+        if flen > 0 {
+            if encrypted {
+                stub_ref_size = 64;
+            } else {
+                stub_ref_size = 32;
+            }
+        }
+
+        let stub_reference = upload_data(
+            create_stub(stub_ref_size).await,
+            encrypted,
+            data_upload_chan,
+        )
+        .await;
 
         let mut root_fork = create_fork("/".to_string(), stub_reference, root_metadata).await;
         fork_bases_virtual.push(root_fork[0..3].to_vec());
@@ -198,6 +307,10 @@ pub async fn create_manifest(
         "Manifest length after node forks: {}",
         manifest_bytes_vec.len()
     )));
+
+    fork_bases.sort_by(|a, b| {
+        alphanumeric_sort::compare_path(forkstring(a.to_vec()), forkstring(b.to_vec()))
+    });
 
     for f1 in &data_forks {
         manifest_bytes_vec.append(&mut f1.clone());
@@ -251,9 +364,17 @@ pub async fn create_fork(path: String, reference: Vec<u8>, metadata: Vec<u8>) ->
     let mut node: Vec<u8> = vec![];
 
     if metadata.len() == 0 {
-        node.push(4_u8);
+        if path.contains("/") {
+            node.push(12_u8);
+        } else {
+            node.push(4_u8);
+        }
     } else {
-        node.push(18_u8);
+        if path.contains("/") && path.len() > 1 {
+            node.push(26_u8);
+        } else {
+            node.push(18_u8);
+        }
     };
 
     if path.len() > 30 {
@@ -303,7 +424,7 @@ pub async fn create_fork(path: String, reference: Vec<u8>, metadata: Vec<u8>) ->
     return node;
 }
 
-pub async fn create_stub() -> Vec<u8> {
+pub async fn create_stub(stub_ref_size: u8) -> Vec<u8> {
     let mut manifest_bytes_vec: Vec<u8> = vec![];
 
     for _ in 0..32 {
@@ -314,9 +435,13 @@ pub async fn create_stub() -> Vec<u8> {
         &mut hex::decode("5768b3b6a7db56d21d1abff40d41cebfc83448fed8d7e9b06ec0d3b073f28f").unwrap(),
     );
 
-    manifest_bytes_vec.push(0_u8);
+    manifest_bytes_vec.push(stub_ref_size);
 
     for _ in 0..32 {
+        manifest_bytes_vec.push(0_u8);
+    }
+
+    for _ in 0..stub_ref_size {
         manifest_bytes_vec.push(0_u8);
     }
 
@@ -329,3 +454,9 @@ pub async fn create_stub() -> Vec<u8> {
 // reference <32/64 bytes>
 // metadataBytesSize <2 bytes>
 // metadataBytes <varlen>
+
+fn forkstring(fork: Vec<u8>) -> String {
+    let pl = fork[1] as usize;
+    let prefix = fork[2..2 + pl].to_vec();
+    String::from_utf8(prefix).unwrap_or("".to_string())
+}

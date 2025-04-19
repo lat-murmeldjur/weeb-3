@@ -112,6 +112,7 @@ pub async fn stamp_chunk(
 
 pub struct Resource {
     pub path0: String,
+    pub filename0: String,
     pub mime0: String,
     pub data: Vec<u8>,
     pub data_address: Vec<u8>,
@@ -121,6 +122,7 @@ pub async fn upload_resource(
     resource0: Vec<Resource>,
     encryption: bool,
     mut index: String,
+    errordoc: String,
     data_upload_chan: &mpsc::Sender<(Vec<u8>, u8, mpsc::Sender<Vec<u8>>)>,
 ) -> Vec<u8> {
     //
@@ -140,6 +142,8 @@ pub async fn upload_resource(
             index = r0.path0.clone();
         };
 
+        let errordoc = "404.html";
+
         web_sys::console::log_1(&JsValue::from(format!(
             "Upload resource returning {:#?}!",
             hex::encode(&core_reference)
@@ -150,7 +154,7 @@ pub async fn upload_resource(
         node0.push(Node {
             data: r0.data_address.clone(), // pub data: Vec<u8>, // repurposed as address
             mime: r0.mime0.clone(),        // pub mime: String,
-            _filename: r0.path0.clone(),   // pub filename: String,
+            filename: r0.filename0.clone(), // pub filename: String,
             path: r0.path0.clone(),        // pub path: String,
         })
     }
@@ -163,7 +167,10 @@ pub async fn upload_resource(
         node0,  // forks
         vec![], // data_forks
         vec![], // reference
-        index,  // index
+        true,   // root manifest
+        0,
+        index,    // index
+        errordoc, // errordoc
         data_upload_chan,
     )
     .await;
