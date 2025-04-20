@@ -277,11 +277,6 @@ pub async fn fresh(
     stream: &mut Stream,
     chan: &mpsc::Sender<(PeerId, u64)>,
 ) -> io::Result<()> {
-    web_sys::console::log_1(&JsValue::from(format!(
-        "Opened Refresh Handle 2 for peer ! {}",
-        amount
-    )));
-
     let empty = etiquette_0::Headers::default();
 
     let mut buf_empty = Vec::new();
@@ -338,11 +333,6 @@ pub async fn fresh(
 
     let refr_am = BigUint::from_bytes_be(&rec_0.amount).to_u64().unwrap();
 
-    web_sys::console::log_1(&JsValue::from(format!(
-        "Accepted Refresh {:#?} from peer {:#?}!",
-        refr_am, peer
-    )));
-
     if amount > 0 {
         chan.send((peer, refr_am)).unwrap();
     }
@@ -356,10 +346,6 @@ pub async fn trieve(
     stream: &mut Stream,
     chan: &mpsc::Sender<Vec<u8>>,
 ) -> io::Result<()> {
-    web_sys::console::log_1(&JsValue::from(format!(
-        "Opened Retrieve Handle 2 for peer !",
-    )));
-
     let empty = etiquette_0::Headers::default();
 
     let mut buf_empty = Vec::new();
@@ -416,11 +402,6 @@ pub async fn trieve(
     };
 
     let rec_1 = rec_0.data;
-
-    // web_sys::console::log_1(&JsValue::from(format!(
-    //     "Got chunk {:#?} from peer {:#?}!",
-    //     hex::encode(chunk_address), peer
-    // )));
 
     chan.send(rec_1).unwrap();
 
@@ -483,8 +464,6 @@ pub async fn refresh_handler(
         web_sys::console::log_1(&JsValue::from(format!("{}", e)));
         return;
     }
-
-    web_sys::console::log_1(&JsValue::from(format!("Refresh complete for {}!", peer)));
 }
 
 pub async fn retrieve_handler(
@@ -510,8 +489,6 @@ pub async fn retrieve_handler(
         web_sys::console::log_1(&JsValue::from(format!("{}", e)));
         return;
     }
-
-    // web_sys::console::log_1(&JsValue::from(format!("{} Retrieve complete!", peer)));
 }
 
 pub async fn pushsync_handler(

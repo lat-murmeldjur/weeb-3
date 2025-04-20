@@ -764,7 +764,6 @@ impl Sekirei {
                     #[allow(irrefutable_let_patterns)]
                     while let re_out = refreshment_instructions_chan_incoming.try_recv() {
                         if !re_out.is_err() {
-                            web_sys::console::log_1(&JsValue::from(format!("Refresh attempt")));
                             let (peer, amount) = re_out.unwrap();
                             {
                                 let map = wings.ongoing_refreshments.lock().unwrap();
@@ -854,7 +853,6 @@ impl Sekirei {
                 #[allow(irrefutable_let_patterns)]
                 while let incoming_request = self.message_port.1.try_recv() {
                     if !incoming_request.is_err() {
-                        web_sys::console::log_1(&JsValue::from(format!("retrieve triggered")));
                         let (n, chan) = incoming_request.unwrap();
                         let encoded_data =
                             retrieve_resource(&n, &data_retrieve_chan_outgoing).await;
@@ -936,7 +934,6 @@ impl Sekirei {
                     if !incoming_request.is_err() {
                         let handle = async {
                             let mut ctrl9 = ctrl6.clone();
-                            web_sys::console::log_1(&JsValue::from(format!("retrieve triggered")));
                             let (n, mode, chan) = incoming_request.unwrap();
                             if mode == 1 {
                                 let chunk_data = retrieve_data(
@@ -989,6 +986,7 @@ impl Sekirei {
 
         let push_data_handle = async {
             let mut timelast = Date::now();
+            let batch_buckets: Arc<Mutex<HashMap<u32, u32>>> = Arc::new(Mutex::new(HashMap::new()));
             loop {
                 let mut request_joiner = Vec::new();
 
@@ -1002,16 +1000,15 @@ impl Sekirei {
 
                             if mode == 1 {
                                 let batch_id =
-        hex::decode("c30dd1d557008751a4c49d1d16210bac9331eebce2adf48d2f057887306e6ec0").unwrap();
-                                let batch_buckets: Arc<Mutex<HashMap<u32, u32>>> =
-                                    Arc::new(Mutex::new(HashMap::new()));
-                                let batch_bucket_limit = 1_u32;
+        hex::decode("9210cb16c79cc4a8cefa2c3f32920271fdb3d00cb929503c0f2456ac62af1321").unwrap();
+
+                                let batch_bucket_limit = 64_u32;
 
                                 let data_reference = push_data(
                                     &n,
                                     true,
                                     batch_id,
-                                    batch_buckets,
+                                    batch_buckets.clone(),
                                     batch_bucket_limit,
                                     &mut ctrl9,
                                     &wings.overlay_peers,
@@ -1027,16 +1024,14 @@ impl Sekirei {
                             }
                             if mode == 0 {
                                 let batch_id =
-        hex::decode("c30dd1d557008751a4c49d1d16210bac9331eebce2adf48d2f057887306e6ec0").unwrap();
-                                let batch_buckets: Arc<Mutex<HashMap<u32, u32>>> =
-                                    Arc::new(Mutex::new(HashMap::new()));
-                                let batch_bucket_limit = 1_u32;
+        hex::decode("9210cb16c79cc4a8cefa2c3f32920271fdb3d00cb929503c0f2456ac62af1321").unwrap();
+                                let batch_bucket_limit = 64_u32;
 
                                 let chunk_reference = push_data(
                                     &n,
                                     false,
                                     batch_id,
-                                    batch_buckets,
+                                    batch_buckets.clone(),
                                     batch_bucket_limit,
                                     &mut ctrl9,
                                     &wings.overlay_peers,

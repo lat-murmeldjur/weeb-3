@@ -253,7 +253,7 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
                     let tx00 = token_contract
                         .call_with_confirmations(
                             "approve",
-                            (contract_address, U256::from(13107200000000000_u64)),
+                            (contract_address, U256::from(419430400000000000_u64)),
                             accounts[0],
                             Options::default(),
                             2,
@@ -274,9 +274,9 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
                             (
                                 Address::from(wallet_address_bytes),
                                 U256::from(100000000000_u64),
-                                17_u8,
+                                22_u8,
                                 16_u8,
-                                [1_u8; 32],
+                                [2_u8; 32],
                                 false,
                             ),
                             accounts[0],

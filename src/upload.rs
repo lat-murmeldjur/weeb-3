@@ -142,8 +142,6 @@ pub async fn upload_resource(
             index = r0.path0.clone();
         };
 
-        let errordoc = "404.html";
-
         web_sys::console::log_1(&JsValue::from(format!(
             "Upload resource returning {:#?}!",
             hex::encode(&core_reference)

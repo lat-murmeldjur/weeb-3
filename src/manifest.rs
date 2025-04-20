@@ -150,8 +150,7 @@ pub async fn interpret_manifest(
         let fork_prefix = &cd[fork_start + 2..fork_start + 2 + (fork_prefix_length as usize)];
         let string_fork_prefix = String::from_utf8(fork_prefix.to_vec()).unwrap_or("".to_string());
         web_sys::console::log_1(&JsValue::from(format!(
-            "string_fork_prefix: {} {}",
-            hex::encode(&string_fork_prefix),
+            "string_fork_prefix: {}",
             string_fork_prefix
         )));
 
@@ -159,7 +158,7 @@ pub async fn interpret_manifest(
         let fork_reference_delimiter = fork_prefix_delimiter + (ref_size as usize);
         let fork_reference = &cd[fork_prefix_delimiter..fork_reference_delimiter];
         web_sys::console::log_1(&JsValue::from(format!(
-            "fork_reference: {}",
+            "fork_reference____: {}",
             hex::encode(fork_reference)
         )));
 

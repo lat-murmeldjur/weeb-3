@@ -4,9 +4,8 @@ use crate::{
     //
     upload_data,
     //
-    HashMap,
-    //
     JsValue,
+    //
 };
 
 use serde_json::json;
@@ -32,11 +31,13 @@ pub async fn create_manifest(
     errordoc: String,
     data_upload_chan: &mpsc::Sender<(Vec<u8>, u8, mpsc::Sender<Vec<u8>>)>,
 ) -> Vec<u8> {
+    let mut fncutoff = first_node_cutoff;
+
     let mut manifest_bytes_vec: Vec<u8> = vec![];
 
     let mut forks = input_forks.clone();
 
-    forks.sort_by(|a, b| alphanumeric_sort::compare_path(&a.path, &b.path));
+    forks.sort_by(|a, b| a.path.cmp(&b.path));
 
     let flen = forks.len();
 
@@ -113,20 +114,28 @@ pub async fn create_manifest(
     let mut fork_bases_virtual: Vec<Vec<u8>> = vec![];
 
     if forks.len() > 0 {
-        let mut fork_groups0: HashMap<String, Vec<Node>> = HashMap::new();
+        let mut fork_groups0: Vec<(String, Vec<Node>)> = vec![];
 
         for forks0 in &forks {
             let path0 = forks0.path.clone();
             let leading_char = path0[0..1].to_string();
-            fork_groups0
-                .entry(leading_char)
-                .or_insert(vec![])
-                .push(forks0.clone());
+
+            let mut exists = false;
+            for (a, b) in fork_groups0.iter_mut() {
+                if *a == leading_char {
+                    b.push(forks0.clone());
+                    exists = true;
+                    break;
+                };
+            }
+            if !exists {
+                fork_groups0.push((leading_char, vec![forks0.clone()]));
+            };
         }
 
-        let mut fork_groups1: HashMap<String, Vec<Node>> = HashMap::new();
+        let mut fork_groups1: Vec<(String, Vec<Node>)> = vec![];
 
-        for (_leading_char, forkgroup0) in fork_groups0.into_iter() {
+        for (_, forkgroup0) in fork_groups0 {
             let mut common_prefix = forkgroup0[0].path.clone();
             for fork0 in &forkgroup0 {
                 while !fork0.path.starts_with(&common_prefix) {
@@ -134,23 +143,29 @@ pub async fn create_manifest(
                 }
             }
 
-            fork_groups1.insert(common_prefix, forkgroup0);
+            fork_groups1.push((common_prefix, forkgroup0));
         }
 
+        fork_groups1.sort_by(|a, b| a.0.cmp(&b.0));
+
         let mut cutoff_first_indicator = 0;
-        for (common_prefix, forkgroup1) in fork_groups1.into_iter() {
+        for (common_prefix, mut forkgroup1) in fork_groups1 {
+            // let mut forkgroup1 = fork_groups1[common_prefix].clone();
+            forkgroup1.sort_by(|a, b| a.path.cmp(&b.path));
             cutoff_first_indicator += 1;
             if forkgroup1.len() == 1 {
                 let forks0 = &forkgroup1[0];
 
                 let mut vforks: Vec<String> = vec![];
 
-                let path0: String = match cutoff_first_indicator == 1 && first_node_cutoff > 0 {
-                    true => forks0.path.clone(),
-                    false => {
-                        if forks0.path.len() > 30 - (first_node_cutoff) {
-                            vforks.push(forks0.path[0..30 - (first_node_cutoff % 30)].to_string());
-                            forks0.path[30 - (first_node_cutoff % 30)..].to_string()
+                let path0: String = match cutoff_first_indicator == 1 && fncutoff > 0 {
+                    false => forks0.path.clone(),
+                    true => {
+                        if forks0.path.len() > 30 - (fncutoff % 30) {
+                            vforks.push(forks0.path[0..30 - (fncutoff % 30)].to_string());
+                            let tr = forks0.path[30 - (fncutoff % 30)..].to_string();
+                            fncutoff = 0;
+                            tr
                         } else {
                             forks0.path.clone()
                         }
@@ -200,10 +215,9 @@ pub async fn create_manifest(
                 .await;
 
                 current_data_reference = upload_data(tip_mf, encrypted, data_upload_chan).await;
-                web_sys::console::log_1(&JsValue::from(format!("vfll {}", vforks.len())));
+
                 for j in 0..vforks.len() {
                     let i = vforks.len() - 1 - j;
-                    web_sys::console::log_1(&JsValue::from(format!("vfl {}", i)));
 
                     //
                     let mut current_metadata = vec![];
@@ -243,9 +257,9 @@ pub async fn create_manifest(
                 let mut forkgroup2: Vec<Node> = vec![];
                 for fork0 in forkgroup1 {
                     forkgroup2.push(Node {
-                        data: fork0.data,
-                        mime: fork0.mime,
-                        filename: fork0.filename,
+                        data: fork0.data.clone(),
+                        mime: fork0.mime.clone(),
+                        filename: fork0.filename.clone(),
                         path: fork0.path[common_prefix.len()..].to_string(),
                     });
                 }
@@ -253,22 +267,28 @@ pub async fn create_manifest(
                 let group_manifest = Box::pin(create_manifest(
                     obfuscated,
                     encrypted,
-                    forkgroup2,                              // forks
-                    vec![],                                  // data_forks
-                    vec![],                                  // reference
-                    false,                                   // root manifest
-                    first_node_cutoff + common_prefix.len(), // weird string prefix cutoff for first element
-                    "".to_string(),                          // index
-                    "".to_string(),                          // errordoc
+                    forkgroup2,                     // forks
+                    vec![],                         // data_forks
+                    vec![],                         // reference
+                    false,                          // root manifest
+                    fncutoff + common_prefix.len(), // weird string prefix cutoff for first element
+                    "".to_string(),                 // index
+                    "".to_string(),                 // errordoc
                     data_upload_chan,
                 ))
                 .await;
 
+                fncutoff = 0;
+
                 let group_data_reference =
                     upload_data(group_manifest, encrypted, data_upload_chan).await;
 
-                let group_fork =
-                    create_fork(common_prefix, group_data_reference.clone(), vec![]).await;
+                let group_fork = create_fork(
+                    common_prefix.to_string(),
+                    group_data_reference.clone(),
+                    vec![],
+                )
+                .await;
 
                 fork_bases.push(group_fork);
             }
@@ -308,9 +328,17 @@ pub async fn create_manifest(
         manifest_bytes_vec.len()
     )));
 
-    fork_bases.sort_by(|a, b| {
-        alphanumeric_sort::compare_path(forkstring(a.to_vec()), forkstring(b.to_vec()))
-    });
+    fork_bases.sort_by(|a, b| forkstring(a.to_vec()).cmp(&forkstring(b.to_vec())));
+
+    let mut kj = 0;
+    for log in &fork_bases {
+        web_sys::console::log_1(&JsValue::from(format!(
+            "Sorted prefix: {} {}",
+            kj,
+            forkstring(log.to_vec())
+        )));
+        kj += 1;
+    }
 
     for f1 in &data_forks {
         manifest_bytes_vec.append(&mut f1.clone());
@@ -331,8 +359,6 @@ pub async fn create_manifest(
 
     for f1 in data_forks {
         let b: u8 = f1[2];
-
-        web_sys::console::log_1(&JsValue::from(format!("######## {}", b)));
 
         bits_as_bytes[(b / 8) as usize] |= 1 << (b % 8);
     }
@@ -405,14 +431,22 @@ pub async fn create_fork(path: String, reference: Vec<u8>, metadata: Vec<u8>) ->
     }
     if metadata.len() > 0 {
         let xl0 = 2 + metadata.len();
-        let mut xl1 = xl0 % 32;
-        if xl1 > 0 {
-            xl1 = 1;
-        }
-        let xl = xl0 + 32 * xl1 - (xl0 % 32);
+
+        // if metadataJSONBytesSizeWithSize < 32
+        // paddingLength := 32 - metadataJSONBytesSizeWithSize
+        // } else if metadataJSONBytesSizeWithSize > 32
+        // paddingLength := 32 - metadataJSONBytesSizeWithSize % 32
+
+        //
+
+        let xl1 = match xl0 < 32 {
+            true => 32 - xl0,
+            false => 32 - (xl0 % 32),
+        };
+
+        let xl = xl0 + xl1;
 
         node.append(&mut ((xl - 2) as u16).to_be_bytes().to_vec());
-
         node.append(&mut metadata.clone());
 
         let pdl = xl - 2 - metadata.len();
