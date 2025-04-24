@@ -130,11 +130,13 @@ pub struct Sekirei {
         mpsc::Sender<(
             Vec<(String, String, String, Vec<u8>)>,
             bool,
+            String,
             mpsc::Sender<Vec<u8>>,
         )>,
         mpsc::Receiver<(
             Vec<(String, String, String, Vec<u8>)>,
             bool,
+            String,
             mpsc::Sender<Vec<u8>>,
         )>,
     ),
@@ -209,7 +211,7 @@ impl Sekirei {
         );
     }
 
-    pub async fn post_upload(&self, file: File, encryption: bool) -> Vec<u8> {
+    pub async fn post_upload(&self, file: File, encryption: bool, index_string: String) -> Vec<u8> {
         web_sys::console::log_1(&JsValue::from(format!("File size {}", file.size())));
 
         let (chan_out, chan_in) = mpsc::channel::<Vec<u8>>();
@@ -233,8 +235,16 @@ impl Sekirei {
 
         let content: Vec<u8> = content_u8a.to_vec();
 
+        let mut index_document = "".to_string();
+
         if f_type == "application/x-tar" || f_type == "application/tar" {
             // let tar = GzDecoder::new(file);
+
+            index_document = match index_string.len() == 0 {
+                true => "index.html".to_string(),
+                false => index_string,
+            };
+
             let mut archive = Archive::new(&content[..]);
 
             for f0 in archive.entries().unwrap() {
@@ -281,8 +291,6 @@ impl Sekirei {
                         },
                         _ => continue,
                     };
-                    // let mut fc0;
-                    //copy(&mut f0, &mut fc0).unwrap();
 
                     let mut data0: Vec<u8> = vec![];
 
@@ -297,7 +305,10 @@ impl Sekirei {
             fvec0.push((f_name, "".to_string(), f_type, content));
         }
 
-        let _ = self.upload_port.0.send((fvec0, encryption, chan_out));
+        let _ = self
+            .upload_port
+            .0
+            .send((fvec0, encryption, index_document, chan_out));
 
         let k0 = async {
             let mut timelast: f64;
@@ -427,6 +438,7 @@ impl Sekirei {
         let (u_out, u_in) = mpsc::channel::<(
             Vec<(String, String, String, Vec<u8>)>,
             bool,
+            String,
             mpsc::Sender<Vec<u8>>,
         )>();
         let (b_out, b_in) = mpsc::channel::<(String, mpsc::Sender<String>)>();
@@ -882,7 +894,7 @@ impl Sekirei {
                 while let incoming_request = self.upload_port.1.try_recv() {
                     if !incoming_request.is_err() {
                         web_sys::console::log_1(&JsValue::from(format!("push triggered")));
-                        let (file0, enc, chan) = incoming_request.unwrap();
+                        let (file0, enc, index, chan) = incoming_request.unwrap();
                         let mut res0: Vec<Resource> = vec![];
                         for f in file0 {
                             res0.push(Resource {
@@ -897,7 +909,7 @@ impl Sekirei {
                         let push_reference = upload_resource(
                             res0,
                             enc,
-                            "index.html".to_string(),
+                            index,
                             "404.html".to_string(),
                             &data_upload_chan_outgoing,
                         )

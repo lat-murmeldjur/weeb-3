@@ -338,6 +338,19 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
                 file.size()
             )));
 
+            let index_input = document
+                .get_element_by_id("indexString")
+                .expect("#indexString should exist");
+
+            let index_input = index_input
+                .dyn_ref::<HtmlInputElement>()
+                .expect("#indexString should be a HtmlInputElement");
+
+            let index_string = match index_input.value().parse::<String>() {
+                Ok(text) => text,
+                Err(_) => "".to_string(),
+            };
+
             // let content_u8a = Uint8Array::new(&content_buf);
 
             let msgobj = js_sys::Object::new();
@@ -353,6 +366,12 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
                 &msgobj,
                 &JsValue::from_str("encryption0"),
                 &JsValue::from_bool(false),
+            );
+
+            let _ = js_sys::Reflect::set(
+                &msgobj,
+                &JsValue::from_str("index0"),
+                &JsValue::from_str(&index_string),
             );
 
             let worker_handle_2 = worker_handle3.borrow();
