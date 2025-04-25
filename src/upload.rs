@@ -12,6 +12,9 @@ use crate::{
     //    // // // // // // // //
     mpsc,
     //    // // // // // // // //
+    persistence::bump_bucket,
+    //    // // // // // // // //
+    //    // // // // // // // //
     price,
     //    // // // // // // // //
     pushsync_handler,
@@ -37,7 +40,6 @@ use crate::{
     PeerId,
     //    // // // // // // // //
     PROTOCOL_ROUND_TIME,
-    //    // // // // // // // //
 };
 
 use byteorder::ByteOrder;
@@ -48,12 +50,9 @@ use alloy::primitives::keccak256;
 use alloy::signers::local::PrivateKeySigner;
 use alloy::signers::Signer;
 
-use async_std::sync::Arc;
-
 pub async fn stamp_chunk(
     // stamp_signer: Signer,
     batch_id: Vec<u8>,
-    batch_buckets: Arc<Mutex<HashMap<u32, u32>>>,
     batch_bucket_limit: u32,
     chunk_address: Vec<u8>,
     //
@@ -65,23 +64,22 @@ pub async fn stamp_chunk(
     };
 
     let bucket = u32::from_be_bytes(chunk_address[..4].try_into().unwrap()) >> (32 - 16);
-    let mut index = 0_u32;
 
-    {
-        let mut batch_buckets_mut = batch_buckets.lock().unwrap();
-        match batch_buckets_mut.get(&bucket) {
-            Some(numbr) => {
-                index = *numbr;
-                if index > batch_bucket_limit {
-                    web_sys::console::log_1(&JsValue::from(format!("Stamp bucket overuse")));
+    #[allow(unused_assignments)]
+    let mut index = 0;
 
-                    return vec![];
-                }
-            }
-            _ => {}
-        }
-        _ = batch_buckets_mut.insert(bucket, index + 1);
-    }
+    let (h, index0) = bump_bucket(hex::encode(&batch_id).to_string() + &bucket.to_string()).await;
+    index = index0;
+
+    if index > batch_bucket_limit {
+        web_sys::console::log_1(&JsValue::from(format!("Stamp bucket overuse")));
+        return vec![];
+    };
+
+    if !h {
+        web_sys::console::log_1(&JsValue::from(format!("Stamp bucket use fail")));
+        return vec![];
+    };
 
     let index_bytes = [bucket.to_be_bytes(), index.to_be_bytes()].concat();
 
@@ -233,7 +231,7 @@ pub async fn push_data(
     data: &Vec<u8>,
     encryption: bool,
     batch_id: Vec<u8>,
-    batch_buckets: Arc<Mutex<HashMap<u32, u32>>>,
+
     batch_bucket_limit: u32,
     control: &mut stream::Control,
     peers: &Mutex<HashMap<String, PeerId>>,
@@ -250,7 +248,6 @@ pub async fn push_data(
             data,
             encryption,
             batch_id,
-            batch_buckets,
             batch_bucket_limit,
             control,
             peers,
@@ -305,7 +302,6 @@ pub async fn push_data(
             let data_carry = data[data_start..data_end].to_vec();
 
             let bi0 = batch_id.clone();
-            let bb0 = batch_buckets.clone();
 
             let handle = async move {
                 return (
@@ -313,7 +309,6 @@ pub async fn push_data(
                         &data_carry,
                         encryption,
                         bi0,
-                        bb0,
                         batch_bucket_limit,
                         &mut ctrl,
                         peers,
@@ -359,7 +354,6 @@ pub async fn push_data(
             &data_capstone,
             encryption,
             batch_id,
-            batch_buckets,
             batch_bucket_limit,
             control,
             peers,
@@ -385,7 +379,6 @@ pub async fn push_chunk(
     data: &Vec<u8>,
     encryption: bool,
     batch_id: Vec<u8>,
-    batch_buckets: Arc<Mutex<HashMap<u32, u32>>>,
     batch_bucket_limit: u32,
     control: &mut stream::Control,
     peers: &Mutex<HashMap<String, PeerId>>,
@@ -426,7 +419,6 @@ pub async fn push_chunk(
     let cstamp0 = stamp_chunk(
         //
         batch_id,
-        batch_buckets,
         batch_bucket_limit,
         caddr.clone(),
     )

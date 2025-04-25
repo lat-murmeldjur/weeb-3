@@ -1,4 +1,4 @@
-use crate::{decode_resources, init_panic_hook, Body};
+use crate::{decode_resources, init_panic_hook, persistence::*, Body};
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::str::FromStr;
@@ -35,6 +35,27 @@ use alloy::{network::EthereumWallet, primitives::keccak256, signers::local::Priv
 #[wasm_bindgen]
 pub async fn interweeb(_st: String) -> Result<(), JsError> {
     init_panic_hook();
+
+    let k0 = bump_bucket("test_bucket_id".to_string()).await;
+    web_sys::console::log_1(&JsValue::from(format!("test0 {:#?}", k0)));
+
+    let k1 = bump_bucket("test_bucket_id".to_string()).await;
+    web_sys::console::log_1(&JsValue::from(format!("test0 {:#?}", k1)));
+
+    let k2 = bump_bucket("test_bucket_id".to_string()).await;
+    web_sys::console::log_1(&JsValue::from(format!("test0 {:#?}", k2)));
+
+    let kd = reset_bucket("test_bucket_id".to_string()).await;
+    web_sys::console::log_1(&JsValue::from(format!("test0 {:#?}", kd)));
+
+    let k3 = bump_bucket("test_bucket_id".to_string()).await;
+    web_sys::console::log_1(&JsValue::from(format!("test0 {:#?}", k3)));
+
+    let k4 = bump_bucket("test_bucket_id".to_string()).await;
+    web_sys::console::log_1(&JsValue::from(format!("test0 {:#?}", k4)));
+
+    let k5 = bump_bucket("test_bucket_id".to_string()).await;
+    web_sys::console::log_1(&JsValue::from(format!("test0 {:#?}", k5)));
 
     let window = &web_sys::window().unwrap();
 

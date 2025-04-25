@@ -49,6 +49,8 @@ mod manifest;
 
 mod manifest_upload;
 
+mod persistence;
+
 mod retrieval;
 use retrieval::*;
 
@@ -610,11 +612,12 @@ impl Sekirei {
                 )
                 .await;
 
+                web_sys::console::log_1(&JsValue::from(format!(
+                    "Current Event Handled {:#?}",
+                    event
+                )));
+
                 if !event.is_err() {
-                    // web_sys::console::log_1(&JsValue::from(format!(
-                    //     "Current Event Handled {:#?}",
-                    //     event
-                    // )));
                     match event.unwrap() {
                         Some(SwarmEvent::ConnectionEstablished {
                             // peer_id,
@@ -998,7 +1001,6 @@ impl Sekirei {
 
         let push_data_handle = async {
             let mut timelast = Date::now();
-            let batch_buckets: Arc<Mutex<HashMap<u32, u32>>> = Arc::new(Mutex::new(HashMap::new()));
             loop {
                 let mut request_joiner = Vec::new();
 
@@ -1020,7 +1022,6 @@ impl Sekirei {
                                     &n,
                                     true,
                                     batch_id,
-                                    batch_buckets.clone(),
                                     batch_bucket_limit,
                                     &mut ctrl9,
                                     &wings.overlay_peers,
@@ -1043,7 +1044,6 @@ impl Sekirei {
                                     &n,
                                     false,
                                     batch_id,
-                                    batch_buckets.clone(),
                                     batch_bucket_limit,
                                     &mut ctrl9,
                                     &wings.overlay_peers,
