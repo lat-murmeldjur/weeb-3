@@ -15,9 +15,11 @@ class Code_One {
 		clientele('cargo', ['fix', '--allow-staged', '--allow-dirty'], count);
 		var wbuild:Array<Null<Bool>> = [null];
 		var build:Array<Null<Bool>> = [null];
-
-		clientele('wasm-pack', [ 'build', '--target', 'web', '--out-dir', 'static'], count, wbuild);
 		clientele('cargo', ['build'], count, build);
+
+		Sys.putEnv("RUSTFLAGS", "--cfg getrandom_backend=\"wasm_js\"");
+		clientele('wasm-pack', [ '-v', 'build', '--target', 'web', '--out-dir', 'static'], count, wbuild);
+		Sys.putEnv("RUSTFLAGS", null);
 
 		if ( build[0] && wbuild[0]) {
 			clientele('cp', [ './static/index.html', './docs/' ], count);

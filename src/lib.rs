@@ -8,30 +8,30 @@ use async_std::sync::Arc;
 use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::num::NonZero;
-use std::sync::{mpsc, Mutex};
+use std::sync::{Mutex, mpsc};
 use std::time::Duration;
 
 use tar::Archive;
 
 use libp2p::{
-    autonat,
+    PeerId, StreamProtocol, Swarm, autonat,
     core::{self, Multiaddr, Transport},
     dcutr,
     futures::{
+        StreamExt,
         future::join_all, //
         join,
-        StreamExt,
     },
     identify, identity,
     identity::{ecdsa, ecdsa::SecretKey},
     noise, ping,
     swarm::{NetworkBehaviour, SwarmEvent},
-    websocket_websys, yamux, PeerId, StreamProtocol, Swarm,
+    websocket_websys, yamux,
 };
 use libp2p_stream as stream;
 
 use js_sys::{Date, Uint8Array};
-use wasm_bindgen::{prelude::*, JsValue};
+use wasm_bindgen::{JsValue, prelude::*};
 use web_sys::File;
 
 mod accounting;
@@ -155,6 +155,7 @@ pub struct Wings {
     overlay_peers: Mutex<HashMap<String, PeerId>>,
     accounting_peers: Mutex<HashMap<PeerId, Mutex<PeerAccounting>>>,
     ongoing_refreshments: Mutex<HashSet<PeerId>>,
+    connection_attempts: Mutex<HashSet<PeerId>>,
 }
 
 #[wasm_bindgen]
@@ -435,6 +436,7 @@ impl Sekirei {
         let accounting_peers: Mutex<HashMap<PeerId, Mutex<PeerAccounting>>> =
             Mutex::new(HashMap::new());
         let ongoing_refreshments: Mutex<HashSet<PeerId>> = Mutex::new(HashSet::new());
+        let connection_attempts: Mutex<HashSet<PeerId>> = Mutex::new(HashSet::new());
 
         let (m_out, m_in) = mpsc::channel::<(Vec<u8>, mpsc::Sender<Vec<u8>>)>();
         let (u_out, u_in) = mpsc::channel::<(
@@ -453,6 +455,7 @@ impl Sekirei {
                 overlay_peers: overlay_peers,
                 accounting_peers: accounting_peers,
                 ongoing_refreshments: ongoing_refreshments,
+                connection_attempts: connection_attempts,
             }),
             message_port: (m_out, m_in),
             upload_port: (u_out, u_in),
@@ -561,12 +564,20 @@ impl Sekirei {
                             }
                         };
 
-                        match try_from_multiaddr(&addr4.clone()) {
+                        let _pid: PeerId = match try_from_multiaddr(&addr4.clone()) {
                             Some(aok) => {
                                 let connected_peers_map = wings.connected_peers.lock().unwrap();
                                 if connected_peers_map.contains_key(&aok) {
                                     continue;
                                 }
+                                let mut connection_attempts_map =
+                                    wings.connection_attempts.lock().unwrap();
+                                if connection_attempts_map.contains(&aok) {
+                                    continue;
+                                } else {
+                                    connection_attempts_map.insert(aok);
+                                }
+                                aok
                             }
                             _ => {
                                 continue;
@@ -668,6 +679,19 @@ impl Sekirei {
                         //         break;
                         //     }
                         // };
+                        let _pid: PeerId = match try_from_multiaddr(&addr33.clone()) {
+                            Some(aok) => {
+                                let mut connection_attempts_map =
+                                    wings.connection_attempts.lock().unwrap();
+                                if connection_attempts_map.contains(&aok) {
+                                    continue;
+                                } else {
+                                    connection_attempts_map.insert(aok);
+                                }
+                                aok
+                            }
+                            _ => break,
+                        };
 
                         let _ = swarm.dial(addr33.clone());
 
@@ -765,8 +789,11 @@ impl Sekirei {
                         if !pt_in.is_err() {
                             let (peer, amount) = pt_in.unwrap();
                             let accounting = wings.accounting_peers.lock().unwrap();
-                            let accounting_peer = accounting.get(&peer).unwrap();
-                            set_payment_threshold(accounting_peer, amount);
+                            let accounting_peer_lock = match accounting.get(&peer) {
+                                Some(aok) => aok,
+                                _ => continue,
+                            };
+                            set_payment_threshold(accounting_peer_lock, amount);
                         } else {
                             break;
                         }
@@ -791,8 +818,14 @@ impl Sekirei {
                             let datenow = Date::now();
                             {
                                 let accounting = wings.accounting_peers.lock().unwrap();
-                                let accounting_peer_lock = accounting.get(&peer).unwrap();
-                                let mut accounting_peer = accounting_peer_lock.lock().unwrap();
+                                let accounting_peer_lock = match accounting.get(&peer) {
+                                    Some(aok) => aok,
+                                    _ => continue,
+                                };
+                                let mut accounting_peer = match accounting_peer_lock.lock() {
+                                    Ok(aok) => aok,
+                                    _ => continue,
+                                };
                                 daten = accounting_peer.refreshment;
                                 if datenow > accounting_peer.refreshment + 1000.0 {
                                     accounting_peer.refreshment = datenow;
@@ -825,8 +858,11 @@ impl Sekirei {
                             let (peer, amount) = re_in.unwrap();
                             {
                                 let accounting = wings.accounting_peers.lock().unwrap();
-                                let accounting_peer = accounting.get(&peer).unwrap();
-                                apply_refreshment(accounting_peer, amount);
+                                let accounting_peer_lock = match accounting.get(&peer) {
+                                    Some(aok) => aok,
+                                    _ => continue,
+                                };
+                                apply_refreshment(accounting_peer_lock, amount);
                             }
                             let mut map = wings.ongoing_refreshments.lock().unwrap();
                             if map.contains(&peer) {

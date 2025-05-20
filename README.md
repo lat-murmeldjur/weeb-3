@@ -9,7 +9,7 @@ Ensure you have [`wasm-pack`](https://rustwasm.github.io/wasm-pack/), [`protoc`]
 
 1. Build the client library:
 ```shell
-wasm-pack build --target web --out-dir static
+RUSTFLAGS='--cfg getrandom_backend="wasm_js"' wasm-pack build --target web --out-dir static
 ```
 
 2. Start the local server to serve html, js and wasm files:

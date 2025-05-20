@@ -23,16 +23,17 @@ rand = "0.8"
 prost = { git = "https://github.com/tokio-rs/prost.git" }
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = { git = "https://github.com/serde-rs/json.git" }
+getrandom = { version = "0.3.3", features = ["wasm_js"] }
+
 
 [build-dependencies]
 prost-build = { git = "https://github.com/tokio-rs/prost.git" }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 axum = { git = "https://github.com/tokio-rs/axum.git" }
-axum-server = { version = "0.7", features = ["tls-rustls"] }
+axum-server = { git = "https://github.com/programatik29/axum-server.git", features = ["tls-rustls"] }
 rustls = { version = "0.23", features = ["ring","logging","tls12"]}
-
-rust-embed = { git = "https://github.com/pyrossh/rust-embed.git", features = ["include-exclude", "interpolate-folder-path"] }
+rust-embed = { version = "8.7.1", features = ["include-exclude", "interpolate-folder-path"] }
 tokio = { version = "1.38.0", default-features = false, features = ["macros", "net", "rt", "signal", "rt-multi-thread"] }
 tower-http = { git = "https://github.com/tower-rs/tower-http.git", features = ["cors"] }
 mime_guess = { git = "https://github.com/abonander/mime_guess.git" }
@@ -47,6 +48,7 @@ alloy = { git = "https://github.com/alloy-rs/alloy.git", features = [
     "signer-local",
     "wasm-bindgen",
 ] }
+getrandom = { version = "0.3.3", features = ["wasm_js"] }
 alloy-signer-local = { git = "https://github.com/alloy-rs/alloy.git" }
 async-std = { git = "https://github.com/async-rs/async-std.git" }
 console_error_panic_hook = { git = "https://github.com/rustwasm/console_error_panic_hook.git" }

@@ -1,5 +1,24 @@
 use crate::{
     // // // // // // // //
+    Date,
+    // // // // // // // //
+    Duration,
+    // // // // // // // //
+    HashMap,
+    // // // // // // // //
+    HashSet,
+    // // // // // // // //
+    JsValue,
+    // // // // // // // //
+    Mutex,
+    // // // // // // // //
+    PROTOCOL_ROUND_TIME,
+    // // // // // // // //
+    // // // // // // // //
+    PeerAccounting,
+    // // // // // // // //
+    PeerId,
+    // // // // // // // //
     apply_credit,
     // // // // // // // //
     cancel_reserve,
@@ -25,32 +44,13 @@ use crate::{
     valid_cac,
     // // // // // // // //
     valid_soc,
-    // // // // // // // //
-    Date,
-    // // // // // // // //
-    Duration,
-    // // // // // // // //
-    HashMap,
-    // // // // // // // //
-    HashSet,
-    // // // // // // // //
-    JsValue,
-    // // // // // // // //
-    Mutex,
-    // // // // // // // //
-    PeerAccounting,
-    // // // // // // // //
-    PeerId,
-    // // // // // // // //
-    PROTOCOL_ROUND_TIME,
-    // // // // // // // //
 };
 
 use byteorder::ByteOrder;
 
 use alloy::primitives::keccak256;
 
-use libp2p::futures::{stream::FuturesUnordered, StreamExt};
+use libp2p::futures::{StreamExt, stream::FuturesUnordered};
 
 pub async fn retrieve_resource(
     chunk_address: &Vec<u8>,
@@ -612,44 +612,3 @@ pub async fn seek_latest_feed_update(
 //
 //
 //
-// 3ab408eea4f095bde55c1caeeac8e7fcff49477660f0a28f652f0a6d9c60d05f
-// ef30a6c57b0c14d6dc7d7e035b41a88cd48440a50e920eaefa3e1620da11eca8
-// 07f7a2e36a1e481de0da16f5e0647a1a11cf6a6c6fcaf89d367a7d63dbbbc8e7 ( d61aa6bbb728ab89f427d4c01d455845f44ef188fb701681b35a918fdc19a19f )
-// 6dd3f101738f58d3e51f1c914723a226e6180538fed7f1f6bf10089de834e82e ( d213da296b93456148b5a971adb9e8d571daf77a6b6f5c3b997198587ca35960 )
-// 908fb0f1f4b1a173f422bdbf35e9cc9ba0dae0799ff688978c6077df7ad57f54
-// 595f0537cebc3d0ea0d145d19297ae793d9b01ab560d07f6583b8b9dc39cecb3
-// 9540c03a36fbacb12a8fdb3ab1fbda7e43958bef44fb965bca5521053d7dfd89
-// b255e98a86f783f612ed8ccae2701a58421960a745e73356bb94aec7fe4b6caf
-// fad8c208043b864866d157f7465847d4af75307f6382b573dec41bcbbb16bf13
-//
-// 9372d6006de7d4dcc054191e2bae19acb13f8e199ecdb12afa7d55eab4c12599
-// 358d47f9e1b2e99d2f20166ea1c70387949a2e78b286e1636649b95857bca617
-// 46e8c135283b21e78b135a526c72c3f6f2cbf3aee31087f3fba1f332b5739a1c
-// 02943a6a3d69ff8dda5016b24b7fbf69908dfe058a4647d23d8d69daff838494
-//
-// 17618f9a17eac7fa5bba2bc0705ae33fc242a1e1c069b7f1b4f310f5125e812c
-// 17618f9a17eac7fa5bba2bc0705ae33fc242a1e1c069b7f1b4f310f5125e812c
-//
-// c85d8a29aa330c0521910729abfae181ce3d1fbd39d31b2b6664530fb94ab4e5
-// 743e99f3888774cade3996f0a378f6d99378c255ab1bf25ccc5ccd345723c186
-//
-// c744b9670f372f2b0a3f2600fe16fc04c1a3ee4aff6bd9d09e0230abee0b5ec7
-// 02f75ae4f87d013080ed1e29b6a18e85e54ca9efa1c7ee5ed7761f6204cfedfa
-// 9f2a74cdaad2654660bb95b3e29354696b25d492072110ef091d48434e1d76eed80e865888dd5686ada4acc4528dec8925298a7c818cd758dc95c31c0687acb6
-//
-// a018d027eeb247872ef8b77966baa34b644adeccfdf62f41382714e912632ddbfbabb83b217431f66f872f2bfb2ecb001935152c1c380b1200574c6a3ea03541
-//
-// 595f0537cebc3d0ea0d145d19297ae793d9b01ab560d07f6583b8b9dc39cecb3
-//
-// 4f58bd3032b6a3a36815e7e1920929ff7798342e61b0305bc9cd042bc99f5673
-// a2bc4c23ff7cd562004d2c0333fe65bfeeaf6ad602582f11d0c456ba1b6bbca8
-//
-// 82b57bba3dbf534be1eb0a1f9e02c02b6d5d5ad676a1f2ff0952e84c83ec9a16
-// 82b57bba3dbf534be1eb0a1f9e02c02b6d5d5ad676a1f2ff0952e84c83ec9a16
-// af2f89e23b3fc071ed2dfd6fc022a2090be26248fc86be26386f6a012dc1a0ea
-//
-
-// bf0dcbbdec22e5c3963cbd363519c5be7b63b27c6b22caad871b236260c4901a
-// 6ecc088819b294e083c67252de23fb94695ae42caea0ca7e65fb775b1bd47455
-
-// cddfbbf0b44d594b8580c5b5e8ea809ed7d6c9dd1f60e071ebcf6996ef154d2c
