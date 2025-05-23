@@ -21,6 +21,7 @@ use libp2p::{
         StreamExt,
         future::join_all, //
         join,
+        stream::FuturesUnordered,
     },
     identify, identity,
     identity::{ecdsa, ecdsa::SecretKey},
@@ -491,6 +492,9 @@ impl Sekirei {
         let (data_upload_chan_outgoing, data_upload_chan_incoming) =
             mpsc::channel::<(Vec<u8>, u8, mpsc::Sender<Vec<u8>>)>();
 
+        let (chunk_upload_chan_outgoing, chunk_upload_chan_incoming) =
+            mpsc::channel::<(usize, Vec<u8>, u8)>();
+
         let ctrl;
         let mut incoming_pricing_streams;
         let mut incoming_gossip_streams;
@@ -517,6 +521,7 @@ impl Sekirei {
         let mut ctrl3 = ctrl.clone();
         let ctrl4 = ctrl.clone();
         let ctrl6 = ctrl.clone();
+        let ctrl7 = ctrl.clone();
 
         let pricing_inbound_handle = async move {
             web_sys::console::log_1(&JsValue::from(format!("Opened Pricing handler 1")));
@@ -1044,55 +1049,22 @@ impl Sekirei {
                 while let incoming_request = data_upload_chan_incoming.try_recv() {
                     if !incoming_request.is_err() {
                         let handle = async {
-                            let mut ctrl9 = ctrl6.clone();
                             web_sys::console::log_1(&JsValue::from(format!("push triggered")));
                             let (n, mode, chan) = incoming_request.unwrap();
 
-                            if mode == 1 {
-                                let batch_id =
-        hex::decode("9210cb16c79cc4a8cefa2c3f32920271fdb3d00cb929503c0f2456ac62af1321").unwrap();
+                            let encrypted_data = match mode {
+                                0 => false,
+                                _ => true,
+                            };
 
-                                let batch_bucket_limit = 64_u32;
+                            let data_reference =
+                                push_data(n, encrypted_data, &chunk_upload_chan_outgoing).await;
+                            web_sys::console::log_1(&JsValue::from(format!(
+                                "Writing response to encrypted : {} push data request",
+                                encrypted_data
+                            )));
 
-                                let data_reference = push_data(
-                                    &n,
-                                    true,
-                                    batch_id,
-                                    batch_bucket_limit,
-                                    &mut ctrl9,
-                                    &wings.overlay_peers,
-                                    &wings.accounting_peers,
-                                    &refreshment_instructions_chan_outgoing,
-                                )
-                                .await;
-                                web_sys::console::log_1(&JsValue::from(format!(
-                                    "Writing response to encrypted push data request"
-                                )));
-
-                                chan.send(data_reference).unwrap();
-                            }
-                            if mode == 0 {
-                                let batch_id =
-        hex::decode("9210cb16c79cc4a8cefa2c3f32920271fdb3d00cb929503c0f2456ac62af1321").unwrap();
-                                let batch_bucket_limit = 64_u32;
-
-                                let chunk_reference = push_data(
-                                    &n,
-                                    false,
-                                    batch_id,
-                                    batch_bucket_limit,
-                                    &mut ctrl9,
-                                    &wings.overlay_peers,
-                                    &wings.accounting_peers,
-                                    &refreshment_instructions_chan_outgoing,
-                                )
-                                .await;
-                                web_sys::console::log_1(&JsValue::from(format!(
-                                    "Writing response to unencrypted push data request"
-                                )));
-
-                                chan.send(chunk_reference).unwrap();
-                            }
+                            chan.send(data_reference).unwrap();
                         };
                         request_joiner.push(handle);
                     } else {
@@ -1114,12 +1086,81 @@ impl Sekirei {
             }
         };
 
+        let push_chunk_handle = async {
+            let mut timelast = Date::now();
+            loop {
+                let mut request_joiner = FuturesUnordered::new();
+
+                #[allow(irrefutable_let_patterns)]
+                for _i in 0..80000 {
+                    let incoming_request = chunk_upload_chan_incoming.try_recv();
+                    if !incoming_request.is_err() {
+                        let handle =
+                            async {
+                                let mut ctrl9 = ctrl7.clone();
+                                web_sys::console::log_1(&JsValue::from(format!(
+                                    "push chunk triggered"
+                                )));
+                                let (n, d, mode) = incoming_request.unwrap();
+
+                                let encrypted_chunk = match mode {
+                                    0 => false,
+                                    _ => true,
+                                };
+
+                                let batch_id =
+        hex::decode("9210cb16c79cc4a8cefa2c3f32920271fdb3d00cb929503c0f2456ac62af1321").unwrap();
+
+                                let batch_bucket_limit = 64_u32;
+
+                                let data_reference = push_chunk(
+                                    n,
+                                    &d,
+                                    encrypted_chunk,
+                                    batch_id,
+                                    batch_bucket_limit,
+                                    &mut ctrl9,
+                                    &wings.overlay_peers,
+                                    &wings.accounting_peers,
+                                    &refreshment_instructions_chan_outgoing,
+                                )
+                                .await;
+                                web_sys::console::log_1(&JsValue::from(format!(
+                                    "Writing response to encrypted : {} push chunk request",
+                                    encrypted_chunk
+                                )));
+
+                                if data_reference.len() == 0 {
+                                    let _ = chunk_upload_chan_outgoing.send((n, d, mode));
+                                }
+                            };
+                        request_joiner.push(handle);
+                    } else {
+                        break;
+                    }
+                }
+
+                while let Some(()) = request_joiner.next().await {}
+
+                let timenow = Date::now();
+                let seg = timenow - timelast;
+                if seg < PROTO_LOOP_INTERRUPTOR {
+                    async_std::task::sleep(Duration::from_millis(
+                        (PROTO_LOOP_INTERRUPTOR - seg) as u64,
+                    ))
+                    .await;
+                }
+                timelast = Date::now();
+            }
+        };
+
         join!(
             event_handle,
             retrieve_handle,
-            push_handle,
             retrieve_data_handle,
+            push_handle,
             push_data_handle,
+            push_chunk_handle,
             swarm_event_handle,
             gossip_inbound_handle,
             pricing_inbound_handle,

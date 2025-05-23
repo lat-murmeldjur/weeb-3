@@ -1,6 +1,6 @@
 use alloy::primitives::keccak256;
-use alloy::signers::local::PrivateKeySigner;
 use alloy::signers::Signer;
+use alloy::signers::local::PrivateKeySigner;
 
 use byteorder::ByteOrder;
 use num::{BigUint, ToPrimitive};
@@ -12,9 +12,9 @@ use std::sync::mpsc;
 
 use crate::stream;
 use libp2p::{
+    PeerId, Stream,
     futures::{AsyncReadExt, AsyncWriteExt},
     identity::ecdsa,
-    PeerId, Stream,
 };
 
 use wasm_bindgen::JsValue;
@@ -530,16 +530,16 @@ pub async fn pushsync_handler(
 }
 
 pub async fn sync(
-    peer: PeerId,
+    _peer: PeerId,
     chunk_address: Vec<u8>,
     chunk_content: Vec<u8>,
     chunk_stamp: Vec<u8>,
     stream: &mut Stream,
     chan: &mpsc::Sender<(Vec<u8>, Vec<u8>, Vec<u8>)>,
 ) -> io::Result<()> {
-    web_sys::console::log_1(&JsValue::from(format!(
-        "Opened Pushsync Handle 2 for peer !",
-    )));
+    // web_sys::console::log_1(&JsValue::from(format!(
+    //     "Opened Pushsync Handle 2 for peer !",
+    // )));
 
     let empty = etiquette_0::Headers::default();
     let mut buf_empty = Vec::new();
@@ -596,11 +596,11 @@ pub async fn sync(
         }
     };
 
-    web_sys::console::log_1(&JsValue::from(format!(
-        "Got receipt {:#?} from peer {:#?}!",
-        rec_0.address, peer
-    )));
-
+    //    web_sys::console::log_1(&JsValue::from(format!(
+    //        "Got receipt {:#?} from peer {:#?}!",
+    //        rec_0.address, peer
+    //    )));
+    //
     chan.send((rec_0.address, rec_0.signature, rec_0.nonce))
         .unwrap();
 

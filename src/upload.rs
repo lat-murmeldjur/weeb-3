@@ -1,5 +1,23 @@
 use crate::{
     //    // // // // // // // //
+    Date,
+    //    // // // // // // // //
+    Duration,
+    //    // // // // // // // //
+    HashMap,
+    //    // // // // // // // //
+    HashSet,
+    //    // // // // // // // //
+    JsValue,
+    //    // // // // // // // //
+    Mutex,
+    //    // // // // // // // //
+    PROTOCOL_ROUND_TIME,
+    //    // // // // // // // //
+    PeerAccounting,
+    //    // // // // // // // //
+    PeerId,
+    //    // // // // // // // //
     apply_credit,
     //    // // // // // // // //
     cancel_reserve,
@@ -8,7 +26,7 @@ use crate::{
     //    // // // // // // // //
     get_proximity,
     //    // // // // // // // //
-    manifest_upload::{create_manifest, Node},
+    manifest_upload::{Node, create_manifest},
     //    // // // // // // // //
     mpsc,
     //    // // // // // // // //
@@ -22,33 +40,13 @@ use crate::{
     reserve,
     //    // // // // // // // //
     stream,
-    //    // // // // // // // //
-    Date,
-    //    // // // // // // // //
-    Duration,
-    //    // // // // // // // //
-    HashMap,
-    //    // // // // // // // //
-    HashSet,
-    //    // // // // // // // //
-    JsValue,
-    //    // // // // // // // //
-    Mutex,
-    //    // // // // // // // //
-    PeerAccounting,
-    //    // // // // // // // //
-    PeerId,
-    //    // // // // // // // //
-    PROTOCOL_ROUND_TIME,
 };
 
 use byteorder::ByteOrder;
 
-use libp2p::futures::{stream::FuturesUnordered, StreamExt};
-
 use alloy::primitives::keccak256;
-use alloy::signers::local::PrivateKeySigner;
 use alloy::signers::Signer;
+use alloy::signers::local::PrivateKeySigner;
 
 pub async fn stamp_chunk(
     // stamp_signer: Signer,
@@ -228,146 +226,118 @@ pub async fn upload_data(
 }
 
 pub async fn push_data(
-    data: &Vec<u8>,
+    data: Vec<u8>,
     encryption: bool,
-    batch_id: Vec<u8>,
-
-    batch_bucket_limit: u32,
-    control: &mut stream::Control,
-    peers: &Mutex<HashMap<String, PeerId>>,
-    accounting: &Mutex<HashMap<PeerId, Mutex<PeerAccounting>>>,
-    refresh_chan: &mpsc::Sender<(PeerId, u64)>,
+    chunk_upload_chan: &mpsc::Sender<(usize, Vec<u8>, u8)>,
 ) -> Vec<u8> {
     //
+    let mode = match encryption {
+        false => 0,
+        true => 1,
+    };
 
     let span_length = data.len();
 
     if data.len() <= 4096 {
-        let k = push_chunk(
-            data.len(),
-            data,
-            encryption,
-            batch_id,
-            batch_bucket_limit,
-            control,
-            peers,
-            accounting,
-            refresh_chan,
-        )
-        .await;
+        let k =
+            content_address(&[(data.len() as u64).to_le_bytes().to_vec(), data.clone()].concat());
+        let _ = chunk_upload_chan.send((data.len(), data, mode));
 
         web_sys::console::log_1(&JsValue::from(format!(
-            "Pushdata returning {:#?}!",
+            "push_data returning {:#?}!",
             hex::encode(&k)
         )));
 
         return k;
     } else {
-        // split data
+        let mut levels: Vec<Vec<Vec<u8>>> = Vec::new();
+
         let mut address_length = 32;
         if encryption {
             address_length = 64;
         }
 
+        let mut level_data = data;
+
+        let mut level = 0;
         let address_fit = 4096 / address_length;
-        let mut done0 = false;
-        let mut carry_span = 4096_u64;
-        let mut iterations = 0;
+        let next_level = true;
+        let mut span_carriage = 4096;
 
-        while !done0 {
-            let k = span_length / carry_span as usize;
-            let mut l0 = span_length % carry_span as usize;
-            if l0 > 0 {
-                l0 = 1;
+        while next_level {
+            levels.push(Vec::new());
+
+            let mut chunk_l0r = level_data.len() % 4096;
+            if chunk_l0r > 0 {
+                chunk_l0r = 1;
             }
+            let chunk_l0c = level_data.len() / 4096 + chunk_l0r;
 
-            if k + l0 <= address_fit {
-                done0 = true;
-                iterations = k + l0;
-            } else {
-                carry_span *= address_fit as u64;
-            }
-        }
+            web_sys::console::log_1(&JsValue::from(format!(
+                "level  {} chunk count : {}!",
+                level, //
+                chunk_l0c,
+            )));
 
-        let mut joiner = FuturesUnordered::new(); // ::<dyn Future<Output = Vec<u8>>> // ::<Pin<Box<dyn Future<Output = (Vec<u8>, usize)>>>>
+            let mut count_yield = 0;
 
-        for i in 0..iterations {
-            let index = i;
-            let mut ctrl = control.clone();
-            let data_start = i * carry_span as usize;
-            let mut data_end = (i + 1) * carry_span as usize;
-            if data_end > data.len() {
-                data_end = data.len();
-            };
-            let data_carry = data[data_start..data_end].to_vec();
-
-            let bi0 = batch_id.clone();
-
-            let handle = async move {
-                return (
-                    push_data(
-                        &data_carry,
-                        encryption,
-                        bi0,
-                        batch_bucket_limit,
-                        &mut ctrl,
-                        peers,
-                        accounting,
-                        refresh_chan,
-                    )
-                    .await,
-                    index.clone(),
-                );
-            };
-
-            joiner.push(handle);
-        }
-
-        let mut content_holder_3: HashMap<usize, Vec<u8>> = HashMap::new();
-
-        while let Some((result0, result1)) = joiner.next().await {
-            content_holder_3.insert(result1, result0);
-        }
-
-        let mut data_capstone: Vec<u8> = Vec::new();
-
-        for i in 0..iterations {
-            match content_holder_3.get(&i) {
-                Some(data0) => {
-                    if data0.len() > 0 {
-                        data_capstone.append(&mut data0[..].to_vec());
-                    } else {
-                        return vec![];
-                    }
+            for i in 0..chunk_l0c {
+                count_yield += 1;
+                if count_yield > 16 {
+                    async_std::task::yield_now().await;
+                    count_yield = 0;
                 }
-                None => return vec![],
+
+                let data_start = 4096 * i as usize;
+                let mut data_end = 4096 * (i + 1) as usize;
+                if data_end > level_data.len() {
+                    data_end = level_data.len();
+                };
+
+                let mut span = span_carriage;
+
+                if (i + 1) * span_carriage > span_length {
+                    span -= (i + 1) * span_carriage - span_length;
+
+                    web_sys::console::log_1(&JsValue::from(format!(
+                        "last chunk span : {} span_carriage : {}!",
+                        span, span_carriage,
+                    )));
+                };
+
+                let ch_d = level_data[data_start..data_end].to_vec();
+
+                let cha =
+                    content_address(&[(span as u64).to_le_bytes().to_vec(), ch_d.clone()].concat());
+                web_sys::console::log_1(&JsValue::from(format!(
+                    "dispatching iter {} {}",
+                    i,
+                    hex::encode(&cha)
+                )));
+                levels[level].push(cha);
+
+                // (span as u64).to_le_bytes().to_vec(),
+
+                let _ = chunk_upload_chan.send((span, ch_d, mode));
+            }
+
+            if levels[level].len() == 1 {
+                return levels[level][0].clone();
+            } else {
+                level_data = levels[level].concat();
+                level += 1;
+
+                web_sys::console::log_1(&JsValue::from(format!(
+                    "level change data len : {} level : {}!",
+                    level_data.len(),
+                    level,
+                )));
+
+                span_carriage *= address_fit;
             }
         }
 
-        web_sys::console::log_1(&JsValue::from(format!(
-            "Pushdata capstone data {}!",
-            hex::encode(&data_capstone)
-        )));
-
-        let k = push_chunk(
-            span_length,
-            &data_capstone,
-            encryption,
-            batch_id,
-            batch_bucket_limit,
-            control,
-            peers,
-            accounting,
-            refresh_chan,
-        )
-        .await;
-
-        web_sys::console::log_1(&JsValue::from(format!(
-            "Pushdata returning {:#?}!",
-            hex::encode(&k)
-        )));
-
-        return k;
+        return vec![];
     }
 
     #[allow(unreachable_code)]
@@ -407,14 +377,14 @@ pub async fn push_chunk(
         }
 
         let encrey = keccak256(encreysource);
-        data0 = encrypt(span as u64, data, encrey.to_vec());
+        data0 = encrypt(span as u64, &data, encrey.to_vec());
     } else {
         data0 = [(span as u64).to_le_bytes().to_vec(), data00]
             .concat()
             .to_vec();
     }
 
-    let caddr = content_address(data0.clone());
+    let caddr = content_address(&data0.clone());
 
     let cstamp0 = stamp_chunk(
         //
@@ -429,6 +399,8 @@ pub async fn push_chunk(
             "Pushchunk returning empty reference for reason of bucket overuse {}",
             hex::encode(&caddr)
         )));
+
+        return vec![];
     }
 
     let mut skiplist: HashSet<PeerId> = HashSet::new();
@@ -478,6 +450,11 @@ pub async fn push_chunk(
                 skiplist.insert(closest_peer_id);
             } else {
                 if overdraftlist.is_empty() {
+                    web_sys::console::log_1(&JsValue::from(format!(
+                        "Pushchunk returning empty reference for reason of no peers to push to {}",
+                        hex::encode(&caddr)
+                    )));
+
                     return vec![];
                 } else {
                     for k in overdraftlist.iter() {
