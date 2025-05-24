@@ -1,14 +1,14 @@
 // #![allow(warnings)]
 #![cfg(target_arch = "wasm32")]
 
-use std::sync::mpsc;
 use std::sync::Mutex;
+use std::sync::mpsc;
 
 use libp2p::PeerId;
 
 use js_sys::Date;
 
-use crate::conventions::{get_proximity, PeerAccounting};
+use crate::conventions::{PeerAccounting, get_proximity};
 
 pub const REFRESH_RATE: u64 = 4500000;
 pub const PO_PRICE: u64 = 10000;

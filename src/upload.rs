@@ -66,7 +66,8 @@ pub async fn stamp_chunk(
     #[allow(unused_assignments)]
     let mut index = 0;
 
-    let (h, index0) = bump_bucket(hex::encode(&batch_id).to_string() + &bucket.to_string()).await;
+    let (h, index0) =
+        bump_bucket(hex::encode(&batch_id).to_string() + &"_" + &bucket.to_string()).await;
     index = index0;
 
     if index > batch_bucket_limit {
@@ -283,8 +284,9 @@ pub async fn push_data(
 
             for i in 0..chunk_l0c {
                 count_yield += 1;
-                if count_yield > 16 {
+                if count_yield > 128 {
                     async_std::task::yield_now().await;
+                    async_std::task::sleep(Duration::from_millis(50)).await;
                     count_yield = 0;
                 }
 
@@ -309,11 +311,14 @@ pub async fn push_data(
 
                 let cha =
                     content_address(&[(span as u64).to_le_bytes().to_vec(), ch_d.clone()].concat());
-                web_sys::console::log_1(&JsValue::from(format!(
-                    "dispatching iter {} {}",
-                    i,
-                    hex::encode(&cha)
-                )));
+
+                if i % 1000 == 0 {
+                    web_sys::console::log_1(&JsValue::from(format!(
+                        "dispatching iter {} {}",
+                        i,
+                        hex::encode(&cha)
+                    )));
+                }
                 levels[level].push(cha);
 
                 // (span as u64).to_le_bytes().to_vec(),

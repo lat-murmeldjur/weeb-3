@@ -124,7 +124,7 @@ pub fn init_panic_hook() {
 pub struct Sekirei {
     swarm: Arc<Mutex<Swarm<Behaviour>>>,
     secret_key: Mutex<SecretKey>,
-    wings: Mutex<Wings>,
+    wings: Mutex<Arc<Wings>>,
     message_port: (
         mpsc::Sender<(Vec<u8>, mpsc::Sender<Vec<u8>>)>,
         mpsc::Receiver<(Vec<u8>, mpsc::Sender<Vec<u8>>)>,
@@ -451,13 +451,13 @@ impl Sekirei {
         return Sekirei {
             secret_key: Mutex::new(secret_key),
             swarm: Arc::new(Mutex::new(swarm)),
-            wings: Mutex::new(Wings {
+            wings: Mutex::new(Arc::new(Wings {
                 connected_peers: connected_peers,
                 overlay_peers: overlay_peers,
                 accounting_peers: accounting_peers,
                 ongoing_refreshments: ongoing_refreshments,
                 connection_attempts: connection_attempts,
-            }),
+            })),
             message_port: (m_out, m_in),
             upload_port: (u_out, u_in),
             bootnode_port: (b_out, b_in),
@@ -1092,16 +1092,23 @@ impl Sekirei {
                 let mut request_joiner = FuturesUnordered::new();
 
                 #[allow(irrefutable_let_patterns)]
-                for _i in 0..80000 {
+                for _i in 0..128 {
                     let incoming_request = chunk_upload_chan_incoming.try_recv();
                     if !incoming_request.is_err() {
+                        let ctrl71 = ctrl7.clone();
+                        let (n, d, mode) = incoming_request.unwrap();
+
+                        let wings0 = wings.clone();
+                        let chunk_upload_chan_outgoing0 = chunk_upload_chan_outgoing.clone();
+                        let refreshment_instructions_chan_outgoing0 =
+                            refreshment_instructions_chan_outgoing.clone();
+
                         let handle =
-                            async {
-                                let mut ctrl9 = ctrl7.clone();
+                            async move {
+                                let mut ctrl9 = ctrl71.clone();
                                 web_sys::console::log_1(&JsValue::from(format!(
                                     "push chunk triggered"
                                 )));
-                                let (n, d, mode) = incoming_request.unwrap();
 
                                 let encrypted_chunk = match mode {
                                     0 => false,
@@ -1120,9 +1127,9 @@ impl Sekirei {
                                     batch_id,
                                     batch_bucket_limit,
                                     &mut ctrl9,
-                                    &wings.overlay_peers,
-                                    &wings.accounting_peers,
-                                    &refreshment_instructions_chan_outgoing,
+                                    &wings0.overlay_peers,
+                                    &wings0.accounting_peers,
+                                    &refreshment_instructions_chan_outgoing0,
                                 )
                                 .await;
                                 web_sys::console::log_1(&JsValue::from(format!(
@@ -1131,7 +1138,7 @@ impl Sekirei {
                                 )));
 
                                 if data_reference.len() == 0 {
-                                    let _ = chunk_upload_chan_outgoing.send((n, d, mode));
+                                    let _ = chunk_upload_chan_outgoing0.send((n, d, mode));
                                 }
                             };
                         request_joiner.push(handle);
