@@ -526,7 +526,7 @@ pub async fn pushsync_handler(
         return;
     }
 
-    web_sys::console::log_1(&JsValue::from(format!("{} Pushsync complete!", peer)));
+    // web_sys::console::log_1(&JsValue::from(format!("{} Pushsync complete!", peer)));
 }
 
 pub async fn sync(

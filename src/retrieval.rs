@@ -97,6 +97,12 @@ pub async fn retrieve_data(
     let span = u64::from_le_bytes(orig[0..8].try_into().unwrap_or([0; 8]));
     if span <= 4096 {
         return orig;
+    } else {
+        web_sys::console::log_1(&JsValue::from(format!(
+            "Got high level chunk with span {} : {}",
+            span,
+            hex::encode(chunk_address)
+        )));
     }
 
     let address_length = chunk_address.len();
@@ -611,4 +617,6 @@ pub async fn seek_latest_feed_update(
 
 //
 //
+//
+// 489ad55e2c2ba602ad09e245dbc34ea8b079a57ad318efea8cca60fafcfc2028
 //

@@ -67,7 +67,7 @@ pub async fn stamp_chunk(
     let mut index = 0;
 
     let (h, index0) =
-        bump_bucket(hex::encode(&batch_id).to_string() + &"_" + &bucket.to_string()).await;
+        bump_bucket(hex::encode(&batch_id).to_string() + &"__24__" + &bucket.to_string()).await;
     index = index0;
 
     if index > batch_bucket_limit {
@@ -229,7 +229,7 @@ pub async fn upload_data(
 pub async fn push_data(
     data: Vec<u8>,
     encryption: bool,
-    chunk_upload_chan: &mpsc::Sender<(usize, Vec<u8>, u8)>,
+    chunk_upload_chan: &mpsc::Sender<(usize, Vec<u8>, u8, Vec<u8>)>,
 ) -> Vec<u8> {
     //
     let mode = match encryption {
@@ -242,12 +242,12 @@ pub async fn push_data(
     if data.len() <= 4096 {
         let k =
             content_address(&[(data.len() as u64).to_le_bytes().to_vec(), data.clone()].concat());
-        let _ = chunk_upload_chan.send((data.len(), data, mode));
+        let _ = chunk_upload_chan.send((data.len(), data, mode, k.clone()));
 
-        web_sys::console::log_1(&JsValue::from(format!(
-            "push_data returning {:#?}!",
-            hex::encode(&k)
-        )));
+        // web_sys::console::log_1(&JsValue::from(format!(
+        //     "push_data returning {:#?}!",
+        //     hex::encode(&k)
+        // )));
 
         return k;
     } else {
@@ -275,10 +275,20 @@ pub async fn push_data(
             let chunk_l0c = level_data.len() / 4096 + chunk_l0r;
 
             web_sys::console::log_1(&JsValue::from(format!(
-                "level  {} chunk count : {}!",
+                "level  {} chunk count : {}   ln {}!",
                 level, //
                 chunk_l0c,
+                level_data.len()
             )));
+
+            if chunk_l0c == 1 {
+                for j in 0..level_data.len() / 32 {
+                    web_sys::console::log_1(&JsValue::from(format!(
+                        "top level chunk  {}",
+                        hex::encode(&level_data[j * 32..(j + 1) * 32])
+                    )));
+                }
+            }
 
             let mut count_yield = 0;
 
@@ -286,7 +296,7 @@ pub async fn push_data(
                 count_yield += 1;
                 if count_yield > 128 {
                     async_std::task::yield_now().await;
-                    async_std::task::sleep(Duration::from_millis(50)).await;
+                    async_std::task::sleep(Duration::from_millis(100)).await;
                     count_yield = 0;
                 }
 
@@ -299,7 +309,7 @@ pub async fn push_data(
                 let mut span = span_carriage;
 
                 if (i + 1) * span_carriage > span_length {
-                    span -= (i + 1) * span_carriage - span_length;
+                    span = span_length - (i * span_carriage);
 
                     web_sys::console::log_1(&JsValue::from(format!(
                         "last chunk span : {} span_carriage : {}!",
@@ -307,23 +317,34 @@ pub async fn push_data(
                     )));
                 };
 
+                if chunk_l0c == 1 {
+                    span = span_length;
+                    web_sys::console::log_1(&JsValue::from(format!("top chunk span : {}!", span)));
+                }
+
                 let ch_d = level_data[data_start..data_end].to_vec();
 
-                let cha =
-                    content_address(&[(span as u64).to_le_bytes().to_vec(), ch_d.clone()].concat());
+                if ch_d.len() == address_length && level > 0 {
+                    levels[level].push(ch_d);
+                    web_sys::console::log_1(&JsValue::from(format!("partition level difference!")));
+                } else {
+                    let cha = content_address(
+                        &[(span as u64).to_le_bytes().to_vec(), ch_d.clone()].concat(),
+                    );
 
-                if i % 1000 == 0 {
-                    web_sys::console::log_1(&JsValue::from(format!(
-                        "dispatching iter {} {}",
-                        i,
-                        hex::encode(&cha)
-                    )));
+                    if i % 10000 == 0 {
+                        web_sys::console::log_1(&JsValue::from(format!(
+                            "dispatching iter {} {}",
+                            i,
+                            hex::encode(&cha)
+                        )));
+                    }
+                    levels[level].push(cha.clone());
+
+                    // (span as u64).to_le_bytes().to_vec(),
+
+                    let _ = chunk_upload_chan.send((span, ch_d, mode, cha));
                 }
-                levels[level].push(cha);
-
-                // (span as u64).to_le_bytes().to_vec(),
-
-                let _ = chunk_upload_chan.send((span, ch_d, mode));
             }
 
             if levels[level].len() == 1 {
@@ -552,10 +573,10 @@ pub async fn push_chunk(
 
     // validate receipt
 
-    web_sys::console::log_1(&JsValue::from(format!(
-        "Pushchunk returning {:#?}!",
-        hex::encode(&caddr)
-    )));
+    // web_sys::console::log_1(&JsValue::from(format!(
+    //     "Pushchunk returning {:#?}!",
+    //     hex::encode(&caddr)
+    // )));
 
     return caddr;
 }

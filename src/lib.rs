@@ -21,7 +21,6 @@ use libp2p::{
         StreamExt,
         future::join_all, //
         join,
-        stream::FuturesUnordered,
     },
     identify, identity,
     identity::{ecdsa, ecdsa::SecretKey},
@@ -493,7 +492,7 @@ impl Sekirei {
             mpsc::channel::<(Vec<u8>, u8, mpsc::Sender<Vec<u8>>)>();
 
         let (chunk_upload_chan_outgoing, chunk_upload_chan_incoming) =
-            mpsc::channel::<(usize, Vec<u8>, u8)>();
+            mpsc::channel::<(usize, Vec<u8>, u8, Vec<u8>)>();
 
         let ctrl;
         let mut incoming_pricing_streams;
@@ -521,7 +520,7 @@ impl Sekirei {
         let mut ctrl3 = ctrl.clone();
         let ctrl4 = ctrl.clone();
         let ctrl6 = ctrl.clone();
-        let ctrl7 = ctrl.clone();
+        let ctrl8 = ctrl.clone();
 
         let pricing_inbound_handle = async move {
             web_sys::console::log_1(&JsValue::from(format!("Opened Pricing handler 1")));
@@ -628,10 +627,10 @@ impl Sekirei {
                 )
                 .await;
 
-                web_sys::console::log_1(&JsValue::from(format!(
-                    "Current Event Handled {:#?}",
-                    event
-                )));
+                // web_sys::console::log_1(&JsValue::from(format!(
+                //     "Current Event Handled {:#?}",
+                //     event
+                // )));
 
                 if !event.is_err() {
                     match event.unwrap() {
@@ -1089,65 +1088,72 @@ impl Sekirei {
         let push_chunk_handle = async {
             let mut timelast = Date::now();
             loop {
-                let mut request_joiner = FuturesUnordered::new();
+                let mut request_joiner = Vec::new();
 
                 #[allow(irrefutable_let_patterns)]
                 for _i in 0..128 {
                     let incoming_request = chunk_upload_chan_incoming.try_recv();
                     if !incoming_request.is_err() {
-                        let ctrl71 = ctrl7.clone();
-                        let (n, d, mode) = incoming_request.unwrap();
+                        let handle = async {
+                            let (n, d, mode, checkad) = incoming_request.unwrap();
 
-                        let wings0 = wings.clone();
-                        let chunk_upload_chan_outgoing0 = chunk_upload_chan_outgoing.clone();
-                        let refreshment_instructions_chan_outgoing0 =
-                            refreshment_instructions_chan_outgoing.clone();
+                            let mut ctrl9 = ctrl8.clone();
 
-                        let handle =
-                            async move {
-                                let mut ctrl9 = ctrl71.clone();
-                                web_sys::console::log_1(&JsValue::from(format!(
-                                    "push chunk triggered"
-                                )));
-
-                                let encrypted_chunk = match mode {
-                                    0 => false,
-                                    _ => true,
-                                };
-
-                                let batch_id =
-        hex::decode("9210cb16c79cc4a8cefa2c3f32920271fdb3d00cb929503c0f2456ac62af1321").unwrap();
-
-                                let batch_bucket_limit = 64_u32;
-
-                                let data_reference = push_chunk(
-                                    n,
-                                    &d,
-                                    encrypted_chunk,
-                                    batch_id,
-                                    batch_bucket_limit,
-                                    &mut ctrl9,
-                                    &wings0.overlay_peers,
-                                    &wings0.accounting_peers,
-                                    &refreshment_instructions_chan_outgoing0,
-                                )
-                                .await;
-                                web_sys::console::log_1(&JsValue::from(format!(
-                                    "Writing response to encrypted : {} push chunk request",
-                                    encrypted_chunk
-                                )));
-
-                                if data_reference.len() == 0 {
-                                    let _ = chunk_upload_chan_outgoing0.send((n, d, mode));
-                                }
+                            let encrypted_chunk = match mode {
+                                0 => false,
+                                _ => true,
                             };
+
+                            let batch_id = hex::decode(
+                                "9210cb16c79cc4a8cefa2c3f32920271fdb3d00cb929503c0f2456ac62af1321",
+                            )
+                            .unwrap();
+
+                            let batch_bucket_limit = 64_u32;
+
+                            let data_reference = push_chunk(
+                                n,
+                                &d,
+                                encrypted_chunk,
+                                batch_id,
+                                batch_bucket_limit,
+                                &mut ctrl9,
+                                &wings.overlay_peers,
+                                &wings.accounting_peers,
+                                &refreshment_instructions_chan_outgoing,
+                            )
+                            .await;
+
+                            if hex::encode(&data_reference) != hex::encode(&checkad) {
+                                web_sys::console::log_1(&JsValue::from(format!(
+                                    "CH_AD mismatch {} {}",
+                                    hex::encode(&data_reference),
+                                    hex::encode(&checkad)
+                                )));
+                            }
+
+                            if data_reference.len() == 0 {
+                                web_sys::console::log_1(&JsValue::from(format!("CH_AD miss")));
+                                // web_sys::console::log_1(&JsValue::from(format!(
+                                //     "Writing response to encrypted : {} push chunk request",
+                                //     encrypted_chunk
+                                // )));
+
+                                // let _ = chunk_upload_chan_outgoing0.send((n, d, mode, checkad));
+                            }
+                        };
                         request_joiner.push(handle);
                     } else {
                         break;
                     }
                 }
 
-                while let Some(()) = request_joiner.next().await {}
+                web_sys::console::log_1(&JsValue::from(format!("Joining pushsync requests")));
+
+                join_all(request_joiner).await;
+                // while let Some(()) = request_joiner.next().await {
+                //     web_sys::console::log_1(&JsValue::from(format!("push chunk completed")));
+                // }
 
                 let timenow = Date::now();
                 let seg = timenow - timelast;
