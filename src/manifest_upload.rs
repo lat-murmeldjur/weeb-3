@@ -1,11 +1,11 @@
 use crate::{
     //
+    JsValue,
+    //
+    //
     mpsc,
     //
     upload_data,
-    //
-    JsValue,
-    //
 };
 
 use serde_json::json;
@@ -45,7 +45,8 @@ pub async fn create_manifest(
         if !obfuscated {
             manifest_bytes_vec.push(0_u8);
         } else {
-            manifest_bytes_vec.push(rand::random::<u8>());
+            manifest_bytes_vec.push(0_u8);
+            // manifest_bytes_vec.push(rand::random::<u8>());
         }
     }
 

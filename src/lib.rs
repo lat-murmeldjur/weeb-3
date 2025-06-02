@@ -492,7 +492,7 @@ impl Sekirei {
             mpsc::channel::<(Vec<u8>, u8, mpsc::Sender<Vec<u8>>)>();
 
         let (chunk_upload_chan_outgoing, chunk_upload_chan_incoming) =
-            mpsc::channel::<(usize, Vec<u8>, u8, Vec<u8>)>();
+            mpsc::channel::<(Vec<u8>, Vec<u8>)>();
 
         let ctrl;
         let mut incoming_pricing_streams;
@@ -1095,14 +1095,9 @@ impl Sekirei {
                     let incoming_request = chunk_upload_chan_incoming.try_recv();
                     if !incoming_request.is_err() {
                         let handle = async {
-                            let (n, d, mode, checkad) = incoming_request.unwrap();
+                            let (d, checkad) = incoming_request.unwrap();
 
                             let mut ctrl9 = ctrl8.clone();
-
-                            let encrypted_chunk = match mode {
-                                0 => false,
-                                _ => true,
-                            };
 
                             let batch_id = hex::decode(
                                 "9210cb16c79cc4a8cefa2c3f32920271fdb3d00cb929503c0f2456ac62af1321",
@@ -1112,9 +1107,7 @@ impl Sekirei {
                             let batch_bucket_limit = 64_u32;
 
                             let data_reference = push_chunk(
-                                n,
                                 &d,
-                                encrypted_chunk,
                                 batch_id,
                                 batch_bucket_limit,
                                 &mut ctrl9,
@@ -1139,7 +1132,7 @@ impl Sekirei {
                                 //     encrypted_chunk
                                 // )));
 
-                                // let _ = chunk_upload_chan_outgoing0.send((n, d, mode, checkad));
+                                // let _ = chunk_upload_chan_outgoing.send((d, checkad));
                             }
                         };
                         request_joiner.push(handle);

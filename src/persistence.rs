@@ -42,54 +42,6 @@ async fn cat_base() -> Option<Database> {
     Some(db)
 }
 
-pub async fn reset_bucket(bucket_identifier: String) -> bool {
-    let db = match cat_base().await {
-        Some(db0) => db0,
-        _ => {
-            web_sys::console::log_1(&JsValue::from(format!("ep0")));
-            return false;
-        }
-    };
-
-    let transaction = match db
-        .transaction("weeb_datastore_2")
-        .with_mode(TransactionMode::Readwrite)
-        .build()
-    {
-        Ok(t0) => t0,
-        _ => {
-            web_sys::console::log_1(&JsValue::from(format!("ep1")));
-            return false;
-        }
-    };
-
-    let store = match transaction.object_store("weeb_datastore_2") {
-        Ok(s0) => s0,
-        _ => {
-            web_sys::console::log_1(&JsValue::from(format!("ep2")));
-            return false;
-        }
-    };
-
-    let b1 = BucketData {
-        id: bucket_identifier,
-        value: 0,
-    };
-
-    match store.put(b1.clone()).with_key(b1.id).serde() {
-        Ok(_) => {}
-        _ => {
-            web_sys::console::log_1(&JsValue::from(format!("ep3")));
-            return false;
-        }
-    };
-
-    return match transaction.commit().await {
-        Ok(_) => true,
-        _ => false,
-    };
-}
-
 pub async fn bump_bucket(bucket_identifier: String) -> (bool, u32) {
     let mut in_weeb = 0;
 
@@ -150,3 +102,52 @@ pub async fn bump_bucket(bucket_identifier: String) -> (bool, u32) {
         _ => (false, in_weeb),
     };
 }
+
+// pub async fn reset_bucket(bucket_identifier: String) -> bool {
+//     let db = match cat_base().await {
+//         Some(db0) => db0,
+//         _ => {
+//             web_sys::console::log_1(&JsValue::from(format!("ep0")));
+//             return false;
+//         }
+//     };
+//
+//     let transaction = match db
+//         .transaction("weeb_datastore_2")
+//         .with_mode(TransactionMode::Readwrite)
+//         .build()
+//     {
+//         Ok(t0) => t0,
+//         _ => {
+//             web_sys::console::log_1(&JsValue::from(format!("ep1")));
+//             return false;
+//         }
+//     };
+//
+//     let store = match transaction.object_store("weeb_datastore_2") {
+//         Ok(s0) => s0,
+//         _ => {
+//             web_sys::console::log_1(&JsValue::from(format!("ep2")));
+//             return false;
+//         }
+//     };
+//
+//     let b1 = BucketData {
+//         id: bucket_identifier,
+//         value: 0,
+//     };
+//
+//     match store.put(b1.clone()).with_key(b1.id).serde() {
+//         Ok(_) => {}
+//         _ => {
+//             web_sys::console::log_1(&JsValue::from(format!("ep3")));
+//             return false;
+//         }
+//     };
+//
+//     return match transaction.commit().await {
+//         Ok(_) => true,
+//         _ => false,
+//     };
+// }
+//

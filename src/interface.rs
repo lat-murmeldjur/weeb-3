@@ -1,4 +1,4 @@
-use crate::{decode_resources, init_panic_hook, persistence::*, Body};
+use crate::{Body, decode_resources, init_panic_hook};
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::str::FromStr;
@@ -12,11 +12,10 @@ use web3::{
 };
 
 use js_sys::{Array, Date, Uint8Array};
-use wasm_bindgen::{closure::Closure, prelude::*, JsCast, JsError, JsValue};
+use wasm_bindgen::{JsCast, JsError, JsValue, closure::Closure, prelude::*};
 
-use wasm_bindgen_futures::{spawn_local, JsFuture};
+use wasm_bindgen_futures::{JsFuture, spawn_local};
 use web_sys::{
-    console,
     Blob,
     BlobPropertyBag,
     Element,
@@ -28,6 +27,7 @@ use web_sys::{
     ServiceWorkerRegistration,
     SharedWorker,
     //
+    console,
 };
 
 use alloy::{network::EthereumWallet, primitives::keccak256, signers::local::PrivateKeySigner};
@@ -35,27 +35,6 @@ use alloy::{network::EthereumWallet, primitives::keccak256, signers::local::Priv
 #[wasm_bindgen]
 pub async fn interweeb(_st: String) -> Result<(), JsError> {
     init_panic_hook();
-
-    let k0 = bump_bucket("test_bucket_id".to_string()).await;
-    web_sys::console::log_1(&JsValue::from(format!("test0 {:#?}", k0)));
-
-    let k1 = bump_bucket("test_bucket_id".to_string()).await;
-    web_sys::console::log_1(&JsValue::from(format!("test0 {:#?}", k1)));
-
-    let k2 = bump_bucket("test_bucket_id".to_string()).await;
-    web_sys::console::log_1(&JsValue::from(format!("test0 {:#?}", k2)));
-
-    let kd = reset_bucket("test_bucket_id".to_string()).await;
-    web_sys::console::log_1(&JsValue::from(format!("test0 {:#?}", kd)));
-
-    let k3 = bump_bucket("test_bucket_id".to_string()).await;
-    web_sys::console::log_1(&JsValue::from(format!("test0 {:#?}", k3)));
-
-    let k4 = bump_bucket("test_bucket_id".to_string()).await;
-    web_sys::console::log_1(&JsValue::from(format!("test0 {:#?}", k4)));
-
-    let k5 = bump_bucket("test_bucket_id".to_string()).await;
-    web_sys::console::log_1(&JsValue::from(format!("test0 {:#?}", k5)));
 
     let window = &web_sys::window().unwrap();
 
@@ -354,6 +333,14 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
                 _ => return,
             };
 
+            let file_enc = document
+                .get_element_by_id("uploadFileEncrypt")
+                .expect("#uploadFileEncrypt should exist");
+
+            let file_enc = file_enc
+                .dyn_ref::<HtmlInputElement>()
+                .expect("#uploadFileEncrypt should be a HtmlInputElement");
+
             web_sys::console::log_1(&JsValue::from(format!(
                 "selected file length {:#?}",
                 file.size()
@@ -386,7 +373,7 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
             let _ = js_sys::Reflect::set(
                 &msgobj,
                 &JsValue::from_str("encryption0"),
-                &JsValue::from_bool(false),
+                &JsValue::from_bool(file_enc.checked()),
             );
 
             let _ = js_sys::Reflect::set(

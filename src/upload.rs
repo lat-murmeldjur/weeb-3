@@ -67,7 +67,7 @@ pub async fn stamp_chunk(
     let mut index = 0;
 
     let (h, index0) =
-        bump_bucket(hex::encode(&batch_id).to_string() + &"__24__" + &bucket.to_string()).await;
+        bump_bucket(hex::encode(&batch_id).to_string() + &"__25__" + &bucket.to_string()).await;
     index = index0;
 
     if index > batch_bucket_limit {
@@ -229,27 +229,30 @@ pub async fn upload_data(
 pub async fn push_data(
     data: Vec<u8>,
     encryption: bool,
-    chunk_upload_chan: &mpsc::Sender<(usize, Vec<u8>, u8, Vec<u8>)>,
+    chunk_upload_chan: &mpsc::Sender<(Vec<u8>, Vec<u8>)>,
 ) -> Vec<u8> {
-    //
-    let mode = match encryption {
-        false => 0,
-        true => 1,
-    };
-
     let span_length = data.len();
 
     if data.len() <= 4096 {
-        let k =
-            content_address(&[(data.len() as u64).to_le_bytes().to_vec(), data.clone()].concat());
-        let _ = chunk_upload_chan.send((data.len(), data, mode, k.clone()));
+        let mut encrey0 = vec![];
+
+        let data0 = match encryption {
+            true => {
+                encrey0 = encrey();
+                encrypt(span_length, &data, &encrey0)
+            }
+            false => [(data.len() as u64).to_le_bytes().to_vec(), data.clone()].concat(),
+        };
+
+        let k = content_address(&data0);
+        let _ = chunk_upload_chan.send((data0, k.clone()));
 
         // web_sys::console::log_1(&JsValue::from(format!(
         //     "push_data returning {:#?}!",
         //     hex::encode(&k)
         // )));
 
-        return k;
+        return [k, encrey0].concat();
     } else {
         let mut levels: Vec<Vec<Vec<u8>>> = Vec::new();
 
@@ -282,10 +285,10 @@ pub async fn push_data(
             )));
 
             if chunk_l0c == 1 {
-                for j in 0..level_data.len() / 32 {
+                for j in 0..level_data.len() / address_length {
                     web_sys::console::log_1(&JsValue::from(format!(
                         "top level chunk  {}",
-                        hex::encode(&level_data[j * 32..(j + 1) * 32])
+                        hex::encode(&level_data[j * address_length..(j + 1) * address_length])
                     )));
                 }
             }
@@ -328,9 +331,17 @@ pub async fn push_data(
                     levels[level].push(ch_d);
                     web_sys::console::log_1(&JsValue::from(format!("partition level difference!")));
                 } else {
-                    let cha = content_address(
-                        &[(span as u64).to_le_bytes().to_vec(), ch_d.clone()].concat(),
-                    );
+                    let mut encrey0 = vec![];
+
+                    let data0 = match encryption {
+                        true => {
+                            encrey0 = encrey();
+                            encrypt(span, &ch_d, &encrey0)
+                        }
+                        false => [(span as u64).to_le_bytes().to_vec(), ch_d.clone()].concat(),
+                    };
+
+                    let cha = content_address(&data0);
 
                     if i % 10000 == 0 {
                         web_sys::console::log_1(&JsValue::from(format!(
@@ -339,11 +350,11 @@ pub async fn push_data(
                             hex::encode(&cha)
                         )));
                     }
-                    levels[level].push(cha.clone());
+                    levels[level].push([cha.clone(), encrey0].concat());
 
                     // (span as u64).to_le_bytes().to_vec(),
 
-                    let _ = chunk_upload_chan.send((span, ch_d, mode, cha));
+                    let _ = chunk_upload_chan.send((data0, cha));
                 }
             }
 
@@ -371,9 +382,7 @@ pub async fn push_data(
 }
 
 pub async fn push_chunk(
-    span: usize,
     data: &Vec<u8>,
-    encryption: bool,
     batch_id: Vec<u8>,
     batch_bucket_limit: u32,
     control: &mut stream::Control,
@@ -381,7 +390,7 @@ pub async fn push_chunk(
     accounting: &Mutex<HashMap<PeerId, Mutex<PeerAccounting>>>,
     refresh_chan: &mpsc::Sender<(PeerId, u64)>,
 ) -> Vec<u8> {
-    if data.len() > 4096 {
+    if data.len() > 4104 {
         web_sys::console::log_1(&JsValue::from(format!(
             "Pushchunk returning empty reference for reason of data overlength!"
         )));
@@ -389,28 +398,7 @@ pub async fn push_chunk(
         return vec![];
     }
 
-    //
-    let data00 = data.to_vec();
-
-    #[allow(unused_assignments)]
-    let mut data0: Vec<u8> = vec![];
-
-    if encryption {
-        let mut encreysource = vec![];
-
-        for _i in 0..256 {
-            encreysource.push(rand::random::<u8>());
-        }
-
-        let encrey = keccak256(encreysource);
-        data0 = encrypt(span as u64, &data, encrey.to_vec());
-    } else {
-        data0 = [(span as u64).to_le_bytes().to_vec(), data00]
-            .concat()
-            .to_vec();
-    }
-
-    let caddr = content_address(&data0.clone());
+    let caddr = content_address(&data);
 
     let cstamp0 = stamp_chunk(
         //
@@ -532,7 +520,7 @@ pub async fn push_chunk(
         pushsync_handler(
             closest_peer_id,
             caddr.clone(),
-            data0.clone(),
+            data.clone(),
             cstamp0.clone(),
             control,
             &chunk_out,
@@ -581,7 +569,7 @@ pub async fn push_chunk(
     return caddr;
 }
 
-pub fn encrypt(span: u64, cd: &Vec<u8>, encrey: Vec<u8>) -> Vec<u8> {
+pub fn encrypt(span: usize, cd: &Vec<u8>, encrey: &Vec<u8>) -> Vec<u8> {
     if cd.len() < 8 {
         return vec![];
     }
@@ -593,7 +581,7 @@ pub fn encrypt(span: u64, cd: &Vec<u8>, encrey: Vec<u8>) -> Vec<u8> {
         padding.push(rand::random::<u8>());
     }
 
-    let spancred = span.to_le_bytes().to_vec();
+    let spancred = (span as u64).to_le_bytes().to_vec();
     let concred = ([&cd[..], &padding].concat()).to_vec();
     let creylen = encrey.len();
 
@@ -635,4 +623,14 @@ pub fn encrypt(span: u64, cd: &Vec<u8>, encrey: Vec<u8>) -> Vec<u8> {
     }
 
     return [spanbytes, content[..].to_vec()].concat();
+}
+
+pub fn encrey() -> Vec<u8> {
+    let mut encrey0 = vec![];
+
+    for _ in 0..32 {
+        encrey0.push(rand::random::<u8>());
+    }
+
+    encrey0
 }
