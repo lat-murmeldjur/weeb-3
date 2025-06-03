@@ -2,11 +2,11 @@ use std::sync::mpsc;
 
 use crate::{
     //
+    JsValue,
+    //
     get_data,
     //
     seek_latest_feed_update,
-    //
-    JsValue,
 };
 
 use serde_json::Value;
@@ -54,6 +54,10 @@ pub async fn interpret_manifest(
 
     let obfuscation_key = &cd0[8..40];
     let enc_obfuscation_key = hex::encode(obfuscation_key);
+    web_sys::console::log_1(&JsValue::from(format!(
+        "obfuscation_key: {}",
+        enc_obfuscation_key
+    )));
 
     let mut cd = (&cd0[..40]).to_vec();
 

@@ -45,8 +45,7 @@ pub async fn create_manifest(
         if !obfuscated {
             manifest_bytes_vec.push(0_u8);
         } else {
-            manifest_bytes_vec.push(0_u8);
-            // manifest_bytes_vec.push(rand::random::<u8>());
+            manifest_bytes_vec.push(rand::random::<u8>());
         }
     }
 
@@ -313,7 +312,7 @@ pub async fn create_manifest(
         }
 
         let stub_reference = upload_data(
-            create_stub(stub_ref_size).await,
+            create_stub(stub_ref_size, obfuscated).await,
             encrypted,
             data_upload_chan,
         )
@@ -380,9 +379,38 @@ pub async fn create_manifest(
         manifest_bytes_vec[index_bytes_start + i] = bits_as_bytes[i];
     }
 
-    // bits_for_bytes [b/8] |= 1 << (b % 8)
-    //  forks: Vec<Node>,
-    //  data_forks: Vec<u8>,
+    {
+        let obfuscation_key = &manifest_bytes_vec[0..32];
+        let enc_obfuscation_key = hex::encode(obfuscation_key);
+
+        let mut manifest_bytes_obfuscated = (&manifest_bytes_vec[..32]).to_vec();
+
+        if enc_obfuscation_key != "0000000000000000000000000000000000000000000000000000000000000000"
+        {
+            let creylen = obfuscation_key.len();
+            let mut done = false;
+            let mut i = 0;
+            while !done {
+                let mut k = creylen;
+                if k > manifest_bytes_vec.len() - (32 + i * creylen) {
+                    k = manifest_bytes_vec.len() - (32 + i * creylen);
+                };
+
+                for j in (32 + i * creylen)..(32 + i * creylen + k) {
+                    manifest_bytes_obfuscated
+                        .push(manifest_bytes_vec[j] ^ obfuscation_key[j - 32 - i * creylen]);
+                }
+
+                i += 1;
+
+                if !(32 + i * creylen < manifest_bytes_vec.len()) {
+                    done = true;
+                }
+            }
+
+            return manifest_bytes_obfuscated;
+        }
+    }
 
     manifest_bytes_vec
 }
@@ -459,11 +487,15 @@ pub async fn create_fork(path: String, reference: Vec<u8>, metadata: Vec<u8>) ->
     return node;
 }
 
-pub async fn create_stub(stub_ref_size: u8) -> Vec<u8> {
+pub async fn create_stub(stub_ref_size: u8, obfuscated: bool) -> Vec<u8> {
     let mut manifest_bytes_vec: Vec<u8> = vec![];
 
     for _ in 0..32 {
-        manifest_bytes_vec.push(0_u8);
+        if !obfuscated {
+            manifest_bytes_vec.push(0_u8);
+        } else {
+            manifest_bytes_vec.push(rand::random::<u8>());
+        }
     }
 
     manifest_bytes_vec.append(
@@ -478,6 +510,39 @@ pub async fn create_stub(stub_ref_size: u8) -> Vec<u8> {
 
     for _ in 0..stub_ref_size {
         manifest_bytes_vec.push(0_u8);
+    }
+
+    {
+        let obfuscation_key = &manifest_bytes_vec[0..32];
+        let enc_obfuscation_key = hex::encode(obfuscation_key);
+
+        let mut manifest_bytes_obfuscated = (&manifest_bytes_vec[..32]).to_vec();
+
+        if enc_obfuscation_key != "0000000000000000000000000000000000000000000000000000000000000000"
+        {
+            let creylen = obfuscation_key.len();
+            let mut done = false;
+            let mut i = 0;
+            while !done {
+                let mut k = creylen;
+                if k > manifest_bytes_vec.len() - (32 + i * creylen) {
+                    k = manifest_bytes_vec.len() - (32 + i * creylen);
+                };
+
+                for j in (32 + i * creylen)..(32 + i * creylen + k) {
+                    manifest_bytes_obfuscated
+                        .push(manifest_bytes_vec[j] ^ obfuscation_key[j - 32 - i * creylen]);
+                }
+
+                i += 1;
+
+                if !(32 + i * creylen < manifest_bytes_vec.len()) {
+                    done = true;
+                }
+            }
+
+            return manifest_bytes_obfuscated;
+        }
     }
 
     return manifest_bytes_vec;

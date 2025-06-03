@@ -299,7 +299,7 @@ pub async fn push_data(
                 count_yield += 1;
                 if count_yield > 128 {
                     async_std::task::yield_now().await;
-                    async_std::task::sleep(Duration::from_millis(100)).await;
+                    async_std::task::sleep(Duration::from_millis(50)).await;
                     count_yield = 0;
                 }
 
