@@ -115,11 +115,15 @@ pub fn get_proximity(one: &Vec<u8>, other: &Vec<u8>) -> u8 {
 }
 
 pub fn content_address(chunk_content: &Vec<u8>) -> Vec<u8> {
-    let (something, something2) = chunk_content.split_at(SPAN_SIZE);
+    if chunk_content.len() > 8 {
+        let (something, something2) = chunk_content.split_at(SPAN_SIZE);
 
-    let contenthash = hasher_0(&something2.to_vec());
+        let contenthash = hasher_0(&something2.to_vec());
 
-    keccak256([something, &contenthash].concat()).to_vec()
+        return keccak256([something, &contenthash].concat()).to_vec();
+    }
+
+    return vec![];
 }
 
 pub fn valid_cac(chunk_content: &Vec<u8>, address: &Vec<u8>) -> bool {
@@ -136,7 +140,7 @@ pub fn valid_cac(chunk_content: &Vec<u8>, address: &Vec<u8>) -> bool {
 
     web_sys::console::log_1(&JsValue::from(format!(
         "Chunk non content addressed {:?}!",
-        chunk_address,
+        hex::encode(address),
     )));
 
     return false;

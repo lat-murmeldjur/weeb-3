@@ -617,6 +617,89 @@ pub async fn seek_latest_feed_update(
     return vec![];
 }
 
+pub async fn seek_next_feed_update_index(
+    owner: String,
+    topic: String,
+    data_retrieve_chan: &mpsc::Sender<(Vec<u8>, u8, mpsc::Sender<Vec<u8>>)>,
+    redundancy: u8,
+) -> u64 {
+    let mut largest_found = 0;
+    let mut smallest_not_found = u64::MAX;
+    let mut lower_bound = 0;
+    let mut upper_bound = 2_u64.pow(redundancy.into());
+    let mut _exact_ = false;
+
+    while !_exact_ {
+        async_std::task::yield_now().await;
+        async_std::task::sleep(Duration::from_millis(50)).await;
+
+        let angle = upper_bound - lower_bound;
+        let mut joiner = FuturesUnordered::new(); // ::<dyn Future<Output = Vec<u8>>> // ::<Pin<Box<dyn Future<Output = (Vec<u8>, usize)>>>>
+
+        let mut i = 0;
+
+        // dispatch probes
+
+        while lower_bound + i <= upper_bound {
+            let j = lower_bound + i;
+            let feed_update_address = get_feed_address(&owner, &topic, j);
+            let handle = async move {
+                return (get_chunk(feed_update_address, data_retrieve_chan).await, j);
+            };
+            joiner.push(handle);
+
+            if i == 0 || angle <= (redundancy as u64) {
+                i += 1;
+            } else {
+                i *= 2;
+            }
+        }
+
+        // receive results, update scores
+
+        while let Some((result0, result1)) = joiner.next().await {
+            if result0.len() == 0 && smallest_not_found > result1 {
+                smallest_not_found = result1;
+            }
+            if result0.len() > 0 && largest_found < result1 {
+                largest_found = result1;
+            }
+        }
+
+        // if _exact_ frontier found return corresponding data
+
+        if largest_found + 1 == smallest_not_found {
+            return smallest_not_found;
+        }
+
+        // search above previous record height
+
+        lower_bound = largest_found + 1;
+
+        // if smallest not found update was higher than current zone lower bound, narrow search between these values
+
+        if smallest_not_found > lower_bound {
+            upper_bound = smallest_not_found;
+        } else {
+            // exit if largest found stayed zero and smallest not found is also zero
+
+            if smallest_not_found == 0 && largest_found == 0 {
+                return 0;
+            }
+
+            // if we had a missing update below the record found height, discard hole and start from scratch regarding potential height
+
+            smallest_not_found = u64::MAX;
+
+            // set upper bound to search redundancy based limit
+
+            upper_bound = lower_bound + 2_u64.pow(redundancy.into());
+        }
+    }
+
+    return 0;
+}
+
 //
 //
 //

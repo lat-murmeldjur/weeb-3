@@ -215,26 +215,34 @@ pub async fn interpret_manifest(
                 let feed_data_soc =
                     seek_latest_feed_update(owner, topic, data_retrieve_chan, 8).await;
 
-                let feed_data_content =
-                    get_data(feed_data_soc[16..48].to_vec(), data_retrieve_chan).await;
+                if feed_data_soc.len() >= 48 {
+                    let mut ref_bound = 48;
 
-                web_sys::console::log_1(&JsValue::from(format!(
-                    "dispatch interpret manifest for reference in feed head soc ",
-                )));
+                    if ref_size > 32 {
+                        ref_bound = 80;
+                    }
 
-                let (mut appendix_0, _nondiscard) = Box::pin(interpret_manifest(
-                    "".to_string(),
-                    &feed_data_content,
-                    data_retrieve_chan,
-                ))
-                .await;
+                    let feed_data_content =
+                        get_data(feed_data_soc[16..ref_bound].to_vec(), data_retrieve_chan).await;
 
-                if !ind_set {
-                    ind = _nondiscard;
-                    ind_set = true;
+                    web_sys::console::log_1(&JsValue::from(format!(
+                        "dispatch interpret manifest for reference in feed head soc ",
+                    )));
+
+                    let (mut appendix_0, _nondiscard) = Box::pin(interpret_manifest(
+                        "".to_string(),
+                        &feed_data_content,
+                        data_retrieve_chan,
+                    ))
+                    .await;
+
+                    if !ind_set {
+                        ind = _nondiscard;
+                        ind_set = true;
+                    }
+
+                    parts.append(&mut appendix_0);
                 }
-
-                parts.append(&mut appendix_0);
             }
 
             let str0i = v1.get("website-index-document");

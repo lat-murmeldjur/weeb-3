@@ -1,45 +1,47 @@
 use crate::{
-    //    // // // // // // // //
+    //                                                                        //
     Date,
-    //    // // // // // // // //
+    //                                                                        //
     Duration,
-    //    // // // // // // // //
+    //                                                                        //
     HashMap,
-    //    // // // // // // // //
+    //                                                                        //
     HashSet,
-    //    // // // // // // // //
+    //                                                                        //
     JsValue,
-    //    // // // // // // // //
+    //                                                                        //
     Mutex,
-    //    // // // // // // // //
+    //                                                                        //
     PROTOCOL_ROUND_TIME,
-    //    // // // // // // // //
+    //                                                                        //
     PeerAccounting,
-    //    // // // // // // // //
+    //                                                                        //
     PeerId,
-    //    // // // // // // // //
+    //                                                                        //
     apply_credit,
-    //    // // // // // // // //
+    //                                                                        //
     cancel_reserve,
-    //    // // // // // // // //
+    //                                                                        //
     content_address,
-    //    // // // // // // // //
+    //                                                                        //
     get_proximity,
-    //    // // // // // // // //
-    manifest_upload::{Node, create_manifest},
-    //    // // // // // // // //
+    //                                                                        //
+    manifest_upload::{Node, create_fork, create_manifest, create_stub},
+    //                                                                        //
     mpsc,
-    //    // // // // // // // //
+    //                                                                        //
     persistence::bump_bucket,
-    //    // // // // // // // //
-    //    // // // // // // // //
+    //                                                                        //
     price,
-    //    // // // // // // // //
+    //                                                                        //
     pushsync_handler,
-    //    // // // // // // // //
+    //                                                                        //
     reserve,
-    //    // // // // // // // //
+    //                                                                        //
+    seek_next_feed_update_index,
+    //                                                                        //
     stream,
+    //                                                                        //
 };
 
 use byteorder::ByteOrder;
@@ -47,6 +49,8 @@ use byteorder::ByteOrder;
 use alloy::primitives::keccak256;
 use alloy::signers::Signer;
 use alloy::signers::local::PrivateKeySigner;
+
+use serde_json::json;
 
 pub async fn stamp_chunk(
     // stamp_signer: Signer,
@@ -67,7 +71,7 @@ pub async fn stamp_chunk(
     let mut index = 0;
 
     let (h, index0) =
-        bump_bucket(hex::encode(&batch_id).to_string() + &"__25__" + &bucket.to_string()).await;
+        bump_bucket(hex::encode(&batch_id).to_string() + &"__27__" + &bucket.to_string()).await;
     index = index0;
 
     if index > batch_bucket_limit {
@@ -120,7 +124,11 @@ pub async fn upload_resource(
     encryption: bool,
     mut index: String,
     errordoc: String,
+    feed: bool,
+    topic: String,
     data_upload_chan: &mpsc::Sender<(Vec<u8>, u8, mpsc::Sender<Vec<u8>>)>,
+    chunk_upload_chan: &mpsc::Sender<(Vec<u8>, bool, Vec<u8>)>,
+    data_retrieve_chan: &mpsc::Sender<(Vec<u8>, u8, mpsc::Sender<Vec<u8>>)>,
 ) -> Vec<u8> {
     //
     let mut node0: Vec<Node> = vec![];
@@ -170,15 +178,90 @@ pub async fn upload_resource(
     )
     .await;
 
-    return upload_data(core_manifest, encryption, data_upload_chan).await;
+    let mut manifest_reference = upload_data(core_manifest, encryption, data_upload_chan).await;
 
-    // alternatively, unpack .tar.gz and upload all files
-    // {
-    //
-    // }
+    if !feed {
+        return manifest_reference;
+    }
 
-    // create manifest
-    // return manifest reference
+    let owner_bytes_0 = keccak256("Unique owner to be persisted in indexeddb").to_vec();
+    let soc_signer: PrivateKeySigner = match PrivateKeySigner::from_slice(&owner_bytes_0.clone()) {
+        Ok(aok) => aok,
+        _ => return vec![],
+    };
+
+    let feed_owner = soc_signer.address().to_vec();
+    let feed_metadata = serde_json::to_vec(&json!({
+        "swarm-feed-owner": hex::encode(&feed_owner),
+        "swarm-feed-topic": topic,
+        "swarm-feed-type": "Sequence".to_string(),
+
+    }))
+    .unwrap();
+
+    let mut stub_ref_size = 32;
+
+    if encryption {
+        stub_ref_size = 64;
+    }
+
+    let stub_reference = upload_data(
+        create_stub(stub_ref_size, encryption).await,
+        encryption,
+        data_upload_chan,
+    )
+    .await;
+
+    let root_fork = create_fork("/".to_string(), stub_reference, feed_metadata).await;
+
+    let feed_manifest = create_manifest(
+        encryption,
+        encryption,
+        vec![],          // forks
+        vec![root_fork], // data_forks
+        vec![],          // reference
+        false,           // root manifest
+        0,
+        "".to_string(), // index
+        "".to_string(), // errordoc
+        data_upload_chan,
+    )
+    .await;
+
+    let feed_reference = upload_data(feed_manifest, encryption, data_upload_chan).await;
+
+    let index_up = seek_next_feed_update_index(
+        hex::encode(&feed_owner),
+        topic.clone(),
+        data_retrieve_chan,
+        8,
+    )
+    .await;
+
+    let wrapped_len: u64 = 8 + manifest_reference.len() as u64;
+    let wrapped_span = wrapped_len.to_le_bytes();
+
+    let mut soc_wrapped_content: Vec<u8> = vec![];
+    soc_wrapped_content.append(&mut wrapped_span.to_vec());
+    for _i in 0..8 {
+        soc_wrapped_content.push(0_u8);
+    }
+    soc_wrapped_content.append(&mut manifest_reference);
+
+    let index_bytes = index_up.to_le_bytes().to_vec();
+    // let owner_bytes = feed_owner.clone();
+    let topic_bytes = match hex::decode(topic) {
+        Ok(aok) => aok,
+        _ => return vec![],
+    };
+
+    let id_bytes = keccak256([topic_bytes, index_bytes].concat()).to_vec();
+
+    let (soc_actual, soc_address) = make_soc(&soc_wrapped_content, owner_bytes_0, id_bytes).await;
+
+    let _update_reference = chunk_upload_chan.send((soc_actual, true, soc_address));
+
+    return feed_reference;
 }
 
 pub async fn upload_data(
@@ -229,7 +312,7 @@ pub async fn upload_data(
 pub async fn push_data(
     data: Vec<u8>,
     encryption: bool,
-    chunk_upload_chan: &mpsc::Sender<(Vec<u8>, Vec<u8>)>,
+    chunk_upload_chan: &mpsc::Sender<(Vec<u8>, bool, Vec<u8>)>,
 ) -> Vec<u8> {
     let span_length = data.len();
 
@@ -245,7 +328,7 @@ pub async fn push_data(
         };
 
         let k = content_address(&data0);
-        let _ = chunk_upload_chan.send((data0, k.clone()));
+        let _ = chunk_upload_chan.send((data0, false, k.clone()));
 
         // web_sys::console::log_1(&JsValue::from(format!(
         //     "push_data returning {:#?}!",
@@ -354,7 +437,7 @@ pub async fn push_data(
 
                     // (span as u64).to_le_bytes().to_vec(),
 
-                    let _ = chunk_upload_chan.send((data0, cha));
+                    let _ = chunk_upload_chan.send((data0, false, cha));
                 }
             }
 
@@ -383,6 +466,8 @@ pub async fn push_data(
 
 pub async fn push_chunk(
     data: &Vec<u8>,
+    soc: bool,
+    soc_address: Vec<u8>,
     batch_id: Vec<u8>,
     batch_bucket_limit: u32,
     control: &mut stream::Control,
@@ -390,7 +475,7 @@ pub async fn push_chunk(
     accounting: &Mutex<HashMap<PeerId, Mutex<PeerAccounting>>>,
     refresh_chan: &mpsc::Sender<(PeerId, u64)>,
 ) -> Vec<u8> {
-    if data.len() > 4104 {
+    if (data.len() > 4104 && !soc) || (data.len() > 4201) {
         web_sys::console::log_1(&JsValue::from(format!(
             "Pushchunk returning empty reference for reason of data overlength!"
         )));
@@ -398,7 +483,16 @@ pub async fn push_chunk(
         return vec![];
     }
 
-    let caddr = content_address(&data);
+    let mut caddr = content_address(&data);
+
+    if soc {
+        caddr = soc_address.clone();
+
+        web_sys::console::log_1(&JsValue::from(format!(
+            "### Pushing SOC ### {}",
+            data.len()
+        )));
+    }
 
     let cstamp0 = stamp_chunk(
         //
@@ -633,4 +727,57 @@ pub fn encrey() -> Vec<u8> {
     }
 
     encrey0
+}
+
+pub async fn make_soc(
+    chunk_content: &Vec<u8>,
+    owner: Vec<u8>,
+    id_bytes: Vec<u8>,
+) -> (Vec<u8>, Vec<u8>) {
+    //let index_bytes = index.to_le_bytes().to_vec();
+    //let owner_bytes = hex::decode(owner).unwrap();
+    //let topic_bytes = hex::decode(topic).unwrap();
+    //let id_bytes = keccak256([topic_bytes, index_bytes].concat()).to_vec();
+
+    let soc_signer: PrivateKeySigner = match PrivateKeySigner::from_slice(&owner) {
+        Ok(aok) => aok,
+        _ => {
+            web_sys::console::log_1(&JsValue::from(format!(
+                "owner key length not 32 but {}",
+                owner.len()
+            )));
+            return (vec![], vec![]);
+        }
+    };
+
+    let soc_address =
+        keccak256([id_bytes.to_vec(), soc_signer.address().to_vec()].concat()).to_vec();
+
+    let mut soc_content: Vec<u8> = vec![];
+
+    soc_content.append(&mut id_bytes.clone());
+
+    let wrapped_address = content_address(chunk_content);
+
+    let digest = keccak256([id_bytes.clone(), wrapped_address].concat()).to_vec();
+
+    let signature = soc_signer
+        .sign_message(digest.as_slice())
+        .await
+        .unwrap()
+        .as_bytes()
+        .to_vec();
+
+    if signature.len() != 65 {
+        web_sys::console::log_1(&JsValue::from(format!(
+            "soc signature length not 64 but {}",
+            signature.len()
+        )));
+        return (vec![], vec![]);
+    }
+
+    soc_content.append(&mut signature[0..65].to_vec());
+    soc_content.append(&mut chunk_content.clone());
+
+    return (soc_content, soc_address);
 }

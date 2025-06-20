@@ -13,6 +13,8 @@ use std::time::Duration;
 
 use tar::Archive;
 
+use alloy::primitives::keccak256;
+
 use libp2p::{
     PeerId, StreamProtocol, Swarm, autonat,
     core::{self, Multiaddr, Transport},
@@ -133,10 +135,14 @@ pub struct Sekirei {
             Vec<(String, String, String, Vec<u8>)>,
             bool,
             String,
+            bool,
+            String,
             mpsc::Sender<Vec<u8>>,
         )>,
         mpsc::Receiver<(
             Vec<(String, String, String, Vec<u8>)>,
+            bool,
+            String,
             bool,
             String,
             mpsc::Sender<Vec<u8>>,
@@ -214,7 +220,14 @@ impl Sekirei {
         );
     }
 
-    pub async fn post_upload(&self, file: File, encryption: bool, index_string: String) -> Vec<u8> {
+    pub async fn post_upload(
+        &self,
+        file: File,
+        encryption: bool,
+        index_string: String,
+        add_to_feed: bool,
+        feed_topic: String,
+    ) -> Vec<u8> {
         web_sys::console::log_1(&JsValue::from(format!("File size {}", file.size())));
 
         let (chan_out, chan_in) = mpsc::channel::<Vec<u8>>();
@@ -308,10 +321,19 @@ impl Sekirei {
             fvec0.push((f_name, "".to_string(), f_type, content));
         }
 
-        let _ = self
-            .upload_port
-            .0
-            .send((fvec0, encryption, index_document, chan_out));
+        let topic_safe = match hex::decode(&feed_topic) {
+            Ok(_aok) => feed_topic,
+            _ => hex::encode(keccak256(feed_topic)),
+        };
+
+        let _ = self.upload_port.0.send((
+            fvec0,
+            encryption,
+            index_document,
+            add_to_feed,
+            topic_safe,
+            chan_out,
+        ));
 
         let k0 = async {
             let mut timelast: f64;
@@ -443,6 +465,8 @@ impl Sekirei {
             Vec<(String, String, String, Vec<u8>)>,
             bool,
             String,
+            bool,
+            String,
             mpsc::Sender<Vec<u8>>,
         )>();
         let (b_out, b_in) = mpsc::channel::<(String, mpsc::Sender<String>)>();
@@ -492,7 +516,7 @@ impl Sekirei {
             mpsc::channel::<(Vec<u8>, u8, mpsc::Sender<Vec<u8>>)>();
 
         let (chunk_upload_chan_outgoing, chunk_upload_chan_incoming) =
-            mpsc::channel::<(Vec<u8>, Vec<u8>)>();
+            mpsc::channel::<(Vec<u8>, bool, Vec<u8>)>();
 
         let ctrl;
         let mut incoming_pricing_streams;
@@ -937,7 +961,7 @@ impl Sekirei {
                 while let incoming_request = self.upload_port.1.try_recv() {
                     if !incoming_request.is_err() {
                         web_sys::console::log_1(&JsValue::from(format!("push triggered")));
-                        let (file0, enc, index, chan) = incoming_request.unwrap();
+                        let (file0, enc, index, feed, topic, chan) = incoming_request.unwrap();
                         let mut res0: Vec<Resource> = vec![];
                         for f in file0 {
                             res0.push(Resource {
@@ -954,7 +978,11 @@ impl Sekirei {
                             enc,
                             index,
                             "404.html".to_string(),
+                            feed,
+                            topic,
                             &data_upload_chan_outgoing,
+                            &chunk_upload_chan_outgoing,
+                            &data_retrieve_chan_outgoing,
                         )
                         .await;
                         web_sys::console::log_1(&JsValue::from(format!(
@@ -1095,7 +1123,7 @@ impl Sekirei {
                     let incoming_request = chunk_upload_chan_incoming.try_recv();
                     if !incoming_request.is_err() {
                         let handle = async {
-                            let (d, checkad) = incoming_request.unwrap();
+                            let (d, soc, checkad) = incoming_request.unwrap();
 
                             let mut ctrl9 = ctrl8.clone();
 
@@ -1108,6 +1136,8 @@ impl Sekirei {
 
                             let data_reference = push_chunk(
                                 &d,
+                                soc,
+                                checkad.clone(),
                                 batch_id,
                                 batch_bucket_limit,
                                 &mut ctrl9,

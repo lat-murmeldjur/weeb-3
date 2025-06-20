@@ -20,7 +20,7 @@
                 <label>Swarm Bootnode Multiaddress</label>
             </div>
             <div>
-                <input type="text" id="bootNodeMASettings" value="/ip4/192.168.1.6/tcp/1635/ws/p2p/QmP6KX4UmwRSfnn2AcZbdaTod6roKLaryqGcfjifTaR21c" size="90">
+                <input type="text" id="bootNodeMASettings" value="/ip4/192.168.1.6/tcp/1634/ws/p2p/QmZXSnyC43QzHQqqwDVYSMZsJdyxwKLAgSJxRUtiuEa1TJ" size="90">
             </div>
             <div>
                 <label>Swarm Network Id</label>
@@ -31,14 +31,22 @@
             </div>
             <h2>Navigation</h2>
             <input type="text" id="inputString" placeholder="Enter Swarm Hash or ENS site domain to display" size="64">
-            <button id="uploadGetBatch">... Get Space on Swarm for Uploads ...</button>
-            <input id="uploadFileSelect" type="file">... Select File to Upload on Swarm ...</input>
-            
-            <input id="uploadFileEncrypt" name="encryption" type="checkbox" checked>
-            <label for="encryption">Encrypt Upload</label>
 
-            <input type="text" id="indexString" placeholder="(Optional) Enter Index Document path for collection upload (.tar)" size="64">
-            <button id="uploadFile">... Upload on Swarm ...</button>
+            <div>
+                <button id="uploadGetBatch">... Get Space on Swarm for Uploads ...</button>
+                <input id="uploadFileSelect" type="file">... Select File to Upload on   Swarm ...</input>
+                
+                <input id="uploadFileEncrypt" name="encryption" type="checkbox" checked>
+                <label for="encryption">Encrypt Upload</label>
+    
+                <input type="text" id="indexString" placeholder="(Optional) Enter Index     Document path for collection upload (.tar)" size="64">
+                <button id="uploadFile">... Upload on Swarm ...</button>
+                <div>
+                    <input id="uploadAddToFeed" name="addtofeed" type="checkbox">
+                    <label for="addtofeed">Add upload reference to feed</label>
+                    <input type="text" id="feedTopicString" placeholder="Swarm Feed Topic">
+                </div>
+            </div>
             <div id="resultField"></div>
         </div>
     

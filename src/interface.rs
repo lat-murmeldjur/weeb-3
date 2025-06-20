@@ -341,6 +341,32 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
                 .dyn_ref::<HtmlInputElement>()
                 .expect("#uploadFileEncrypt should be a HtmlInputElement");
 
+            let upload_to_feed = document
+                .get_element_by_id("uploadAddToFeed")
+                .expect("#uploadAddToFeed should exist");
+
+            let upload_to_feed = upload_to_feed
+                .dyn_ref::<HtmlInputElement>()
+                .expect("#uploadAddToFeed should be a HtmlInputElement");
+
+            let mut feed_topic = "".to_string();
+
+            if upload_to_feed.checked() {
+                let topic_field = document
+                    .get_element_by_id("feedTopicString")
+                    .expect("#feedTopicString should exist");
+                let topic_field = topic_field
+                    .dyn_ref::<HtmlInputElement>()
+                    .expect("#feedTopicString should be a HtmlInputElement");
+
+                match topic_field.value().parse::<String>() {
+                    Ok(text) => {
+                        feed_topic = text;
+                    }
+                    Err(_) => {}
+                }
+            }
+
             web_sys::console::log_1(&JsValue::from(format!(
                 "selected file length {:#?}",
                 file.size()
@@ -380,6 +406,18 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
                 &msgobj,
                 &JsValue::from_str("index0"),
                 &JsValue::from_str(&index_string),
+            );
+
+            let _ = js_sys::Reflect::set(
+                &msgobj,
+                &JsValue::from_str("feed0"),
+                &JsValue::from_bool(upload_to_feed.checked()),
+            );
+
+            let _ = js_sys::Reflect::set(
+                &msgobj,
+                &JsValue::from_str("topic0"),
+                &JsValue::from_str(&feed_topic),
             );
 
             let worker_handle_2 = worker_handle3.borrow();
