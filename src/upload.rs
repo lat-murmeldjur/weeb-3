@@ -176,6 +176,8 @@ pub async fn upload_resource(
     )
     .await;
 
+    let mut core_manifest0 = core_manifest.clone();
+
     let mut manifest_reference = upload_data(core_manifest, encryption, data_upload_chan).await;
 
     if !feed {
@@ -236,29 +238,36 @@ pub async fn upload_resource(
     )
     .await;
 
-    let wrapped_len: u64 = 8 + manifest_reference.len() as u64;
+    let wrapped_len: u64 = core_manifest0.len() as u64;
     let wrapped_span = wrapped_len.to_le_bytes();
 
     let mut soc_wrapped_content: Vec<u8> = vec![];
     soc_wrapped_content.append(&mut wrapped_span.to_vec());
-    soc_wrapped_content.append(&mut ((Date::now() as u64) / 1000).to_be_bytes().to_vec());
-    soc_wrapped_content.append(&mut manifest_reference);
+    soc_wrapped_content.append(&mut core_manifest0);
 
-    let wrapped_content_reference = upload_data(
-        soc_wrapped_content[8..].to_vec(),
-        encryption,
-        data_upload_chan,
-    )
-    .await;
+    // let wrapped_len: u64 = 8 + manifest_reference.len() as u64;
+    // let wrapped_span = wrapped_len.to_le_bytes();
 
-    if wrapped_content_reference != content_address(&soc_wrapped_content) {
-        web_sys::console::log_1(&JsValue::from(format!("wrapped cac mismatch!",)));
-    } else {
-        web_sys::console::log_1(&JsValue::from(format!(
-            "wrapped cac address {:#?}!",
-            hex::encode(&wrapped_content_reference)
-        )));
-    }
+    //    let mut soc_wrapped_content: Vec<u8> = vec![];
+    //    soc_wrapped_content.append(&mut wrapped_span.to_vec());
+    //    soc_wrapped_content.append(&mut ((Date::now() as u64) / 1000).to_be_bytes().to_vec());
+    //    soc_wrapped_content.append(&mut manifest_reference);
+    //
+    //    let wrapped_content_reference = upload_data(
+    //        soc_wrapped_content[8..].to_vec(),
+    //        encryption,
+    //        data_upload_chan,
+    //    )
+    //    .await;
+    //
+    //    if wrapped_content_reference != content_address(&soc_wrapped_content) {
+    //        web_sys::console::log_1(&JsValue::from(format!("wrapped cac mismatch!",)));
+    //    } else {
+    //        web_sys::console::log_1(&JsValue::from(format!(
+    //            "wrapped cac address {:#?}!",
+    //            hex::encode(&wrapped_content_reference)
+    //        )));
+    //    }
 
     let index_bytes = index_up.to_le_bytes().to_vec();
     // let owner_bytes = feed_owner.clone();
