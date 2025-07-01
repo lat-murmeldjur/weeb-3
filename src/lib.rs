@@ -97,7 +97,7 @@ use crate::weeb_3::etiquette_2;
 // use crate::weeb_3::etiquette_5;
 // use crate::weeb_3::etiquette_6;
 
-const HANDSHAKE_PROTOCOL: StreamProtocol = StreamProtocol::new("/swarm/handshake/13.0.0/handshake");
+const HANDSHAKE_PROTOCOL: StreamProtocol = StreamProtocol::new("/swarm/handshake/14.0.0/handshake");
 const PRICING_PROTOCOL: StreamProtocol = StreamProtocol::new("/swarm/pricing/1.0.0/pricing");
 const GOSSIP_PROTOCOL: StreamProtocol = StreamProtocol::new("/swarm/hive/1.1.0/peers");
 const PSEUDOSETTLE_PROTOCOL: StreamProtocol =
@@ -318,7 +318,7 @@ impl Sekirei {
                 }
             }
         } else {
-            fvec0.push((f_name, "".to_string(), f_type, content));
+            fvec0.push((f_name.clone(), f_name, f_type, content));
         }
 
         let topic_safe = match hex::decode(&feed_topic) {

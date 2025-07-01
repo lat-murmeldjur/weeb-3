@@ -226,7 +226,8 @@ pub async fn interpret_manifest(
                         get_data(feed_data_soc[16..ref_bound].to_vec(), data_retrieve_chan).await;
 
                     web_sys::console::log_1(&JsValue::from(format!(
-                        "dispatch interpret manifest for reference in feed head soc ",
+                        "dispatch interpret manifest for reference in feed head soc {}",
+                        hex::encode(feed_data_soc[16..ref_bound].to_vec()),
                     )));
 
                     let (mut appendix_0, _nondiscard) = Box::pin(interpret_manifest(

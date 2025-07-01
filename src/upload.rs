@@ -162,8 +162,6 @@ pub async fn upload_resource(
         })
     }
 
-    // return core_reference;
-
     let core_manifest = create_manifest(
         encryption,
         encryption,
@@ -184,7 +182,7 @@ pub async fn upload_resource(
         return manifest_reference;
     }
 
-    let owner_bytes_0 = keccak256("Unique owner to be persisted in indexeddb").to_vec();
+    let owner_bytes_0 = keccak256("Unique owner to be persist3d in indexeddb").to_vec();
     let soc_signer: PrivateKeySigner = match PrivateKeySigner::from_slice(&owner_bytes_0.clone()) {
         Ok(aok) => aok,
         _ => return vec![],
@@ -243,10 +241,24 @@ pub async fn upload_resource(
 
     let mut soc_wrapped_content: Vec<u8> = vec![];
     soc_wrapped_content.append(&mut wrapped_span.to_vec());
-    for _i in 0..8 {
-        soc_wrapped_content.push(0_u8);
-    }
+    soc_wrapped_content.append(&mut ((Date::now() as u64) / 1000).to_be_bytes().to_vec());
     soc_wrapped_content.append(&mut manifest_reference);
+
+    let wrapped_content_reference = upload_data(
+        soc_wrapped_content[8..].to_vec(),
+        encryption,
+        data_upload_chan,
+    )
+    .await;
+
+    if wrapped_content_reference != content_address(&soc_wrapped_content) {
+        web_sys::console::log_1(&JsValue::from(format!("wrapped cac mismatch!",)));
+    } else {
+        web_sys::console::log_1(&JsValue::from(format!(
+            "wrapped cac address {:#?}!",
+            hex::encode(&wrapped_content_reference)
+        )));
+    }
 
     let index_bytes = index_up.to_le_bytes().to_vec();
     // let owner_bytes = feed_owner.clone();
