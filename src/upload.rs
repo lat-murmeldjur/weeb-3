@@ -24,6 +24,8 @@ use crate::{
     //                                                                        //
     content_address,
     //                                                                        //
+    get_chunk,
+    //                                                                        //
     get_proximity,
     //                                                                        //
     manifest_upload::{Node, create_fork, create_manifest, create_stub},
@@ -71,7 +73,7 @@ pub async fn stamp_chunk(
     let mut index = 0;
 
     let (h, index0) =
-        bump_bucket(hex::encode(&batch_id).to_string() + &"__27__" + &bucket.to_string()).await;
+        bump_bucket(hex::encode(&batch_id).to_string() + &"__28__" + &bucket.to_string()).await;
     index = index0;
 
     if index > batch_bucket_limit {
@@ -176,9 +178,9 @@ pub async fn upload_resource(
     )
     .await;
 
-    let mut core_manifest0 = core_manifest.clone();
+    let core_manifest0 = core_manifest.clone();
 
-    let mut manifest_reference = upload_data(core_manifest, encryption, data_upload_chan).await;
+    let manifest_reference = upload_data(core_manifest, encryption, data_upload_chan).await;
 
     if !feed {
         return manifest_reference;
@@ -241,9 +243,26 @@ pub async fn upload_resource(
     let wrapped_len: u64 = core_manifest0.len() as u64;
     let wrapped_span = wrapped_len.to_le_bytes();
 
+    let mut wrapped_content = vec![];
+
+    if core_manifest0.len() <= 4096 {
+        wrapped_content = core_manifest0.clone();
+    } else {
+        let mut uploaded = false;
+        while !uploaded {
+            let crown_chunk = get_chunk(manifest_reference.clone(), data_retrieve_chan).await;
+            if crown_chunk.len() > 0 {
+                wrapped_content = crown_chunk[8..].to_vec();
+                uploaded = true;
+            } else {
+                async_std::task::sleep(Duration::from_millis(1000)).await;
+            }
+        }
+    }
+
     let mut soc_wrapped_content: Vec<u8> = vec![];
     soc_wrapped_content.append(&mut wrapped_span.to_vec());
-    soc_wrapped_content.append(&mut core_manifest0);
+    soc_wrapped_content.append(&mut wrapped_content);
 
     // let wrapped_len: u64 = 8 + manifest_reference.len() as u64;
     // let wrapped_span = wrapped_len.to_le_bytes();

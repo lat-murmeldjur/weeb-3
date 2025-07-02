@@ -297,6 +297,7 @@ pub async fn create_manifest(
     if root_manifest {
         let root_metadata = serde_json::to_vec(&json!({
             "website-index-document": index,
+            "website-error-document": errordoc,
         }))
         .unwrap();
 
