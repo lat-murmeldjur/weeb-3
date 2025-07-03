@@ -215,19 +215,36 @@ pub async fn interpret_manifest(
                 let feed_data_soc =
                     seek_latest_feed_update(owner, topic, data_retrieve_chan, 8).await;
 
-                if feed_data_soc.len() >= 48 {
-                    let mut ref_bound = 48;
+                if feed_data_soc.len() >= 8 {
+                    let mut feed_data_content = vec![];
 
-                    if ref_size > 32 {
-                        ref_bound = 80;
+                    let soc_wrapped_span =
+                        u64::from_le_bytes(feed_data_soc[0..8].try_into().unwrap_or([0; 8]));
+
+                    if soc_wrapped_span <= 4096 {
+                        feed_data_content = feed_data_soc.to_vec();
+                    } else {
+                        let lens = (feed_data_soc.len() - 8) / ref_size as usize;
+
+                        feed_data_content.append(&mut feed_data_soc[0..8].to_vec());
+
+                        for i in 0..lens {
+                            let ref_start = 8 + i * ref_size as usize;
+                            let ref_end = 8 + (i + 1) * ref_size as usize;
+
+                            feed_data_content.append(
+                                &mut get_data(
+                                    feed_data_soc[ref_start..ref_end].to_vec(),
+                                    data_retrieve_chan,
+                                )
+                                .await[8..]
+                                    .to_vec(),
+                            );
+                        }
                     }
 
-                    let feed_data_content =
-                        get_data(feed_data_soc[16..ref_bound].to_vec(), data_retrieve_chan).await;
-
                     web_sys::console::log_1(&JsValue::from(format!(
-                        "dispatch interpret manifest for reference in feed head soc {}",
-                        hex::encode(feed_data_soc[16..ref_bound].to_vec()),
+                        "dispatch interpret manifest for wrapped content in feed head soc",
                     )));
 
                     let (mut appendix_0, _nondiscard) = Box::pin(interpret_manifest(

@@ -582,7 +582,7 @@ pub async fn seek_latest_feed_update(
         // if _exact_ frontier found return corresponding data
 
         if largest_found + 1 == smallest_not_found {
-            return get_data(
+            return get_chunk(
                 get_feed_address(&owner, &topic, largest_found),
                 data_retrieve_chan,
             )
