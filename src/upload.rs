@@ -72,8 +72,7 @@ pub async fn stamp_chunk(
     #[allow(unused_assignments)]
     let mut index = 0;
 
-    let (h, index0) =
-        bump_bucket(hex::encode(&batch_id).to_string() + &"__28__" + &bucket.to_string()).await;
+    let (h, index0) = bump_bucket(hex::encode(&batch_id).to_string(), bucket.to_string()).await;
     index = index0;
 
     if index > batch_bucket_limit {

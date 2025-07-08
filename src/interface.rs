@@ -32,9 +32,31 @@ use web_sys::{
 
 use alloy::{network::EthereumWallet, primitives::keccak256, signers::local::PrivateKeySigner};
 
+use crate::persistence::{bump_bucket, reset_stamp};
+
 #[wasm_bindgen]
 pub async fn interweeb(_st: String) -> Result<(), JsError> {
     init_panic_hook();
+
+    let k0 = bump_bucket("test_stamp_id".to_string(), "test_bucket_id".to_string()).await;
+    web_sys::console::log_1(&JsValue::from(format!("test0 {:#?}", k0)));
+
+    let k1 = bump_bucket("test_stamp_id".to_string(), "test_bucket_id".to_string()).await;
+    web_sys::console::log_1(&JsValue::from(format!("test0 {:#?}", k1)));
+
+    let k2 = bump_bucket("test_stamp_id".to_string(), "test_bucket_id".to_string()).await;
+    web_sys::console::log_1(&JsValue::from(format!("test0 {:#?}", k2)));
+
+    let _bracket = reset_stamp(&"test_stamp_id".to_string()).await;
+
+    let k3 = bump_bucket("test_stamp_id".to_string(), "test_bucket_id".to_string()).await;
+    web_sys::console::log_1(&JsValue::from(format!("test0 {:#?}", k3)));
+
+    let k4 = bump_bucket("test_stamp_id".to_string(), "test_bucket_id".to_string()).await;
+    web_sys::console::log_1(&JsValue::from(format!("test0 {:#?}", k4)));
+
+    let k5 = bump_bucket("test_stamp_id".to_string(), "test_bucket_id".to_string()).await;
+    web_sys::console::log_1(&JsValue::from(format!("test0 {:#?}", k5)));
 
     let window = &web_sys::window().unwrap();
 
@@ -399,7 +421,7 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
             let _ = js_sys::Reflect::set(
                 &msgobj,
                 &JsValue::from_str("encryption0"),
-                &JsValue::from_bool(file_enc.checked()),
+                &JsValue::from_bool(file_enc.checked() && !upload_to_feed.checked()),
             );
 
             let _ = js_sys::Reflect::set(

@@ -10,9 +10,20 @@ pub struct BucketData {
     value: u32,
 }
 
-async fn cat_base() -> Option<Database> {
-    let db = match Database::open("weeb_db")
-        .with_version(2u8)
+pub async fn reset_stamp(identifier: &String) {
+    let db = match Database::open("weeb_".to_string() + &identifier).await {
+        Ok(db0) => db0,
+        Err(e) => {
+            web_sys::console::log_1(&JsValue::from(format!("error opening database: {}", e)));
+            return;
+        }
+    };
+    let _ = db.delete();
+}
+
+async fn cat_base(identifier: String) -> Option<Database> {
+    let db = match Database::open("weeb_".to_string() + &identifier)
+        .with_version(1u8)
         .with_on_upgrade_needed(|event, db| {
             match (event.old_version(), event.new_version()) {
                 (0.0, Some(1.0)) => {
@@ -20,13 +31,6 @@ async fn cat_base() -> Option<Database> {
                         .create_object_store("weeb_datastore")
                         .with_auto_increment(true)
                         .build();
-                }
-                (prev, Some(2.0)) => {
-                    if prev == 1.0 {
-                        let _ = db.delete_object_store("weeb_datastore");
-                    }
-
-                    let _ = db.create_object_store("weeb_datastore_2").build();
                 }
                 _ => {}
             }
@@ -42,10 +46,10 @@ async fn cat_base() -> Option<Database> {
     Some(db)
 }
 
-pub async fn bump_bucket(bucket_identifier: String) -> (bool, u32) {
+pub async fn bump_bucket(stamp_identifier: String, bucket_identifier: String) -> (bool, u32) {
     let mut in_weeb = 0;
 
-    let db = match cat_base().await {
+    let db = match cat_base(stamp_identifier).await {
         Some(db0) => db0,
         _ => {
             web_sys::console::log_1(&JsValue::from(format!("ep0")));
@@ -54,7 +58,7 @@ pub async fn bump_bucket(bucket_identifier: String) -> (bool, u32) {
     };
 
     let transaction = match db
-        .transaction("weeb_datastore_2")
+        .transaction("weeb_datastore")
         .with_mode(TransactionMode::Readwrite)
         .build()
     {
@@ -65,7 +69,7 @@ pub async fn bump_bucket(bucket_identifier: String) -> (bool, u32) {
         }
     };
 
-    let store = match transaction.object_store("weeb_datastore_2") {
+    let store = match transaction.object_store("weeb_datastore") {
         Ok(s0) => s0,
         _ => {
             web_sys::console::log_1(&JsValue::from(format!("ep2")));

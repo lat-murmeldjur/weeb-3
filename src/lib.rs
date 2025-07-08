@@ -363,9 +363,8 @@ impl Sekirei {
         return encode_resources(
             vec![(
                 format!(
-                    "upload result: returned address displayed here: {} {}",
-                    hex::encode(&result),
-                    hex::encode([0_u8; 4])
+                    "upload result: returned address displayed here: {}",
+                    hex::encode(&result)
                 )
                 .as_bytes()
                 .to_vec(),
