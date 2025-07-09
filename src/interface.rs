@@ -86,6 +86,7 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
     let worker_handle = worker_handle0.clone();
     let worker_handle3 = worker_handle0.clone();
     let worker_handle4 = worker_handle0.clone();
+    let worker_handle5 = worker_handle0.clone();
 
     {
         let worker_handle_2 = &*worker_handle.borrow();
@@ -99,10 +100,12 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
     let mut persistent_callback_handle = get_on_msg_callback(r_out.clone());
     let mut persistent_callback_handle3 = get_on_msg_callback(r_out.clone());
     let mut persistent_callback_handle4 = get_on_msg_callback(r_out.clone());
+    let mut persistent_callback_handle5 = get_on_msg_callback(r_out.clone());
 
     let r_out0 = r_out.clone();
     let r_out3 = r_out.clone();
     let r_out4 = r_out.clone();
+    let r_out5 = r_out.clone();
 
     let callback =
         wasm_bindgen::closure::Closure::<dyn FnMut(web_sys::MessageEvent)>::new(move |_msg| {
@@ -536,6 +539,45 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
         .dyn_ref::<HtmlButtonElement>()
         .expect("#networkSet should be a HtmlButtonElement")
         .set_onclick(Some(callback4.as_ref().unchecked_ref()));
+
+    let callback5 =
+        wasm_bindgen::closure::Closure::<dyn FnMut(web_sys::MessageEvent)>::new(move |_msg| {
+            console::log_1(&"oninput reset stamp callback".into());
+
+            let window = web_sys::window().unwrap();
+
+            if window
+                .confirm_with_message(
+                    "This will enable overwriting previously uploaded content with new content.",
+                )
+                .unwrap_or(false)
+            {
+                let msgobj = js_sys::Object::new();
+                let _ = js_sys::Reflect::set(
+                    &msgobj,
+                    &JsValue::from_str("type0"),
+                    &JsValue::from_str("stamp_reset"),
+                );
+
+                let worker_handle_5 = worker_handle5.borrow();
+                let _ = worker_handle_5.port().post_message(&msgobj);
+
+                persistent_callback_handle5 = get_on_msg_callback(r_out5.clone());
+
+                // Since the worker returns the message asynchronously, we
+                // attach a callback to be triggered when the worker returns.
+                worker_handle_5
+                    .port()
+                    .set_onmessage(Some(persistent_callback_handle5.as_ref().unchecked_ref()));
+            }
+        });
+
+    document
+        .get_element_by_id("uploadResetStamp")
+        .expect("#uploadResetStamp should exist")
+        .dyn_ref::<HtmlButtonElement>()
+        .expect("#uploadResetStamp should be a HtmlButtonElement")
+        .set_onclick(Some(callback5.as_ref().unchecked_ref()));
 
     body.append_p(&format!("Created a new worker from within Wasm"))?;
 

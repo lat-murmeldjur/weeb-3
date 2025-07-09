@@ -52,6 +52,7 @@ mod manifest;
 mod manifest_upload;
 
 mod persistence;
+use persistence::reset_stamp;
 
 mod retrieval;
 use retrieval::*;
@@ -416,6 +417,24 @@ impl Sekirei {
         let result = k0.await;
 
         return result;
+    }
+
+    pub async fn reset_stamp(&self) -> Vec<u8> {
+        reset_stamp(
+            &"9210cb16c79cc4a8cefa2c3f32920271fdb3d00cb929503c0f2456ac62af1321".to_string(),
+        )
+        .await;
+
+        return encode_resources(
+            vec![(
+                format!("Stamp reset and ready to be reused. Uploads after this point will overwrite uploads from before this point.")
+                    .as_bytes()
+                    .to_vec(),
+                "text/plain".to_string(),
+                "... result ...".to_string(),
+            )],
+            "... result ...".to_string(),
+        );
     }
 
     pub fn new(_st: String) -> Sekirei {
