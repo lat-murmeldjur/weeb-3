@@ -107,51 +107,99 @@ pub async fn bump_bucket(stamp_identifier: String, bucket_identifier: String) ->
     };
 }
 
-// pub async fn reset_bucket(bucket_identifier: String) -> bool {
-//     let db = match cat_base().await {
-//         Some(db0) => db0,
-//         _ => {
-//             web_sys::console::log_1(&JsValue::from(format!("ep0")));
-//             return false;
-//         }
-//     };
-//
-//     let transaction = match db
-//         .transaction("weeb_datastore_2")
-//         .with_mode(TransactionMode::Readwrite)
-//         .build()
-//     {
-//         Ok(t0) => t0,
-//         _ => {
-//             web_sys::console::log_1(&JsValue::from(format!("ep1")));
-//             return false;
-//         }
-//     };
-//
-//     let store = match transaction.object_store("weeb_datastore_2") {
-//         Ok(s0) => s0,
-//         _ => {
-//             web_sys::console::log_1(&JsValue::from(format!("ep2")));
-//             return false;
-//         }
-//     };
-//
-//     let b1 = BucketData {
-//         id: bucket_identifier,
-//         value: 0,
-//     };
-//
-//     match store.put(b1.clone()).with_key(b1.id).serde() {
-//         Ok(_) => {}
-//         _ => {
-//             web_sys::console::log_1(&JsValue::from(format!("ep3")));
-//             return false;
-//         }
-//     };
-//
-//     return match transaction.commit().await {
-//         Ok(_) => true,
-//         _ => false,
-//     };
-// }
-//
+pub async fn cache_chunk(chunk_address: Vec<u8>, chunk_content: Vec<u8>) {
+    let db = match cat_base("chunk_cachestore".to_string()).await {
+        Some(db0) => db0,
+        _ => {
+            web_sys::console::log_1(&JsValue::from(format!("chunk cache store failed to open")));
+            return;
+        }
+    };
+
+    let transaction = match db
+        .transaction("weeb_datastore")
+        .with_mode(TransactionMode::Readwrite)
+        .build()
+    {
+        Ok(t0) => t0,
+        _ => {
+            web_sys::console::log_1(&JsValue::from(format!(
+                "chunk cache transaction failed to open"
+            )));
+            return;
+        }
+    };
+
+    let store = match transaction.object_store("weeb_datastore") {
+        Ok(s0) => s0,
+        _ => {
+            web_sys::console::log_1(&JsValue::from(format!(
+                "chunk cache datastore failed to open"
+            )));
+            return;
+        }
+    };
+
+    match store
+        .put(chunk_content)
+        .with_key(hex::encode(chunk_address))
+        .primitive()
+    {
+        Ok(_) => {}
+        _ => {
+            web_sys::console::log_1(&JsValue::from(format!("chunk cache store put failed")));
+        }
+    };
+
+    let _ = transaction.commit().await;
+
+    return;
+}
+
+pub async fn retrieve_cached_chunk(chunk_address: Vec<u8>) -> Vec<u8> {
+    let db = match cat_base("chunk_cachestore".to_string()).await {
+        Some(db0) => db0,
+        _ => {
+            web_sys::console::log_1(&JsValue::from(format!("chunk cache store failed to open")));
+            return vec![];
+        }
+    };
+
+    let transaction = match db
+        .transaction("weeb_datastore")
+        .with_mode(TransactionMode::Readwrite)
+        .build()
+    {
+        Ok(t0) => t0,
+        _ => {
+            web_sys::console::log_1(&JsValue::from(format!(
+                "chunk cache transaction failed to open"
+            )));
+            return vec![];
+        }
+    };
+
+    let store = match transaction.object_store("weeb_datastore") {
+        Ok(s0) => s0,
+        _ => {
+            web_sys::console::log_1(&JsValue::from(format!(
+                "chunk cache datastore failed to open"
+            )));
+            return vec![];
+        }
+    };
+
+    let chunk_data: Vec<u8> = match store
+        .get(hex::encode(chunk_address))
+        .primitive()
+        .unwrap()
+        .await
+    {
+        Ok(Some(b)) => b,
+        _ => vec![],
+    };
+
+    transaction.commit().await;
+
+    return chunk_data;
+}
