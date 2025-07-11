@@ -33,6 +33,8 @@ use crate::{
     // // // // // // // //
     mpsc,
     // // // // // // // //
+    persistence::{cache_chunk, retrieve_cached_chunk},
+    // // // // // // // //
     price,
     // // // // // // // //
     reserve,
@@ -187,6 +189,8 @@ pub async fn retrieve_chunk(
         encred = true;
     }
 
+    #[allow(unused_assignments)]
+    let mut chunk_valid = false;
     let mut soc = false;
     let mut skiplist: HashSet<PeerId> = HashSet::new();
     let mut overdraftlist: HashSet<PeerId> = HashSet::new();
@@ -204,7 +208,18 @@ pub async fn retrieve_chunk(
     let mut error_count = 0;
     let mut max_error = 8;
 
+    #[allow(unused_assignments)]
     let mut cd = vec![];
+
+    cd = retrieve_cached_chunk(&caddr).await;
+    if cd.len() > 0 {
+        (chunk_valid, soc) = verify_chunk(&caddr, &cd);
+        if chunk_valid {
+            error_count = max_error;
+        } else {
+            cd = vec![];
+        };
+    };
 
     while error_count < max_error {
         let mut seer = true;
@@ -319,43 +334,27 @@ pub async fn retrieve_chunk(
 
         match chunk_data {
             Ok(_x) => {
-                let contaddrd = valid_cac(&cd, &caddr);
-
-                if !contaddrd {
-                    soc = valid_soc(&cd, &caddr);
-                    if !soc {
-                        web_sys::console::log_1(&JsValue::from(format!(
-                            "invalid as Soc&Cac with len {} for address {}!",
-                            cd.len(),
-                            hex::encode(chunk_address)
-                        )));
-                        error_count += 1;
-                        let accounting_peers = accounting.lock().unwrap();
-                        if accounting_peers.contains_key(&closest_peer_id) {
-                            let accounting_peer = accounting_peers.get(&closest_peer_id).unwrap();
-                            cancel_reserve(accounting_peer, req_price)
-                        }
-                        web_sys::console::log_1(&JsValue::from(format!(
-                            "unable to retrieve chunk {} - content validity error",
-                            hex::encode(chunk_address)
-                        )));
-
-                        cd = vec![];
-                    } else {
+                (chunk_valid, soc) = verify_chunk(&caddr, &cd);
+                if chunk_valid {
+                    {
                         let accounting_peers = accounting.lock().unwrap();
                         if accounting_peers.contains_key(&closest_peer_id) {
                             let accounting_peer = accounting_peers.get(&closest_peer_id).unwrap();
                             apply_credit(accounting_peer, req_price);
                         }
-                        break;
                     }
-                } else {
-                    let accounting_peers = accounting.lock().unwrap();
-                    if accounting_peers.contains_key(&closest_peer_id) {
-                        let accounting_peer = accounting_peers.get(&closest_peer_id).unwrap();
-                        apply_credit(accounting_peer, req_price);
-                    }
+                    cache_chunk(&caddr, &cd).await;
                     break;
+                } else {
+                    error_count += 1;
+                    {
+                        let accounting_peers = accounting.lock().unwrap();
+                        if accounting_peers.contains_key(&closest_peer_id) {
+                            let accounting_peer = accounting_peers.get(&closest_peer_id).unwrap();
+                            cancel_reserve(accounting_peer, req_price)
+                        }
+                    }
+                    cd = vec![];
                 }
             }
             _ => {}
@@ -390,6 +389,20 @@ pub async fn retrieve_chunk(
         )));
     }
     return cd;
+}
+
+pub fn verify_chunk(caddr: &Vec<u8>, cd: &Vec<u8>) -> (bool, bool) {
+    let contaddrd = valid_cac(&cd, &caddr);
+    if !contaddrd {
+        let soc = valid_soc(&cd, &caddr);
+        if !soc {
+            return (false, false);
+        } else {
+            return (true, true);
+        }
+    } else {
+        return (true, false);
+    }
 }
 
 pub fn decrypt(cd: &Vec<u8>, encrey: Vec<u8>) -> Vec<u8> {

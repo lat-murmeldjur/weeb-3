@@ -32,31 +32,19 @@ use web_sys::{
 
 use alloy::{network::EthereumWallet, primitives::keccak256, signers::local::PrivateKeySigner};
 
-use crate::persistence::{bump_bucket, reset_stamp};
+use crate::persistence::{cache_chunk, retrieve_cached_chunk};
 
 #[wasm_bindgen]
 pub async fn interweeb(_st: String) -> Result<(), JsError> {
     init_panic_hook();
 
-    let k0 = bump_bucket("test_stamp_id".to_string(), "test_bucket_id".to_string()).await;
-    web_sys::console::log_1(&JsValue::from(format!("test0 {:#?}", k0)));
-
-    let k1 = bump_bucket("test_stamp_id".to_string(), "test_bucket_id".to_string()).await;
-    web_sys::console::log_1(&JsValue::from(format!("test0 {:#?}", k1)));
-
-    let k2 = bump_bucket("test_stamp_id".to_string(), "test_bucket_id".to_string()).await;
-    web_sys::console::log_1(&JsValue::from(format!("test0 {:#?}", k2)));
-
-    let _bracket = reset_stamp(&"test_stamp_id".to_string()).await;
-
-    let k3 = bump_bucket("test_stamp_id".to_string(), "test_bucket_id".to_string()).await;
-    web_sys::console::log_1(&JsValue::from(format!("test0 {:#?}", k3)));
-
-    let k4 = bump_bucket("test_stamp_id".to_string(), "test_bucket_id".to_string()).await;
-    web_sys::console::log_1(&JsValue::from(format!("test0 {:#?}", k4)));
-
-    let k5 = bump_bucket("test_stamp_id".to_string(), "test_bucket_id".to_string()).await;
-    web_sys::console::log_1(&JsValue::from(format!("test0 {:#?}", k5)));
+    cache_chunk(
+        &(hex::decode("ffff").unwrap().to_vec()),
+        &(hex::decode("ffffaaba").unwrap().to_vec()),
+    )
+    .await;
+    let fx0 = retrieve_cached_chunk(&(hex::decode("ffff").unwrap().to_vec())).await;
+    web_sys::console::log_1(&JsValue::from(format!("test0 {:#?}", hex::encode(fx0))));
 
     let window = &web_sys::window().unwrap();
 

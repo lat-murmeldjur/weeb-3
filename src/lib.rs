@@ -1189,7 +1189,9 @@ impl Sekirei {
                     }
                 }
 
-                web_sys::console::log_1(&JsValue::from(format!("Joining pushsync requests")));
+                if request_joiner.len() > 0 {
+                    web_sys::console::log_1(&JsValue::from(format!("making pushsync requests")));
+                }
 
                 join_all(request_joiner).await;
                 // while let Some(()) = request_joiner.next().await {
