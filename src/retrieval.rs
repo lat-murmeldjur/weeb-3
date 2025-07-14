@@ -48,9 +48,9 @@ use crate::{
     valid_soc,
 };
 
-use byteorder::ByteOrder;
-
 use alloy::primitives::keccak256;
+use async_std::sync::Arc;
+use byteorder::ByteOrder;
 
 use libp2p::futures::{StreamExt, stream::FuturesUnordered};
 
@@ -86,8 +86,8 @@ pub async fn retrieve_resource(
 pub async fn retrieve_data(
     chunk_address: &Vec<u8>,
     control: &mut stream::Control,
-    peers: &Mutex<HashMap<String, PeerId>>,
-    accounting: &Mutex<HashMap<PeerId, Mutex<PeerAccounting>>>,
+    peers: &Arc<Mutex<HashMap<String, PeerId>>>,
+    accounting: &Arc<Mutex<HashMap<PeerId, Mutex<PeerAccounting>>>>,
     refresh_chan: &mpsc::Sender<(PeerId, u64)>,
     // chunk_retrieve_chan: &mpsc::Sender<(Vec<u8>, u8, mpsc::Sender<Vec<u8>>)>,
 ) -> Vec<u8> {
@@ -136,8 +136,8 @@ pub async fn retrieve_data(
                 retrieve_data(
                     &address,
                     &mut ctrl,
-                    peers,
-                    accounting,
+                    &peers.clone(),
+                    &accounting.clone(),
                     refresh_chan,
                     // chunk_retrieve_chan,
                 )
@@ -175,8 +175,8 @@ pub async fn retrieve_data(
 pub async fn retrieve_chunk(
     chunk_address: &Vec<u8>,
     control: &mut stream::Control,
-    peers: &Mutex<HashMap<String, PeerId>>,
-    accounting: &Mutex<HashMap<PeerId, Mutex<PeerAccounting>>>,
+    peers: &Arc<Mutex<HashMap<String, PeerId>>>,
+    accounting: &Arc<Mutex<HashMap<PeerId, Mutex<PeerAccounting>>>>,
     refresh_chan: &mpsc::Sender<(PeerId, u64)>,
 ) -> Vec<u8> {
     let mut caddr: Vec<u8> = chunk_address.to_vec();
@@ -715,6 +715,4 @@ pub async fn seek_next_feed_update_index(
 
 //
 //
-//
-// 489ad55e2c2ba602ad09e245dbc34ea8b079a57ad318efea8cca60fafcfc2028
 //

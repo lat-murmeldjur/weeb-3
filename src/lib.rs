@@ -158,11 +158,11 @@ pub struct Sekirei {
 
 #[wasm_bindgen]
 pub struct Wings {
-    connected_peers: Mutex<HashMap<PeerId, PeerFile>>,
-    overlay_peers: Mutex<HashMap<String, PeerId>>,
-    accounting_peers: Mutex<HashMap<PeerId, Mutex<PeerAccounting>>>,
-    ongoing_refreshments: Mutex<HashSet<PeerId>>,
-    connection_attempts: Mutex<HashSet<PeerId>>,
+    connected_peers: Arc<Mutex<HashMap<PeerId, PeerFile>>>,
+    overlay_peers: Arc<Mutex<HashMap<String, PeerId>>>,
+    accounting_peers: Arc<Mutex<HashMap<PeerId, Mutex<PeerAccounting>>>>,
+    ongoing_refreshments: Arc<Mutex<HashSet<PeerId>>>,
+    connection_attempts: Arc<Mutex<HashSet<PeerId>>>,
 }
 
 #[wasm_bindgen]
@@ -471,12 +471,15 @@ impl Sekirei {
             })
             .build();
 
-        let connected_peers: Mutex<HashMap<PeerId, PeerFile>> = Mutex::new(HashMap::new());
-        let overlay_peers: Mutex<HashMap<String, PeerId>> = Mutex::new(HashMap::new());
-        let accounting_peers: Mutex<HashMap<PeerId, Mutex<PeerAccounting>>> =
-            Mutex::new(HashMap::new());
-        let ongoing_refreshments: Mutex<HashSet<PeerId>> = Mutex::new(HashSet::new());
-        let connection_attempts: Mutex<HashSet<PeerId>> = Mutex::new(HashSet::new());
+        let connected_peers: Arc<Mutex<HashMap<PeerId, PeerFile>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let overlay_peers: Arc<Mutex<HashMap<String, PeerId>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let accounting_peers: Arc<Mutex<HashMap<PeerId, Mutex<PeerAccounting>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let ongoing_refreshments: Arc<Mutex<HashSet<PeerId>>> =
+            Arc::new(Mutex::new(HashSet::new()));
+        let connection_attempts: Arc<Mutex<HashSet<PeerId>>> = Arc::new(Mutex::new(HashSet::new()));
 
         let (m_out, m_in) = mpsc::channel::<(Vec<u8>, mpsc::Sender<Vec<u8>>)>();
         let (u_out, u_in) = mpsc::channel::<(
@@ -1040,8 +1043,8 @@ impl Sekirei {
                                 let chunk_data = retrieve_data(
                                     &n,
                                     &mut ctrl9,
-                                    &wings.overlay_peers,
-                                    &wings.accounting_peers,
+                                    &wings.overlay_peers.clone(),
+                                    &wings.accounting_peers.clone(),
                                     &refreshment_instructions_chan_outgoing,
                                 )
                                 .await;
@@ -1052,8 +1055,8 @@ impl Sekirei {
                                 let chunk_data = retrieve_chunk(
                                     &n,
                                     &mut ctrl9,
-                                    &wings.overlay_peers,
-                                    &wings.accounting_peers,
+                                    &wings.overlay_peers.clone(),
+                                    &wings.accounting_peers.clone(),
                                     &refreshment_instructions_chan_outgoing,
                                 )
                                 .await;
@@ -1159,8 +1162,8 @@ impl Sekirei {
                                 batch_id,
                                 batch_bucket_limit,
                                 &mut ctrl9,
-                                &wings.overlay_peers,
-                                &wings.accounting_peers,
+                                &wings.overlay_peers.clone(),
+                                &wings.accounting_peers.clone(),
                                 &refreshment_instructions_chan_outgoing,
                             )
                             .await;
