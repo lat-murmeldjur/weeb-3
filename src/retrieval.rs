@@ -56,11 +56,13 @@ use libp2p::futures::{StreamExt, stream::FuturesUnordered};
 
 pub async fn retrieve_resource(
     chunk_address: &Vec<u8>,
-    data_retrieve_chan: &mpsc::Sender<(Vec<u8>, u8, mpsc::Sender<Vec<u8>>)>,
+    data_retrieve_chan: &mpsc::Sender<(Vec<u8>, mpsc::Sender<Vec<u8>>)>,
+    chunk_retrieve_chan: &mpsc::Sender<(Vec<u8>, mpsc::Sender<Vec<u8>>)>,
 ) -> Vec<u8> {
     let cd = get_data(chunk_address.to_vec(), data_retrieve_chan).await;
 
-    let (data_vector, index) = interpret_manifest("".to_string(), &cd, data_retrieve_chan).await;
+    let (data_vector, index) =
+        interpret_manifest("".to_string(), &cd, data_retrieve_chan, chunk_retrieve_chan).await;
     let mut data_vector_e: Vec<(Vec<u8>, String, String)> = vec![];
 
     for f in &data_vector {
@@ -84,92 +86,142 @@ pub async fn retrieve_resource(
 }
 
 pub async fn retrieve_data(
-    chunk_address: &Vec<u8>,
-    control: &mut stream::Control,
-    peers: &Arc<Mutex<HashMap<String, PeerId>>>,
-    accounting: &Arc<Mutex<HashMap<PeerId, Mutex<PeerAccounting>>>>,
-    refresh_chan: &mpsc::Sender<(PeerId, u64)>,
-    // chunk_retrieve_chan: &mpsc::Sender<(Vec<u8>, u8, mpsc::Sender<Vec<u8>>)>,
+    data_address: &Vec<u8>,
+    chunk_retrieve_chan: &mpsc::Sender<(Vec<u8>, mpsc::Sender<Vec<u8>>)>,
 ) -> Vec<u8> {
-    let orig = retrieve_chunk(chunk_address, control, peers, accounting, refresh_chan).await;
-    if orig.len() < 8 {
-        return vec![];
-    }
+    let root_chunk = get_chunk(data_address.to_vec(), chunk_retrieve_chan).await;
 
-    let span = u64::from_le_bytes(orig[0..8].try_into().unwrap_or([0; 8]));
-    if span <= 4096 {
-        return orig;
+    let mut root_span: u64 = 0;
+
+    if root_chunk.len() >= 8 {
+        root_span = u64::from_le_bytes(root_chunk[0..8].try_into().unwrap());
     } else {
         web_sys::console::log_1(&JsValue::from(format!(
-            "Got high level chunk with span {} : {}",
-            span,
-            hex::encode(chunk_address)
+            "chunk not found: {}",
+            hex::encode(data_address),
         )));
-    }
-
-    let address_length = chunk_address.len();
-
-    if (orig.len() - 8) % address_length != 0 {
         return vec![];
     }
 
-    async_std::task::yield_now().await;
-    async_std::task::sleep(Duration::from_millis(50)).await;
-
-    let mut joiner = FuturesUnordered::new(); // ::<dyn Future<Output = Vec<u8>>> // ::<Pin<Box<dyn Future<Output = (Vec<u8>, usize)>>>>
-
-    let subs = (orig.len() - 8) / address_length;
-
-    let mut content_holder_2: Vec<Vec<u8>> = vec![];
-
-    for i in 0..subs {
-        content_holder_2
-            .push((&orig[8 + i * address_length..8 + (i + 1) * address_length]).to_vec());
-    }
-
-    for (i, addr) in content_holder_2.iter().enumerate() {
-        let index = i;
-        let address = addr.clone();
-        let mut ctrl = control.clone();
-        let handle = async move {
-            return (
-                retrieve_data(
-                    &address,
-                    &mut ctrl,
-                    &peers.clone(),
-                    &accounting.clone(),
-                    refresh_chan,
-                    // chunk_retrieve_chan,
-                )
-                .await,
-                index.clone(),
-            );
-        };
-        joiner.push(handle);
-    }
-
-    let mut content_holder_3: HashMap<usize, Vec<u8>> = HashMap::new();
-
-    while let Some((result0, result1)) = joiner.next().await {
-        content_holder_3.insert(result1, result0);
-    }
-
-    let mut data: Vec<u8> = Vec::new();
-    data.append(&mut orig[0..8].to_vec());
-    for i in 0..subs {
-        match content_holder_3.get(&i) {
-            Some(data0) => {
-                if data0.len() > 0 {
-                    data.append(&mut data0[8..].to_vec());
-                } else {
-                    return vec![];
-                }
-            }
-            None => return vec![],
+    if root_span <= 4096 {
+        if (root_span + 8) as usize == root_chunk.len() {
+            return root_chunk;
+        } else {
+            web_sys::console::log_1(&JsValue::from(format!(
+                "retrieved chunk length ({}) mismatching span ({}) + 8 for chunk {}",
+                root_chunk.len(),
+                root_span,
+                hex::encode(data_address),
+            )));
+            return vec![];
         }
     }
 
-    return data;
+    let address_length = data_address.len();
+
+    if root_chunk.len() < 8 + address_length {
+        web_sys::console::log_1(&JsValue::from(format!(
+            "chunk too short: {}",
+            hex::encode(data_address),
+        )));
+        return vec![];
+    }
+
+    let mut orig = root_chunk[8..].to_vec();
+
+    let mut data: Vec<u8> = vec![];
+    data.append(&mut root_chunk[0..8].to_vec());
+
+    let mut done = false;
+    while !done {
+        if orig.len() % address_length != 0 {
+            return vec![];
+        }
+
+        let subs = orig.len() / address_length;
+        let mut content_holder_2: Vec<Vec<u8>> = vec![];
+        for i in 0..subs {
+            content_holder_2.push((&orig[i * address_length..(i + 1) * address_length]).to_vec());
+        }
+
+        let mut joiner = FuturesUnordered::new();
+
+        for (i, addr) in content_holder_2.iter().enumerate() {
+            let index = i;
+            let handle = async move {
+                return (
+                    get_chunk(addr.clone(), chunk_retrieve_chan).await,
+                    index.clone(),
+                    addr.clone(),
+                );
+            };
+            joiner.push(handle);
+        }
+
+        let mut content_holder_3: HashMap<usize, Vec<u8>> = HashMap::new();
+        let mut content_holder_4: HashMap<usize, Vec<u8>> = HashMap::new();
+
+        done = true;
+        while let Some((result0, result1, result2)) = joiner.next().await {
+            if result0.len() > 8 {
+                let result_span = u64::from_le_bytes(result0[0..8].try_into().unwrap());
+                if result_span > 4096 {
+                    done = false;
+                    content_holder_3.insert(result1, result0[8..].to_vec());
+                } else {
+                    content_holder_3.insert(result1, result2);
+                    content_holder_4.insert(result1, result0[8..].to_vec());
+                }
+            } else {
+                web_sys::console::log_1(&JsValue::from(format!(
+                    "chunk not found: {}",
+                    hex::encode(result2),
+                )));
+                return vec![];
+            }
+        }
+
+        if !done {
+            orig = vec![];
+            for i in 0..subs {
+                match content_holder_3.get(&i) {
+                    Some(data0) => {
+                        if data0.len() > 0 {
+                            orig.append(&mut data0[..].to_vec());
+                        } else {
+                            return vec![];
+                        }
+                    }
+                    None => return vec![],
+                }
+            }
+        } else {
+            for i in 0..subs {
+                match content_holder_4.get(&i) {
+                    Some(data0) => {
+                        if data0.len() > 0 {
+                            data.append(&mut data0[..].to_vec());
+                        } else {
+                            return vec![];
+                        }
+                    }
+                    None => return vec![],
+                }
+            }
+        }
+    }
+
+    if data.len() == (root_span + 8) as usize {
+        return data;
+    } else {
+        web_sys::console::log_1(&JsValue::from(format!(
+            "retrieved result length ({}) not matching span ({}) + 8 for data address {}",
+            data.len(),
+            root_span,
+            hex::encode(data_address),
+        )));
+        return vec![];
+    }
 }
 
 pub async fn retrieve_chunk(
@@ -477,12 +529,10 @@ pub fn decrypt(cd: &Vec<u8>, encrey: Vec<u8>) -> Vec<u8> {
 
 pub async fn get_data(
     data_address: Vec<u8>,
-    data_retrieve_chan: &mpsc::Sender<(Vec<u8>, u8, mpsc::Sender<Vec<u8>>)>,
+    data_retrieve_chan: &mpsc::Sender<(Vec<u8>, mpsc::Sender<Vec<u8>>)>,
 ) -> Vec<u8> {
     let (chan_out, chan_in) = mpsc::channel::<Vec<u8>>();
-    data_retrieve_chan
-        .send((data_address, 1, chan_out))
-        .unwrap();
+    data_retrieve_chan.send((data_address, chan_out)).unwrap();
 
     let k0 = async {
         let mut timelast: f64;
@@ -511,12 +561,10 @@ pub async fn get_data(
 
 pub async fn get_chunk(
     data_address: Vec<u8>,
-    data_retrieve_chan: &mpsc::Sender<(Vec<u8>, u8, mpsc::Sender<Vec<u8>>)>,
+    chunk_retrieve_chan: &mpsc::Sender<(Vec<u8>, mpsc::Sender<Vec<u8>>)>,
 ) -> Vec<u8> {
     let (chan_out, chan_in) = mpsc::channel::<Vec<u8>>();
-    data_retrieve_chan
-        .send((data_address, 0, chan_out))
-        .unwrap();
+    chunk_retrieve_chan.send((data_address, chan_out)).unwrap();
 
     let k0 = async {
         let mut timelast: f64;
@@ -546,7 +594,7 @@ pub async fn get_chunk(
 pub async fn seek_latest_feed_update(
     owner: String,
     topic: String,
-    data_retrieve_chan: &mpsc::Sender<(Vec<u8>, u8, mpsc::Sender<Vec<u8>>)>,
+    chunk_retrieve_chan: &mpsc::Sender<(Vec<u8>, mpsc::Sender<Vec<u8>>)>,
     redundancy: u8,
 ) -> Vec<u8> {
     let mut largest_found = 0;
@@ -570,7 +618,7 @@ pub async fn seek_latest_feed_update(
             let j = lower_bound + i;
             let feed_update_address = get_feed_address(&owner, &topic, j);
             let handle = async move {
-                return (get_chunk(feed_update_address, data_retrieve_chan).await, j);
+                return (get_chunk(feed_update_address, chunk_retrieve_chan).await, j);
             };
             joiner.push(handle);
 
@@ -597,7 +645,7 @@ pub async fn seek_latest_feed_update(
         if largest_found + 1 == smallest_not_found {
             return get_chunk(
                 get_feed_address(&owner, &topic, largest_found),
-                data_retrieve_chan,
+                chunk_retrieve_chan,
             )
             .await;
         }
@@ -633,7 +681,7 @@ pub async fn seek_latest_feed_update(
 pub async fn seek_next_feed_update_index(
     owner: String,
     topic: String,
-    data_retrieve_chan: &mpsc::Sender<(Vec<u8>, u8, mpsc::Sender<Vec<u8>>)>,
+    chunk_retrieve_chan: &mpsc::Sender<(Vec<u8>, mpsc::Sender<Vec<u8>>)>,
     redundancy: u8,
 ) -> u64 {
     let mut largest_found = 0;
@@ -657,7 +705,7 @@ pub async fn seek_next_feed_update_index(
             let j = lower_bound + i;
             let feed_update_address = get_feed_address(&owner, &topic, j);
             let handle = async move {
-                return (get_chunk(feed_update_address, data_retrieve_chan).await, j);
+                return (get_chunk(feed_update_address, chunk_retrieve_chan).await, j);
             };
             joiner.push(handle);
 
@@ -714,5 +762,5 @@ pub async fn seek_next_feed_update_index(
 }
 
 //
-//
+// 166875e18d6754e468f231c8545322eaff22a0e3ec939fc25b296c4ce31dd654
 //

@@ -167,7 +167,7 @@ pub async fn retrieve_cached_chunk(chunk_address: &Vec<u8>) -> Vec<u8> {
 
     let transaction = match db
         .transaction("weeb_datastore")
-        .with_mode(TransactionMode::Readwrite)
+        .with_mode(TransactionMode::Readonly)
         .build()
     {
         Ok(t0) => t0,

@@ -22,7 +22,8 @@ pub struct Fork {
 pub async fn interpret_manifest(
     path_prefix_heritance: String,
     cd0: &Vec<u8>,
-    data_retrieve_chan: &mpsc::Sender<(Vec<u8>, u8, mpsc::Sender<Vec<u8>>)>,
+    data_retrieve_chan: &mpsc::Sender<(Vec<u8>, mpsc::Sender<Vec<u8>>)>,
+    chunk_retrieve_chan: &mpsc::Sender<(Vec<u8>, mpsc::Sender<Vec<u8>>)>,
 ) -> (Vec<Fork>, String) {
     let mut ind: String = "".to_string();
     let mut ind_set = false;
@@ -213,7 +214,7 @@ pub async fn interpret_manifest(
 
             if feed {
                 let feed_data_soc =
-                    seek_latest_feed_update(owner, topic, data_retrieve_chan, 8).await;
+                    seek_latest_feed_update(owner, topic, chunk_retrieve_chan, 8).await;
 
                 if feed_data_soc.len() >= 8 {
                     let mut feed_data_content = vec![];
@@ -251,6 +252,7 @@ pub async fn interpret_manifest(
                         "".to_string(),
                         &feed_data_content,
                         data_retrieve_chan,
+                        chunk_retrieve_chan,
                     ))
                     .await;
 
@@ -285,8 +287,13 @@ pub async fn interpret_manifest(
                         "dispatch interpret manifest for with metadata fork reference with no content type",
                     )));
 
-                    let (mut appendix_0, _discard) =
-                        Box::pin(interpret_manifest(bequeath, &ref_data, data_retrieve_chan)).await;
+                    let (mut appendix_0, _discard) = Box::pin(interpret_manifest(
+                        bequeath,
+                        &ref_data,
+                        data_retrieve_chan,
+                        chunk_retrieve_chan,
+                    ))
+                    .await;
                     parts.append(&mut appendix_0);
                     continue;
                 }
@@ -370,8 +377,13 @@ pub async fn interpret_manifest(
             web_sys::console::log_1(&JsValue::from(format!(
                 "dispatch interpret manifest for fork with no metadata",
             )));
-            let (mut appendix_0, _discard) =
-                Box::pin(interpret_manifest(bequeath, &ref_data, data_retrieve_chan)).await;
+            let (mut appendix_0, _discard) = Box::pin(interpret_manifest(
+                bequeath,
+                &ref_data,
+                data_retrieve_chan,
+                chunk_retrieve_chan,
+            ))
+            .await;
             parts.append(&mut appendix_0);
         }
     }

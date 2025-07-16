@@ -129,7 +129,7 @@ pub async fn upload_resource(
     topic: String,
     data_upload_chan: &mpsc::Sender<(Vec<u8>, u8, mpsc::Sender<Vec<u8>>)>,
     chunk_upload_chan: &mpsc::Sender<(Vec<u8>, bool, Vec<u8>)>,
-    data_retrieve_chan: &mpsc::Sender<(Vec<u8>, u8, mpsc::Sender<Vec<u8>>)>,
+    chunk_retrieve_chan: &mpsc::Sender<(Vec<u8>, mpsc::Sender<Vec<u8>>)>,
 ) -> Vec<u8> {
     //
     let mut node0: Vec<Node> = vec![];
@@ -234,7 +234,7 @@ pub async fn upload_resource(
     let index_up = seek_next_feed_update_index(
         hex::encode(&feed_owner),
         topic.clone(),
-        data_retrieve_chan,
+        chunk_retrieve_chan,
         8,
     )
     .await;
@@ -249,7 +249,7 @@ pub async fn upload_resource(
     } else {
         let mut uploaded = false;
         while !uploaded {
-            let crown_chunk = get_chunk(manifest_reference.clone(), data_retrieve_chan).await;
+            let crown_chunk = get_chunk(manifest_reference.clone(), chunk_retrieve_chan).await;
             if crown_chunk.len() > 0 {
                 wrapped_content = crown_chunk[8..].to_vec();
                 uploaded = true;
@@ -262,30 +262,6 @@ pub async fn upload_resource(
     let mut soc_wrapped_content: Vec<u8> = vec![];
     soc_wrapped_content.append(&mut wrapped_span.to_vec());
     soc_wrapped_content.append(&mut wrapped_content);
-
-    // let wrapped_len: u64 = 8 + manifest_reference.len() as u64;
-    // let wrapped_span = wrapped_len.to_le_bytes();
-
-    //    let mut soc_wrapped_content: Vec<u8> = vec![];
-    //    soc_wrapped_content.append(&mut wrapped_span.to_vec());
-    //    soc_wrapped_content.append(&mut ((Date::now() as u64) / 1000).to_be_bytes().to_vec());
-    //    soc_wrapped_content.append(&mut manifest_reference);
-    //
-    //    let wrapped_content_reference = upload_data(
-    //        soc_wrapped_content[8..].to_vec(),
-    //        encryption,
-    //        data_upload_chan,
-    //    )
-    //    .await;
-    //
-    //    if wrapped_content_reference != content_address(&soc_wrapped_content) {
-    //        web_sys::console::log_1(&JsValue::from(format!("wrapped cac mismatch!",)));
-    //    } else {
-    //        web_sys::console::log_1(&JsValue::from(format!(
-    //            "wrapped cac address {:#?}!",
-    //            hex::encode(&wrapped_content_reference)
-    //        )));
-    //    }
 
     let index_bytes = index_up.to_le_bytes().to_vec();
     // let owner_bytes = feed_owner.clone();

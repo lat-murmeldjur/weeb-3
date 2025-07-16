@@ -531,7 +531,10 @@ impl Sekirei {
             mpsc::channel::<(PeerId, u64)>();
 
         let (data_retrieve_chan_outgoing, data_retrieve_chan_incoming) =
-            mpsc::channel::<(Vec<u8>, u8, mpsc::Sender<Vec<u8>>)>();
+            mpsc::channel::<(Vec<u8>, mpsc::Sender<Vec<u8>>)>();
+
+        let (chunk_retrieve_chan_outgoing, chunk_retrieve_chan_incoming) =
+            mpsc::channel::<(Vec<u8>, mpsc::Sender<Vec<u8>>)>();
 
         let (data_upload_chan_outgoing, data_upload_chan_incoming) =
             mpsc::channel::<(Vec<u8>, u8, mpsc::Sender<Vec<u8>>)>();
@@ -571,7 +574,7 @@ impl Sekirei {
             web_sys::console::log_1(&JsValue::from(format!("Opened Pricing handler 1")));
             while let Some((peer, stream)) = incoming_pricing_streams.next().await {
                 web_sys::console::log_1(&JsValue::from(format!("Entered Pricing handler 1")));
-                pricing_handler(peer, stream, &pricing_chan_outgoing)
+                pricing_handler(peer, stream, &pricing_chan_outgoing.clone())
                     .await
                     .unwrap();
             }
@@ -581,7 +584,7 @@ impl Sekirei {
             web_sys::console::log_1(&JsValue::from(format!("Opened Gossip handler 1")));
             while let Some((peer, stream)) = incoming_gossip_streams.next().await {
                 web_sys::console::log_1(&JsValue::from(format!("Entered Gossip handler 1")));
-                gossip_handler(peer, stream, &peers_instructions_chan_outgoing)
+                gossip_handler(peer, stream, &peers_instructions_chan_outgoing.clone())
                     .await
                     .unwrap();
             }
@@ -782,7 +785,7 @@ impl Sekirei {
                                     &mut ctrl3,
                                     &addr3.clone(),
                                     &self.secret_key.lock().unwrap(),
-                                    &accounting_peer_chan_outgoing,
+                                    &accounting_peer_chan_outgoing.clone(),
                                 )
                                 .await;
                             }
@@ -954,8 +957,12 @@ impl Sekirei {
                 while let incoming_request = self.message_port.1.try_recv() {
                     if !incoming_request.is_err() {
                         let (n, chan) = incoming_request.unwrap();
-                        let encoded_data =
-                            retrieve_resource(&n, &data_retrieve_chan_outgoing).await;
+                        let encoded_data = retrieve_resource(
+                            &n,
+                            &data_retrieve_chan_outgoing.clone(),
+                            &chunk_retrieve_chan_outgoing.clone(),
+                        )
+                        .await;
 
                         chan.send(encoded_data).unwrap();
                     } else {
@@ -1001,9 +1008,9 @@ impl Sekirei {
                             "404.html".to_string(),
                             feed,
                             topic,
-                            &data_upload_chan_outgoing,
-                            &chunk_upload_chan_outgoing,
-                            &data_retrieve_chan_outgoing,
+                            &data_upload_chan_outgoing.clone(),
+                            &chunk_upload_chan_outgoing.clone(),
+                            &chunk_retrieve_chan_outgoing.clone(),
                         )
                         .await;
                         web_sys::console::log_1(&JsValue::from(format!(
@@ -1037,32 +1044,10 @@ impl Sekirei {
                 while let incoming_request = data_retrieve_chan_incoming.try_recv() {
                     if !incoming_request.is_err() {
                         let handle = async {
-                            let mut ctrl9 = ctrl6.clone();
-                            let (n, mode, chan) = incoming_request.unwrap();
-                            if mode == 1 {
-                                let chunk_data = retrieve_data(
-                                    &n,
-                                    &mut ctrl9,
-                                    &wings.overlay_peers.clone(),
-                                    &wings.accounting_peers.clone(),
-                                    &refreshment_instructions_chan_outgoing,
-                                )
-                                .await;
-
-                                chan.send(chunk_data).unwrap();
-                            }
-                            if mode == 0 {
-                                let chunk_data = retrieve_chunk(
-                                    &n,
-                                    &mut ctrl9,
-                                    &wings.overlay_peers.clone(),
-                                    &wings.accounting_peers.clone(),
-                                    &refreshment_instructions_chan_outgoing,
-                                )
-                                .await;
-
-                                chan.send(chunk_data).unwrap();
-                            }
+                            let (n, chan) = incoming_request.unwrap();
+                            let retrieved_data =
+                                retrieve_data(&n, &chunk_retrieve_chan_outgoing.clone()).await;
+                            chan.send(retrieved_data).unwrap();
                         };
                         request_joiner.push(handle);
                     } else {
@@ -1106,7 +1091,8 @@ impl Sekirei {
                             };
 
                             let data_reference =
-                                push_data(n, encrypted_data, &chunk_upload_chan_outgoing).await;
+                                push_data(n, encrypted_data, &chunk_upload_chan_outgoing.clone())
+                                    .await;
                             web_sys::console::log_1(&JsValue::from(format!(
                                 "Writing response to encrypted : {} push data request",
                                 encrypted_data
@@ -1164,7 +1150,7 @@ impl Sekirei {
                                 &mut ctrl9,
                                 &wings.overlay_peers.clone(),
                                 &wings.accounting_peers.clone(),
-                                &refreshment_instructions_chan_outgoing,
+                                &refreshment_instructions_chan_outgoing.clone(),
                             )
                             .await;
 
@@ -1213,10 +1199,63 @@ impl Sekirei {
             }
         };
 
+        let retrieve_chunk_handle = async {
+            let mut timelast = Date::now();
+            loop {
+                let mut request_joiner = Vec::new();
+
+                #[allow(irrefutable_let_patterns)]
+                for _i in 0..1024 {
+                    let incoming_request = chunk_retrieve_chan_incoming.try_recv();
+                    if !incoming_request.is_err() {
+                        let handle = async {
+                            let (n, chan) = incoming_request.unwrap();
+
+                            let mut ctrl9 = ctrl6.clone();
+
+                            let chunk_data = retrieve_chunk(
+                                &n,
+                                &mut ctrl9,
+                                &wings.overlay_peers.clone(),
+                                &wings.accounting_peers.clone(),
+                                &refreshment_instructions_chan_outgoing.clone(),
+                            )
+                            .await;
+
+                            chan.send(chunk_data).unwrap();
+                        };
+                        request_joiner.push(handle);
+                    } else {
+                        break;
+                    }
+                }
+
+                if request_joiner.len() > 0 {
+                    web_sys::console::log_1(&JsValue::from(format!(
+                        "making ({}) chunk retrieval requests",
+                        request_joiner.len()
+                    )));
+                }
+
+                join_all(request_joiner).await;
+
+                let timenow = Date::now();
+                let seg = timenow - timelast;
+                if seg < PROTO_LOOP_INTERRUPTOR {
+                    async_std::task::sleep(Duration::from_millis(
+                        (PROTO_LOOP_INTERRUPTOR - seg) as u64,
+                    ))
+                    .await;
+                }
+                timelast = Date::now();
+            }
+        };
+
         join!(
             event_handle,
             retrieve_handle,
             retrieve_data_handle,
+            retrieve_chunk_handle,
             push_handle,
             push_data_handle,
             push_chunk_handle,
