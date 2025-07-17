@@ -19,6 +19,15 @@ pub async fn reset_stamp(identifier: &String) {
         }
     };
     let _ = db.delete();
+
+    let db2 = match Database::open("weeb_chunk_cachestore".to_string()).await {
+        Ok(db0) => db0,
+        Err(e) => {
+            web_sys::console::log_1(&JsValue::from(format!("error opening database: {}", e)));
+            return;
+        }
+    };
+    let _ = db2.delete();
 }
 
 async fn cat_base(identifier: String) -> Option<Database> {

@@ -146,43 +146,55 @@ pub async fn retrieve_data(
 
         let mut joiner = FuturesUnordered::new();
 
-        for (i, addr) in content_holder_2.iter().enumerate() {
-            let index = i;
-            let handle = async move {
-                return (
-                    get_chunk(addr.clone(), chunk_retrieve_chan).await,
-                    index.clone(),
-                    addr.clone(),
-                );
-            };
-            joiner.push(handle);
-        }
-
+        done = true;
+        let mut waves_done = false;
+        let mut i = 0;
         let mut content_holder_3: HashMap<usize, Vec<u8>> = HashMap::new();
         let mut content_holder_4: HashMap<usize, Vec<u8>> = HashMap::new();
 
-        done = true;
-        while let Some((result0, result1, result2)) = joiner.next().await {
-            if result0.len() > 8 {
-                let result_span = u64::from_le_bytes(result0[0..8].try_into().unwrap());
-                if result_span > 4096 {
-                    done = false;
-                    content_holder_3.insert(result1, result0[8..].to_vec());
-                } else {
-                    content_holder_3.insert(result1, result2);
-                    content_holder_4.insert(result1, result0[8..].to_vec());
+        while !waves_done {
+            for j in 0..128 {
+                if i + j >= content_holder_2.len() {
+                    waves_done = true;
+                    break;
                 }
-            } else {
-                web_sys::console::log_1(&JsValue::from(format!(
-                    "chunk not found: {}",
-                    hex::encode(result2),
-                )));
-                return vec![];
+
+                let addr = &content_holder_2[i + j];
+                let index = i + j;
+                let handle = async move {
+                    return (
+                        get_chunk(addr.clone(), chunk_retrieve_chan).await,
+                        index.clone(),
+                        addr.clone(),
+                    );
+                };
+                joiner.push(handle);
             }
+
+            while let Some((result0, result1, result2)) = joiner.next().await {
+                if result0.len() > 8 {
+                    let result_span = u64::from_le_bytes(result0[0..8].try_into().unwrap());
+                    if result_span > 4096 {
+                        done = false;
+                        content_holder_3.insert(result1, result0[8..].to_vec());
+                    } else {
+                        content_holder_3.insert(result1, result2);
+                        content_holder_4.insert(result1, result0[8..].to_vec());
+                    }
+                } else {
+                    web_sys::console::log_1(&JsValue::from(format!(
+                        "chunk not found: {}",
+                        hex::encode(result2),
+                    )));
+                    return vec![];
+                }
+            }
+
+            i = i + 128;
         }
 
         if !done {
-            orig = vec![];
+            orig = Vec::new();
             for i in 0..subs {
                 match content_holder_3.get(&i) {
                     Some(data0) => {
@@ -263,15 +275,15 @@ pub async fn retrieve_chunk(
     #[allow(unused_assignments)]
     let mut cd = vec![];
 
-    cd = retrieve_cached_chunk(&caddr).await;
-    if cd.len() > 0 {
-        (chunk_valid, soc) = verify_chunk(&caddr, &cd);
-        if chunk_valid {
-            error_count = max_error;
-        } else {
-            cd = vec![];
-        };
-    };
+    // cd = retrieve_cached_chunk(&caddr).await;
+    // if cd.len() > 0 {
+    //     (chunk_valid, soc) = verify_chunk(&caddr, &cd);
+    //     if chunk_valid {
+    //         error_count = max_error;
+    //     } else {
+    //         cd = vec![];
+    //     };
+    // };
 
     while error_count < max_error {
         let mut seer = true;
@@ -395,7 +407,7 @@ pub async fn retrieve_chunk(
                             apply_credit(accounting_peer, req_price);
                         }
                     }
-                    cache_chunk(&caddr, &cd).await;
+                    // cache_chunk(&caddr, &cd).await;
                     break;
                 } else {
                     error_count += 1;
