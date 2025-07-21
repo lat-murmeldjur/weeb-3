@@ -61,15 +61,27 @@ pub async fn retrieve_resource(
 ) -> Vec<u8> {
     let cd = get_data(chunk_address.to_vec(), data_retrieve_chan).await;
 
-    let (data_vector, index) =
-        interpret_manifest("".to_string(), &cd, data_retrieve_chan, chunk_retrieve_chan).await;
     let mut data_vector_e: Vec<(Vec<u8>, String, String)> = vec![];
 
-    for f in &data_vector {
-        if f.data.len() > 8 {
-            data_vector_e.push((f.data[8..].to_vec(), f.mime.clone(), f.path.clone()));
-        };
+    #[allow(unused_assignments)]
+    let mut index: String = "".to_string();
+
+    {
+        let (data_vector, index0) =
+            interpret_manifest("".to_string(), &cd, data_retrieve_chan, chunk_retrieve_chan).await;
+
+        index = index0;
+
+        web_sys::console::log_1(&JsValue::from(format!("marker 20")));
+
+        for f in &data_vector {
+            if f.data.len() > 8 {
+                data_vector_e.push((f.data[8..].to_vec(), f.mime.clone(), f.path.clone()));
+            };
+        }
     }
+
+    web_sys::console::log_1(&JsValue::from(format!("marker 21")));
 
     if data_vector_e.len() == 0 {
         web_sys::console::log_1(&JsValue::from(format!(
@@ -82,6 +94,8 @@ pub async fn retrieve_resource(
         );
     }
 
+    web_sys::console::log_1(&JsValue::from(format!("marker 22")));
+
     return encode_resources(data_vector_e, index);
 }
 
@@ -91,6 +105,7 @@ pub async fn retrieve_data(
 ) -> Vec<u8> {
     let root_chunk = get_chunk(data_address.to_vec(), chunk_retrieve_chan).await;
 
+    #[allow(unused_assignments)]
     let mut root_span: u64 = 0;
 
     if root_chunk.len() >= 8 {
@@ -129,7 +144,7 @@ pub async fn retrieve_data(
 
     let mut orig = root_chunk[8..].to_vec();
 
-    let mut data: Vec<u8> = vec![];
+    let mut data: Vec<u8> = Vec::with_capacity((root_span + 8) as usize);
     data.append(&mut root_chunk[0..8].to_vec());
 
     let mut done = false;
@@ -194,6 +209,7 @@ pub async fn retrieve_data(
         }
 
         if !done {
+            web_sys::console::log_1(&JsValue::from(format!("marker 00")));
             orig = Vec::new();
             for i in 0..subs {
                 match content_holder_3.get(&i) {
@@ -207,7 +223,9 @@ pub async fn retrieve_data(
                     None => return vec![],
                 }
             }
+            web_sys::console::log_1(&JsValue::from(format!("marker 0")));
         } else {
+            web_sys::console::log_1(&JsValue::from(format!("marker 10")));
             for i in 0..subs {
                 match content_holder_4.get(&i) {
                     Some(data0) => {
@@ -220,6 +238,7 @@ pub async fn retrieve_data(
                     None => return vec![],
                 }
             }
+            web_sys::console::log_1(&JsValue::from(format!("marker 11")));
         }
     }
 

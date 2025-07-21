@@ -386,7 +386,6 @@ impl Sekirei {
 
         let _ = self.message_port.0.send((valaddr, chan_out));
 
-        // 3ab408eea4f095bde55c1caeeac8e7fcff49477660f0a28f652f0a6d9c60d05f
         let k0 = async {
             let mut timelast: f64;
             #[allow(irrefutable_let_patterns)]
@@ -957,14 +956,15 @@ impl Sekirei {
                 while let incoming_request = self.message_port.1.try_recv() {
                     if !incoming_request.is_err() {
                         let (n, chan) = incoming_request.unwrap();
-                        let encoded_data = retrieve_resource(
-                            &n,
-                            &data_retrieve_chan_outgoing.clone(),
-                            &chunk_retrieve_chan_outgoing.clone(),
-                        )
-                        .await;
-
-                        chan.send(encoded_data).unwrap();
+                        web_sys::console::log_1(&JsValue::from(format!("marker 30")));
+                        let _ = chan.send(
+                            retrieve_resource(
+                                &n,
+                                &data_retrieve_chan_outgoing.clone(),
+                                &chunk_retrieve_chan_outgoing.clone(),
+                            )
+                            .await,
+                        );
                     } else {
                         break;
                     }
