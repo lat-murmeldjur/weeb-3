@@ -8,7 +8,7 @@ use std::time::Duration;
 use web3::{
     contract::{Contract, Options},
     transports::eip_1193::{Eip1193, Provider},
-    types::{Address, U256},
+    types::{Address, H160, H256, U256},
 };
 
 use js_sys::{Array, Date, Uint8Array};
@@ -30,21 +30,16 @@ use web_sys::{
     console,
 };
 
-use alloy::{network::EthereumWallet, primitives::keccak256, signers::local::PrivateKeySigner};
+use alloy::{network::EthereumWallet, signers::local::PrivateKeySigner};
 
-use crate::persistence::{cache_chunk, retrieve_cached_chunk};
+use crate::{
+    encrey,
+    persistence::{get_batch_id, get_batch_owner_key, set_batch_id, set_batch_owner_key},
+};
 
 #[wasm_bindgen]
 pub async fn interweeb(_st: String) -> Result<(), JsError> {
     init_panic_hook();
-
-    cache_chunk(
-        &(hex::decode("ffff").unwrap().to_vec()),
-        &(hex::decode("ffffaaba").unwrap().to_vec()),
-    )
-    .await;
-    let fx0 = retrieve_cached_chunk(&(hex::decode("ffff").unwrap().to_vec())).await;
-    web_sys::console::log_1(&JsValue::from(format!("test0 {:#?}", hex::encode(fx0))));
 
     let window = &web_sys::window().unwrap();
 
@@ -148,6 +143,15 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
 
             spawn_local(async {
                 {
+                    let stored_stamp_signer_key = get_batch_owner_key().await;
+                    let stored_batch_id = get_batch_id().await;
+
+                    if stored_stamp_signer_key.len() != 0 && stored_batch_id.len() != 0 {
+                        let window = web_sys::window().unwrap();
+                        let _ = window.alert_with_message("Already have a batch for uploads");
+                        return;
+                    }
+
                     let provider = Provider::default().unwrap().unwrap();
 
                     let transport = Eip1193::new(provider);
@@ -195,9 +199,9 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
                         _ => return,
                     };
 
-                    let stamp_signer_key = keccak256("Key To Be Persisted In Browser Localstore");
+                    let stamp_signer_key = encrey();
                     let stamp_signer: PrivateKeySigner =
-                        match PrivateKeySigner::from_bytes(&stamp_signer_key) {
+                        match PrivateKeySigner::from_slice(&stamp_signer_key) {
                             Ok(aok) => aok,
                             _ => return,
                         };
@@ -269,7 +273,7 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
                             (contract_address, U256::from(419430400000000000_u64)),
                             accounts[0],
                             Options::default(),
-                            2,
+                            1,
                         )
                         .await
                         .unwrap();
@@ -281,24 +285,81 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
 
                     // 131072000000000
 
-                    let tx = contract
-                        .call(
+                    let nonce: [u8; 32] = encrey().try_into().unwrap();
+
+                    let receipt = match contract
+                        .call_with_confirmations(
                             "createBatch",
                             (
                                 Address::from(wallet_address_bytes),
                                 U256::from(100000000000_u64),
                                 22_u8,
                                 16_u8,
-                                [2_u8; 32],
+                                nonce,
                                 false,
                             ),
                             accounts[0],
                             Options::default(),
+                            1,
                         )
                         .await
-                        .unwrap();
+                    {
+                        Ok(aok) => aok,
+                        Err(e) => {
+                            web_sys::console::log_1(&JsValue::from(format!(
+                                "Error creating batch {}",
+                                e
+                            )));
+                            return;
+                        }
+                    };
 
-                    web_sys::console::log_1(&JsValue::from(format!("createBatch tx {}", tx)));
+                    let batch_created_topic = H256::from_slice(
+                        &hex::decode(
+                            "9b088e2c89b322a3c1d81515e1c88db3d386d022926f0e2d0b9b5813b7413d58",
+                        )
+                        .unwrap(),
+                    );
+
+                    let batch_contract = H160::from_slice(
+                        &hex::decode("cdfdC3752caaA826fE62531E0000C40546eC56A6").unwrap(),
+                    );
+
+                    let mut batch_id: Vec<u8> = vec![];
+
+                    for log in receipt.logs.iter() {
+                        if log.topics.len() > 0 {
+                            if log.address == batch_contract
+                                && log.topics[0] == batch_created_topic
+                                && log.topics.len() > 1
+                            {
+                                batch_id = log.topics[1].as_bytes().to_vec();
+                            };
+                        };
+                    }
+
+                    if batch_id.len() == 0 {
+                        let window = web_sys::window().unwrap();
+                        let _ = window.alert_with_message("Failed to get batch id from receipt");
+                        return;
+                    } else {
+                        web_sys::console::log_1(&JsValue::from(format!(
+                            "got batch id: {}",
+                            hex::encode(&batch_id)
+                        )));
+                    }
+
+                    if !set_batch_owner_key(&stamp_signer_key).await {
+                        let window = web_sys::window().unwrap();
+                        let _ = window.alert_with_message("Failed to save batch owner key");
+                        return;
+                    }
+
+                    if !set_batch_id(&batch_id).await {
+                        let window = web_sys::window().unwrap();
+                        let _ = window.alert_with_message("Failed to save batch id");
+                        return;
+                    }
 
                     // tx 0x538ea062d293a809915336eff3bb5010dc742c0ab6ac12b510992aafb4a68ffb
                     // id 0xb57e46b067d21cede7432900215423e82c97823b733219b7f42e73017562a96d
@@ -308,8 +369,8 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
                     // immutableFlag : False
 
                     web_sys::console::log_1(&JsValue::from(format!(
-                        "createBatch tx 2 {}",
-                        hex::encode(tx.as_bytes())
+                        "createBatch tx {}",
+                        hex::encode(receipt.transaction_hash.as_bytes())
                     )));
                 }
             });
@@ -775,6 +836,7 @@ fn create_ielement(indx: String) -> Element {
     let _ = i.set_attribute("src", &indx);
     let _ = i.set_attribute("width", "90%");
     let _ = i.set_attribute("height", "90%");
+    let _ = i.set_attribute("sandbox", "allow-scripts");
     return i;
 }
 

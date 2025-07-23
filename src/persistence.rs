@@ -40,7 +40,10 @@ async fn cat_base(identifier: String) -> Option<Database> {
         .await
     {
         Ok(db0) => db0,
-        _ => return None,
+        Err(e) => {
+            web_sys::console::log_1(&JsValue::from(format!("error opening database: {}", e)));
+            return None;
+        }
     };
 
     Some(db)
@@ -52,7 +55,9 @@ pub async fn bump_bucket(stamp_identifier: String, bucket_identifier: String) ->
     let db = match cat_base(stamp_identifier).await {
         Some(db0) => db0,
         _ => {
-            web_sys::console::log_1(&JsValue::from(format!("ep0")));
+            web_sys::console::log_1(&JsValue::from(format!(
+                "Failed to open database for bucket incrementation"
+            )));
             return (false, in_weeb);
         }
     };
@@ -63,26 +68,43 @@ pub async fn bump_bucket(stamp_identifier: String, bucket_identifier: String) ->
         .build()
     {
         Ok(t0) => t0,
-        _ => {
-            web_sys::console::log_1(&JsValue::from(format!("ep1")));
+        Err(e) => {
+            web_sys::console::log_1(&JsValue::from(format!(
+                "Failed to open transaction for bucket incrementation {:#?}",
+                e
+            )));
             return (false, in_weeb);
         }
     };
 
     let store = match transaction.object_store("weeb_datastore") {
         Ok(s0) => s0,
-        _ => {
-            web_sys::console::log_1(&JsValue::from(format!("ep2")));
+        Err(e) => {
+            web_sys::console::log_1(&JsValue::from(format!(
+                "Failed to open datastore for bucket incrementation {:#?}",
+                e
+            )));
             return (false, in_weeb);
         }
     };
 
     let bucket: BucketData = match store.get(bucket_identifier.clone()).serde().unwrap().await {
         Ok(Some(b)) => b,
-        _ => BucketData {
+        Ok(None) => BucketData {
             id: bucket_identifier,
             value: 0,
         },
+        Err(e) => {
+            web_sys::console::log_1(&JsValue::from(format!(
+                "Error while getting bucket data for bucket incrementation {:#?}",
+                e
+            )));
+
+            BucketData {
+                id: bucket_identifier,
+                value: 0,
+            }
+        }
     };
 
     in_weeb = bucket.value;
@@ -95,15 +117,24 @@ pub async fn bump_bucket(stamp_identifier: String, bucket_identifier: String) ->
     // awaiting individual requests is optional - they still go out
     match store.put(b1.clone()).with_key(b1.id).serde() {
         Ok(_) => {}
-        _ => {
-            web_sys::console::log_1(&JsValue::from(format!("ep3")));
+        Err(e) => {
+            web_sys::console::log_1(&JsValue::from(format!(
+                "Failed to put bucket incrementation {:#?}",
+                e
+            )));
             return (false, in_weeb);
         }
     };
 
     return match transaction.commit().await {
         Ok(_) => (true, in_weeb),
-        _ => (false, in_weeb),
+        Err(e) => {
+            web_sys::console::log_1(&JsValue::from(format!(
+                "Failed to commit put for bucket incrementation {:#?}",
+                e
+            )));
+            return (false, in_weeb);
+        }
     };
 }
 
@@ -111,7 +142,9 @@ pub async fn cache_chunk(chunk_address: &Vec<u8>, chunk_content: &Vec<u8>) {
     let db = match cat_base("chunk_cachestore".to_string()).await {
         Some(db0) => db0,
         _ => {
-            web_sys::console::log_1(&JsValue::from(format!("chunk cache store failed to open")));
+            web_sys::console::log_1(&JsValue::from(format!(
+                "Failed to open database for chunk cache"
+            )));
             return;
         }
     };
@@ -122,9 +155,10 @@ pub async fn cache_chunk(chunk_address: &Vec<u8>, chunk_content: &Vec<u8>) {
         .build()
     {
         Ok(t0) => t0,
-        _ => {
+        Err(e) => {
             web_sys::console::log_1(&JsValue::from(format!(
-                "chunk cache transaction failed to open"
+                "Failed to open transaction for chunk caching {:#?}",
+                e
             )));
             return;
         }
@@ -132,9 +166,10 @@ pub async fn cache_chunk(chunk_address: &Vec<u8>, chunk_content: &Vec<u8>) {
 
     let store = match transaction.object_store("weeb_datastore") {
         Ok(s0) => s0,
-        _ => {
+        Err(e) => {
             web_sys::console::log_1(&JsValue::from(format!(
-                "chunk cache datastore failed to open"
+                "Failed to open datastore for chunk caching {:#?}",
+                e
             )));
             return;
         }
@@ -146,13 +181,23 @@ pub async fn cache_chunk(chunk_address: &Vec<u8>, chunk_content: &Vec<u8>) {
         .primitive()
     {
         Ok(_) => {}
-        _ => {
-            web_sys::console::log_1(&JsValue::from(format!("chunk cache store put failed")));
+        Err(e) => {
+            web_sys::console::log_1(&JsValue::from(format!(
+                "Failed put for chunk caching {:#?}",
+                e
+            )));
         }
     };
 
-    let _ = transaction.commit().await;
-
+    let _ = match transaction.commit().await {
+        Ok(_) => {}
+        Err(e) => {
+            web_sys::console::log_1(&JsValue::from(format!(
+                "Failed to commit put for chunk caching {:#?}",
+                e
+            )));
+        }
+    };
     return;
 }
 
@@ -160,7 +205,10 @@ pub async fn retrieve_cached_chunk(chunk_address: &Vec<u8>) -> Vec<u8> {
     let db = match cat_base("chunk_cachestore".to_string()).await {
         Some(db0) => db0,
         _ => {
-            web_sys::console::log_1(&JsValue::from(format!("chunk cache store failed to open")));
+            web_sys::console::log_1(&JsValue::from(format!(
+                "Failed to open database for reading chunk cache"
+            )));
+
             return vec![];
         }
     };
@@ -171,9 +219,10 @@ pub async fn retrieve_cached_chunk(chunk_address: &Vec<u8>) -> Vec<u8> {
         .build()
     {
         Ok(t0) => t0,
-        _ => {
+        Err(e) => {
             web_sys::console::log_1(&JsValue::from(format!(
-                "chunk cache transaction failed to open"
+                "Failed to open transaction for reading chunk cache {:#?}",
+                e
             )));
             return vec![];
         }
@@ -181,9 +230,10 @@ pub async fn retrieve_cached_chunk(chunk_address: &Vec<u8>) -> Vec<u8> {
 
     let store = match transaction.object_store("weeb_datastore") {
         Ok(s0) => s0,
-        _ => {
+        Err(e) => {
             web_sys::console::log_1(&JsValue::from(format!(
-                "chunk cache datastore failed to open"
+                "Failed to open datastore for reading chunk cache {:#?}",
+                e
             )));
             return vec![];
         }
@@ -202,4 +252,131 @@ pub async fn retrieve_cached_chunk(chunk_address: &Vec<u8>) -> Vec<u8> {
     let _ = transaction.commit().await;
 
     return chunk_data;
+}
+
+pub async fn get_batch_field(field: String) -> Vec<u8> {
+    let db = match cat_base("batchstore_data".to_string()).await {
+        Some(db0) => db0,
+        _ => {
+            web_sys::console::log_1(&JsValue::from(format!(
+                "Failed to open database for batch metadata {}",
+                field
+            )));
+            return vec![];
+        }
+    };
+
+    let transaction = match db
+        .transaction("weeb_datastore")
+        .with_mode(TransactionMode::Readonly)
+        .build()
+    {
+        Ok(t0) => t0,
+        Err(e) => {
+            web_sys::console::log_1(&JsValue::from(format!(
+                "Failed to open transaction for batch metadata {} {:#?}",
+                field, e
+            )));
+            return vec![];
+        }
+    };
+
+    let store = match transaction.object_store("weeb_datastore") {
+        Ok(s0) => s0,
+        Err(e) => {
+            web_sys::console::log_1(&JsValue::from(format!(
+                "Failed to open datastore for batch metadata {} {:#?}",
+                field, e
+            )));
+            return vec![];
+        }
+    };
+
+    let key_data: Vec<u8> = match store.get(field).primitive().unwrap().await {
+        Ok(Some(b)) => b,
+        _ => vec![],
+    };
+
+    let _ = transaction.commit().await;
+
+    return key_data;
+}
+
+pub async fn set_batch_field(field: String, value: &Vec<u8>) -> bool {
+    let db = match cat_base("batchstore_data".to_string()).await {
+        Some(db0) => db0,
+        _ => {
+            web_sys::console::log_1(&JsValue::from(format!(
+                "Failed to open database for setting batch metadata {}",
+                field
+            )));
+            return false;
+        }
+    };
+
+    let transaction = match db
+        .transaction("weeb_datastore")
+        .with_mode(TransactionMode::Readwrite)
+        .build()
+    {
+        Ok(t0) => t0,
+        Err(e) => {
+            web_sys::console::log_1(&JsValue::from(format!(
+                "Failed to open transaction for setting batch metadata {} {:#?}",
+                field, e
+            )));
+            return false;
+        }
+    };
+
+    let store = match transaction.object_store("weeb_datastore") {
+        Ok(s0) => s0,
+        Err(e) => {
+            web_sys::console::log_1(&JsValue::from(format!(
+                "Failed to open datastore for setting batch metadata {} {:#?}",
+                field, e
+            )));
+            return false;
+        }
+    };
+
+    match store.put(value).with_key(field.clone()).primitive() {
+        Ok(_) => {}
+        Err(e) => {
+            web_sys::console::log_1(&JsValue::from(format!(
+                "Failed to put for setting batch metadata {} {:#?}",
+                field, e
+            )));
+            let _ = transaction.commit().await;
+            return false;
+        }
+    };
+
+    let _ = match transaction.commit().await {
+        Ok(_) => {}
+        Err(e) => {
+            web_sys::console::log_1(&JsValue::from(format!(
+                "Failed to commit put for setting batch metadata {} {:#?}",
+                field, e
+            )));
+            return false;
+        }
+    };
+    return true;
+}
+
+pub async fn get_batch_id() -> Vec<u8> {
+    return get_batch_field("batch_id".to_string()).await;
+}
+
+pub async fn set_batch_id(id: &Vec<u8>) -> bool {
+    return set_batch_field("batch_id".to_string(), id).await;
+}
+
+pub async fn get_batch_owner_key() -> Vec<u8> {
+    return get_batch_field("batch_owner_key".to_string()).await;
+}
+
+pub async fn set_batch_owner_key(key: &Vec<u8>) -> bool {
+    return set_batch_field("batch_owner_key".to_string(), key).await;
 }

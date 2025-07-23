@@ -28,7 +28,9 @@ pub async fn create_manifest(
     first_node_cutoff: usize,
     index: String,
     errordoc: String,
-    data_upload_chan: &mpsc::Sender<(Vec<u8>, u8, mpsc::Sender<Vec<u8>>)>,
+    batch_owner: Vec<u8>,
+    batch_id: Vec<u8>,
+    data_upload_chan: &mpsc::Sender<(Vec<u8>, u8, Vec<u8>, Vec<u8>, mpsc::Sender<Vec<u8>>)>,
 ) -> Vec<u8> {
     let mut fncutoff = first_node_cutoff;
 
@@ -209,11 +211,20 @@ pub async fn create_manifest(
                     0,                      // weird string prefix cutoff for first element
                     "".to_string(),         // index
                     "".to_string(),         // errordoc
+                    batch_owner.clone(),
+                    batch_id.clone(),
                     data_upload_chan,
                 ))
                 .await;
 
-                current_data_reference = upload_data(tip_mf, encrypted, data_upload_chan).await;
+                current_data_reference = upload_data(
+                    tip_mf,
+                    encrypted,
+                    batch_owner.clone(),
+                    batch_id.clone(),
+                    data_upload_chan,
+                )
+                .await;
 
                 for j in 0..vforks.len() {
                     let i = vforks.len() - 1 - j;
@@ -242,12 +253,20 @@ pub async fn create_manifest(
                             0,                  // weird string prefix cutoff for first element
                             "".to_string(),     // index
                             "".to_string(),     // errordoc
+                            batch_owner.clone(),
+                            batch_id.clone(),
                             data_upload_chan,
                         ))
                         .await;
 
-                        current_data_reference =
-                            upload_data(current_manifest, encrypted, data_upload_chan).await;
+                        current_data_reference = upload_data(
+                            current_manifest,
+                            encrypted,
+                            batch_owner.clone(),
+                            batch_id.clone(),
+                            data_upload_chan,
+                        )
+                        .await;
                     } else {
                         fork_bases.push(current_fork);
                     }
@@ -273,14 +292,22 @@ pub async fn create_manifest(
                     fncutoff + common_prefix.len(), // weird string prefix cutoff for first element
                     "".to_string(),                 // index
                     "".to_string(),                 // errordoc
+                    batch_owner.clone(),
+                    batch_id.clone(),
                     data_upload_chan,
                 ))
                 .await;
 
                 fncutoff = 0;
 
-                let group_data_reference =
-                    upload_data(group_manifest, encrypted, data_upload_chan).await;
+                let group_data_reference = upload_data(
+                    group_manifest,
+                    encrypted,
+                    batch_owner.clone(),
+                    batch_id.clone(),
+                    data_upload_chan,
+                )
+                .await;
 
                 let group_fork = create_fork(
                     common_prefix.to_string(),
@@ -313,6 +340,8 @@ pub async fn create_manifest(
         let stub_reference = upload_data(
             create_stub(stub_ref_size, obfuscated).await,
             encrypted,
+            batch_owner.clone(),
+            batch_id.clone(),
             data_upload_chan,
         )
         .await;

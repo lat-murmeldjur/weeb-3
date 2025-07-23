@@ -55,14 +55,12 @@ use alloy::signers::local::PrivateKeySigner;
 use serde_json::json;
 
 pub async fn stamp_chunk(
-    // stamp_signer: Signer,
+    stamp_signer_key: Vec<u8>,
     batch_id: Vec<u8>,
     batch_bucket_limit: u32,
     chunk_address: Vec<u8>,
-    //
 ) -> Vec<u8> {
-    let stamp_signer_key = keccak256("Key To Be Persisted In Browser Localstore");
-    let stamp_signer: PrivateKeySigner = match PrivateKeySigner::from_bytes(&stamp_signer_key) {
+    let stamp_signer: PrivateKeySigner = match PrivateKeySigner::from_slice(&stamp_signer_key) {
         Ok(aok) => aok,
         _ => return vec![],
     };
@@ -127,8 +125,10 @@ pub async fn upload_resource(
     errordoc: String,
     feed: bool,
     topic: String,
-    data_upload_chan: &mpsc::Sender<(Vec<u8>, u8, mpsc::Sender<Vec<u8>>)>,
-    chunk_upload_chan: &mpsc::Sender<(Vec<u8>, bool, Vec<u8>)>,
+    batch_owner: Vec<u8>,
+    batch_id: Vec<u8>,
+    data_upload_chan: &mpsc::Sender<(Vec<u8>, u8, Vec<u8>, Vec<u8>, mpsc::Sender<Vec<u8>>)>,
+    chunk_upload_chan: &mpsc::Sender<(Vec<u8>, bool, Vec<u8>, Vec<u8>, Vec<u8>)>,
     chunk_retrieve_chan: &mpsc::Sender<(Vec<u8>, mpsc::Sender<Vec<u8>>)>,
 ) -> Vec<u8> {
     //
@@ -138,7 +138,14 @@ pub async fn upload_resource(
         web_sys::console::log_1(&JsValue::from(format!("Attempt uploading resource!",)));
 
         // upload core file
-        let core_reference = upload_data(r0.data.to_vec(), encryption, data_upload_chan).await;
+        let core_reference = upload_data(
+            r0.data.to_vec(),
+            encryption,
+            batch_owner.clone(),
+            batch_id.clone(),
+            data_upload_chan,
+        )
+        .await;
 
         if r0.path0.len() == 0 {
             r0.path0 = hex::encode(&core_reference);
@@ -173,13 +180,22 @@ pub async fn upload_resource(
         0,
         index,    // index
         errordoc, // errordoc
+        batch_owner.clone(),
+        batch_id.clone(),
         data_upload_chan,
     )
     .await;
 
     let core_manifest0 = core_manifest.clone();
 
-    let manifest_reference = upload_data(core_manifest, encryption, data_upload_chan).await;
+    let manifest_reference = upload_data(
+        core_manifest,
+        encryption,
+        batch_owner.clone(),
+        batch_id.clone(),
+        data_upload_chan,
+    )
+    .await;
 
     if !feed {
         return manifest_reference;
@@ -209,6 +225,8 @@ pub async fn upload_resource(
     let stub_reference = upload_data(
         create_stub(stub_ref_size, encryption).await,
         encryption,
+        batch_owner.clone(),
+        batch_id.clone(),
         data_upload_chan,
     )
     .await;
@@ -225,11 +243,20 @@ pub async fn upload_resource(
         0,
         "".to_string(), // index
         "".to_string(), // errordoc
+        batch_owner.clone(),
+        batch_id.clone(),
         data_upload_chan,
     )
     .await;
 
-    let feed_reference = upload_data(feed_manifest, encryption, data_upload_chan).await;
+    let feed_reference = upload_data(
+        feed_manifest,
+        encryption,
+        batch_owner.clone(),
+        batch_id.clone(),
+        data_upload_chan,
+    )
+    .await;
 
     let index_up = seek_next_feed_update_index(
         hex::encode(&feed_owner),
@@ -274,7 +301,13 @@ pub async fn upload_resource(
 
     let (soc_actual, soc_address) = make_soc(&soc_wrapped_content, owner_bytes_0, id_bytes).await;
 
-    let _update_reference = chunk_upload_chan.send((soc_actual, true, soc_address));
+    let _update_reference = chunk_upload_chan.send((
+        soc_actual,
+        true,
+        soc_address,
+        batch_owner.clone(),
+        batch_id.clone(),
+    ));
 
     return feed_reference;
 }
@@ -282,7 +315,9 @@ pub async fn upload_resource(
 pub async fn upload_data(
     data: Vec<u8>,
     enc: bool,
-    data_upload_chan: &mpsc::Sender<(Vec<u8>, u8, mpsc::Sender<Vec<u8>>)>,
+    batch_owner: Vec<u8>,
+    batch_id: Vec<u8>,
+    data_upload_chan: &mpsc::Sender<(Vec<u8>, u8, Vec<u8>, Vec<u8>, mpsc::Sender<Vec<u8>>)>,
 ) -> Vec<u8> {
     let (chan_out, chan_in) = mpsc::channel::<Vec<u8>>();
     let mut enc_mode = 0;
@@ -290,7 +325,9 @@ pub async fn upload_data(
         enc_mode = 1;
     }
 
-    data_upload_chan.send((data, enc_mode, chan_out)).unwrap();
+    data_upload_chan
+        .send((data, enc_mode, batch_owner, batch_id, chan_out))
+        .unwrap();
 
     let k0 = async {
         let mut timelast: f64;
@@ -327,7 +364,9 @@ pub async fn upload_data(
 pub async fn push_data(
     data: Vec<u8>,
     encryption: bool,
-    chunk_upload_chan: &mpsc::Sender<(Vec<u8>, bool, Vec<u8>)>,
+    batch_owner: Vec<u8>,
+    batch_id: Vec<u8>,
+    chunk_upload_chan: &mpsc::Sender<(Vec<u8>, bool, Vec<u8>, Vec<u8>, Vec<u8>)>,
 ) -> Vec<u8> {
     let span_length = data.len();
 
@@ -343,7 +382,13 @@ pub async fn push_data(
         };
 
         let k = content_address(&data0);
-        let _ = chunk_upload_chan.send((data0, false, k.clone()));
+        let _ = chunk_upload_chan.send((
+            data0,
+            false,
+            k.clone(),
+            batch_owner.clone(),
+            batch_id.clone(),
+        ));
 
         // web_sys::console::log_1(&JsValue::from(format!(
         //     "push_data returning {:#?}!",
@@ -452,7 +497,13 @@ pub async fn push_data(
 
                     // (span as u64).to_le_bytes().to_vec(),
 
-                    let _ = chunk_upload_chan.send((data0, false, cha));
+                    let _ = chunk_upload_chan.send((
+                        data0,
+                        false,
+                        cha,
+                        batch_owner.clone(),
+                        batch_id.clone(),
+                    ));
                 }
             }
 
@@ -483,6 +534,7 @@ pub async fn push_chunk(
     data: &Vec<u8>,
     soc: bool,
     soc_address: Vec<u8>,
+    batch_owner: Vec<u8>,
     batch_id: Vec<u8>,
     batch_bucket_limit: u32,
     control: &mut stream::Control,
@@ -509,13 +561,7 @@ pub async fn push_chunk(
         )));
     }
 
-    let cstamp0 = stamp_chunk(
-        //
-        batch_id,
-        batch_bucket_limit,
-        caddr.clone(),
-    )
-    .await;
+    let cstamp0 = stamp_chunk(batch_owner, batch_id, batch_bucket_limit, caddr.clone()).await;
 
     if cstamp0.len() == 0 {
         web_sys::console::log_1(&JsValue::from(format!(

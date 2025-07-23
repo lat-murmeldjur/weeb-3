@@ -52,7 +52,7 @@ mod manifest;
 mod manifest_upload;
 
 mod persistence;
-use persistence::reset_stamp;
+use persistence::{get_batch_id, get_batch_owner_key, reset_stamp};
 
 mod retrieval;
 use retrieval::*;
@@ -536,10 +536,10 @@ impl Sekirei {
             mpsc::channel::<(Vec<u8>, mpsc::Sender<Vec<u8>>)>();
 
         let (data_upload_chan_outgoing, data_upload_chan_incoming) =
-            mpsc::channel::<(Vec<u8>, u8, mpsc::Sender<Vec<u8>>)>();
+            mpsc::channel::<(Vec<u8>, u8, Vec<u8>, Vec<u8>, mpsc::Sender<Vec<u8>>)>();
 
         let (chunk_upload_chan_outgoing, chunk_upload_chan_incoming) =
-            mpsc::channel::<(Vec<u8>, bool, Vec<u8>)>();
+            mpsc::channel::<(Vec<u8>, bool, Vec<u8>, Vec<u8>, Vec<u8>)>();
 
         let ctrl;
         let mut incoming_pricing_streams;
@@ -990,6 +990,20 @@ impl Sekirei {
                     if !incoming_request.is_err() {
                         web_sys::console::log_1(&JsValue::from(format!("push triggered")));
                         let (file0, enc, index, feed, topic, chan) = incoming_request.unwrap();
+
+                        let batch_owner = get_batch_owner_key().await;
+                        let batch_id = get_batch_id().await;
+
+                        if batch_owner.len() == 0 {
+                            chan.send(vec![]).unwrap();
+                            continue;
+                        }
+
+                        if batch_id.len() == 0 {
+                            chan.send(vec![]).unwrap();
+                            continue;
+                        }
+
                         let mut res0: Vec<Resource> = vec![];
                         for f in file0 {
                             res0.push(Resource {
@@ -1008,6 +1022,8 @@ impl Sekirei {
                             "404.html".to_string(),
                             feed,
                             topic,
+                            batch_owner.clone(),
+                            batch_id.clone(),
                             &data_upload_chan_outgoing.clone(),
                             &chunk_upload_chan_outgoing.clone(),
                             &chunk_retrieve_chan_outgoing.clone(),
@@ -1083,16 +1099,21 @@ impl Sekirei {
                     if !incoming_request.is_err() {
                         let handle = async {
                             web_sys::console::log_1(&JsValue::from(format!("push triggered")));
-                            let (n, mode, chan) = incoming_request.unwrap();
+                            let (n, mode, batch_owner, batch_id, chan) = incoming_request.unwrap();
 
                             let encrypted_data = match mode {
                                 0 => false,
                                 _ => true,
                             };
 
-                            let data_reference =
-                                push_data(n, encrypted_data, &chunk_upload_chan_outgoing.clone())
-                                    .await;
+                            let data_reference = push_data(
+                                n,
+                                encrypted_data,
+                                batch_owner,
+                                batch_id,
+                                &chunk_upload_chan_outgoing.clone(),
+                            )
+                            .await;
                             web_sys::console::log_1(&JsValue::from(format!(
                                 "Writing response to encrypted : {} push data request",
                                 encrypted_data
@@ -1130,14 +1151,10 @@ impl Sekirei {
                     let incoming_request = chunk_upload_chan_incoming.try_recv();
                     if !incoming_request.is_err() {
                         let handle = async {
-                            let (d, soc, checkad) = incoming_request.unwrap();
+                            let (d, soc, checkad, batch_owner, batch_id) =
+                                incoming_request.unwrap();
 
                             let mut ctrl9 = ctrl8.clone();
-
-                            let batch_id = hex::decode(
-                                "9210cb16c79cc4a8cefa2c3f32920271fdb3d00cb929503c0f2456ac62af1321",
-                            )
-                            .unwrap();
 
                             let batch_bucket_limit = 64_u32;
 
@@ -1145,6 +1162,7 @@ impl Sekirei {
                                 &d,
                                 soc,
                                 checkad.clone(),
+                                batch_owner,
                                 batch_id,
                                 batch_bucket_limit,
                                 &mut ctrl9,
