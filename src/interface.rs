@@ -22,6 +22,7 @@ use web_sys::{
     HtmlButtonElement,
     HtmlElement,
     HtmlInputElement,
+    HtmlSelectElement,
     MessageEvent,
     RequestInit,
     ServiceWorkerRegistration,
@@ -41,7 +42,7 @@ use crate::{
 pub async fn interweeb(_st: String) -> Result<(), JsError> {
     init_panic_hook();
 
-    let window = &web_sys::window().unwrap();
+    let window = web_sys::window().unwrap();
 
     let host2 = window
         .document()
@@ -141,7 +142,46 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
         wasm_bindgen::closure::Closure::<dyn FnMut(web_sys::MessageEvent)>::new(move |_msg| {
             console::log_1(&"uploadGetBatch callback triggered".into());
 
-            spawn_local(async {
+            let document = web_sys::window().unwrap().document().unwrap();
+
+            let validity_input = document
+                .get_element_by_id("batchValidityDays")
+                .expect("#batchValidityDays should exist");
+
+            let validity_input = validity_input
+                .dyn_ref::<HtmlInputElement>()
+                .expect("#batchValidityDays should be a HtmlInputElement");
+
+            let validity = match validity_input.value().parse::<u64>() {
+                Ok(validity) => validity,
+                _ => {
+                    let _ = window.alert_with_message("Failed to read batch validity");
+                    return;
+                }
+            };
+
+            let size_input = document
+                .get_element_by_id("batchSize")
+                .expect("#batchSize should exist");
+
+            let size_input = size_input
+                .dyn_ref::<HtmlSelectElement>()
+                .expect("#batchSize should be a HtmlSelectElement");
+
+            let batch_depth = match size_input.value().parse::<u8>() {
+                Ok(size0) => 17 + size0,
+                _ => {
+                    let _ = window.alert_with_message("Failed to read batch size");
+                    return;
+                }
+            };
+
+            web_sys::console::log_1(&JsValue::from(format!(
+                "Selected batch depth: {}",
+                batch_depth
+            )));
+
+            spawn_local(async move {
                 {
                     let stored_stamp_signer_key = get_batch_owner_key().await;
                     let stored_batch_id = get_batch_id().await;
@@ -222,17 +262,18 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
                     //        bytes32 _nonce,
                     //        bool _immutable
                     //    ) external whenNotPaused returns (bytes32)
-                    let result_cc: U256 = contract
-                        .query("currentTotalOutPayment", (), None, Options::default(), None)
+                    let result_lp: U256 = contract
+                        .query("lastPrice", (), None, Options::default(), None)
                         .await
                         .unwrap();
 
-                    web_sys::console::log_1(&JsValue::from(format!(
-                        "currentTotalOutPayment (minimum valid balance) {}",
-                        result_cc
-                    )));
+                    let initial_balance: U256 = result_lp * 7200 * validity;
 
-                    // expiredBatchesExist()
+                    let chunk_count = u64::pow(2, batch_depth as u32);
+
+                    let approve_size: U256 = initial_balance * chunk_count;
+
+                    web_sys::console::log_1(&JsValue::from(format!("current price {}", result_lp)));
 
                     let mut expire = true;
 
@@ -270,7 +311,7 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
                     let tx00 = token_contract
                         .call_with_confirmations(
                             "approve",
-                            (contract_address, U256::from(419430400000000000_u64)),
+                            (contract_address, approve_size),
                             accounts[0],
                             Options::default(),
                             1,
@@ -292,8 +333,8 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
                             "createBatch",
                             (
                                 Address::from(wallet_address_bytes),
-                                U256::from(100000000000_u64),
-                                22_u8,
+                                initial_balance,
+                                batch_depth as u8,
                                 16_u8,
                                 nonce,
                                 false,

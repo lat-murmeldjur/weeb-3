@@ -10,8 +10,6 @@
     <body>
         <div id="wrapper">
             <h1>Weeb-3</h1>
-        </div>
-        <div id="wrapper">
             <h2>Settings</h2>
             <div>
                 <label>Swarm Bootnode Multiaddress</label>
@@ -28,21 +26,50 @@
             </div>
             <h2>Navigation</h2>
             <input type="text" id="inputString" placeholder="Enter Swarm Hash or ENS site domain to display" size="64">
+            <div id="resultField"></div>
+
             <div>
-                <button id="uploadGetBatch">... Get Space on Swarm for Uploads ...</button>
-                <button id="uploadResetStamp">... Reuse Space on Swarm for New Uploads ...</button>
-                <input id="uploadFileSelect" type="file">... Select File to Upload on   Swarm ...</input>
-                <input id="uploadFileEncrypt" name="encryption" type="checkbox" checked>
-                <label for="encryption">Encrypt Upload</label>
-                <input type="text" id="indexString" placeholder="(Optional) Enter Index     Document path for collection upload (.tar)" size="64">
-                <button id="uploadFile">... Upload on Swarm ...</button>
+                <h2>Create Storage on Swarm</h2>
                 <div>
-                    <input id="uploadAddToFeed" name="addtofeed" type="checkbox">
-                    <label for="addtofeed">Add upload reference to feed</label>
-                    <input type="text" id="feedTopicString" placeholder="Swarm Feed Topic">
+                    <div>
+                        <label>Create storage valid for (days)</label>
+                    </div>
+                    <div>
+                        <input type="number" id="batchValidityDays" value="365" min="0">
+                    </div>
+                    <div>
+                        <label>Create storage with size</label>
+                    </div>
+                    <div>
+                        <select id="batchSize">
+                            <option name="batchsize" value="0">512 MB</option>
+                            <option name="batchsize" value="1">1 GB</option>
+                            <option name="batchsize" value="2">2 GB</option>
+                            <option name="batchsize" value="3" selected="selected">4 GB</option>
+                            <option name="batchsize" value="4">8 GB</option>
+                            <option name="batchsize" value="5">16 GB</option>
+                            <option name="batchsize" value="6">32 GB</option>
+                            <option name="batchsize" value="7">64 GB</option>
+                            <option name="batchsize" value="8">128 GB</option>
+                        </select>
+                    </div>
+                    <button id="uploadGetBatch">... Create Storage on Swarm for Uploads ...</button>
+                    <button id="uploadResetStamp">... Reuse Space on Swarm for New Uploads ...</button>
+                </div>
+                <h2>Upload</h2>
+                <div>
+                    <input id="uploadFileSelect" type="file">... Select File to Upload on   Swarm ...</input>
+                    <input id="uploadFileEncrypt" name="encryption" type="checkbox" checked>
+                    <label for="encryption">Encrypt Upload</label>
+                    <input type="text" id="indexString" placeholder="(Optional) Enter Index     Document path for collection upload     (.tar)" size="64">
+                    <button id="uploadFile">... Upload on Swarm ...</button>
+                    <div>
+                        <input id="uploadAddToFeed" name="addtofeed" type="checkbox">
+                        <label for="addtofeed">Add upload reference to feed</label>
+                        <input type="text" id="feedTopicString" placeholder="Swarm Feed Topic">
+                    </div>
                 </div>
             </div>
-            <div id="resultField"></div>
         </div>
         <script type="module" defer>
             import init, { interweeb } from "./weeb_3.js"

@@ -366,17 +366,17 @@ pub async fn set_batch_field(field: String, value: &Vec<u8>) -> bool {
 }
 
 pub async fn get_batch_id() -> Vec<u8> {
-    return get_batch_field("batch_id".to_string()).await;
+    return get_batch_field("batch_0_id".to_string()).await;
 }
 
 pub async fn set_batch_id(id: &Vec<u8>) -> bool {
-    return set_batch_field("batch_id".to_string(), id).await;
+    return set_batch_field("batch_0_id".to_string(), id).await;
 }
 
 pub async fn get_batch_owner_key() -> Vec<u8> {
-    return get_batch_field("batch_owner_key".to_string()).await;
+    return get_batch_field("batch_owner_0_key".to_string()).await;
 }
 
 pub async fn set_batch_owner_key(key: &Vec<u8>) -> bool {
-    return set_batch_field("batch_owner_key".to_string(), key).await;
+    return set_batch_field("batch_owner_0_key".to_string(), key).await;
 }
