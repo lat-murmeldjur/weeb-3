@@ -17,7 +17,7 @@ use alloy::primitives::keccak256;
 
 use libp2p::{
     PeerId, StreamProtocol, Swarm, autonat,
-    core::{self, Multiaddr, Transport},
+    core::Multiaddr,
     dcutr,
     futures::{
         StreamExt,
@@ -26,9 +26,9 @@ use libp2p::{
     },
     identify, identity,
     identity::{ecdsa, ecdsa::SecretKey},
-    noise, ping,
+    ping,
     swarm::{NetworkBehaviour, SwarmEvent},
-    websocket_websys, yamux,
+    webrtc_websys,
 };
 use libp2p_stream as stream;
 
@@ -452,13 +452,9 @@ impl Sekirei {
         let swarm = libp2p::SwarmBuilder::with_existing_identity(keypair.clone().into())
             .with_wasm_bindgen()
             .with_other_transport(|key| {
-                websocket_websys::Transport::default()
-                    .upgrade(core::upgrade::Version::V1)
-                    .authenticate(noise::Config::new(&key).unwrap())
-                    .multiplex(yamux::Config::default())
-                    .boxed()
+                webrtc_websys::Transport::new(webrtc_websys::Config::new(&key))
             })
-            .expect("Failed to create WebSocket transport")
+            .expect("Failed to create WebRTC transport")
             .with_behaviour(|key| Behaviour::new(key.public()))
             .unwrap()
             .with_swarm_config(|_| {
@@ -510,8 +506,6 @@ impl Sekirei {
 
     pub async fn run(&self, _st: String) -> () {
         init_panic_hook();
-
-        prt("".to_string(), "".to_string()).await;
 
         let wings = self.wings.lock().unwrap();
 
@@ -674,10 +668,10 @@ impl Sekirei {
                 )
                 .await;
 
-                // web_sys::console::log_1(&JsValue::from(format!(
-                //     "Current Event Handled {:#?}",
-                //     event
-                // )));
+                web_sys::console::log_1(&JsValue::from(format!(
+                    "Current Event Handled {:#?}",
+                    event
+                )));
 
                 if !event.is_err() {
                     match event.unwrap() {
@@ -778,6 +772,8 @@ impl Sekirei {
                             }
 
                             if id.is_some() {
+                                web_sys::console::log_1(&JsValue::from(format!("INIT HANDSHAKE",)));
+
                                 connection_handler(
                                     id.expect("not"),
                                     nid,

@@ -62,7 +62,7 @@ libp2p = { git = "https://github.com/libp2p/rust-libp2p.git", features = [
 "ping",
 "secp256k1", 
 "wasm-bindgen", 
-"websocket-websys",
+"webrtc-websys",
 "yamux" 
 ] }
 libp2p-stream = { git = "https://github.com/libp2p/rust-libp2p.git" }
@@ -80,7 +80,6 @@ web-sys = { version = "0.3.72", features = [
   'EventListener',
   'File',
   'FileList',
-  'MessagePort',
   'Headers',
   'HtmlButtonElement',
   'HtmlElement',
@@ -88,13 +87,11 @@ web-sys = { version = "0.3.72", features = [
   'HtmlParagraphElement',
   'HtmlSelectElement',
   'Location',
-  'MessageEvent',
   'Navigator',
   'Node',
   'ServiceWorker',
   'ServiceWorkerContainer',
   'ServiceWorkerRegistration',
-  'SharedWorker',
   'ReadableStream',
   'Request',
   'RequestCache',
@@ -105,9 +102,6 @@ web-sys = { version = "0.3.72", features = [
   'ResponseInit',
   'Url',
   'Window',
-  'Worker',
-  'WorkerOptions',
-  'WorkerType',
 ] }
 byteorder = { git = "https://github.com/BurntSushi/byteorder" }
 num = { git = "https://github.com/rust-num/num.git" }

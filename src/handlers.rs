@@ -55,6 +55,7 @@ pub async fn ceive(
     step_0.encode_length_delimited(&mut bufw_0).unwrap();
 
     stream.write_all(&bufw_0).await?;
+    let _ = stream.flush().await;
 
     let mut buf_nondiscard_0 = Vec::new();
     let mut buf_discard_0: [u8; 255] = [0; 255];
@@ -125,6 +126,7 @@ pub async fn ceive(
     bufw_1.reserve(step_1_len + prost::length_delimiter_len(step_1_len));
     step_1.encode_length_delimited(&mut bufw_1).unwrap();
     stream.write_all(&bufw_1).await?;
+    let _ = stream.flush().await;
 
     let _ = stream.close().await;
     web_sys::console::log_1(&JsValue::from(format!("Connected Peer {:#?}!", peer)));
@@ -178,7 +180,6 @@ pub async fn pricing_handler(
         }
     }
 
-    let _ = stream.flush().await;
     let _ = stream.close().await;
 
     let rec_0_u = etiquette_4::AnnouncePaymentThreshold::decode_length_delimited(&mut Cursor::new(
@@ -246,7 +247,6 @@ pub async fn gossip_handler(
         }
     }
 
-    let _ = stream.flush().await;
     let _ = stream.close().await;
 
     let rec_0_u = etiquette_2::Peers::decode_length_delimited(&mut Cursor::new(buf_nondiscard_0));
@@ -428,11 +428,17 @@ pub async fn connection_handler(
         }
     };
 
+    web_sys::console::log_1(&JsValue::from(format!("INITIAL HANDSHAKE STREAM OPEN",)));
+
     if let Err(e) = ceive(peer, network_id, &mut stream, a.clone(), &pk.clone(), chan).await {
         web_sys::console::log_1(&JsValue::from("Handshake protocol failed"));
         web_sys::console::log_1(&JsValue::from(format!("{}", e)));
         return false;
     }
+
+    web_sys::console::log_1(&JsValue::from(
+        format!("INITIAL HANDSHAKE STREAM COMPLETE",),
+    ));
 
     web_sys::console::log_1(&JsValue::from(format!("{} Handshake complete!", peer)));
 
