@@ -257,7 +257,7 @@ pub async fn retrieve_data(
 
 pub async fn retrieve_chunk(
     chunk_address: &Vec<u8>,
-    control: &mut stream::Control,
+    control: stream::Control,
     peers: &Arc<Mutex<HashMap<String, PeerId>>>,
     accounting: &Arc<Mutex<HashMap<PeerId, Mutex<PeerAccounting>>>>,
     refresh_chan: &mpsc::Sender<(PeerId, u64)>,
@@ -321,7 +321,7 @@ pub async fn retrieve_chunk(
 
                     let current_po = get_proximity(&caddr, &hex::decode(&ov).unwrap());
 
-                    if current_po >= current_max_po {
+                    if current_po >= current_max_po || selected == false {
                         selected = true;
                         closest_overlay = ov.clone();
                         closest_peer_id = id.clone();
@@ -385,7 +385,7 @@ pub async fn retrieve_chunk(
 
         let (chunk_out, chunk_in) = mpsc::channel::<Vec<u8>>();
 
-        retrieve_handler(closest_peer_id, caddr.clone(), control, &chunk_out).await;
+        retrieve_handler(closest_peer_id, caddr.clone(), control.clone(), &chunk_out).await;
 
         let chunk_data = chunk_in.try_recv();
         if chunk_data.is_err() {

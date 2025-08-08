@@ -143,7 +143,7 @@ pub async fn upload_resource(
             encryption,
             batch_owner.clone(),
             batch_id.clone(),
-            data_upload_chan,
+            &data_upload_chan.clone(),
         )
         .await;
 
@@ -182,7 +182,7 @@ pub async fn upload_resource(
         errordoc, // errordoc
         batch_owner.clone(),
         batch_id.clone(),
-        data_upload_chan,
+        &data_upload_chan.clone(),
     )
     .await;
 
@@ -193,7 +193,7 @@ pub async fn upload_resource(
         encryption,
         batch_owner.clone(),
         batch_id.clone(),
-        data_upload_chan,
+        &data_upload_chan.clone(),
     )
     .await;
 
@@ -201,7 +201,7 @@ pub async fn upload_resource(
         return manifest_reference;
     }
 
-    let owner_bytes_0 = keccak256("Unique owner to be persist3d in indexeddb").to_vec();
+    let owner_bytes_0 = keccak256("Unique owner to be persisted in indexeddb").to_vec();
     let soc_signer: PrivateKeySigner = match PrivateKeySigner::from_slice(&owner_bytes_0.clone()) {
         Ok(aok) => aok,
         _ => return vec![],
@@ -227,7 +227,7 @@ pub async fn upload_resource(
         encryption,
         batch_owner.clone(),
         batch_id.clone(),
-        data_upload_chan,
+        &data_upload_chan.clone(),
     )
     .await;
 
@@ -245,7 +245,7 @@ pub async fn upload_resource(
         "".to_string(), // errordoc
         batch_owner.clone(),
         batch_id.clone(),
-        data_upload_chan,
+        &data_upload_chan.clone(),
     )
     .await;
 
@@ -254,14 +254,14 @@ pub async fn upload_resource(
         encryption,
         batch_owner.clone(),
         batch_id.clone(),
-        data_upload_chan,
+        &data_upload_chan.clone(),
     )
     .await;
 
     let index_up = seek_next_feed_update_index(
         hex::encode(&feed_owner),
         topic.clone(),
-        chunk_retrieve_chan,
+        &chunk_retrieve_chan.clone(),
         8,
     )
     .await;
@@ -276,7 +276,8 @@ pub async fn upload_resource(
     } else {
         let mut uploaded = false;
         while !uploaded {
-            let crown_chunk = get_chunk(manifest_reference.clone(), chunk_retrieve_chan).await;
+            let crown_chunk =
+                get_chunk(manifest_reference.clone(), &chunk_retrieve_chan.clone()).await;
             if crown_chunk.len() > 0 {
                 wrapped_content = crown_chunk[8..].to_vec();
                 uploaded = true;
@@ -537,7 +538,7 @@ pub async fn push_chunk(
     batch_owner: Vec<u8>,
     batch_id: Vec<u8>,
     batch_bucket_limit: u32,
-    control: &mut stream::Control,
+    control: stream::Control,
     peers: &Mutex<HashMap<String, PeerId>>,
     accounting: &Mutex<HashMap<PeerId, Mutex<PeerAccounting>>>,
     refresh_chan: &mpsc::Sender<(PeerId, u64)>,
@@ -658,7 +659,7 @@ pub async fn push_chunk(
                 };
                 if accounting_peers.contains_key(&closest_peer_id) {
                     let accounting_peer = accounting_peers.get(&closest_peer_id).unwrap();
-                    let allowed = reserve(accounting_peer, req_price, refresh_chan);
+                    let allowed = reserve(accounting_peer, req_price, &refresh_chan.clone());
                     if !allowed {
                         overdraftlist.insert(closest_peer_id);
                     } else {
@@ -677,7 +678,7 @@ pub async fn push_chunk(
             caddr.clone(),
             data.clone(),
             cstamp0.clone(),
-            control,
+            control.clone(),
             &chunk_out,
         )
         .await;

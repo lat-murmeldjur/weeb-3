@@ -1,7 +1,6 @@
 #![cfg(target_arch = "wasm32")]
 
 use console_error_panic_hook;
-use rand::rngs::OsRng;
 
 use async_std::sync::Arc;
 
@@ -16,17 +15,20 @@ use tar::Archive;
 use alloy::primitives::keccak256;
 
 use libp2p::{
-    PeerId, StreamProtocol, Swarm, autonat,
+    PeerId,
+    StreamProtocol,
+    Swarm, // autonat,
     core::Multiaddr,
-    dcutr,
+    // dcutr,
     futures::{
         StreamExt,
         future::join_all, //
         join,
     },
-    identify, identity,
+    // identify,
+    identity,
     identity::{ecdsa, ecdsa::SecretKey},
-    ping,
+    // ping,
     swarm::{NetworkBehaviour, SwarmEvent},
     webrtc_websys,
 };
@@ -160,6 +162,7 @@ pub struct Sekirei {
 pub struct Wings {
     connected_peers: Arc<Mutex<HashMap<PeerId, PeerFile>>>,
     overlay_peers: Arc<Mutex<HashMap<String, PeerId>>>,
+    bootnodes: Arc<Mutex<HashSet<String>>>,
     accounting_peers: Arc<Mutex<HashMap<PeerId, Mutex<PeerAccounting>>>>,
     ongoing_refreshments: Arc<Mutex<HashSet<PeerId>>>,
     connection_attempts: Arc<Mutex<HashSet<PeerId>>>,
@@ -440,7 +443,7 @@ impl Sekirei {
         // tracing_wasm::set_as_global_default(); // uncomment to turn on tracing
         init_panic_hook();
 
-        let idle_duration = Duration::from_secs(60);
+        let idle_duration = Duration::from_secs(3600);
 
         // let body = Body::from_current_window()?;
         // body.append_p(&format!("Attempt to establish connection over websocket"))?;
@@ -460,9 +463,9 @@ impl Sekirei {
             .with_swarm_config(|_| {
                 libp2p::swarm::Config::with_wasm_executor()
                     .with_idle_connection_timeout(idle_duration)
-                    .with_max_negotiating_inbound_streams(NonZero::new(10000_usize).unwrap().into())
-                    .with_per_connection_event_buffer_size(10000_usize)
-                    .with_notify_handler_buffer_size(NonZero::new(10000_usize).unwrap().into())
+                    .with_max_negotiating_inbound_streams(NonZero::new(1000_usize).unwrap().into())
+                    .with_per_connection_event_buffer_size(1000_usize)
+                    .with_notify_handler_buffer_size(NonZero::new(1000_usize).unwrap().into())
             })
             .build();
 
@@ -470,6 +473,7 @@ impl Sekirei {
             Arc::new(Mutex::new(HashMap::new()));
         let overlay_peers: Arc<Mutex<HashMap<String, PeerId>>> =
             Arc::new(Mutex::new(HashMap::new()));
+        let bootnodes: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
         let accounting_peers: Arc<Mutex<HashMap<PeerId, Mutex<PeerAccounting>>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let ongoing_refreshments: Arc<Mutex<HashSet<PeerId>>> =
@@ -493,6 +497,7 @@ impl Sekirei {
             wings: Mutex::new(Arc::new(Wings {
                 connected_peers: connected_peers,
                 overlay_peers: overlay_peers,
+                bootnodes: bootnodes,
                 accounting_peers: accounting_peers,
                 ongoing_refreshments: ongoing_refreshments,
                 connection_attempts: connection_attempts,
@@ -511,7 +516,7 @@ impl Sekirei {
 
         let (peers_instructions_chan_outgoing, peers_instructions_chan_incoming) = mpsc::channel();
         let (connections_instructions_chan_outgoing, connections_instructions_chan_incoming) =
-            mpsc::channel::<etiquette_2::BzzAddress>();
+            mpsc::channel::<(etiquette_2::BzzAddress, bool)>();
 
         let (accounting_peer_chan_outgoing, accounting_peer_chan_incoming) = mpsc::channel();
 
@@ -558,7 +563,7 @@ impl Sekirei {
                 .unwrap();
         }
 
-        let mut ctrl3 = ctrl.clone();
+        let ctrl3 = ctrl.clone();
         let ctrl4 = ctrl.clone();
         let ctrl6 = ctrl.clone();
         let ctrl8 = ctrl.clone();
@@ -601,6 +606,56 @@ impl Sekirei {
                             }
                         };
 
+                        let rtclist = paddr.clone().rtc_underlays;
+
+                        for rtcaddr in rtclist.iter() {
+                            let addr3 = match libp2p::core::Multiaddr::try_from(rtcaddr.clone()) {
+                                Ok(aok) => aok,
+                                _ => {
+                                    continue;
+                                }
+                            };
+
+                            let prck = addr3.protocol_stack();
+                            let mut webrtc_direct = false;
+                            for p in prck {
+                                if p == "webrtc-direct" {
+                                    webrtc_direct = true;
+                                }
+                            }
+
+                            if webrtc_direct {
+                                let _pid: PeerId = match try_from_multiaddr(&addr3.clone()) {
+                                    Some(aok) => {
+                                        let connected_peers_map =
+                                            wings.connected_peers.lock().unwrap();
+                                        if connected_peers_map.contains_key(&aok) {
+                                            continue;
+                                        }
+                                        let mut connection_attempts_map =
+                                            wings.connection_attempts.lock().unwrap();
+                                        if connection_attempts_map.contains(&aok) {
+                                            continue;
+                                        } else {
+                                            connection_attempts_map.insert(aok);
+                                        }
+                                        aok
+                                    }
+                                    _ => {
+                                        continue;
+                                    }
+                                };
+                                let _ = swarm.dial(addr3.clone());
+
+                                let mut paddr5 = paddr.clone();
+                                paddr5.underlay = addr3.to_vec();
+
+                                let _ = connections_instructions_chan_outgoing
+                                    .clone()
+                                    .send((paddr5.clone(), false));
+                            }
+                        }
+
                         let addr4 = match libp2p::core::Multiaddr::try_from(paddr.clone().underlay)
                         {
                             Ok(aok) => aok,
@@ -609,53 +664,43 @@ impl Sekirei {
                             }
                         };
 
-                        let _pid: PeerId = match try_from_multiaddr(&addr4.clone()) {
-                            Some(aok) => {
-                                let connected_peers_map = wings.connected_peers.lock().unwrap();
-                                if connected_peers_map.contains_key(&aok) {
-                                    continue;
-                                }
-                                let mut connection_attempts_map =
-                                    wings.connection_attempts.lock().unwrap();
-                                if connection_attempts_map.contains(&aok) {
-                                    continue;
-                                } else {
-                                    connection_attempts_map.insert(aok);
-                                }
-                                aok
-                            }
-                            _ => {
-                                continue;
-                            }
-                        };
-
                         let prck = addr4.protocol_stack();
-                        let mut ws = false;
+                        let mut webrtc_direct = false;
                         for p in prck {
-                            if p == "ws" {
-                                ws = true;
+                            if p == "webrtc-direct" {
+                                webrtc_direct = true;
                             }
                         }
 
-                        if !ws {
-                            let addr40 = addr4.to_string().replace("/p2p/", "/ws/p2p/");
-
-                            let addr41 = match addr40.parse::<Multiaddr>() {
-                                Ok(aok) => aok,
+                        if webrtc_direct {
+                            let _pid: PeerId = match try_from_multiaddr(&addr4.clone()) {
+                                Some(aok) => {
+                                    let connected_peers_map = wings.connected_peers.lock().unwrap();
+                                    if connected_peers_map.contains_key(&aok) {
+                                        continue;
+                                    }
+                                    let mut connection_attempts_map =
+                                        wings.connection_attempts.lock().unwrap();
+                                    if connection_attempts_map.contains(&aok) {
+                                        continue;
+                                    } else {
+                                        connection_attempts_map.insert(aok);
+                                    }
+                                    aok
+                                }
                                 _ => {
                                     continue;
                                 }
                             };
 
-                            let _ = swarm.dial(addr41.clone());
+                            let _ = swarm.dial(addr4.clone());
 
-                            let mut bzzaddr = etiquette_2::BzzAddress::default();
-                            bzzaddr.underlay = addr41.to_vec();
+                            let mut paddr5 = paddr.clone();
+                            paddr5.underlay = addr4.to_vec();
 
-                            let _ = connections_instructions_chan_outgoing.send(bzzaddr);
-                        } else {
-                            let _ = swarm.dial(addr4);
-                            let _ = connections_instructions_chan_outgoing.send(paddr);
+                            let _ = connections_instructions_chan_outgoing
+                                .clone()
+                                .send((paddr5.clone(), false));
                         }
                     } else {
                         break;
@@ -668,10 +713,10 @@ impl Sekirei {
                 )
                 .await;
 
-                web_sys::console::log_1(&JsValue::from(format!(
-                    "Current Event Handled {:#?}",
-                    event
-                )));
+                //                web_sys::console::log_1(&JsValue::from(format!(
+                //                    "Current Event Handled {:#?}",
+                //                    event
+                //                )));
 
                 if !event.is_err() {
                     match event.unwrap() {
@@ -746,7 +791,9 @@ impl Sekirei {
 
                         bzzaddr.underlay = addr33.to_vec();
 
-                        let _ = connections_instructions_chan_outgoing.send(bzzaddr);
+                        let _ = connections_instructions_chan_outgoing
+                            .clone()
+                            .send((bzzaddr, true));
                     } else {
                         break;
                     }
@@ -762,28 +809,36 @@ impl Sekirei {
                     #[allow(irrefutable_let_patterns)]
                     while let that = connections_instructions_chan_incoming.try_recv() {
                         if !that.is_err() {
+                            let (bzzaddr0, bootn) = that.unwrap();
+
                             let addr3 =
-                                libp2p::core::Multiaddr::try_from(that.unwrap().underlay).unwrap();
-                            let id = try_from_multiaddr(&addr3);
+                                libp2p::core::Multiaddr::try_from(bzzaddr0.underlay).unwrap();
+                            let id = match try_from_multiaddr(&addr3) {
+                                Some(aok) => aok,
+                                _ => continue,
+                            };
                             let nid: u64;
                             {
                                 let nid0 = self.network_id.lock().unwrap().clone();
                                 nid = nid0;
                             }
 
-                            if id.is_some() {
-                                web_sys::console::log_1(&JsValue::from(format!("INIT HANDSHAKE",)));
-
-                                connection_handler(
-                                    id.expect("not"),
-                                    nid,
-                                    &mut ctrl3,
-                                    &addr3.clone(),
-                                    &self.secret_key.lock().unwrap(),
-                                    &accounting_peer_chan_outgoing.clone(),
-                                )
-                                .await;
+                            if bootn {
+                                let mut bootnodes_set = wings.bootnodes.lock().unwrap();
+                                bootnodes_set.insert(id.to_string());
                             }
+
+                            web_sys::console::log_1(&JsValue::from(format!("INIT HANDSHAKE",)));
+
+                            connection_handler(
+                                id,
+                                nid,
+                                ctrl3.clone(),
+                                &addr3.clone(),
+                                &self.secret_key.lock().unwrap(),
+                                &accounting_peer_chan_outgoing.clone(),
+                            )
+                            .await;
                         } else {
                             break;
                         }
@@ -817,8 +872,11 @@ impl Sekirei {
                                 }
                             }
                             {
-                                let mut overlay_peers_map = wings.overlay_peers.lock().unwrap();
-                                overlay_peers_map.insert(ol, peer_file.peer_id);
+                                let bootnodes_set = wings.bootnodes.lock().unwrap();
+                                if !bootnodes_set.contains(&peer_file.peer_id.to_string()) {
+                                    let mut overlay_peers_map = wings.overlay_peers.lock().unwrap();
+                                    overlay_peers_map.insert(ol, peer_file.peer_id);
+                                }
                             }
                             {
                                 let mut connected_peers_map = wings.connected_peers.lock().unwrap();
@@ -883,10 +941,10 @@ impl Sekirei {
                                     let mut map = wings.ongoing_refreshments.lock().unwrap();
                                     map.insert(peer);
                                 }
-                                let mut ctrl7 = ctrl4.clone();
+                                let ctrl7 = ctrl4.clone();
                                 let rco = refreshment_chan_outgoing.clone();
                                 let handle = async move {
-                                    refresh_handler(peer, amount, &mut ctrl7, &rco).await;
+                                    refresh_handler(peer, amount, ctrl7, &rco).await;
                                 };
                                 refresh_joiner.push(handle);
                             }
@@ -1150,7 +1208,7 @@ impl Sekirei {
                             let (d, soc, checkad, batch_owner, batch_id) =
                                 incoming_request.unwrap();
 
-                            let mut ctrl9 = ctrl8.clone();
+                            let ctrl9 = ctrl8.clone();
 
                             let batch_bucket_limit = 64_u32;
 
@@ -1158,10 +1216,10 @@ impl Sekirei {
                                 &d,
                                 soc,
                                 checkad.clone(),
-                                batch_owner,
-                                batch_id,
+                                batch_owner.clone(),
+                                batch_id.clone(),
                                 batch_bucket_limit,
-                                &mut ctrl9,
+                                ctrl9.clone(),
                                 &wings.overlay_peers.clone(),
                                 &wings.accounting_peers.clone(),
                                 &refreshment_instructions_chan_outgoing.clone(),
@@ -1175,16 +1233,27 @@ impl Sekirei {
                                     hex::encode(&checkad)
                                 )));
                             }
-
-                            if data_reference.len() == 0 {
-                                web_sys::console::log_1(&JsValue::from(format!("CH_AD miss")));
-                                // web_sys::console::log_1(&JsValue::from(format!(
-                                //     "Writing response to encrypted : {} push chunk request",
-                                //     encrypted_chunk
-                                // )));
-
-                                // let _ = chunk_upload_chan_outgoing.send((d, checkad));
-                            }
+                            //
+                            //                            let data_available = retrieve_chunk(
+                            //                                &checkad,
+                            //                                ctrl9.clone()z,
+                            //                                &wings.overlay_peers.clone(),
+                            //                                &wings.accounting_peers.clone(),
+                            //                                &refreshment_instructions_chan_outgoing.clone(),
+                            //                            )
+                            //                            .await;
+                            //
+                            //                            if data_available.len() == 0 {
+                            //                                web_sys::console::log_1(&JsValue::from(format!("CH_AD miss")));
+                            //
+                            //                                let _ = chunk_upload_chan_outgoing.clone().send((
+                            //                                    d.clone(),
+                            //                                    soc,
+                            //                                    checkad.clone(),
+                            //                                    batch_owner,
+                            //                                    batch_id,
+                            //                                ));
+                            //                            }
                         };
                         request_joiner.push(handle);
                     } else {
@@ -1193,7 +1262,10 @@ impl Sekirei {
                 }
 
                 if request_joiner.len() > 0 {
-                    web_sys::console::log_1(&JsValue::from(format!("making pushsync requests")));
+                    web_sys::console::log_1(&JsValue::from(format!(
+                        "making {} pushsync requests",
+                        request_joiner.len()
+                    )));
                 }
 
                 join_all(request_joiner).await;
@@ -1225,11 +1297,11 @@ impl Sekirei {
                         let handle = async {
                             let (n, chan) = incoming_request.unwrap();
 
-                            let mut ctrl9 = ctrl6.clone();
+                            let ctrl9 = ctrl6.clone();
 
                             let chunk_data = retrieve_chunk(
                                 &n,
-                                &mut ctrl9,
+                                ctrl9,
                                 &wings.overlay_peers.clone(),
                                 &wings.accounting_peers.clone(),
                                 &refreshment_instructions_chan_outgoing.clone(),
@@ -1286,29 +1358,29 @@ impl Sekirei {
 
 #[derive(NetworkBehaviour)]
 struct Behaviour {
-    autonat: autonat::v2::client::Behaviour,
-    autonat_s: autonat::v2::server::Behaviour,
-    dcutr: dcutr::Behaviour,
-    identify: identify::Behaviour,
-    ping: ping::Behaviour,
+    //    autonat: autonat::v2::client::Behaviour,
+    //    autonat_s: autonat::v2::server::Behaviour,
+    //    dcutr: dcutr::Behaviour,
+    //    identify: identify::Behaviour,
+    // ping: ping::Behaviour,
     stream: stream::Behaviour,
 }
 
 impl Behaviour {
-    fn new(local_public_key: identity::PublicKey) -> Self {
+    fn new(_local_public_key: identity::PublicKey) -> Self {
         Self {
-            autonat: autonat::v2::client::Behaviour::new(
-                OsRng,
-                autonat::v2::client::Config::default().with_probe_interval(Duration::from_secs(60)),
-            ),
-            autonat_s: autonat::v2::server::Behaviour::new(OsRng),
-            dcutr: dcutr::Behaviour::new(local_public_key.to_peer_id()),
-            identify: identify::Behaviour::new(
-                identify::Config::new("/weeb-3".into(), local_public_key.clone())
-                    .with_push_listen_addr_updates(true)
-                    .with_interval(Duration::from_secs(60)), // .with_cache_size(10), //
-            ),
-            ping: ping::Behaviour::new(ping::Config::new().with_interval(Duration::from_secs(50))),
+            //            autonat: autonat::v2::client::Behaviour::new(
+            //                OsRng,
+            //                autonat::v2::client::Config::default().with_probe_interval(Duration::from_secs(60)),
+            //            ),
+            //            autonat_s: autonat::v2::server::Behaviour::new(OsRng),
+            //            dcutr: dcutr::Behaviour::new(local_public_key.to_peer_id()),
+            // identify: identify::Behaviour::new(
+            //     identify::Config::new("/weeb-3".into(), local_public_key.clone())
+            //         .with_push_listen_addr_updates(true)
+            //         .with_interval(Duration::from_secs(10)), // .with_cache_size(10), //
+            // ),
+            // ping: ping::Behaviour::new(ping::Config::new().with_interval(Duration::from_secs(9))),
             stream: stream::Behaviour::new(),
         }
     }
