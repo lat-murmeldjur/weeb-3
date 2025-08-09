@@ -6,6 +6,7 @@ use async_std::sync::Arc;
 
 use std::collections::{HashMap, HashSet};
 use std::io::Read;
+use std::net::Ipv4Addr;
 use std::num::NonZero;
 use std::sync::{Mutex, mpsc};
 use std::time::Duration;
@@ -19,6 +20,7 @@ use libp2p::{
     StreamProtocol,
     Swarm, // autonat,
     core::Multiaddr,
+    core::multiaddr::Protocol,
     // dcutr,
     futures::{
         StreamExt,
@@ -620,7 +622,16 @@ impl Sekirei {
                             let mut webrtc_direct = false;
                             for p in prck {
                                 if p == "webrtc-direct" {
-                                    webrtc_direct = true;
+                                    for protocol in addr3.iter() {
+                                        match protocol {
+                                            Protocol::Ip4(addr) => {
+                                                if addr != Ipv4Addr::new(127, 0, 0, 1) {
+                                                    webrtc_direct = true;
+                                                }
+                                            }
+                                            _ => continue,
+                                        }
+                                    }
                                 }
                             }
 
