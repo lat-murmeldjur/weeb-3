@@ -131,6 +131,7 @@ pub struct Sekirei {
     swarm: Arc<Mutex<Swarm<Behaviour>>>,
     secret_key: Mutex<SecretKey>,
     wings: Mutex<Arc<Wings>>,
+    log_port: (mpsc::Sender<String>, mpsc::Receiver<String>),
     message_port: (
         mpsc::Sender<(Vec<u8>, mpsc::Sender<Vec<u8>>)>,
         mpsc::Receiver<(Vec<u8>, mpsc::Sender<Vec<u8>>)>,
@@ -483,6 +484,9 @@ impl Sekirei {
         let connection_attempts: Arc<Mutex<HashSet<PeerId>>> = Arc::new(Mutex::new(HashSet::new()));
 
         let (m_out, m_in) = mpsc::channel::<(Vec<u8>, mpsc::Sender<Vec<u8>>)>();
+
+        let (log_port_out, log_port_in) = mpsc::channel::<String>();
+
         let (u_out, u_in) = mpsc::channel::<(
             Vec<(String, String, String, Vec<u8>)>,
             bool,
@@ -504,11 +508,31 @@ impl Sekirei {
                 ongoing_refreshments: ongoing_refreshments,
                 connection_attempts: connection_attempts,
             })),
+            log_port: (log_port_out, log_port_in),
             message_port: (m_out, m_in),
             upload_port: (u_out, u_in),
             bootnode_port: (b_out, b_in),
             network_id: Mutex::new(10_u64),
         };
+    }
+
+    pub async fn get_current_logs(&self) -> Vec<String> {
+        let mut logs: Vec<String> = vec![];
+        while let data0 = self.log_port.1.try_recv() {
+            if !data0.is_err() {
+                let log_message = data0.unwrap();
+                logs.push(log_message);
+            } else {
+                break;
+            }
+        }
+
+        return logs;
+    }
+
+    pub async fn interface_log(&self, log0: String) {
+        self.log_port.0.send(log0.to_string());
+        web_sys::console::log_1(&JsValue::from(log0));
     }
 
     pub async fn run(&self, _st: String) -> () {
@@ -627,6 +651,13 @@ impl Sekirei {
                                             Protocol::Ip4(addr) => {
                                                 if addr != Ipv4Addr::new(127, 0, 0, 1) {
                                                     webrtc_direct = true;
+
+                                                    web_sys::console::log_1(&JsValue::from(
+                                                        format!(
+                                                            "Non localhost webrtc address found {:#?}",
+                                                            addr3
+                                                        ),
+                                                    ));
                                                 }
                                             }
                                             _ => continue,
@@ -724,10 +755,7 @@ impl Sekirei {
                 )
                 .await;
 
-                //                web_sys::console::log_1(&JsValue::from(format!(
-                //                    "Current Event Handled {:#?}",
-                //                    event
-                //                )));
+                // self.interface_log(format!("Current Event Handled {:#?}", event)).await;
 
                 if !event.is_err() {
                     match event.unwrap() {
@@ -748,6 +776,7 @@ impl Sekirei {
                                         overlay_peers_map.remove(&ol0);
                                     };
                                     connected_peers_map.remove(&peer_id);
+                                    self.interface_log(format!("Disconnected from peer {}", &ol0)).await;
                                 };
                             }
                             let mut accounting = wings.accounting_peers.lock().unwrap();
@@ -882,13 +911,7 @@ impl Sekirei {
                                     );
                                 }
                             }
-                            {
-                                let bootnodes_set = wings.bootnodes.lock().unwrap();
-                                if !bootnodes_set.contains(&peer_file.peer_id.to_string()) {
-                                    let mut overlay_peers_map = wings.overlay_peers.lock().unwrap();
-                                    overlay_peers_map.insert(ol, peer_file.peer_id);
-                                }
-                            }
+
                             {
                                 let mut connected_peers_map = wings.connected_peers.lock().unwrap();
                                 connected_peers_map.insert(peer_file.peer_id, peer_file);
@@ -910,6 +933,25 @@ impl Sekirei {
                                 _ => continue,
                             };
                             set_payment_threshold(accounting_peer_lock, amount);
+                            {
+                                let bootnodes_set = wings.bootnodes.lock().unwrap();
+                                let connected_peers_map = wings.connected_peers.lock().unwrap();
+                                let ol: String;
+                                {
+                                    ol = hex::encode(
+                                        connected_peers_map.get(&peer).unwrap().overlay.clone(),
+                                    );
+                                }
+                                if !bootnodes_set.contains(&peer.to_string()) {
+                                    let mut overlay_peers_map = wings.overlay_peers.lock().unwrap();
+                                    self.interface_log(format!("Connected to peer {}", &ol))
+                                        .await;
+                                    overlay_peers_map.insert(ol, peer);
+                                } else {
+                                    self.interface_log(format!("Connected to bootnode {}", &ol))
+                                        .await;
+                                }
+                            }
                         } else {
                             break;
                         }

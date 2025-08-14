@@ -1,4 +1,4 @@
-use crate::{Body, Sekirei, decode_resources, init_panic_hook};
+use crate::{Body, Sekirei, decode_resources, init_panic_hook, mpsc};
 
 use std::str::FromStr;
 use std::time::Duration;
@@ -43,6 +43,8 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
 
     let sekirei0 = sekirei.clone();
 
+    let (log_chan_out, log_chan_in) = mpsc::channel::<String>();
+
     let sekirei_async = async move {
         sekirei0.run("".to_string()).await;
     };
@@ -51,6 +53,7 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
     let sekirei2 = sekirei.clone();
     let sekirei3 = sekirei.clone();
     let sekirei4 = sekirei.clone();
+    let sekirei5 = sekirei.clone();
 
     let window = web_sys::window().unwrap();
 
@@ -587,10 +590,15 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
             .expect("#uploadResetStamp should be a HtmlButtonElement")
             .set_onclick(Some(callback5.as_ref().unchecked_ref()));
 
-        body.append_p(&format!("Created a new worker from within Wasm"))
-            .unwrap();
+        render_log_message(&format!("Created a new client from wasm"));
 
         loop {
+            #[allow(irrefutable_let_patterns)]
+            let logs_current = sekirei5.get_current_logs().await;
+            for log_message in logs_current.iter() {
+                render_log_message(&log_message);
+            }
+
             async_std::task::sleep(Duration::from_millis(600)).await
         }
     };
@@ -636,6 +644,19 @@ fn service_worker_missing() {
         .dyn_ref::<HtmlElement>()
         .unwrap()
         .prepend_with_node_1(&errod)
+        .unwrap();
+}
+
+fn render_log_message(log: &String) {
+    let document = web_sys::window().unwrap().document().unwrap();
+    let log_message_div = document.create_element("div").unwrap();
+    log_message_div.set_inner_html(&log);
+    let _r = document
+        .get_element_by_id("logsField")
+        .expect("#logsField should exist")
+        .dyn_ref::<HtmlElement>()
+        .unwrap()
+        .prepend_with_node_1(&log_message_div)
         .unwrap();
 }
 
