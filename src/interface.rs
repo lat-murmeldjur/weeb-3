@@ -1,4 +1,4 @@
-use crate::{Body, Sekirei, decode_resources, init_panic_hook, mpsc};
+use crate::{Sekirei, decode_resources, init_panic_hook};
 
 use std::str::FromStr;
 use std::time::Duration;
@@ -43,8 +43,6 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
 
     let sekirei0 = sekirei.clone();
 
-    let (log_chan_out, log_chan_in) = mpsc::channel::<String>();
-
     let sekirei_async = async move {
         sekirei0.run("".to_string()).await;
     };
@@ -67,8 +65,6 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
 
     let interface_async = async move {
         web_sys::console::log_1(&JsValue::from(format!("host2 {:#?}", host2)));
-
-        let body = Body::from_current_window().unwrap();
 
         let document = web_sys::window().unwrap().document().unwrap();
 

@@ -32,7 +32,7 @@ use crate::{
     //                                                                        //
     mpsc,
     //                                                                        //
-    persistence::bump_bucket,
+    persistence::{bump_bucket, get_feed_owner_key, set_feed_owner_key},
     //                                                                        //
     price,
     //                                                                        //
@@ -201,7 +201,16 @@ pub async fn upload_resource(
         return manifest_reference;
     }
 
-    let owner_bytes_0 = keccak256("Unique owner to be persisted in indexeddb").to_vec();
+    let mut owner_bytes_0 = get_feed_owner_key().await;
+
+    if owner_bytes_0.len() == 0 {
+        owner_bytes_0 = encrey();
+        let saved = set_feed_owner_key(&owner_bytes_0).await;
+        if !saved {
+            return vec![];
+        };
+    };
+
     let soc_signer: PrivateKeySigner = match PrivateKeySigner::from_slice(&owner_bytes_0.clone()) {
         Ok(aok) => aok,
         _ => return vec![],

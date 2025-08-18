@@ -1,18 +1,17 @@
 #![cfg(target_arch = "wasm32")]
 
 use std::collections::HashMap;
-use std::io;
-
-use alloy::primitives::keccak256;
-use alloy::primitives::{Signature, normalize_v};
 
 use libp2p::multiaddr::Protocol;
 use libp2p::{Multiaddr, PeerId};
 
-use wasm_bindgen::prelude::*;
-use web_sys::{Document, HtmlElement};
-
+use alloy::primitives::keccak256;
+use alloy::primitives::{Signature, normalize_v};
 use serde::{Deserialize, Serialize};
+use wasm_bindgen::prelude::*;
+
+// use std::io;
+// use web_sys::{Document, HtmlElement};
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct Entry {
@@ -50,41 +49,41 @@ pub fn try_from_multiaddr(address: &Multiaddr) -> Option<PeerId> {
     })
 }
 
-pub struct Body {
-    body: HtmlElement,
-    document: Document,
-}
-
-impl Body {
-    pub fn from_current_window() -> Result<Self, JsError> {
-        let document = web_sys::window()
-            .ok_or(js_error("no global `window` exists"))?
-            .document()
-            .ok_or(js_error("should have a document on window"))?;
-        let body = document
-            .body()
-            .ok_or(js_error("document should have a body"))?;
-
-        Ok(Self { body, document })
-    }
-
-    pub fn append_p(&self, msg: &str) -> Result<(), JsError> {
-        let val = self
-            .document
-            .create_element("p")
-            .map_err(|_| js_error("failed to create <p>"))?;
-        val.set_text_content(Some(msg));
-        self.body
-            .append_child(&val)
-            .map_err(|_| js_error("failed to append <p>"))?;
-
-        Ok(())
-    }
-}
-
-fn js_error(msg: &str) -> JsError {
-    io::Error::new(io::ErrorKind::Other, msg).into()
-}
+//  pub struct Body {
+//      body: HtmlElement,
+//      document: Document,
+//  }
+//
+//  impl Body {
+//      pub fn from_current_window() -> Result<Self, JsError> {
+//          let document = web_sys::window()
+//              .ok_or(js_error("no global `window` exists"))?
+//              .document()
+//              .ok_or(js_error("should have a document on window"))?;
+//          let body = document
+//              .body()
+//              .ok_or(js_error("document should have a body"))?;
+//
+//          Ok(Self { body, document })
+//      }
+//
+//      pub fn append_p(&self, msg: &str) -> Result<(), JsError> {
+//          let val = self
+//              .document
+//              .create_element("p")
+//              .map_err(|_| js_error("failed to create <p>"))?;
+//          val.set_text_content(Some(msg));
+//          self.body
+//              .append_child(&val)
+//              .map_err(|_| js_error("failed to append <p>"))?;
+//
+//          Ok(())
+//      }
+//  }
+//
+//  fn js_error(msg: &str) -> JsError {
+//      io::Error::new(io::ErrorKind::Other, msg).into()
+//  }
 
 pub fn get_proximity(one: &Vec<u8>, other: &Vec<u8>) -> u8 {
     let mut b: usize = (MAX_PO / 4 + 1).into();

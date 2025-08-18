@@ -380,3 +380,11 @@ pub async fn get_batch_owner_key() -> Vec<u8> {
 pub async fn set_batch_owner_key(key: &Vec<u8>) -> bool {
     return set_batch_field("batch_owner_0_key".to_string(), key).await;
 }
+
+pub async fn get_feed_owner_key() -> Vec<u8> {
+    return get_batch_field("feed_owner_0_key".to_string()).await;
+}
+
+pub async fn set_feed_owner_key(key: &Vec<u8>) -> bool {
+    return set_batch_field("feed_owner_0_key".to_string(), key).await;
+}

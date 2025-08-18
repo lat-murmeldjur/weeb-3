@@ -518,6 +518,8 @@ impl Sekirei {
 
     pub async fn get_current_logs(&self) -> Vec<String> {
         let mut logs: Vec<String> = vec![];
+
+        #[allow(irrefutable_let_patterns)]
         while let data0 = self.log_port.1.try_recv() {
             if !data0.is_err() {
                 let log_message = data0.unwrap();
@@ -531,7 +533,7 @@ impl Sekirei {
     }
 
     pub async fn interface_log(&self, log0: String) {
-        self.log_port.0.send(log0.to_string());
+        let _ = self.log_port.0.send(log0.to_string());
         web_sys::console::log_1(&JsValue::from(log0));
     }
 
