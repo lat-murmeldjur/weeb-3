@@ -22,6 +22,7 @@ use web_sys::{
     HtmlElement,
     HtmlInputElement,
     HtmlSelectElement,
+    HtmlSpanElement,
     RequestInit,
     ServiceWorkerRegistration,
     //
@@ -594,6 +595,24 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
             for log_message in logs_current.iter() {
                 render_log_message(&log_message);
             }
+
+            let ongoing = sekirei5.get_ongoing_connections().await;
+
+            let _ = document
+                .get_element_by_id("ongoing")
+                .expect("#ongoing should exist")
+                .dyn_ref::<HtmlSpanElement>()
+                .unwrap()
+                .set_inner_html(&ongoing.to_string());
+
+            let connections = sekirei5.get_connections().await;
+
+            let _ = document
+                .get_element_by_id("connections")
+                .expect("#connections should exist")
+                .dyn_ref::<HtmlSpanElement>()
+                .unwrap()
+                .set_inner_html(&connections.to_string());
 
             async_std::task::sleep(Duration::from_millis(600)).await
         }

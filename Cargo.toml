@@ -84,6 +84,7 @@ web-sys = { version = "0.3.77", features = [
   'HtmlButtonElement',
   'HtmlElement',
   'HtmlInputElement',
+  'HtmlSpanElement',
   'HtmlParagraphElement',
   'HtmlSelectElement',
   'Location',

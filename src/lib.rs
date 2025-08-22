@@ -11,26 +11,24 @@ use std::num::NonZero;
 use std::sync::{Mutex, mpsc};
 use std::time::Duration;
 
+use rand::rngs::OsRng;
 use tar::Archive;
 
 use alloy::primitives::keccak256;
 
 use libp2p::{
-    PeerId,
-    StreamProtocol,
-    Swarm, // autonat,
+    PeerId, StreamProtocol, Swarm, autonat,
     core::Multiaddr,
     core::multiaddr::Protocol,
-    // dcutr,
+    dcutr,
     futures::{
         StreamExt,
         future::join_all, //
         join,
     },
-    // identify,
-    identity,
+    identify, identity,
     identity::{ecdsa, ecdsa::SecretKey},
-    // ping,
+    ping,
     swarm::{NetworkBehaviour, SwarmEvent},
     webrtc_websys,
 };
@@ -159,6 +157,8 @@ pub struct Sekirei {
         mpsc::Receiver<(String, mpsc::Sender<String>)>,
     ),
     network_id: Mutex<u64>,
+    ongoing_connections: Mutex<u64>,
+    connections: Mutex<u64>,
 }
 
 #[wasm_bindgen]
@@ -446,7 +446,7 @@ impl Sekirei {
         // tracing_wasm::set_as_global_default(); // uncomment to turn on tracing
         init_panic_hook();
 
-        let idle_duration = Duration::from_secs(3600);
+        let idle_duration = Duration::from_secs(12);
 
         // let body = Body::from_current_window()?;
         // body.append_p(&format!("Attempt to establish connection over websocket"))?;
@@ -466,9 +466,9 @@ impl Sekirei {
             .with_swarm_config(|_| {
                 libp2p::swarm::Config::with_wasm_executor()
                     .with_idle_connection_timeout(idle_duration)
-                    .with_max_negotiating_inbound_streams(NonZero::new(1000_usize).unwrap().into())
-                    .with_per_connection_event_buffer_size(1000_usize)
-                    .with_notify_handler_buffer_size(NonZero::new(1000_usize).unwrap().into())
+                    .with_max_negotiating_inbound_streams(NonZero::new(10000_usize).unwrap().into())
+                    .with_per_connection_event_buffer_size(10000_usize)
+                    .with_notify_handler_buffer_size(NonZero::new(10000_usize).unwrap().into())
             })
             .build();
 
@@ -513,6 +513,8 @@ impl Sekirei {
             upload_port: (u_out, u_in),
             bootnode_port: (b_out, b_in),
             network_id: Mutex::new(10_u64),
+            ongoing_connections: Mutex::new(0_u64),
+            connections: Mutex::new(0_u64),
         };
     }
 
@@ -530,6 +532,16 @@ impl Sekirei {
         }
 
         return logs;
+    }
+
+    pub async fn get_ongoing_connections(&self) -> u64 {
+        let ongoing = self.ongoing_connections.lock().unwrap();
+        return *ongoing;
+    }
+
+    pub async fn get_connections(&self) -> u64 {
+        let connected = self.connections.lock().unwrap();
+        return *connected;
     }
 
     pub async fn interface_log(&self, log0: String) {
@@ -569,27 +581,20 @@ impl Sekirei {
             mpsc::channel::<(Vec<u8>, bool, Vec<u8>, Vec<u8>, Vec<u8>)>();
 
         let ctrl;
+        let mut ctrl0;
+        let mut ctrl1;
         let mut incoming_pricing_streams;
         let mut incoming_gossip_streams;
 
         {
             let mut swarm = self.swarm.lock().unwrap();
             ctrl = swarm.behaviour_mut().stream.new_control();
-
-            incoming_pricing_streams = swarm
-                .behaviour_mut()
-                .stream
-                .new_control()
-                .accept(PRICING_PROTOCOL)
-                .unwrap();
-
-            incoming_gossip_streams = swarm
-                .behaviour_mut()
-                .stream
-                .new_control()
-                .accept(GOSSIP_PROTOCOL)
-                .unwrap();
+            ctrl0 = swarm.behaviour_mut().stream.new_control();
+            ctrl1 = swarm.behaviour_mut().stream.new_control();
         }
+
+        incoming_pricing_streams = ctrl0.accept(PRICING_PROTOCOL).unwrap();
+        incoming_gossip_streams = ctrl1.accept(GOSSIP_PROTOCOL).unwrap();
 
         let ctrl3 = ctrl.clone();
         let ctrl4 = ctrl.clone();
@@ -653,13 +658,6 @@ impl Sekirei {
                                             Protocol::Ip4(addr) => {
                                                 if addr != Ipv4Addr::new(127, 0, 0, 1) {
                                                     webrtc_direct = true;
-
-                                                    web_sys::console::log_1(&JsValue::from(
-                                                        format!(
-                                                            "Non localhost webrtc address found {:#?}",
-                                                            addr3
-                                                        ),
-                                                    ));
                                                 }
                                             }
                                             _ => continue,
@@ -776,6 +774,15 @@ impl Sekirei {
                                     let ol0 = hex::encode(connected_peers_map.get(&peer_id).unwrap().overlay.clone());
                                     if overlay_peers_map.contains_key(&ol0) {
                                         overlay_peers_map.remove(&ol0);
+                                        {
+                                           let mut connections = self.connections.lock().unwrap();
+                                            *connections = *connections - 1
+                                        }
+                                    } else {
+                                        {
+                                           let mut ongoing = self.ongoing_connections.lock().unwrap();
+                                            *ongoing = *ongoing - 1
+                                        }
                                     };
                                     connected_peers_map.remove(&peer_id);
                                     self.interface_log(format!("Disconnected from peer {}", &ol0)).await;
@@ -872,6 +879,8 @@ impl Sekirei {
 
                             web_sys::console::log_1(&JsValue::from(format!("INIT HANDSHAKE",)));
 
+                            async_std::task::sleep(Duration::from_millis(2000)).await; // stall
+
                             connection_handler(
                                 id,
                                 nid,
@@ -917,6 +926,9 @@ impl Sekirei {
                             {
                                 let mut connected_peers_map = wings.connected_peers.lock().unwrap();
                                 connected_peers_map.insert(peer_file.peer_id, peer_file);
+
+                                let mut ongoing = self.ongoing_connections.lock().unwrap();
+                                *ongoing = *ongoing + 1;
                             }
                         } else {
                             break;
@@ -937,9 +949,9 @@ impl Sekirei {
                             set_payment_threshold(accounting_peer_lock, amount);
                             {
                                 let bootnodes_set = wings.bootnodes.lock().unwrap();
-                                let connected_peers_map = wings.connected_peers.lock().unwrap();
                                 let ol: String;
                                 {
+                                    let connected_peers_map = wings.connected_peers.lock().unwrap();
                                     ol = hex::encode(
                                         connected_peers_map.get(&peer).unwrap().overlay.clone(),
                                     );
@@ -952,6 +964,14 @@ impl Sekirei {
                                 } else {
                                     self.interface_log(format!("Connected to bootnode {}", &ol))
                                         .await;
+                                }
+                                {
+                                    let mut connections = self.connections.lock().unwrap();
+                                    *connections = *connections + 1
+                                }
+                                {
+                                    let mut ongoing = self.ongoing_connections.lock().unwrap();
+                                    *ongoing = *ongoing - 1
                                 }
                             }
                         } else {
@@ -1413,29 +1433,29 @@ impl Sekirei {
 
 #[derive(NetworkBehaviour)]
 struct Behaviour {
-    //    autonat: autonat::v2::client::Behaviour,
-    //    autonat_s: autonat::v2::server::Behaviour,
-    //    dcutr: dcutr::Behaviour,
-    //    identify: identify::Behaviour,
-    // ping: ping::Behaviour,
+    autonat: autonat::v2::client::Behaviour,
+    autonat_s: autonat::v2::server::Behaviour,
+    dcutr: dcutr::Behaviour,
+    identify: identify::Behaviour,
+    ping: ping::Behaviour,
     stream: stream::Behaviour,
 }
 
 impl Behaviour {
-    fn new(_local_public_key: identity::PublicKey) -> Self {
+    fn new(local_public_key: identity::PublicKey) -> Self {
         Self {
-            //            autonat: autonat::v2::client::Behaviour::new(
-            //                OsRng,
-            //                autonat::v2::client::Config::default().with_probe_interval(Duration::from_secs(60)),
-            //            ),
-            //            autonat_s: autonat::v2::server::Behaviour::new(OsRng),
-            //            dcutr: dcutr::Behaviour::new(local_public_key.to_peer_id()),
-            // identify: identify::Behaviour::new(
-            //     identify::Config::new("/weeb-3".into(), local_public_key.clone())
-            //         .with_push_listen_addr_updates(true)
-            //         .with_interval(Duration::from_secs(10)), // .with_cache_size(10), //
-            // ),
-            // ping: ping::Behaviour::new(ping::Config::new().with_interval(Duration::from_secs(9))),
+            autonat: autonat::v2::client::Behaviour::new(
+                OsRng,
+                autonat::v2::client::Config::default().with_probe_interval(Duration::from_secs(60)),
+            ),
+            autonat_s: autonat::v2::server::Behaviour::new(OsRng),
+            dcutr: dcutr::Behaviour::new(local_public_key.to_peer_id()),
+            identify: identify::Behaviour::new(
+                identify::Config::new("/weeb-3".into(), local_public_key.clone())
+                    .with_push_listen_addr_updates(true)
+                    .with_interval(Duration::from_secs(30)), // .with_cache_size(10), //
+            ),
+            ping: ping::Behaviour::new(ping::Config::new().with_interval(Duration::from_secs(9))),
             stream: stream::Behaviour::new(),
         }
     }
