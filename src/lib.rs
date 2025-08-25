@@ -11,24 +11,28 @@ use std::num::NonZero;
 use std::sync::{Mutex, mpsc};
 use std::time::Duration;
 
-use rand::rngs::OsRng;
+// use rand::rngs::OsRng;
 use tar::Archive;
 
 use alloy::primitives::keccak256;
 
 use libp2p::{
-    PeerId, StreamProtocol, Swarm, autonat,
+    PeerId,
+    StreamProtocol,
+    Swarm,
+    // autonat,
     core::Multiaddr,
     core::multiaddr::Protocol,
-    dcutr,
+    // dcutr,
     futures::{
         StreamExt,
         future::join_all, //
         join,
     },
-    identify, identity,
+    // identify,
+    identity,
     identity::{ecdsa, ecdsa::SecretKey},
-    ping,
+    // ping,
     swarm::{NetworkBehaviour, SwarmEvent},
     webrtc_websys,
 };
@@ -446,7 +450,7 @@ impl Sekirei {
         // tracing_wasm::set_as_global_default(); // uncomment to turn on tracing
         init_panic_hook();
 
-        let idle_duration = Duration::from_secs(12);
+        let idle_duration = Duration::from_secs(3600);
 
         // let body = Body::from_current_window()?;
         // body.append_p(&format!("Attempt to establish connection over websocket"))?;
@@ -776,12 +780,16 @@ impl Sekirei {
                                         overlay_peers_map.remove(&ol0);
                                         {
                                            let mut connections = self.connections.lock().unwrap();
-                                            *connections = *connections - 1
+                                            if *connections > 0 {
+                                                *connections = *connections - 1
+                                            }
                                         }
                                     } else {
                                         {
                                            let mut ongoing = self.ongoing_connections.lock().unwrap();
-                                            *ongoing = *ongoing - 1
+                                            if *ongoing > 0 {
+                                                *ongoing = *ongoing - 1
+                                            }
                                         }
                                     };
                                     connected_peers_map.remove(&peer_id);
@@ -971,7 +979,9 @@ impl Sekirei {
                                 }
                                 {
                                     let mut ongoing = self.ongoing_connections.lock().unwrap();
-                                    *ongoing = *ongoing - 1
+                                    if *ongoing > 0 {
+                                        *ongoing = *ongoing - 1
+                                    }
                                 }
                             }
                         } else {
@@ -1433,29 +1443,29 @@ impl Sekirei {
 
 #[derive(NetworkBehaviour)]
 struct Behaviour {
-    autonat: autonat::v2::client::Behaviour,
-    autonat_s: autonat::v2::server::Behaviour,
-    dcutr: dcutr::Behaviour,
-    identify: identify::Behaviour,
-    ping: ping::Behaviour,
+    // autonat: autonat::v2::client::Behaviour,
+    // autonat_s: autonat::v2::server::Behaviour,
+    // dcutr: dcutr::Behaviour,
+    // identify: identify::Behaviour,
+    // ping: ping::Behaviour,
     stream: stream::Behaviour,
 }
 
 impl Behaviour {
-    fn new(local_public_key: identity::PublicKey) -> Self {
+    fn new(_local_public_key: identity::PublicKey) -> Self {
         Self {
-            autonat: autonat::v2::client::Behaviour::new(
-                OsRng,
-                autonat::v2::client::Config::default().with_probe_interval(Duration::from_secs(60)),
-            ),
-            autonat_s: autonat::v2::server::Behaviour::new(OsRng),
-            dcutr: dcutr::Behaviour::new(local_public_key.to_peer_id()),
-            identify: identify::Behaviour::new(
-                identify::Config::new("/weeb-3".into(), local_public_key.clone())
-                    .with_push_listen_addr_updates(true)
-                    .with_interval(Duration::from_secs(30)), // .with_cache_size(10), //
-            ),
-            ping: ping::Behaviour::new(ping::Config::new().with_interval(Duration::from_secs(9))),
+            // autonat: autonat::v2::client::Behaviour::new(
+            //     OsRng,
+            //     autonat::v2::client::Config::default().with_probe_interval(Duration::from_secs(60)),
+            // ),
+            // autonat_s: autonat::v2::server::Behaviour::new(OsRng),
+            // dcutr: dcutr::Behaviour::new(local_public_key.to_peer_id()),
+            // identify: identify::Behaviour::new(
+            //     identify::Config::new("/weeb-3".into(), local_public_key.clone())
+            //         .with_push_listen_addr_updates(true)
+            //         .with_interval(Duration::from_secs(30)), // .with_cache_size(10), //
+            // ),
+            // ping: ping::Behaviour::new(ping::Config::new().with_interval(Duration::from_secs(9))),
             stream: stream::Behaviour::new(),
         }
     }
