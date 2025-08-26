@@ -4,18 +4,12 @@ version = "0.0.0"
 edition = "2024"
 license = "MIT"
 
-[package.metadata.release]
-release = false
-
 [[bin]]
 name = "weebery"           # The name of the target.
 path = "src/main.rs"
 
 [lib]
 crate-type = ["cdylib"]
-
-[profile.release]
-debug = true
 
 [dependencies]
 anyhow = { git = "https://github.com/dtolnay/anyhow.git" }
@@ -39,6 +33,11 @@ tower-http = { git = "https://github.com/tower-rs/tower-http.git", features = ["
 mime_guess = { git = "https://github.com/abonander/mime_guess.git" }
 libp2p = { git = "https://github.com/libp2p/rust-libp2p.git", features = [ "ecdsa", "ed25519", "macros", "ping", "tokio"] }
 libp2p-webrtc = { git = "https://github.com/libp2p/rust-libp2p.git",  features = [ "tokio"] }
+
+[target.'cfg(target_arch = "wasm32")']
+rustflags = [
+  "-C", "link-args=-z stack-size=350000000",
+]
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 ethers = { git = "https://github.com/gakonst/ethers-rs.git" }

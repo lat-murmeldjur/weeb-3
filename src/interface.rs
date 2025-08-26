@@ -38,7 +38,7 @@ use crate::{
 
 #[wasm_bindgen]
 pub async fn interweeb(_st: String) -> Result<(), JsError> {
-    init_panic_hook();
+    //    init_panic_hook();
 
     let sekirei = Arc::new(Sekirei::new("".to_string()));
 

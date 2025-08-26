@@ -448,7 +448,7 @@ impl Sekirei {
 
     pub fn new(_st: String) -> Sekirei {
         // tracing_wasm::set_as_global_default(); // uncomment to turn on tracing
-        init_panic_hook();
+        // init_panic_hook();
 
         let idle_duration = Duration::from_secs(3600);
 
