@@ -1,4 +1,4 @@
-use crate::{Sekirei, decode_resources, init_panic_hook};
+use crate::{Sekirei, decode_resources};
 
 use std::str::FromStr;
 use std::time::Duration;
@@ -234,6 +234,7 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
                         //        bytes32 _nonce,
                         //        bool _immutable
                         //    ) external whenNotPaused returns (bytes32)
+
                         let result_lp: U256 = contract
                             .query("lastPrice", (), None, Options::default(), None)
                             .await

@@ -166,9 +166,10 @@ pub async fn retrieve_data(
         let mut i = 0;
         let mut content_holder_3: HashMap<usize, Vec<u8>> = HashMap::new();
         let mut content_holder_4: HashMap<usize, Vec<u8>> = HashMap::new();
+        let wave_size = 64;
 
         while !waves_done {
-            for j in 0..128 {
+            for j in 0..wave_size {
                 if i + j >= content_holder_2.len() {
                     waves_done = true;
                     break;
@@ -205,7 +206,7 @@ pub async fn retrieve_data(
                 }
             }
 
-            i = i + 128;
+            i = i + wave_size;
         }
 
         if !done {

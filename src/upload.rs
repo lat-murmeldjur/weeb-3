@@ -128,7 +128,14 @@ pub async fn upload_resource(
     batch_owner: Vec<u8>,
     batch_id: Vec<u8>,
     data_upload_chan: &mpsc::Sender<(Vec<u8>, u8, Vec<u8>, Vec<u8>, mpsc::Sender<Vec<u8>>)>,
-    chunk_upload_chan: &mpsc::Sender<(Vec<u8>, bool, Vec<u8>, Vec<u8>, Vec<u8>)>,
+    chunk_upload_chan: &mpsc::Sender<(
+        Vec<u8>,
+        bool,
+        Vec<u8>,
+        Vec<u8>,
+        Vec<u8>,
+        mpsc::Sender<bool>,
+    )>,
     chunk_retrieve_chan: &mpsc::Sender<(Vec<u8>, mpsc::Sender<Vec<u8>>)>,
 ) -> Vec<u8> {
     //
@@ -311,12 +318,15 @@ pub async fn upload_resource(
 
     let (soc_actual, soc_address) = make_soc(&soc_wrapped_content, owner_bytes_0, id_bytes).await;
 
+    let (result_chan_out, _result_chan_in) = mpsc::channel::<bool>();
+
     let _update_reference = chunk_upload_chan.send((
         soc_actual,
         true,
         soc_address,
         batch_owner.clone(),
         batch_id.clone(),
+        result_chan_out,
     ));
 
     return feed_reference;
@@ -376,7 +386,14 @@ pub async fn push_data(
     encryption: bool,
     batch_owner: Vec<u8>,
     batch_id: Vec<u8>,
-    chunk_upload_chan: &mpsc::Sender<(Vec<u8>, bool, Vec<u8>, Vec<u8>, Vec<u8>)>,
+    chunk_upload_chan: &mpsc::Sender<(
+        Vec<u8>,
+        bool,
+        Vec<u8>,
+        Vec<u8>,
+        Vec<u8>,
+        mpsc::Sender<bool>,
+    )>,
 ) -> Vec<u8> {
     let span_length = data.len();
 
@@ -392,12 +409,16 @@ pub async fn push_data(
         };
 
         let k = content_address(&data0);
+
+        let (result_chan_out, _result_chan_in) = mpsc::channel::<bool>();
+
         let _ = chunk_upload_chan.send((
             data0,
             false,
             k.clone(),
             batch_owner.clone(),
             batch_id.clone(),
+            result_chan_out,
         ));
 
         // web_sys::console::log_1(&JsValue::from(format!(
@@ -420,6 +441,8 @@ pub async fn push_data(
         let address_fit = 4096 / address_length;
         let next_level = true;
         let mut span_carriage = 4096;
+
+        let (result_chan_out, result_chan_in) = mpsc::channel::<bool>();
 
         while next_level {
             levels.push(Vec::new());
@@ -450,9 +473,20 @@ pub async fn push_data(
 
             for i in 0..chunk_l0c {
                 count_yield += 1;
-                if count_yield > 128 {
-                    async_std::task::yield_now().await;
-                    async_std::task::sleep(Duration::from_millis(50)).await;
+                if count_yield > 64 {
+                    let mut k = 0;
+
+                    // relax push chunk channel
+
+                    while k < 64 {
+                        let kresult = result_chan_in.try_recv();
+                        if !kresult.is_err() {
+                            k += 1
+                        } else {
+                            async_std::task::sleep(Duration::from_millis(50)).await;
+                        }
+                    }
+
                     count_yield = 0;
                 }
 
@@ -513,6 +547,7 @@ pub async fn push_data(
                         cha,
                         batch_owner.clone(),
                         batch_id.clone(),
+                        result_chan_out.clone(),
                     ));
                 }
             }

@@ -1,7 +1,5 @@
 #![cfg(target_arch = "wasm32")]
 
-use console_error_panic_hook;
-
 use async_std::sync::Arc;
 
 use std::collections::{HashMap, HashSet};
@@ -123,10 +121,10 @@ const PROTOCOL_ROUND_TIME: f64 = 600.0;
 const EVENT_LOOP_INTERRUPTOR: f64 = 600.0;
 const PROTO_LOOP_INTERRUPTOR: f64 = 600.0;
 
-#[wasm_bindgen]
-pub fn init_panic_hook() {
-    console_error_panic_hook::set_once();
-}
+// #[wasm_bindgen]
+// pub fn init_panic_hook() {
+//     console_error_panic_hook::set_once();
+// }
 
 #[wasm_bindgen]
 pub struct Sekirei {
@@ -450,7 +448,7 @@ impl Sekirei {
         // tracing_wasm::set_as_global_default(); // uncomment to turn on tracing
         // init_panic_hook();
 
-        let idle_duration = Duration::from_secs(3600);
+        let idle_duration = Duration::from_secs(360000);
 
         // let body = Body::from_current_window()?;
         // body.append_p(&format!("Attempt to establish connection over websocket"))?;
@@ -554,7 +552,7 @@ impl Sekirei {
     }
 
     pub async fn run(&self, _st: String) -> () {
-        init_panic_hook();
+        // init_panic_hook();
 
         let wings = self.wings.lock().unwrap();
 
@@ -582,7 +580,7 @@ impl Sekirei {
             mpsc::channel::<(Vec<u8>, u8, Vec<u8>, Vec<u8>, mpsc::Sender<Vec<u8>>)>();
 
         let (chunk_upload_chan_outgoing, chunk_upload_chan_incoming) =
-            mpsc::channel::<(Vec<u8>, bool, Vec<u8>, Vec<u8>, Vec<u8>)>();
+            mpsc::channel::<(Vec<u8>, bool, Vec<u8>, Vec<u8>, Vec<u8>, mpsc::Sender<bool>)>();
 
         let ctrl;
         let mut ctrl0;
@@ -966,21 +964,35 @@ impl Sekirei {
                                 }
                                 if !bootnodes_set.contains(&peer.to_string()) {
                                     let mut overlay_peers_map = wings.overlay_peers.lock().unwrap();
-                                    self.interface_log(format!("Connected to peer {}", &ol))
-                                        .await;
-                                    overlay_peers_map.insert(ol, peer);
+                                    if !overlay_peers_map.contains_key(&ol.to_string()) {
+                                        self.interface_log(format!("Connected to peer {}", &ol))
+                                            .await;
+                                        overlay_peers_map.insert(ol, peer);
+                                        {
+                                            let mut connections = self.connections.lock().unwrap();
+                                            *connections = *connections + 1
+                                        }
+                                        {
+                                            let mut ongoing =
+                                                self.ongoing_connections.lock().unwrap();
+                                            if *ongoing > 0 {
+                                                *ongoing = *ongoing - 1
+                                            }
+                                        }
+                                    }
                                 } else {
                                     self.interface_log(format!("Connected to bootnode {}", &ol))
                                         .await;
-                                }
-                                {
-                                    let mut connections = self.connections.lock().unwrap();
-                                    *connections = *connections + 1
-                                }
-                                {
-                                    let mut ongoing = self.ongoing_connections.lock().unwrap();
-                                    if *ongoing > 0 {
-                                        *ongoing = *ongoing - 1
+
+                                    {
+                                        let mut connections = self.connections.lock().unwrap();
+                                        *connections = *connections + 1
+                                    }
+                                    {
+                                        let mut ongoing = self.ongoing_connections.lock().unwrap();
+                                        if *ongoing > 0 {
+                                            *ongoing = *ongoing - 1
+                                        }
                                     }
                                 }
                             }
@@ -1286,11 +1298,11 @@ impl Sekirei {
                 let mut request_joiner = Vec::new();
 
                 #[allow(irrefutable_let_patterns)]
-                for _i in 0..128 {
+                for _i in 0..64 {
                     let incoming_request = chunk_upload_chan_incoming.try_recv();
                     if !incoming_request.is_err() {
                         let handle = async {
-                            let (d, soc, checkad, batch_owner, batch_id) =
+                            let (d, soc, checkad, batch_owner, batch_id, feedback) =
                                 incoming_request.unwrap();
 
                             let ctrl9 = ctrl8.clone();
@@ -1318,6 +1330,8 @@ impl Sekirei {
                                     hex::encode(&checkad)
                                 )));
                             }
+
+                            let _ = feedback.send(true);
                             //
                             //                            let data_available = retrieve_chunk(
                             //                                &checkad,
@@ -1376,7 +1390,7 @@ impl Sekirei {
                 let mut request_joiner = Vec::new();
 
                 #[allow(irrefutable_let_patterns)]
-                for _i in 0..1024 {
+                for _i in 0..64 {
                     let incoming_request = chunk_retrieve_chan_incoming.try_recv();
                     if !incoming_request.is_err() {
                         let handle = async {

@@ -146,7 +146,8 @@ pub async fn pricing_handler(
     chan: &mpsc::Sender<(PeerId, u64)>,
 ) -> io::Result<()> {
     web_sys::console::log_1(&JsValue::from(format!(
-        "Opened Pricing handle 2 for peer !",
+        "Opened pricing handle for peer {}!",
+        peer
     )));
 
     let mut buf_nondiscard_0 = Vec::new();
@@ -209,13 +210,14 @@ pub async fn pricing_handler(
 }
 
 pub async fn gossip_handler(
-    _peer: PeerId,
+    peer: PeerId,
     mut stream: Stream,
     chan: &mpsc::Sender<etiquette_2::BzzAddress>,
 ) -> io::Result<()> {
-    web_sys::console::log_1(&JsValue::from(
-        format!("Opened Gossip Handle 2 for peer !",),
-    ));
+    web_sys::console::log_1(&JsValue::from(format!(
+        "Opened gossip handle for peer {}!",
+        peer
+    )));
 
     let mut buf_nondiscard_0 = Vec::new();
     let mut buf_discard_0: [u8; 255] = [0; 255];
@@ -264,7 +266,7 @@ pub async fn gossip_handler(
 
     for peer in rec_0.peers {
         web_sys::console::log_1(&JsValue::from(format!(
-            "Got Peer {:#?}!",
+            "Got gossip of peer {:#?}!",
             hex::encode(&peer.overlay)
         )));
         chan.send(peer).unwrap();
@@ -434,21 +436,16 @@ pub async fn connection_handler(
         }
     };
 
-    web_sys::console::log_1(&JsValue::from(format!("INITIAL HANDSHAKE STREAM OPEN",)));
-
     if let Err(e) = ceive(peer, network_id, stream, a.clone(), &pk.clone(), chan).await {
         web_sys::console::log_1(&JsValue::from("Handshake protocol failed"));
         web_sys::console::log_1(&JsValue::from(format!("{}", e)));
         return false;
     }
 
-    web_sys::console::log_1(&JsValue::from(
-        format!("INITIAL HANDSHAKE STREAM COMPLETE",),
-    ));
-
-    web_sys::console::log_1(&JsValue::from(format!("{} Handshake complete!", peer)));
-
-    web_sys::console::log_1(&JsValue::from(format!("Closing handler 1")));
+    web_sys::console::log_1(&JsValue::from(format!(
+        "Handshake complete for peer: {}!",
+        peer
+    )));
 
     return true;
 }
@@ -515,10 +512,6 @@ pub async fn pushsync_handler(
     control: stream::Control,
     chan: &mpsc::Sender<(Vec<u8>, Vec<u8>, Vec<u8>)>,
 ) {
-    web_sys::console::log_1(&JsValue::from(format!(
-        "Opened Pushsync Handle 1 for peer !",
-    )));
-
     let stream = match control.clone().open_stream(peer, PUSHSYNC_PROTOCOL).await {
         Ok(stream) => stream,
         Err(error @ stream::OpenStreamError::UnsupportedProtocol(_)) => {
@@ -545,11 +538,6 @@ pub async fn pushsync_handler(
         web_sys::console::log_1(&JsValue::from(format!("{}", e)));
         return;
     }
-
-    web_sys::console::log_1(&JsValue::from(format!(
-        "Pushsync complete for peer {}!",
-        peer
-    )));
 }
 
 pub async fn sync(
@@ -560,10 +548,6 @@ pub async fn sync(
     mut stream: Stream,
     chan: &mpsc::Sender<(Vec<u8>, Vec<u8>, Vec<u8>)>,
 ) -> io::Result<()> {
-    web_sys::console::log_1(&JsValue::from(format!(
-        "Opened Pushsync Handle 2 for peer !",
-    )));
-
     let empty = etiquette_0::Headers::default();
     let mut buf_empty = Vec::new();
 
@@ -592,8 +576,6 @@ pub async fn sync(
 
     let bufw_1 = step_1.encode_length_delimited_to_vec();
 
-    web_sys::console::log_1(&JsValue::from(format!("3marker {}", bufw_1.len())));
-
     let mut i = 0;
     loop {
         let mut j = i + 255;
@@ -618,9 +600,7 @@ pub async fn sync(
         }
     }
 
-    web_sys::console::log_1(&JsValue::from(format!("marker in protocol 1!")));
     let _ = stream.close().await;
-    web_sys::console::log_1(&JsValue::from(format!("marker in protocol 2!")));
 
     let rec_0_u = etiquette_7::Receipt::decode_length_delimited(&mut Cursor::new(buf_nondiscard_0));
 

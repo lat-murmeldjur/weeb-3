@@ -20,7 +20,7 @@ pub fn set_payment_threshold(a: &Mutex<PeerAccounting>, amount: u64) {
 
 pub fn reserve(a: &Mutex<PeerAccounting>, amount: u64, chan: &mpsc::Sender<(PeerId, u64)>) -> bool {
     let mut account = a.lock().unwrap();
-    if account.balance > REFRESH_RATE && account.refreshment + 1000.0 < Date::now() {
+    if account.balance >= REFRESH_RATE && account.refreshment + 1000.0 < Date::now() {
         // start refreshing
         let _ = chan.send((account.id.clone(), account.threshold));
     }
