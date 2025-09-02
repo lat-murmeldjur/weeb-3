@@ -36,7 +36,7 @@ use libp2p::{
 };
 use libp2p_stream as stream;
 
-use js_sys::{Date, Uint8Array};
+use js_sys::Date;
 use wasm_bindgen::{JsValue, prelude::*};
 use web_sys::File;
 
@@ -117,11 +117,11 @@ const PUSHSYNC_PROTOCOL: StreamProtocol = StreamProtocol::new("/swarm/pushsync/1
 // const PULL_PROTOCOL: StreamProtocol = StreamProtocol::new("/swarm/pullsync/1.4.0/pullsync");
 // const PUSH_PROTOCOL: StreamProtocol = StreamProtocol::new("/swarm/pushsync/1.3.0/pushsync");
 
-const PROTOCOL_ROUND_TIME: f64 = 600.0;
-const EVENT_LOOP_INTERRUPTOR: f64 = 600.0;
-const PROTO_LOOP_INTERRUPTOR: f64 = 600.0;
+const PROTOCOL_ROUND_TIME: f64 = 340.0;
+const EVENT_LOOP_INTERRUPTOR: f64 = 70.0;
+const PROTO_LOOP_INTERRUPTOR: f64 = 70.0;
 
-// #[wasm_bindgen]
+//
 // pub fn init_panic_hook() {
 //     console_error_panic_hook::set_once();
 // }
@@ -138,7 +138,7 @@ pub struct Sekirei {
     ),
     upload_port: (
         mpsc::Sender<(
-            Vec<(String, String, String, Vec<u8>)>,
+            Vec<Resource>,
             bool,
             String,
             bool,
@@ -146,7 +146,7 @@ pub struct Sekirei {
             mpsc::Sender<Vec<u8>>,
         )>,
         mpsc::Receiver<(
-            Vec<(String, String, String, Vec<u8>)>,
+            Vec<Resource>,
             bool,
             String,
             bool,
@@ -237,8 +237,6 @@ impl Sekirei {
         add_to_feed: bool,
         feed_topic: String,
     ) -> Vec<u8> {
-        web_sys::console::log_1(&JsValue::from(format!("File size {}", file.size())));
-
         let (chan_out, chan_in) = mpsc::channel::<Vec<u8>>();
 
         let f_name = file.name();
@@ -248,17 +246,7 @@ impl Sekirei {
             false => f_type0,
         };
 
-        web_sys::console::log_1(&JsValue::from(format!("File type {}", f_type)));
-
-        let mut fvec0: Vec<(String, String, String, Vec<u8>)> = vec![];
-
-        let content_buf = wasm_bindgen_futures::JsFuture::from(file.array_buffer())
-            .await
-            .unwrap();
-
-        let content_u8a = Uint8Array::new(&content_buf);
-
-        let content: Vec<u8> = content_u8a.to_vec();
+        let mut fvec0: Vec<Resource> = vec![];
 
         let mut index_document = "".to_string();
 
@@ -270,7 +258,13 @@ impl Sekirei {
                 false => index_string,
             };
 
-            let mut archive = Archive::new(&content[..]);
+            let content0: Vec<u8> = read_file(file)
+                .await
+                .into_iter() // Take ownership of the outer vector and its inner vectors
+                .flat_map(|inner_vec| inner_vec.into_iter()) // Flatten by iterating over each inner_vec
+                .collect();
+
+            let mut archive = Archive::new(&content0[..]);
 
             for f0 in archive.entries().unwrap() {
                 let mut f01 = match f0 {
@@ -302,13 +296,6 @@ impl Sekirei {
                         _ => continue,
                     };
 
-                    web_sys::console::log_1(&JsValue::from(format!("File size {}", f01.size())));
-                    web_sys::console::log_1(&JsValue::from(format!("File path {}", f0path)));
-                    web_sys::console::log_1(&JsValue::from(format!(
-                        "Entry type file: {}",
-                        entry_type_file0
-                    )));
-
                     let mime0 = match mime_guess::from_path(&f0path).first_raw() {
                         Some(aok) => match aok.to_string().starts_with("text/") {
                             true => aok.to_string() + "; charset=utf-8",
@@ -321,13 +308,23 @@ impl Sekirei {
 
                     let _ = f01.read_to_end(&mut data0);
 
-                    web_sys::console::log_1(&JsValue::from(format!("File size {}", data0.len())));
-
-                    fvec0.push((f0path, fname0, mime0, data0))
+                    fvec0.push(Resource {
+                        path0: f0path,
+                        filename0: fname0,
+                        mime0: mime0,
+                        data: vec![data0],
+                        data_address: vec![],
+                    })
                 }
             }
         } else {
-            fvec0.push((f_name.clone(), f_name, f_type, content));
+            fvec0.push(Resource {
+                path0: f_name.clone(),
+                filename0: f_name,
+                mime0: f_type,
+                data: read_file(file).await,
+                data_address: vec![],
+            });
         }
 
         let topic_safe = match hex::decode(&feed_topic) {
@@ -427,10 +424,9 @@ impl Sekirei {
     }
 
     pub async fn reset_stamp(&self) -> Vec<u8> {
-        reset_stamp(
-            &"9210cb16c79cc4a8cefa2c3f32920271fdb3d00cb929503c0f2456ac62af1321".to_string(),
-        )
-        .await;
+        let batch_id = get_batch_id().await;
+
+        reset_stamp(&hex::encode(&batch_id).to_string()).await;
 
         return encode_resources(
             vec![(
@@ -447,8 +443,6 @@ impl Sekirei {
     pub fn new(_st: String) -> Sekirei {
         // tracing_wasm::set_as_global_default(); // uncomment to turn on tracing
         // init_panic_hook();
-
-        let idle_duration = Duration::from_secs(360000);
 
         // let body = Body::from_current_window()?;
         // body.append_p(&format!("Attempt to establish connection over websocket"))?;
@@ -467,7 +461,7 @@ impl Sekirei {
             .unwrap()
             .with_swarm_config(|_| {
                 libp2p::swarm::Config::with_wasm_executor()
-                    .with_idle_connection_timeout(idle_duration)
+                    .with_idle_connection_timeout(Duration::from_secs(36000000))
                     .with_max_negotiating_inbound_streams(NonZero::new(10000_usize).unwrap().into())
                     .with_per_connection_event_buffer_size(10000_usize)
                     .with_notify_handler_buffer_size(NonZero::new(10000_usize).unwrap().into())
@@ -490,7 +484,7 @@ impl Sekirei {
         let (log_port_out, log_port_in) = mpsc::channel::<String>();
 
         let (u_out, u_in) = mpsc::channel::<(
-            Vec<(String, String, String, Vec<u8>)>,
+            Vec<Resource>,
             bool,
             String,
             bool,
@@ -546,7 +540,7 @@ impl Sekirei {
         return *connected;
     }
 
-    pub async fn interface_log(&self, log0: String) {
+    pub fn interface_log(&self, log0: String) {
         let _ = self.log_port.0.send(log0.to_string());
         web_sys::console::log_1(&JsValue::from(log0));
     }
@@ -577,49 +571,42 @@ impl Sekirei {
             mpsc::channel::<(Vec<u8>, mpsc::Sender<Vec<u8>>)>();
 
         let (data_upload_chan_outgoing, data_upload_chan_incoming) =
-            mpsc::channel::<(Vec<u8>, u8, Vec<u8>, Vec<u8>, mpsc::Sender<Vec<u8>>)>();
+            mpsc::channel::<(Vec<Vec<u8>>, u8, Vec<u8>, Vec<u8>, mpsc::Sender<Vec<u8>>)>();
 
         let (chunk_upload_chan_outgoing, chunk_upload_chan_incoming) =
             mpsc::channel::<(Vec<u8>, bool, Vec<u8>, Vec<u8>, Vec<u8>, mpsc::Sender<bool>)>();
 
-        let ctrl;
         let mut ctrl0;
         let mut ctrl1;
+        let ctrl3;
+        let ctrl4;
+        let ctrl6;
+        let ctrl8;
         let mut incoming_pricing_streams;
         let mut incoming_gossip_streams;
 
         {
             let mut swarm = self.swarm.lock().unwrap();
-            ctrl = swarm.behaviour_mut().stream.new_control();
             ctrl0 = swarm.behaviour_mut().stream.new_control();
             ctrl1 = swarm.behaviour_mut().stream.new_control();
+            ctrl3 = swarm.behaviour_mut().stream.new_control();
+            ctrl4 = swarm.behaviour_mut().stream.new_control();
+            ctrl6 = swarm.behaviour_mut().stream.new_control();
+            ctrl8 = swarm.behaviour_mut().stream.new_control();
         }
 
         incoming_pricing_streams = ctrl0.accept(PRICING_PROTOCOL).unwrap();
         incoming_gossip_streams = ctrl1.accept(GOSSIP_PROTOCOL).unwrap();
 
-        let ctrl3 = ctrl.clone();
-        let ctrl4 = ctrl.clone();
-        let ctrl6 = ctrl.clone();
-        let ctrl8 = ctrl.clone();
-
         let pricing_inbound_handle = async move {
-            web_sys::console::log_1(&JsValue::from(format!("Opened Pricing handler 1")));
             while let Some((peer, stream)) = incoming_pricing_streams.next().await {
-                web_sys::console::log_1(&JsValue::from(format!("Entered Pricing handler 1")));
-                pricing_handler(peer, stream, &pricing_chan_outgoing.clone())
-                    .await
-                    .unwrap();
+                pricing_handler(peer, stream, &pricing_chan_outgoing.clone()).await;
             }
         };
 
         let gossip_inbound_handle = async move {
-            web_sys::console::log_1(&JsValue::from(format!("Opened Gossip handler 1")));
             while let Some((peer, stream)) = incoming_gossip_streams.next().await {
-                web_sys::console::log_1(&JsValue::from(format!("Entered Gossip handler 1")));
-                gossip_handler(peer, stream, &peers_instructions_chan_outgoing.clone())
-                    .await
-                    .unwrap();
+                gossip_handler(peer, stream, &peers_instructions_chan_outgoing.clone()).await;
             }
         };
 
@@ -695,7 +682,6 @@ impl Sekirei {
                                 paddr5.underlay = addr3.to_vec();
 
                                 let _ = connections_instructions_chan_outgoing
-                                    .clone()
                                     .send((paddr5.clone(), false));
                             }
                         }
@@ -743,7 +729,6 @@ impl Sekirei {
                             paddr5.underlay = addr4.to_vec();
 
                             let _ = connections_instructions_chan_outgoing
-                                .clone()
                                 .send((paddr5.clone(), false));
                         }
                     } else {
@@ -758,6 +743,10 @@ impl Sekirei {
                 .await;
 
                 // self.interface_log(format!("Current Event Handled {:#?}", event)).await;
+                // web_sys::console::log_1(&JsValue::from(format!(
+                //     "Current Event Handled {:#?}",
+                //     event
+                // )));
 
                 if !event.is_err() {
                     match event.unwrap() {
@@ -791,7 +780,7 @@ impl Sekirei {
                                         }
                                     };
                                     connected_peers_map.remove(&peer_id);
-                                    self.interface_log(format!("Disconnected from peer {}", &ol0)).await;
+                                    self.interface_log(format!("Disconnected from peer {}", &ol0));
                                 };
                             }
                             let mut accounting = wings.accounting_peers.lock().unwrap();
@@ -801,6 +790,7 @@ impl Sekirei {
                         }
                         _ => {}
                     }
+                } else {
                 }
 
                 #[allow(irrefutable_let_patterns)]
@@ -846,9 +836,7 @@ impl Sekirei {
 
                         bzzaddr.underlay = addr33.to_vec();
 
-                        let _ = connections_instructions_chan_outgoing
-                            .clone()
-                            .send((bzzaddr, true));
+                        let _ = connections_instructions_chan_outgoing.send((bzzaddr, true));
                     } else {
                         break;
                     }
@@ -883,8 +871,6 @@ impl Sekirei {
                                 bootnodes_set.insert(id.to_string());
                             }
 
-                            web_sys::console::log_1(&JsValue::from(format!("INIT HANDSHAKE",)));
-
                             async_std::task::sleep(Duration::from_millis(2000)).await; // stall
 
                             connection_handler(
@@ -908,14 +894,10 @@ impl Sekirei {
                         if !incoming_peer.is_err() {
                             // Accounting connect
                             let peer_file: PeerFile = incoming_peer.unwrap();
-                            let ol = hex::encode(peer_file.overlay.clone());
+                            // let ol = hex::encode(peer_file.overlay.clone());
                             {
                                 let mut accounting = wings.accounting_peers.lock().unwrap();
                                 if !accounting.contains_key(&peer_file.peer_id) {
-                                    web_sys::console::log_1(&JsValue::from(format!(
-                                        "Accounting Connecting Peer {:#?} {:#?}!",
-                                        ol, peer_file.peer_id
-                                    )));
                                     accounting.insert(
                                         peer_file.peer_id,
                                         Mutex::new(PeerAccounting {
@@ -965,8 +947,7 @@ impl Sekirei {
                                 if !bootnodes_set.contains(&peer.to_string()) {
                                     let mut overlay_peers_map = wings.overlay_peers.lock().unwrap();
                                     if !overlay_peers_map.contains_key(&ol.to_string()) {
-                                        self.interface_log(format!("Connected to peer {}", &ol))
-                                            .await;
+                                        self.interface_log(format!("Connected to peer {}", &ol));
                                         overlay_peers_map.insert(ol, peer);
                                         {
                                             let mut connections = self.connections.lock().unwrap();
@@ -981,8 +962,7 @@ impl Sekirei {
                                         }
                                     }
                                 } else {
-                                    self.interface_log(format!("Connected to bootnode {}", &ol))
-                                        .await;
+                                    self.interface_log(format!("Connected to bootnode {}", &ol));
 
                                     {
                                         let mut connections = self.connections.lock().unwrap();
@@ -997,6 +977,7 @@ impl Sekirei {
                                 }
                             }
                         } else {
+                            let _ = pt_in;
                             break;
                         }
                     }
@@ -1017,7 +998,7 @@ impl Sekirei {
                             }
                             #[allow(unused_assignments)]
                             let mut daten = Date::now();
-                            let datenow = Date::now();
+                            let datenow = daten;
                             {
                                 let accounting = wings.accounting_peers.lock().unwrap();
                                 let accounting_peer_lock = match accounting.get(&peer) {
@@ -1046,6 +1027,7 @@ impl Sekirei {
                                 refresh_joiner.push(handle);
                             }
                         } else {
+                            let _ = re_out;
                             break;
                         }
                     }
@@ -1058,7 +1040,7 @@ impl Sekirei {
                     while let re_in = refreshment_chan_incoming.try_recv() {
                         if !re_in.is_err() {
                             let (peer, amount) = re_in.unwrap();
-                            {
+                            if amount > 0 {
                                 let accounting = wings.accounting_peers.lock().unwrap();
                                 let accounting_peer_lock = match accounting.get(&peer) {
                                     Some(aok) => aok,
@@ -1071,6 +1053,7 @@ impl Sekirei {
                                 map.remove(&peer);
                             }
                         } else {
+                            let _ = re_in;
                             break;
                         }
                     }
@@ -1107,7 +1090,7 @@ impl Sekirei {
                 while let incoming_request = self.message_port.1.try_recv() {
                     if !incoming_request.is_err() {
                         let (n, chan) = incoming_request.unwrap();
-                        web_sys::console::log_1(&JsValue::from(format!("marker 30")));
+
                         let _ = chan.send(
                             retrieve_resource(
                                 &n,
@@ -1139,35 +1122,27 @@ impl Sekirei {
                 #[allow(irrefutable_let_patterns)]
                 while let incoming_request = self.upload_port.1.try_recv() {
                     if !incoming_request.is_err() {
-                        web_sys::console::log_1(&JsValue::from(format!("push triggered")));
                         let (file0, enc, index, feed, topic, chan) = incoming_request.unwrap();
 
                         let batch_owner = get_batch_owner_key().await;
                         let batch_id = get_batch_id().await;
 
                         if batch_owner.len() == 0 {
+                            self.interface_log("No batch found for uploads".to_string());
+
                             chan.send(vec![]).unwrap();
                             continue;
                         }
 
                         if batch_id.len() == 0 {
+                            self.interface_log("No batchId found for uploads".to_string());
+
                             chan.send(vec![]).unwrap();
                             continue;
                         }
 
-                        let mut res0: Vec<Resource> = vec![];
-                        for f in file0 {
-                            res0.push(Resource {
-                                path0: f.0,
-                                filename0: f.1,
-                                mime0: f.2,
-                                data: f.3,
-                                data_address: vec![],
-                            })
-                        }
-
                         let push_reference = upload_resource(
-                            res0,
+                            file0,
                             enc,
                             index,
                             "404.html".to_string(),
@@ -1249,7 +1224,6 @@ impl Sekirei {
                 while let incoming_request = data_upload_chan_incoming.try_recv() {
                     if !incoming_request.is_err() {
                         let handle = async {
-                            web_sys::console::log_1(&JsValue::from(format!("push triggered")));
                             let (n, mode, batch_owner, batch_id, chan) = incoming_request.unwrap();
 
                             let encrypted_data = match mode {
@@ -1265,10 +1239,6 @@ impl Sekirei {
                                 &chunk_upload_chan_outgoing.clone(),
                             )
                             .await;
-                            web_sys::console::log_1(&JsValue::from(format!(
-                                "Writing response to encrypted : {} push data request",
-                                encrypted_data
-                            )));
 
                             chan.send(data_reference).unwrap();
                         };
@@ -1295,57 +1265,48 @@ impl Sekirei {
         let push_chunk_handle = async {
             let mut timelast = Date::now();
             loop {
-                let mut request_joiner = Vec::new();
+                let mut request_joiner = vec![];
 
                 #[allow(irrefutable_let_patterns)]
-                for _i in 0..64 {
+                for _i in 0..4096 {
                     let incoming_request = chunk_upload_chan_incoming.try_recv();
                     if !incoming_request.is_err() {
                         let handle = async {
                             let (d, soc, checkad, batch_owner, batch_id, feedback) =
                                 incoming_request.unwrap();
 
-                            let ctrl9 = ctrl8.clone();
+                            let batch_bucket_limit = 128_u32;
 
-                            let batch_bucket_limit = 64_u32;
-
-                            let data_reference = push_chunk(
-                                &d,
+                            let _ = push_chunk(
+                                d,
                                 soc,
                                 checkad.clone(),
-                                batch_owner.clone(),
-                                batch_id.clone(),
+                                batch_owner,
+                                batch_id,
                                 batch_bucket_limit,
-                                ctrl9.clone(),
+                                ctrl8.clone(),
                                 &wings.overlay_peers.clone(),
                                 &wings.accounting_peers.clone(),
                                 &refreshment_instructions_chan_outgoing.clone(),
                             )
                             .await;
 
-                            if hex::encode(&data_reference) != hex::encode(&checkad) {
-                                web_sys::console::log_1(&JsValue::from(format!(
-                                    "CH_AD mismatch {} {}",
-                                    hex::encode(&data_reference),
-                                    hex::encode(&checkad)
-                                )));
-                            }
-
                             let _ = feedback.send(true);
+
                             //
                             //                            let data_available = retrieve_chunk(
                             //                                &checkad,
                             //                                ctrl9.clone()z,
                             //                                &wings.overlay_peers.clone(),
                             //                                &wings.accounting_peers.clone(),
-                            //                                &refreshment_instructions_chan_outgoing.clone(),
+                            //                                &refreshment_instructions_chan_outgoing,
                             //                            )
                             //                            .await;
                             //
                             //                            if data_available.len() == 0 {
                             //                                web_sys::console::log_1(&JsValue::from(format!("CH_AD miss")));
                             //
-                            //                                let _ = chunk_upload_chan_outgoing.clone().send((
+                            //                                let _ = chunk_upload_chan_outgoing.send((
                             //                                    d.clone(),
                             //                                    soc,
                             //                                    checkad.clone(),
@@ -1361,13 +1322,14 @@ impl Sekirei {
                 }
 
                 if request_joiner.len() > 0 {
-                    web_sys::console::log_1(&JsValue::from(format!(
-                        "making {} pushsync requests",
+                    self.interface_log(format!(
+                        "Making {} pushsync requests",
                         request_joiner.len()
-                    )));
+                    ));
                 }
 
                 join_all(request_joiner).await;
+
                 // while let Some(()) = request_joiner.next().await {
                 //     web_sys::console::log_1(&JsValue::from(format!("push chunk completed")));
                 // }
@@ -1390,7 +1352,7 @@ impl Sekirei {
                 let mut request_joiner = Vec::new();
 
                 #[allow(irrefutable_let_patterns)]
-                for _i in 0..64 {
+                for _i in 0..4096 {
                     let incoming_request = chunk_retrieve_chan_incoming.try_recv();
                     if !incoming_request.is_err() {
                         let handle = async {
@@ -1416,10 +1378,10 @@ impl Sekirei {
                 }
 
                 if request_joiner.len() > 0 {
-                    web_sys::console::log_1(&JsValue::from(format!(
-                        "making ({}) chunk retrieval requests",
+                    self.interface_log(format!(
+                        "Making ({}) chunk retrieval requests",
                         request_joiner.len()
-                    )));
+                    ));
                 }
 
                 join_all(request_joiner).await;

@@ -137,11 +137,6 @@ pub fn valid_cac(chunk_content: &Vec<u8>, address: &Vec<u8>) -> bool {
         return true;
     }
 
-    web_sys::console::log_1(&JsValue::from(format!(
-        "Chunk non content addressed {:?}!",
-        hex::encode(address),
-    )));
-
     return false;
     //
 }
@@ -224,7 +219,6 @@ pub fn valid_soc(chunk_content: &Vec<u8>, address: &Vec<u8>) -> bool {
             return false;
         }
     };
-    web_sys::console::log_1(&JsValue::from(format!("soc owner: {}", hex::encode(owner))));
 
     let address_constructed = keccak256([soc_address, owner.as_slice().to_vec()].concat()).to_vec();
 
@@ -285,11 +279,6 @@ pub fn encode_resources(data_array: Vec<(Vec<u8>, String, String)>, indx: String
 pub fn decode_resources(encoded_data: Vec<u8>) -> (Vec<(Vec<u8>, String, String)>, String) {
     let mut output: Vec<(Vec<u8>, String, String)> = vec![];
     let mut ind = "".to_string();
-
-    web_sys::console::log_1(&JsValue::from(format!(
-        "encoded_data_len: {:#?} ",
-        encoded_data.len()
-    )));
 
     if encoded_data.len() < 8 {
         return (vec![], ind);
@@ -360,4 +349,68 @@ pub fn decode_resources(encoded_data: Vec<u8>) -> (Vec<(Vec<u8>, String, String)
         output.push((data, string0, string1));
     }
     (output, ind)
+}
+
+pub async fn read_file(file: web_sys::File) -> Vec<Vec<u8>> {
+    let fils = file.size();
+    let partition_size = 99999744.0_f64;
+
+    if fils <= partition_size {
+        let content_buf = wasm_bindgen_futures::JsFuture::from(file.array_buffer())
+            .await
+            .unwrap();
+
+        let content_u8a = js_sys::Uint8Array::new(&content_buf);
+
+        return vec![content_u8a.to_vec()];
+    } else {
+        let mut content: Vec<Vec<u8>> = vec![];
+
+        let mut start = 0.0_f64;
+        let mut end = partition_size;
+        let mut going = true;
+
+        while going {
+            let content_slice = file.slice_with_f64_and_f64(start, end);
+
+            let content_buf = match content_slice {
+                Ok(b) => wasm_bindgen_futures::JsFuture::from(b.array_buffer())
+                    .await
+                    .unwrap(),
+                Err(v) => {
+                    web_sys::console::log_1(&JsValue::from(format!(
+                        "Failed to turn content slice into array buffer: {:#?}",
+                        v
+                    )));
+                    return vec![];
+                }
+            };
+
+            let content_u8a = js_sys::Uint8Array::new(&content_buf);
+
+            let slice = content_u8a.to_vec();
+
+            web_sys::console::log_1(&JsValue::from(format!(
+                "Slice start: {} end: {} length: {} from filesize: {}",
+                start,
+                end,
+                slice.len(),
+                fils,
+            )));
+            content.push(slice);
+
+            start = end;
+            end += partition_size;
+
+            if end >= fils {
+                end = fils;
+            }
+
+            if start >= fils {
+                going = false;
+            }
+        }
+
+        return content;
+    }
 }

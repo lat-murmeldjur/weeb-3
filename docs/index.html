@@ -22,7 +22,7 @@
                 <label>Swarm Bootnode Multiaddress</label>
             </div>
             <div>
-                <input type="text" id="bootNodeMASettings" value="/ip4/192.168.100.148/udp/1634/webrtc-direct/certhash/uEiD2pxHc8egNQ4Nb8xnPBnqU2g484MAyfS6PW92rc7ejRQ/p2p/QmUc5v7G7ZV9xbuKR7q6LCJ6tJNUvc1GoyPcuTaGXQGJsd" size="90">
+                <input type="text" id="bootNodeMASettings" value="/192.168.100.148/udp/1634/webrtc-direct/certhash/uEiDUFQ2nVQPZyaXZJ0s4WL9-toVwEgkWDarKhtUeUt6QjA/p2p/QmNQzrHeoQT1QbFfZYKhfLqEvyFfRSuocTSMKBSNrcetsJ" size="90">
             </div>
             <div>
                 <label>Swarm Network Id</label>
@@ -81,6 +81,19 @@
             </div>
         </div>
         <script type="module" defer>
+            async function requestPersistentStorage() {
+                if (navigator.storage && navigator.storage.persist) {
+                    const isPersisted = await navigator.storage.persist();
+                    console.log(`Persistent storage granted: ${isPersisted}`);
+                    return isPersisted;
+                } else {
+                    console.warn("StorageManager API or persist() not supported.");
+                    return false;
+                }
+            }
+        
+            requestPersistentStorage();
+
             import init, { interweeb } from "./weeb_3.js"
             await init();
             interweeb(""); 

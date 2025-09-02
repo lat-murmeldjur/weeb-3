@@ -1,6 +1,5 @@
 // #![allow(warnings)]
 #![cfg(target_arch = "wasm32")]
-
 use std::sync::Mutex;
 use std::sync::mpsc;
 
@@ -43,10 +42,12 @@ pub fn apply_credit(a: &Mutex<PeerAccounting>, amount: u64) {
 
 pub fn apply_refreshment(a: &Mutex<PeerAccounting>, amount: u64) {
     let mut account = a.lock().unwrap();
+    account.refreshment = Date::now();
     if account.balance > amount {
         account.balance -= amount;
         return;
     }
+
     account.balance = 0;
 }
 

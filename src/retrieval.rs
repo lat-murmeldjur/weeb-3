@@ -59,7 +59,7 @@ pub async fn retrieve_resource(
     data_retrieve_chan: &mpsc::Sender<(Vec<u8>, mpsc::Sender<Vec<u8>>)>,
     chunk_retrieve_chan: &mpsc::Sender<(Vec<u8>, mpsc::Sender<Vec<u8>>)>,
 ) -> Vec<u8> {
-    let cd = get_data(chunk_address.to_vec(), data_retrieve_chan).await;
+    let cd = get_data(chunk_address.to_vec(), &data_retrieve_chan).await;
 
     let mut data_vector_e: Vec<(Vec<u8>, String, String)> = vec![];
 
@@ -67,8 +67,13 @@ pub async fn retrieve_resource(
     let mut index: String = "".to_string();
 
     {
-        let (data_vector, index0) =
-            interpret_manifest("".to_string(), &cd, data_retrieve_chan, chunk_retrieve_chan).await;
+        let (data_vector, index0) = interpret_manifest(
+            "".to_string(),
+            &cd,
+            &data_retrieve_chan,
+            &chunk_retrieve_chan,
+        )
+        .await;
 
         index = index0;
 
@@ -103,7 +108,7 @@ pub async fn retrieve_data(
     data_address: &Vec<u8>,
     chunk_retrieve_chan: &mpsc::Sender<(Vec<u8>, mpsc::Sender<Vec<u8>>)>,
 ) -> Vec<u8> {
-    let root_chunk = get_chunk(data_address.to_vec(), chunk_retrieve_chan).await;
+    let root_chunk = get_chunk(data_address.to_vec(), &chunk_retrieve_chan).await;
 
     #[allow(unused_assignments)]
     let mut root_span: u64 = 0;
@@ -166,7 +171,7 @@ pub async fn retrieve_data(
         let mut i = 0;
         let mut content_holder_3: HashMap<usize, Vec<u8>> = HashMap::new();
         let mut content_holder_4: HashMap<usize, Vec<u8>> = HashMap::new();
-        let wave_size = 64;
+        let wave_size = 2048;
 
         while !waves_done {
             for j in 0..wave_size {
@@ -177,9 +182,10 @@ pub async fn retrieve_data(
 
                 let addr = &content_holder_2[i + j];
                 let index = i + j;
+
                 let handle = async move {
                     return (
-                        get_chunk(addr.clone(), chunk_retrieve_chan).await,
+                        get_chunk(addr.clone(), &chunk_retrieve_chan).await,
                         index.clone(),
                         addr.clone(),
                     );
@@ -372,7 +378,7 @@ pub async fn retrieve_chunk(
                 };
                 if accounting_peers.contains_key(&closest_peer_id) {
                     let accounting_peer = accounting_peers.get(&closest_peer_id).unwrap();
-                    let allowed = reserve(accounting_peer, req_price, refresh_chan);
+                    let allowed = reserve(accounting_peer, req_price, &refresh_chan);
                     if !allowed {
                         overdraftlist.insert(closest_peer_id);
                     } else {
@@ -650,7 +656,10 @@ pub async fn seek_latest_feed_update(
             let j = lower_bound + i;
             let feed_update_address = get_feed_address(&owner, &topic, j);
             let handle = async move {
-                return (get_chunk(feed_update_address, chunk_retrieve_chan).await, j);
+                return (
+                    get_chunk(feed_update_address, &chunk_retrieve_chan).await,
+                    j,
+                );
             };
             joiner.push(handle);
 
@@ -677,7 +686,7 @@ pub async fn seek_latest_feed_update(
         if largest_found + 1 == smallest_not_found {
             return get_chunk(
                 get_feed_address(&owner, &topic, largest_found),
-                chunk_retrieve_chan,
+                &chunk_retrieve_chan,
             )
             .await;
         }
@@ -737,7 +746,10 @@ pub async fn seek_next_feed_update_index(
             let j = lower_bound + i;
             let feed_update_address = get_feed_address(&owner, &topic, j);
             let handle = async move {
-                return (get_chunk(feed_update_address, chunk_retrieve_chan).await, j);
+                return (
+                    get_chunk(feed_update_address, &chunk_retrieve_chan).await,
+                    j,
+                );
             };
             joiner.push(handle);
 

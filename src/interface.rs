@@ -478,6 +478,8 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
                         Err(_) => "".to_string(),
                     };
 
+                    web_sys::console::log_1(&JsValue::from(format!("IF Upload Marker 0")));
+
                     let result = sekirei00
                         .post_upload(
                             file,
@@ -487,6 +489,8 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
                             feed_topic,
                         )
                         .await;
+
+                    web_sys::console::log_1(&JsValue::from(format!("IF Upload Marker 1")));
 
                     let (data, indx) = decode_resources(result);
 
@@ -587,8 +591,6 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
             .dyn_ref::<HtmlButtonElement>()
             .expect("#uploadResetStamp should be a HtmlButtonElement")
             .set_onclick(Some(callback5.as_ref().unchecked_ref()));
-
-        render_log_message(&format!("Created a new client from wasm"));
 
         loop {
             #[allow(irrefutable_let_patterns)]

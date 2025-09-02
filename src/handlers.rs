@@ -6,7 +6,6 @@ use byteorder::ByteOrder;
 use num::{BigUint, ToPrimitive};
 use prost::Message;
 
-use std::io;
 use std::io::Cursor;
 use std::sync::mpsc;
 
@@ -42,7 +41,7 @@ pub async fn ceive(
     a: libp2p::core::Multiaddr,
     pk: &ecdsa::SecretKey,
     chan: &mpsc::Sender<PeerFile>,
-) -> io::Result<()> {
+) -> bool {
     let mut step_0 = etiquette_1::Syn::default();
 
     step_0.observed_underlay = a.clone().to_vec();
@@ -54,13 +53,23 @@ pub async fn ceive(
     bufw_0.reserve(step_0_len + prost::length_delimiter_len(step_0_len));
     step_0.encode_length_delimited(&mut bufw_0).unwrap();
 
-    stream.write_all(&bufw_0).await?;
+    match stream.write_all(&bufw_0).await {
+        Ok(_) => {}
+        Err(_) => {
+            return false;
+        }
+    };
     let _ = stream.flush().await;
 
     let mut buf_nondiscard_0 = Vec::new();
     let mut buf_discard_0: [u8; 255] = [0; 255];
     loop {
-        let n = stream.read(&mut buf_discard_0).await?;
+        let n = match stream.read(&mut buf_discard_0).await {
+            Ok(a) => a,
+            Err(_) => {
+                return false;
+            }
+        };
         buf_nondiscard_0.extend_from_slice(&buf_discard_0[..n]);
         if n < 255 {
             break;
@@ -72,8 +81,7 @@ pub async fn ceive(
     let rec_0 = match rec_0_u {
         Ok(x) => x,
         Err(_x) => {
-            let _ = stream.close().await;
-            return Ok(());
+            return false;
         }
     };
 
@@ -125,7 +133,12 @@ pub async fn ceive(
 
     bufw_1.reserve(step_1_len + prost::length_delimiter_len(step_1_len));
     step_1.encode_length_delimited(&mut bufw_1).unwrap();
-    stream.write_all(&bufw_1).await?;
+    match stream.write_all(&bufw_1).await {
+        Ok(_) => {}
+        Err(_) => {
+            return false;
+        }
+    };
     let _ = stream.flush().await;
 
     let _ = stream.close().await;
@@ -137,14 +150,10 @@ pub async fn ceive(
     })
     .unwrap();
 
-    Ok(())
+    return true;
 }
 
-pub async fn pricing_handler(
-    peer: PeerId,
-    mut stream: Stream,
-    chan: &mpsc::Sender<(PeerId, u64)>,
-) -> io::Result<()> {
+pub async fn pricing_handler(peer: PeerId, mut stream: Stream, chan: &mpsc::Sender<(PeerId, u64)>) {
     web_sys::console::log_1(&JsValue::from(format!(
         "Opened pricing handle for peer {}!",
         peer
@@ -153,7 +162,12 @@ pub async fn pricing_handler(
     let mut buf_nondiscard_0 = Vec::new();
     let mut buf_discard_0: [u8; 255] = [0; 255];
     loop {
-        let n = stream.read(&mut buf_discard_0).await?;
+        let n = match stream.read(&mut buf_discard_0).await {
+            Ok(a) => a,
+            Err(_) => {
+                return;
+            }
+        };
         buf_nondiscard_0.extend_from_slice(&buf_discard_0[..n]);
         if n < 255 {
             break;
@@ -168,13 +182,23 @@ pub async fn pricing_handler(
     buf_empty.reserve(empty_len + prost::length_delimiter_len(empty_len));
     empty.encode_length_delimited(&mut buf_empty).unwrap();
 
-    stream.write_all(&buf_empty).await?;
+    match stream.write_all(&buf_empty).await {
+        Ok(_) => {}
+        Err(_) => {
+            return;
+        }
+    };
     let _ = stream.flush().await;
 
     let mut buf_nondiscard_0 = Vec::new();
     let mut buf_discard_0: [u8; 255] = [0; 255];
     loop {
-        let n = stream.read(&mut buf_discard_0).await?;
+        let n = match stream.read(&mut buf_discard_0).await {
+            Ok(a) => a,
+            Err(_) => {
+                return;
+            }
+        };
         buf_nondiscard_0.extend_from_slice(&buf_discard_0[..n]);
         if n < 255 {
             break;
@@ -191,7 +215,7 @@ pub async fn pricing_handler(
         Ok(x) => x,
         Err(_x) => {
             web_sys::console::log_1(&JsValue::from(format!("Error in protocol {:#?}!", _x)));
-            return Ok(());
+            return;
         }
     };
 
@@ -205,15 +229,13 @@ pub async fn pricing_handler(
         .unwrap();
 
     let _ = chan.send((peer, pt));
-
-    Ok(())
 }
 
 pub async fn gossip_handler(
     peer: PeerId,
     mut stream: Stream,
     chan: &mpsc::Sender<etiquette_2::BzzAddress>,
-) -> io::Result<()> {
+) {
     web_sys::console::log_1(&JsValue::from(format!(
         "Opened gossip handle for peer {}!",
         peer
@@ -222,7 +244,12 @@ pub async fn gossip_handler(
     let mut buf_nondiscard_0 = Vec::new();
     let mut buf_discard_0: [u8; 255] = [0; 255];
     loop {
-        let n = stream.read(&mut buf_discard_0).await?;
+        let n = match stream.read(&mut buf_discard_0).await {
+            Ok(a) => a,
+            Err(_) => {
+                return;
+            }
+        };
         buf_nondiscard_0.extend_from_slice(&buf_discard_0[..n]);
         if n < 255 {
             break;
@@ -237,13 +264,23 @@ pub async fn gossip_handler(
     buf_empty.reserve(empty_len + prost::length_delimiter_len(empty_len));
     empty.encode_length_delimited(&mut buf_empty).unwrap();
 
-    stream.write_all(&buf_empty).await?;
+    match stream.write_all(&buf_empty).await {
+        Ok(_) => {}
+        Err(_) => {
+            return;
+        }
+    };
     let _ = stream.flush().await;
 
     let mut buf_nondiscard_0 = Vec::new();
     let mut buf_discard_0: [u8; 255] = [0; 255];
     loop {
-        let n = stream.read(&mut buf_discard_0).await?;
+        let n = match stream.read(&mut buf_discard_0).await {
+            Ok(a) => a,
+            Err(_) => {
+                return;
+            }
+        };
         buf_nondiscard_0.extend_from_slice(&buf_discard_0[..n]);
         if n < 255 {
             break;
@@ -258,21 +295,19 @@ pub async fn gossip_handler(
         Ok(x) => x,
         Err(x) => {
             web_sys::console::log_1(&JsValue::from(format!("Error in protocol {:#?}!", x)));
-            return Ok(());
+            return;
         }
     };
 
     // web_sys::console::log_1(&JsValue::from(format!("Got Peers Message {:#?}!", rec_0)));
 
     for peer in rec_0.peers {
-        web_sys::console::log_1(&JsValue::from(format!(
-            "Got gossip of peer {:#?}!",
-            hex::encode(&peer.overlay)
-        )));
+        // web_sys::console::log_1(&JsValue::from(format!(
+        //     "Got gossip of peer {:#?}!",
+        //     hex::encode(&peer.overlay)
+        // )));
         chan.send(peer).unwrap();
     }
-
-    Ok(())
 }
 
 pub async fn fresh(
@@ -280,7 +315,7 @@ pub async fn fresh(
     amount: u64,
     mut stream: Stream,
     chan: &mpsc::Sender<(PeerId, u64)>,
-) -> io::Result<()> {
+) {
     let empty = etiquette_0::Headers::default();
 
     let mut buf_empty = Vec::new();
@@ -289,13 +324,25 @@ pub async fn fresh(
     buf_empty.reserve(empty_len + prost::length_delimiter_len(empty_len));
     empty.encode_length_delimited(&mut buf_empty).unwrap();
 
-    stream.write_all(&buf_empty).await?;
+    match stream.write_all(&buf_empty).await {
+        Ok(_) => {}
+        Err(_) => {
+            chan.send((peer, 0)).unwrap();
+            return;
+        }
+    };
     let _ = stream.flush().await;
 
     let mut buf_nondiscard_0 = Vec::new();
     let mut buf_discard_0: [u8; 255] = [0; 255];
     loop {
-        let n = stream.read(&mut buf_discard_0).await?;
+        let n = match stream.read(&mut buf_discard_0).await {
+            Ok(a) => a,
+            Err(_) => {
+                chan.send((peer, 0)).unwrap();
+                return;
+            }
+        };
         buf_nondiscard_0.extend_from_slice(&buf_discard_0[..n]);
         if n < 255 {
             break;
@@ -312,13 +359,25 @@ pub async fn fresh(
 
     bufw_1.reserve(step_1_len + prost::length_delimiter_len(step_1_len));
     step_1.encode_length_delimited(&mut bufw_1).unwrap();
-    stream.write_all(&bufw_1).await?;
+    match stream.write_all(&bufw_1).await {
+        Ok(_) => {}
+        Err(_) => {
+            chan.send((peer, 0)).unwrap();
+            return;
+        }
+    };
     let _ = stream.flush().await;
 
     let mut buf_nondiscard_0 = Vec::new();
     let mut buf_discard_0: [u8; 255] = [0; 255];
     loop {
-        let n = stream.read(&mut buf_discard_0).await?;
+        let n = match stream.read(&mut buf_discard_0).await {
+            Ok(a) => a,
+            Err(_) => {
+                chan.send((peer, 0)).unwrap();
+                return;
+            }
+        };
         buf_nondiscard_0.extend_from_slice(&buf_discard_0[..n]);
         if n < 255 {
             break;
@@ -332,8 +391,9 @@ pub async fn fresh(
     let rec_0 = match rec_0_u {
         Ok(x) => x,
         Err(x) => {
+            chan.send((peer, 0)).unwrap();
             web_sys::console::log_1(&JsValue::from(format!("Error in protocol {:#?}!", x)));
-            return Ok(());
+            return;
         }
     };
 
@@ -341,9 +401,9 @@ pub async fn fresh(
 
     if amount > 0 {
         chan.send((peer, refr_am)).unwrap();
+    } else {
+        chan.send((peer, 0)).unwrap();
     }
-
-    Ok(())
 }
 
 pub async fn trieve(
@@ -351,7 +411,7 @@ pub async fn trieve(
     chunk_address: Vec<u8>,
     mut stream: Stream,
     chan: &mpsc::Sender<Vec<u8>>,
-) -> io::Result<()> {
+) {
     let empty = etiquette_0::Headers::default();
 
     let mut buf_empty = Vec::new();
@@ -360,13 +420,23 @@ pub async fn trieve(
     buf_empty.reserve(empty_len + prost::length_delimiter_len(empty_len));
     empty.encode_length_delimited(&mut buf_empty).unwrap();
 
-    stream.write_all(&buf_empty).await?;
+    match stream.write_all(&buf_empty).await {
+        Ok(_) => {}
+        Err(_) => {
+            return;
+        }
+    };
     let _ = stream.flush().await;
 
     let mut buf_nondiscard_0 = Vec::new();
     let mut buf_discard_0: [u8; 255] = [0; 255];
     loop {
-        let n = stream.read(&mut buf_discard_0).await?;
+        let n = match stream.read(&mut buf_discard_0).await {
+            Ok(a) => a,
+            Err(_) => {
+                return;
+            }
+        };
         buf_nondiscard_0.extend_from_slice(&buf_discard_0[..n]);
         if n < 255 {
             break;
@@ -383,13 +453,23 @@ pub async fn trieve(
 
     bufw_1.reserve(step_1_len + prost::length_delimiter_len(step_1_len));
     step_1.encode_length_delimited(&mut bufw_1).unwrap();
-    stream.write_all(&bufw_1).await?;
+    match stream.write_all(&bufw_1).await {
+        Ok(_) => {}
+        Err(_) => {
+            return;
+        }
+    };
     let _ = stream.flush().await;
 
     let mut buf_nondiscard_0 = Vec::new();
     let mut buf_discard_0: [u8; 255] = [0; 255];
     loop {
-        let n = stream.read(&mut buf_discard_0).await?;
+        let n = match stream.read(&mut buf_discard_0).await {
+            Ok(a) => a,
+            Err(_) => {
+                return;
+            }
+        };
         buf_nondiscard_0.extend_from_slice(&buf_discard_0[..n]);
         if n < 255 {
             break;
@@ -405,15 +485,15 @@ pub async fn trieve(
         Ok(x) => x,
         Err(x) => {
             web_sys::console::log_1(&JsValue::from(format!("Error in protocol {:#?}!", x)));
-            return Ok(());
+            {
+                return;
+            };
         }
     };
 
     let rec_1 = rec_0.data;
 
     chan.send(rec_1).unwrap();
-
-    Ok(())
 }
 
 pub async fn connection_handler(
@@ -436,9 +516,8 @@ pub async fn connection_handler(
         }
     };
 
-    if let Err(e) = ceive(peer, network_id, stream, a.clone(), &pk.clone(), chan).await {
+    if !ceive(peer, network_id, stream, a.clone(), &pk.clone(), chan).await {
         web_sys::console::log_1(&JsValue::from("Handshake protocol failed"));
-        web_sys::console::log_1(&JsValue::from(format!("{}", e)));
         return false;
     }
 
@@ -464,19 +543,17 @@ pub async fn refresh_handler(
         Ok(stream) => stream,
         Err(error @ stream::OpenStreamError::UnsupportedProtocol(_)) => {
             web_sys::console::log_1(&JsValue::from(format!("{} {}", peer, error)));
+            chan.send((peer, 0)).unwrap();
             return;
         }
         Err(error) => {
             web_sys::console::log_1(&JsValue::from(format!("{} {}", peer, error)));
+            chan.send((peer, 0)).unwrap();
             return;
         }
     };
 
-    if let Err(e) = fresh(peer, amount, stream, chan).await {
-        web_sys::console::log_1(&JsValue::from("Refresh protocol failed"));
-        web_sys::console::log_1(&JsValue::from(format!("{}", e)));
-        return;
-    }
+    fresh(peer, amount, stream, chan).await;
 }
 
 pub async fn retrieve_handler(
@@ -497,20 +574,16 @@ pub async fn retrieve_handler(
         }
     };
 
-    if let Err(e) = trieve(peer, chunk_address, stream, chan).await {
-        web_sys::console::log_1(&JsValue::from("Retrieve protocol failed"));
-        web_sys::console::log_1(&JsValue::from(format!("{}", e)));
-        return;
-    }
+    trieve(peer, chunk_address, stream, chan).await;
 }
 
 pub async fn pushsync_handler(
     peer: PeerId,
-    chunk_address: Vec<u8>,
-    chunk_content: Vec<u8>,
-    chunk_stamp: Vec<u8>,
+    chunk_address: &Vec<u8>,
+    chunk_content: &Vec<u8>,
+    chunk_stamp: &Vec<u8>,
     control: stream::Control,
-    chan: &mpsc::Sender<(Vec<u8>, Vec<u8>, Vec<u8>)>,
+    chan: &mpsc::Sender<bool>,
 ) {
     let stream = match control.clone().open_stream(peer, PUSHSYNC_PROTOCOL).await {
         Ok(stream) => stream,
@@ -524,7 +597,7 @@ pub async fn pushsync_handler(
         }
     };
 
-    if let Err(e) = sync(
+    sync(
         peer,
         chunk_address,
         chunk_content,
@@ -532,22 +605,17 @@ pub async fn pushsync_handler(
         stream,
         chan,
     )
-    .await
-    {
-        web_sys::console::log_1(&JsValue::from("Pushsync protocol failed"));
-        web_sys::console::log_1(&JsValue::from(format!("{}", e)));
-        return;
-    }
+    .await;
 }
 
 pub async fn sync(
     _peer: PeerId,
-    chunk_address: Vec<u8>,
-    chunk_content: Vec<u8>,
-    chunk_stamp: Vec<u8>,
+    chunk_address: &Vec<u8>,
+    chunk_content: &Vec<u8>,
+    chunk_stamp: &Vec<u8>,
     mut stream: Stream,
-    chan: &mpsc::Sender<(Vec<u8>, Vec<u8>, Vec<u8>)>,
-) -> io::Result<()> {
+    chan: &mpsc::Sender<bool>,
+) {
     let empty = etiquette_0::Headers::default();
     let mut buf_empty = Vec::new();
 
@@ -555,13 +623,25 @@ pub async fn sync(
     buf_empty.reserve(empty_len + prost::length_delimiter_len(empty_len));
     empty.encode_length_delimited(&mut buf_empty).unwrap();
 
-    stream.write_all(&buf_empty).await?;
+    match stream.write_all(&buf_empty).await {
+        Ok(_) => {}
+        Err(_) => {
+            chan.send(false).unwrap();
+            return;
+        }
+    };
     let _ = stream.flush().await;
 
     let mut buf_nondiscard_0 = Vec::new();
     let mut buf_discard_0: [u8; 255] = [0; 255];
     loop {
-        let n = stream.read(&mut buf_discard_0).await?;
+        let n = match stream.read(&mut buf_discard_0).await {
+            Ok(a) => a,
+            Err(_) => {
+                chan.send(false).unwrap();
+                return;
+            }
+        };
         buf_nondiscard_0.extend_from_slice(&buf_discard_0[..n]);
         if n < 255 {
             break;
@@ -570,9 +650,9 @@ pub async fn sync(
 
     let mut step_1 = etiquette_7::Delivery::default();
 
-    step_1.address = chunk_address;
-    step_1.data = chunk_content;
-    step_1.stamp = chunk_stamp;
+    step_1.address = chunk_address.to_vec();
+    step_1.data = chunk_content.to_vec();
+    step_1.stamp = chunk_stamp.to_vec();
 
     let bufw_1 = step_1.encode_length_delimited_to_vec();
 
@@ -582,7 +662,13 @@ pub async fn sync(
         if j > bufw_1.len() {
             j = bufw_1.len();
         };
-        stream.write(&bufw_1[i..j].to_vec()).await?;
+        match stream.write(&bufw_1[i..j].to_vec()).await {
+            Ok(_) => {}
+            Err(_) => {
+                chan.send(false).unwrap();
+                return;
+            }
+        };
         let _ = stream.flush().await;
         i = i + 255;
         if j == bufw_1.len() {
@@ -593,7 +679,13 @@ pub async fn sync(
     let mut buf_nondiscard_0 = Vec::new();
     let mut buf_discard_0: [u8; 255] = [0; 255];
     loop {
-        let n = stream.read(&mut buf_discard_0).await?;
+        let n = match stream.read(&mut buf_discard_0).await {
+            Ok(a) => a,
+            Err(_) => {
+                chan.send(false).unwrap();
+                return;
+            }
+        };
         buf_nondiscard_0.extend_from_slice(&buf_discard_0[..n]);
         if n < 255 {
             break;
@@ -604,23 +696,21 @@ pub async fn sync(
 
     let rec_0_u = etiquette_7::Receipt::decode_length_delimited(&mut Cursor::new(buf_nondiscard_0));
 
-    let rec_0 = match rec_0_u {
+    let _rec_0 = match rec_0_u {
         Ok(x) => x,
         Err(x) => {
             web_sys::console::log_1(&JsValue::from(format!("Error in protocol {:#?}!", x)));
-            return Ok(());
+            chan.send(false).unwrap();
+            return;
         }
     };
 
-    web_sys::console::log_1(&JsValue::from(format!(
-        "Got receipt {:#?} with err {} from peer {}!",
-        hex::encode(&rec_0.address),
-        rec_0.err,
-        _peer
-    )));
+    //    web_sys::console::log_1(&JsValue::from(format!(
+    //        "Got receipt {:#?} with err {} from peer {}!",
+    //        hex::encode(&rec_0.address),
+    //        rec_0.err,
+    //        _peer
+    //    )));
 
-    chan.send((rec_0.address, rec_0.signature, rec_0.nonce))
-        .unwrap();
-
-    Ok(())
+    chan.send(true).unwrap();
 }

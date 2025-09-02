@@ -30,7 +30,7 @@ pub async fn create_manifest(
     errordoc: String,
     batch_owner: Vec<u8>,
     batch_id: Vec<u8>,
-    data_upload_chan: &mpsc::Sender<(Vec<u8>, u8, Vec<u8>, Vec<u8>, mpsc::Sender<Vec<u8>>)>,
+    data_upload_chan: &mpsc::Sender<(Vec<Vec<u8>>, u8, Vec<u8>, Vec<u8>, mpsc::Sender<Vec<u8>>)>,
 ) -> Vec<u8> {
     let mut fncutoff = first_node_cutoff;
 
@@ -218,7 +218,7 @@ pub async fn create_manifest(
                 .await;
 
                 current_data_reference = upload_data(
-                    tip_mf,
+                    vec![tip_mf],
                     encrypted,
                     batch_owner.clone(),
                     batch_id.clone(),
@@ -260,7 +260,7 @@ pub async fn create_manifest(
                         .await;
 
                         current_data_reference = upload_data(
-                            current_manifest,
+                            vec![current_manifest],
                             encrypted,
                             batch_owner.clone(),
                             batch_id.clone(),
@@ -301,7 +301,7 @@ pub async fn create_manifest(
                 fncutoff = 0;
 
                 let group_data_reference = upload_data(
-                    group_manifest,
+                    vec![group_manifest],
                     encrypted,
                     batch_owner.clone(),
                     batch_id.clone(),
@@ -338,7 +338,7 @@ pub async fn create_manifest(
         }
 
         let stub_reference = upload_data(
-            create_stub(stub_ref_size, obfuscated).await,
+            vec![create_stub(stub_ref_size, obfuscated).await],
             encrypted,
             batch_owner.clone(),
             batch_id.clone(),

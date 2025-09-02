@@ -12,6 +12,8 @@ use crate::{
     //                                                                        //
     Mutex,
     //                                                                        //
+    PROTO_LOOP_INTERRUPTOR,
+    //                                                                        //
     PROTOCOL_ROUND_TIME,
     //                                                                        //
     PeerAccounting,
@@ -74,12 +76,10 @@ pub async fn stamp_chunk(
     index = index0;
 
     if index > batch_bucket_limit {
-        web_sys::console::log_1(&JsValue::from(format!("Stamp bucket overuse")));
         return vec![];
     };
 
     if !h {
-        web_sys::console::log_1(&JsValue::from(format!("Stamp bucket use fail")));
         return vec![];
     };
 
@@ -114,7 +114,7 @@ pub struct Resource {
     pub path0: String,
     pub filename0: String,
     pub mime0: String,
-    pub data: Vec<u8>,
+    pub data: Vec<Vec<u8>>,
     pub data_address: Vec<u8>,
 }
 
@@ -127,7 +127,7 @@ pub async fn upload_resource(
     topic: String,
     batch_owner: Vec<u8>,
     batch_id: Vec<u8>,
-    data_upload_chan: &mpsc::Sender<(Vec<u8>, u8, Vec<u8>, Vec<u8>, mpsc::Sender<Vec<u8>>)>,
+    data_upload_chan: &mpsc::Sender<(Vec<Vec<u8>>, u8, Vec<u8>, Vec<u8>, mpsc::Sender<Vec<u8>>)>,
     chunk_upload_chan: &mpsc::Sender<(
         Vec<u8>,
         bool,
@@ -146,11 +146,11 @@ pub async fn upload_resource(
 
         // upload core file
         let core_reference = upload_data(
-            r0.data.to_vec(),
+            r0.data,
             encryption,
             batch_owner.clone(),
             batch_id.clone(),
-            &data_upload_chan.clone(),
+            &data_upload_chan,
         )
         .await;
 
@@ -189,18 +189,18 @@ pub async fn upload_resource(
         errordoc, // errordoc
         batch_owner.clone(),
         batch_id.clone(),
-        &data_upload_chan.clone(),
+        &data_upload_chan,
     )
     .await;
 
     let core_manifest0 = core_manifest.clone();
 
     let manifest_reference = upload_data(
-        core_manifest,
+        vec![core_manifest],
         encryption,
         batch_owner.clone(),
         batch_id.clone(),
-        &data_upload_chan.clone(),
+        &data_upload_chan,
     )
     .await;
 
@@ -239,11 +239,11 @@ pub async fn upload_resource(
     }
 
     let stub_reference = upload_data(
-        create_stub(stub_ref_size, encryption).await,
+        vec![create_stub(stub_ref_size, encryption).await],
         encryption,
         batch_owner.clone(),
         batch_id.clone(),
-        &data_upload_chan.clone(),
+        &data_upload_chan,
     )
     .await;
 
@@ -261,23 +261,23 @@ pub async fn upload_resource(
         "".to_string(), // errordoc
         batch_owner.clone(),
         batch_id.clone(),
-        &data_upload_chan.clone(),
+        &data_upload_chan,
     )
     .await;
 
     let feed_reference = upload_data(
-        feed_manifest,
+        vec![feed_manifest],
         encryption,
         batch_owner.clone(),
         batch_id.clone(),
-        &data_upload_chan.clone(),
+        &data_upload_chan,
     )
     .await;
 
     let index_up = seek_next_feed_update_index(
         hex::encode(&feed_owner),
         topic.clone(),
-        &chunk_retrieve_chan.clone(),
+        &chunk_retrieve_chan,
         8,
     )
     .await;
@@ -292,8 +292,7 @@ pub async fn upload_resource(
     } else {
         let mut uploaded = false;
         while !uploaded {
-            let crown_chunk =
-                get_chunk(manifest_reference.clone(), &chunk_retrieve_chan.clone()).await;
+            let crown_chunk = get_chunk(manifest_reference.clone(), &chunk_retrieve_chan).await;
             if crown_chunk.len() > 0 {
                 wrapped_content = crown_chunk[8..].to_vec();
                 uploaded = true;
@@ -333,11 +332,11 @@ pub async fn upload_resource(
 }
 
 pub async fn upload_data(
-    data: Vec<u8>,
+    data: Vec<Vec<u8>>,
     enc: bool,
     batch_owner: Vec<u8>,
     batch_id: Vec<u8>,
-    data_upload_chan: &mpsc::Sender<(Vec<u8>, u8, Vec<u8>, Vec<u8>, mpsc::Sender<Vec<u8>>)>,
+    data_upload_chan: &mpsc::Sender<(Vec<Vec<u8>>, u8, Vec<u8>, Vec<u8>, mpsc::Sender<Vec<u8>>)>,
 ) -> Vec<u8> {
     let (chan_out, chan_in) = mpsc::channel::<Vec<u8>>();
     let mut enc_mode = 0;
@@ -382,7 +381,7 @@ pub async fn upload_data(
 }
 
 pub async fn push_data(
-    data: Vec<u8>,
+    mut data: Vec<Vec<u8>>,
     encryption: bool,
     batch_owner: Vec<u8>,
     batch_id: Vec<u8>,
@@ -395,17 +394,25 @@ pub async fn push_data(
         mpsc::Sender<bool>,
     )>,
 ) -> Vec<u8> {
-    let span_length = data.len();
+    let mut span_length = 0;
 
-    if data.len() <= 4096 {
+    for i in &data {
+        span_length += i.len();
+    }
+
+    if data.len() == 1 && data[0].len() <= 4096 {
         let mut encrey0 = vec![];
 
         let data0 = match encryption {
             true => {
                 encrey0 = encrey();
-                encrypt(span_length, &data, &encrey0)
+                encrypt(span_length, &data[0], &encrey0)
             }
-            false => [(data.len() as u64).to_le_bytes().to_vec(), data.clone()].concat(),
+            false => [
+                (data[0].len() as u64).to_le_bytes().to_vec(),
+                data[0].clone(),
+            ]
+            .concat(),
         };
 
         let k = content_address(&data0);
@@ -435,8 +442,6 @@ pub async fn push_data(
             address_length = 64;
         }
 
-        let mut level_data = data;
-
         let mut level = 0;
         let address_fit = 4096 / address_length;
         let next_level = true;
@@ -445,125 +450,100 @@ pub async fn push_data(
         let (result_chan_out, result_chan_in) = mpsc::channel::<bool>();
 
         while next_level {
+            let mut sc = 0;
             levels.push(Vec::new());
 
-            let mut chunk_l0r = level_data.len() % 4096;
-            if chunk_l0r > 0 {
-                chunk_l0r = 1;
-            }
-            let chunk_l0c = level_data.len() / 4096 + chunk_l0r;
+            let partition_count = data.len();
 
-            web_sys::console::log_1(&JsValue::from(format!(
-                "level  {} chunk count : {}   ln {}!",
-                level, //
-                chunk_l0c,
-                level_data.len()
-            )));
-
-            if chunk_l0c == 1 {
-                for j in 0..level_data.len() / address_length {
-                    web_sys::console::log_1(&JsValue::from(format!(
-                        "top level chunk  {}",
-                        hex::encode(&level_data[j * address_length..(j + 1) * address_length])
-                    )));
+            for _ in 0..partition_count {
+                let level_data = data.remove(0);
+                let mut chunk_l0r = level_data.len() % 4096;
+                if chunk_l0r > 0 {
+                    chunk_l0r = 1;
                 }
-            }
+                let chunk_l0c = level_data.len() / 4096 + chunk_l0r;
 
-            let mut count_yield = 0;
+                let mut count_yield = 0;
 
-            for i in 0..chunk_l0c {
-                count_yield += 1;
-                if count_yield > 64 {
-                    let mut k = 0;
-
-                    // relax push chunk channel
-
-                    while k < 64 {
-                        let kresult = result_chan_in.try_recv();
-                        if !kresult.is_err() {
-                            k += 1
-                        } else {
-                            async_std::task::sleep(Duration::from_millis(50)).await;
+                for i in 0..chunk_l0c {
+                    count_yield += 1;
+                    if count_yield > 4096 {
+                        // relax push chunk channel
+                        #[allow(irrefutable_let_patterns)]
+                        while let kresult = result_chan_in.try_recv() {
+                            if !kresult.is_err() {
+                                if count_yield > 0 {
+                                    count_yield -= 1;
+                                }
+                            } else {
+                                if count_yield < 2048 {
+                                    break;
+                                }
+                                async_std::task::sleep(Duration::from_millis(
+                                    PROTO_LOOP_INTERRUPTOR as u64,
+                                ))
+                                .await;
+                            }
                         }
                     }
 
-                    count_yield = 0;
-                }
-
-                let data_start = 4096 * i as usize;
-                let mut data_end = 4096 * (i + 1) as usize;
-                if data_end > level_data.len() {
-                    data_end = level_data.len();
-                };
-
-                let mut span = span_carriage;
-
-                if (i + 1) * span_carriage > span_length {
-                    span = span_length - (i * span_carriage);
-
-                    web_sys::console::log_1(&JsValue::from(format!(
-                        "last chunk span : {} span_carriage : {}!",
-                        span, span_carriage,
-                    )));
-                };
-
-                if chunk_l0c == 1 {
-                    span = span_length;
-                    web_sys::console::log_1(&JsValue::from(format!("top chunk span : {}!", span)));
-                }
-
-                let ch_d = level_data[data_start..data_end].to_vec();
-
-                if ch_d.len() == address_length && level > 0 {
-                    levels[level].push(ch_d);
-                    web_sys::console::log_1(&JsValue::from(format!("partition level difference!")));
-                } else {
-                    let mut encrey0 = vec![];
-
-                    let data0 = match encryption {
-                        true => {
-                            encrey0 = encrey();
-                            encrypt(span, &ch_d, &encrey0)
-                        }
-                        false => [(span as u64).to_le_bytes().to_vec(), ch_d.clone()].concat(),
+                    let data_start = 4096 * i as usize;
+                    let mut data_end = 4096 * (i + 1) as usize;
+                    if data_end > level_data.len() {
+                        data_end = level_data.len();
                     };
 
-                    let cha = content_address(&data0);
+                    let mut span = span_carriage;
 
-                    if i % 10000 == 0 {
-                        web_sys::console::log_1(&JsValue::from(format!(
-                            "dispatching iter {} {}",
-                            i,
-                            hex::encode(&cha)
-                        )));
+                    if (sc + 1) * span_carriage > span_length {
+                        span = span_length - (sc * span_carriage);
+                    };
+
+                    sc += 1;
+
+                    if chunk_l0c == 1 {
+                        span = span_length;
                     }
-                    levels[level].push([cha.clone(), encrey0].concat());
 
-                    // (span as u64).to_le_bytes().to_vec(),
+                    let ch_d = level_data[data_start..data_end].to_vec();
 
-                    let _ = chunk_upload_chan.send((
-                        data0,
-                        false,
-                        cha,
-                        batch_owner.clone(),
-                        batch_id.clone(),
-                        result_chan_out.clone(),
-                    ));
+                    if ch_d.len() == address_length && level > 0 {
+                        levels[level].push(ch_d);
+                    } else {
+                        let mut encrey0 = vec![];
+
+                        let data0 = match encryption {
+                            true => {
+                                encrey0 = encrey();
+                                encrypt(span, &ch_d, &encrey0)
+                            }
+                            false => [(span as u64).to_le_bytes().to_vec(), ch_d].concat(),
+                        };
+
+                        let cha = content_address(&data0);
+
+                        levels[level].push([cha.clone(), encrey0].concat());
+
+                        // (span as u64).to_le_bytes().to_vec(),
+
+                        let _ = chunk_upload_chan.send((
+                            data0,
+                            false,
+                            cha,
+                            batch_owner.clone(),
+                            batch_id.clone(),
+                            result_chan_out.clone(),
+                        ));
+                    }
                 }
             }
 
             if levels[level].len() == 1 {
                 return levels[level][0].clone();
             } else {
-                level_data = levels[level].concat();
+                data = vec![levels[level].concat()];
+                data.shrink_to_fit();
                 level += 1;
-
-                web_sys::console::log_1(&JsValue::from(format!(
-                    "level change data len : {} level : {}!",
-                    level_data.len(),
-                    level,
-                )));
-
                 span_carriage *= address_fit;
             }
         }
@@ -576,7 +556,7 @@ pub async fn push_data(
 }
 
 pub async fn push_chunk(
-    data: &Vec<u8>,
+    data: Vec<u8>,
     soc: bool,
     soc_address: Vec<u8>,
     batch_owner: Vec<u8>,
@@ -588,10 +568,6 @@ pub async fn push_chunk(
     refresh_chan: &mpsc::Sender<(PeerId, u64)>,
 ) -> Vec<u8> {
     if (data.len() > 4104 && !soc) || (data.len() > 4201) {
-        web_sys::console::log_1(&JsValue::from(format!(
-            "Pushchunk returning empty reference for reason of data overlength!"
-        )));
-
         return vec![];
     }
 
@@ -599,21 +575,11 @@ pub async fn push_chunk(
 
     if soc {
         caddr = soc_address.clone();
-
-        web_sys::console::log_1(&JsValue::from(format!(
-            "### Pushing SOC ### {}",
-            data.len()
-        )));
     }
 
     let cstamp0 = stamp_chunk(batch_owner, batch_id, batch_bucket_limit, caddr.clone()).await;
 
     if cstamp0.len() == 0 {
-        web_sys::console::log_1(&JsValue::from(format!(
-            "Pushchunk returning empty reference for reason of bucket overuse {}",
-            hex::encode(&caddr)
-        )));
-
         return vec![];
     }
 
@@ -632,8 +598,6 @@ pub async fn push_chunk(
 
     let mut error_count = 0;
     let mut max_error = 8;
-
-    let (mut _storer_address, mut _storer_signature, mut _receipt_nonce) = (vec![], vec![], vec![]);
 
     while error_count < max_error {
         let mut seer = true;
@@ -664,11 +628,6 @@ pub async fn push_chunk(
                 skiplist.insert(closest_peer_id);
             } else {
                 if overdraftlist.is_empty() {
-                    web_sys::console::log_1(&JsValue::from(format!(
-                        "Pushchunk returning empty reference for reason of no peers to push to {}",
-                        hex::encode(&caddr)
-                    )));
-
                     return vec![];
                 } else {
                     for k in overdraftlist.iter() {
@@ -703,7 +662,7 @@ pub async fn push_chunk(
                 };
                 if accounting_peers.contains_key(&closest_peer_id) {
                     let accounting_peer = accounting_peers.get(&closest_peer_id).unwrap();
-                    let allowed = reserve(accounting_peer, req_price, &refresh_chan.clone());
+                    let allowed = reserve(accounting_peer, req_price, &refresh_chan);
                     if !allowed {
                         overdraftlist.insert(closest_peer_id);
                     } else {
@@ -715,20 +674,20 @@ pub async fn push_chunk(
 
         let req_price = price(&closest_overlay, &caddr);
 
-        let (chunk_out, chunk_in) = mpsc::channel::<(Vec<u8>, Vec<u8>, Vec<u8>)>();
+        let (chunk_out, chunk_in) = mpsc::channel::<bool>();
 
         pushsync_handler(
             closest_peer_id,
-            caddr.clone(),
-            data.clone(),
-            cstamp0.clone(),
+            &caddr,
+            &data,
+            &cstamp0,
             control.clone(),
             &chunk_out,
         )
         .await;
 
-        let receipt_values = chunk_in.try_recv();
-        if receipt_values.is_err() {
+        let receipt_received = chunk_in.try_recv();
+        if receipt_received.is_err() {
             let accounting_peers = accounting.lock().unwrap();
             if accounting_peers.contains_key(&closest_peer_id) {
                 let accounting_peer = accounting_peers.get(&closest_peer_id).unwrap();
@@ -736,35 +695,25 @@ pub async fn push_chunk(
             }
         }
 
-        (_storer_address, _storer_signature, _receipt_nonce) = match receipt_values {
-            Ok((ref _x, ref _y, ref _z)) => {
+        match receipt_received {
+            Ok(true) => {
                 let accounting_peers = accounting.lock().unwrap();
                 if accounting_peers.contains_key(&closest_peer_id) {
                     let accounting_peer = accounting_peers.get(&closest_peer_id).unwrap();
                     apply_credit(accounting_peer, req_price);
                 }
                 break; // move this to receipt validation later
-                #[allow(unreachable_code)]
-                (_x.clone(), _y.clone(), _z.clone())
             }
-            Err(_x) => {
+            _ => {
                 error_count += 1;
                 let accounting_peers = accounting.lock().unwrap();
                 if accounting_peers.contains_key(&closest_peer_id) {
                     let accounting_peer = accounting_peers.get(&closest_peer_id).unwrap();
                     cancel_reserve(accounting_peer, req_price)
                 }
-                (vec![], vec![], vec![])
             }
         };
     }
-
-    // validate receipt
-
-    // web_sys::console::log_1(&JsValue::from(format!(
-    //     "Pushchunk returning {:#?}!",
-    //     hex::encode(&caddr)
-    // )));
 
     return caddr;
 }
@@ -822,7 +771,7 @@ pub fn encrypt(span: usize, cd: &Vec<u8>, encrey: &Vec<u8>) -> Vec<u8> {
         }
     }
 
-    return [spanbytes, content[..].to_vec()].concat();
+    return [spanbytes, content].concat();
 }
 
 pub fn encrey() -> Vec<u8> {
