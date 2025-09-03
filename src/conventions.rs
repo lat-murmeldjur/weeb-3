@@ -37,6 +37,7 @@ pub struct PeerFile {
 pub struct PeerAccounting {
     pub balance: u64,
     pub threshold: u64,
+    pub payment_threshold: u64,
     pub reserve: u64,
     pub refreshment: f64,
     pub id: PeerId,
@@ -353,7 +354,7 @@ pub fn decode_resources(encoded_data: Vec<u8>) -> (Vec<(Vec<u8>, String, String)
 
 pub async fn read_file(file: web_sys::File) -> Vec<Vec<u8>> {
     let fils = file.size();
-    let partition_size = 99999744.0_f64;
+    let partition_size = 69001216.0_f64;
 
     if fils <= partition_size {
         let content_buf = wasm_bindgen_futures::JsFuture::from(file.array_buffer())

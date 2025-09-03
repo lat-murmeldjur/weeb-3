@@ -456,7 +456,8 @@ pub async fn push_data(
             let partition_count = data.len();
 
             for _ in 0..partition_count {
-                let level_data = data.remove(0);
+                let mut level_data = data.remove(0);
+                data.shrink_to_fit();
                 let mut chunk_l0r = level_data.len() % 4096;
                 if chunk_l0r > 0 {
                     chunk_l0r = 1;
@@ -465,9 +466,10 @@ pub async fn push_data(
 
                 let mut count_yield = 0;
 
-                for i in 0..chunk_l0c {
+                for _ in 0..chunk_l0c {
+                    level_data.shrink_to_fit();
                     count_yield += 1;
-                    if count_yield > 4096 {
+                    if count_yield > 512 {
                         // relax push chunk channel
                         #[allow(irrefutable_let_patterns)]
                         while let kresult = result_chan_in.try_recv() {
@@ -476,7 +478,7 @@ pub async fn push_data(
                                     count_yield -= 1;
                                 }
                             } else {
-                                if count_yield < 2048 {
+                                if count_yield < 256 {
                                     break;
                                 }
                                 async_std::task::sleep(Duration::from_millis(
@@ -487,8 +489,8 @@ pub async fn push_data(
                         }
                     }
 
-                    let data_start = 4096 * i as usize;
-                    let mut data_end = 4096 * (i + 1) as usize;
+                    let data_start = 0 as usize;
+                    let mut data_end = 4096 as usize;
                     if data_end > level_data.len() {
                         data_end = level_data.len();
                     };
@@ -505,19 +507,25 @@ pub async fn push_data(
                         span = span_length;
                     }
 
-                    let ch_d = level_data[data_start..data_end].to_vec();
-
-                    if ch_d.len() == address_length && level > 0 {
-                        levels[level].push(ch_d);
+                    if data_end - data_start == address_length && level > 0 {
+                        levels[level].push(level_data.drain(data_start..data_end).collect());
                     } else {
                         let mut encrey0 = vec![];
 
                         let data0 = match encryption {
                             true => {
                                 encrey0 = encrey();
-                                encrypt(span, &ch_d, &encrey0)
+                                encrypt(
+                                    span,
+                                    &level_data.drain(data_start..data_end).collect(),
+                                    &encrey0,
+                                )
                             }
-                            false => [(span as u64).to_le_bytes().to_vec(), ch_d].concat(),
+                            false => [
+                                (span as u64).to_le_bytes().to_vec(),
+                                level_data.drain(data_start..data_end).collect(),
+                            ]
+                            .concat(),
                         };
 
                         let cha = content_address(&data0);
@@ -536,6 +544,9 @@ pub async fn push_data(
                         ));
                     }
                 }
+
+                level_data = vec![];
+                level_data.shrink_to_fit();
             }
 
             if levels[level].len() == 1 {

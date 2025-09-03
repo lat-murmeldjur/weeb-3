@@ -56,7 +56,7 @@ mod manifest;
 mod manifest_upload;
 
 mod persistence;
-use persistence::{get_batch_id, get_batch_owner_key, reset_stamp};
+use persistence::{get_batch_bucket_limit, get_batch_id, get_batch_owner_key, reset_stamp};
 
 mod retrieval;
 use retrieval::*;
@@ -117,9 +117,9 @@ const PUSHSYNC_PROTOCOL: StreamProtocol = StreamProtocol::new("/swarm/pushsync/1
 // const PULL_PROTOCOL: StreamProtocol = StreamProtocol::new("/swarm/pullsync/1.4.0/pullsync");
 // const PUSH_PROTOCOL: StreamProtocol = StreamProtocol::new("/swarm/pushsync/1.3.0/pushsync");
 
-const PROTOCOL_ROUND_TIME: f64 = 340.0;
-const EVENT_LOOP_INTERRUPTOR: f64 = 70.0;
-const PROTO_LOOP_INTERRUPTOR: f64 = 70.0;
+const PROTOCOL_ROUND_TIME: f64 = 300.0;
+const EVENT_LOOP_INTERRUPTOR: f64 = 50.0;
+const PROTO_LOOP_INTERRUPTOR: f64 = 50.0;
 
 //
 // pub fn init_panic_hook() {
@@ -903,6 +903,7 @@ impl Sekirei {
                                         Mutex::new(PeerAccounting {
                                             balance: 0,
                                             threshold: 0,
+                                            payment_threshold: 0,
                                             reserve: 0,
                                             refreshment: 0.0,
                                             id: peer_file.peer_id,
@@ -1268,14 +1269,14 @@ impl Sekirei {
                 let mut request_joiner = vec![];
 
                 #[allow(irrefutable_let_patterns)]
-                for _i in 0..4096 {
+                for _i in 0..1024 {
                     let incoming_request = chunk_upload_chan_incoming.try_recv();
                     if !incoming_request.is_err() {
                         let handle = async {
                             let (d, soc, checkad, batch_owner, batch_id, feedback) =
                                 incoming_request.unwrap();
 
-                            let batch_bucket_limit = 128_u32;
+                            let batch_bucket_limit = get_batch_bucket_limit().await;
 
                             let _ = push_chunk(
                                 d,
@@ -1285,9 +1286,9 @@ impl Sekirei {
                                 batch_id,
                                 batch_bucket_limit,
                                 ctrl8.clone(),
-                                &wings.overlay_peers.clone(),
-                                &wings.accounting_peers.clone(),
-                                &refreshment_instructions_chan_outgoing.clone(),
+                                &wings.overlay_peers,
+                                &wings.accounting_peers,
+                                &refreshment_instructions_chan_outgoing,
                             )
                             .await;
 
@@ -1328,7 +1329,7 @@ impl Sekirei {
                     ));
                 }
 
-                join_all(request_joiner).await;
+                let _ = join_all(request_joiner).await;
 
                 // while let Some(()) = request_joiner.next().await {
                 //     web_sys::console::log_1(&JsValue::from(format!("push chunk completed")));

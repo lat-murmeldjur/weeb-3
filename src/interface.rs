@@ -33,7 +33,10 @@ use alloy::{network::EthereumWallet, signers::local::PrivateKeySigner};
 
 use crate::{
     encrey, join,
-    persistence::{get_batch_id, get_batch_owner_key, set_batch_id, set_batch_owner_key},
+    persistence::{
+        get_batch_bucket_limit, get_batch_id, get_batch_owner_key, set_batch_bucket_limit,
+        set_batch_id, set_batch_owner_key,
+    },
 };
 
 #[wasm_bindgen]
@@ -157,8 +160,12 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
                     {
                         let stored_stamp_signer_key = get_batch_owner_key().await;
                         let stored_batch_id = get_batch_id().await;
+                        let bucket_limit = get_batch_bucket_limit().await;
 
-                        if stored_stamp_signer_key.len() != 0 && stored_batch_id.len() != 0 {
+                        if stored_stamp_signer_key.len() != 0
+                            && stored_batch_id.len() != 0
+                            && bucket_limit > 0
+                        {
                             let window = web_sys::window().unwrap();
                             let _ = window.alert_with_message("Already have a batch for uploads");
                             return;
@@ -376,6 +383,12 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
                         if !set_batch_id(&batch_id).await {
                             let window = web_sys::window().unwrap();
                             let _ = window.alert_with_message("Failed to save batch id");
+                            return;
+                        }
+
+                        if !set_batch_bucket_limit(u32::pow(2, (batch_depth - 16) as u32)).await {
+                            let window = web_sys::window().unwrap();
+                            let _ = window.alert_with_message("Failed to save batch bucket depth");
                             return;
                         }
 

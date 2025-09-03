@@ -381,6 +381,19 @@ pub async fn set_batch_owner_key(key: &Vec<u8>) -> bool {
     return set_batch_field("batch_owner_0_key".to_string(), key).await;
 }
 
+pub async fn get_batch_bucket_limit() -> u32 {
+    let k = get_batch_field("batch_0_bucket_limit".to_string()).await;
+    return u32::from_le_bytes(k.try_into().unwrap());
+}
+
+pub async fn set_batch_bucket_limit(limit: u32) -> bool {
+    return set_batch_field(
+        "batch_0_bucket_limit".to_string(),
+        &limit.to_le_bytes().to_vec(),
+    )
+    .await;
+}
+
 pub async fn get_feed_owner_key() -> Vec<u8> {
     return get_batch_field("feed_owner_0_key".to_string()).await;
 }
