@@ -414,9 +414,10 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
             .expect("#uploadGetBatch should be a HtmlButtonElement")
             .set_onclick(Some(callback2.as_ref().unchecked_ref()));
 
-        let callback3 =
-            wasm_bindgen::closure::Closure::<dyn FnMut(web_sys::MessageEvent)>::new(move |_msg| {
+        let callback3 = wasm_bindgen::closure::Closure::<dyn FnMut(web_sys::MessageEvent)>::new(
+            move |_msg| {
                 console::log_1(&"oninput file callback".into());
+
                 let sekirei00 = sekirei2.clone();
 
                 let document = web_sys::window().unwrap().document().unwrap();
@@ -439,6 +440,19 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
                     _ => return,
                 };
                 spawn_local(async move {
+                    let stored_stamp_signer_key = get_batch_owner_key().await;
+                    let stored_batch_id = get_batch_id().await;
+                    let bucket_limit = get_batch_bucket_limit().await;
+
+                    if stored_stamp_signer_key.len() == 0
+                        || stored_batch_id.len() == 0
+                        || bucket_limit == 0
+                    {
+                        let window = web_sys::window().unwrap();
+                        let _ = window.alert_with_message("Require a postage batch for uploads. To get one, connect metamask wallet with sepolia Eth / sepolia Bzz with the 'Create Storage on Swarm for Uploads' button");
+                        return;
+                    }
+
                     let file_enc = document
                         .get_element_by_id("uploadFileEncrypt")
                         .expect("#uploadFileEncrypt should exist");
@@ -511,7 +525,8 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
 
                     console::log_1(&"oninput file callback happened".into());
                 })
-            });
+            },
+        );
 
         document
             .get_element_by_id("uploadFile")

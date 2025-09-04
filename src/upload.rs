@@ -34,7 +34,7 @@ use crate::{
     //                                                                        //
     mpsc,
     //                                                                        //
-    persistence::{bump_bucket, get_feed_owner_key, set_feed_owner_key},
+    persistence::{bump_bucket, get_batch_bucket_limit, get_feed_owner_key, set_feed_owner_key},
     //                                                                        //
     price,
     //                                                                        //
@@ -56,15 +56,17 @@ use alloy::signers::local::PrivateKeySigner;
 
 use serde_json::json;
 
+const BATCH_BUCKET_TRIALS: usize = 1024;
+
 pub async fn stamp_chunk(
     stamp_signer_key: Vec<u8>,
     batch_id: Vec<u8>,
     batch_bucket_limit: u32,
     chunk_address: Vec<u8>,
-) -> Vec<u8> {
+) -> (Vec<u8>, bool) {
     let stamp_signer: PrivateKeySigner = match PrivateKeySigner::from_slice(&stamp_signer_key) {
         Ok(aok) => aok,
-        _ => return vec![],
+        _ => return (vec![], false),
     };
 
     let bucket = u32::from_be_bytes(chunk_address[..4].try_into().unwrap()) >> (32 - 16);
@@ -76,24 +78,24 @@ pub async fn stamp_chunk(
     index = index0;
 
     if index > batch_bucket_limit {
-        return vec![];
+        return (vec![], true);
     };
 
     if !h {
-        return vec![];
+        return (vec![], false);
     };
 
     let index_bytes = [bucket.to_be_bytes(), index.to_be_bytes()].concat();
 
     let timestamp: u64 = (Date::now() as u64) * 1000000;
-    let timestamp_bytes = timestamp.to_be_bytes();
+    let timestamp_bytes = timestamp.to_be_bytes().to_vec();
 
     let to_sign_digest = keccak256(
         [
-            chunk_address.clone(),
+            chunk_address,
             batch_id.clone(),
             index_bytes.clone(),
-            timestamp_bytes.to_vec(),
+            timestamp_bytes.clone(),
         ]
         .concat(),
     );
@@ -105,9 +107,9 @@ pub async fn stamp_chunk(
         .as_bytes()
         .to_vec();
 
-    let stamp = [batch_id, index_bytes, timestamp_bytes.to_vec(), signature].concat();
+    let stamp = [batch_id, index_bytes, timestamp_bytes, signature].concat();
 
-    stamp
+    (stamp, false)
 }
 
 pub struct Resource {
@@ -128,14 +130,7 @@ pub async fn upload_resource(
     batch_owner: Vec<u8>,
     batch_id: Vec<u8>,
     data_upload_chan: &mpsc::Sender<(Vec<Vec<u8>>, u8, Vec<u8>, Vec<u8>, mpsc::Sender<Vec<u8>>)>,
-    chunk_upload_chan: &mpsc::Sender<(
-        Vec<u8>,
-        bool,
-        Vec<u8>,
-        Vec<u8>,
-        Vec<u8>,
-        mpsc::Sender<bool>,
-    )>,
+    chunk_upload_chan: &mpsc::Sender<(Vec<u8>, bool, Vec<u8>, Vec<u8>, mpsc::Sender<bool>)>,
     chunk_retrieve_chan: &mpsc::Sender<(Vec<u8>, mpsc::Sender<Vec<u8>>)>,
 ) -> Vec<u8> {
     //
@@ -319,14 +314,22 @@ pub async fn upload_resource(
 
     let (result_chan_out, _result_chan_in) = mpsc::channel::<bool>();
 
-    let _update_reference = chunk_upload_chan.send((
-        soc_actual,
-        true,
-        soc_address,
+    let batch_bucket_limit = get_batch_bucket_limit().await;
+
+    let (cstamp0, _bucket_full) = stamp_chunk(
         batch_owner.clone(),
         batch_id.clone(),
-        result_chan_out,
-    ));
+        batch_bucket_limit,
+        soc_address.clone(),
+    )
+    .await;
+
+    if cstamp0.len() == 0 {
+        return vec![];
+    }
+
+    let _update_reference =
+        chunk_upload_chan.send((soc_actual, true, soc_address, cstamp0, result_chan_out));
 
     return feed_reference;
 }
@@ -385,14 +388,8 @@ pub async fn push_data(
     encryption: bool,
     batch_owner: Vec<u8>,
     batch_id: Vec<u8>,
-    chunk_upload_chan: &mpsc::Sender<(
-        Vec<u8>,
-        bool,
-        Vec<u8>,
-        Vec<u8>,
-        Vec<u8>,
-        mpsc::Sender<bool>,
-    )>,
+    batch_bucket_limit: u32,
+    chunk_upload_chan: &mpsc::Sender<(Vec<u8>, bool, Vec<u8>, Vec<u8>, mpsc::Sender<bool>)>,
 ) -> Vec<u8> {
     let mut span_length = 0;
 
@@ -401,9 +398,10 @@ pub async fn push_data(
     }
 
     if data.len() == 1 && data[0].len() <= 4096 {
+        let mut soc = false;
         let mut encrey0 = vec![];
 
-        let data0 = match encryption {
+        let mut data0 = match encryption {
             true => {
                 encrey0 = encrey();
                 encrypt(span_length, &data[0], &encrey0)
@@ -415,25 +413,55 @@ pub async fn push_data(
             .concat(),
         };
 
-        let k = content_address(&data0);
+        let mut cstamp0: Vec<u8> = vec![];
+        let mut bucket_full: bool;
+        let mut cha = content_address(&data0);
+
+        for _ in 0..BATCH_BUCKET_TRIALS {
+            (cstamp0, bucket_full) = stamp_chunk(
+                batch_owner.clone(),
+                batch_id.clone(),
+                batch_bucket_limit,
+                cha.clone(),
+            )
+            .await;
+
+            if !bucket_full {
+                break;
+            } else {
+                match encryption {
+                    true => {
+                        encrey0 = encrey();
+                        data0 = encrypt(span_length, &data[0], &encrey0);
+                        cha = content_address(&data0);
+                    }
+                    false => {
+                        soc = true;
+                        (data0, cha) = make_soc(
+                            &[span_length.to_le_bytes().to_vec(), data[0].clone()].concat(),
+                            encrey(),
+                            encrey(),
+                        )
+                        .await;
+                    }
+                }
+            }
+        }
+
+        if cstamp0.len() == 0 {
+            return vec![];
+        }
 
         let (result_chan_out, _result_chan_in) = mpsc::channel::<bool>();
 
-        let _ = chunk_upload_chan.send((
-            data0,
-            false,
-            k.clone(),
-            batch_owner.clone(),
-            batch_id.clone(),
-            result_chan_out,
-        ));
+        let _ = chunk_upload_chan.send((data0, soc, cha.clone(), cstamp0, result_chan_out));
 
         // web_sys::console::log_1(&JsValue::from(format!(
         //     "push_data returning {:#?}!",
         //     hex::encode(&k)
         // )));
 
-        return [k, encrey0].concat();
+        return [cha, encrey0].concat();
     } else {
         let mut levels: Vec<Vec<Vec<u8>>> = Vec::new();
 
@@ -453,11 +481,7 @@ pub async fn push_data(
             let mut sc = 0;
             levels.push(Vec::new());
 
-            let partition_count = data.len();
-
-            for _ in 0..partition_count {
-                let mut level_data = data.remove(0);
-                data.shrink_to_fit();
+            for level_data in &data {
                 let mut chunk_l0r = level_data.len() % 4096;
                 if chunk_l0r > 0 {
                     chunk_l0r = 1;
@@ -466,8 +490,7 @@ pub async fn push_data(
 
                 let mut count_yield = 0;
 
-                for _ in 0..chunk_l0c {
-                    level_data.shrink_to_fit();
+                for i in 0..chunk_l0c {
                     count_yield += 1;
                     if count_yield > 512 {
                         // relax push chunk channel
@@ -489,11 +512,13 @@ pub async fn push_data(
                         }
                     }
 
-                    let data_start = 0 as usize;
-                    let mut data_end = 4096 as usize;
+                    let data_start = i * 4096 as usize;
+                    let mut data_end = (i + 1) * 4096 as usize;
                     if data_end > level_data.len() {
                         data_end = level_data.len();
                     };
+
+                    let ch_d = level_data[data_start..data_end].to_vec();
 
                     let mut span = span_carriage;
 
@@ -508,27 +533,61 @@ pub async fn push_data(
                     }
 
                     if data_end - data_start == address_length && level > 0 {
-                        levels[level].push(level_data.drain(data_start..data_end).collect());
+                        levels[level].push(ch_d);
                     } else {
+                        let mut soc = false;
                         let mut encrey0 = vec![];
 
-                        let data0 = match encryption {
+                        let mut data0 = match encryption {
                             true => {
                                 encrey0 = encrey();
-                                encrypt(
-                                    span,
-                                    &level_data.drain(data_start..data_end).collect(),
-                                    &encrey0,
-                                )
+                                encrypt(span, &ch_d, &encrey0)
                             }
-                            false => [
-                                (span as u64).to_le_bytes().to_vec(),
-                                level_data.drain(data_start..data_end).collect(),
-                            ]
-                            .concat(),
+                            false => [(span as u64).to_le_bytes().to_vec(), ch_d.clone()].concat(),
                         };
 
-                        let cha = content_address(&data0);
+                        let mut cstamp0: Vec<u8> = vec![];
+                        let mut bucket_full: bool;
+                        let mut cha = content_address(&data0);
+
+                        for _ in 0..BATCH_BUCKET_TRIALS {
+                            (cstamp0, bucket_full) = stamp_chunk(
+                                batch_owner.clone(),
+                                batch_id.clone(),
+                                batch_bucket_limit,
+                                cha.clone(),
+                            )
+                            .await;
+
+                            if !bucket_full {
+                                break;
+                            } else {
+                                match encryption {
+                                    true => {
+                                        encrey0 = encrey();
+                                        data0 = encrypt(span, &ch_d, &encrey0);
+                                        cha = content_address(&data0);
+                                    }
+                                    false => {
+                                        soc = true;
+                                        (data0, cha) = make_soc(
+                                            &&[span.to_le_bytes().to_vec(), ch_d.clone()].concat(),
+                                            encrey(),
+                                            encrey(),
+                                        )
+                                        .await;
+                                    }
+                                }
+                            }
+                        }
+
+                        if cstamp0.len() == 0 {
+                            return vec![];
+                        }
+                        //    stamp_signer_key: Vec<u8>,
+                        //    batch_id: Vec<u8>,
+                        //    batch_bucket_limit: u32,
+                        //    chunk_address: Vec<u8>,
 
                         levels[level].push([cha.clone(), encrey0].concat());
 
@@ -536,24 +595,21 @@ pub async fn push_data(
 
                         let _ = chunk_upload_chan.send((
                             data0,
-                            false,
+                            soc,
                             cha,
-                            batch_owner.clone(),
-                            batch_id.clone(),
+                            cstamp0,
                             result_chan_out.clone(),
                         ));
                     }
                 }
-
-                level_data = vec![];
-                level_data.shrink_to_fit();
             }
 
             if levels[level].len() == 1 {
                 return levels[level][0].clone();
             } else {
-                data = vec![levels[level].concat()];
+                data.clear();
                 data.shrink_to_fit();
+                data = vec![levels[level].concat()];
                 level += 1;
                 span_carriage *= address_fit;
             }
@@ -570,9 +626,7 @@ pub async fn push_chunk(
     data: Vec<u8>,
     soc: bool,
     soc_address: Vec<u8>,
-    batch_owner: Vec<u8>,
-    batch_id: Vec<u8>,
-    batch_bucket_limit: u32,
+    cstamp0: Vec<u8>,
     control: stream::Control,
     peers: &Mutex<HashMap<String, PeerId>>,
     accounting: &Mutex<HashMap<PeerId, Mutex<PeerAccounting>>>,
@@ -586,12 +640,6 @@ pub async fn push_chunk(
 
     if soc {
         caddr = soc_address.clone();
-    }
-
-    let cstamp0 = stamp_chunk(batch_owner, batch_id, batch_bucket_limit, caddr.clone()).await;
-
-    if cstamp0.len() == 0 {
-        return vec![];
     }
 
     let mut skiplist: HashSet<PeerId> = HashSet::new();

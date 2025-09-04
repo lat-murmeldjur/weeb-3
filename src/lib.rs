@@ -574,7 +574,7 @@ impl Sekirei {
             mpsc::channel::<(Vec<Vec<u8>>, u8, Vec<u8>, Vec<u8>, mpsc::Sender<Vec<u8>>)>();
 
         let (chunk_upload_chan_outgoing, chunk_upload_chan_incoming) =
-            mpsc::channel::<(Vec<u8>, bool, Vec<u8>, Vec<u8>, Vec<u8>, mpsc::Sender<bool>)>();
+            mpsc::channel::<(Vec<u8>, bool, Vec<u8>, Vec<u8>, mpsc::Sender<bool>)>();
 
         let mut ctrl0;
         let mut ctrl1;
@@ -1232,11 +1232,14 @@ impl Sekirei {
                                 _ => true,
                             };
 
+                            let batch_bucket_limit = get_batch_bucket_limit().await;
+
                             let data_reference = push_data(
                                 n,
                                 encrypted_data,
                                 batch_owner,
                                 batch_id,
+                                batch_bucket_limit,
                                 &chunk_upload_chan_outgoing.clone(),
                             )
                             .await;
@@ -1273,18 +1276,13 @@ impl Sekirei {
                     let incoming_request = chunk_upload_chan_incoming.try_recv();
                     if !incoming_request.is_err() {
                         let handle = async {
-                            let (d, soc, checkad, batch_owner, batch_id, feedback) =
-                                incoming_request.unwrap();
+                            let (d, soc, checkad, stamp, feedback) = incoming_request.unwrap();
 
-                            let batch_bucket_limit = get_batch_bucket_limit().await;
-
-                            let _ = push_chunk(
+                            let _address = push_chunk(
                                 d,
                                 soc,
-                                checkad.clone(),
-                                batch_owner,
-                                batch_id,
-                                batch_bucket_limit,
+                                checkad,
+                                stamp,
                                 ctrl8.clone(),
                                 &wings.overlay_peers,
                                 &wings.accounting_peers,
