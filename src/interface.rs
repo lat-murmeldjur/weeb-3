@@ -43,6 +43,8 @@ use crate::{
 pub async fn interweeb(_st: String) -> Result<(), JsError> {
     //    init_panic_hook();
 
+    set_batch_bucket_limit(2).await;
+
     let sekirei = Arc::new(Sekirei::new("".to_string()));
 
     let sekirei0 = sekirei.clone();

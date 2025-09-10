@@ -950,6 +950,7 @@ impl Sekirei {
                                     if !overlay_peers_map.contains_key(&ol.to_string()) {
                                         self.interface_log(format!("Connected to peer {}", &ol));
                                         overlay_peers_map.insert(ol, peer);
+
                                         {
                                             let mut connections = self.connections.lock().unwrap();
                                             *connections = *connections + 1
@@ -1268,7 +1269,20 @@ impl Sekirei {
 
         let push_chunk_handle = async {
             let mut timelast = Date::now();
+            let mut connections = false;
             loop {
+                if !connections {
+                    {
+                        let overlay_peers_map = wings.overlay_peers.lock().unwrap();
+                        if overlay_peers_map.len() > 0 {
+                            connections = true;
+                        }
+                    }
+                    async_std::task::sleep(Duration::from_millis(PROTO_LOOP_INTERRUPTOR as u64))
+                        .await;
+                    continue;
+                }
+
                 let mut request_joiner = vec![];
 
                 #[allow(irrefutable_let_patterns)]
@@ -1347,8 +1361,21 @@ impl Sekirei {
 
         let retrieve_chunk_handle = async {
             let mut timelast = Date::now();
+            let mut connections = false;
             loop {
                 let mut request_joiner = Vec::new();
+
+                if !connections {
+                    {
+                        let overlay_peers_map = wings.overlay_peers.lock().unwrap();
+                        if overlay_peers_map.len() > 0 {
+                            connections = true;
+                        }
+                    }
+                    async_std::task::sleep(Duration::from_millis(PROTO_LOOP_INTERRUPTOR as u64))
+                        .await;
+                    continue;
+                }
 
                 #[allow(irrefutable_let_patterns)]
                 for _i in 0..4096 {

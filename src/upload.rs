@@ -56,6 +56,8 @@ use alloy::signers::local::PrivateKeySigner;
 
 use serde_json::json;
 
+use wasm_bindgen::JsCast;
+
 const BATCH_BUCKET_TRIALS: usize = 1024;
 
 pub async fn stamp_chunk(
@@ -429,6 +431,7 @@ pub async fn push_data(
             if !bucket_full {
                 break;
             } else {
+                render_log_message(&"Restamping chunk to avoid bucket overflow".to_string());
                 match encryption {
                     true => {
                         encrey0 = encrey();
@@ -437,12 +440,15 @@ pub async fn push_data(
                     }
                     false => {
                         soc = true;
-                        (data0, cha) = make_soc(
+                        let (data00, cha0) = make_soc(
                             &[span_length.to_le_bytes().to_vec(), data[0].clone()].concat(),
                             encrey(),
                             encrey(),
                         )
                         .await;
+
+                        data0 = data00;
+                        cha = cha0;
                     }
                 }
             }
@@ -562,6 +568,9 @@ pub async fn push_data(
                             if !bucket_full {
                                 break;
                             } else {
+                                render_log_message(
+                                    &"Restamping chunk to avoid bucket overflow".to_string(),
+                                );
                                 match encryption {
                                     true => {
                                         encrey0 = encrey();
@@ -570,18 +579,27 @@ pub async fn push_data(
                                     }
                                     false => {
                                         soc = true;
-                                        (data0, cha) = make_soc(
-                                            &&[span.to_le_bytes().to_vec(), ch_d.clone()].concat(),
-                                            encrey(),
-                                            encrey(),
-                                        )
-                                        .await;
+                                        let ob = encrey();
+                                        let idb = encrey();
+
+                                        let mut soc_wrapped_content: Vec<u8> = vec![];
+                                        soc_wrapped_content
+                                            .append(&mut (span as u64).to_le_bytes().to_vec());
+                                        soc_wrapped_content.append(&mut ch_d.clone());
+
+                                        let (data00, cha0) =
+                                            make_soc(&soc_wrapped_content, ob, idb).await;
+
+                                        data0 = data00;
+                                        cha = cha0;
                                     }
                                 }
                             }
                         }
 
                         if cstamp0.len() == 0 {
+                            render_log_message(&"Stamp length 0".to_string());
+
                             return vec![];
                         }
                         //    stamp_signer_key: Vec<u8>,
@@ -636,11 +654,10 @@ pub async fn push_chunk(
         return vec![];
     }
 
-    let mut caddr = content_address(&data);
-
-    if soc {
-        caddr = soc_address.clone();
-    }
+    let caddr = match soc {
+        true => soc_address.clone(),
+        false => content_address(&data),
+    };
 
     let mut skiplist: HashSet<PeerId> = HashSet::new();
     let mut overdraftlist: HashSet<PeerId> = HashSet::new();
@@ -683,6 +700,7 @@ pub async fn push_chunk(
                     }
                 }
             }
+
             if selected {
                 skiplist.insert(closest_peer_id);
             } else {
@@ -735,13 +753,16 @@ pub async fn push_chunk(
 
         let (chunk_out, chunk_in) = mpsc::channel::<bool>();
 
-        pushsync_handler(
-            closest_peer_id,
-            &caddr,
-            &data,
-            &cstamp0,
-            control.clone(),
-            &chunk_out,
+        let _ = async_std::future::timeout(
+            Duration::from_secs(10),
+            pushsync_handler(
+                closest_peer_id,
+                &caddr,
+                &data,
+                &cstamp0,
+                control.clone(),
+                &chunk_out,
+            ),
         )
         .await;
 
@@ -894,4 +915,17 @@ pub async fn make_soc(
     soc_content.append(&mut chunk_content.clone());
 
     return (soc_content, soc_address);
+}
+
+fn render_log_message(log: &String) {
+    let document = web_sys::window().unwrap().document().unwrap();
+    let log_message_div = document.create_element("div").unwrap();
+    log_message_div.set_inner_html(&log);
+    let _r = document
+        .get_element_by_id("logsField")
+        .expect("#logsField should exist")
+        .dyn_ref::<web_sys::HtmlElement>()
+        .unwrap()
+        .prepend_with_node_1(&log_message_div)
+        .unwrap();
 }

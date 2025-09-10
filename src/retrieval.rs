@@ -392,7 +392,11 @@ pub async fn retrieve_chunk(
 
         let (chunk_out, chunk_in) = mpsc::channel::<Vec<u8>>();
 
-        retrieve_handler(closest_peer_id, caddr.clone(), control.clone(), &chunk_out).await;
+        let _ = async_std::future::timeout(
+            Duration::from_secs(10),
+            retrieve_handler(closest_peer_id, caddr.clone(), control.clone(), &chunk_out),
+        )
+        .await;
 
         let chunk_data = chunk_in.try_recv();
         if chunk_data.is_err() {
