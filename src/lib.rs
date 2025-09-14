@@ -1,12 +1,12 @@
 #![cfg(target_arch = "wasm32")]
 
-use async_std::sync::Arc;
+use async_std::sync::{Arc, Mutex};
 
 use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::net::Ipv4Addr;
 use std::num::NonZero;
-use std::sync::{Mutex, mpsc};
+use std::sync::mpsc;
 use std::time::Duration;
 
 // use rand::rngs::OsRng;
@@ -181,7 +181,7 @@ impl Sekirei {
         match parse_id {
             Ok(parsed_id) => {
                 web_sys::console::log_1(&JsValue::from(format!("Parsed network id {}", parsed_id)));
-                let mut nid = self.network_id.lock().unwrap();
+                let mut nid = self.network_id.lock().await;
                 *nid = parsed_id;
             }
             _ => {}
@@ -531,12 +531,12 @@ impl Sekirei {
     }
 
     pub async fn get_ongoing_connections(&self) -> u64 {
-        let ongoing = self.ongoing_connections.lock().unwrap();
+        let ongoing = self.ongoing_connections.lock().await;
         return *ongoing;
     }
 
     pub async fn get_connections(&self) -> u64 {
-        let connected = self.connections.lock().unwrap();
+        let connected = self.connections.lock().await;
         return *connected;
     }
 
@@ -548,7 +548,7 @@ impl Sekirei {
     pub async fn run(&self, _st: String) -> () {
         // init_panic_hook();
 
-        let wings = self.wings.lock().unwrap();
+        let wings = self.wings.lock().await;
 
         let (peers_instructions_chan_outgoing, peers_instructions_chan_incoming) = mpsc::channel();
         let (connections_instructions_chan_outgoing, connections_instructions_chan_incoming) =
@@ -586,7 +586,7 @@ impl Sekirei {
         let mut incoming_gossip_streams;
 
         {
-            let mut swarm = self.swarm.lock().unwrap();
+            let mut swarm = self.swarm.lock().await;
             ctrl0 = swarm.behaviour_mut().stream.new_control();
             ctrl1 = swarm.behaviour_mut().stream.new_control();
             ctrl3 = swarm.behaviour_mut().stream.new_control();
@@ -611,7 +611,7 @@ impl Sekirei {
         };
 
         let swarm_event_handle = async {
-            let mut swarm = self.swarm.lock().unwrap();
+            let mut swarm = self.swarm.lock().await;
             loop {
                 #[allow(irrefutable_let_patterns)]
                 while let paddr0 = peers_instructions_chan_incoming.try_recv() {
@@ -659,12 +659,12 @@ impl Sekirei {
                                 let _pid: PeerId = match try_from_multiaddr(&addr3.clone()) {
                                     Some(aok) => {
                                         let connected_peers_map =
-                                            wings.connected_peers.lock().unwrap();
+                                            wings.connected_peers.lock().await;
                                         if connected_peers_map.contains_key(&aok) {
                                             continue;
                                         }
                                         let mut connection_attempts_map =
-                                            wings.connection_attempts.lock().unwrap();
+                                            wings.connection_attempts.lock().await;
                                         if connection_attempts_map.contains(&aok) {
                                             continue;
                                         } else {
@@ -705,12 +705,12 @@ impl Sekirei {
                         if webrtc_direct {
                             let _pid: PeerId = match try_from_multiaddr(&addr4.clone()) {
                                 Some(aok) => {
-                                    let connected_peers_map = wings.connected_peers.lock().unwrap();
+                                    let connected_peers_map = wings.connected_peers.lock().await;
                                     if connected_peers_map.contains_key(&aok) {
                                         continue;
                                     }
                                     let mut connection_attempts_map =
-                                        wings.connection_attempts.lock().unwrap();
+                                        wings.connection_attempts.lock().await;
                                     if connection_attempts_map.contains(&aok) {
                                         continue;
                                     } else {
@@ -759,21 +759,21 @@ impl Sekirei {
                         }
                         Some(SwarmEvent::ConnectionClosed { peer_id, .. }) => {
                             {
-                                let mut connected_peers_map = wings.connected_peers.lock().unwrap();
-                                let mut overlay_peers_map = wings.overlay_peers.lock().unwrap();
+                                let mut connected_peers_map = wings.connected_peers.lock().await;
+                                let mut overlay_peers_map = wings.overlay_peers.lock().await;
                                 if connected_peers_map.contains_key(&peer_id) {
                                     let ol0 = hex::encode(connected_peers_map.get(&peer_id).unwrap().overlay.clone());
                                     if overlay_peers_map.contains_key(&ol0) {
                                         overlay_peers_map.remove(&ol0);
                                         {
-                                           let mut connections = self.connections.lock().unwrap();
+                                           let mut connections = self.connections.lock().await;
                                             if *connections > 0 {
                                                 *connections = *connections - 1
                                             }
                                         }
                                     } else {
                                         {
-                                           let mut ongoing = self.ongoing_connections.lock().unwrap();
+                                           let mut ongoing = self.ongoing_connections.lock().await;
                                             if *ongoing > 0 {
                                                 *ongoing = *ongoing - 1
                                             }
@@ -783,7 +783,7 @@ impl Sekirei {
                                     self.interface_log(format!("Disconnected from peer {}", &ol0));
                                 };
                             }
-                            let mut accounting = wings.accounting_peers.lock().unwrap();
+                            let mut accounting = wings.accounting_peers.lock().await;
                             if accounting.contains_key(&peer_id) {
                                 accounting.remove(&peer_id);
                             };
@@ -817,7 +817,7 @@ impl Sekirei {
                         let _pid: PeerId = match try_from_multiaddr(&addr33.clone()) {
                             Some(aok) => {
                                 let mut connection_attempts_map =
-                                    wings.connection_attempts.lock().unwrap();
+                                    wings.connection_attempts.lock().await;
                                 if connection_attempts_map.contains(&aok) {
                                     continue;
                                 } else {
@@ -862,12 +862,12 @@ impl Sekirei {
                             };
                             let nid: u64;
                             {
-                                let nid0 = self.network_id.lock().unwrap().clone();
+                                let nid0 = self.network_id.lock().await.clone();
                                 nid = nid0;
                             }
 
                             if bootn {
-                                let mut bootnodes_set = wings.bootnodes.lock().unwrap();
+                                let mut bootnodes_set = wings.bootnodes.lock().await;
                                 bootnodes_set.insert(id.to_string());
                             }
 
@@ -878,7 +878,7 @@ impl Sekirei {
                                 nid,
                                 ctrl3.clone(),
                                 &addr3.clone(),
-                                &self.secret_key.lock().unwrap(),
+                                &(*self.secret_key.lock().await),
                                 &accounting_peer_chan_outgoing.clone(),
                             )
                             .await;
@@ -896,7 +896,7 @@ impl Sekirei {
                             let peer_file: PeerFile = incoming_peer.unwrap();
                             // let ol = hex::encode(peer_file.overlay.clone());
                             {
-                                let mut accounting = wings.accounting_peers.lock().unwrap();
+                                let mut accounting = wings.accounting_peers.lock().await;
                                 if !accounting.contains_key(&peer_file.peer_id) {
                                     accounting.insert(
                                         peer_file.peer_id,
@@ -913,10 +913,10 @@ impl Sekirei {
                             }
 
                             {
-                                let mut connected_peers_map = wings.connected_peers.lock().unwrap();
+                                let mut connected_peers_map = wings.connected_peers.lock().await;
                                 connected_peers_map.insert(peer_file.peer_id, peer_file);
 
-                                let mut ongoing = self.ongoing_connections.lock().unwrap();
+                                let mut ongoing = self.ongoing_connections.lock().await;
                                 *ongoing = *ongoing + 1;
                             }
                         } else {
@@ -930,34 +930,33 @@ impl Sekirei {
                     while let pt_in = pricing_chan_incoming.try_recv() {
                         if !pt_in.is_err() {
                             let (peer, amount) = pt_in.unwrap();
-                            let accounting = wings.accounting_peers.lock().unwrap();
+                            let accounting = wings.accounting_peers.lock().await;
                             let accounting_peer_lock = match accounting.get(&peer) {
                                 Some(aok) => aok,
                                 _ => continue,
                             };
-                            set_payment_threshold(accounting_peer_lock, amount);
+                            set_payment_threshold(accounting_peer_lock, amount).await;
                             {
-                                let bootnodes_set = wings.bootnodes.lock().unwrap();
+                                let bootnodes_set = wings.bootnodes.lock().await;
                                 let ol: String;
                                 {
-                                    let connected_peers_map = wings.connected_peers.lock().unwrap();
+                                    let connected_peers_map = wings.connected_peers.lock().await;
                                     ol = hex::encode(
                                         connected_peers_map.get(&peer).unwrap().overlay.clone(),
                                     );
                                 }
                                 if !bootnodes_set.contains(&peer.to_string()) {
-                                    let mut overlay_peers_map = wings.overlay_peers.lock().unwrap();
+                                    let mut overlay_peers_map = wings.overlay_peers.lock().await;
                                     if !overlay_peers_map.contains_key(&ol.to_string()) {
                                         self.interface_log(format!("Connected to peer {}", &ol));
                                         overlay_peers_map.insert(ol, peer);
 
                                         {
-                                            let mut connections = self.connections.lock().unwrap();
+                                            let mut connections = self.connections.lock().await;
                                             *connections = *connections + 1
                                         }
                                         {
-                                            let mut ongoing =
-                                                self.ongoing_connections.lock().unwrap();
+                                            let mut ongoing = self.ongoing_connections.lock().await;
                                             if *ongoing > 0 {
                                                 *ongoing = *ongoing - 1
                                             }
@@ -967,11 +966,11 @@ impl Sekirei {
                                     self.interface_log(format!("Connected to bootnode {}", &ol));
 
                                     {
-                                        let mut connections = self.connections.lock().unwrap();
+                                        let mut connections = self.connections.lock().await;
                                         *connections = *connections + 1
                                     }
                                     {
-                                        let mut ongoing = self.ongoing_connections.lock().unwrap();
+                                        let mut ongoing = self.ongoing_connections.lock().await;
                                         if *ongoing > 0 {
                                             *ongoing = *ongoing - 1
                                         }
@@ -993,7 +992,7 @@ impl Sekirei {
                         if !re_out.is_err() {
                             let (peer, amount) = re_out.unwrap();
                             {
-                                let map = wings.ongoing_refreshments.lock().unwrap();
+                                let map = wings.ongoing_refreshments.lock().await;
                                 if map.contains(&peer) {
                                     continue;
                                 }
@@ -1002,15 +1001,12 @@ impl Sekirei {
                             let mut daten = Date::now();
                             let datenow = daten;
                             {
-                                let accounting = wings.accounting_peers.lock().unwrap();
+                                let accounting = wings.accounting_peers.lock().await;
                                 let accounting_peer_lock = match accounting.get(&peer) {
                                     Some(aok) => aok,
                                     _ => continue,
                                 };
-                                let mut accounting_peer = match accounting_peer_lock.lock() {
-                                    Ok(aok) => aok,
-                                    _ => continue,
-                                };
+                                let mut accounting_peer = accounting_peer_lock.lock().await;
                                 daten = accounting_peer.refreshment;
                                 if datenow > accounting_peer.refreshment + 1000.0 {
                                     accounting_peer.refreshment = datenow;
@@ -1018,7 +1014,7 @@ impl Sekirei {
                             }
                             if datenow > daten + 1000.0 {
                                 {
-                                    let mut map = wings.ongoing_refreshments.lock().unwrap();
+                                    let mut map = wings.ongoing_refreshments.lock().await;
                                     map.insert(peer);
                                 }
                                 let ctrl7 = ctrl4.clone();
@@ -1043,14 +1039,14 @@ impl Sekirei {
                         if !re_in.is_err() {
                             let (peer, amount) = re_in.unwrap();
                             if amount > 0 {
-                                let accounting = wings.accounting_peers.lock().unwrap();
+                                let accounting = wings.accounting_peers.lock().await;
                                 let accounting_peer_lock = match accounting.get(&peer) {
                                     Some(aok) => aok,
                                     _ => continue,
                                 };
-                                apply_refreshment(accounting_peer_lock, amount);
+                                apply_refreshment(accounting_peer_lock, amount).await;
                             }
-                            let mut map = wings.ongoing_refreshments.lock().unwrap();
+                            let mut map = wings.ongoing_refreshments.lock().await;
                             if map.contains(&peer) {
                                 map.remove(&peer);
                             }
@@ -1273,7 +1269,7 @@ impl Sekirei {
             loop {
                 if !connections {
                     {
-                        let overlay_peers_map = wings.overlay_peers.lock().unwrap();
+                        let overlay_peers_map = wings.overlay_peers.lock().await;
                         if overlay_peers_map.len() > 0 {
                             connections = true;
                         }
@@ -1367,7 +1363,7 @@ impl Sekirei {
 
                 if !connections {
                     {
-                        let overlay_peers_map = wings.overlay_peers.lock().unwrap();
+                        let overlay_peers_map = wings.overlay_peers.lock().await;
                         if overlay_peers_map.len() > 0 {
                             connections = true;
                         }

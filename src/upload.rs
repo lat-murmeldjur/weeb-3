@@ -684,7 +684,7 @@ pub async fn push_chunk(
             current_max_po = 0;
             selected = false;
             {
-                let peers_map = peers.lock().unwrap();
+                let peers_map = peers.lock().await;
                 for (ov, id) in peers_map.iter() {
                     if skiplist.contains(id) {
                         continue;
@@ -733,13 +733,13 @@ pub async fn push_chunk(
             let req_price = price(&closest_overlay, &caddr);
 
             {
-                let accounting_peers = accounting.lock().unwrap();
+                let accounting_peers = accounting.lock().await;
                 if max_error > accounting_peers.len() {
                     max_error = accounting_peers.len();
                 };
                 if accounting_peers.contains_key(&closest_peer_id) {
                     let accounting_peer = accounting_peers.get(&closest_peer_id).unwrap();
-                    let allowed = reserve(accounting_peer, req_price, &refresh_chan);
+                    let allowed = reserve(accounting_peer, req_price, &refresh_chan).await;
                     if !allowed {
                         overdraftlist.insert(closest_peer_id);
                     } else {
@@ -768,28 +768,28 @@ pub async fn push_chunk(
 
         let receipt_received = chunk_in.try_recv();
         if receipt_received.is_err() {
-            let accounting_peers = accounting.lock().unwrap();
+            let accounting_peers = accounting.lock().await;
             if accounting_peers.contains_key(&closest_peer_id) {
                 let accounting_peer = accounting_peers.get(&closest_peer_id).unwrap();
-                cancel_reserve(accounting_peer, req_price)
+                cancel_reserve(accounting_peer, req_price).await
             }
         }
 
         match receipt_received {
             Ok(true) => {
-                let accounting_peers = accounting.lock().unwrap();
+                let accounting_peers = accounting.lock().await;
                 if accounting_peers.contains_key(&closest_peer_id) {
                     let accounting_peer = accounting_peers.get(&closest_peer_id).unwrap();
-                    apply_credit(accounting_peer, req_price);
+                    apply_credit(accounting_peer, req_price).await;
                 }
                 break; // move this to receipt validation later
             }
             _ => {
                 error_count += 1;
-                let accounting_peers = accounting.lock().unwrap();
+                let accounting_peers = accounting.lock().await;
                 if accounting_peers.contains_key(&closest_peer_id) {
                     let accounting_peer = accounting_peers.get(&closest_peer_id).unwrap();
-                    cancel_reserve(accounting_peer, req_price)
+                    cancel_reserve(accounting_peer, req_price).await
                 }
             }
         };
