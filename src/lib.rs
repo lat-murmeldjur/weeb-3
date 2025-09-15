@@ -27,10 +27,10 @@ use libp2p::{
         future::join_all, //
         join,
     },
-    // identify,
+    identify,
     identity,
     identity::{ecdsa, ecdsa::SecretKey},
-    // ping,
+    ping,
     swarm::{NetworkBehaviour, SwarmEvent},
     webrtc_websys,
 };
@@ -585,14 +585,16 @@ impl Sekirei {
         let mut incoming_pricing_streams;
         let mut incoming_gossip_streams;
 
+        let swarm0 = self.swarm.clone();
+
         {
-            let mut swarm = self.swarm.lock().await;
-            ctrl0 = swarm.behaviour_mut().stream.new_control();
-            ctrl1 = swarm.behaviour_mut().stream.new_control();
-            ctrl3 = swarm.behaviour_mut().stream.new_control();
-            ctrl4 = swarm.behaviour_mut().stream.new_control();
-            ctrl6 = swarm.behaviour_mut().stream.new_control();
-            ctrl8 = swarm.behaviour_mut().stream.new_control();
+            let swarm = swarm0.lock().await;
+            ctrl0 = swarm.behaviour().stream.new_control();
+            ctrl1 = ctrl0.clone();
+            ctrl3 = ctrl0.clone();
+            ctrl4 = ctrl0.clone();
+            ctrl6 = ctrl0.clone();
+            ctrl8 = ctrl0.clone();
         }
 
         incoming_pricing_streams = ctrl0.accept(PRICING_PROTOCOL).unwrap();
@@ -610,237 +612,280 @@ impl Sekirei {
             }
         };
 
-        let swarm_event_handle = async {
-            let mut swarm = self.swarm.lock().await;
+        let swarm_event_handle_0 = async {
             loop {
+                let mut dial_joiner = Vec::new();
+
                 #[allow(irrefutable_let_patterns)]
                 while let paddr0 = peers_instructions_chan_incoming.try_recv() {
                     if !paddr0.is_err() {
-                        // web_sys::console::log_1(&JsValue::from(format!(
-                        //     "Current Conn Handled {:#?}",
-                        //     paddr
-                        // )));
+                        let handle = async {
+                            // web_sys::console::log_1(&JsValue::from(format!(
+                            //     "Current Conn Handled {:#?}",
+                            //     paddr
+                            // )));
 
-                        let paddr = match paddr0 {
-                            Ok(aok) => aok,
-                            _ => {
-                                continue;
-                            }
-                        };
-
-                        let rtclist = paddr.clone().rtc_underlays;
-
-                        for rtcaddr in rtclist.iter() {
-                            let addr3 = match libp2p::core::Multiaddr::try_from(rtcaddr.clone()) {
+                            let paddr = match paddr0 {
                                 Ok(aok) => aok,
                                 _ => {
-                                    continue;
+                                    return;
                                 }
                             };
 
-                            let prck = addr3.protocol_stack();
+                            let rtclist = paddr.clone().rtc_underlays;
+
+                            for rtcaddr in rtclist.iter() {
+                                let addr3 = match libp2p::core::Multiaddr::try_from(rtcaddr.clone())
+                                {
+                                    Ok(aok) => aok,
+                                    _ => {
+                                        return;
+                                    }
+                                };
+
+                                let prck = addr3.protocol_stack();
+                                let mut webrtc_direct = false;
+                                for p in prck {
+                                    if p == "webrtc-direct" {
+                                        for protocol in addr3.iter() {
+                                            match protocol {
+                                                Protocol::Ip4(addr) => {
+                                                    if addr != Ipv4Addr::new(127, 0, 0, 1) {
+                                                        webrtc_direct = true;
+                                                    }
+                                                }
+                                                _ => {
+                                                    continue;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+
+                                if webrtc_direct {
+                                    let _pid: PeerId = match try_from_multiaddr(&addr3.clone()) {
+                                        Some(aok) => {
+                                            let connected_peers_map =
+                                                wings.connected_peers.lock().await;
+                                            if connected_peers_map.contains_key(&aok) {
+                                                return;
+                                            }
+                                            let mut connection_attempts_map =
+                                                wings.connection_attempts.lock().await;
+                                            if connection_attempts_map.contains(&aok) {
+                                                return;
+                                            } else {
+                                                connection_attempts_map.insert(aok);
+                                            }
+                                            aok
+                                        }
+                                        _ => {
+                                            return;
+                                        }
+                                    };
+
+                                    {
+                                        let mut swarm = self.swarm.lock_arc().await;
+
+                                        let _ = swarm.dial(addr3.clone());
+                                    }
+
+                                    let mut paddr5 = paddr.clone();
+                                    paddr5.underlay = addr3.to_vec();
+
+                                    let _ = connections_instructions_chan_outgoing
+                                        .send((paddr5.clone(), false));
+                                }
+                            }
+
+                            let addr4 =
+                                match libp2p::core::Multiaddr::try_from(paddr.clone().underlay) {
+                                    Ok(aok) => aok,
+                                    _ => {
+                                        return;
+                                    }
+                                };
+
+                            let prck = addr4.protocol_stack();
                             let mut webrtc_direct = false;
                             for p in prck {
                                 if p == "webrtc-direct" {
-                                    for protocol in addr3.iter() {
-                                        match protocol {
-                                            Protocol::Ip4(addr) => {
-                                                if addr != Ipv4Addr::new(127, 0, 0, 1) {
-                                                    webrtc_direct = true;
-                                                }
-                                            }
-                                            _ => continue,
-                                        }
-                                    }
+                                    webrtc_direct = true;
                                 }
                             }
 
                             if webrtc_direct {
-                                let _pid: PeerId = match try_from_multiaddr(&addr3.clone()) {
+                                let _pid: PeerId = match try_from_multiaddr(&addr4.clone()) {
                                     Some(aok) => {
                                         let connected_peers_map =
                                             wings.connected_peers.lock().await;
                                         if connected_peers_map.contains_key(&aok) {
-                                            continue;
+                                            return;
                                         }
                                         let mut connection_attempts_map =
                                             wings.connection_attempts.lock().await;
                                         if connection_attempts_map.contains(&aok) {
-                                            continue;
+                                            return;
                                         } else {
                                             connection_attempts_map.insert(aok);
                                         }
                                         aok
                                     }
                                     _ => {
-                                        continue;
+                                        return;
                                     }
                                 };
-                                let _ = swarm.dial(addr3.clone());
+                                {
+                                    let mut swarm = self.swarm.lock_arc().await;
+
+                                    let _ = swarm.dial(addr4.clone());
+                                }
 
                                 let mut paddr5 = paddr.clone();
-                                paddr5.underlay = addr3.to_vec();
+                                paddr5.underlay = addr4.to_vec();
 
                                 let _ = connections_instructions_chan_outgoing
                                     .send((paddr5.clone(), false));
                             }
-                        }
-
-                        let addr4 = match libp2p::core::Multiaddr::try_from(paddr.clone().underlay)
-                        {
-                            Ok(aok) => aok,
-                            _ => {
-                                continue;
-                            }
                         };
-
-                        let prck = addr4.protocol_stack();
-                        let mut webrtc_direct = false;
-                        for p in prck {
-                            if p == "webrtc-direct" {
-                                webrtc_direct = true;
-                            }
-                        }
-
-                        if webrtc_direct {
-                            let _pid: PeerId = match try_from_multiaddr(&addr4.clone()) {
-                                Some(aok) => {
-                                    let connected_peers_map = wings.connected_peers.lock().await;
-                                    if connected_peers_map.contains_key(&aok) {
-                                        continue;
-                                    }
-                                    let mut connection_attempts_map =
-                                        wings.connection_attempts.lock().await;
-                                    if connection_attempts_map.contains(&aok) {
-                                        continue;
-                                    } else {
-                                        connection_attempts_map.insert(aok);
-                                    }
-                                    aok
-                                }
-                                _ => {
-                                    continue;
-                                }
-                            };
-
-                            let _ = swarm.dial(addr4.clone());
-
-                            let mut paddr5 = paddr.clone();
-                            paddr5.underlay = addr4.to_vec();
-
-                            let _ = connections_instructions_chan_outgoing
-                                .send((paddr5.clone(), false));
-                        }
+                        dial_joiner.push(handle);
                     } else {
                         break;
                     };
                 }
 
-                let event = async_std::future::timeout(
-                    Duration::from_millis(EVENT_LOOP_INTERRUPTOR as u64),
-                    swarm.next(),
-                )
-                .await;
+                join_all(dial_joiner).await;
+                async_std::task::sleep(Duration::from_millis(300)).await;
+            }
+        };
 
-                // self.interface_log(format!("Current Event Handled {:#?}", event)).await;
-                // web_sys::console::log_1(&JsValue::from(format!(
-                //     "Current Event Handled {:#?}",
-                //     event
-                // )));
+        let swarm_event_handle_1 = async {
+            loop {
+                {
+                    let mut swarm = self.swarm.lock_arc().await;
 
-                if !event.is_err() {
-                    match event.unwrap() {
-                        Some(SwarmEvent::ConnectionEstablished {
-                            // peer_id,
-                            // established_in,
-                            ..
-                        }) => {
-                            //
-                        }
-                        Some(SwarmEvent::ConnectionClosed { peer_id, .. }) => {
-                            {
-                                let mut connected_peers_map = wings.connected_peers.lock().await;
-                                let mut overlay_peers_map = wings.overlay_peers.lock().await;
-                                if connected_peers_map.contains_key(&peer_id) {
-                                    let ol0 = hex::encode(connected_peers_map.get(&peer_id).unwrap().overlay.clone());
-                                    if overlay_peers_map.contains_key(&ol0) {
-                                        overlay_peers_map.remove(&ol0);
-                                        {
-                                           let mut connections = self.connections.lock().await;
-                                            if *connections > 0 {
-                                                *connections = *connections - 1
-                                            }
-                                        }
-                                    } else {
-                                        {
-                                           let mut ongoing = self.ongoing_connections.lock().await;
-                                            if *ongoing > 0 {
-                                                *ongoing = *ongoing - 1
-                                            }
-                                        }
+                    #[allow(irrefutable_let_patterns)]
+                    while let event = async_std::future::timeout(
+                        Duration::from_millis(EVENT_LOOP_INTERRUPTOR as u64),
+                        swarm.next(),
+                    )
+                    .await
+                    {
+                        if !event.is_err() {
+                            // self.interface_log(format!("Current Event Handled {:#?}", event));
+                            // web_sys::console::log_1(&JsValue::from(format!(
+                            //     "Current Event Handled {:#?}",
+                            //     event
+                            // )));
+                            match event.unwrap() {
+                                Some(SwarmEvent::ConnectionEstablished {
+                                    // peer_id,
+                                    // established_in,
+                                    ..
+                                }) => {
+                                    //
+                                }
+                                Some(SwarmEvent::ConnectionClosed { peer_id, .. }) => {
+                                    {
+                                        let mut connected_peers_map = wings.connected_peers.lock().await;
+                                        let mut overlay_peers_map = wings.overlay_peers.lock().await;
+                                        if connected_peers_map.contains_key(&peer_id) {
+                                            let ol0 = hex::encode(connected_peers_map.get(&peer_id).unwrap().overlay.clone());
+                                            if overlay_peers_map.contains_key(&ol0) {
+                                                overlay_peers_map.remove(&ol0);
+                                                {
+                                                   let mut connections = self.connections.lock().await;
+                                                    if *connections > 0 {
+                                                        *connections = *connections - 1
+                                                    }
+                                                }
+                                            } else {
+                                                {
+                                                   let mut ongoing = self.ongoing_connections.lock().await;
+                                                    if *ongoing > 0 {
+                                                        *ongoing = *ongoing - 1
+                                                    }
+                                                }
+                                            };
+                                            connected_peers_map.remove(&peer_id);
+                                            self.interface_log(format!("Disconnected from peer {}", &ol0));
+                                        };
+                                    }
+                                    let mut accounting = wings.accounting_peers.lock().await;
+                                    if accounting.contains_key(&peer_id) {
+                                        accounting.remove(&peer_id);
                                     };
-                                    connected_peers_map.remove(&peer_id);
-                                    self.interface_log(format!("Disconnected from peer {}", &ol0));
-                                };
+                                }
+                                _ => {}
                             }
-                            let mut accounting = wings.accounting_peers.lock().await;
-                            if accounting.contains_key(&peer_id) {
-                                accounting.remove(&peer_id);
-                            };
+                        } else {
+                            break;
                         }
-                        _ => {}
                     }
-                } else {
                 }
+                async_std::task::sleep(Duration::from_millis(300)).await;
+            }
+        };
+
+        let swarm_event_handle_2 = async {
+            loop {
+                let mut bootnode_dial_joiner = Vec::new();
 
                 #[allow(irrefutable_let_patterns)]
                 while let bootnode_change = self.bootnode_port.1.try_recv() {
                     if !bootnode_change.is_err() {
-                        let (baddr, chan) = bootnode_change.unwrap();
+                        let handle = async {
+                            let (baddr, chan) = bootnode_change.unwrap();
 
-                        let addr33 = match baddr.parse::<Multiaddr>() {
-                            Ok(aok) => aok,
-                            _ => {
-                                let _ =
-                                    chan.send("parse multiaddress for bootnode failed".to_string());
-                                break;
-                            }
-                        };
-
-                        // let bn_id: PeerId = match try_from_multiaddr(&addr33.clone()) {
-                        //     Some(aok) => aok,
-                        //     _ => {
-                        //         let _ = chan.send("parse peerid for bootnode failed".to_string());
-                        //         break;
-                        //     }
-                        // };
-                        let _pid: PeerId = match try_from_multiaddr(&addr33.clone()) {
-                            Some(aok) => {
-                                let mut connection_attempts_map =
-                                    wings.connection_attempts.lock().await;
-                                if connection_attempts_map.contains(&aok) {
-                                    continue;
-                                } else {
-                                    connection_attempts_map.insert(aok);
+                            let addr33 = match baddr.parse::<Multiaddr>() {
+                                Ok(aok) => aok,
+                                _ => {
+                                    let _ = chan
+                                        .send("parse multiaddress for bootnode failed".to_string());
+                                    return;
                                 }
-                                aok
+                            };
+
+                            // let bn_id: PeerId = match try_from_multiaddr(&addr33.clone()) {
+                            //     Some(aok) => aok,
+                            //     _ => {
+                            //         let _ = chan.send("parse peerid for bootnode failed".to_string());
+                            //         break;
+                            //     }
+                            // };
+                            let _pid: PeerId = match try_from_multiaddr(&addr33.clone()) {
+                                Some(aok) => {
+                                    let mut connection_attempts_map =
+                                        wings.connection_attempts.lock().await;
+                                    if connection_attempts_map.contains(&aok) {
+                                        return;
+                                    } else {
+                                        connection_attempts_map.insert(aok);
+                                    }
+                                    aok
+                                }
+                                _ => return,
+                            };
+                            {
+                                let mut swarm = self.swarm.lock_arc().await;
+
+                                let _ = swarm.dial(addr33.clone());
                             }
-                            _ => break,
+                            let _ = chan.send("dialing bootnode".to_string());
+
+                            let mut bzzaddr = etiquette_2::BzzAddress::default();
+
+                            bzzaddr.underlay = addr33.to_vec();
+
+                            let _ = connections_instructions_chan_outgoing.send((bzzaddr, true));
                         };
-
-                        let _ = swarm.dial(addr33.clone());
-
-                        let _ = chan.send("dialing bootnode".to_string());
-
-                        let mut bzzaddr = etiquette_2::BzzAddress::default();
-
-                        bzzaddr.underlay = addr33.to_vec();
-
-                        let _ = connections_instructions_chan_outgoing.send((bzzaddr, true));
+                        bootnode_dial_joiner.push(handle);
                     } else {
                         break;
                     }
                 }
+                join_all(bootnode_dial_joiner).await;
+                async_std::task::sleep(Duration::from_millis(300)).await;
             }
         };
 
@@ -849,43 +894,48 @@ impl Sekirei {
             let mut interrupt_last = Date::now();
             loop {
                 let k0 = async {
+                    let mut joiner = Vec::new();
                     #[allow(irrefutable_let_patterns)]
                     while let that = connections_instructions_chan_incoming.try_recv() {
                         if !that.is_err() {
-                            let (bzzaddr0, bootn) = that.unwrap();
+                            let handle = async {
+                                let (bzzaddr0, bootn) = that.unwrap();
 
-                            let addr3 =
-                                libp2p::core::Multiaddr::try_from(bzzaddr0.underlay).unwrap();
-                            let id = match try_from_multiaddr(&addr3) {
-                                Some(aok) => aok,
-                                _ => continue,
+                                let addr3 =
+                                    libp2p::core::Multiaddr::try_from(bzzaddr0.underlay).unwrap();
+                                let id = match try_from_multiaddr(&addr3) {
+                                    Some(aok) => aok,
+                                    _ => return,
+                                };
+                                let nid: u64;
+                                {
+                                    let nid0 = self.network_id.lock().await.clone();
+                                    nid = nid0;
+                                }
+
+                                if bootn {
+                                    let mut bootnodes_set = wings.bootnodes.lock().await;
+                                    bootnodes_set.insert(id.to_string());
+                                }
+
+                                async_std::task::sleep(Duration::from_millis(6400)).await; // stall
+
+                                connection_handler(
+                                    id,
+                                    nid,
+                                    ctrl3.clone(),
+                                    &addr3.clone(),
+                                    &(*self.secret_key.lock().await),
+                                    &accounting_peer_chan_outgoing.clone(),
+                                )
+                                .await;
                             };
-                            let nid: u64;
-                            {
-                                let nid0 = self.network_id.lock().await.clone();
-                                nid = nid0;
-                            }
-
-                            if bootn {
-                                let mut bootnodes_set = wings.bootnodes.lock().await;
-                                bootnodes_set.insert(id.to_string());
-                            }
-
-                            async_std::task::sleep(Duration::from_millis(2000)).await; // stall
-
-                            connection_handler(
-                                id,
-                                nid,
-                                ctrl3.clone(),
-                                &addr3.clone(),
-                                &(*self.secret_key.lock().await),
-                                &accounting_peer_chan_outgoing.clone(),
-                            )
-                            .await;
+                            joiner.push(handle);
                         } else {
                             break;
                         }
                     }
+                    join_all(joiner).await;
                 };
 
                 let k1 = async {
@@ -1428,7 +1478,9 @@ impl Sekirei {
             push_handle,
             push_data_handle,
             push_chunk_handle,
-            swarm_event_handle,
+            swarm_event_handle_0,
+            swarm_event_handle_1,
+            swarm_event_handle_2,
             gossip_inbound_handle,
             pricing_inbound_handle,
         );
@@ -1444,13 +1496,13 @@ struct Behaviour {
     // autonat: autonat::v2::client::Behaviour,
     // autonat_s: autonat::v2::server::Behaviour,
     // dcutr: dcutr::Behaviour,
-    // identify: identify::Behaviour,
-    // ping: ping::Behaviour,
+    identify: identify::Behaviour,
+    ping: ping::Behaviour,
     stream: stream::Behaviour,
 }
 
 impl Behaviour {
-    fn new(_local_public_key: identity::PublicKey) -> Self {
+    fn new(local_public_key: identity::PublicKey) -> Self {
         Self {
             // autonat: autonat::v2::client::Behaviour::new(
             //     OsRng,
@@ -1458,12 +1510,12 @@ impl Behaviour {
             // ),
             // autonat_s: autonat::v2::server::Behaviour::new(OsRng),
             // dcutr: dcutr::Behaviour::new(local_public_key.to_peer_id()),
-            // identify: identify::Behaviour::new(
-            //     identify::Config::new("/weeb-3".into(), local_public_key.clone())
-            //         .with_push_listen_addr_updates(true)
-            //         .with_interval(Duration::from_secs(30)), // .with_cache_size(10), //
-            // ),
-            // ping: ping::Behaviour::new(ping::Config::new().with_interval(Duration::from_secs(9))),
+            identify: identify::Behaviour::new(
+                identify::Config::new("/weeb-3".into(), local_public_key.clone())
+                    .with_push_listen_addr_updates(true)
+                    .with_interval(Duration::from_secs(30)), // .with_cache_size(10), //
+            ),
+            ping: ping::Behaviour::new(ping::Config::new().with_interval(Duration::from_secs(15))),
             stream: stream::Behaviour::new(),
         }
     }
