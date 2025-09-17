@@ -72,7 +72,7 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
     let interface_async = async move {
         web_sys::console::log_1(&JsValue::from(format!("host2 {:#?}", host2)));
 
-        let document = web_sys::window().unwrap().document().unwrap();
+        // let document = web_sys::window().unwrap().document().unwrap();
 
         let callback =
             wasm_bindgen::closure::Closure::<dyn FnMut(web_sys::MessageEvent)>::new(move |_msg| {
@@ -108,7 +108,10 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
                 }
             });
 
-        document
+        web_sys::window()
+            .unwrap()
+            .document()
+            .unwrap()
             .get_element_by_id("inputString")
             .expect("#inputString should exist")
             .dyn_ref::<HtmlInputElement>()
@@ -409,7 +412,10 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
                 });
             });
 
-        document
+        web_sys::window()
+            .unwrap()
+            .document()
+            .unwrap()
             .get_element_by_id("uploadGetBatch")
             .expect("#uploadGetBatch should exist")
             .dyn_ref::<HtmlButtonElement>()
@@ -530,7 +536,10 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
             },
         );
 
-        document
+        web_sys::window()
+            .unwrap()
+            .document()
+            .unwrap()
             .get_element_by_id("uploadFile")
             .expect("#uploadFile should exist")
             .dyn_ref::<HtmlButtonElement>()
@@ -543,48 +552,22 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
 
                 console::log_1(&"oninput bootnode callback".into());
 
-                let document = web_sys::window().unwrap().document().unwrap();
+                spawn_local(async move {
+                    let (bna, nid) = parsebootconnect();
+                    let result = sekirei00.change_bootnode_address(bna, nid).await;
 
-                let bootnode_input = document
-                    .get_element_by_id("bootNodeMASettings")
-                    .expect("#bootNodeMASettings should exist");
+                    let (data, indx) = decode_resources(result);
 
-                let bootnode_input = bootnode_input
-                    .dyn_ref::<HtmlInputElement>()
-                    .expect("#bootNodeMASettings should be a HtmlInputElement");
+                    render_result(data, indx).await;
+                });
 
-                web_sys::console::log_1(&"g0 bootnode change triggered".into());
-                match bootnode_input.value().parse::<String>() {
-                    Ok(bootnode_address) => {
-                        web_sys::console::log_1(&"g1 bootnode change triggered".into());
-
-                        let network_id_input = document
-                            .get_element_by_id("networkIDSettings")
-                            .expect("#networkIDSettings should exist");
-
-                        let network_id_input = network_id_input
-                            .dyn_ref::<HtmlInputElement>()
-                            .expect("#networkIDSettings should be a HtmlInputElement");
-
-                        match network_id_input.value().parse::<String>() {
-                            Ok(network_id) => spawn_local(async move {
-                                let result = sekirei00
-                                    .change_bootnode_address(bootnode_address, network_id)
-                                    .await;
-
-                                let (data, indx) = decode_resources(result);
-
-                                render_result(data, indx).await;
-                            }),
-                            _ => {}
-                        };
-                    }
-                    _ => {}
-                };
                 console::log_1(&"oninput network settings callback happened".into());
             });
 
-        document
+        web_sys::window()
+            .unwrap()
+            .document()
+            .unwrap()
             .get_element_by_id("networkSet")
             .expect("#networkSet should exist")
             .dyn_ref::<HtmlButtonElement>()
@@ -615,7 +598,10 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
             }
             });
 
-        document
+        web_sys::window()
+            .unwrap()
+            .document()
+            .unwrap()
             .get_element_by_id("uploadResetStamp")
             .expect("#uploadResetStamp should exist")
             .dyn_ref::<HtmlButtonElement>()
@@ -631,7 +617,10 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
 
             let ongoing = sekirei5.get_ongoing_connections().await;
 
-            let _ = document
+            let _ = web_sys::window()
+                .unwrap()
+                .document()
+                .unwrap()
                 .get_element_by_id("ongoing")
                 .expect("#ongoing should exist")
                 .dyn_ref::<HtmlSpanElement>()
@@ -640,7 +629,10 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
 
             let connections = sekirei5.get_connections().await;
 
-            let _ = document
+            let _ = web_sys::window()
+                .unwrap()
+                .document()
+                .unwrap()
                 .get_element_by_id("connections")
                 .expect("#connections should exist")
                 .dyn_ref::<HtmlSpanElement>()
@@ -877,4 +869,38 @@ async fn render_result(data: Vec<(Vec<u8>, String, String)>, indx: String) {
             .prepend_with_node_1(&new_element)
             .unwrap();
     }
+}
+
+pub fn parsebootconnect() -> (String, String) {
+    let document = web_sys::window().unwrap().document().unwrap();
+
+    let bootnode_input = document
+        .get_element_by_id("bootNodeMASettings")
+        .expect("#bootNodeMASettings should exist");
+
+    let bootnode_input = bootnode_input
+        .dyn_ref::<HtmlInputElement>()
+        .expect("#bootNodeMASettings should be a HtmlInputElement");
+
+    web_sys::console::log_1(&"g0 bootnode change triggered".into());
+    match bootnode_input.value().parse::<String>() {
+        Ok(bootnode_address) => {
+            web_sys::console::log_1(&"g1 bootnode change triggered".into());
+
+            let network_id_input = document
+                .get_element_by_id("networkIDSettings")
+                .expect("#networkIDSettings should exist");
+
+            let network_id_input = network_id_input
+                .dyn_ref::<HtmlInputElement>()
+                .expect("#networkIDSettings should be a HtmlInputElement");
+
+            match network_id_input.value().parse::<String>() {
+                Ok(network_id) => return (bootnode_address, network_id),
+                _ => return (bootnode_address, "10".to_string()),
+            };
+        }
+        _ => {}
+    };
+    return ("".to_string(), "".to_string());
 }

@@ -9,7 +9,6 @@ use std::num::NonZero;
 use std::sync::mpsc;
 use std::time::Duration;
 
-// use rand::rngs::OsRng;
 use tar::Archive;
 
 use alloy::primitives::keccak256;
@@ -50,6 +49,7 @@ mod handlers;
 use handlers::*;
 
 mod interface;
+use interface::parsebootconnect;
 
 mod manifest;
 
@@ -828,6 +828,9 @@ impl Sekirei {
         };
 
         let swarm_event_handle_2 = async {
+            let (bna, nid) = parsebootconnect();
+            self.change_bootnode_address(bna, nid).await;
+
             loop {
                 let mut bootnode_dial_joiner = Vec::new();
 
@@ -1338,20 +1341,28 @@ impl Sekirei {
                         let handle = async {
                             let (d, soc, checkad, stamp, feedback) = incoming_request.unwrap();
 
-                            let _address = push_chunk(
-                                d,
-                                soc,
-                                checkad,
-                                stamp,
+                            let address = push_chunk(
+                                d.clone(),
+                                soc.clone(),
+                                checkad.clone(),
+                                stamp.clone(),
                                 ctrl8.clone(),
                                 &wings.overlay_peers,
                                 &wings.accounting_peers,
                                 &refreshment_instructions_chan_outgoing,
                             )
                             .await;
-
-                            let _ = feedback.send(true);
-
+                            if address.len() == 0 {
+                                let _ = chunk_upload_chan_outgoing.send((
+                                    d.clone(),
+                                    soc.clone(),
+                                    checkad.clone(),
+                                    stamp.clone(),
+                                    feedback.clone(),
+                                ));
+                            } else {
+                                let _ = feedback.send(true);
+                            }
                             //
                             //                            let data_available = retrieve_chunk(
                             //                                &checkad,
@@ -1441,7 +1452,11 @@ impl Sekirei {
                             )
                             .await;
 
-                            chan.send(chunk_data).unwrap();
+                            if chunk_data.len() == 0 {
+                                let _ = chunk_retrieve_chan_outgoing.send((n, chan.clone()));
+                            } else {
+                                chan.send(chunk_data).unwrap();
+                            };
                         };
                         request_joiner.push(handle);
                     } else {

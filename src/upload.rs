@@ -782,7 +782,8 @@ pub async fn push_chunk(
                     let accounting_peer = accounting_peers.get(&closest_peer_id).unwrap();
                     apply_credit(accounting_peer, req_price).await;
                 }
-                break; // move this to receipt validation later
+                // missing receipt validation
+                return caddr;
             }
             _ => {
                 error_count += 1;
@@ -795,7 +796,7 @@ pub async fn push_chunk(
         };
     }
 
-    return caddr;
+    return vec![];
 }
 
 pub fn encrypt(span: usize, cd: &Vec<u8>, encrey: &Vec<u8>) -> Vec<u8> {
