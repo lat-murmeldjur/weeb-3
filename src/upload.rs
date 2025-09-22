@@ -754,7 +754,7 @@ pub async fn push_chunk(
         let (chunk_out, chunk_in) = mpsc::channel::<bool>();
 
         let _ = async_std::future::timeout(
-            Duration::from_secs(10),
+            Duration::from_secs(15),
             pushsync_handler(
                 closest_peer_id,
                 &caddr,
@@ -782,8 +782,7 @@ pub async fn push_chunk(
                     let accounting_peer = accounting_peers.get(&closest_peer_id).unwrap();
                     apply_credit(accounting_peer, req_price).await;
                 }
-                // missing receipt validation
-                return caddr;
+                break; // move this to receipt validation later
             }
             _ => {
                 error_count += 1;
@@ -796,7 +795,7 @@ pub async fn push_chunk(
         };
     }
 
-    return vec![];
+    return caddr;
 }
 
 pub fn encrypt(span: usize, cd: &Vec<u8>, encrey: &Vec<u8>) -> Vec<u8> {

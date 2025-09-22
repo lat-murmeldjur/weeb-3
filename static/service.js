@@ -27,9 +27,12 @@ const cacheFirst = async (request) => {
   console.log("respc: ", responseFromCache);
   if (responseFromCache) {
     return responseFromCache;
-  }
+  } 
   console.log("loading from cache failed");
-  return fetch(request);
+  let originWithSlashWeeb3 = origin + '/weeb-3';
+  const newRequest = new Request(originWithSlashWeeb3, request);
+  console.log("request change", newRequest);
+  return fetch(newRequest);
 };
 
 self.addEventListener("fetch", (event) => {

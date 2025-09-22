@@ -1,28 +1,12 @@
 #![cfg(target_arch = "wasm32")]
 
-use std::collections::HashMap;
-
 use libp2p::multiaddr::Protocol;
 use libp2p::{Multiaddr, PeerId};
 
 use alloy::primitives::keccak256;
 use alloy::primitives::{Signature, normalize_v};
-use serde::{Deserialize, Serialize};
+
 use wasm_bindgen::prelude::*;
-
-// use std::io;
-// use web_sys::{Document, HtmlElement};
-
-#[derive(Debug, Deserialize, Serialize)]
-pub struct Entry {
-    pub reference: String,
-    pub meta: HashMap<String, String>,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-pub struct Manifest {
-    pub entries: HashMap<String, Entry>,
-}
 
 pub const MAX_PO: u8 = 31;
 pub const SPAN_SIZE: usize = 8;

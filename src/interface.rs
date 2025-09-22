@@ -43,7 +43,7 @@ use crate::{
 pub async fn interweeb(_st: String) -> Result<(), JsError> {
     //    init_panic_hook();
 
-    set_batch_bucket_limit(2).await;
+    set_batch_bucket_limit(128).await;
 
     let sekirei = Arc::new(Sekirei::new("".to_string()));
 
@@ -758,49 +758,9 @@ async fn render_result(data: Vec<(Vec<u8>, String, String)>, indx: String) {
     } else {
         let date3 = Date::now().to_string();
 
-        let service0 = web_sys::window().unwrap().navigator().service_worker();
-
-        match JsFuture::from(service0.register("./service.js")).await {
-            Ok(registration) => {
-                let _ = JsFuture::from(
-                    registration
-                        .unchecked_into::<ServiceWorkerRegistration>()
-                        .update()
-                        .unwrap(),
-                )
-                .await;
-                let _ = JsFuture::from(service0.ready().unwrap()).await;
-            }
-            Err(err) => {
-                console::warn_1(&err);
-            }
-        }
-
-        let registration0 = JsFuture::from(service0.get_registration()).await;
-
-        let registration1: ServiceWorkerRegistration = match registration0 {
-            Ok(registration) => {
-                let reg = registration.dyn_into();
-                match reg {
-                    Ok(reg) => reg,
-                    _ => {
-                        service_worker_missing();
-                        return;
-                    }
-                }
-            }
-            _ => {
-                service_worker_missing();
-                return;
-            }
-        };
-
-        let service_worker0 = registration1.active();
-
-        let service_worker1 = match service_worker0 {
+        let service_worker1 = match get_service_worker().await {
             Some(service_worker) => service_worker,
-            _ => {
-                service_worker_missing();
+            None => {
                 return;
             }
         };
@@ -903,4 +863,55 @@ pub fn parsebootconnect() -> (String, String) {
         _ => {}
     };
     return ("".to_string(), "".to_string());
+}
+
+pub async fn get_service_worker() -> Option<web_sys::ServiceWorker> {
+    let service0 = web_sys::window().unwrap().navigator().service_worker();
+
+    match JsFuture::from(service0.register("./service.js")).await {
+        Ok(registration) => {
+            let _ = JsFuture::from(
+                registration
+                    .unchecked_into::<ServiceWorkerRegistration>()
+                    .update()
+                    .unwrap(),
+            )
+            .await;
+            let _ = JsFuture::from(service0.ready().unwrap()).await;
+        }
+        Err(err) => {
+            console::warn_1(&err);
+        }
+    }
+
+    let registration0 = JsFuture::from(service0.get_registration()).await;
+
+    let registration1: ServiceWorkerRegistration = match registration0 {
+        Ok(registration) => {
+            let reg = registration.dyn_into();
+            match reg {
+                Ok(reg) => reg,
+                _ => {
+                    service_worker_missing();
+                    return None;
+                }
+            }
+        }
+        _ => {
+            service_worker_missing();
+            return None;
+        }
+    };
+
+    let service_worker0 = registration1.active();
+
+    let _service_worker1 = match service_worker0 {
+        Some(service_worker) => {
+            return Some(service_worker);
+        }
+        _ => {
+            service_worker_missing();
+            return None;
+        }
+    };
 }

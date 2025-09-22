@@ -409,16 +409,16 @@ pub async fn retrieve_chunk(
 
         cd = match chunk_data {
             Ok(ref x) => x.clone(),
-            Err(_x) => {
-                error_count += 1;
+            Err(x) => {
                 let accounting_peers = accounting.lock().await;
                 if accounting_peers.contains_key(&closest_peer_id) {
                     let accounting_peer = accounting_peers.get(&closest_peer_id).unwrap();
                     cancel_reserve(accounting_peer, req_price).await
                 }
                 web_sys::console::log_1(&JsValue::from(format!(
-                    "unable to retrieve chunk {} error",
-                    hex::encode(chunk_address)
+                    "unable to retrieve chunk {} error {}",
+                    hex::encode(chunk_address),
+                    x
                 )));
                 vec![]
             }
@@ -430,6 +430,10 @@ pub async fn retrieve_chunk(
             Ok(_x) => {
                 (chunk_valid, soc) = verify_chunk(&caddr, &cd);
                 if chunk_valid {
+                    web_sys::console::log_1(&JsValue::from(format!(
+                        "chunk valid {}",
+                        hex::encode(&caddr),
+                    )));
                     {
                         let accounting_peers = accounting.lock().await;
                         if accounting_peers.contains_key(&closest_peer_id) {
@@ -482,6 +486,7 @@ pub async fn retrieve_chunk(
             hex::encode(chunk_address)
         )));
     }
+
     return cd;
 }
 
@@ -490,11 +495,21 @@ pub fn verify_chunk(caddr: &Vec<u8>, cd: &Vec<u8>) -> (bool, bool) {
     if !contaddrd {
         let soc = valid_soc(&cd, &caddr);
         if !soc {
+            web_sys::console::log_1(&JsValue::from(format!(
+                "invalid soc {}",
+                hex::encode(&caddr)
+            )));
             return (false, false);
         } else {
+            web_sys::console::log_1(&JsValue::from(format!("valid soc {}", hex::encode(&caddr))));
             return (true, true);
         }
     } else {
+        web_sys::console::log_1(&JsValue::from(format!(
+            "valid cac {} {}",
+            cd.len(),
+            hex::encode(&caddr)
+        )));
         return (true, false);
     }
 }

@@ -26,10 +26,10 @@ use libp2p::{
         future::join_all, //
         join,
     },
-    identify,
+    //  identify,
     identity,
     identity::{ecdsa, ecdsa::SecretKey},
-    ping,
+    //  ping,
     swarm::{NetworkBehaviour, SwarmEvent},
     webrtc_websys,
 };
@@ -588,13 +588,13 @@ impl Sekirei {
         let swarm0 = self.swarm.clone();
 
         {
-            let swarm = swarm0.lock().await;
-            ctrl0 = swarm.behaviour().stream.new_control();
-            ctrl1 = ctrl0.clone();
-            ctrl3 = ctrl0.clone();
-            ctrl4 = ctrl0.clone();
-            ctrl6 = ctrl0.clone();
-            ctrl8 = ctrl0.clone();
+            let mut swarm = swarm0.lock().await;
+            ctrl0 = swarm.behaviour_mut().stream.new_control();
+            ctrl1 = swarm.behaviour_mut().stream.new_control();
+            ctrl3 = swarm.behaviour_mut().stream.new_control();
+            ctrl4 = swarm.behaviour_mut().stream.new_control();
+            ctrl6 = swarm.behaviour_mut().stream.new_control();
+            ctrl8 = swarm.behaviour_mut().stream.new_control();
         }
 
         incoming_pricing_streams = ctrl0.accept(PRICING_PROTOCOL).unwrap();
@@ -828,9 +828,6 @@ impl Sekirei {
         };
 
         let swarm_event_handle_2 = async {
-            let (bna, nid) = parsebootconnect();
-            self.change_bootnode_address(bna, nid).await;
-
             loop {
                 let mut bootnode_dial_joiner = Vec::new();
 
@@ -897,48 +894,43 @@ impl Sekirei {
             let mut interrupt_last = Date::now();
             loop {
                 let k0 = async {
-                    let mut joiner = Vec::new();
                     #[allow(irrefutable_let_patterns)]
                     while let that = connections_instructions_chan_incoming.try_recv() {
                         if !that.is_err() {
-                            let handle = async {
-                                let (bzzaddr0, bootn) = that.unwrap();
+                            let (bzzaddr0, bootn) = that.unwrap();
 
-                                let addr3 =
-                                    libp2p::core::Multiaddr::try_from(bzzaddr0.underlay).unwrap();
-                                let id = match try_from_multiaddr(&addr3) {
-                                    Some(aok) => aok,
-                                    _ => return,
-                                };
-                                let nid: u64;
-                                {
-                                    let nid0 = self.network_id.lock().await.clone();
-                                    nid = nid0;
-                                }
-
-                                if bootn {
-                                    let mut bootnodes_set = wings.bootnodes.lock().await;
-                                    bootnodes_set.insert(id.to_string());
-                                }
-
-                                async_std::task::sleep(Duration::from_millis(6400)).await; // stall
-
-                                connection_handler(
-                                    id,
-                                    nid,
-                                    ctrl3.clone(),
-                                    &addr3.clone(),
-                                    &(*self.secret_key.lock().await),
-                                    &accounting_peer_chan_outgoing.clone(),
-                                )
-                                .await;
+                            let addr3 =
+                                libp2p::core::Multiaddr::try_from(bzzaddr0.underlay).unwrap();
+                            let id = match try_from_multiaddr(&addr3) {
+                                Some(aok) => aok,
+                                _ => continue,
                             };
-                            joiner.push(handle);
+                            let nid: u64;
+                            {
+                                let nid0 = self.network_id.lock().await.clone();
+                                nid = nid0;
+                            }
+
+                            if bootn {
+                                let mut bootnodes_set = wings.bootnodes.lock().await;
+                                bootnodes_set.insert(id.to_string());
+                            }
+
+                            async_std::task::sleep(Duration::from_millis(2000)).await; // stall
+
+                            connection_handler(
+                                id,
+                                nid,
+                                ctrl3.clone(),
+                                &addr3.clone(),
+                                &(*self.secret_key.lock().await),
+                                &accounting_peer_chan_outgoing.clone(),
+                            )
+                            .await;
                         } else {
                             break;
                         }
                     }
-                    join_all(joiner).await;
                 };
 
                 let k1 = async {
@@ -1341,49 +1333,19 @@ impl Sekirei {
                         let handle = async {
                             let (d, soc, checkad, stamp, feedback) = incoming_request.unwrap();
 
-                            let address = push_chunk(
-                                d.clone(),
-                                soc.clone(),
-                                checkad.clone(),
-                                stamp.clone(),
+                            let _address = push_chunk(
+                                d,
+                                soc,
+                                checkad,
+                                stamp,
                                 ctrl8.clone(),
                                 &wings.overlay_peers,
                                 &wings.accounting_peers,
                                 &refreshment_instructions_chan_outgoing,
                             )
                             .await;
-                            if address.len() == 0 {
-                                let _ = chunk_upload_chan_outgoing.send((
-                                    d.clone(),
-                                    soc.clone(),
-                                    checkad.clone(),
-                                    stamp.clone(),
-                                    feedback.clone(),
-                                ));
-                            } else {
-                                let _ = feedback.send(true);
-                            }
-                            //
-                            //                            let data_available = retrieve_chunk(
-                            //                                &checkad,
-                            //                                ctrl9.clone()z,
-                            //                                &wings.overlay_peers.clone(),
-                            //                                &wings.accounting_peers.clone(),
-                            //                                &refreshment_instructions_chan_outgoing,
-                            //                            )
-                            //                            .await;
-                            //
-                            //                            if data_available.len() == 0 {
-                            //                                web_sys::console::log_1(&JsValue::from(format!("CH_AD miss")));
-                            //
-                            //                                let _ = chunk_upload_chan_outgoing.send((
-                            //                                    d.clone(),
-                            //                                    soc,
-                            //                                    checkad.clone(),
-                            //                                    batch_owner,
-                            //                                    batch_id,
-                            //                                ));
-                            //                            }
+
+                            let _ = feedback.send(true);
                         };
                         request_joiner.push(handle);
                     } else {
@@ -1452,11 +1414,7 @@ impl Sekirei {
                             )
                             .await;
 
-                            if chunk_data.len() == 0 {
-                                let _ = chunk_retrieve_chan_outgoing.send((n, chan.clone()));
-                            } else {
-                                chan.send(chunk_data).unwrap();
-                            };
+                            chan.send(chunk_data).unwrap();
                         };
                         request_joiner.push(handle);
                     } else {
@@ -1485,6 +1443,12 @@ impl Sekirei {
             }
         };
 
+        let initial_connect_handle = async {
+            async_std::task::sleep(Duration::from_millis(600)).await;
+            let (bna, nid) = parsebootconnect();
+            self.change_bootnode_address(bna, nid).await;
+        };
+
         join!(
             event_handle,
             retrieve_handle,
@@ -1498,6 +1462,7 @@ impl Sekirei {
             swarm_event_handle_2,
             gossip_inbound_handle,
             pricing_inbound_handle,
+            initial_connect_handle,
         );
 
         web_sys::console::log_1(&JsValue::from(format!("Dropping All handlers")));
@@ -1511,13 +1476,13 @@ struct Behaviour {
     // autonat: autonat::v2::client::Behaviour,
     // autonat_s: autonat::v2::server::Behaviour,
     // dcutr: dcutr::Behaviour,
-    identify: identify::Behaviour,
-    ping: ping::Behaviour,
+    // identify: identify::Behaviour,
+    // ping: ping::Behaviour,
     stream: stream::Behaviour,
 }
 
 impl Behaviour {
-    fn new(local_public_key: identity::PublicKey) -> Self {
+    fn new(_local_public_key: identity::PublicKey) -> Self {
         Self {
             // autonat: autonat::v2::client::Behaviour::new(
             //     OsRng,
@@ -1525,12 +1490,12 @@ impl Behaviour {
             // ),
             // autonat_s: autonat::v2::server::Behaviour::new(OsRng),
             // dcutr: dcutr::Behaviour::new(local_public_key.to_peer_id()),
-            identify: identify::Behaviour::new(
-                identify::Config::new("/weeb-3".into(), local_public_key.clone())
-                    .with_push_listen_addr_updates(true)
-                    .with_interval(Duration::from_secs(30)), // .with_cache_size(10), //
-            ),
-            ping: ping::Behaviour::new(ping::Config::new().with_interval(Duration::from_secs(15))),
+            // identify: identify::Behaviour::new(
+            //     identify::Config::new("/weeb-3".into(), local_public_key.clone())
+            //         .with_push_listen_addr_updates(true)
+            //         .with_interval(Duration::from_secs(30)), // .with_cache_size(10), //
+            // ),
+            // ping: ping::Behaviour::new(ping::Config::new().with_interval(Duration::from_secs(15))),
             stream: stream::Behaviour::new(),
         }
     }
