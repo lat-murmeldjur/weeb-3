@@ -552,7 +552,7 @@ impl Sekirei {
 
         let (peers_instructions_chan_outgoing, peers_instructions_chan_incoming) = mpsc::channel();
         let (connections_instructions_chan_outgoing, connections_instructions_chan_incoming) =
-            mpsc::channel::<(etiquette_2::BzzAddress, bool)>();
+            mpsc::channel::<(etiquette_2::BzzAddress, bool, u64)>();
 
         let (accounting_peer_chan_outgoing, accounting_peer_chan_incoming) = mpsc::channel();
 
@@ -693,8 +693,11 @@ impl Sekirei {
                                     let mut paddr5 = paddr.clone();
                                     paddr5.underlay = addr3.to_vec();
 
-                                    let _ = connections_instructions_chan_outgoing
-                                        .send((paddr5.clone(), false));
+                                    let _ = connections_instructions_chan_outgoing.send((
+                                        paddr5.clone(),
+                                        false,
+                                        Date::now() as u64,
+                                    ));
                                 }
                             }
 
@@ -744,8 +747,11 @@ impl Sekirei {
                                 let mut paddr5 = paddr.clone();
                                 paddr5.underlay = addr4.to_vec();
 
-                                let _ = connections_instructions_chan_outgoing
-                                    .send((paddr5.clone(), false));
+                                let _ = connections_instructions_chan_outgoing.send((
+                                    paddr5.clone(),
+                                    false,
+                                    Date::now() as u64,
+                                ));
                             }
                         };
                         dial_joiner.push(handle);
@@ -877,7 +883,11 @@ impl Sekirei {
 
                             bzzaddr.underlay = addr33.to_vec();
 
-                            let _ = connections_instructions_chan_outgoing.send((bzzaddr, true));
+                            let _ = connections_instructions_chan_outgoing.send((
+                                bzzaddr,
+                                true,
+                                Date::now() as u64,
+                            ));
                         };
                         bootnode_dial_joiner.push(handle);
                     } else {
@@ -893,46 +903,6 @@ impl Sekirei {
             let mut timelast = Date::now();
             let mut interrupt_last = Date::now();
             loop {
-                let k0 = async {
-                    #[allow(irrefutable_let_patterns)]
-                    while let that = connections_instructions_chan_incoming.try_recv() {
-                        if !that.is_err() {
-                            let (bzzaddr0, bootn) = that.unwrap();
-
-                            let addr3 =
-                                libp2p::core::Multiaddr::try_from(bzzaddr0.underlay).unwrap();
-                            let id = match try_from_multiaddr(&addr3) {
-                                Some(aok) => aok,
-                                _ => continue,
-                            };
-                            let nid: u64;
-                            {
-                                let nid0 = self.network_id.lock().await.clone();
-                                nid = nid0;
-                            }
-
-                            if bootn {
-                                let mut bootnodes_set = wings.bootnodes.lock().await;
-                                bootnodes_set.insert(id.to_string());
-                            }
-
-                            async_std::task::sleep(Duration::from_millis(2000)).await; // stall
-
-                            connection_handler(
-                                id,
-                                nid,
-                                ctrl3.clone(),
-                                &addr3.clone(),
-                                &(*self.secret_key.lock().await),
-                                &accounting_peer_chan_outgoing.clone(),
-                            )
-                            .await;
-                        } else {
-                            break;
-                        }
-                    }
-                };
-
                 let k1 = async {
                     #[allow(irrefutable_let_patterns)]
                     while let incoming_peer = accounting_peer_chan_incoming.try_recv() {
@@ -1102,7 +1072,7 @@ impl Sekirei {
                     }
                 };
 
-                join!(k0, k1, k2, k3, k4);
+                join!(k1, k2, k3, k4);
 
                 let timenow = Date::now();
                 let seg = timenow - interrupt_last;
@@ -1443,6 +1413,65 @@ impl Sekirei {
             }
         };
 
+        let hive_joiner = async {
+            let mut timelast = Date::now();
+            loop {
+                #[allow(irrefutable_let_patterns)]
+                while let that = connections_instructions_chan_incoming.try_recv() {
+                    if !that.is_err() {
+                        let (bzzaddr0, bootn, dialat) = that.unwrap();
+
+                        let addr3 = libp2p::core::Multiaddr::try_from(bzzaddr0.underlay).unwrap();
+                        let id = match try_from_multiaddr(&addr3) {
+                            Some(aok) => aok,
+                            _ => continue,
+                        };
+                        let nid: u64;
+                        {
+                            let nid0 = self.network_id.lock().await.clone();
+                            nid = nid0;
+                        }
+
+                        if bootn {
+                            let mut bootnodes_set = wings.bootnodes.lock().await;
+                            bootnodes_set.insert(id.to_string());
+                        }
+
+                        let now = Date::now() as u64;
+
+                        if dialat + 6400 > now {
+                            async_std::task::sleep(Duration::from_millis(6400 + dialat - now))
+                                .await;
+                        }
+
+                        async_std::task::sleep(Duration::from_millis(100)).await;
+
+                        connection_handler(
+                            id,
+                            nid,
+                            ctrl3.clone(),
+                            &addr3.clone(),
+                            &(*self.secret_key.lock().await),
+                            &accounting_peer_chan_outgoing.clone(),
+                        )
+                        .await;
+                    } else {
+                        break;
+                    }
+                }
+
+                let timenow = Date::now();
+                let seg = timenow - timelast;
+                if seg < PROTO_LOOP_INTERRUPTOR {
+                    async_std::task::sleep(Duration::from_millis(
+                        (PROTO_LOOP_INTERRUPTOR - seg) as u64,
+                    ))
+                    .await;
+                }
+                timelast = Date::now();
+            }
+        };
+
         let initial_connect_handle = async {
             async_std::task::sleep(Duration::from_millis(600)).await;
             let (bna, nid) = parsebootconnect();
@@ -1463,6 +1492,7 @@ impl Sekirei {
             gossip_inbound_handle,
             pricing_inbound_handle,
             initial_connect_handle,
+            hive_joiner,
         );
 
         web_sys::console::log_1(&JsValue::from(format!("Dropping All handlers")));
