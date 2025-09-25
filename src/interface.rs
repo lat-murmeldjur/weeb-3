@@ -42,8 +42,10 @@ use crate::{
 #[wasm_bindgen]
 pub async fn interweeb(_st: String) -> Result<(), JsError> {
     //    init_panic_hook();
-
-    set_batch_bucket_limit(128).await;
+    let _ = match get_service_worker().await {
+        Some(service_worker) => Some(service_worker),
+        None => None,
+    };
 
     let sekirei = Arc::new(Sekirei::new("".to_string()));
 

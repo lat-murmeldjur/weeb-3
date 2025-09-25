@@ -8,16 +8,16 @@ use std::time::Duration;
 
 use tower_http::cors::{Any, CorsLayer};
 
-use axum::http::header::CONTENT_TYPE;
 use axum::http::StatusCode;
+use axum::http::header::CONTENT_TYPE;
 use axum::response::{Html, IntoResponse};
-use axum::{http::Method, routing::get, Router};
+use axum::{Router, http::Method, routing::get};
 use axum_server::tls_rustls::RustlsConfig;
 
 use libp2p::futures::StreamExt;
 use libp2p::{
-    core::muxing::StreamMuxerBox,
     core::Transport,
+    core::muxing::StreamMuxerBox,
     multiaddr::{Multiaddr, Protocol},
     ping,
     swarm::SwarmEvent,
@@ -98,16 +98,20 @@ pub(crate) async fn serve(libp2p_transport: Multiaddr) {
         .unwrap();
 
     let server = Router::new()
-        .route("/", get(get_index))
-        .route("/index.html", get(get_index))
-        .route("/weeb_3.js", get(get_static_file_weeb_3_js))
-        .route("/weeb_3_bg.wasm", get(get_static_file_weeb_3_bg_wasm))
-        .route("/worker.js", get(get_static_file_worker_js))
-        .route("/service.js", get(get_static_file_service_js))
+        .route("/weeb-3/", get(get_index))
+        .route("/weeb-3/index.html", get(get_index))
+        .route("/weeb-3/weeb_3.js", get(get_static_file_weeb_3_js))
         .route(
-            "/snippets/web3-0742d85b024bb6f5/inline0.js",
+            "/weeb-3/weeb_3_bg.wasm",
+            get(get_static_file_weeb_3_bg_wasm),
+        )
+        .route("/weeb-3/worker.js", get(get_static_file_worker_js))
+        .route("/weeb-3/service.js", get(get_static_file_service_js))
+        .route(
+            "/weeb-3/snippets/web3-0742d85b024bb6f5/inline0.js",
             get(get_static_file_web3_export_js),
         )
+        .route("/{*wildcard}", get(get_404))
         .layer(
             CorsLayer::new()
                 .allow_origin(Any)
@@ -187,4 +191,16 @@ async fn get_static_file_web3_export_js() -> Result<impl IntoResponse, StatusCod
         .to_string();
 
     Ok(([(CONTENT_TYPE, content_type)], content))
+}
+
+async fn get_404() -> Result<Html<String>, StatusCode> {
+    let content = StaticFiles::get("404.html")
+        .ok_or(StatusCode::NOT_FOUND)?
+        .data;
+
+    let html = std::str::from_utf8(&content)
+        .expect("404.html to be valid utf8")
+        .to_string();
+
+    Ok(Html(html))
 }

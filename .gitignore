@@ -3,4 +3,7 @@ target
 Cargo.lock
 
 !*/static/index.html
+!*/static/service.js
+!*/static/cert.pem
+!*/static/key.pem
 
