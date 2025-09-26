@@ -1,0 +1,11 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <script>
+      const path = window.location.pathname.replace(/^\/weeb-3/, "");
+      // Redirect to /wz/, but keep the original path in the hash
+      window.location.replace("/weeb-3/#" + path + window.location.search);
+    </script>
+  </head>
+  <body></body>
+</html>
