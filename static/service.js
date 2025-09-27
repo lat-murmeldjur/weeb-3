@@ -30,7 +30,7 @@ const cacheFirst = async (request) => {
     return responseFromCache;
   } 
   try {
-    return await fetch(event.request);
+    return await fetch(request);
   } catch(e) {
     let cachedIndex = await cache.match('/weeb-3/index.html');
     if (cachedIndex) {
