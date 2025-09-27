@@ -30,10 +30,18 @@ const cacheFirst = async (request) => {
     return responseFromCache;
   } 
   try {
-    return cache.match('/weeb-3');
+    return cache.match('/weeb-3/index.html');
   }
 };
 
 self.addEventListener("fetch", (event) => {
   event.respondWith(cacheFirst(event.request));
+});
+
+self.addEventListener('install', (event) => {
+  event.waitUntil(
+    caches.open('default0').then((cache) => {
+      return cache.addAll(['/weeb-3/index.html']);
+    })
+  );
 });
