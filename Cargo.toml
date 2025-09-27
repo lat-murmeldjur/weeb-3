@@ -76,6 +76,7 @@ web-sys = { version = "0.3.77", features = [
   'FileList',
   'FileReader',
   'Headers',
+  'History',
   'HtmlButtonElement',
   'HtmlElement',
   'HtmlInputElement',

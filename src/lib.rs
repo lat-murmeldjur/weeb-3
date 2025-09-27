@@ -55,6 +55,8 @@ mod manifest;
 
 mod manifest_upload;
 
+mod nav;
+
 mod persistence;
 use persistence::{get_batch_bucket_limit, get_batch_id, get_batch_owner_key, reset_stamp};
 

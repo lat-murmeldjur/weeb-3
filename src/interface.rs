@@ -33,6 +33,7 @@ use alloy::{network::EthereumWallet, signers::local::PrivateKeySigner};
 
 use crate::{
     encrey, join,
+    nav::clear_path,
     persistence::{
         get_batch_bucket_limit, get_batch_id, get_batch_owner_key, set_batch_bucket_limit,
         set_batch_id, set_batch_owner_key,
@@ -42,6 +43,9 @@ use crate::{
 #[wasm_bindgen]
 pub async fn interweeb(_st: String) -> Result<(), JsError> {
     //    init_panic_hook();
+
+    clear_path().await;
+
     let _ = match get_service_worker().await {
         Some(service_worker) => Some(service_worker),
         None => None,
