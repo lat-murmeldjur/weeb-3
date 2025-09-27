@@ -30,8 +30,18 @@ const cacheFirst = async (request) => {
     return responseFromCache;
   } 
   try {
-    return cache.match('/weeb-3/index.html');
+    return await fetch(event.request);
+  } catch(e) {
+    let cachedIndex = await cache.match('/weeb-3/index.html');
+    if (cachedIndex) {
+      return cachedIndex;
+    }
+    
+    let fetched = await fetch('/weeb-3/index.html');
+    cache.put('/weeb-3/index.html', fetched.clone());
+    return fetched;
   }
+
 };
 
 self.addEventListener("fetch", (event) => {
@@ -39,6 +49,7 @@ self.addEventListener("fetch", (event) => {
 });
 
 self.addEventListener('install', (event) => {
+  console.log("install");
   event.waitUntil(
     caches.open('default0').then((cache) => {
       return cache.addAll(['/weeb-3/index.html']);
