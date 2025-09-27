@@ -32,8 +32,8 @@ use web_sys::{
 use alloy::{network::EthereumWallet, signers::local::PrivateKeySigner};
 
 use crate::{
-    encrey, join,
-    nav::clear_path,
+    encrey, join, join_all,
+    nav::{clear_path, read_path},
     persistence::{
         get_batch_bucket_limit, get_batch_id, get_batch_owner_key, set_batch_bucket_limit,
         set_batch_id, set_batch_owner_key,
@@ -64,6 +64,26 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
     let sekirei3 = sekirei.clone();
     let sekirei4 = sekirei.clone();
     let sekirei5 = sekirei.clone();
+    let sekirei6 = sekirei.clone();
+
+    let path_load_init = async {
+        let references = read_path().await;
+        let mut handles = vec![];
+        for reference in references {
+            let handle = async {
+                let sekirei00 = sekirei6.clone();
+                web_sys::console::log_1(&JsValue::from(format!(
+                    "Loading /bzz/ reference from path {:#?}",
+                    reference
+                )));
+                let result = sekirei00.acquire(reference).await;
+                let (data, indx) = decode_resources(result);
+                render_result(data, indx).await;
+            };
+            handles.push(handle);
+        }
+        let _ = join_all(handles).await;
+    };
 
     let window = web_sys::window().unwrap();
 
@@ -649,7 +669,7 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
         }
     };
 
-    join!(sekirei_async, interface_async);
+    join!(sekirei_async, interface_async, path_load_init);
 
     #[allow(unreachable_code)]
     Ok(())

@@ -100,3 +100,37 @@ pub async fn clear_path() {
         };
     }
 }
+
+pub async fn read_path() -> Vec<String> {
+    let window = match window() {
+        Some(w) => w,
+        None => return vec![],
+    };
+    let location = window.location();
+    let pathname = match location.pathname() {
+        Ok(p) => p,
+        Err(_) => return vec![],
+    };
+
+    let mut references: Vec<String> = vec![];
+    let mut current = vec![];
+    let mut entered_bzz = false;
+
+    for part in pathname.split('/') {
+        if part == "bzz" {
+            if entered_bzz && !current.is_empty() {
+                references.push(current.join("/"));
+                current = vec![];
+            }
+            entered_bzz = true;
+        } else if entered_bzz && !part.is_empty() {
+            current.push(part.to_string());
+        }
+    }
+
+    if entered_bzz && !current.is_empty() {
+        references.push(current.join("/"));
+    }
+
+    references
+}
