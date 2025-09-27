@@ -23,16 +23,15 @@ self.addEventListener('message', async function(event) {
 const cacheFirst = async (request) => {
   const cache = await caches.open('default0');
   console.log("req0: ", request);
+
   const responseFromCache = await cache.match(request);
   console.log("respc: ", responseFromCache);
   if (responseFromCache) {
     return responseFromCache;
   } 
-  console.log("loading from cache failed");
-  let originWithSlashWeeb3 = origin + '/weeb-3';
-  const newRequest = new Request(originWithSlashWeeb3, request);
-  console.log("request change", newRequest);
-  return fetch(newRequest);
+  try {
+    return cache.match('/weeb-3');
+  }
 };
 
 self.addEventListener("fetch", (event) => {
