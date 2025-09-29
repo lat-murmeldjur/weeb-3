@@ -55,6 +55,8 @@ mod manifest;
 
 mod manifest_upload;
 
+mod on_chain;
+
 mod nav;
 
 mod persistence;

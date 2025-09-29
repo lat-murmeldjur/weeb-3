@@ -1,5 +1,3 @@
-use crate::{Sekirei, decode_resources};
-
 use std::str::FromStr;
 use std::time::Duration;
 
@@ -32,8 +30,9 @@ use web_sys::{
 use alloy::{network::EthereumWallet, signers::local::PrivateKeySigner};
 
 use crate::{
-    encrey, join, join_all,
+    Sekirei, decode_resources, encrey, join, join_all,
     nav::{clear_path, read_path},
+    on_chain::get_batch_validity,
     persistence::{
         get_batch_bucket_limit, get_batch_id, get_batch_owner_key, set_batch_bucket_limit,
         set_batch_id, set_batch_owner_key,
@@ -45,6 +44,15 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
     //    init_panic_hook();
 
     clear_path().await;
+
+    let stored_batch_id = get_batch_id().await;
+    if stored_batch_id.len() == 32 {
+        let validity = get_batch_validity(stored_batch_id).await;
+        web_sys::console::log_1(&JsValue::from(format!(
+            "Found batch with validity {:#?}",
+            validity
+        )));
+    }
 
     let _ = match get_service_worker().await {
         Some(service_worker) => Some(service_worker),
@@ -190,7 +198,9 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
                 spawn_local(async move {
                     {
                         let stored_stamp_signer_key = get_batch_owner_key().await;
+
                         let stored_batch_id = get_batch_id().await;
+
                         let bucket_limit = get_batch_bucket_limit().await;
 
                         if stored_stamp_signer_key.len() != 0
@@ -485,6 +495,19 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
                         let window = web_sys::window().unwrap();
                         let _ = window.alert_with_message("Require a postage batch for uploads. To get one, connect metamask wallet with sepolia Eth / sepolia Bzz with the 'Create Storage on Swarm for Uploads' button");
                         return;
+                    }
+
+                    let validity = get_batch_validity(stored_batch_id).await;
+
+                    if validity == U256::from(0) {
+                        let window = web_sys::window().unwrap();
+                        let _ = window.alert_with_message(
+                            "Postage batch validity reached zero. Getting a new batch is required.",
+                        );
+
+                        set_batch_owner_key(&vec![]).await;
+                        set_batch_id(&vec![]).await;
+                        set_batch_bucket_limit(0).await;
                     }
 
                     let file_enc = document

@@ -292,7 +292,12 @@ pub async fn get_batch_field(field: String) -> Vec<u8> {
         }
     };
 
-    let key_data: Vec<u8> = match store.get(field).primitive().unwrap().await {
+    let key_data0 = match store.get(field).primitive() {
+        Ok(aok) => aok,
+        _ => return vec![],
+    };
+
+    let key_data: Vec<u8> = match key_data0.await {
         Ok(Some(b)) => b,
         _ => vec![],
     };
@@ -383,7 +388,13 @@ pub async fn set_batch_owner_key(key: &Vec<u8>) -> bool {
 
 pub async fn get_batch_bucket_limit() -> u32 {
     let k = get_batch_field("batch_0_bucket_limit".to_string()).await;
-    return u32::from_le_bytes(k.try_into().unwrap());
+
+    let k0: [u8; 4] = match k.try_into() {
+        Ok(aok) => aok,
+        _ => [0; 4],
+    };
+
+    return u32::from_le_bytes(k0);
 }
 
 pub async fn set_batch_bucket_limit(limit: u32) -> bool {
