@@ -127,7 +127,7 @@ const fetchFromLibRs = async (request, client) => {
     };
 
     client.postMessage(
-      { type: "RETRIEVE_REQUEST", url: resource, port: channel.port2  },
+      { type: "RETRIEVE_REQUEST", url: resource, port: channel.port2 },
       [channel.port2]
     );
   });
