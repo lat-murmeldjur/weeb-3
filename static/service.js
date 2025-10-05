@@ -78,9 +78,12 @@ self.addEventListener("fetch", (event) => {
     }
 
     try {
-      return await fetch(req);
-    } catch(e) {
+      const actual_resource = await fetch(req);
   
+      if (actual_resource.ok) {
+        return actual_resource;
+      }
+    } catch(e) {
       // if no cache hit find tab where fetch originated from
       let client = null;
       if (event.clientId) {
