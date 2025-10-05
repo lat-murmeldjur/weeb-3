@@ -51,9 +51,11 @@ const cacheFirst = async (request) => {
 self.addEventListener('install', (event) => {
   console.log("install");
   event.waitUntil(
-    caches.open('default0').then((cache) => {
-      return cache.addAll(['/weeb-3/index.html']);
-    })
+    (async () => {
+      const cache = await caches.open('default0');
+      await cache.addAll(['/weeb-3/index.html']);
+      self.skipWaiting(); 
+    })()
   );
 });
 
@@ -128,6 +130,13 @@ const fetchFromLibRs = async (request, client) => {
     const channel = new MessageChannel();
     channel.port1.onmessage = async (event) => {
       const { ok, body, mime, path } = event.data;
+      console.log("Message from interface:", {
+        ok,
+        bodyType: body ? body.constructor.name : body, // show if it's Uint8Array, undefined, etc.
+        bodyLen: body && body.length ? body.length : 0,
+        mime,
+        path
+      });
       if (ok && body) {
         const response = new Response(new Blob([body], { type: mime }), {
           headers: { "Content-Type": mime }
