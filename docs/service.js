@@ -29,19 +29,23 @@ const cacheFirst = async (request) => {
   if (responseFromCache) {
     return responseFromCache;
   } 
-  try {
-    return await fetch(request);
-  } catch(e) {
-    let cachedIndex = await cache.match('/weeb-3/index.html');
-    if (cachedIndex) {
-      return cachedIndex;
-    }
-    
-    let fetched = await fetch('/weeb-3/index.html');
-    cache.put('/weeb-3/index.html', fetched.clone());
-    return fetched;
-  }
 
+  try {
+    const actual_resource = await fetch(request);
+    if (actual_resource.ok) {
+      return actual_resource;
+    }
+  } catch (e) {
+  }
+  
+  let cachedIndex = await cache.match('/weeb-3/index.html');
+  if (cachedIndex) {
+    return cachedIndex;
+  }
+  
+  let fetched = await fetch('/weeb-3/index.html');
+  cache.put('/weeb-3/index.html', fetched.clone());
+  return fetched;
 };
 
 self.addEventListener('install', (event) => {
@@ -83,16 +87,18 @@ self.addEventListener("fetch", (event) => {
       if (actual_resource.ok) {
         return actual_resource;
       }
-    } catch(e) {
-      // if no cache hit find tab where fetch originated from
-      let client = null;
-      if (event.clientId) {
-        client = await self.clients.get(event.clientId);
-      }
-  
-      console.log("acquire attempt for", req.url);
-      return await fetchFromLibRs(req, client);
+    } catch (e) {
     }
+
+    // if no cache hit find tab where fetch originated from
+    let client = null;
+    if (event.clientId) {
+      client = await self.clients.get(event.clientId);
+    }
+
+    console.log("acquire attempt for", req.url);
+    return await fetchFromLibRs(req, client);
+    
   })());
 });
 
