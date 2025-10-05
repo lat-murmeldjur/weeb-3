@@ -110,7 +110,7 @@ self.addEventListener("fetch", (event) => {
 const fetchFromLibRs = async (request, client) => {
   const allClients = await self.clients.matchAll({ includeUncontrolled: true, type: "window" });
   console.log("all clients", allClients.map(c => c.id));
-  console.log("actual client", client.id);
+  console.log("actual client", client ? client.id : "none");
 
   if (!client) {
     return new Response("Request ghosted by client", { status: 502 });
@@ -132,11 +132,11 @@ const fetchFromLibRs = async (request, client) => {
         const response = new Response(new Blob([body], { type: mime }), {
           headers: { "Content-Type": mime }
         });
-    
+
         const cache = await caches.open("default0");
         await cache.put(path || request, response.clone());
-    
-        resolve(response);
+
+        resolve(response);  
       } else {
         resolve(new Response("weeb-3 did not retrieve resource", { status: 404 }));
       }

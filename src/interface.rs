@@ -698,7 +698,9 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
 
                         if let Some((bytes, mime, path)) = head_resource {
                             let u8arr: js_sys::Uint8Array = JsValue::from(bytes.clone()).into();
-                            js_sys::Reflect::set(&resp, &"body".into(), &u8arr).unwrap();
+                            let abuf = u8arr.buffer();
+                            js_sys::Reflect::set(&resp, &"body".into(), &abuf).unwrap();
+
                             js_sys::Reflect::set(&resp, &"mime".into(), &mime.clone().into())
                                 .unwrap();
                             js_sys::Reflect::set(&resp, &"path".into(), &path.clone().into())
