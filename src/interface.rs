@@ -688,13 +688,12 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
                     js_sys::Reflect::set(&resp, &"type".into(), &"RETRIEVE_RESPONSE".into())
                         .unwrap();
 
-                    let _ = web_sys::window()
-                        .unwrap()
-                        .navigator()
-                        .service_worker()
-                        .controller()
-                        .unwrap()
-                        .post_message(&resp);
+                    let ports: Array = event.ports().into();
+                    if let Some(port_val) = ports.get(0).dyn_into::<web_sys::MessagePort>().ok() {
+                        port_val.post_message(&resp).unwrap();
+                    } else {
+                        web_sys::console::warn_1(&"No port found on service worker message".into());
+                    }
                 }
             }
         }) as Box<dyn FnMut(_)>);

@@ -116,25 +116,20 @@ const fetchFromLibRs = async (request, client) => {
   }
 
   return new Promise((resolve) => {
-    client.postMessage({
-      type: "RETRIEVE_REQUEST",
-      url: resource
-    });
-
-    const listener = (event) => {
-      if (event.data && event.data.type === "RETRIEVE_RESPONSE") {
-        self.removeEventListener("message", listener);
-        const { ok, body, mime, path } = event.data;
-
-        if (ok) {
-          resolve(new Response("weeb-3 did retrieve resource", { status: 200 }));
-        } else {
-          resolve(new Response("weeb-3 did not retrieve resource", { status: 404 }));
-        }
-      }
+    const channel = new MessageChannel();
+    channel.port1.onmessage = (event) => {
+      const { ok } = event.data;
+      resolve(
+        ok
+          ? new Response("weeb-3 did retrieve resource", { status: 200 })
+          : new Response("weeb-3 did not retrieve resource", { status: 404 })
+      );
     };
 
-    self.addEventListener("message", listener);
+    client.postMessage(
+      { type: "RETRIEVE_REQUEST", url: resource },
+      [channel.port2]
+    );
   });
 };
 
