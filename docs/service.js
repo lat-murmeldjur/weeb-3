@@ -77,13 +77,19 @@ self.addEventListener("fetch", (event) => {
       return responseFromCache;
     }
 
-    // if no cache hit find tab where fetch originated from
-    let client = null;
-    if (event.clientId) {
-      client = await self.clients.get(event.clientId);
+    try {
+      return await fetch(req);
+    } catch(e) {
+  
+      // if no cache hit find tab where fetch originated from
+      let client = null;
+      if (event.clientId) {
+        client = await self.clients.get(event.clientId);
+      }
+  
+      console.log("acquire attempt for", req.url);
+      return await fetchFromLibRs(req, client);
     }
-
-    return await fetchFromLibRs(req, client);
   })());
 });
 
