@@ -695,10 +695,11 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
             }
         }) as Box<dyn FnMut(_)>);
 
-        web_sys::window()
+        let _ = web_sys::window()
             .unwrap()
-            .add_event_listener_with_callback("message", service_closure.as_ref().unchecked_ref())
-            .unwrap();
+            .navigator()
+            .service_worker()
+            .add_event_listener_with_callback("message", service_closure.as_ref().unchecked_ref());
 
         loop {
             #[allow(irrefutable_let_patterns)]
