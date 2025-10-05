@@ -661,6 +661,10 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
 
         let service_closure = Closure::wrap(Box::new(move |event: MessageEvent| {
             if let Ok(obj) = event.data().dyn_into::<js_sys::Object>() {
+                web_sys::console::log_1(&JsValue::from(format!(
+                    "Attempting to load reference received from service worker {:#?}",
+                    obj
+                )));
                 let ty =
                     js_sys::Reflect::get(&obj, &JsValue::from_str("type")).unwrap_or(JsValue::NULL);
                 if ty == JsValue::from_str("RETRIEVE_REQUEST") {
@@ -678,6 +682,15 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
                         let (data, indx) = decode_resources(result);
                         render_result(data, indx).await;
                     });
+
+                    let port = js_sys::Reflect::get(&obj, &JsValue::from_str("port"))
+                        .unwrap()
+                        .dyn_into::<web_sys::MessagePort>()
+                        .unwrap();
+
+                    let resp = js_sys::Object::new();
+                    js_sys::Reflect::set(&resp, &"ok".into(), &true.into()).unwrap();
+                    port.post_message(&resp).unwrap();
                 }
             }
         }) as Box<dyn FnMut(_)>);

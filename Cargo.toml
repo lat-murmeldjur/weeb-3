@@ -84,6 +84,7 @@ web-sys = { version = "0.3.77", features = [
   'HtmlParagraphElement',
   'HtmlSelectElement',
   'Location',
+  'MessagePort',
   'Navigator',
   'Node',
   'ServiceWorker',
