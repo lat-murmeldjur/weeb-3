@@ -683,22 +683,26 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
                         render_result(data, indx).await;
                     });
 
-                    let port = js_sys::Reflect::get(&obj, &JsValue::from_str("port"))
-                        .unwrap()
-                        .dyn_into::<web_sys::MessagePort>()
-                        .unwrap();
-
                     let resp = js_sys::Object::new();
                     js_sys::Reflect::set(&resp, &"ok".into(), &true.into()).unwrap();
-                    port.post_message(&resp).unwrap();
+                    js_sys::Reflect::set(&resp, &"type".into(), &"RETRIEVE_RESPONSE".into())
+                        .unwrap();
+
+                    let _ = web_sys::window()
+                        .unwrap()
+                        .navigator()
+                        .service_worker()
+                        .controller()
+                        .unwrap()
+                        .post_message(&resp);
                 }
             }
         }) as Box<dyn FnMut(_)>);
 
         let service_listener = match web_sys::window()
             .unwrap()
-            .navigator()
-            .service_worker()
+            // .navigator()
+            // .service_worker()
             .add_event_listener_with_callback("message", service_closure.as_ref().unchecked_ref())
         {
             Ok(aok) => aok,

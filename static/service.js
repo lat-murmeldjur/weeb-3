@@ -110,26 +110,25 @@ const fetchFromLibRs = async (request, client) => {
   }
 
   return new Promise((resolve) => {
-    const channel = new MessageChannel();
-    channel.port1.onmessage = async (event) => {
-      const { ok, body, mime, path } = event.data;
-      if (ok) {
-        const response = new Response(new Blob([body], { type: mime }), { headers: { 'Content-Type': mime } });
+    client.postMessage({
+      type: "RETRIEVE_REQUEST",
+      url: resource
+    });
 
-        // Cache it
-        const cache = await caches.open('default0');
-        await cache.put(path || request, response.clone());
+    const listener = (event) => {
+      if (event.data && event.data.type === "RETRIEVE_RESPONSE") {
+        self.removeEventListener("message", listener);
+        const { ok, body, mime, path } = event.data;
 
-        resolve(response);
-      } else {
-        resolve(new Response("weeb-3 did not retrieve resource", { status: 404 }));
+        if (ok) {
+          resolve(new Response("weeb-3 did retrieve resource", { status: 200 }));
+        } else {
+          resolve(new Response("weeb-3 did not retrieve resource", { status: 404 }));
+        }
       }
     };
 
-    client.postMessage(
-      { type: "RETRIEVE_REQUEST", url: resource, port: channel.port2 },
-      [channel.port2]
-    );
+    self.addEventListener("message", listener);
   });
 };
 
