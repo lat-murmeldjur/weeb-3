@@ -57,6 +57,11 @@ self.addEventListener('install', (event) => {
   );
 });
 
+self.addEventListener("activate", event => {
+  console.log("serice activated, claim client");
+  event.waitUntil(self.clients.claim());
+});
+
 // self.addEventListener("fetch", (event) => {
 //   event.respondWith(cacheFirst(event.request));
 // });
