@@ -736,7 +736,7 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
     };
 
     let fetch_test = async move {
-        async_std::task::sleep(Duration::from_millis(600)).await;
+        async_std::task::sleep(Duration::from_millis(6400)).await;
 
         let host3 = web_sys::window()
             .unwrap()
