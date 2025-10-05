@@ -143,7 +143,7 @@ const fetchFromLibRs = async (request, client) => {
         });
 
         const cache = await caches.open("default0");
-        await cache.put(path || request, response.clone());
+        await cache.put(request, response.clone());
 
         resolve(response);  
       } else {

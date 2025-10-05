@@ -697,9 +697,14 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
                             .or_else(|| data.get(0));
 
                         if let Some((bytes, mime, path)) = head_resource {
-                            let u8arr: js_sys::Uint8Array = JsValue::from(bytes.clone()).into();
-                            let abuf = u8arr.buffer();
-                            js_sys::Reflect::set(&resp, &"body".into(), &abuf).unwrap();
+                            web_sys::console::log_1(&JsValue::from(format!(
+                                "service message resource len {}",
+                                bytes.len()
+                            )));
+
+                            let u8arr = js_sys::Uint8Array::new_with_length(bytes.len() as u32);
+                            u8arr.copy_from(&bytes);
+                            js_sys::Reflect::set(&resp, &"body".into(), &u8arr).unwrap();
 
                             js_sys::Reflect::set(&resp, &"mime".into(), &mime.clone().into())
                                 .unwrap();
