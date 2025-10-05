@@ -1430,10 +1430,11 @@ impl Sekirei {
                             Some(aok) => aok,
                             _ => continue,
                         };
+
                         let nid: u64;
                         {
                             let nid0 = self.network_id.lock().await.clone();
-                            nid = nid0;
+                            nid = nid0.clone();
                         }
 
                         if bootn {

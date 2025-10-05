@@ -21,6 +21,7 @@ use web_sys::{
     HtmlInputElement,
     HtmlSelectElement,
     HtmlSpanElement,
+    MessageEvent,
     RequestInit,
     ServiceWorkerRegistration,
     //
@@ -73,6 +74,7 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
     let sekirei4 = sekirei.clone();
     let sekirei5 = sekirei.clone();
     let sekirei6 = sekirei.clone();
+    let sekirei7 = sekirei.clone();
 
     let path_load_init = async {
         let references = read_path().await;
@@ -657,6 +659,34 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
             .expect("#uploadResetStamp should be a HtmlButtonElement")
             .set_onclick(Some(callback5.as_ref().unchecked_ref()));
 
+        let service_closure = Closure::wrap(Box::new(move |event: MessageEvent| {
+            if let Ok(obj) = event.data().dyn_into::<js_sys::Object>() {
+                let ty =
+                    js_sys::Reflect::get(&obj, &JsValue::from_str("type")).unwrap_or(JsValue::NULL);
+                if ty == JsValue::from_str("RETRIEVE_REQUEST") {
+                    let url = js_sys::Reflect::get(&obj, &JsValue::from_str("url"))
+                        .unwrap_or(JsValue::NULL);
+                    let reference = url.as_string().unwrap_or_default();
+                    let sekirei00 = sekirei7.clone();
+
+                    wasm_bindgen_futures::spawn_local(async move {
+                        web_sys::console::log_1(&JsValue::from(format!(
+                            "Loading /bzz/ reference from service worker {:#?}",
+                            reference
+                        )));
+                        let result = sekirei00.acquire(reference).await;
+                        let (data, indx) = decode_resources(result);
+                        render_result(data, indx).await;
+                    });
+                }
+            }
+        }) as Box<dyn FnMut(_)>);
+
+        web_sys::window()
+            .unwrap()
+            .add_event_listener_with_callback("message", service_closure.as_ref().unchecked_ref())
+            .unwrap();
+
         loop {
             #[allow(irrefutable_let_patterns)]
             let logs_current = sekirei5.get_current_logs().await;
@@ -692,7 +722,33 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
         }
     };
 
-    join!(sekirei_async, interface_async, path_load_init);
+    let fetch_test = async move {
+        async_std::task::sleep(Duration::from_millis(600)).await;
+
+        let host3 = web_sys::window()
+            .unwrap()
+            .document()
+            .unwrap()
+            .location()
+            .unwrap()
+            .origin()
+            .unwrap();
+
+        let opts = RequestInit::new();
+        opts.set_method("GET");
+        opts.set_mode(web_sys::RequestMode::Cors);
+
+        let sel = "6863c7cd109274984542f6b4b2b1898a323bb88aa99f7890154a65e321e668ad".to_string();
+
+        let url = format!("{}/weeb-3/bzz/{}", host3, sel);
+
+        let request = web_sys::Request::new_with_str_and_init(&url, &opts).unwrap();
+
+        let window = web_sys::window().unwrap();
+        let _resp_value = JsFuture::from(window.fetch_with_request(&request)).await;
+    };
+
+    join!(sekirei_async, interface_async, path_load_init, fetch_test);
 
     #[allow(unreachable_code)]
     Ok(())

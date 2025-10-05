@@ -44,10 +44,6 @@ const cacheFirst = async (request) => {
 
 };
 
-self.addEventListener("fetch", (event) => {
-  event.respondWith(cacheFirst(event.request));
-});
-
 self.addEventListener('install', (event) => {
   console.log("install");
   event.waitUntil(
@@ -56,3 +52,77 @@ self.addEventListener('install', (event) => {
     })
   );
 });
+
+// self.addEventListener("fetch", (event) => {
+//   event.respondWith(cacheFirst(event.request));
+// });
+
+// Try experimental endpoint
+
+self.addEventListener("fetch", (event) => {
+  const req = event.request;
+
+  event.respondWith((async () => {
+    if (req.mode === "navigate") {
+      return cacheFirst(req);
+    }
+
+    // try cache first anyway
+    const cache = await caches.open('default0');
+    const responseFromCache = await cache.match(req);
+    if (responseFromCache) {
+      return responseFromCache;
+    }
+
+    // if no cache hit find tab where fetch originated from
+    let client = null;
+    if (event.clientId) {
+      client = await self.clients.get(event.clientId);
+    }
+
+    return await fetchFromLibRs(req, client);
+  })());
+});
+
+const fetchFromLibRs = async (request, client) => {
+  if (!client) {
+    return new Response("Request ghosted by client", { status: 502 });
+  }
+
+  const url = new URL(request.url);
+  let resource = url.pathname;
+  const marker = "/weeb-3/bzz/";
+  const idx = resource.indexOf(marker);
+  if (idx >= 0) {
+    resource = resource.substring(idx + marker.length);
+  }
+
+  return new Promise((resolve) => {
+    const channel = new MessageChannel();
+    channel.port1.onmessage = async (event) => {
+      const { ok, body, mime, path } = event.data;
+      if (ok) {
+        const response = new Response(new Blob([body], { type: mime }), { headers: { 'Content-Type': mime } });
+
+        // Cache it
+        const cache = await caches.open('default0');
+        await cache.put(path || request, response.clone());
+
+        resolve(response);
+      } else {
+        resolve(new Response("weeb-3 did not retrieve resource", { status: 404 }));
+      }
+    };
+
+    client.postMessage(
+      { type: "RETRIEVE_REQUEST", url: resource },
+      [channel.port2]
+    );
+  });
+};
+
+
+
+
+
+

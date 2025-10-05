@@ -19,7 +19,7 @@ cargo run
 ```
 Note this server uses an unsecure self-signed certificate to provide https, which is not sufficient to enable Service Workers in chrome etc. This enables displaying single files from swarm, however to display websites a service worker is necessary, which requires a certificate deemed safe by the browser. You can however get your own safe certificate from - for example - github pages by forking the repository and setting the github pages to 'docs', and copying your latest version of the files from the static folder to the docs folder. 
 
-3. Open the URL (https://localhost:8080 or for the github pages hosted version https://lat-murmeldjur.github.io/weeb-3)
+3. Open the URL (https://localhost:8080/weeb-3 or for the github pages hosted version https://lat-murmeldjur.github.io/weeb-3)
 
 ## [Notes]
 
@@ -75,7 +75,7 @@ The high level architecture of the client resides in src/lib.rs, which (in order
 
 In slightly more detail, the new function does the following (in order of appearing in the code):
 - Randomises a new secret keypair
-- Starts a libp2p client with a number of libp2p protocols enabled (autonat, dcutr, identify, ping, stream) using websocket transport
+- Starts a libp2p client with the stream libp2p behaviour enabled using webrtc transport
 - Creates a registry of peers (connected_peers, overlay_peers) and peer accounting (accounting_peers, ongoing_refreshments)
 - Creates a message port (to be listened to by the client and to be used by the acquire function)
 This message port can receive the writing end of a channel of bytes along with an address, so that it can write back the results of looking up the address to the channel received.
@@ -88,13 +88,14 @@ The run function of the client implements an asynchronous architecture that does
 - Setting up listening to gossip protocol messages (information about existing peers) and pricing protocol messages (for receiving connected peers payment threshold updates)
 - An async routine to continously establish new libp2p-connections (dial) and consume libp2p-swarm events (swarm_event_handle) as well as dialing to bootnode
 - An async routine that wraps a number of further async routines for the following functions (event_handle):
-	2) Accounting connecting newly established peer connections (k1)
-	3) Setting payment thresholds for peers after successfully receiving payment threshold updates in the pricing protocol (k2)
-	4) Initiating refreshments/pseudosettle protocol for peers when triggered by accounting actions (k3)
-	5) Registering the results of successful refreshments towards peers (k4)
+	1) Accounting connecting newly established peer connections (k1)
+	2) Setting payment thresholds for peers after successfully receiving payment threshold updates in the pricing protocol (k2)
+	3) Initiating refreshments/pseudosettle protocol for peers when triggered by accounting actions (k3)
+	4) Registering the results of successful refreshments towards peers (k4)
 - Two async routines that listens to high level download / upload requests 
 - Two async routines that listens to data object level download / upload requests enabling joining and splitting of chunks
 - Two async routines that enable concurrent chunk level pushsync and retrieval requests
+- An async routine that attempts to conduct handshakes with dialed connections
 
 Currently - due to the blocking - non-blocking nature of the async framework, and to avoid a waiting thread hogging the single execution thread, the aforementioned routines intermittently try progressing every 600ms with non cpu intensive async sleeps happening in-between.
 
@@ -121,6 +122,7 @@ The weeb process persists 3 types of data:
 	3) Batch Bucket Limit
 	4) Private key of Feed Owner
 - Saturation of individual Batch Buckets
+
 The indexeddb access is denied to loaded websites by opening websites from swarm in iframes marked with the sandbox attribute.
 The private keys are not used for blockchain purposes, the wallet responsible for buying a batch can only be connected through metamask currently.
 The libp2p node keys are chosen randomly each time the tab is reloaded, resulting in a unique overlay every time
