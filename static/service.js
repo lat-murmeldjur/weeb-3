@@ -127,12 +127,18 @@ const fetchFromLibRs = async (request, client) => {
   return new Promise((resolve) => {
     const channel = new MessageChannel();
     channel.port1.onmessage = (event) => {
-      const { ok } = event.data;
-      resolve(
-        ok
-          ? new Response("weeb-3 did retrieve resource", { status: 200 })
-          : new Response("weeb-3 did not retrieve resource", { status: 404 })
-      );
+      const { ok, body, mime, path } = event.data;
+      if (ok && body) {
+        const response = new Response(new Blob([body], { type: mime }), {
+          headers: { "Content-Type": mime }
+        });
+       
+        const cache = await caches.open("default0");
+        await cache.put(path || request, response.clone());
+        resolve(response);
+      } else {
+        resolve(new Response("weeb-3 did not retrieve resource", { status: 404 }));
+      }
     };
 
     client.postMessage(

@@ -673,6 +673,9 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
                     let reference = url.as_string().unwrap_or_default();
                     let sekirei00 = sekirei7.clone();
 
+                    let ports: Array = event.ports().into();
+                    let port = ports.get(0).dyn_into::<web_sys::MessagePort>().ok();
+
                     wasm_bindgen_futures::spawn_local(async move {
                         web_sys::console::log_1(&JsValue::from(format!(
                             "Loading /bzz/ reference from service worker {:#?}",
@@ -680,7 +683,31 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
                         )));
                         let result = sekirei00.acquire(reference).await;
                         let (data, indx) = decode_resources(result);
-                        render_result(data, indx).await;
+                        render_result(data.clone(), indx.clone()).await;
+
+                        let resp = js_sys::Object::new();
+                        js_sys::Reflect::set(&resp, &"ok".into(), &true.into()).unwrap();
+                        js_sys::Reflect::set(&resp, &"type".into(), &"RETRIEVE_RESPONSE".into())
+                            .unwrap();
+                        js_sys::Reflect::set(&resp, &"indx".into(), &indx.clone().into()).unwrap();
+
+                        let head_resource = data
+                            .iter()
+                            .find(|(_, _, path)| *path == indx)
+                            .or_else(|| data.get(0));
+
+                        if let Some((bytes, mime, path)) = head_resource {
+                            let u8arr: js_sys::Uint8Array = JsValue::from(bytes.clone()).into();
+                            js_sys::Reflect::set(&resp, &"body".into(), &u8arr).unwrap();
+                            js_sys::Reflect::set(&resp, &"mime".into(), &mime.clone().into())
+                                .unwrap();
+                            js_sys::Reflect::set(&resp, &"path".into(), &path.clone().into())
+                                .unwrap();
+                        }
+
+                        if let Some(port) = port {
+                            port.post_message(&resp).unwrap();
+                        }
                     });
 
                     let resp = js_sys::Object::new();
