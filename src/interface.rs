@@ -55,7 +55,7 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
         )));
     }
 
-    let _ = match get_service_worker().await {
+    let service_worker = match get_service_worker().await {
         Some(service_worker) => Some(service_worker),
         None => None,
     };
@@ -700,12 +700,17 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
 
         let service_listener = match web_sys::window()
             .unwrap()
-            // .navigator()
-            // .service_worker()
+            .navigator()
+            .service_worker()
             .add_event_listener_with_callback("message", service_closure.as_ref().unchecked_ref())
         {
             Ok(aok) => aok,
-            _ => {}
+            Err(err) => {
+                web_sys::console::log_1(&JsValue::from(format!(
+                    "Service listener error {:#?}",
+                    err
+                )));
+            }
         };
 
         loop {
