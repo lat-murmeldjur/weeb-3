@@ -103,6 +103,9 @@ self.addEventListener("fetch", (event) => {
 });
 
 const fetchFromLibRs = async (request, client) => {
+  const allClients = await self.clients.matchAll({ includeUncontrolled: true, type: "window" });
+  console.log("all clients", allClients.map(c => c.id));
+
   if (!client) {
     return new Response("Request ghosted by client", { status: 502 });
   }
