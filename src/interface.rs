@@ -747,13 +747,16 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
             .origin()
             .unwrap();
 
-        let opts = RequestInit::new();
-        opts.set_method("GET");
-        opts.set_mode(web_sys::RequestMode::Cors);
-
         let sel = "6863c7cd109274984542f6b4b2b1898a323bb88aa99f7890154a65e321e668ad".to_string();
 
         let url = format!("{}/weeb-3/bzz/{}", host3, sel);
+
+        let opts = web_sys::RequestInit::new();
+        let headers = web_sys::Headers::new().unwrap();
+        opts.set_headers(&headers);
+        opts.set_method("GET");
+        opts.set_mode(web_sys::RequestMode::Cors);
+        opts.set_credentials(web_sys::RequestCredentials::Include);
 
         let request = web_sys::Request::new_with_str_and_init(&url, &opts).unwrap();
 

@@ -94,6 +94,7 @@ web-sys = { version = "0.3.77", features = [
   'Request',
   'RequestCache',
   'RequestMode',
+  'RequestCredentials',
   'RequestInit',
   'Response',
   'ResponseType',

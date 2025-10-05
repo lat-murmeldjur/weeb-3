@@ -60,10 +60,13 @@ self.addEventListener('install', (event) => {
 // Try experimental endpoint
 
 self.addEventListener("fetch", (event) => {
+  console.log("fetch mode:", event.request.mode, "url:", event.request.url);
+
   const req = event.request;
 
   event.respondWith((async () => {
     if (req.mode === "navigate") {
+      console.log("navigate attempt for", req.url);
       return cacheFirst(req);
     }
 
