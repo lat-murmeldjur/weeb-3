@@ -74,7 +74,8 @@ self.addEventListener("fetch", (event) => {
   console.log("fetch mode:", event.request.mode, "url:", event.request.url);
 
   const req = event.request;
-
+  
+  const url = new URL(req.url);
   if (req.method === "POST" && url.pathname.endsWith("/weeb-3/bzz")) {
     event.respondWith(postToLibRs(req, event));
     return;
@@ -172,10 +173,8 @@ async function postToLibRs(request, event) {
   const addToFeed = request.headers.get("swarm-collection") === "true"; 
   const feedTopic = url.searchParams.get("feedTopic") || "";
 
-  // --- Extract body as Blob/File ---
   const bodyBlob = await request.blob();
 
-  // --- Find client ---
   let client = null;
   if (event.clientId) {
     client = await self.clients.get(event.clientId);
