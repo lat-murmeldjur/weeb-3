@@ -76,7 +76,11 @@ self.addEventListener("fetch", (event) => {
   const req = event.request;
   
   const url = new URL(req.url);
+
+  console.log("SW FETCH:", req.method, url.pathname, "scope:", self.registration.scope);
+
   if (req.method === "POST" && url.pathname.endsWith("/weeb-3/bzz")) {
+    console.log("Intercepting POST upload:", url.toString());
     event.respondWith(postToLibRs(req, event));
     return;
   }
@@ -166,7 +170,7 @@ const fetchFromLibRs = async (request, client) => {
 };
 
 async function postToLibRs(request, event) {
- const url = new URL(request.url);
+  const url = new URL(request.url);
 
   const encryption = request.headers.get("swarm-encrypt") === "true";
   const indexString = request.headers.get("swarm-index-document") || "";
