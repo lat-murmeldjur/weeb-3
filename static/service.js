@@ -75,6 +75,11 @@ self.addEventListener("fetch", (event) => {
 
   const req = event.request;
 
+  if (req.method === "POST" && url.pathname.endsWith("/weeb-3/bzz")) {
+    event.respondWith(postToLibRs(req, event));
+    return;
+  }
+
   event.respondWith((async () => {
     if (req.mode === "navigate") {
       console.log("navigate attempt for", req.url);
@@ -159,8 +164,52 @@ const fetchFromLibRs = async (request, client) => {
   });
 };
 
+async function postToLibRs(request, event) {
+ const url = new URL(request.url);
 
+  const encryption = request.headers.get("swarm-encrypt") === "true";
+  const indexString = request.headers.get("swarm-index-document") || "";
+  const addToFeed = request.headers.get("swarm-collection") === "true"; 
+  const feedTopic = url.searchParams.get("feedTopic") || "";
 
+  // --- Extract body as Blob/File ---
+  const bodyBlob = await request.blob();
 
+  // --- Find client ---
+  let client = null;
+  if (event.clientId) {
+    client = await self.clients.get(event.clientId);
+  }
+  if (!client) {
+    return new Response("No client available for upload", { status: 502 });
+  }
 
+  return new Promise((resolve) => {
+    const channel = new MessageChannel();
+    channel.port1.onmessage = (event) => {
+      const { ok, reference } = event.data;
+      if (ok) {
+        resolve(
+          new Response(JSON.stringify({ reference }), {
+            status: 201,
+            headers: { "Content-Type": "application/json" }
+          })
+        );
+      } else {
+        resolve(new Response("Upload failed", { status: 500 }));
+      }
+    };
 
+    client.postMessage(
+      {
+        type: "UPLOAD_REQUEST",
+        file: bodyBlob,
+        encryption,
+        indexString,
+        addToFeed,
+        feedTopic
+      },
+      [channel.port2]
+    );
+  });
+}
