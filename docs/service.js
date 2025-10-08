@@ -170,6 +170,7 @@ const fetchFromLibRs = async (request, client) => {
 };
 
 async function postToLibRs(request, event) {
+  console.log("attempting upload");
   const url = new URL(request.url);
 
   const encryption = request.headers.get("swarm-encrypt") === "true";
