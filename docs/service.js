@@ -188,6 +188,12 @@ async function postToLibRs(request, event) {
     return new Response("No client available for upload", { status: 502 });
   }
 
+  const bodyFile = await request.arrayBuffer().then(buf => {
+    return new File([buf], request.headers.get("x-original-filename") || "upload.bin", {
+      type: request.headers.get("Content-Type") || "application/octet-stream"
+    });
+  });
+
   return new Promise((resolve) => {
     const channel = new MessageChannel();
     channel.port1.onmessage = (event) => {
@@ -207,7 +213,7 @@ async function postToLibRs(request, event) {
     client.postMessage(
       {
         type: "UPLOAD_REQUEST",
-        file: bodyBlob,
+        file: bodyFile,
         encryption,
         indexString,
         addToFeed,

@@ -942,10 +942,13 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
         let headers = web_sys::Headers::new().unwrap();
         headers.set("Content-Type", "text/plain").unwrap();
         headers.set("swarm-encrypt", "true").unwrap();
-        headers.set("swarm-index-document", "index.html").unwrap();
+        headers.set("swarm-index-document", "sel.txt").unwrap();
         opts.set_headers(&headers);
 
-        opts.set_body(&JsValue::from(blob));
+        let file =
+            web_sys::File::new_with_blob_sequence(&js_sys::Array::of1(&blob), "sel.txt").unwrap();
+
+        opts.set_body(&JsValue::from(file));
 
         let request = web_sys::Request::new_with_str_and_init(&url, &opts).unwrap();
 
