@@ -60,7 +60,7 @@ self.addEventListener('install', (event) => {
 });
 
 self.addEventListener("activate", event => {
-  console.log("serice activated, claim client");
+  console.log("service activated, claim client");
   event.waitUntil(self.clients.claim());
 });
 
@@ -172,14 +172,20 @@ const fetchFromLibRs = async (request, client) => {
 async function postToLibRs(request, event) {
   console.log("attempting upload (multipart/form-data)");
 
-  const formData = await request.formData();
-  const file = formData.get("file");  
-  console.log("filename:", file.name, "type:", file.type, "size:", file.size);
+  const url = new URL(request.url);
 
   const encryption = request.headers.get("swarm-encrypt") === "true";
   const indexString = request.headers.get("swarm-index-document") || "";
   const addToFeed = request.headers.get("swarm-collection") === "true"; 
-  const feedTopic = new URL(request.url).searchParams.get("feedTopic") || "";
+  const feedTopic = url.searchParams.get("feedTopic") || "";
+
+  // Parse form data
+  const form = await request.formData();
+  const file = form.get("file");   // This is a File object (with name + type)
+
+  if (!(file instanceof File)) {
+    return new Response("No file in form data", { status: 400 });
+  }
 
   let client = null;
   if (event.clientId) {
@@ -206,7 +212,7 @@ async function postToLibRs(request, event) {
     client.postMessage(
       {
         type: "UPLOAD_REQUEST",
-        file: file,          
+        file: file,           // Preserve the File with original name + type
         encryption,
         indexString,
         addToFeed,
