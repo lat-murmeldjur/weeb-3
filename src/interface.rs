@@ -948,7 +948,10 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
         let file =
             web_sys::File::new_with_blob_sequence(&js_sys::Array::of1(&blob), "sel.txt").unwrap();
 
-        opts.set_body(&JsValue::from(file));
+        let form = web_sys::FormData::new().unwrap();
+        form.append_with_blob_and_filename("file", &file, "sel.txt")
+            .unwrap();
+        opts.set_body(&form);
 
         let request = web_sys::Request::new_with_str_and_init(&url, &opts).unwrap();
 

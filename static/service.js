@@ -170,15 +170,16 @@ const fetchFromLibRs = async (request, client) => {
 };
 
 async function postToLibRs(request, event) {
-  console.log("attempting upload");
-  const url = new URL(request.url);
+  console.log("attempting upload (multipart/form-data)");
+
+  const formData = await request.formData();
+  const file = formData.get("file");  
+  console.log("filename:", file.name, "type:", file.type, "size:", file.size);
 
   const encryption = request.headers.get("swarm-encrypt") === "true";
   const indexString = request.headers.get("swarm-index-document") || "";
   const addToFeed = request.headers.get("swarm-collection") === "true"; 
-  const feedTopic = url.searchParams.get("feedTopic") || "";
-
-  const bodyBlob = await request.blob();
+  const feedTopic = new URL(request.url).searchParams.get("feedTopic") || "";
 
   let client = null;
   if (event.clientId) {
@@ -188,23 +189,15 @@ async function postToLibRs(request, event) {
     return new Response("No client available for upload", { status: 502 });
   }
 
-  const bodyFile = await request.arrayBuffer().then(buf => {
-    return new File([buf], request.headers.get("x-original-filename") || "upload.bin", {
-      type: request.headers.get("Content-Type") || "application/octet-stream"
-    });
-  });
-
   return new Promise((resolve) => {
     const channel = new MessageChannel();
     channel.port1.onmessage = (event) => {
       const { ok, reference } = event.data;
       if (ok) {
-        resolve(
-          new Response(JSON.stringify({ reference }), {
-            status: 201,
-            headers: { "Content-Type": "application/json" }
-          })
-        );
+        resolve(new Response(JSON.stringify({ reference }), {
+          status: 201,
+          headers: { "Content-Type": "application/json" }
+        }));
       } else {
         resolve(new Response("Upload failed", { status: 500 }));
       }
@@ -213,7 +206,7 @@ async function postToLibRs(request, event) {
     client.postMessage(
       {
         type: "UPLOAD_REQUEST",
-        file: bodyFile,
+        file: file,          
         encryption,
         indexString,
         addToFeed,
