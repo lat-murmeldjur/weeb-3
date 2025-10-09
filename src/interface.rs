@@ -945,11 +945,8 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
         headers.set("swarm-index-document", "sel.txt").unwrap();
         opts.set_headers(&headers);
 
-        let file =
-            web_sys::File::new_with_blob_sequence(&js_sys::Array::of1(&blob), "sel.txt").unwrap();
-
         let form = web_sys::FormData::new().unwrap();
-        form.append_with_blob_and_filename("file", &file, "sel.txt")
+        form.append_with_blob_and_filename("file", &blob, "sel.txt")
             .unwrap();
         opts.set_body(&form);
 

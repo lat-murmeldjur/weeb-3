@@ -179,9 +179,9 @@ async function postToLibRs(request, event) {
   const addToFeed = request.headers.get("swarm-collection") === "true"; 
   const feedTopic = url.searchParams.get("feedTopic") || "";
 
-  // Parse form data
-  const form = await request.formData();
-  const file = form.get("file");   // This is a File object (with name + type)
+  const formData = await request.formData();
+  const file = formData.get("file");
+  console.log("Got file:", file?.name, file?.type, file?.size);
 
   if (!(file instanceof File)) {
     return new Response("No file in form data", { status: 400 });
