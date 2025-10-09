@@ -925,7 +925,6 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
 
         let u8arr = js_sys::Uint8Array::from(ascii_art.as_bytes());
 
-        // Put into a Blob
         let blob_parts = js_sys::Array::new();
         blob_parts.push(&u8arr);
         let props = web_sys::BlobPropertyBag::new();
@@ -933,24 +932,22 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
         let blob =
             web_sys::Blob::new_with_u8_array_sequence_and_options(&blob_parts, &props).unwrap();
 
-        // Setup POST
-        let opts = web_sys::RequestInit::new();
-        opts.set_method("POST");
-        opts.set_mode(web_sys::RequestMode::Cors);
-        opts.set_credentials(web_sys::RequestCredentials::Include);
-
-        let headers = web_sys::Headers::new().unwrap();
-        headers.set("Content-Type", "text/plain").unwrap();
-        headers.set("swarm-encrypt", "true").unwrap();
-        headers.set("swarm-index-document", "sel.txt").unwrap();
-        opts.set_headers(&headers);
-
         let form = web_sys::FormData::new().unwrap();
         form.append_with_blob_and_filename("file", &blob, "sel.txt")
             .unwrap();
-        opts.set_body(&form);
+
+        let opts = web_sys::RequestInit::new();
+        opts.set_method("POST");
+
+        let headers = web_sys::Headers::new().unwrap();
+        headers.set("swarm-encrypt", "true").unwrap();
+        opts.set_headers(&headers);
+        opts.set_body(&wasm_bindgen::JsValue::from(form)); // <-- important: JsValue
 
         let request = web_sys::Request::new_with_str_and_init(&url, &opts).unwrap();
+        let window = web_sys::window().unwrap();
+        let resp_value = JsFuture::from(window.fetch_with_request(&request)).await;
+        web_sys::console::log_1(&JsValue::from(format!("Upload response: {:?}", resp_value)));
 
         let window = web_sys::window().unwrap();
         let resp_value = JsFuture::from(window.fetch_with_request(&request)).await;
