@@ -189,6 +189,7 @@ pub async fn pricing_handler(peer: PeerId, mut stream: Stream, chan: &mpsc::Send
         }
     };
     let _ = stream.flush().await;
+    let _ = stream.close().await;
 
     let mut buf_nondiscard_0 = Vec::new();
     let mut buf_discard_0: [u8; 255] = [0; 255];
@@ -204,8 +205,6 @@ pub async fn pricing_handler(peer: PeerId, mut stream: Stream, chan: &mpsc::Send
             break;
         }
     }
-
-    let _ = stream.close().await;
 
     let rec_0_u = etiquette_4::AnnouncePaymentThreshold::decode_length_delimited(&mut Cursor::new(
         buf_nondiscard_0,
@@ -271,6 +270,7 @@ pub async fn gossip_handler(
         }
     };
     let _ = stream.flush().await;
+    let _ = stream.close().await;
 
     let mut buf_nondiscard_0 = Vec::new();
     let mut buf_discard_0: [u8; 255] = [0; 255];
@@ -286,8 +286,6 @@ pub async fn gossip_handler(
             break;
         }
     }
-
-    let _ = stream.close().await;
 
     let rec_0_u = etiquette_2::Peers::decode_length_delimited(&mut Cursor::new(buf_nondiscard_0));
 
@@ -367,6 +365,7 @@ pub async fn fresh(
         }
     };
     let _ = stream.flush().await;
+    let _ = stream.close().await;
 
     let mut buf_nondiscard_0 = Vec::new();
     let mut buf_discard_0: [u8; 255] = [0; 255];
@@ -384,7 +383,6 @@ pub async fn fresh(
         }
     }
 
-    let _ = stream.close().await;
     let rec_0_u =
         etiquette_5::PaymentAck::decode_length_delimited(&mut Cursor::new(buf_nondiscard_0));
 
@@ -460,6 +458,7 @@ pub async fn trieve(
         }
     };
     let _ = stream.flush().await;
+    let _ = stream.close().await;
 
     let mut buf_nondiscard_0 = Vec::new();
     let mut buf_discard_0: [u8; 255] = [0; 255];
@@ -475,8 +474,6 @@ pub async fn trieve(
             break;
         }
     }
-
-    let _ = stream.close().await;
 
     let rec_0_u =
         etiquette_6::Delivery::decode_length_delimited(&mut Cursor::new(buf_nondiscard_0));
@@ -676,6 +673,8 @@ pub async fn sync(
         };
     }
 
+    let _ = stream.close().await;
+
     let mut buf_nondiscard_0 = Vec::new();
     let mut buf_discard_0: [u8; 255] = [0; 255];
     loop {
@@ -691,8 +690,6 @@ pub async fn sync(
             break;
         }
     }
-
-    let _ = stream.close().await;
 
     let rec_0_u = etiquette_7::Receipt::decode_length_delimited(&mut Cursor::new(buf_nondiscard_0));
 
