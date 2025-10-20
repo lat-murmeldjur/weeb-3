@@ -51,6 +51,8 @@ use handlers::*;
 mod interface;
 use interface::parsebootconnect;
 
+mod library;
+
 mod manifest;
 
 mod manifest_upload;
@@ -381,7 +383,7 @@ impl Sekirei {
                 "text/plain".to_string(),
                 "... result ...".to_string(),
             )],
-            "... result ...".to_string(),
+            hex::encode(&result).to_string(),
         );
     }
 

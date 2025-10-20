@@ -138,6 +138,7 @@ pub async fn bump_bucket(stamp_identifier: String, bucket_identifier: String) ->
     };
 }
 
+#[allow(dead_code)]
 pub async fn cache_chunk(chunk_address: &Vec<u8>, chunk_content: &Vec<u8>) {
     let db = match cat_base("chunk_cachestore".to_string()).await {
         Some(db0) => db0,
@@ -201,6 +202,7 @@ pub async fn cache_chunk(chunk_address: &Vec<u8>, chunk_content: &Vec<u8>) {
     return;
 }
 
+#[allow(dead_code)]
 pub async fn retrieve_cached_chunk(chunk_address: &Vec<u8>) -> Vec<u8> {
     let db = match cat_base("chunk_cachestore".to_string()).await {
         Some(db0) => db0,
