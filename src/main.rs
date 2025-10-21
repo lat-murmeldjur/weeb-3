@@ -100,6 +100,7 @@ pub(crate) async fn serve(libp2p_transport: Multiaddr) {
     let server = Router::new()
         .route("/weeb-3/", get(get_index))
         .route("/weeb-3/index.html", get(get_index))
+        .route("/example.html", get(get_example))
         .route("/weeb-3/weeb_3.js", get(get_static_file_weeb_3_js))
         .route(
             "/weeb-3/weeb_3_bg.wasm",
@@ -133,6 +134,18 @@ async fn get_index() -> Result<Html<String>, StatusCode> {
 
     let html = std::str::from_utf8(&content)
         .expect("index.html to be valid utf8")
+        .to_string();
+
+    Ok(Html(html))
+}
+
+async fn get_example() -> Result<Html<String>, StatusCode> {
+    let content = StaticFiles::get("example.html")
+        .ok_or(StatusCode::NOT_FOUND)?
+        .data;
+
+    let html = std::str::from_utf8(&content)
+        .expect("example.html to be valid utf8")
         .to_string();
 
     Ok(Html(html))

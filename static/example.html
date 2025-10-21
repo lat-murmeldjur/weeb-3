@@ -1,0 +1,107 @@
+<!doctype html>
+<html lang="en">
+  <meta charset="utf-8" />
+  <title>weeb-3 embed demo</title>
+  <p>
+    <label>
+      Address:
+      <input id="address" size="70"
+             value="3af38f54ce83a76ecf002183928ba3f63ad98bac2094d59a678b71ba37cffebea161753e7dedc254ee3fb0c48f0e2bc0aa3e38b6513106b8cfd180df7d5eb2e6" />
+    </label>
+    <button id="go">Retrieve</button>
+  </p>
+
+  <div id="viewerRoot"></div>
+  <div id="meta"></div>
+  <p id="fallback" hidden>
+    Can’t preview this type. <a id="dl" href="#" download>Download file</a>
+  </p>
+
+  <script type="module">
+    import init, { SekireiNo103 } from "./weeb-3/weeb_3.js";
+    await init();
+
+    const weeb3node = new SekireiNo103();
+    weeb3node.start("/ip4/192.168.100.148/udp/1634/webrtc-direct/certhash/uEiCkvQyYxFoixnyftrDOvfO4igY2JtsgAXtBcYXhyQ--KA/p2p/QmQU8F1HcWziRdww5r8CzTWYyUdeMGmdXF3zTATSa1jrGF", "10");
+
+    const viewerRoot = document.getElementById("viewerRoot");
+    const meta   = document.getElementById("meta");
+    const dl     = document.getElementById("dl");
+    const fb     = document.getElementById("fallback");
+
+    let currentUrl = null;
+
+    function inferMimeFromName(name) {
+      const ext = name.split(".").pop()?.toLowerCase();
+      switch (ext) {
+        case "jpg":
+        case "jpeg": return "image/jpeg";
+        case "png": return "image/png";
+        case "gif": return "image/gif";
+        case "webp": return "image/webp";
+        case "pdf": return "application/pdf";
+        case "mp4": return "video/mp4";
+        case "webm": return "video/webm";
+        case "mp3": return "audio/mpeg";
+        case "wav": return "audio/wav";
+        case "ogg": return "audio/ogg";
+        case "txt": return "text/plain";
+        case "json": return "application/json";
+        case "html": return "text/html";
+        default: return "application/octet-stream";
+      }
+    }
+
+    function formatBytes(n) {
+      if (n < 1024) return `${n} B`;
+      const u = ["KB","MB","GB","TB"];
+      let i = -1; do { n /= 1024; i++; } while (n >= 1024 && i < u.length - 1);
+      return `${n.toFixed(1)} ${u[i]}`;
+    }
+
+    function showFile(file) {
+      if (currentUrl) URL.revokeObjectURL(currentUrl);
+
+      const url = URL.createObjectURL(file);
+      currentUrl = url;
+
+      const embed = document.createElement("embed");
+      const mime = file.type && file.type.trim() !== "" ? file.type : inferMimeFromName(file.name);
+
+      embed.setAttribute("type", mime);
+      embed.setAttribute("src", url);
+
+      viewerRoot.replaceChildren(embed);
+
+      meta.textContent = `${file.name} — ${mime} — ${formatBytes(file.size)}`;
+      if (dl) {
+        dl.href = url;
+        dl.download = file.name || "download";
+      }
+      if (fb) fb.hidden = true;
+    }
+
+    document.getElementById("go").addEventListener("click", async () => {
+      const addr = document.getElementById("address").value.trim();
+      meta.textContent = "";
+      viewerRoot.replaceChildren(); // clear
+
+      try {
+        const files = await weeb3node.retrieve(addr);
+        if (files.length === 0) {
+          meta.textContent = "No files were returned for this address.";
+          if (fb) fb.hidden = false;
+          return;
+        }
+        showFile(files[0]);
+      } catch (e) {
+        meta.textContent = "Retrieve failed: " + (e?.message ?? String(e));
+        if (fb) fb.hidden = false;
+      }
+    });
+
+    window.addEventListener("beforeunload", () => {
+      if (currentUrl) URL.revokeObjectURL(currentUrl);
+    });
+  </script>
+</html>

@@ -76,6 +76,7 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
     let sekirei6 = sekirei.clone();
     let sekirei7 = sekirei.clone();
     let sekirei8 = sekirei.clone();
+    let sekirei9 = sekirei.clone();
 
     let path_load_init = async {
         let references = read_path().await;
@@ -955,7 +956,19 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
         web_sys::console::log_1(&JsValue::from(format!("Upload response: {:?}", resp_value)));
     };
 
-    join!(sekirei_async, interface_async, path_load_init, fetch_test);
+    let initial_connect_handle = async {
+        async_std::task::sleep(Duration::from_millis(600)).await;
+        let (bna, nid) = parsebootconnect();
+        sekirei9.change_bootnode_address(bna, nid).await;
+    };
+
+    join!(
+        sekirei_async,
+        interface_async,
+        path_load_init,
+        fetch_test,
+        initial_connect_handle
+    );
 
     #[allow(unreachable_code)]
     Ok(())

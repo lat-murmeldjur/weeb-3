@@ -49,7 +49,6 @@ mod handlers;
 use handlers::*;
 
 mod interface;
-use interface::parsebootconnect;
 
 mod library;
 
@@ -1479,12 +1478,6 @@ impl Sekirei {
             }
         };
 
-        let initial_connect_handle = async {
-            async_std::task::sleep(Duration::from_millis(600)).await;
-            let (bna, nid) = parsebootconnect();
-            self.change_bootnode_address(bna, nid).await;
-        };
-
         join!(
             event_handle,
             retrieve_handle,
@@ -1498,7 +1491,6 @@ impl Sekirei {
             swarm_event_handle_2,
             gossip_inbound_handle,
             pricing_inbound_handle,
-            initial_connect_handle,
             hive_joiner,
         );
 

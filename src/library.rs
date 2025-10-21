@@ -5,6 +5,7 @@ use async_std::sync::Arc;
 use js_sys::Object;
 use js_sys::Reflect;
 use js_sys::{Array, Uint8Array};
+use std::time::Duration;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::spawn_local;
 use web_sys::{File, FilePropertyBag};
@@ -50,13 +51,17 @@ impl SekireiNo103 {
     pub fn start(&self, bootnode_multiaddr: String, network_id: String) {
         let s = self.inner.clone();
         spawn_local(async move {
+            let s0 = s.clone();
+            spawn_local(async move {
+                s0.run(String::new()).await;
+            });
+
+            async_std::task::sleep(Duration::from_millis(600)).await;
             if !bootnode_multiaddr.is_empty() {
                 let _ = s
                     .change_bootnode_address(bootnode_multiaddr, network_id)
                     .await;
             }
-
-            s.run(String::new()).await;
         });
     }
 

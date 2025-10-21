@@ -6,4 +6,5 @@ Cargo.lock
 !*/static/service.js
 !*/static/cert.pem
 !*/static/key.pem
+!*/static/example.html
 
