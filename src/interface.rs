@@ -261,6 +261,19 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
                                             return;
                                         }
 
+                                        if let Ok(w3) = crate::on_chain::web3() {
+                                            if let Ok(cid) = w3.eth().chain_id().await {
+                                                use web3::types::U256;
+                                                if cid != U256::from(11155111u64) {
+                                                    let wnd = web_sys::window().unwrap();
+                                                    let _ = wnd.alert_with_message(
+                                                        "Wallet is not on Sepolia (11155111). Please switch to Sepolia in your wallet and try again."
+                                                    );
+                                                    return;
+                                                }
+                                            }
+                                        }
+
                                         let stamp_signer_key = encrey();
                                         let stamp_signer: PrivateKeySigner =
                                             match PrivateKeySigner::from_slice(&stamp_signer_key) {

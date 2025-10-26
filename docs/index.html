@@ -105,41 +105,29 @@
               const accs0 = await injected.request({ method: "eth_accounts" });
               if (accs0 && accs0.length) return accs0;
             } catch (_) {}
-            
             try {
               return await injected.request({ method: "eth_requestAccounts" });
             } catch (e) {
               const err = normalizeEthError(e);
               try {
-                await injected.request({
-                  method: "wallet_requestPermissions",
-                  params: [{ eth_accounts: {} }],
-                });
+                await injected.request({ method: "wallet_requestPermissions", params: [{ eth_accounts: {} }] });
               } catch (_) {}
               const accs2 = await injected.request({ method: "eth_accounts" }).catch(() => []);
               if (accs2 && accs2.length) return accs2;
               throw err;
             }
           }
-          
+        
           async function getWalletConnectAccounts(provider) {
-            
-            if (Array.isArray(provider.accounts) && provider.accounts.length) {
-              return provider.accounts;
-            }
-            
+            if (Array.isArray(provider.accounts) && provider.accounts.length) return provider.accounts;
             const ns = provider.session?.namespaces?.eip155;
             if (ns?.accounts?.length) {
-              return ns.accounts
-                .map((a) => (typeof a === "string" ? a.split(":")[2] : null))
-                .filter(Boolean);
+              return ns.accounts.map((a) => (typeof a === "string" ? a.split(":")[2] : null)).filter(Boolean);
             }
-            
             try {
               const accs = await provider.request({ method: "eth_accounts" });
               if (accs && accs.length) return accs;
             } catch (_) {}
-        
             throw normalizeEthError({ code: 4001, message: "No accounts in WC session (user may have cancelled)" });
           }
           
@@ -155,25 +143,26 @@
                   return { ok: false, error: `${err.code}: ${err.message}` };
                 }
               }
-              
+        
               const wc = window['@walletconnect/ethereum-provider'];
-              if (!wc?.EthereumProvider) {
-                return { ok: false, error: "WalletConnect UMD not loaded" };
-              }
-              if (!projectId) {
-                return { ok: false, error: "WalletConnect projectId is required" };
-              }
+              if (!wc?.EthereumProvider) return { ok: false, error: "WalletConnect UMD not loaded" };
+              if (!projectId) return { ok: false, error: "WalletConnect projectId is required" };
               
               const provider = await wc.EthereumProvider.init({
                 projectId,
                 chains: [1],                
                 optionalChains: [11155111], 
                 showQrModal: true,
-                methods: [],                
-                optionalMethods: [
+                methods: [
+                  "eth_call",
+                  "eth_estimateGas",
                   "eth_sendTransaction",
+                  "eth_chainId",            
+                ],
+                optionalMethods: [
                   "wallet_switchEthereumChain",
                   "wallet_addEthereumChain",
+                  "eth_accounts"            
                 ],
                 events: ["chainChanged", "accountsChanged", "disconnect"],
                 metadata: {
@@ -184,13 +173,21 @@
                 },
               });
               
+              try {
+                const methods = provider.session?.namespaces?.eip155?.methods || [];
+                const required = ["eth_call","eth_estimateGas","eth_sendTransaction"];
+                const missing = required.some((m) => !methods.includes(m));
+                if (provider.session && missing && typeof provider.disconnect === "function") {
+                  await provider.disconnect();
+                }
+              } catch (_) {}
+              
               if (typeof provider.connect === "function") {
                 try { await provider.connect(); } catch (e) { throw normalizeEthError(e); }
               }
               
               const origRequest = provider.request.bind(provider);
-              provider.request = (args) =>
-                origRequest(args).catch((e) => Promise.reject(normalizeEthError(e)));
+              provider.request = (args) => origRequest(args).catch((e) => Promise.reject(normalizeEthError(e)));
               
               window.ethereum = provider;
               
@@ -202,19 +199,15 @@
                       method: "wallet_switchEthereumChain",
                       params: [{ chainId: "0xaa36a7" }],
                     });
-                  } catch (e) {
-                    console.warn("User declined chain switch; select Sepolia in wallet if needed.");
-                  }
+                  } catch (_) {}
                 }
-              } catch (e) {
-                console.warn("eth_chainId failed:", e);
-              }
+              } catch (e) { console.warn("eth_chainId failed:", e); }
               
               const accounts = await getWalletConnectAccounts(provider);
-              
+        
               provider.on?.("accountsChanged", (a) => console.log("accountsChanged", a));
-              provider.on?.("disconnect", (ev) => console.log("disconnect", ev));
-              provider.on?.("chainChanged", (cid) => console.log("chainChanged", cid));
+              provider.on?.("disconnect",     (ev) => console.log("disconnect", ev));
+              provider.on?.("chainChanged",   (cid) => console.log("chainChanged", cid));
         
               return { ok: true, accounts };
             } catch (e) {
