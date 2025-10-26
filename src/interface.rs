@@ -149,7 +149,6 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
             .dyn_ref::<HtmlInputElement>()
             .expect("#inputString should be a HtmlInputElement")
             .set_oninput(Some(callback.as_ref().unchecked_ref()));
-
         let callback2 = wasm_bindgen::closure::Closure::<dyn FnMut(web_sys::MessageEvent)>::new(
             move |_msg| {
                 console::log_1(&"uploadGetBatch callback triggered".into());
@@ -194,6 +193,47 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
                 )));
 
                 spawn_local(async move {
+                    use wasm_bindgen::{JsCast, JsValue};
+                    use wasm_bindgen_futures::JsFuture;
+                    use web3::transports::eip_1193::Provider as Eip1193Provider;
+
+                    let provider_present = Eip1193Provider::default().ok().flatten().is_some();
+                    if !provider_present {
+                        let window = web_sys::window().unwrap();
+                        if let Ok(func) =
+                            js_sys::Reflect::get(&window, &JsValue::from_str("weeb3EnsureEip1193"))
+                        {
+                            if let Ok(f) = func.dyn_into::<js_sys::Function>() {
+                                let project_id =
+                                    JsValue::from_str("64c5f91181ce0a3192a783346a475d23");
+                                match f.call1(&JsValue::NULL, &project_id) {
+                                    Ok(promise_val) => {
+                                        if let Ok(promise) =
+                                            promise_val.dyn_into::<js_sys::Promise>()
+                                        {
+                                            let _ = JsFuture::from(promise).await;
+                                        }
+                                    }
+                                    Err(e) => {
+                                        web_sys::console::error_1(&JsValue::from_str(&format!(
+                                            "weeb3EnsureEip1193 threw: {:?}",
+                                            e
+                                        )));
+                                    }
+                                }
+                            }
+                        }
+
+                        if Eip1193Provider::default().ok().flatten().is_none() {
+                            let wnd = web_sys::window().unwrap();
+                            let _ = wnd.alert_with_message(
+                        "No Ethereum provider available. \
+                         On mobile, you should see a wallet prompt. If not, try MetaMask in-app browser.",
+                    );
+                            return;
+                        }
+                    }
+
                     let stored_stamp_signer_key = get_batch_owner_key().await;
                     let stored_batch_id = get_batch_id().await;
                     let bucket_limit = get_batch_bucket_limit().await;
@@ -233,10 +273,9 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
                         Ok(p) => p,
                         Err(e) => {
                             let wnd = web_sys::window().unwrap();
-                            // NOTE: use {:?} because JsError doesn't implement Display
                             let _ = wnd.alert_with_message(&format!(
                         "Batch purchase failed: {:?}. \
-                         Make sure a wallet is connected (window.ethereum), e.g. via WalletConnect or MetaMask.",
+                         Ensure your wallet is connected, on Sepolia, and has sufficient SBZZ + Sepolia ETH.",
                         e
                     ));
                             return;
@@ -273,11 +312,11 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
 
                     let wnd = web_sys::window().unwrap();
                     let _ = wnd.alert_with_message(&format!(
-                        "Storage batch ready.\nBatch ID: 0x{}\nDepth: {}\nStorage slots per bucket: {}",
-                        hex::encode(&purchase.batch_id),
-                        batch_depth,
-                        purchase.bucket_limit
-                    ));
+                "Storage batch ready.\nBatch ID: 0x{}\nDepth: {}\nStorage slots per bucket: {}",
+                hex::encode(&purchase.batch_id),
+                batch_depth,
+                purchase.bucket_limit
+            ));
                 });
             },
         );

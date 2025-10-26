@@ -80,6 +80,75 @@
                 <div id="logsField"></div>
             </div>
         </div>
+        
+        <script src="https://cdn.jsdelivr.net/npm/@walletconnect/ethereum-provider@2.22.4/dist/index.umd.js" crossorigin="anonymous"></script>
+        
+        <script>
+          window.weeb3EnsureEip1193 = async function(projectId) {
+              try {
+                  if (window.ethereum && typeof window.ethereum.request === "function") {
+                    try {
+                      const accounts = await window.ethereum.request({ method: "eth_requestAccounts" });
+                      return { ok: true, accounts };
+                    } catch (e) {
+                      return { ok: false, error: e?.message || String(e) };
+                    }
+                  }
+            
+                  const wc = window['@walletconnect/ethereum-provider'];
+                  if (!wc || !wc.EthereumProvider) {
+                    return { ok: false, error: "WalletConnect UMD not loaded" };
+                  }
+                  if (!projectId) {
+                    return { ok: false, error: "WalletConnect projectId is required" };
+                  }
+            
+                  const provider = await wc.EthereumProvider.init({
+                    projectId,
+                    chains: [11155111],  // Sepolia
+                    showQrModal: true,
+                    methods: [
+                      "eth_requestAccounts",
+                      "eth_sendTransaction",
+                      "eth_sign",
+                      "personal_sign",
+                      "eth_signTypedData",
+                      "eth_signTransaction",
+                    ],
+                    optionalMethods: [
+                      "wallet_switchEthereumChain",
+                      "wallet_addEthereumChain",
+                    ],
+                    events: ["chainChanged", "accountsChanged", "disconnect"],
+                    metadata: {
+                      name: "weeb-3",
+                      description: "Swarm uploader",
+                      url: window.location.origin,
+                      icons: [window.location.origin + "/icon.png"],
+                    },
+                  });
+            
+                  window.ethereum = provider;
+            
+                  try {
+                    await provider.request({
+                      method: "wallet_switchEthereumChain",
+                      params: [{ chainId: "0xaa36a7" }], // 11155111
+                    });
+                  } catch (_) { }
+            
+                  const accounts = await provider.request({ method: "eth_requestAccounts" });
+            
+                  provider.on("accountsChanged", (accs) => console.log("accountsChanged", accs));
+                  provider.on("disconnect", (evt) => console.log("disconnect", evt));
+                  provider.on("chainChanged", (cid) => console.log("chainChanged", cid));
+            
+                  return { ok: true, accounts };
+                } catch (e) {
+                    return { ok: false, error: e?.message || String(e) };
+                }
+            };
+        </script>
         <script type="module" defer>
             async function requestPersistentStorage() {
                 if (navigator.storage && navigator.storage.persist) {
@@ -97,52 +166,6 @@
             import init, { interweeb } from "./weeb_3.js"
             await init();
             interweeb(""); 
-        </script>
-        <script type="module">
-          import EthereumProvider from "https://cdn.jsdelivr.net/npm/@walletconnect/ethereum-provider@2/dist/ethereum-provider.min.js";
-        
-          async function ensureEip1193() {
-            if (window.ethereum) return;
-        
-            const provider = await EthereumProvider.init({
-              projectId: "<YOUR_WALLETCONNECT_PROJECT_ID>",
-              chains: [11155111], // Sepolia
-              showQrModal: true,
-              methods: [
-                "eth_requestAccounts",
-                "eth_sendTransaction",
-                "eth_sign",
-                "personal_sign",
-                "eth_signTypedData",
-                "eth_signTransaction"
-              ],
-              optionalMethods: [
-                "wallet_switchEthereumChain",
-                "wallet_addEthereumChain"
-              ],
-              events: ["chainChanged", "accountsChanged", "disconnect"],
-              metadata: {
-                name: "weeb-3",
-                description: "Swarm uploader",
-                url: window.location.origin,
-                icons: [window.location.origin + "/icon.png"]
-              }
-            });
-        
-            window.ethereum = provider;
-        
-            try {
-              await provider.request({
-                method: "wallet_switchEthereumChain",
-                params: [{ chainId: "0xaa36a7" }], // 11155111 Sepolia
-              });
-            } catch (e) {  }
-        
-            try { await provider.enable?.(); } catch (e) { console.warn(e); }
-          }
-
-          window.ensureEip1193 = ensureEip1193;
-          ensureEip1193();
         </script>
     </body>
 </html>
