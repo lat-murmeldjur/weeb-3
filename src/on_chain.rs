@@ -212,34 +212,13 @@ pub fn buckets_for_depth(depth: u8) -> u32 {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct BatchPurchaseResult {
-    pub approve_tx: H256,
-    pub create_tx: H256,
-    pub batch_id: Vec<u8>,
-    pub last_price: U256,
-    #[allow(dead_code)]
-    pub initial_balance_per_chunk: U256,
-    #[allow(dead_code)]
-    pub approve_amount: U256,
-    pub bucket_limit: u32,
-}
-
-fn add_buffer(g: U256) -> U256 {
-    g + (g / U256::from(5u8))
-}
-
-pub async fn buy_postage_batch(
+pub async fn buy_postage_batch_with_payer(
     validity_days: u64,
     depth: u8,
     owner: Address,
+    payer: Address,
 ) -> Result<BatchPurchaseResult, JsError> {
     let w3 = web3()?;
-    let accounts = connected_accounts(&w3).await?;
-    let payer = *accounts
-        .first()
-        .ok_or_else(|| JsError::new("No accounts returned by provider"))?;
-
     let postage = postage_contract(&w3).await?;
     let token = token_contract(&w3).await?;
 
@@ -251,11 +230,9 @@ pub async fn buy_postage_batch(
         .query("balanceOf", (payer,), None, Options::default(), None)
         .await
         .map_err(|e| JsError::new(&format!("balanceOf() failed: {e}")))?;
-
     if sbzz_balance < approve_amt {
         return Err(JsError::new(&format!(
-            "Insufficient SBZZ balance. Need {}, have {}. \
-             Reduce batch size or validity days, or top up SBZZ.",
+            "Insufficient SBZZ. Need {}, have {}. Reduce depth/validity or top up.",
             approve_amt, sbzz_balance
         )));
     }
@@ -272,21 +249,19 @@ pub async fn buy_postage_batch(
             .await
             .unwrap_or(U256::from(200_000u64));
         exp_opts.gas = Some(add_buffer(gas_est));
-
-        let _tx = postage
+        let _ = postage
             .call("expireLimited", (U256::from(5u64),), payer, exp_opts)
             .await
             .map_err(|e| JsError::new(&format!("expireLimited() failed: {e}")))?;
     }
 
-    let spender = ensure_addr(POSTAGE_CONTRACT_ADDR)?;
     let mut approve_opts = Options::default();
+    let spender = Address::from_slice(&hex::decode(POSTAGE_CONTRACT_ADDR).unwrap());
     let approve_gas = token
         .estimate_gas("approve", (spender, approve_amt), payer, Options::default())
         .await
         .unwrap_or(U256::from(100_000u64));
     approve_opts.gas = Some(add_buffer(approve_gas));
-
     let approve_receipt = token
         .call_with_confirmations(
             "approve",
@@ -298,10 +273,10 @@ pub async fn buy_postage_batch(
         .await
         .map_err(|e| JsError::new(&format!("approve() failed: {e}")))?;
 
+    let mut cb_opts = Options::default();
     let nonce_rand: [u8; 32] = crate::encrey()
         .try_into()
         .map_err(|_| JsError::new("nonce gen"))?;
-    let mut cb_opts = Options::default();
     let cb_gas = postage
         .estimate_gas(
             "createBatch",
@@ -319,7 +294,6 @@ pub async fn buy_postage_batch(
         .await
         .unwrap_or(U256::from(1_500_000u64));
     cb_opts.gas = Some(add_buffer(cb_gas));
-
     let create_receipt = postage
         .call_with_confirmations(
             "createBatch",
@@ -350,4 +324,21 @@ pub async fn buy_postage_batch(
         approve_amount: approve_amt,
         bucket_limit: buckets_for_depth(depth),
     })
+}
+
+#[derive(Debug, Clone)]
+pub struct BatchPurchaseResult {
+    pub approve_tx: H256,
+    pub create_tx: H256,
+    pub batch_id: Vec<u8>,
+    pub last_price: U256,
+    #[allow(dead_code)]
+    pub initial_balance_per_chunk: U256,
+    #[allow(dead_code)]
+    pub approve_amount: U256,
+    pub bucket_limit: u32,
+}
+
+fn add_buffer(g: U256) -> U256 {
+    g + (g / U256::from(5u8))
 }
