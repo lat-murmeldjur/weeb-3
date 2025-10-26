@@ -194,8 +194,7 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
                 )));
 
                 spawn_local(async move {
-                    let provider_present = Eip1193Provider::default().ok().flatten().is_some();
-                    if !provider_present {
+                    {
                         let window = web_sys::window().unwrap();
                         if let Ok(func) =
                             js_sys::Reflect::get(&window, &JsValue::from_str("weeb3EnsureEip1193"))
@@ -232,7 +231,11 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
                             }
                         }
 
-                        if Eip1193Provider::default().ok().flatten().is_none() {
+                        if web3::transports::eip_1193::Provider::default()
+                            .ok()
+                            .flatten()
+                            .is_none()
+                        {
                             let wnd = web_sys::window().unwrap();
                             let _ = wnd.alert_with_message(
                                 "No Ethereum provider. Try again, or open this page in the MetaMask in‑app browser."

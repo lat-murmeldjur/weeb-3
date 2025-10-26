@@ -82,9 +82,7 @@
         </div>
         
         <script src="https://cdn.jsdelivr.net/npm/@walletconnect/ethereum-provider@2.22.4/dist/index.umd.js" crossorigin="anonymous"></script>
-        
         <script>
-          
           function normalizeEthError(err) {
             try {
               if (err && typeof err === "object") {
@@ -112,7 +110,6 @@
               return await provider.request({ method: "eth_requestAccounts" });
             } catch (e) {
               const err = normalizeEthError(e);
-        
               
               try {
                 await provider.request({
@@ -120,14 +117,13 @@
                   params: [{ eth_accounts: {} }],
                 });
               } catch (_) {}
-        
               const accs2 = await provider.request({ method: "eth_accounts" }).catch(() => []);
               if (accs2 && accs2.length) return accs2;
-        
               throw err;
             }
           }
         
+          
           window.weeb3EnsureEip1193 = async function(projectId) {
             try {
               
@@ -151,18 +147,23 @@
               }
         
               
-              const REQUIRED_METHODS = [
-                "eth_requestAccounts",
-                "eth_sendTransaction",
-              ];
-        
               const provider = await wc.EthereumProvider.init({
                 projectId,
-                chains: [11155111],         
-                showQrModal: true,
-                methods: REQUIRED_METHODS,  
-                optionalMethods: [],        
                 
+                chains: [1],
+                
+                optionalChains: [11155111],
+                showQrModal: true,
+                methods: [
+                  "eth_requestAccounts",         
+                ],
+                optionalMethods: [
+                  "eth_sendTransaction",         
+                  "wallet_switchEthereumChain",  
+                  "wallet_addEthereumChain",     
+                ],
+                
+                events: ["chainChanged", "accountsChanged", "disconnect"],
                 metadata: {
                   name: "weeb-3",
                   description: "Swarm uploader",
@@ -173,7 +174,8 @@
         
               
               if (typeof provider.connect === "function") {
-                try { await provider.connect(); } catch (e) { throw normalizeEthError(e); }
+                try { await provider.connect(); }
+                catch (e) { throw normalizeEthError(e); }
               }
         
               
@@ -186,16 +188,15 @@
         
               
               try {
-                const chainId = await provider.request({ method: "eth_chainId" });
-                if (chainId !== "0xaa36a7") {
-                  
+                const cid = await provider.request({ method: "eth_chainId" });
+                if (cid !== "0xaa36a7") {
                   try {
                     await provider.request({
                       method: "wallet_switchEthereumChain",
                       params: [{ chainId: "0xaa36a7" }],
                     });
                   } catch (e) {
-                    console.warn("User declined chain switch; user must switch to Sepolia manually.");
+                    console.warn("User declined chain switch; please select Sepolia in the wallet.");
                   }
                 }
               } catch (e) {
@@ -204,7 +205,6 @@
         
               const accounts = await requestAccountsWithFallback(provider);
         
-              
               provider.on?.("accountsChanged", (a) => console.log("accountsChanged", a));
               provider.on?.("disconnect", (ev) => console.log("disconnect", ev));
               provider.on?.("chainChanged", (cid) => console.log("chainChanged", cid));
@@ -212,7 +212,6 @@
               return { ok: true, accounts };
             } catch (e) {
               const err = normalizeEthError(e);
-              
               return { ok: false, error: `${err.code}: ${err.message}` };
             }
           };
