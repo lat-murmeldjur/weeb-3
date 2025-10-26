@@ -82,7 +82,9 @@
         </div>
         
         <script src="https://cdn.jsdelivr.net/npm/@walletconnect/ethereum-provider@2.22.4/dist/index.umd.js" crossorigin="anonymous"></script>
+        
         <script>
+          
           function normalizeEthError(err) {
             try {
               if (err && typeof err === "object") {
@@ -111,6 +113,7 @@
             } catch (e) {
               const err = normalizeEthError(e);
         
+              
               try {
                 await provider.request({
                   method: "wallet_requestPermissions",
@@ -127,6 +130,7 @@
         
           window.weeb3EnsureEip1193 = async function(projectId) {
             try {
+              
               if (window.ethereum && typeof window.ethereum.request === "function") {
                 try {
                   const accounts = await requestAccountsWithFallback(window.ethereum);
@@ -137,6 +141,7 @@
                 }
               }
         
+              
               const wc = window['@walletconnect/ethereum-provider'];
               if (!wc?.EthereumProvider) {
                 return { ok: false, error: "WalletConnect UMD not loaded" };
@@ -145,23 +150,19 @@
                 return { ok: false, error: "WalletConnect projectId is required" };
               }
         
+              
+              const REQUIRED_METHODS = [
+                "eth_requestAccounts",
+                "eth_sendTransaction",
+              ];
+        
               const provider = await wc.EthereumProvider.init({
                 projectId,
-                chains: [11155111], // Sepolia
+                chains: [11155111],         
                 showQrModal: true,
-                methods: [
-                  "eth_requestAccounts",
-                  "eth_sendTransaction",
-                  "eth_sign",
-                  "personal_sign",
-                  "eth_signTypedData",
-                  "eth_signTransaction",
-                ],
-                optionalMethods: [
-                  "wallet_switchEthereumChain",
-                  "wallet_addEthereumChain",
-                ],
-                events: ["chainChanged", "accountsChanged", "disconnect"],
+                methods: REQUIRED_METHODS,  
+                optionalMethods: [],        
+                
                 metadata: {
                   name: "weeb-3",
                   description: "Swarm uploader",
@@ -170,32 +171,48 @@
                 },
               });
         
+              
               if (typeof provider.connect === "function") {
-                await provider.connect(); // deep-link on mobile, QR modal on desktop if needed
+                try { await provider.connect(); } catch (e) { throw normalizeEthError(e); }
               }
         
+              
               const origRequest = provider.request.bind(provider);
               provider.request = (args) =>
                 origRequest(args).catch((e) => Promise.reject(normalizeEthError(e)));
         
+              
               window.ethereum = provider;
         
+              
               try {
-                await provider.request({
-                  method: "wallet_switchEthereumChain",
-                  params: [{ chainId: "0xaa36a7" }], // 11155111
-                });
-              } catch (_) {}
+                const chainId = await provider.request({ method: "eth_chainId" });
+                if (chainId !== "0xaa36a7") {
+                  
+                  try {
+                    await provider.request({
+                      method: "wallet_switchEthereumChain",
+                      params: [{ chainId: "0xaa36a7" }],
+                    });
+                  } catch (e) {
+                    console.warn("User declined chain switch; user must switch to Sepolia manually.");
+                  }
+                }
+              } catch (e) {
+                console.warn("eth_chainId failed:", e);
+              }
         
               const accounts = await requestAccountsWithFallback(provider);
         
-              provider.on("accountsChanged", (a) => console.log("accountsChanged", a));
-              provider.on("disconnect", (ev) => console.log("disconnect", ev));
-              provider.on("chainChanged", (cid) => console.log("chainChanged", cid));
+              
+              provider.on?.("accountsChanged", (a) => console.log("accountsChanged", a));
+              provider.on?.("disconnect", (ev) => console.log("disconnect", ev));
+              provider.on?.("chainChanged", (cid) => console.log("chainChanged", cid));
         
               return { ok: true, accounts };
             } catch (e) {
               const err = normalizeEthError(e);
+              
               return { ok: false, error: `${err.code}: ${err.message}` };
             }
           };
