@@ -81,14 +81,14 @@ pub async fn expired_batches_exist(postage: &PostageContract) -> Result<bool, Js
 }
 
 pub async fn get_batch_validity(batch_id: Vec<u8>) -> U256 {
-    let Ok(w3) = web3() else { return U256::from(1) };
+    let Ok(w3) = web3() else { return U256::from(0) };
     let Ok(contract) = postage_contract(&w3).await else {
-        return U256::from(1);
+        return U256::from(0);
     };
 
     let id_bytes_32: [u8; 32] = match batch_id.try_into() {
         Ok(x) => x,
-        Err(_) => return U256::from(1),
+        Err(_) => return U256::from(0),
     };
 
     match contract
@@ -102,7 +102,7 @@ pub async fn get_batch_validity(batch_id: Vec<u8>) -> U256 {
         .await
     {
         Ok(val) => val,
-        Err(_) => U256::from(1),
+        Err(_) => U256::from(0),
     }
 }
 
@@ -219,6 +219,21 @@ pub async fn buy_postage_batch_with_payer(
     payer: Address,
 ) -> Result<BatchPurchaseResult, JsError> {
     let w3 = web3()?;
+
+    {
+        use web3::types::U256;
+        let cid = w3
+            .eth()
+            .chain_id()
+            .await
+            .map_err(|e| JsError::new(&format!("chain_id failed: {e:?}")))?;
+        if cid != U256::from(11155111u64) {
+            return Err(JsError::new(
+                "Wrong network. Please switch to Sepolia (11155111).",
+            ));
+        }
+    }
+
     let postage = postage_contract(&w3).await?;
     let token = token_contract(&w3).await?;
 

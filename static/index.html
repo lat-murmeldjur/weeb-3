@@ -122,7 +122,9 @@
             if (Array.isArray(provider.accounts) && provider.accounts.length) return provider.accounts;
             const ns = provider.session?.namespaces?.eip155;
             if (ns?.accounts?.length) {
-              return ns.accounts.map((a) => (typeof a === "string" ? a.split(":")[2] : null)).filter(Boolean);
+              return ns.accounts
+                .map((a) => (typeof a === "string" ? a.split(":")[2] : null))
+                .filter(Boolean);
             }
             try {
               const accs = await provider.request({ method: "eth_accounts" });
@@ -130,7 +132,7 @@
             } catch (_) {}
             throw normalizeEthError({ code: 4001, message: "No accounts in WC session (user may have cancelled)" });
           }
-          
+        
           window.weeb3EnsureEip1193 = async function(projectId) {
             try {
               
@@ -143,27 +145,33 @@
                   return { ok: false, error: `${err.code}: ${err.message}` };
                 }
               }
-        
+              
               const wc = window['@walletconnect/ethereum-provider'];
               if (!wc?.EthereumProvider) return { ok: false, error: "WalletConnect UMD not loaded" };
               if (!projectId) return { ok: false, error: "WalletConnect projectId is required" };
               
+              const REQUIRED_METHODS = [
+                "eth_call",           
+                "eth_estimateGas",    
+                "eth_sendTransaction",
+                "eth_chainId"
+              ];
+        
               const provider = await wc.EthereumProvider.init({
                 projectId,
                 chains: [1],                
                 optionalChains: [11155111], 
                 showQrModal: true,
-                methods: [
-                  "eth_call",
-                  "eth_estimateGas",
-                  "eth_sendTransaction",
-                  "eth_chainId",            
-                ],
+                methods: REQUIRED_METHODS,  
                 optionalMethods: [
                   "wallet_switchEthereumChain",
                   "wallet_addEthereumChain",
-                  "eth_accounts"            
+                  "eth_accounts"
                 ],
+                
+                rpcMap: {
+                  11155111: "https://rpc.sepolia.org"
+                },
                 events: ["chainChanged", "accountsChanged", "disconnect"],
                 metadata: {
                   name: "weeb-3",
@@ -175,8 +183,7 @@
               
               try {
                 const methods = provider.session?.namespaces?.eip155?.methods || [];
-                const required = ["eth_call","eth_estimateGas","eth_sendTransaction"];
-                const missing = required.some((m) => !methods.includes(m));
+                const missing = REQUIRED_METHODS.some((m) => !methods.includes(m));
                 if (provider.session && missing && typeof provider.disconnect === "function") {
                   await provider.disconnect();
                 }
@@ -199,11 +206,39 @@
                       method: "wallet_switchEthereumChain",
                       params: [{ chainId: "0xaa36a7" }],
                     });
-                  } catch (_) {}
+                  } catch (e1) {
+                    
+                    try {
+                      await provider.request({
+                        method: "wallet_addEthereumChain",
+                        params: [{
+                          chainId: "0xaa36a7",
+                          chainName: "Sepolia",
+                          nativeCurrency: { name: "Sepolia Ether", symbol: "ETH", decimals: 18 },
+                          rpcUrls: ["https://rpc.sepolia.org"],
+                          blockExplorerUrls: ["https://sepolia.etherscan.io"]
+                        }]
+                      });
+                      
+                      await provider.request({
+                        method: "wallet_switchEthereumChain",
+                        params: [{ chainId: "0xaa36a7" }],
+                      });
+                    } catch (e2) {
+                      console.warn("User declined chain add/switch; must set Sepolia manually.");
+                    }
+                  }
                 }
-              } catch (e) { console.warn("eth_chainId failed:", e); }
+              } catch (e) {
+                console.warn("eth_chainId failed:", e);
+              }
               
               const accounts = await getWalletConnectAccounts(provider);
+        
+              try {
+                const methods = provider.session?.namespaces?.eip155?.methods || [];
+                console.log("WC methods in session:", methods);
+              } catch (_) {}
         
               provider.on?.("accountsChanged", (a) => console.log("accountsChanged", a));
               provider.on?.("disconnect",     (ev) => console.log("disconnect", ev));
@@ -216,6 +251,7 @@
             }
           };
         </script>
+        
         <script type="module" defer>
             async function requestPersistentStorage() {
                 if (navigator.storage && navigator.storage.persist) {
