@@ -22,7 +22,7 @@
                 <label>Swarm Bootnode Multiaddress</label>
             </div>
             <div>
-                <input type="text" id="bootNodeMASettings" value="/ip4/192.168.100.148/udp/1634/webrtc-direct/certhash/uEiCkvQyYxFoixnyftrDOvfO4igY2JtsgAXtBcYXhyQ--KA/p2p/QmQU8F1HcWziRdww5r8CzTWYyUdeMGmdXF3zTATSa1jrGF" size="90">
+                <input type="text" id="bootNodeMASettings" value="/ip4/192.168.100.148/udp/1634/webrtc-direct/certhash/uEiDvMGDMiBfMLNE6zm-EMxBtXPOYZJI3107zHQ-FvYYt2Q/p2p/QmQU8F1HcWziRdww5r8CzTWYyUdeMGmdXF3zTATSa1jrGF" size="90">
             </div>
             <div>
                 <label>Swarm Network Id</label>
@@ -97,6 +97,52 @@
             import init, { interweeb } from "./weeb_3.js"
             await init();
             interweeb(""); 
+        </script>
+        <script type="module">
+          import EthereumProvider from "https://cdn.jsdelivr.net/npm/@walletconnect/ethereum-provider@2/dist/ethereum-provider.min.js";
+        
+          async function ensureEip1193() {
+            if (window.ethereum) return;
+        
+            const provider = await EthereumProvider.init({
+              projectId: "<YOUR_WALLETCONNECT_PROJECT_ID>",
+              chains: [11155111], // Sepolia
+              showQrModal: true,
+              methods: [
+                "eth_requestAccounts",
+                "eth_sendTransaction",
+                "eth_sign",
+                "personal_sign",
+                "eth_signTypedData",
+                "eth_signTransaction"
+              ],
+              optionalMethods: [
+                "wallet_switchEthereumChain",
+                "wallet_addEthereumChain"
+              ],
+              events: ["chainChanged", "accountsChanged", "disconnect"],
+              metadata: {
+                name: "weeb-3",
+                description: "Swarm uploader",
+                url: window.location.origin,
+                icons: [window.location.origin + "/icon.png"]
+              }
+            });
+        
+            window.ethereum = provider;
+        
+            try {
+              await provider.request({
+                method: "wallet_switchEthereumChain",
+                params: [{ chainId: "0xaa36a7" }], // 11155111 Sepolia
+              });
+            } catch (e) {  }
+        
+            try { await provider.enable?.(); } catch (e) { console.warn(e); }
+          }
+
+          window.ensureEip1193 = ensureEip1193;
+          ensureEip1193();
         </script>
     </body>
 </html>

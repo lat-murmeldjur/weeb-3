@@ -1,11 +1,6 @@
-use std::str::FromStr;
 use std::time::Duration;
 
-use web3::{
-    contract::{Contract, Options},
-    transports::eip_1193::{Eip1193, Provider},
-    types::{Address, H160, H256, U256},
-};
+use web3::types::{Address, U256};
 
 use async_std::sync::Arc;
 use js_sys::{Array, Date, Uint8Array};
@@ -28,17 +23,16 @@ use web_sys::{
     console,
 };
 
-use alloy::{network::EthereumWallet, signers::local::PrivateKeySigner};
-
 use crate::{
     Sekirei, decode_resources, encrey, join, join_all,
     nav::{clear_path, read_path},
-    on_chain::get_batch_validity,
+    on_chain::{buy_postage_batch, get_batch_validity},
     persistence::{
         get_batch_bucket_limit, get_batch_id, get_batch_owner_key, set_batch_bucket_limit,
         set_batch_id, set_batch_owner_key,
     },
 };
+use alloy::{network::EthereumWallet, signers::local::PrivateKeySigner};
 
 #[wasm_bindgen]
 pub async fn interweeb(_st: String) -> Result<(), JsError> {
@@ -156,8 +150,8 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
             .expect("#inputString should be a HtmlInputElement")
             .set_oninput(Some(callback.as_ref().unchecked_ref()));
 
-        let callback2 =
-            wasm_bindgen::closure::Closure::<dyn FnMut(web_sys::MessageEvent)>::new(move |_msg| {
+        let callback2 = wasm_bindgen::closure::Closure::<dyn FnMut(web_sys::MessageEvent)>::new(
+            move |_msg| {
                 console::log_1(&"uploadGetBatch callback triggered".into());
 
                 let document = web_sys::window().unwrap().document().unwrap();
@@ -165,15 +159,15 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
                 let validity_input = document
                     .get_element_by_id("batchValidityDays")
                     .expect("#batchValidityDays should exist");
-
                 let validity_input = validity_input
                     .dyn_ref::<HtmlInputElement>()
                     .expect("#batchValidityDays should be a HtmlInputElement");
 
                 let validity = match validity_input.value().parse::<u64>() {
-                    Ok(validity) => validity,
+                    Ok(v) => v,
                     _ => {
-                        let _ = window.alert_with_message("Failed to read batch validity");
+                        let wnd = web_sys::window().unwrap();
+                        let _ = wnd.alert_with_message("Failed to read batch validity");
                         return;
                     }
                 };
@@ -181,7 +175,6 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
                 let size_input = document
                     .get_element_by_id("batchSize")
                     .expect("#batchSize should exist");
-
                 let size_input = size_input
                     .dyn_ref::<HtmlSelectElement>()
                     .expect("#batchSize should be a HtmlSelectElement");
@@ -189,7 +182,8 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
                 let batch_depth = match size_input.value().parse::<u8>() {
                     Ok(size0) => 17 + size0,
                     _ => {
-                        let _ = window.alert_with_message("Failed to read batch size");
+                        let wnd = web_sys::window().unwrap();
+                        let _ = wnd.alert_with_message("Failed to read batch size");
                         return;
                     }
                 };
@@ -200,257 +194,93 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
                 )));
 
                 spawn_local(async move {
+                    let stored_stamp_signer_key = get_batch_owner_key().await;
+                    let stored_batch_id = get_batch_id().await;
+                    let bucket_limit = get_batch_bucket_limit().await;
+
+                    if !stored_stamp_signer_key.is_empty()
+                        && !stored_batch_id.is_empty()
+                        && bucket_limit > 0
                     {
-                        let stored_stamp_signer_key = get_batch_owner_key().await;
+                        let wnd = web_sys::window().unwrap();
+                        let _ = wnd.alert_with_message("Already have a batch for uploads");
+                        return;
+                    }
 
-                        let stored_batch_id = get_batch_id().await;
-
-                        let bucket_limit = get_batch_bucket_limit().await;
-
-                        if stored_stamp_signer_key.len() != 0
-                            && stored_batch_id.len() != 0
-                            && bucket_limit > 0
-                        {
-                            let window = web_sys::window().unwrap();
-                            let _ = window.alert_with_message("Already have a batch for uploads");
-                            return;
-                        }
-
-                        let provider = Provider::default().unwrap().unwrap();
-
-                        let transport = Eip1193::new(provider);
-                        let web3 = web3::Web3::new(transport);
-                        let accounts = match web3.eth().request_accounts().await {
-                            Ok(aok) => aok,
-                            _ => return,
-                        };
-
-                        for account in &accounts {
-                            let balance = web3.eth().balance(*account, None).await.unwrap();
-                            web_sys::console::log_1(&JsValue::from(format!(
-                                "Balance of {:?}: {}",
-                                account, balance
-                            )));
-                        }
-
-                        let token_contract_address =
-                            match Address::from_str("543dDb01Ba47acB11de34891cD86B675F04840db") {
-                                Ok(aok) => aok,
-                                _ => return,
-                            };
-
-                        let contract_address =
-                            match Address::from_str("cdfdC3752caaA826fE62531E0000C40546eC56A6") {
-                                Ok(aok) => aok,
-                                _ => return,
-                            };
-
-                        let token_contract = match Contract::from_json(
-                            web3.eth(),
-                            token_contract_address,
-                            include_bytes!("./sbzz.json"),
-                        ) {
-                            Ok(aok) => aok,
-                            _ => return,
-                        };
-
-                        let contract = match Contract::from_json(
-                            web3.eth(),
-                            contract_address,
-                            include_bytes!("./postagestamp.json"),
-                        ) {
-                            Ok(aok) => aok,
-                            _ => return,
-                        };
-
-                        let stamp_signer_key = encrey();
-                        let stamp_signer: PrivateKeySigner =
-                            match PrivateKeySigner::from_slice(&stamp_signer_key) {
-                                Ok(aok) => aok,
-                                _ => return,
-                            };
-                        let _wallet = EthereumWallet::from(stamp_signer.clone());
-                        let wallet_address = stamp_signer.address();
-                        let wallet_address_bytes: [u8; 20] = *wallet_address.as_ref();
-
-                        web_sys::console::log_1(&JsValue::from(format!(
-                            "StampSigner len {:#?}",
-                            wallet_address_bytes.len()
-                        )));
-
-                        //    function createBatch(
-                        //        address _owner,
-                        //        uint256 _initialBalancePerChunk,
-                        //        uint8 _depth,
-                        //        uint8 _bucketDepth,
-                        //        bytes32 _nonce,
-                        //        bool _immutable
-                        //    ) external whenNotPaused returns (bytes32)
-
-                        let result_lp: U256 = contract
-                            .query("lastPrice", (), None, Options::default(), None)
-                            .await
-                            .unwrap();
-
-                        let initial_balance: U256 = result_lp * 7200 * validity;
-
-                        let chunk_count = u64::pow(2, batch_depth as u32);
-
-                        let approve_size: U256 = initial_balance * chunk_count;
-
-                        web_sys::console::log_1(&JsValue::from(format!(
-                            "current price {}",
-                            result_lp
-                        )));
-
-                        let mut expire = true;
-
-                        while expire {
-                            let expire0 = contract
-                                .query("expiredBatchesExist", (), None, Options::default(), None)
-                                .await
-                                .unwrap();
-
-                            web_sys::console::log_1(&JsValue::from(format!(
-                                "expiredBatchesExist {}",
-                                expire0
-                            )));
-
-                            if expire0 {
-                                let tx0 = contract
-                                    .call(
-                                        "expireLimited",
-                                        (U256::from(5),),
-                                        accounts[0],
-                                        Options::default(),
-                                    )
-                                    .await
-                                    .unwrap();
-
-                                web_sys::console::log_1(&JsValue::from(format!(
-                                    "expirelimited tx0 {}",
-                                    hex::encode(tx0.as_bytes())
-                                )));
-                            } else {
-                                expire = false;
-                            }
-                        }
-
-                        let tx00 = token_contract
-                            .call_with_confirmations(
-                                "approve",
-                                (contract_address, approve_size),
-                                accounts[0],
-                                Options::default(),
-                                1,
-                            )
-                            .await
-                            .unwrap();
-
-                        web_sys::console::log_1(&JsValue::from(format!(
-                            "Approve tx {}",
-                            hex::encode(tx00.transaction_hash.as_bytes())
-                        )));
-
-                        // 131072000000000
-
-                        let nonce: [u8; 32] = encrey().try_into().unwrap();
-
-                        let receipt = match contract
-                            .call_with_confirmations(
-                                "createBatch",
-                                (
-                                    Address::from(wallet_address_bytes),
-                                    initial_balance,
-                                    batch_depth as u8,
-                                    16_u8,
-                                    nonce,
-                                    false,
-                                ),
-                                accounts[0],
-                                Options::default(),
-                                1,
-                            )
-                            .await
-                        {
-                            Ok(aok) => aok,
-                            Err(e) => {
-                                web_sys::console::log_1(&JsValue::from(format!(
-                                    "Error creating batch {}",
-                                    e
-                                )));
+                    let stamp_signer_key = encrey();
+                    let stamp_signer: PrivateKeySigner =
+                        match PrivateKeySigner::from_slice(&stamp_signer_key) {
+                            Ok(s) => s,
+                            Err(_) => {
+                                let wnd = web_sys::window().unwrap();
+                                let _ = wnd
+                                    .alert_with_message("Failed to create local stamp signer key");
                                 return;
                             }
                         };
 
-                        let batch_created_topic = H256::from_slice(
-                            &hex::decode(
-                                "9b088e2c89b322a3c1d81515e1c88db3d386d022926f0e2d0b9b5813b7413d58",
-                            )
-                            .unwrap(),
-                        );
+                    let _wallet = EthereumWallet::from(stamp_signer.clone());
 
-                        let batch_contract = H160::from_slice(
-                            &hex::decode("cdfdC3752caaA826fE62531E0000C40546eC56A6").unwrap(),
-                        );
+                    let owner_h160_bytes: [u8; 20] = *stamp_signer.address().as_ref();
+                    let owner = Address::from(owner_h160_bytes);
 
-                        let mut batch_id: Vec<u8> = vec![];
+                    web_sys::console::log_1(&JsValue::from(format!(
+                        "StampSigner addr 0x{}",
+                        hex::encode(owner_h160_bytes)
+                    )));
 
-                        for log in receipt.logs.iter() {
-                            if log.topics.len() > 0 {
-                                if log.address == batch_contract
-                                    && log.topics[0] == batch_created_topic
-                                    && log.topics.len() > 1
-                                {
-                                    batch_id = log.topics[1].as_bytes().to_vec();
-                                };
-                            };
-                        }
-
-                        if batch_id.len() == 0 {
-                            let window = web_sys::window().unwrap();
-                            let _ =
-                                window.alert_with_message("Failed to get batch id from receipt");
-                            return;
-                        } else {
-                            web_sys::console::log_1(&JsValue::from(format!(
-                                "got batch id: {}",
-                                hex::encode(&batch_id)
-                            )));
-                        }
-
-                        if !set_batch_owner_key(&stamp_signer_key).await {
-                            let window = web_sys::window().unwrap();
-                            let _ = window.alert_with_message("Failed to save batch owner key");
+                    let purchase = match buy_postage_batch(validity, batch_depth, owner).await {
+                        Ok(p) => p,
+                        Err(e) => {
+                            let wnd = web_sys::window().unwrap();
+                            // NOTE: use {:?} because JsError doesn't implement Display
+                            let _ = wnd.alert_with_message(&format!(
+                        "Batch purchase failed: {:?}. \
+                         Make sure a wallet is connected (window.ethereum), e.g. via WalletConnect or MetaMask.",
+                        e
+                    ));
                             return;
                         }
+                    };
 
-                        if !set_batch_id(&batch_id).await {
-                            let window = web_sys::window().unwrap();
-                            let _ = window.alert_with_message("Failed to save batch id");
-                            return;
-                        }
-
-                        if !set_batch_bucket_limit(u32::pow(2, (batch_depth - 16) as u32)).await {
-                            let window = web_sys::window().unwrap();
-                            let _ = window.alert_with_message("Failed to save batch bucket depth");
-                            return;
-                        }
-
-                        // tx 0x538ea062d293a809915336eff3bb5010dc742c0ab6ac12b510992aafb4a68ffb
-                        // id 0xb57e46b067d21cede7432900215423e82c97823b733219b7f42e73017562a96d
-                        // owner : 0x4d10dDf65bCCB88C458607b4fF64AA808c31C53c
-                        // depth : 17
-                        // bucketDepth : 16
-                        // immutableFlag : False
-
-                        web_sys::console::log_1(&JsValue::from(format!(
-                            "createBatch tx {}",
-                            hex::encode(receipt.transaction_hash.as_bytes())
-                        )));
+                    if !set_batch_owner_key(&stamp_signer_key).await {
+                        let wnd = web_sys::window().unwrap();
+                        let _ = wnd.alert_with_message("Failed to save batch owner key");
+                        return;
                     }
+
+                    if !set_batch_id(&purchase.batch_id).await {
+                        let wnd = web_sys::window().unwrap();
+                        let _ = wnd.alert_with_message("Failed to save batch id");
+                        return;
+                    }
+
+                    if !set_batch_bucket_limit(purchase.bucket_limit).await {
+                        let wnd = web_sys::window().unwrap();
+                        let _ = wnd.alert_with_message("Failed to save batch bucket depth");
+                        return;
+                    }
+
+                    web_sys::console::log_1(&JsValue::from(format!(
+                        "Approve tx 0x{}, Create tx 0x{}, Batch id 0x{}, depth {}, validity {}d, lastPrice {}",
+                        hex::encode(purchase.approve_tx.as_bytes()),
+                        hex::encode(purchase.create_tx.as_bytes()),
+                        hex::encode(&purchase.batch_id),
+                        batch_depth,
+                        validity,
+                        purchase.last_price,
+                    )));
+
+                    let wnd = web_sys::window().unwrap();
+                    let _ = wnd.alert_with_message(&format!(
+                        "Storage batch ready.\nBatch ID: 0x{}\nDepth: {}\nStorage slots per bucket: {}",
+                        hex::encode(&purchase.batch_id),
+                        batch_depth,
+                        purchase.bucket_limit
+                    ));
                 });
-            });
+            },
+        );
 
         web_sys::window()
             .unwrap()
