@@ -40,17 +40,18 @@ pub fn web3() -> Result<Web3Inst, JsError> {
     Ok(web3::Web3::new(Eip1193::new(prov)))
 }
 
-pub async fn request_accounts(w3: &Web3Inst) -> Result<Vec<Address>, JsError> {
-    if let Ok(accs0) = w3.eth().accounts().await {
-        if !accs0.is_empty() {
-            return Ok(accs0);
-        }
+pub async fn connected_accounts(w3: &Web3Inst) -> Result<Vec<Address>, JsError> {
+    let accs = w3
+        .eth()
+        .accounts()
+        .await
+        .map_err(|e| JsError::new(&format!("eth_accounts failed: {e:?}")))?;
+    if accs.is_empty() {
+        return Err(JsError::new(
+            "No wallet account available. Connect the wallet first.",
+        ));
     }
-
-    match w3.eth().request_accounts().await {
-        Ok(a) => Ok(a),
-        Err(e) => Err(JsError::new(&format!("eth_requestAccounts failed: {e:?}"))),
-    }
+    Ok(accs)
 }
 
 pub async fn postage_contract(w3: &Web3Inst) -> Result<PostageContract, JsError> {
@@ -234,7 +235,7 @@ pub async fn buy_postage_batch(
     owner: Address,
 ) -> Result<BatchPurchaseResult, JsError> {
     let w3 = web3()?;
-    let accounts = request_accounts(&w3).await?;
+    let accounts = connected_accounts(&w3).await?;
     let payer = *accounts
         .first()
         .ok_or_else(|| JsError::new("No accounts returned by provider"))?;

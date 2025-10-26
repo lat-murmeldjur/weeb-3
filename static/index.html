@@ -99,12 +99,13 @@
               return { code: 4001, message: "Unknown provider error" };
             }
           }
-          
+        
           async function getInjectedAccounts(injected) {
             try {
               const accs0 = await injected.request({ method: "eth_accounts" });
               if (accs0 && accs0.length) return accs0;
             } catch (_) {}
+            
             try {
               return await injected.request({ method: "eth_requestAccounts" });
             } catch (e) {
@@ -127,17 +128,18 @@
               return provider.accounts;
             }
             
-            const ns = provider.session && provider.session.namespaces && provider.session.namespaces.eip155;
-            if (ns && Array.isArray(ns.accounts) && ns.accounts.length) {
-              
-              return ns.accounts.map((a) => (a && typeof a === "string" ? a.split(":")[2] : null)).filter(Boolean);
+            const ns = provider.session?.namespaces?.eip155;
+            if (ns?.accounts?.length) {
+              return ns.accounts
+                .map((a) => (typeof a === "string" ? a.split(":")[2] : null))
+                .filter(Boolean);
             }
             
             try {
               const accs = await provider.request({ method: "eth_accounts" });
               if (accs && accs.length) return accs;
             } catch (_) {}
-            
+        
             throw normalizeEthError({ code: 4001, message: "No accounts in WC session (user may have cancelled)" });
           }
           
@@ -153,7 +155,7 @@
                   return { ok: false, error: `${err.code}: ${err.message}` };
                 }
               }
-            
+              
               const wc = window['@walletconnect/ethereum-provider'];
               if (!wc?.EthereumProvider) {
                 return { ok: false, error: "WalletConnect UMD not loaded" };
@@ -164,16 +166,11 @@
               
               const provider = await wc.EthereumProvider.init({
                 projectId,
-                
-                chains: [1],
-                optionalChains: [11155111],
+                chains: [1],                
+                optionalChains: [11155111], 
                 showQrModal: true,
-                methods: [
-                  
-                  "eth_requestAccounts",
-                ],
+                methods: [],                
                 optionalMethods: [
-                  
                   "eth_sendTransaction",
                   "wallet_switchEthereumChain",
                   "wallet_addEthereumChain",
@@ -214,7 +211,7 @@
               }
               
               const accounts = await getWalletConnectAccounts(provider);
-        
+              
               provider.on?.("accountsChanged", (a) => console.log("accountsChanged", a));
               provider.on?.("disconnect", (ev) => console.log("disconnect", ev));
               provider.on?.("chainChanged", (cid) => console.log("chainChanged", cid));

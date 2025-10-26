@@ -119,7 +119,7 @@ pub(crate) async fn serve(libp2p_transport: Multiaddr) {
                 .allow_methods([Method::GET]),
         );
 
-    let socket = SocketAddr::new(IpAddr::V4(listen_addr), 6768);
+    let socket = SocketAddr::new(IpAddr::V4(listen_addr), 6868);
 
     axum_server::bind_rustls(socket, config)
         .serve(server.into_make_service())

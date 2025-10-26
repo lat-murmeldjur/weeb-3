@@ -237,8 +237,8 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
                         {
                             let wnd = web_sys::window().unwrap();
                             let _ = wnd.alert_with_message(
-            "No Ethereum provider. Try again, or open this page in the MetaMask in‑app browser."
-        );
+                                "No Ethereum provider. Try again, or open this page in the MetaMask in‑app browser."
+                            );
                             return;
                         }
                     }
