@@ -235,7 +235,7 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
                         if Eip1193Provider::default().ok().flatten().is_none() {
                             let wnd = web_sys::window().unwrap();
                             let _ = wnd.alert_with_message(
-                                "No Ethereum provider available. Try again, or open in MetaMask in-app browser."
+                                "No Ethereum provider. Try again, or open this page in the MetaMask in‑app browser."
                             );
                             return;
                         }

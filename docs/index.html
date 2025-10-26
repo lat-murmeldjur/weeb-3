@@ -82,24 +82,18 @@
         </div>
         
         <script src="https://cdn.jsdelivr.net/npm/@walletconnect/ethereum-provider@2.22.4/dist/index.umd.js" crossorigin="anonymous"></script>
-        
         <script>
-          
           function normalizeEthError(err) {
             try {
               if (err && typeof err === "object") {
-                
                 if (typeof err.code !== "number") {
-                  const message = String(err.message || "Request rejected");
-                  return { code: 4001, message, data: err };
+                  return { code: 4001, message: String(err.message || "Request rejected"), data: err };
                 }
-                
                 if (typeof err.message !== "string") {
                   return { code: err.code, message: JSON.stringify(err), data: err };
                 }
                 return err;
               }
-              
               return { code: 4001, message: String(err) };
             } catch (_) {
               return { code: 4001, message: "Unknown provider error" };
@@ -107,13 +101,11 @@
           }
         
           async function requestAccountsWithFallback(provider) {
-            
             try {
               const accs0 = await provider.request({ method: "eth_accounts" });
               if (accs0 && accs0.length) return accs0;
-            } catch (_) { /* ignore */ }
+            } catch (_) {}
         
-            
             try {
               return await provider.request({ method: "eth_requestAccounts" });
             } catch (e) {
@@ -124,12 +116,12 @@
                   method: "wallet_requestPermissions",
                   params: [{ eth_accounts: {} }],
                 });
-              } catch (_) { /* ignore */ }
+              } catch (_) {}
         
               const accs2 = await provider.request({ method: "eth_accounts" }).catch(() => []);
               if (accs2 && accs2.length) return accs2;
         
-              throw err; 
+              throw err;
             }
           }
         
@@ -178,6 +170,10 @@
                 },
               });
         
+              if (typeof provider.connect === "function") {
+                await provider.connect(); // deep-link on mobile, QR modal on desktop if needed
+              }
+        
               const origRequest = provider.request.bind(provider);
               provider.request = (args) =>
                 origRequest(args).catch((e) => Promise.reject(normalizeEthError(e)));
@@ -204,7 +200,6 @@
             }
           };
         </script>
-
         <script type="module" defer>
             async function requestPersistentStorage() {
                 if (navigator.storage && navigator.storage.persist) {
