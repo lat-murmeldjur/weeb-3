@@ -6,7 +6,6 @@ use async_std::sync::Arc;
 use js_sys::{Array, Date, Uint8Array};
 use wasm_bindgen::{JsCast, JsError, JsValue, prelude::*};
 use wasm_bindgen_futures::{JsFuture, spawn_local};
-use web3::transports::eip_1193::Provider as Eip1193Provider;
 
 use web_sys::{
     Blob,
@@ -238,8 +237,8 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
                         {
                             let wnd = web_sys::window().unwrap();
                             let _ = wnd.alert_with_message(
-                                "No Ethereum provider. Try again, or open this page in the MetaMask in‑app browser."
-                            );
+            "No Ethereum provider. Try again, or open this page in the MetaMask in‑app browser."
+        );
                             return;
                         }
                     }

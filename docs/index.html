@@ -99,45 +99,61 @@
               return { code: 4001, message: "Unknown provider error" };
             }
           }
-        
-          async function requestAccountsWithFallback(provider) {
+          
+          async function getInjectedAccounts(injected) {
             try {
-              const accs0 = await provider.request({ method: "eth_accounts" });
+              const accs0 = await injected.request({ method: "eth_accounts" });
               if (accs0 && accs0.length) return accs0;
             } catch (_) {}
-        
             try {
-              return await provider.request({ method: "eth_requestAccounts" });
+              return await injected.request({ method: "eth_requestAccounts" });
             } catch (e) {
               const err = normalizeEthError(e);
-              
               try {
-                await provider.request({
+                await injected.request({
                   method: "wallet_requestPermissions",
                   params: [{ eth_accounts: {} }],
                 });
               } catch (_) {}
-              const accs2 = await provider.request({ method: "eth_accounts" }).catch(() => []);
+              const accs2 = await injected.request({ method: "eth_accounts" }).catch(() => []);
               if (accs2 && accs2.length) return accs2;
               throw err;
             }
           }
-        
+          
+          async function getWalletConnectAccounts(provider) {
+            
+            if (Array.isArray(provider.accounts) && provider.accounts.length) {
+              return provider.accounts;
+            }
+            
+            const ns = provider.session && provider.session.namespaces && provider.session.namespaces.eip155;
+            if (ns && Array.isArray(ns.accounts) && ns.accounts.length) {
+              
+              return ns.accounts.map((a) => (a && typeof a === "string" ? a.split(":")[2] : null)).filter(Boolean);
+            }
+            
+            try {
+              const accs = await provider.request({ method: "eth_accounts" });
+              if (accs && accs.length) return accs;
+            } catch (_) {}
+            
+            throw normalizeEthError({ code: 4001, message: "No accounts in WC session (user may have cancelled)" });
+          }
           
           window.weeb3EnsureEip1193 = async function(projectId) {
             try {
               
-              if (window.ethereum && typeof window.ethereum.request === "function") {
+              if (window.ethereum && typeof window.ethereum.request === "function" && !window.ethereum.connect) {
                 try {
-                  const accounts = await requestAccountsWithFallback(window.ethereum);
+                  const accounts = await getInjectedAccounts(window.ethereum);
                   return { ok: true, accounts };
                 } catch (e) {
                   const err = normalizeEthError(e);
                   return { ok: false, error: `${err.code}: ${err.message}` };
                 }
               }
-        
-              
+            
               const wc = window['@walletconnect/ethereum-provider'];
               if (!wc?.EthereumProvider) {
                 return { ok: false, error: "WalletConnect UMD not loaded" };
@@ -145,24 +161,23 @@
               if (!projectId) {
                 return { ok: false, error: "WalletConnect projectId is required" };
               }
-        
               
               const provider = await wc.EthereumProvider.init({
                 projectId,
                 
                 chains: [1],
-                
                 optionalChains: [11155111],
                 showQrModal: true,
                 methods: [
-                  "eth_requestAccounts",         
+                  
+                  "eth_requestAccounts",
                 ],
                 optionalMethods: [
-                  "eth_sendTransaction",         
-                  "wallet_switchEthereumChain",  
-                  "wallet_addEthereumChain",     
+                  
+                  "eth_sendTransaction",
+                  "wallet_switchEthereumChain",
+                  "wallet_addEthereumChain",
                 ],
-                
                 events: ["chainChanged", "accountsChanged", "disconnect"],
                 metadata: {
                   name: "weeb-3",
@@ -171,21 +186,16 @@
                   icons: [window.location.origin + "/icon.png"],
                 },
               });
-        
               
               if (typeof provider.connect === "function") {
-                try { await provider.connect(); }
-                catch (e) { throw normalizeEthError(e); }
+                try { await provider.connect(); } catch (e) { throw normalizeEthError(e); }
               }
-        
               
               const origRequest = provider.request.bind(provider);
               provider.request = (args) =>
                 origRequest(args).catch((e) => Promise.reject(normalizeEthError(e)));
-        
               
               window.ethereum = provider;
-        
               
               try {
                 const cid = await provider.request({ method: "eth_chainId" });
@@ -196,14 +206,14 @@
                       params: [{ chainId: "0xaa36a7" }],
                     });
                   } catch (e) {
-                    console.warn("User declined chain switch; please select Sepolia in the wallet.");
+                    console.warn("User declined chain switch; select Sepolia in wallet if needed.");
                   }
                 }
               } catch (e) {
                 console.warn("eth_chainId failed:", e);
               }
-        
-              const accounts = await requestAccountsWithFallback(provider);
+              
+              const accounts = await getWalletConnectAccounts(provider);
         
               provider.on?.("accountsChanged", (a) => console.log("accountsChanged", a));
               provider.on?.("disconnect", (ev) => console.log("disconnect", ev));
