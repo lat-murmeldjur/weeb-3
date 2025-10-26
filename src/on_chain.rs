@@ -41,10 +41,16 @@ pub fn web3() -> Result<Web3Inst, JsError> {
 }
 
 pub async fn request_accounts(w3: &Web3Inst) -> Result<Vec<Address>, JsError> {
-    w3.eth()
-        .request_accounts()
-        .await
-        .map_err(|e| JsError::new(&format!("eth_requestAccounts failed: {e}")))
+    if let Ok(accs0) = w3.eth().accounts().await {
+        if !accs0.is_empty() {
+            return Ok(accs0);
+        }
+    }
+
+    match w3.eth().request_accounts().await {
+        Ok(a) => Ok(a),
+        Err(e) => Err(JsError::new(&format!("eth_requestAccounts failed: {e:?}"))),
+    }
 }
 
 pub async fn postage_contract(w3: &Web3Inst) -> Result<PostageContract, JsError> {

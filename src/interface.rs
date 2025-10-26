@@ -5,8 +5,9 @@ use web3::types::{Address, U256};
 use async_std::sync::Arc;
 use js_sys::{Array, Date, Uint8Array};
 use wasm_bindgen::{JsCast, JsError, JsValue, prelude::*};
-
 use wasm_bindgen_futures::{JsFuture, spawn_local};
+use web3::transports::eip_1193::Provider as Eip1193Provider;
+
 use web_sys::{
     Blob,
     BlobPropertyBag,
@@ -193,10 +194,6 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
                 )));
 
                 spawn_local(async move {
-                    use wasm_bindgen::{JsCast, JsValue};
-                    use wasm_bindgen_futures::JsFuture;
-                    use web3::transports::eip_1193::Provider as Eip1193Provider;
-
                     let provider_present = Eip1193Provider::default().ok().flatten().is_some();
                     if !provider_present {
                         let window = web_sys::window().unwrap();
@@ -206,19 +203,30 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
                             if let Ok(f) = func.dyn_into::<js_sys::Function>() {
                                 let project_id =
                                     JsValue::from_str("64c5f91181ce0a3192a783346a475d23");
-                                match f.call1(&JsValue::NULL, &project_id) {
-                                    Ok(promise_val) => {
-                                        if let Ok(promise) =
-                                            promise_val.dyn_into::<js_sys::Promise>()
-                                        {
-                                            let _ = JsFuture::from(promise).await;
+                                if let Ok(promise_val) = f.call1(&JsValue::NULL, &project_id) {
+                                    if let Ok(promise) = promise_val.dyn_into::<js_sys::Promise>() {
+                                        let res = JsFuture::from(promise).await;
+                                        if let Ok(obj) = res {
+                                            let ok = js_sys::Reflect::get(&obj, &"ok".into())
+                                                .ok()
+                                                .and_then(|v| v.as_bool())
+                                                .unwrap_or(false);
+                                            if !ok {
+                                                let err =
+                                                    js_sys::Reflect::get(&obj, &"error".into())
+                                                        .ok()
+                                                        .and_then(|v| v.as_string())
+                                                        .unwrap_or_else(|| {
+                                                            "WalletConnect failed".into()
+                                                        });
+                                                let wnd = web_sys::window().unwrap();
+                                                let _ = wnd.alert_with_message(&format!(
+                                                    "Wallet connect failed: {}",
+                                                    err
+                                                ));
+                                                return;
+                                            }
                                         }
-                                    }
-                                    Err(e) => {
-                                        web_sys::console::error_1(&JsValue::from_str(&format!(
-                                            "weeb3EnsureEip1193 threw: {:?}",
-                                            e
-                                        )));
                                     }
                                 }
                             }
@@ -227,9 +235,8 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
                         if Eip1193Provider::default().ok().flatten().is_none() {
                             let wnd = web_sys::window().unwrap();
                             let _ = wnd.alert_with_message(
-                        "No Ethereum provider available. \
-                         On mobile, you should see a wallet prompt. If not, try MetaMask in-app browser.",
-                    );
+                                "No Ethereum provider available. Try again, or open in MetaMask in-app browser."
+                            );
                             return;
                         }
                     }
@@ -274,10 +281,10 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
                         Err(e) => {
                             let wnd = web_sys::window().unwrap();
                             let _ = wnd.alert_with_message(&format!(
-                        "Batch purchase failed: {:?}. \
-                         Ensure your wallet is connected, on Sepolia, and has sufficient SBZZ + Sepolia ETH.",
-                        e
-                    ));
+                                    "Batch purchase failed: {:?}. \
+                                     Ensure your wallet is connected, on Sepolia, and has sufficient SBZZ + Sepolia ETH.",
+                                    e
+                                ));
                             return;
                         }
                     };
@@ -312,11 +319,11 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
 
                     let wnd = web_sys::window().unwrap();
                     let _ = wnd.alert_with_message(&format!(
-                "Storage batch ready.\nBatch ID: 0x{}\nDepth: {}\nStorage slots per bucket: {}",
-                hex::encode(&purchase.batch_id),
-                batch_depth,
-                purchase.bucket_limit
-            ));
+                        "Storage batch ready.\nBatch ID: 0x{}\nDepth: {}\nStorage slots per bucket: {}",
+                        hex::encode(&purchase.batch_id),
+                        batch_depth,
+                        purchase.bucket_limit
+                    ));
                 });
             },
         );
