@@ -22,7 +22,7 @@
                 <label>Swarm Bootnode Multiaddress</label>
             </div>
             <div>
-                <input type="text" id="bootNodeMASettings" value="/ip4/192.168.100.148/udp/1634/webrtc-direct/certhash/uEiDvMGDMiBfMLNE6zm-EMxBtXPOYZJI3107zHQ-FvYYt2Q/p2p/QmQU8F1HcWziRdww5r8CzTWYyUdeMGmdXF3zTATSa1jrGF" size="90">
+                <input type="text" id="bootNodeMASettings" value="/ip4/192.168.100.148/udp/1634/webrtc-direct/certhash/uEiCBPX5UkyYt-0IuDzGo2QAEK5o09vXTEZ6U1bnUVnjUOQ/p2p/QmQU8F1HcWziRdww5r8CzTWYyUdeMGmdXF3zTATSa1jrGF" size="90">
             </div>
             <div>
                 <label>Swarm Network Id</label>
@@ -82,7 +82,7 @@
         </div>
         
         <script src="https://cdn.jsdelivr.net/npm/@walletconnect/ethereum-provider@2.22.4/dist/index.umd.js" crossorigin="anonymous"></script>
-        <script>
+          <script>
           function normalizeEthError(err) {
             try {
               if (err && typeof err === "object") {
@@ -132,14 +132,14 @@
             } catch (_) {}
             throw normalizeEthError({ code: 4001, message: "No accounts in WC session (user may have cancelled)" });
           }
-        
+          
           window.weeb3EnsureEip1193 = async function(projectId) {
             try {
               
               if (window.ethereum && typeof window.ethereum.request === "function" && !window.ethereum.connect) {
                 try {
                   const accounts = await getInjectedAccounts(window.ethereum);
-                  return { ok: true, accounts };
+                  return { ok: true, accounts, chainId: null };
                 } catch (e) {
                   const err = normalizeEthError(e);
                   return { ok: false, error: `${err.code}: ${err.message}` };
@@ -150,27 +150,23 @@
               if (!wc?.EthereumProvider) return { ok: false, error: "WalletConnect UMD not loaded" };
               if (!projectId) return { ok: false, error: "WalletConnect projectId is required" };
               
-              const REQUIRED_METHODS = [
-                "eth_call",           
-                "eth_estimateGas",    
-                "eth_sendTransaction",
-                "eth_chainId"
-              ];
+              const REQUIRED_METHODS = ["eth_call", "eth_estimateGas", "eth_sendTransaction"];
         
               const provider = await wc.EthereumProvider.init({
                 projectId,
-                chains: [1],                
-                optionalChains: [11155111], 
+                
+                chains: [1],
+                optionalChains: [11155111],
                 showQrModal: true,
-                methods: REQUIRED_METHODS,  
+                methods: REQUIRED_METHODS,
                 optionalMethods: [
                   "wallet_switchEthereumChain",
                   "wallet_addEthereumChain",
-                  "eth_accounts"
+                  "eth_accounts", 
                 ],
-                
                 rpcMap: {
-                  11155111: "https://rpc.sepolia.org"
+                  11155111: "https://rpc.sepolia.org",
+                  1: "https://cloudflare-eth.com"
                 },
                 events: ["chainChanged", "accountsChanged", "disconnect"],
                 metadata: {
@@ -198,43 +194,26 @@
               
               window.ethereum = provider;
               
+              let chainIdHex = null;
               try {
-                const cid = await provider.request({ method: "eth_chainId" });
-                if (cid !== "0xaa36a7") {
+                chainIdHex = await provider.request({ method: "eth_chainId" }); 
+                if (chainIdHex !== "0xaa36a7") {
                   try {
                     await provider.request({
                       method: "wallet_switchEthereumChain",
                       params: [{ chainId: "0xaa36a7" }],
                     });
-                  } catch (e1) {
+                    chainIdHex = "0xaa36a7";
+                  } catch (_) {
                     
-                    try {
-                      await provider.request({
-                        method: "wallet_addEthereumChain",
-                        params: [{
-                          chainId: "0xaa36a7",
-                          chainName: "Sepolia",
-                          nativeCurrency: { name: "Sepolia Ether", symbol: "ETH", decimals: 18 },
-                          rpcUrls: ["https://rpc.sepolia.org"],
-                          blockExplorerUrls: ["https://sepolia.etherscan.io"]
-                        }]
-                      });
-                      
-                      await provider.request({
-                        method: "wallet_switchEthereumChain",
-                        params: [{ chainId: "0xaa36a7" }],
-                      });
-                    } catch (e2) {
-                      console.warn("User declined chain add/switch; must set Sepolia manually.");
-                    }
                   }
                 }
-              } catch (e) {
-                console.warn("eth_chainId failed:", e);
+              } catch (_) {
+                
               }
-              
-              const accounts = await getWalletConnectAccounts(provider);
         
+              const accounts = await getWalletConnectAccounts(provider);
+              
               try {
                 const methods = provider.session?.namespaces?.eip155?.methods || [];
                 console.log("WC methods in session:", methods);
@@ -244,14 +223,13 @@
               provider.on?.("disconnect",     (ev) => console.log("disconnect", ev));
               provider.on?.("chainChanged",   (cid) => console.log("chainChanged", cid));
         
-              return { ok: true, accounts };
+              return { ok: true, accounts, chainId: chainIdHex };
             } catch (e) {
               const err = normalizeEthError(e);
               return { ok: false, error: `${err.code}: ${err.message}` };
             }
           };
-        </script>
-        
+        </script>      
         <script type="module" defer>
             async function requestPersistentStorage() {
                 if (navigator.storage && navigator.storage.persist) {

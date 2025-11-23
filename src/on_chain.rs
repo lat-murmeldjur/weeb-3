@@ -40,6 +40,7 @@ pub fn web3() -> Result<Web3Inst, JsError> {
     Ok(web3::Web3::new(Eip1193::new(prov)))
 }
 
+#[allow(dead_code)]
 pub async fn connected_accounts(w3: &Web3Inst) -> Result<Vec<Address>, JsError> {
     let accs = w3
         .eth()

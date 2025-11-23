@@ -42,6 +42,9 @@ use web_sys::File;
 mod accounting;
 use accounting::*;
 
+mod addresses;
+use addresses::deserialize_underlays;
+
 mod conventions;
 use conventions::*;
 
@@ -637,16 +640,13 @@ impl Sekirei {
                                 }
                             };
 
-                            let rtclist = paddr.clone().rtc_underlays;
+                            let und_addrs = deserialize_underlays(&paddr.clone().underlay);
 
-                            for rtcaddr in rtclist.iter() {
-                                let addr3 = match libp2p::core::Multiaddr::try_from(rtcaddr.clone())
-                                {
-                                    Ok(aok) => aok,
-                                    _ => {
-                                        return;
-                                    }
-                                };
+                            for addr3 in und_addrs.iter() {
+                                web_sys::console::log_1(&JsValue::from(format!(
+                                    "Current Conn Handled {:#?}",
+                                    addr3.to_string()
+                                )));
 
                                 let prck = addr3.protocol_stack();
                                 let mut webrtc_direct = false;
@@ -673,19 +673,19 @@ impl Sekirei {
                                             let connected_peers_map =
                                                 wings.connected_peers.lock().await;
                                             if connected_peers_map.contains_key(&aok) {
-                                                return;
+                                                continue;
                                             }
                                             let mut connection_attempts_map =
                                                 wings.connection_attempts.lock().await;
                                             if connection_attempts_map.contains(&aok) {
-                                                return;
+                                                continue;
                                             } else {
                                                 connection_attempts_map.insert(aok);
                                             }
                                             aok
                                         }
                                         _ => {
-                                            return;
+                                            continue;
                                         }
                                     };
 
