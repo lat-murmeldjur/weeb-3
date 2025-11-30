@@ -72,13 +72,26 @@ impl SekireiNo103 {
 
         let out = Array::new();
 
+        // Helper to build { path, file } objects
+        fn make_entry(path: &str, file: &JsValue) -> JsValue {
+            let obj = Object::new();
+            Reflect::set(&obj, &JsValue::from("path"), &JsValue::from(path)).expect("set path");
+            Reflect::set(&obj, &JsValue::from("file"), file).expect("set file");
+            obj.into()
+        }
+
+        // Keep your "index" file first
         if let Some(pos) = data.iter().position(|(_, _, p)| *p == indx) {
             let (bytes, mime, path) = data.remove(pos);
-            out.push(&make_js_file(bytes, &mime, &path));
+            let file = make_js_file(bytes, &mime, &path); // JsValue or File→JsValue
+            let entry = make_entry(&path, &file);
+            out.push(&entry);
         }
 
         for (bytes, mime, path) in data {
-            out.push(&make_js_file(bytes, &mime, &path));
+            let file = make_js_file(bytes, &mime, &path);
+            let entry = make_entry(&path, &file);
+            out.push(&entry);
         }
 
         out
@@ -138,11 +151,14 @@ await init();
 const node = new Sekirei_No_103();
 node.start("/ip4/203.0.113.5/udp/8443/webrtc-direct/p2p/12D3K...", "10");
 
-const files = await node.retrieve("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
-for (const f of files) {
-  console.log(f.name, f.type, f.size);
-  const url = URL.createObjectURL(f);
+// retrieve now returns: Array<{ path: string, file: File }>
+const entries = await node.retrieve("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
 
+for (const { path, file } of entries) {
+  console.log(path, file.name, file.type, file.size);
+
+  const url = URL.createObjectURL(file);
+  // do something with url...
 }
 
 */

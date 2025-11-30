@@ -22,12 +22,15 @@
     await init();
 
     const weeb3node = new SekireiNo103();
-    weeb3node.start("/ip4/192.168.100.148/udp/1634/webrtc-direct/certhash/uEiD7oh1Ug_GQdb9k7afYZ911gmo9xeJRjxEeiXw3Ry2GZw/p2p/QmQU8F1HcWziRdww5r8CzTWYyUdeMGmdXF3zTATSa1jrGF", "10");
+    weeb3node.start(
+      "/ip4/192.168.100.148/udp/1634/webrtc-direct/certhash/uEiBkjDfW1c9mv2W3xo4tYDM6ejW-YClV_WwGriu0HBvpig/p2p/QmQU8F1HcWziRdww5r8CzTWYyUdeMGmdXF3zTATSa1jrGF",
+      "10"
+    );
 
     const viewerRoot = document.getElementById("viewerRoot");
-    const meta   = document.getElementById("meta");
-    const dl     = document.getElementById("dl");
-    const fb     = document.getElementById("fallback");
+    const meta       = document.getElementById("meta");
+    const dl         = document.getElementById("dl");
+    const fb         = document.getElementById("fallback");
 
     let currentUrl = null;
 
@@ -36,47 +39,54 @@
       switch (ext) {
         case "jpg":
         case "jpeg": return "image/jpeg";
-        case "png": return "image/png";
-        case "gif": return "image/gif";
+        case "png":  return "image/png";
+        case "gif":  return "image/gif";
         case "webp": return "image/webp";
-        case "pdf": return "application/pdf";
-        case "mp4": return "video/mp4";
+        case "pdf":  return "application/pdf";
+        case "mp4":  return "video/mp4";
         case "webm": return "video/webm";
-        case "mp3": return "audio/mpeg";
-        case "wav": return "audio/wav";
-        case "ogg": return "audio/ogg";
-        case "txt": return "text/plain";
+        case "mp3":  return "audio/mpeg";
+        case "wav":  return "audio/wav";
+        case "ogg":  return "audio/ogg";
+        case "txt":  return "text/plain";
         case "json": return "application/json";
         case "html": return "text/html";
-        default: return "application/octet-stream";
+        default:     return "application/octet-stream";
       }
     }
 
     function formatBytes(n) {
       if (n < 1024) return `${n} B`;
       const u = ["KB","MB","GB","TB"];
-      let i = -1; do { n /= 1024; i++; } while (n >= 1024 && i < u.length - 1);
+      let i = -1;
+      do { n /= 1024; i++; } while (n >= 1024 && i < u.length - 1);
       return `${n.toFixed(1)} ${u[i]}`;
     }
 
-    function showFile(file) {
+    function showFile(entry) {
+      const { path, file } = entry;
+
       if (currentUrl) URL.revokeObjectURL(currentUrl);
 
       const url = URL.createObjectURL(file);
       currentUrl = url;
 
       const embed = document.createElement("embed");
-      const mime = file.type && file.type.trim() !== "" ? file.type : inferMimeFromName(file.name);
+      const mime = file.type && file.type.trim() !== ""
+        ? file.type
+        : inferMimeFromName(file.name || path);
 
       embed.setAttribute("type", mime);
       embed.setAttribute("src", url);
 
       viewerRoot.replaceChildren(embed);
 
-      meta.textContent = `${file.name} — ${mime} — ${formatBytes(file.size)}`;
+      meta.textContent =
+        `${path} — ${file.name || "(no name)"} — ${mime} — ${formatBytes(file.size)}`;
+
       if (dl) {
         dl.href = url;
-        dl.download = file.name || "download";
+        dl.download = file.name || path || "download";
       }
       if (fb) fb.hidden = true;
     }
@@ -87,13 +97,15 @@
       viewerRoot.replaceChildren(); // clear
 
       try {
-        const files = await weeb3node.retrieve(addr);
-        if (files.length === 0) {
+        const entries = await weeb3node.retrieve(addr);
+
+        if (entries.length === 0) {
           meta.textContent = "No files were returned for this address.";
           if (fb) fb.hidden = false;
           return;
         }
-        showFile(files[0]);
+
+        showFile(entries[0]);
       } catch (e) {
         meta.textContent = "Retrieve failed: " + (e?.message ?? String(e));
         if (fb) fb.hidden = false;
