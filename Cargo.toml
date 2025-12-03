@@ -111,3 +111,4 @@ web3 = { git = "https://github.com/tomusdrw/rust-web3.git", default-features = f
 tar = { git = "https://github.com/alexcrichton/tar-rs.git" }
 mime_guess = { git = "https://github.com/abonander/mime_guess.git" }
 indexed_db_futures = { git = "https://github.com/Alorel/rust-indexed-db.git", features = ["serde", "indices", "async-upgrade"] }
+base64 = "0.22.1"
