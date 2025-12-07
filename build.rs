@@ -9,4 +9,5 @@ fn main() {
     prost_build::compile_protos(&["src/etiquette_5.proto"], &["src/"]).unwrap();
     prost_build::compile_protos(&["src/etiquette_6.proto"], &["src/"]).unwrap();
     prost_build::compile_protos(&["src/etiquette_7.proto"], &["src/"]).unwrap();
+    prost_build::compile_protos(&["src/etiquette_8.proto"], &["src/"]).unwrap();
 }

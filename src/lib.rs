@@ -100,6 +100,9 @@ pub mod weeb_3 {
     pub mod etiquette_7 {
         include!(concat!(env!("OUT_DIR"), "/weeb_3.etiquette_7.rs"));
     }
+    pub mod etiquette_8 {
+        include!(concat!(env!("OUT_DIR"), "/weeb_3.etiquette_8.rs"));
+    }
 }
 
 // use crate::weeb_3::etiquette_0;
@@ -117,6 +120,7 @@ const PSEUDOSETTLE_PROTOCOL: StreamProtocol =
     StreamProtocol::new("/swarm/pseudosettle/1.0.0/pseudosettle");
 const RETRIEVAL_PROTOCOL: StreamProtocol = StreamProtocol::new("/swarm/retrieval/1.4.0/retrieval");
 const PUSHSYNC_PROTOCOL: StreamProtocol = StreamProtocol::new("/swarm/pushsync/1.3.1/pushsync");
+const SWAP_PROTOCOL: StreamProtocol = StreamProtocol::new("/swarm/swap/1.0.0/swap");
 
 // const PINGPONG_PROTOCOL: StreamProtocol = StreamProtocol::new("/swarm/pingpong/1.0.0/pingpong");
 // const STATUS_PROTOCOL: StreamProtocol = StreamProtocol::new("/swarm/status/1.1.1/status");

@@ -28,11 +28,13 @@ use crate::weeb_3::etiquette_4;
 use crate::weeb_3::etiquette_5;
 use crate::weeb_3::etiquette_6;
 use crate::weeb_3::etiquette_7;
+use crate::weeb_3::etiquette_8;
 
 use crate::HANDSHAKE_PROTOCOL;
 use crate::PSEUDOSETTLE_PROTOCOL;
 use crate::PUSHSYNC_PROTOCOL;
 use crate::RETRIEVAL_PROTOCOL;
+use crate::SWAP_PROTOCOL;
 
 pub async fn ceive(
     peer: PeerId,
@@ -404,6 +406,64 @@ pub async fn fresh(
     }
 }
 
+#[allow(dead_code)]
+pub async fn issue(
+    peer: PeerId,
+    cheque: Vec<u8>,
+    mut stream: Stream,
+    chan: &mpsc::Sender<(PeerId, bool)>,
+) {
+    let empty = etiquette_0::Headers::default();
+
+    let mut buf_empty = Vec::new();
+
+    let empty_len = empty.encoded_len();
+    buf_empty.reserve(empty_len + prost::length_delimiter_len(empty_len));
+    empty.encode_length_delimited(&mut buf_empty).unwrap();
+
+    match stream.write_all(&buf_empty).await {
+        Ok(_) => {}
+        Err(_) => {
+            let _ = chan.send((peer, false)).unwrap();
+            return;
+        }
+    };
+    let _ = stream.flush().await;
+
+    let mut buf_nondiscard_0 = Vec::new();
+    let mut buf_discard_0: [u8; 255] = [0; 255];
+    loop {
+        let n = match stream.read(&mut buf_discard_0).await {
+            Ok(a) => a,
+            Err(_) => {
+                let _ = chan.send((peer, false)).unwrap();
+                return;
+            }
+        };
+        buf_nondiscard_0.extend_from_slice(&buf_discard_0[..n]);
+        if n < 255 {
+            break;
+        }
+    }
+
+    let mut step_1 = etiquette_8::EmitCheque::default();
+    step_1.cheque = cheque;
+
+    let bufw_1 = step_1.encode_length_delimited_to_vec();
+
+    match stream.write_all(&bufw_1).await {
+        Ok(_) => {}
+        Err(_) => {
+            let _ = chan.send((peer, false)).unwrap();
+            return;
+        }
+    };
+    let _ = stream.flush().await;
+    let _ = stream.close().await;
+
+    let _ = chan.send((peer, true)).unwrap();
+}
+
 pub async fn trieve(
     _peer: PeerId,
     chunk_address: Vec<u8>,
@@ -551,6 +611,30 @@ pub async fn refresh_handler(
     };
 
     fresh(peer, amount, stream, chan).await;
+}
+
+#[allow(dead_code)]
+pub async fn issue_handler(
+    peer: PeerId,
+    cheque: Vec<u8>,
+    control: stream::Control,
+    chan: &mpsc::Sender<(PeerId, bool)>,
+) {
+    let stream = match control.clone().open_stream(peer, SWAP_PROTOCOL).await {
+        Ok(stream) => stream,
+        Err(error @ stream::OpenStreamError::UnsupportedProtocol(_)) => {
+            web_sys::console::log_1(&JsValue::from(format!("{} {}", peer, error)));
+            let _ = chan.send((peer, false));
+            return;
+        }
+        Err(error) => {
+            web_sys::console::log_1(&JsValue::from(format!("{} {}", peer, error)));
+            let _ = chan.send((peer, false));
+            return;
+        }
+    };
+
+    issue(peer, cheque, stream, chan).await;
 }
 
 pub async fn retrieve_handler(

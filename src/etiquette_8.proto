@@ -1,0 +1,11 @@
+syntax = "proto3";
+
+package weeb_3.etiquette_8;
+
+message EmitCheque {
+  bytes Cheque = 1;
+}
+
+message Handshake {
+  bytes Beneficiary = 1;
+}
