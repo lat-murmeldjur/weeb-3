@@ -1,5 +1,4 @@
-use std::str::FromStr;
-use std::time::Duration;
+use std::{cell::RefCell, rc::Rc, str::FromStr, time::Duration};
 
 use web3::types::{Address, U256};
 
@@ -27,7 +26,10 @@ use web_sys::{
 use crate::{
     Sekirei, decode_resources, encrey, join, join_all,
     nav::{clear_path, read_path},
-    on_chain::{buy_postage_batch_with_payer, get_batch_validity},
+    on_chain::{
+        buy_postage_batch_with_payer, chequebook_balance, deposit_to_chequebook,
+        deploy_chequebook_with_payer, get_batch_validity, token_contract,
+    },
     persistence::{
         get_batch_bucket_limit, get_batch_id, get_batch_owner_key, set_batch_bucket_limit,
         set_batch_id, set_batch_owner_key,
@@ -73,6 +75,8 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
     let sekirei8 = sekirei.clone();
     let sekirei9 = sekirei.clone();
 
+    let chequebook_state = Rc::new(RefCell::new(None::<Address>));
+
     let path_load_init = async {
         let references = read_path().await;
         let mut handles = vec![];
@@ -104,6 +108,9 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
 
     let interface_async = async move {
         web_sys::console::log_1(&JsValue::from(format!("host2 {:#?}", host2)));
+
+        let chequebook_state_deploy = chequebook_state.clone();
+        let chequebook_state_deposit = chequebook_state.clone();
 
         // let document = web_sys::window().unwrap().document().unwrap();
 
@@ -577,6 +584,307 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
             .dyn_ref::<HtmlButtonElement>()
             .expect("#uploadResetStamp should be a HtmlButtonElement")
             .set_onclick(Some(callback5.as_ref().unchecked_ref()));
+
+        let callback6 = wasm_bindgen::closure::Closure::<dyn FnMut(web_sys::MessageEvent)>::new(
+            move |_msg| {
+                let state = chequebook_state_deploy.clone();
+                spawn_local(async move {
+                    let window = web_sys::window().unwrap();
+                    if let Ok(func) =
+                        js_sys::Reflect::get(&window, &JsValue::from_str("weeb3EnsureEip1193"))
+                    {
+                        if let Ok(f) = func.dyn_into::<js_sys::Function>() {
+                            let project_id = JsValue::from_str("64c5f91181ce0a3192a783346a475d23");
+                            if let Ok(promise_val) = f.call1(&JsValue::NULL, &project_id) {
+                                if let Ok(promise) = promise_val.dyn_into::<js_sys::Promise>() {
+                                    let res = JsFuture::from(promise).await;
+                                    if let Ok(obj) = res {
+                                        let ok = js_sys::Reflect::get(&obj, &"ok".into())
+                                            .ok()
+                                            .and_then(|v| v.as_bool())
+                                            .unwrap_or(false);
+                                        if !ok {
+                                            let err = js_sys::Reflect::get(&obj, &"error".into())
+                                                .ok()
+                                                .and_then(|v| v.as_string())
+                                                .unwrap_or_else(|| "WalletConnect failed".into());
+                                            let wnd = web_sys::window().unwrap();
+                                            let _ = wnd.alert_with_message(&format!(
+                                                "Wallet connect failed: {}",
+                                                err
+                                            ));
+                                            return;
+                                        }
+
+                                        let mut payer_opt: Option<Address> = None;
+                                        if let Ok(accs_val) =
+                                            js_sys::Reflect::get(&obj, &"accounts".into())
+                                        {
+                                            if !accs_val.is_undefined() && !accs_val.is_null() {
+                                                let accs = js_sys::Array::from(&accs_val);
+                                                let first = accs.get(0);
+                                                if let Some(addr_str) = first.as_string() {
+                                                    if let Ok(addr) = Address::from_str(&addr_str) {
+                                                        payer_opt = Some(addr);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        let payer = match payer_opt {
+                                            Some(a) => a,
+                                            None => {
+                                                let wnd = web_sys::window().unwrap();
+                                                let _ = wnd.alert_with_message(
+                                            "Connected but no account found. If using MetaMask Mobile, ensure the connection succeeded and try again."
+                                        );
+                                                return;
+                                            }
+                                        };
+
+                                        if let Ok(w3) = crate::on_chain::web3() {
+                                            if let Ok(cid) = w3.eth().chain_id().await {
+                                                if cid != U256::from(11155111u64) {
+                                                    let wnd = web_sys::window().unwrap();
+                                                    let _ = wnd.alert_with_message(
+                                                        "Wallet is not on Sepolia (11155111). Please switch to Sepolia in your wallet and try again."
+                                                    );
+                                                    return;
+                                                }
+                                            }
+                                        }
+
+                                        let deployment = match deploy_chequebook_with_payer(
+                                            payer, payer,
+                                        )
+                                        .await
+                                        {
+                                            Ok(d) => d,
+                                            Err(e) => {
+                                                let wnd = web_sys::window().unwrap();
+                                                let _ = wnd.alert_with_message(&format!(
+                                                    "Chequebook deployment failed: {:?}",
+                                                    e
+                                                ));
+                                                return;
+                                            }
+                                        };
+
+                                        *state.borrow_mut() = Some(deployment.chequebook);
+
+                                        let wnd = web_sys::window().unwrap();
+                                        let _ = wnd.alert_with_message(&format!(
+                                            "Chequebook deployed at 0x{}.\nDeployment tx: 0x{}",
+                                            hex::encode(deployment.chequebook.as_bytes()),
+                                            hex::encode(deployment.tx.as_bytes())
+                                        ));
+                                        return;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    let wnd = web_sys::window().unwrap();
+                    let _ = wnd.alert_with_message(
+                "Could not initialize wallet connection. Try again or open in MetaMask in-app browser."
+            );
+                });
+            },
+        );
+
+        web_sys::window()
+            .unwrap()
+            .document()
+            .unwrap()
+            .get_element_by_id("deployChequebook")
+            .expect("#deployChequebook should exist")
+            .dyn_ref::<HtmlButtonElement>()
+            .expect("#deployChequebook should be a HtmlButtonElement")
+            .set_onclick(Some(callback6.as_ref().unchecked_ref()));
+
+        let callback7 = wasm_bindgen::closure::Closure::<dyn FnMut(web_sys::MessageEvent)>::new(
+            move |_msg| {
+                let state = chequebook_state_deposit.clone();
+
+                let document = web_sys::window().unwrap().document().unwrap();
+                let amount_el = document
+                    .get_element_by_id("depositAmount")
+                    .expect("#depositAmount should exist");
+                let amount_input: HtmlInputElement = amount_el
+                    .dyn_into::<HtmlInputElement>()
+                    .expect("#depositAmount should be a HtmlInputElement");
+
+                let amount_raw = amount_input.value();
+                let amount = match U256::from_dec_str(amount_raw.trim()) {
+                    Ok(v) => v,
+                    Err(_) => {
+                        let wnd = web_sys::window().unwrap();
+                        let _ = wnd.alert_with_message("Failed to read deposit amount");
+                        return;
+                    }
+                };
+
+                if amount == U256::from(0u8) {
+                    let wnd = web_sys::window().unwrap();
+                    let _ = wnd.alert_with_message("Deposit amount must be greater than zero");
+                    return;
+                }
+
+                let chequebook = match *state.borrow() {
+                    Some(addr) => addr,
+                    None => {
+                        let wnd = web_sys::window().unwrap();
+                        let _ = wnd.alert_with_message(
+                            "Deploy a chequebook first before depositing.",
+                        );
+                        return;
+                    }
+                };
+
+                spawn_local(async move {
+                    let window = web_sys::window().unwrap();
+                    if let Ok(func) =
+                        js_sys::Reflect::get(&window, &JsValue::from_str("weeb3EnsureEip1193"))
+                    {
+                        if let Ok(f) = func.dyn_into::<js_sys::Function>() {
+                            let project_id = JsValue::from_str("64c5f91181ce0a3192a783346a475d23");
+                            if let Ok(promise_val) = f.call1(&JsValue::NULL, &project_id) {
+                                if let Ok(promise) = promise_val.dyn_into::<js_sys::Promise>() {
+                                    let res = JsFuture::from(promise).await;
+                                    if let Ok(obj) = res {
+                                        let ok = js_sys::Reflect::get(&obj, &"ok".into())
+                                            .ok()
+                                            .and_then(|v| v.as_bool())
+                                            .unwrap_or(false);
+                                        if !ok {
+                                            let err = js_sys::Reflect::get(&obj, &"error".into())
+                                                .ok()
+                                                .and_then(|v| v.as_string())
+                                                .unwrap_or_else(|| "WalletConnect failed".into());
+                                            let wnd = web_sys::window().unwrap();
+                                            let _ = wnd.alert_with_message(&format!(
+                                                "Wallet connect failed: {}",
+                                                err
+                                            ));
+                                            return;
+                                        }
+
+                                        let mut payer_opt: Option<Address> = None;
+                                        if let Ok(accs_val) =
+                                            js_sys::Reflect::get(&obj, &"accounts".into())
+                                        {
+                                            if !accs_val.is_undefined() && !accs_val.is_null() {
+                                                let accs = js_sys::Array::from(&accs_val);
+                                                let first = accs.get(0);
+                                                if let Some(addr_str) = first.as_string() {
+                                                    if let Ok(addr) = Address::from_str(&addr_str) {
+                                                        payer_opt = Some(addr);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        let payer = match payer_opt {
+                                            Some(a) => a,
+                                            None => {
+                                                let wnd = web_sys::window().unwrap();
+                                                let _ = wnd.alert_with_message(
+                                            "Connected but no account found. If using MetaMask Mobile, ensure the connection succeeded and try again."
+                                        );
+                                                return;
+                                            }
+                                        };
+
+                                        let w3 = match crate::on_chain::web3() {
+                                            Ok(w) => w,
+                                            Err(e) => {
+                                                let wnd = web_sys::window().unwrap();
+                                                let _ = wnd.alert_with_message(&format!(
+                                                    "Failed to initialize web3: {:?}",
+                                                    e
+                                                ));
+                                                return;
+                                            }
+                                        };
+
+                                        if let Ok(cid) = w3.eth().chain_id().await {
+                                            if cid != U256::from(11155111u64) {
+                                                let wnd = web_sys::window().unwrap();
+                                                let _ = wnd.alert_with_message(
+                                                    "Wallet is not on Sepolia (11155111). Please switch to Sepolia in your wallet and try again."
+                                                );
+                                                return;
+                                            }
+                                        }
+
+                                        let token = match token_contract(&w3).await {
+                                            Ok(t) => t,
+                                            Err(e) => {
+                                                let wnd = web_sys::window().unwrap();
+                                                let _ = wnd.alert_with_message(&format!(
+                                                    "Failed to load token contract: {:?}",
+                                                    e
+                                                ));
+                                                return;
+                                            }
+                                        };
+
+                                        let receipt = match deposit_to_chequebook(
+                                            &token,
+                                            chequebook,
+                                            payer,
+                                            amount,
+                                        )
+                                        .await
+                                        {
+                                            Ok(r) => r,
+                                            Err(e) => {
+                                                let wnd = web_sys::window().unwrap();
+                                                let _ = wnd.alert_with_message(&format!(
+                                                    "Deposit failed: {:?}",
+                                                    e
+                                                ));
+                                                return;
+                                            }
+                                        };
+
+                                        let mut balance_note = String::new();
+                                        if let Ok(balance) =
+                                            chequebook_balance(&w3, chequebook).await
+                                        {
+                                            balance_note =
+                                                format!("\nNew balance: {}", balance);
+                                        }
+
+                                        let wnd = web_sys::window().unwrap();
+                                        let _ = wnd.alert_with_message(&format!(
+                                            "Deposit submitted.\nTx: 0x{}{}",
+                                            hex::encode(receipt.transaction_hash.as_bytes()),
+                                            balance_note
+                                        ));
+                                        return;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    let wnd = web_sys::window().unwrap();
+                    let _ = wnd.alert_with_message(
+                "Could not initialize wallet connection. Try again or open in MetaMask in-app browser."
+            );
+                });
+            },
+        );
+
+        web_sys::window()
+            .unwrap()
+            .document()
+            .unwrap()
+            .get_element_by_id("depositCash")
+            .expect("#depositCash should exist")
+            .dyn_ref::<HtmlButtonElement>()
+            .expect("#depositCash should be a HtmlButtonElement")
+            .set_onclick(Some(callback7.as_ref().unchecked_ref()));
 
         let service_closure = Closure::wrap(Box::new(move |event: MessageEvent| {
             if let Ok(obj) = event.data().dyn_into::<js_sys::Object>() {

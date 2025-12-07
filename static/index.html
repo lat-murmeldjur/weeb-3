@@ -70,14 +70,22 @@
                     <label for="encryption">Encrypt Upload</label>
                     <input type="text" id="indexString" placeholder="(Optional) Enter Index     Document path for collection upload     (.tar)" size="64">
                     <button id="uploadFile">... Upload on Swarm ...</button>
-                    <div>
-                        <input id="uploadAddToFeed" name="addtofeed" type="checkbox">
-                        <label for="addtofeed">Add upload reference to feed</label>
-                        <input type="text" id="feedTopicString" placeholder="Swarm Feed Topic">
-                    </div>
+                <div>
+                    <input id="uploadAddToFeed" name="addtofeed" type="checkbox">
+                    <label for="addtofeed">Add upload reference to feed</label>
+                    <input type="text" id="feedTopicString" placeholder="Swarm Feed Topic">
                 </div>
-                <h2>Logs</h2>
-                <div id="logsField"></div>
+            </div>
+            <h2>Bandwidth</h2>
+            <div>
+                <button id="deployChequebook">... deploy chequebook ...</button>
+            </div>
+            <div>
+                <button id="depositCash">... deposit cash ...</button>
+                <input type="text" id="depositAmount" placeholder="amount">
+            </div>
+            <h2>Logs</h2>
+            <div id="logsField"></div>
             </div>
         </div>
         
