@@ -414,3 +414,19 @@ pub async fn get_feed_owner_key() -> Vec<u8> {
 pub async fn set_feed_owner_key(key: &Vec<u8>) -> bool {
     return set_batch_field("feed_owner_0_key".to_string(), key).await;
 }
+
+pub async fn get_chequebook_signer_key() -> Vec<u8> {
+    return get_batch_field("chequebook_signer_key".to_string()).await;
+}
+
+pub async fn set_chequebook_signer_key(key: &Vec<u8>) -> bool {
+    return set_batch_field("chequebook_signer_key".to_string(), key).await;
+}
+
+pub async fn get_chequebook_address() -> Vec<u8> {
+    return get_batch_field("chequebook_address".to_string()).await;
+}
+
+pub async fn set_chequebook_address(addr: &Vec<u8>) -> bool {
+    return set_batch_field("chequebook_address".to_string(), addr).await;
+}

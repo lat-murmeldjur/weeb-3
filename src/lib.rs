@@ -12,6 +12,8 @@ use std::time::Duration;
 use tar::Archive;
 
 use alloy::primitives::keccak256;
+use ethers::signers::{LocalWallet, Signer};
+use prost::Message;
 
 use libp2p::{
     PeerId,
@@ -22,6 +24,8 @@ use libp2p::{
     core::multiaddr::Protocol,
     // dcutr,
     futures::{
+        //        AsyncReadExt,
+        AsyncWriteExt,
         StreamExt,
         future::join_all, //
         join,
@@ -37,6 +41,7 @@ use libp2p_stream as stream;
 
 use js_sys::Date;
 use wasm_bindgen::{JsValue, prelude::*};
+use wasm_bindgen_futures::spawn_local;
 use web_sys::File;
 
 mod accounting;
@@ -64,7 +69,10 @@ mod on_chain;
 mod nav;
 
 mod persistence;
-use persistence::{get_batch_bucket_limit, get_batch_id, get_batch_owner_key, reset_stamp};
+use persistence::{
+    get_batch_bucket_limit, get_batch_id, get_batch_owner_key, get_chequebook_signer_key,
+    reset_stamp,
+};
 
 mod retrieval;
 use retrieval::*;
@@ -112,6 +120,7 @@ use crate::weeb_3::etiquette_2;
 // use crate::weeb_3::etiquette_4;
 // use crate::weeb_3::etiquette_5;
 // use crate::weeb_3::etiquette_6;
+use crate::weeb_3::etiquette_8;
 
 const HANDSHAKE_PROTOCOL: StreamProtocol = StreamProtocol::new("/swarm/handshake/14.0.0/handshake");
 const PRICING_PROTOCOL: StreamProtocol = StreamProtocol::new("/swarm/pricing/1.0.0/pricing");
@@ -182,6 +191,8 @@ pub struct Wings {
     bootnodes: Arc<Mutex<HashSet<String>>>,
     accounting_peers: Arc<Mutex<HashMap<PeerId, Mutex<PeerAccounting>>>>,
     ongoing_refreshments: Arc<Mutex<HashSet<PeerId>>>,
+    ongoing_cheques: Arc<Mutex<HashMap<PeerId, u64>>>,
+    swap_beneficiaries: Arc<Mutex<HashMap<PeerId, Vec<u8>>>>,
     connection_attempts: Arc<Mutex<HashSet<PeerId>>>,
 }
 
@@ -490,6 +501,10 @@ impl Sekirei {
         let ongoing_refreshments: Arc<Mutex<HashSet<PeerId>>> =
             Arc::new(Mutex::new(HashSet::new()));
         let connection_attempts: Arc<Mutex<HashSet<PeerId>>> = Arc::new(Mutex::new(HashSet::new()));
+        let ongoing_cheques: Arc<Mutex<HashMap<PeerId, u64>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let swap_beneficiaries: Arc<Mutex<HashMap<PeerId, Vec<u8>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
 
         let (m_out, m_in) = mpsc::channel::<(Vec<u8>, mpsc::Sender<Vec<u8>>)>();
 
@@ -514,6 +529,8 @@ impl Sekirei {
                 bootnodes: bootnodes,
                 accounting_peers: accounting_peers,
                 ongoing_refreshments: ongoing_refreshments,
+                ongoing_cheques: ongoing_cheques,
+                swap_beneficiaries: swap_beneficiaries,
                 connection_attempts: connection_attempts,
             })),
             log_port: (log_port_out, log_port_in),
@@ -588,14 +605,21 @@ impl Sekirei {
         let (chunk_upload_chan_outgoing, chunk_upload_chan_incoming) =
             mpsc::channel::<(Vec<u8>, bool, Vec<u8>, Vec<u8>, mpsc::Sender<bool>)>();
 
+        let (cheque_instructions_chan_outgoing, cheque_instructions_chan_incoming) =
+            mpsc::channel::<(PeerId, u64)>();
+        let (cheque_send_chan_outgoing, cheque_send_chan_incoming) =
+            mpsc::channel::<(PeerId, bool)>();
+
         let mut ctrl0;
         let mut ctrl1;
         let ctrl3;
         let ctrl4;
+        let mut ctrl5;
         let ctrl6;
         let ctrl8;
         let mut incoming_pricing_streams;
         let mut incoming_gossip_streams;
+        let mut incoming_swap_streams;
 
         let swarm0 = self.swarm.clone();
 
@@ -603,6 +627,7 @@ impl Sekirei {
             let mut swarm = swarm0.lock().await;
             ctrl0 = swarm.behaviour_mut().stream.new_control();
             ctrl1 = swarm.behaviour_mut().stream.new_control();
+            ctrl5 = swarm.behaviour_mut().stream.new_control();
             ctrl3 = swarm.behaviour_mut().stream.new_control();
             ctrl4 = swarm.behaviour_mut().stream.new_control();
             ctrl6 = swarm.behaviour_mut().stream.new_control();
@@ -611,6 +636,7 @@ impl Sekirei {
 
         incoming_pricing_streams = ctrl0.accept(PRICING_PROTOCOL).unwrap();
         incoming_gossip_streams = ctrl1.accept(GOSSIP_PROTOCOL).unwrap();
+        incoming_swap_streams = ctrl5.accept(SWAP_PROTOCOL).unwrap();
 
         let pricing_inbound_handle = async move {
             while let Some((peer, stream)) = incoming_pricing_streams.next().await {
@@ -621,6 +647,13 @@ impl Sekirei {
         let gossip_inbound_handle = async move {
             while let Some((peer, stream)) = incoming_gossip_streams.next().await {
                 gossip_handler(peer, stream, &peers_instructions_chan_outgoing.clone()).await;
+            }
+        };
+
+        let wings_swap = wings.clone();
+        let swap_inbound_handle = async move {
+            while let Some((peer, stream)) = incoming_swap_streams.next().await {
+                swap_inbound_handler(peer, stream, wings_swap.swap_beneficiaries.clone()).await;
             }
         };
 
@@ -999,6 +1032,32 @@ impl Sekirei {
                                             *ongoing = *ongoing - 1
                                         }
                                     }
+                                    // send swap handshake to new peer with our beneficiary
+                                    let ctrl_swap = ctrl5.clone();
+                                    let bene_key = get_chequebook_signer_key().await;
+                                    spawn_local(async move {
+                                        if bene_key.len() == 32 {
+                                            if let Ok(wallet) = LocalWallet::from_bytes(&bene_key) {
+                                                let bene_addr = wallet.address();
+                                                let mut msg = etiquette_8::Handshake::default();
+                                                msg.beneficiary = bene_addr.as_bytes().to_vec();
+                                                let mut payload = Vec::new();
+                                                let len = msg.encoded_len();
+                                                payload.reserve(
+                                                    len + prost::length_delimiter_len(len),
+                                                );
+                                                msg.encode_length_delimited(&mut payload).unwrap();
+                                                if let Ok(mut stream) = ctrl_swap
+                                                    .clone()
+                                                    .open_stream(peer, SWAP_PROTOCOL)
+                                                    .await
+                                                {
+                                                    let _ = stream.write_all(&payload).await;
+                                                    let _ = stream.close().await;
+                                                }
+                                            }
+                                        }
+                                    });
                                 }
                             }
                         } else {
@@ -1024,6 +1083,7 @@ impl Sekirei {
                             #[allow(unused_assignments)]
                             let mut daten = Date::now();
                             let datenow = daten;
+                            let mut cheque_amt: u64 = 0;
                             {
                                 let accounting = wings.accounting_peers.lock().await;
                                 let accounting_peer_lock = match accounting.get(&peer) {
@@ -1034,6 +1094,10 @@ impl Sekirei {
                                 daten = accounting_peer.refreshment;
                                 if datenow > accounting_peer.refreshment + 1000.0 {
                                     accounting_peer.refreshment = datenow;
+                                } else {
+                                    if accounting_peer.balance > REFRESH_RATE {
+                                        cheque_amt = accounting_peer.balance - REFRESH_RATE;
+                                    }
                                 }
                             }
                             if datenow > daten + 1000.0 {
@@ -1047,6 +1111,13 @@ impl Sekirei {
                                     refresh_handler(peer, amount, ctrl7, &rco).await;
                                 };
                                 refresh_joiner.push(handle);
+                            } else if cheque_amt > 0 {
+                                let mut map = wings.ongoing_cheques.lock().await;
+                                if !map.contains_key(&peer) {
+                                    map.insert(peer, cheque_amt);
+                                    let _ =
+                                        cheque_instructions_chan_outgoing.send((peer, cheque_amt));
+                                }
                             }
                         } else {
                             let _ = re_out;
@@ -1081,7 +1152,63 @@ impl Sekirei {
                     }
                 };
 
-                join!(k1, k2, k3, k4);
+                let k5 = async {
+                    let mut cheque_joiner = Vec::new();
+
+                    #[allow(irrefutable_let_patterns)]
+                    while let ch_out = cheque_instructions_chan_incoming.try_recv() {
+                        if !ch_out.is_err() {
+                            let (peer, amount) = ch_out.unwrap();
+                            let ctrl_swap = ctrl5.clone();
+                            let cheque_chan = cheque_send_chan_outgoing.clone();
+                            let peers_for_cheque = wings.swap_beneficiaries.clone();
+                            let handle = async move {
+                                issue_handler(
+                                    peer,
+                                    amount,
+                                    ctrl_swap,
+                                    &cheque_chan,
+                                    peers_for_cheque,
+                                )
+                                .await;
+                            };
+                            cheque_joiner.push(handle);
+                        } else {
+                            let _ = ch_out;
+                            break;
+                        }
+                    }
+
+                    join_all(cheque_joiner).await;
+                };
+
+                let k6 = async {
+                    #[allow(irrefutable_let_patterns)]
+                    while let ch_in = cheque_send_chan_incoming.try_recv() {
+                        if !ch_in.is_err() {
+                            let (peer, ok) = ch_in.unwrap();
+                            let amt_opt = {
+                                let mut map = wings.ongoing_cheques.lock().await;
+                                map.remove(&peer)
+                            };
+                            if ok {
+                                if let Some(amount) = amt_opt {
+                                    let accounting = wings.accounting_peers.lock().await;
+                                    let accounting_peer_lock = match accounting.get(&peer) {
+                                        Some(aok) => aok,
+                                        _ => continue,
+                                    };
+                                    apply_refreshment(accounting_peer_lock, amount).await;
+                                }
+                            }
+                        } else {
+                            let _ = ch_in;
+                            break;
+                        }
+                    }
+                };
+
+                join!(k1, k2, k3, k4, k5, k6);
 
                 let timenow = Date::now();
                 let seg = timenow - interrupt_last;
@@ -1495,6 +1622,7 @@ impl Sekirei {
             swarm_event_handle_2,
             gossip_inbound_handle,
             pricing_inbound_handle,
+            swap_inbound_handle,
             hive_joiner,
         );
 

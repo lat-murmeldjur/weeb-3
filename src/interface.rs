@@ -32,7 +32,7 @@ use crate::{
     },
     persistence::{
         get_batch_bucket_limit, get_batch_id, get_batch_owner_key, set_batch_bucket_limit,
-        set_batch_id, set_batch_owner_key,
+        set_batch_id, set_batch_owner_key, set_chequebook_address, set_chequebook_signer_key,
     },
 };
 use alloy::{network::EthereumWallet, signers::local::PrivateKeySigner};
@@ -653,8 +653,26 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
                                             }
                                         }
 
+                                        let cheque_signer_key = encrey();
+                                        let cheque_signer: PrivateKeySigner =
+                                            match PrivateKeySigner::from_slice(
+                                                &cheque_signer_key,
+                                            ) {
+                                                Ok(s) => s,
+                                                Err(_) => {
+                                                    let wnd = web_sys::window().unwrap();
+                                                    let _ = wnd.alert_with_message(
+                                                        "Failed to create chequebook signer key",
+                                                    );
+                                                    return;
+                                                }
+                                            };
+                                        let issuer_h160_bytes: [u8; 20] =
+                                            *cheque_signer.address().as_ref();
+                                        let issuer = Address::from(issuer_h160_bytes);
+
                                         let deployment = match deploy_chequebook_with_payer(
-                                            payer, payer,
+                                            issuer, payer,
                                         )
                                         .await
                                         {
@@ -669,12 +687,30 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
                                             }
                                         };
 
+                                        if !set_chequebook_signer_key(&cheque_signer_key).await {
+                                            let wnd = web_sys::window().unwrap();
+                                            let _ = wnd.alert_with_message(
+                                                "Chequebook deployed, but failed to save signer key locally.",
+                                            );
+                                        }
+                                        if !set_chequebook_address(
+                                            &deployment.chequebook.as_bytes().to_vec(),
+                                        )
+                                        .await
+                                        {
+                                            let wnd = web_sys::window().unwrap();
+                                            let _ = wnd.alert_with_message(
+                                                "Chequebook deployed, but failed to save address locally.",
+                                            );
+                                        }
+
                                         *state.borrow_mut() = Some(deployment.chequebook);
 
                                         let wnd = web_sys::window().unwrap();
                                         let _ = wnd.alert_with_message(&format!(
-                                            "Chequebook deployed at 0x{}.\nDeployment tx: 0x{}",
+                                            "Chequebook deployed at 0x{}.\nIssuer: 0x{}\nDeployment tx: 0x{}",
                                             hex::encode(deployment.chequebook.as_bytes()),
+                                            hex::encode(issuer_h160_bytes),
                                             hex::encode(deployment.tx.as_bytes())
                                         ));
                                         return;
