@@ -15,6 +15,7 @@ pub const SPAN_SIZE: usize = 8;
 pub struct PeerFile {
     pub peer_id: PeerId,
     pub overlay: Vec<u8>,
+    pub beneficiary: web3::types::Address,
 }
 
 #[derive(Debug)]
@@ -398,4 +399,48 @@ pub async fn read_file(file: web_sys::File) -> Vec<Vec<u8>> {
 
         return content;
     }
+}
+
+fn generate_sign_data(underlay: &[u8], overlay: &[u8], network_id: u64) -> Vec<u8> {
+    let mut out = b"bee-handshake-".to_vec();
+    out.extend_from_slice(underlay);
+    out.extend_from_slice(overlay);
+    out.extend_from_slice(&network_id.to_be_bytes());
+    out
+}
+
+fn recover_address(signature: &[u8], message: &[u8]) -> Vec<u8> {
+    if signature.len() != 65 {
+        return Vec::new();
+    }
+
+    let parity = match normalize_v(signature[64] as u64) {
+        Some(p) => p,
+        None => return Vec::new(),
+    };
+
+    let sig = Signature::from_bytes_and_parity(&signature[0..64], parity);
+
+    let address = match sig.recover_address_from_msg(message) {
+        Ok(addr) => addr,
+        Err(_) => return Vec::new(),
+    };
+
+    address.as_slice().to_vec()
+}
+
+pub fn parse_address(
+    underlay: &[u8],
+    overlay: &[u8],
+    signature: &[u8],
+    network_id: u64,
+) -> web3::types::Address {
+    let sign_data = generate_sign_data(underlay, overlay, network_id);
+    let recovered = recover_address(signature, &sign_data);
+
+    if recovered.len() != 20 {
+        return web3::types::Address::zero();
+    }
+
+    web3::types::Address::from_slice(&recovered)
 }

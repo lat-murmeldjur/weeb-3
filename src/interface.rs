@@ -27,12 +27,13 @@ use crate::{
     Sekirei, decode_resources, encrey, join, join_all,
     nav::{clear_path, read_path},
     on_chain::{
-        buy_postage_batch_with_payer, chequebook_balance, deposit_to_chequebook,
-        deploy_chequebook_with_payer, get_batch_validity, token_contract,
+        buy_postage_batch_with_payer, chequebook_balance, deploy_chequebook_with_payer,
+        deposit_to_chequebook, get_batch_validity, token_contract,
     },
     persistence::{
-        get_batch_bucket_limit, get_batch_id, get_batch_owner_key, set_batch_bucket_limit,
-        set_batch_id, set_batch_owner_key, set_chequebook_address, set_chequebook_signer_key,
+        get_batch_bucket_limit, get_batch_id, get_batch_owner_key, get_chequebook_address,
+        get_chequebook_signer_key, set_batch_bucket_limit, set_batch_id, set_batch_owner_key,
+        set_chequebook_address, set_chequebook_signer_key,
     },
 };
 use alloy::{network::EthereumWallet, signers::local::PrivateKeySigner};
@@ -76,6 +77,14 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
     let sekirei9 = sekirei.clone();
 
     let chequebook_state = Rc::new(RefCell::new(None::<Address>));
+
+    let stored_chequebook_signer_key = get_chequebook_signer_key().await;
+    let stored_chequebook_address = get_chequebook_address().await;
+
+    if !stored_chequebook_signer_key.is_empty() && !stored_chequebook_signer_key.is_empty() {
+        *chequebook_state.borrow_mut() =
+            Some(Address::from_str(&hex::encode(stored_chequebook_address)).unwrap());
+    }
 
     let path_load_init = async {
         let references = read_path().await;
@@ -616,6 +625,22 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
                                             return;
                                         }
 
+                                        let stored_chequebook_signer_key =
+                                            get_chequebook_signer_key().await;
+                                        let stored_chequebook_address =
+                                            get_chequebook_address().await;
+
+                                        if !stored_chequebook_signer_key.is_empty()
+                                            && !stored_chequebook_signer_key.is_empty()
+                                        {
+                                            let wnd = web_sys::window().unwrap();
+                                            let _ = wnd.alert_with_message(&format!(
+                                                "Already have a chequebook deployed at address {}",
+                                                hex::encode(stored_chequebook_address)
+                                            ));
+                                            return;
+                                        }
+
                                         let mut payer_opt: Option<Address> = None;
                                         if let Ok(accs_val) =
                                             js_sys::Reflect::get(&obj, &"accounts".into())
@@ -655,9 +680,7 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
 
                                         let cheque_signer_key = encrey();
                                         let cheque_signer: PrivateKeySigner =
-                                            match PrivateKeySigner::from_slice(
-                                                &cheque_signer_key,
-                                            ) {
+                                            match PrivateKeySigner::from_slice(&cheque_signer_key) {
                                                 Ok(s) => s,
                                                 Err(_) => {
                                                     let wnd = web_sys::window().unwrap();
@@ -671,21 +694,19 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
                                             *cheque_signer.address().as_ref();
                                         let issuer = Address::from(issuer_h160_bytes);
 
-                                        let deployment = match deploy_chequebook_with_payer(
-                                            issuer, payer,
-                                        )
-                                        .await
-                                        {
-                                            Ok(d) => d,
-                                            Err(e) => {
-                                                let wnd = web_sys::window().unwrap();
-                                                let _ = wnd.alert_with_message(&format!(
-                                                    "Chequebook deployment failed: {:?}",
-                                                    e
-                                                ));
-                                                return;
-                                            }
-                                        };
+                                        let deployment =
+                                            match deploy_chequebook_with_payer(issuer, payer).await
+                                            {
+                                                Ok(d) => d,
+                                                Err(e) => {
+                                                    let wnd = web_sys::window().unwrap();
+                                                    let _ = wnd.alert_with_message(&format!(
+                                                        "Chequebook deployment failed: {:?}",
+                                                        e
+                                                    ));
+                                                    return;
+                                                }
+                                            };
 
                                         if !set_chequebook_signer_key(&cheque_signer_key).await {
                                             let wnd = web_sys::window().unwrap();
@@ -693,6 +714,7 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
                                                 "Chequebook deployed, but failed to save signer key locally.",
                                             );
                                         }
+
                                         if !set_chequebook_address(
                                             &deployment.chequebook.as_bytes().to_vec(),
                                         )
@@ -770,9 +792,8 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
                     Some(addr) => addr,
                     None => {
                         let wnd = web_sys::window().unwrap();
-                        let _ = wnd.alert_with_message(
-                            "Deploy a chequebook first before depositing.",
-                        );
+                        let _ =
+                            wnd.alert_with_message("Deploy a chequebook first before depositing.");
                         return;
                     }
                 };
@@ -865,10 +886,7 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
                                         };
 
                                         let receipt = match deposit_to_chequebook(
-                                            &token,
-                                            chequebook,
-                                            payer,
-                                            amount,
+                                            &token, chequebook, payer, amount,
                                         )
                                         .await
                                         {
@@ -887,8 +905,7 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
                                         if let Ok(balance) =
                                             chequebook_balance(&w3, chequebook).await
                                         {
-                                            balance_note =
-                                                format!("\nNew balance: {}", balance);
+                                            balance_note = format!("\nNew balance: {}", balance);
                                         }
 
                                         let wnd = web_sys::window().unwrap();
@@ -1082,21 +1099,22 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
         }
     };
 
-    let fetch_test = async move {
-        async_std::task::sleep(Duration::from_millis(6400)).await;
+    /*
+        let fetch_test = async move {
+            async_std::task::sleep(Duration::from_millis(6400)).await;
 
-        let host3 = web_sys::window()
-            .unwrap()
-            .document()
-            .unwrap()
-            .location()
-            .unwrap()
-            .origin()
-            .unwrap();
+            let host3 = web_sys::window()
+                .unwrap()
+                .document()
+                .unwrap()
+                .location()
+                .unwrap()
+                .origin()
+                .unwrap();
 
-        let url = format!("{}/weeb-3/bzz", host3);
+            let url = format!("{}/weeb-3/bzz", host3);
 
-        let ascii_art = r#"@@@@%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%@@@
+            let ascii_art = r#"@@@@%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%@@@
 %@%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%@
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%@@@%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
@@ -1185,38 +1203,38 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
 @@@@@@@@@@@@@@@@@@@%#####%%@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@%%@@@@@@@%%%%%%%%%#%@@@@@%@@
 @@@@@@@@@@@@@@@@@@@%%%%####@%@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@%%@@@@@@@%%%%%%%%%*#%@@@@@@@"#;
 
-        let u8arr = js_sys::Uint8Array::from(ascii_art.as_bytes());
+            let u8arr = js_sys::Uint8Array::from(ascii_art.as_bytes());
 
-        let blob_parts = js_sys::Array::new();
-        blob_parts.push(&u8arr);
-        let props = web_sys::BlobPropertyBag::new();
-        props.set_type("text/plain");
-        let blob =
-            web_sys::Blob::new_with_u8_array_sequence_and_options(&blob_parts, &props).unwrap();
+            let blob_parts = js_sys::Array::new();
+            blob_parts.push(&u8arr);
+            let props = web_sys::BlobPropertyBag::new();
+            props.set_type("text/plain");
+            let blob =
+                web_sys::Blob::new_with_u8_array_sequence_and_options(&blob_parts, &props).unwrap();
 
-        let form = web_sys::FormData::new().unwrap();
-        form.append_with_blob_and_filename("file", &blob, "sel.txt")
-            .unwrap();
+            let form = web_sys::FormData::new().unwrap();
+            form.append_with_blob_and_filename("file", &blob, "sel.txt")
+                .unwrap();
 
-        let opts = web_sys::RequestInit::new();
-        opts.set_method("POST");
+            let opts = web_sys::RequestInit::new();
+            opts.set_method("POST");
 
-        let headers = web_sys::Headers::new().unwrap();
-        headers.set("swarm-encrypt", "true").unwrap();
-        opts.set_headers(&headers);
-        opts.set_body(&wasm_bindgen::JsValue::from(form)); // <-- important: JsValue
+            let headers = web_sys::Headers::new().unwrap();
+            headers.set("swarm-encrypt", "true").unwrap();
+            opts.set_headers(&headers);
+            opts.set_body(&wasm_bindgen::JsValue::from(form)); // <-- important: JsValue
 
-        let request = web_sys::Request::new_with_str_and_init(&url, &opts).unwrap();
-        let window = web_sys::window().unwrap();
-        let resp_value = JsFuture::from(window.fetch_with_request(&request)).await;
-        web_sys::console::log_1(&JsValue::from(format!("Upload response: {:?}", resp_value)));
+            let request = web_sys::Request::new_with_str_and_init(&url, &opts).unwrap();
+            let window = web_sys::window().unwrap();
+            let resp_value = JsFuture::from(window.fetch_with_request(&request)).await;
+            web_sys::console::log_1(&JsValue::from(format!("Upload response: {:?}", resp_value)));
 
-        let window = web_sys::window().unwrap();
-        let resp_value = JsFuture::from(window.fetch_with_request(&request)).await;
+            let window = web_sys::window().unwrap();
+            let resp_value = JsFuture::from(window.fetch_with_request(&request)).await;
 
-        web_sys::console::log_1(&JsValue::from(format!("Upload response: {:?}", resp_value)));
-    };
-
+            web_sys::console::log_1(&JsValue::from(format!("Upload response: {:?}", resp_value)));
+        };
+    */
     let initial_connect_handle = async {
         async_std::task::sleep(Duration::from_millis(600)).await;
         let (bna, nid) = parsebootconnect();
@@ -1227,7 +1245,7 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
         sekirei_async,
         interface_async,
         path_load_init,
-        fetch_test,
+        // fetch_test,
         initial_connect_handle
     );
 

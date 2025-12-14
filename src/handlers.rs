@@ -32,8 +32,8 @@ use crate::weeb_3::etiquette_6;
 use crate::weeb_3::etiquette_7;
 use crate::weeb_3::etiquette_8;
 
-use crate::persistence::{get_chequebook_address, get_chequebook_signer_key};
 use crate::on_chain::ChequebookClient;
+use crate::persistence::{get_chequebook_address, get_chequebook_signer_key};
 use ethers::signers::LocalWallet;
 use ethers::types::{Address as EthAddress, U256 as EthU256};
 
@@ -96,7 +96,14 @@ pub async fn ceive(
 
     let underlay = libp2p::core::Multiaddr::try_from(rec_0.syn.unwrap().observed_underlay).unwrap();
 
-    let peer_overlay = rec_0.ack.unwrap().address.unwrap().overlay;
+    let peer_overlay = rec_0.ack.clone().unwrap().address.unwrap().overlay;
+
+    let beneficiary = parse_address(
+        &rec_0.ack.clone().unwrap().address.unwrap().underlay,
+        &rec_0.ack.clone().unwrap().address.unwrap().overlay,
+        &rec_0.ack.clone().unwrap().address.unwrap().signature,
+        network_id,
+    );
 
     // web_sys::console::log_1(&JsValue::from(format!("Got underlay {}!", underlay)));
 
@@ -151,11 +158,15 @@ pub async fn ceive(
     let _ = stream.flush().await;
 
     let _ = stream.close().await;
-    web_sys::console::log_1(&JsValue::from(format!("Connected Peer {:#?}!", peer)));
+    web_sys::console::log_1(&JsValue::from(format!(
+        "Connected Peer {:#?} with address {}!",
+        peer, beneficiary
+    )));
 
     chan.send(PeerFile {
         peer_id: peer,
         overlay: peer_overlay.clone(),
+        beneficiary: beneficiary,
     })
     .unwrap();
 
@@ -463,15 +474,14 @@ pub async fn issue(
         .checked_mul(exchange_rate)
         .and_then(|v| v.checked_add(deduction));
 
-    let bufw_1 = match send_amount.and_then(|amt| {
-        client.prepare_emit_cheque_bytes(beneficiary, amt)
-    }) {
-        Some(b) => b,
-        None => {
-            let _ = chan.send((peer, false)).unwrap_or(());
-            return;
-        }
-    };
+    let bufw_1 =
+        match send_amount.and_then(|amt| client.prepare_emit_cheque_bytes(beneficiary, amt)) {
+            Some(b) => b,
+            None => {
+                let _ = chan.send((peer, false)).unwrap_or(());
+                return;
+            }
+        };
 
     let mut msg = etiquette_8::EmitCheque::default();
     msg.cheque = bufw_1;
@@ -488,35 +498,6 @@ pub async fn issue(
     let _ = stream.close().await;
 
     let _ = chan.send((peer, true)).unwrap_or(());
-}
-
-pub async fn swap_inbound_handler(
-    peer: PeerId,
-    mut stream: Stream,
-    beneficiaries: Arc<Mutex<HashMap<PeerId, Vec<u8>>>>,
-) {
-    let mut buf_nondiscard_0 = Vec::new();
-    let mut buf_discard_0: [u8; 255] = [0; 255];
-    loop {
-        let n = match stream.read(&mut buf_discard_0).await {
-            Ok(a) => a,
-            Err(_) => {
-                break;
-            }
-        };
-        buf_nondiscard_0.extend_from_slice(&buf_discard_0[..n]);
-        if n < 255 {
-            break;
-        }
-    }
-
-    if let Ok(handshake) =
-        etiquette_8::Handshake::decode_length_delimited(&mut Cursor::new(buf_nondiscard_0))
-    {
-        let mut map = beneficiaries.lock().await;
-        map.insert(peer, handshake.beneficiary);
-    }
-    let _ = stream.close().await;
 }
 
 pub async fn trieve(

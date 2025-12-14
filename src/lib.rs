@@ -12,8 +12,6 @@ use std::time::Duration;
 use tar::Archive;
 
 use alloy::primitives::keccak256;
-use ethers::signers::{LocalWallet, Signer};
-use prost::Message;
 
 use libp2p::{
     PeerId,
@@ -24,8 +22,6 @@ use libp2p::{
     core::multiaddr::Protocol,
     // dcutr,
     futures::{
-        //        AsyncReadExt,
-        AsyncWriteExt,
         StreamExt,
         future::join_all, //
         join,
@@ -41,7 +37,6 @@ use libp2p_stream as stream;
 
 use js_sys::Date;
 use wasm_bindgen::{JsValue, prelude::*};
-use wasm_bindgen_futures::spawn_local;
 use web_sys::File;
 
 mod accounting;
@@ -70,7 +65,10 @@ mod nav;
 
 mod persistence;
 use persistence::{
-    get_batch_bucket_limit, get_batch_id, get_batch_owner_key, get_chequebook_signer_key,
+    get_batch_bucket_limit,
+    get_batch_id,
+    get_batch_owner_key,
+    // get_chequebook_signer_key,
     reset_stamp,
 };
 
@@ -120,7 +118,7 @@ use crate::weeb_3::etiquette_2;
 // use crate::weeb_3::etiquette_4;
 // use crate::weeb_3::etiquette_5;
 // use crate::weeb_3::etiquette_6;
-use crate::weeb_3::etiquette_8;
+// use crate::weeb_3::etiquette_8;
 
 const HANDSHAKE_PROTOCOL: StreamProtocol = StreamProtocol::new("/swarm/handshake/14.0.0/handshake");
 const PRICING_PROTOCOL: StreamProtocol = StreamProtocol::new("/swarm/pricing/1.0.0/pricing");
@@ -619,7 +617,6 @@ impl Sekirei {
         let ctrl8;
         let mut incoming_pricing_streams;
         let mut incoming_gossip_streams;
-        let mut incoming_swap_streams;
 
         let swarm0 = self.swarm.clone();
 
@@ -627,16 +624,15 @@ impl Sekirei {
             let mut swarm = swarm0.lock().await;
             ctrl0 = swarm.behaviour_mut().stream.new_control();
             ctrl1 = swarm.behaviour_mut().stream.new_control();
-            ctrl5 = swarm.behaviour_mut().stream.new_control();
             ctrl3 = swarm.behaviour_mut().stream.new_control();
             ctrl4 = swarm.behaviour_mut().stream.new_control();
+            ctrl5 = swarm.behaviour_mut().stream.new_control();
             ctrl6 = swarm.behaviour_mut().stream.new_control();
             ctrl8 = swarm.behaviour_mut().stream.new_control();
         }
 
         incoming_pricing_streams = ctrl0.accept(PRICING_PROTOCOL).unwrap();
         incoming_gossip_streams = ctrl1.accept(GOSSIP_PROTOCOL).unwrap();
-        incoming_swap_streams = ctrl5.accept(SWAP_PROTOCOL).unwrap();
 
         let pricing_inbound_handle = async move {
             while let Some((peer, stream)) = incoming_pricing_streams.next().await {
@@ -647,13 +643,6 @@ impl Sekirei {
         let gossip_inbound_handle = async move {
             while let Some((peer, stream)) = incoming_gossip_streams.next().await {
                 gossip_handler(peer, stream, &peers_instructions_chan_outgoing.clone()).await;
-            }
-        };
-
-        let wings_swap = wings.clone();
-        let swap_inbound_handle = async move {
-            while let Some((peer, stream)) = incoming_swap_streams.next().await {
-                swap_inbound_handler(peer, stream, wings_swap.swap_beneficiaries.clone()).await;
             }
         };
 
@@ -1032,32 +1021,6 @@ impl Sekirei {
                                             *ongoing = *ongoing - 1
                                         }
                                     }
-                                    // send swap handshake to new peer with our beneficiary
-                                    let ctrl_swap = ctrl5.clone();
-                                    let bene_key = get_chequebook_signer_key().await;
-                                    spawn_local(async move {
-                                        if bene_key.len() == 32 {
-                                            if let Ok(wallet) = LocalWallet::from_bytes(&bene_key) {
-                                                let bene_addr = wallet.address();
-                                                let mut msg = etiquette_8::Handshake::default();
-                                                msg.beneficiary = bene_addr.as_bytes().to_vec();
-                                                let mut payload = Vec::new();
-                                                let len = msg.encoded_len();
-                                                payload.reserve(
-                                                    len + prost::length_delimiter_len(len),
-                                                );
-                                                msg.encode_length_delimited(&mut payload).unwrap();
-                                                if let Ok(mut stream) = ctrl_swap
-                                                    .clone()
-                                                    .open_stream(peer, SWAP_PROTOCOL)
-                                                    .await
-                                                {
-                                                    let _ = stream.write_all(&payload).await;
-                                                    let _ = stream.close().await;
-                                                }
-                                            }
-                                        }
-                                    });
                                 }
                             }
                         } else {
@@ -1622,7 +1585,6 @@ impl Sekirei {
             swarm_event_handle_2,
             gossip_inbound_handle,
             pricing_inbound_handle,
-            swap_inbound_handle,
             hive_joiner,
         );
 

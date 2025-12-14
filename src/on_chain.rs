@@ -159,16 +159,6 @@ impl ChequebookClient {
         let msg = EmitCheque { cheque: json_bytes };
         Some(msg.encode_to_vec())
     }
-
-    pub async fn send_cheque<F, Fut>(&mut self, beneficiary: EthAddress, amount: EthU256, send: F)
-    where
-        F: Fn(Vec<u8>) -> Fut,
-        Fut: core::future::Future<Output = ()>,
-    {
-        if let Some(bytes) = self.prepare_emit_cheque_bytes(beneficiary, amount) {
-            send(bytes).await;
-        }
-    }
 }
 
 const POSTAGE_CONTRACT_ADDR: &str = "cdfdC3752caaA826fE62531E0000C40546eC56A6";
