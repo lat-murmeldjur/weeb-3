@@ -18,6 +18,7 @@ use libp2p::{
 };
 
 use wasm_bindgen::JsValue;
+use web3::types::U256;
 
 use crate::conventions::*;
 use async_std::sync::{Arc, Mutex};
@@ -140,7 +141,7 @@ pub async fn ceive(
     step_1.address = Some(step_1_ad);
     step_1.nonce = nonce.to_vec();
     step_1.network_id = network_id;
-    step_1.full_node = false;
+    step_1.full_node = true;
     step_1.welcome_message = "... Ara Ara ...".to_string();
 
     let mut bufw_1 = Vec::new();
@@ -431,7 +432,69 @@ pub async fn issue(
     mut stream: Stream,
     chan: &mpsc::Sender<(PeerId, bool)>,
     beneficiaries: Arc<Mutex<HashMap<PeerId, Vec<u8>>>>,
+    price: U256,
+    deduction: U256,
 ) {
+    web_sys::console::log_1(&JsValue::from(format!(
+        "Opened issue handle for peer {}!",
+        peer
+    )));
+
+    let mut non_empty = etiquette_0::Headers::default();
+
+    let mut price_header = etiquette_0::Header::default();
+    price_header.key = "exchange".to_string();
+
+    let mut buf = [0u8; 32];
+    price.to_big_endian(&mut buf);
+    price_header.value = BigUint::from_bytes_be(&buf).to_bytes_be();
+
+    let mut deduction_header = etiquette_0::Header::default();
+    deduction_header.key = "deduction".to_string();
+
+    let mut buf = [0u8; 32];
+    deduction.to_big_endian(&mut buf);
+    deduction_header.value = BigUint::from_bytes_be(&buf).to_bytes_be();
+
+    non_empty.headers = vec![price_header, deduction_header];
+
+    let mut buf_non_empty = Vec::new();
+
+    let non_empty_len = non_empty.encoded_len();
+    buf_non_empty.reserve(non_empty_len + prost::length_delimiter_len(non_empty_len));
+    non_empty
+        .encode_length_delimited(&mut buf_non_empty)
+        .unwrap();
+
+    match stream.write_all(&buf_non_empty).await {
+        Ok(_) => {}
+        Err(_) => {
+            chan.send((peer, false)).unwrap();
+            web_sys::console::log_1(&JsValue::from(format!("Issue fail -2")));
+
+            return;
+        }
+    };
+    let _ = stream.flush().await;
+
+    let mut buf_nondiscard_0 = Vec::new();
+    let mut buf_discard_0: [u8; 255] = [0; 255];
+    loop {
+        let n = match stream.read(&mut buf_discard_0).await {
+            Ok(a) => a,
+            Err(_) => {
+                chan.send((peer, false)).unwrap();
+                web_sys::console::log_1(&JsValue::from(format!("Issue fail -1")));
+
+                return;
+            }
+        };
+        buf_nondiscard_0.extend_from_slice(&buf_discard_0[..n]);
+        if n < 255 {
+            break;
+        }
+    }
+
     let beneficiary_bytes_opt = {
         let map = beneficiaries.lock().await;
         map.get(&peer).cloned()
@@ -440,6 +503,7 @@ pub async fn issue(
         Some(b) if b.len() == 20 => b,
         _ => {
             let _ = chan.send((peer, false)).unwrap_or(());
+            web_sys::console::log_1(&JsValue::from(format!("Issue fail 0")));
             return;
         }
     };
@@ -448,12 +512,14 @@ pub async fn issue(
     let signer_key = get_chequebook_signer_key().await;
     if signer_key.len() != 32 {
         let _ = chan.send((peer, false)).unwrap_or(());
+        web_sys::console::log_1(&JsValue::from(format!("Issue fail 1")));
         return;
     }
     let wallet = match LocalWallet::from_bytes(&signer_key) {
         Ok(w) => w,
         Err(_) => {
             let _ = chan.send((peer, false)).unwrap_or(());
+            web_sys::console::log_1(&JsValue::from(format!("Issue fail 2")));
             return;
         }
     };
@@ -461,6 +527,7 @@ pub async fn issue(
     let cb_addr_bytes = get_chequebook_address().await;
     if cb_addr_bytes.len() != 20 {
         let _ = chan.send((peer, false)).unwrap_or(());
+        web_sys::console::log_1(&JsValue::from(format!("Issue fail 3")));
         return;
     }
     let chequebook_addr = EthAddress::from_slice(&cb_addr_bytes);
@@ -479,6 +546,7 @@ pub async fn issue(
             Some(b) => b,
             None => {
                 let _ = chan.send((peer, false)).unwrap_or(());
+                web_sys::console::log_1(&JsValue::from(format!("Issue fail 4")));
                 return;
             }
         };
@@ -491,12 +559,14 @@ pub async fn issue(
         Ok(_) => {}
         Err(_) => {
             let _ = chan.send((peer, false)).unwrap_or(());
+            web_sys::console::log_1(&JsValue::from(format!("Issue fail 5")));
             return;
         }
     };
     let _ = stream.flush().await;
     let _ = stream.close().await;
 
+    web_sys::console::log_1(&JsValue::from(format!("Issue complete")));
     let _ = chan.send((peer, true)).unwrap_or(());
 }
 
@@ -656,6 +726,8 @@ pub async fn issue_handler(
     control: stream::Control,
     chan: &mpsc::Sender<(PeerId, bool)>,
     beneficiaries: Arc<Mutex<HashMap<PeerId, Vec<u8>>>>,
+    price: U256,
+    deduction: U256,
 ) {
     let stream = match control.clone().open_stream(peer, SWAP_PROTOCOL).await {
         Ok(stream) => stream,
@@ -671,7 +743,7 @@ pub async fn issue_handler(
         }
     };
 
-    issue(peer, amount, stream, chan, beneficiaries).await;
+    issue(peer, amount, stream, chan, beneficiaries, price, deduction).await;
 }
 
 pub async fn retrieve_handler(

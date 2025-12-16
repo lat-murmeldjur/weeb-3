@@ -165,6 +165,7 @@ const POSTAGE_CONTRACT_ADDR: &str = "cdfdC3752caaA826fE62531E0000C40546eC56A6";
 const SBZZ_TOKEN_CONTRACT_ADDR: &str = "543dDb01Ba47acB11de34891cD86B675F04840db";
 const BATCH_CREATED_TOPIC: &str =
     "9b088e2c89b322a3c1d81515e1c88db3d386d022926f0e2d0b9b5813b7413d58";
+const PRICE_ORACLE_ADDR: &str = "1814e9b3951Df0CB8e12b2bB99c5594514588936";
 const BUCKET_DEPTH: u8 = 16;
 const CHEQUEBOOK_FACTORY_ADDR: &str = "0fF044F6bB4F684a5A149B46D7eC03ea659F98A1";
 
@@ -173,6 +174,7 @@ pub type PostageContract = Contract<Eip1193>;
 pub type TokenContract = Contract<Eip1193>;
 pub type ChequebookFactory = Contract<Eip1193>;
 pub type ChequebookContract = Contract<Eip1193>;
+pub type PriceOracleContract = Contract<Eip1193>;
 
 fn ensure_addr(s: &str) -> Result<Address, JsError> {
     Address::from_str(s).map_err(|_| JsError::new("Invalid address constant"))
@@ -630,4 +632,31 @@ pub async fn deploy_chequebook_with_payer(
 
 fn add_buffer(g: U256) -> U256 {
     g + (g / U256::from(5u8))
+}
+
+async fn price_oracle_contract(w3: &Web3Inst) -> Result<PriceOracleContract, JsError> {
+    let addr = ensure_addr(PRICE_ORACLE_ADDR)?;
+
+    Contract::from_json(w3.eth(), addr, include_bytes!("./priceoracle.json"))
+        .map_err(|e| JsError::new(&format!("Failed to load PriceOracle contract: {e}")))
+}
+
+pub async fn get_price_from_oracle() -> (U256, U256) {
+    let w3 = match web3() {
+        Ok(w3) => w3,
+        Err(_) => return (U256::from(0), U256::from(0)),
+    };
+
+    let oracle = match price_oracle_contract(&w3).await {
+        Ok(oracle) => oracle,
+        Err(_) => return (U256::from(0), U256::from(0)),
+    };
+
+    match oracle
+        .query::<(U256, U256), _, _, _>("getPrice", (), None, Options::default(), None)
+        .await
+    {
+        Ok((price, cheque_value_deduction)) => (price, cheque_value_deduction),
+        Err(_) => (U256::from(0), U256::from(0)),
+    }
 }

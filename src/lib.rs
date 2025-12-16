@@ -12,6 +12,7 @@ use std::time::Duration;
 use tar::Archive;
 
 use alloy::primitives::keccak256;
+use web3::types::U256;
 
 use libp2p::{
     PeerId,
@@ -60,6 +61,7 @@ mod manifest;
 mod manifest_upload;
 
 mod on_chain;
+use on_chain::get_price_from_oracle;
 
 mod nav;
 
@@ -612,7 +614,7 @@ impl Sekirei {
         let mut ctrl1;
         let ctrl3;
         let ctrl4;
-        let mut ctrl5;
+        let ctrl5;
         let ctrl6;
         let ctrl8;
         let mut incoming_pricing_streams;
@@ -1063,7 +1065,7 @@ impl Sekirei {
                                     }
                                 }
                             }
-                            if datenow > daten + 1000.0 {
+                            if datenow > daten + 1000.0 && false {
                                 {
                                     let mut map = wings.ongoing_refreshments.lock().await;
                                     map.insert(peer);
@@ -1115,23 +1117,60 @@ impl Sekirei {
                     }
                 };
 
+                let swap_price = Arc::new(Mutex::new(U256::from(0)));
+                let swap_deduction = Arc::new(Mutex::new(U256::from(0)));
+
                 let k5 = async {
                     let mut cheque_joiner = Vec::new();
 
                     #[allow(irrefutable_let_patterns)]
                     while let ch_out = cheque_instructions_chan_incoming.try_recv() {
+                        let swap_price_0 = swap_price.clone();
+                        let swap_deduction_0 = swap_deduction.clone();
                         if !ch_out.is_err() {
+                            let set_price = {
+                                let price = swap_price_0.lock().await;
+                                price.is_zero()
+                            };
+
+                            if set_price {
+                                let (oracle_price, cheque_deduction) =
+                                    get_price_from_oracle().await;
+
+                                let mut price = swap_price_0.lock().await;
+                                if price.is_zero() {
+                                    *price = oracle_price;
+                                }
+
+                                let mut deduction = swap_deduction_0.lock().await;
+                                if deduction.is_zero() {
+                                    *deduction = cheque_deduction;
+                                }
+                            }
+
                             let (peer, amount) = ch_out.unwrap();
                             let ctrl_swap = ctrl5.clone();
                             let cheque_chan = cheque_send_chan_outgoing.clone();
                             let peers_for_cheque = wings.swap_beneficiaries.clone();
                             let handle = async move {
+                                let price: U256 = {
+                                    let current_price = swap_price_0.lock().await;
+                                    *current_price
+                                };
+
+                                let deduction: U256 = {
+                                    let current_deduction = swap_deduction_0.lock().await;
+                                    *current_deduction
+                                };
+
                                 issue_handler(
                                     peer,
                                     amount,
                                     ctrl_swap,
                                     &cheque_chan,
                                     peers_for_cheque,
+                                    price,
+                                    deduction,
                                 )
                                 .await;
                             };
