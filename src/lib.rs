@@ -192,7 +192,7 @@ pub struct Wings {
     accounting_peers: Arc<Mutex<HashMap<PeerId, Mutex<PeerAccounting>>>>,
     ongoing_refreshments: Arc<Mutex<HashSet<PeerId>>>,
     ongoing_cheques: Arc<Mutex<HashMap<PeerId, u64>>>,
-    swap_beneficiaries: Arc<Mutex<HashMap<PeerId, Vec<u8>>>>,
+    swap_beneficiaries: Arc<Mutex<HashMap<PeerId, (web3::types::Address, bool)>>>,
     connection_attempts: Arc<Mutex<HashSet<PeerId>>>,
 }
 
@@ -503,7 +503,7 @@ impl Sekirei {
         let connection_attempts: Arc<Mutex<HashSet<PeerId>>> = Arc::new(Mutex::new(HashSet::new()));
         let ongoing_cheques: Arc<Mutex<HashMap<PeerId, u64>>> =
             Arc::new(Mutex::new(HashMap::new()));
-        let swap_beneficiaries: Arc<Mutex<HashMap<PeerId, Vec<u8>>>> =
+        let swap_beneficiaries: Arc<Mutex<HashMap<PeerId, (web3::types::Address, bool)>>> =
             Arc::new(Mutex::new(HashMap::new()));
 
         let (m_out, m_in) = mpsc::channel::<(Vec<u8>, mpsc::Sender<Vec<u8>>)>();
@@ -962,8 +962,17 @@ impl Sekirei {
 
                             {
                                 let mut connected_peers_map = wings.connected_peers.lock().await;
-                                connected_peers_map.insert(peer_file.peer_id, peer_file);
+                                connected_peers_map
+                                    .insert(peer_file.peer_id.clone(), peer_file.clone());
+                            }
+                            {
+                                let mut swap_beneficiaries_map =
+                                    wings.swap_beneficiaries.lock().await;
 
+                                swap_beneficiaries_map
+                                    .insert(peer_file.peer_id, (peer_file.beneficiary, false));
+                            }
+                            {
                                 let mut ongoing = self.ongoing_connections.lock().await;
                                 *ongoing = *ongoing + 1;
                             }

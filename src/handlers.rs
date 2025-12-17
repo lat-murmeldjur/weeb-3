@@ -431,7 +431,7 @@ pub async fn issue(
     amount: u64,
     mut stream: Stream,
     chan: &mpsc::Sender<(PeerId, bool)>,
-    beneficiaries: Arc<Mutex<HashMap<PeerId, Vec<u8>>>>,
+    beneficiaries: Arc<Mutex<HashMap<PeerId, (web3::types::Address, bool)>>>,
     price: U256,
     deduction: U256,
 ) {
@@ -500,7 +500,7 @@ pub async fn issue(
         map.get(&peer).cloned()
     };
     let beneficiary_bytes = match beneficiary_bytes_opt {
-        Some(b) if b.len() == 20 => b,
+        Some(b) => b.0.as_bytes().to_vec(),
         _ => {
             let _ = chan.send((peer, false)).unwrap_or(());
             web_sys::console::log_1(&JsValue::from(format!("Issue fail 0")));
@@ -515,6 +515,7 @@ pub async fn issue(
         web_sys::console::log_1(&JsValue::from(format!("Issue fail 1")));
         return;
     }
+
     let wallet = match LocalWallet::from_bytes(&signer_key) {
         Ok(w) => w,
         Err(_) => {
@@ -530,39 +531,41 @@ pub async fn issue(
         web_sys::console::log_1(&JsValue::from(format!("Issue fail 3")));
         return;
     }
+
     let chequebook_addr = EthAddress::from_slice(&cb_addr_bytes);
 
     let mut client = ChequebookClient::new(chequebook_addr, wallet, 11155111);
 
-    // In absence of negotiated headers, default exchange rate 1 and deduction 0
-    let exchange_rate = EthU256::from(1u64);
-    let deduction = EthU256::zero();
+    let exchange_rate = EthU256::from(price);
+    let deduction = EthU256::from(deduction);
     let send_amount = EthU256::from(amount)
         .checked_mul(exchange_rate)
         .and_then(|v| v.checked_add(deduction));
 
-    let bufw_1 =
+    let cheque_json =
         match send_amount.and_then(|amt| client.prepare_emit_cheque_bytes(beneficiary, amt)) {
             Some(b) => b,
             None => {
-                let _ = chan.send((peer, false)).unwrap_or(());
-                web_sys::console::log_1(&JsValue::from(format!("Issue fail 4")));
+                let _ = chan.send((peer, false));
+                web_sys::console::log_1(&"Issue fail 4".into());
                 return;
             }
         };
 
     let mut msg = etiquette_8::EmitCheque::default();
-    msg.cheque = bufw_1;
-    let payload = msg.encode_length_delimited_to_vec();
+    msg.cheque = cheque_json;
 
-    match stream.write_all(&payload).await {
-        Ok(_) => {}
-        Err(_) => {
-            let _ = chan.send((peer, false)).unwrap_or(());
-            web_sys::console::log_1(&JsValue::from(format!("Issue fail 5")));
-            return;
-        }
-    };
+    let mut bufw = Vec::new();
+    let len = msg.encoded_len();
+    bufw.reserve(len + prost::length_delimiter_len(len));
+    msg.encode_length_delimited(&mut bufw).unwrap();
+
+    if let Err(_) = stream.write_all(&bufw).await {
+        let _ = chan.send((peer, false));
+        web_sys::console::log_1(&"Issue fail 5".into());
+        return;
+    }
+
     let _ = stream.flush().await;
     let _ = stream.close().await;
 
@@ -725,7 +728,7 @@ pub async fn issue_handler(
     amount: u64,
     control: stream::Control,
     chan: &mpsc::Sender<(PeerId, bool)>,
-    beneficiaries: Arc<Mutex<HashMap<PeerId, Vec<u8>>>>,
+    beneficiaries: Arc<Mutex<HashMap<PeerId, (web3::types::Address, bool)>>>,
     price: U256,
     deduction: U256,
 ) {

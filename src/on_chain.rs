@@ -8,6 +8,8 @@ use web3::{
     types::{Address, H160, H256, TransactionReceipt, U256},
 };
 
+use num::BigUint;
+
 use base64;
 use ethers::abi::{Token, encode};
 use ethers::signers::LocalWallet;
@@ -37,7 +39,7 @@ struct SignedChequeJson {
     #[serde(rename = "Beneficiary")]
     beneficiary: String,
     #[serde(rename = "CumulativePayout")]
-    cumulative_payout: String,
+    cumulative_payout: u128,
     #[serde(rename = "Signature")]
     signature: String,
 }
@@ -46,7 +48,9 @@ impl SignedChequeJson {
     fn from_cheque(cheque: &Cheque, signature: &[u8]) -> Self {
         let chequebook = format!("{:#x}", cheque.chequebook);
         let beneficiary = format!("{:#x}", cheque.beneficiary);
-        let cumulative_payout = cheque.cumulative_payout.to_string();
+
+        let cumulative_payout = cheque.cumulative_payout.as_u128();
+
         let signature = base64::encode(signature);
         Self {
             chequebook,
@@ -147,17 +151,18 @@ impl ChequebookClient {
     ) -> Option<Vec<u8>> {
         let last = self.cumulative_payout_for(&beneficiary);
         let cumulative = last.checked_add(amount)?;
+
         let cheque = Cheque {
             chequebook: self.chequebook,
             beneficiary,
             cumulative_payout: cumulative,
         };
+
         let signature = self.signer.sign(&cheque)?;
         self.last_payouts.insert(beneficiary, cumulative);
+
         let json = SignedChequeJson::from_cheque(&cheque, &signature);
-        let json_bytes = serde_json::to_vec(&json).ok()?;
-        let msg = EmitCheque { cheque: json_bytes };
-        Some(msg.encode_to_vec())
+        serde_json::to_vec(&json).ok()
     }
 }
 
