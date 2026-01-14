@@ -2,9 +2,9 @@
 
 use async_std::sync::{Arc, Mutex};
 
+use rand::rngs::OsRng;
 use std::collections::{HashMap, HashSet};
 use std::io::Read;
-use std::net::Ipv4Addr;
 use std::num::NonZero;
 use std::sync::mpsc;
 use std::time::Duration;
@@ -15,24 +15,19 @@ use alloy::primitives::keccak256;
 use web3::types::U256;
 
 use libp2p::{
-    PeerId,
-    StreamProtocol,
-    Swarm,
-    // autonat,
-    core::Multiaddr,
-    core::multiaddr::Protocol,
-    // dcutr,
+    PeerId, StreamProtocol, Swarm, autonat,
+    core::{self, Multiaddr, Transport},
+    dcutr,
     futures::{
         StreamExt,
         future::join_all, //
         join,
     },
-    //  identify,
-    identity,
+    identify, identity,
     identity::{ecdsa, ecdsa::SecretKey},
-    //  ping,
+    noise, ping,
     swarm::{NetworkBehaviour, SwarmEvent},
-    webrtc_websys,
+    websocket_websys, yamux,
 };
 use libp2p_stream as stream;
 
@@ -44,7 +39,9 @@ mod accounting;
 use accounting::*;
 
 mod addresses;
-use addresses::deserialize_underlays;
+use addresses::{
+    UnderlayFormat, beewss_to_dns_transformed, deserialize_underlays, detect_underlay_format,
+};
 
 mod conventions;
 use conventions::*;
@@ -184,6 +181,8 @@ pub struct Sekirei {
     connections: Mutex<u64>,
 }
 
+type PeerAddrMap = Arc<Mutex<HashMap<PeerId, Multiaddr>>>;
+
 #[wasm_bindgen]
 pub struct Wings {
     connected_peers: Arc<Mutex<HashMap<PeerId, PeerFile>>>,
@@ -194,6 +193,7 @@ pub struct Wings {
     ongoing_cheques: Arc<Mutex<HashMap<PeerId, u64>>>,
     swap_beneficiaries: Arc<Mutex<HashMap<PeerId, (web3::types::Address, bool)>>>,
     connection_attempts: Arc<Mutex<HashSet<PeerId>>>,
+    self_ephemerals: PeerAddrMap,
 }
 
 #[wasm_bindgen]
@@ -476,10 +476,14 @@ impl Sekirei {
 
         let swarm = libp2p::SwarmBuilder::with_existing_identity(keypair.clone().into())
             .with_wasm_bindgen()
-            .with_other_transport(|key| {
-                webrtc_websys::Transport::new(webrtc_websys::Config::new(&key))
+            .with_other_transport(|_key| {
+                websocket_websys::Transport::default()
+                    .upgrade(core::upgrade::Version::V1)
+                    .authenticate(noise::Config::new(&keypair.clone().into()).unwrap())
+                    .multiplex(yamux::Config::default())
+                    .boxed()
             })
-            .expect("Failed to create WebRTC transport")
+            .expect("Failed to create WebSocket transport")
             .with_behaviour(|key| Behaviour::new(key.public()))
             .unwrap()
             .with_swarm_config(|_| {
@@ -505,6 +509,7 @@ impl Sekirei {
             Arc::new(Mutex::new(HashMap::new()));
         let swap_beneficiaries: Arc<Mutex<HashMap<PeerId, (web3::types::Address, bool)>>> =
             Arc::new(Mutex::new(HashMap::new()));
+        let self_ephemerals: PeerAddrMap = Arc::new(Mutex::new(HashMap::new()));
 
         let (m_out, m_in) = mpsc::channel::<(Vec<u8>, mpsc::Sender<Vec<u8>>)>();
 
@@ -532,6 +537,7 @@ impl Sekirei {
                 ongoing_cheques: ongoing_cheques,
                 swap_beneficiaries: swap_beneficiaries,
                 connection_attempts: connection_attempts,
+                self_ephemerals: self_ephemerals,
             })),
             log_port: (log_port_out, log_port_in),
             message_port: (m_out, m_in),
@@ -576,6 +582,26 @@ impl Sekirei {
 
     pub async fn run(&self, _st: String) -> () {
         // init_panic_hook();
+        let baddr = "/ip4/49.12.172.37/tcp/32532/tls/sni/49-12-172-37.k2k4r8pr3m3aug5nudg2y039qfj2gxw6wnlx0e0ghzxufcn38soyp9z4.libp2p.direct/ws/p2p/QmfSx1ujzboapD5h2CiqTJqUy46FeTDwXBszB3XUCfKEEj".to_string();
+        let addr30 = match baddr.parse::<Multiaddr>() {
+            Ok(aok) => aok,
+            _ => return,
+        };
+
+        web_sys::console::log_1(&JsValue::from(format!(
+            "F0: {:#?}",
+            detect_underlay_format(&addr30)
+        )));
+
+        web_sys::console::log_1(&JsValue::from(format!(
+            "F1: {:#?}",
+            beewss_to_dns_transformed(&addr30)
+        )));
+
+        web_sys::console::log_1(&JsValue::from(format!(
+            "F2: {:#?}",
+            detect_underlay_format(&beewss_to_dns_transformed(&addr30))
+        )));
 
         let wings = self.wings.lock().await;
 
@@ -676,26 +702,7 @@ impl Sekirei {
                                     addr3.to_string()
                                 )));
 
-                                let prck = addr3.protocol_stack();
-                                let mut webrtc_direct = false;
-                                for p in prck {
-                                    if p == "webrtc-direct" {
-                                        for protocol in addr3.iter() {
-                                            match protocol {
-                                                Protocol::Ip4(addr) => {
-                                                    if addr != Ipv4Addr::new(127, 0, 0, 1) {
-                                                        webrtc_direct = true;
-                                                    }
-                                                }
-                                                _ => {
-                                                    continue;
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-
-                                if webrtc_direct {
+                                if detect_underlay_format(&addr3) == UnderlayFormat::BeeWss {
                                     let _pid: PeerId = match try_from_multiaddr(&addr3.clone()) {
                                         Some(aok) => {
                                             let connected_peers_map =
@@ -717,14 +724,14 @@ impl Sekirei {
                                         }
                                     };
 
+                                    let mut paddr5 = paddr.clone();
                                     {
                                         let mut swarm = self.swarm.lock_arc().await;
-
-                                        let _ = swarm.dial(addr3.clone());
+                                        web_sys::console::log_1(&JsValue::from(format!("dial 0",)));
+                                        let addr30 = beewss_to_dns_transformed(&addr3);
+                                        let _ = swarm.dial(addr30.clone());
+                                        paddr5.underlay = addr30.to_vec();
                                     }
-
-                                    let mut paddr5 = paddr.clone();
-                                    paddr5.underlay = addr3.to_vec();
 
                                     let _ = connections_instructions_chan_outgoing.send((
                                         paddr5.clone(),
@@ -742,15 +749,7 @@ impl Sekirei {
                                     }
                                 };
 
-                            let prck = addr4.protocol_stack();
-                            let mut webrtc_direct = false;
-                            for p in prck {
-                                if p == "webrtc-direct" {
-                                    webrtc_direct = true;
-                                }
-                            }
-
-                            if webrtc_direct {
+                            if detect_underlay_format(&addr4) == UnderlayFormat::BeeWss {
                                 let _pid: PeerId = match try_from_multiaddr(&addr4.clone()) {
                                     Some(aok) => {
                                         let connected_peers_map =
@@ -771,14 +770,16 @@ impl Sekirei {
                                         return;
                                     }
                                 };
+
+                                let mut paddr5 = paddr.clone();
                                 {
                                     let mut swarm = self.swarm.lock_arc().await;
 
-                                    let _ = swarm.dial(addr4.clone());
+                                    web_sys::console::log_1(&JsValue::from(format!("dial 1",)));
+                                    let addr40 = beewss_to_dns_transformed(&addr4);
+                                    let _ = swarm.dial(addr40.clone());
+                                    paddr5.underlay = addr40.to_vec();
                                 }
-
-                                let mut paddr5 = paddr.clone();
-                                paddr5.underlay = addr4.to_vec();
 
                                 let _ = connections_instructions_chan_outgoing.send((
                                     paddr5.clone(),
@@ -810,13 +811,27 @@ impl Sekirei {
                     )
                     .await
                     {
+                        self.interface_log(format!("Current Event Handled {:#?}", event));
+                        web_sys::console::log_1(&JsValue::from(format!(
+                            "Current Event Handled {:#?}",
+                            event
+                        )));
+
                         if !event.is_err() {
-                            // self.interface_log(format!("Current Event Handled {:#?}", event));
-                            // web_sys::console::log_1(&JsValue::from(format!(
-                            //     "Current Event Handled {:#?}",
-                            //     event
-                            // )));
                             match event.unwrap() {
+                                Some(SwarmEvent::Behaviour(out_event)) => {
+                                    if let BehaviourEvent::Identify(identify_event) = out_event {
+                                        if let identify::Event::Received { peer_id, info, .. } = identify_event {
+                                            let observed_addr: Multiaddr = info.observed_addr.clone();
+                                            let mut map = wings.self_ephemerals.lock().await;
+                                            map.insert(peer_id.clone(), observed_addr.clone());
+                                            self.interface_log(format!(
+                                                "Observed address {} for peer {} stored/overwritten",
+                                                observed_addr, peer_id
+                                            ));
+                                        }
+                                    }
+                                }
                                 Some(SwarmEvent::ConnectionEstablished {
                                     // peer_id,
                                     // established_in,
@@ -907,20 +922,41 @@ impl Sekirei {
                             };
                             {
                                 let mut swarm = self.swarm.lock_arc().await;
+                                web_sys::console::log_1(&JsValue::from(format!(
+                                    "dial 2 :: {:#?}",
+                                    addr33
+                                )));
+                                if detect_underlay_format(&addr33) == UnderlayFormat::BeeWss {
+                                    let addr30 = beewss_to_dns_transformed(&addr33);
+                                    let _ = swarm.dial(addr30.clone());
 
-                                let _ = swarm.dial(addr33.clone());
+                                    let _ = chan.send("dialing bootnode".to_string());
+
+                                    let mut bzzaddr = etiquette_2::BzzAddress::default();
+
+                                    bzzaddr.underlay = addr30.to_vec();
+
+                                    let _ = connections_instructions_chan_outgoing.send((
+                                        bzzaddr,
+                                        true,
+                                        Date::now() as u64,
+                                    ));
+                                } else {
+                                    let _ = swarm.dial(addr33.clone());
+
+                                    let _ = chan.send("dialing bootnode".to_string());
+
+                                    let mut bzzaddr = etiquette_2::BzzAddress::default();
+
+                                    bzzaddr.underlay = addr33.to_vec();
+
+                                    let _ = connections_instructions_chan_outgoing.send((
+                                        bzzaddr,
+                                        true,
+                                        Date::now() as u64,
+                                    ));
+                                }
                             }
-                            let _ = chan.send("dialing bootnode".to_string());
-
-                            let mut bzzaddr = etiquette_2::BzzAddress::default();
-
-                            bzzaddr.underlay = addr33.to_vec();
-
-                            let _ = connections_instructions_chan_outgoing.send((
-                                bzzaddr,
-                                true,
-                                Date::now() as u64,
-                            ));
                         };
                         bootnode_dial_joiner.push(handle);
                     } else {
@@ -1566,7 +1602,7 @@ impl Sekirei {
                 #[allow(irrefutable_let_patterns)]
                 while let that = connections_instructions_chan_incoming.try_recv() {
                     if !that.is_err() {
-                        let (bzzaddr0, bootn, dialat) = that.unwrap();
+                        let (bzzaddr0, bootn, _dialat) = that.unwrap();
 
                         let addr3 = libp2p::core::Multiaddr::try_from(bzzaddr0.underlay).unwrap();
                         let id = match try_from_multiaddr(&addr3) {
@@ -1585,18 +1621,26 @@ impl Sekirei {
                             bootnodes_set.insert(id.to_string());
                         }
 
-                        let now = Date::now() as u64;
+                        // if dialat + 1000 > now {
+                        //     // 6400
+                        //     async_std::task::sleep(Duration::from_millis(1000 + dialat - now))
+                        //         .await;
+                        // }
 
-                        if dialat + 6400 > now {
-                            async_std::task::sleep(Duration::from_millis(6400 + dialat - now))
-                                .await;
-                        }
-
-                        async_std::task::sleep(Duration::from_millis(100)).await;
+                        let self_ephemeral: Multiaddr = loop {
+                            {
+                                let map = wings.self_ephemerals.lock().await;
+                                if let Some(addr) = map.get(&id) {
+                                    break addr.clone(); // found it, break the loop with the cloned address
+                                }
+                            }
+                            async_std::task::sleep(Duration::from_millis(100)).await;
+                        };
 
                         connection_handler(
                             id,
                             nid,
+                            self_ephemeral,
                             ctrl3.clone(),
                             &addr3.clone(),
                             &(*self.secret_key.lock().await),
@@ -1644,29 +1688,29 @@ impl Sekirei {
 
 #[derive(NetworkBehaviour)]
 struct Behaviour {
-    // autonat: autonat::v2::client::Behaviour,
-    // autonat_s: autonat::v2::server::Behaviour,
-    // dcutr: dcutr::Behaviour,
-    // identify: identify::Behaviour,
-    // ping: ping::Behaviour,
+    autonat: autonat::v2::client::Behaviour,
+    autonat_s: autonat::v2::server::Behaviour,
+    dcutr: dcutr::Behaviour,
+    identify: identify::Behaviour,
+    ping: ping::Behaviour,
     stream: stream::Behaviour,
 }
 
 impl Behaviour {
-    fn new(_local_public_key: identity::PublicKey) -> Self {
+    fn new(local_public_key: identity::PublicKey) -> Self {
         Self {
-            // autonat: autonat::v2::client::Behaviour::new(
-            //     OsRng,
-            //     autonat::v2::client::Config::default().with_probe_interval(Duration::from_secs(60)),
-            // ),
-            // autonat_s: autonat::v2::server::Behaviour::new(OsRng),
-            // dcutr: dcutr::Behaviour::new(local_public_key.to_peer_id()),
-            // identify: identify::Behaviour::new(
-            //     identify::Config::new("/weeb-3".into(), local_public_key.clone())
-            //         .with_push_listen_addr_updates(true)
-            //         .with_interval(Duration::from_secs(30)), // .with_cache_size(10), //
-            // ),
-            // ping: ping::Behaviour::new(ping::Config::new().with_interval(Duration::from_secs(15))),
+            autonat: autonat::v2::client::Behaviour::new(
+                OsRng,
+                autonat::v2::client::Config::default().with_probe_interval(Duration::from_secs(60)),
+            ),
+            autonat_s: autonat::v2::server::Behaviour::new(OsRng),
+            dcutr: dcutr::Behaviour::new(local_public_key.to_peer_id()),
+            identify: identify::Behaviour::new(
+                identify::Config::new("/weeb-3".into(), local_public_key.clone())
+                    .with_push_listen_addr_updates(true)
+                    .with_interval(Duration::from_secs(30)), // .with_cache_size(10), //
+            ),
+            ping: ping::Behaviour::new(ping::Config::new().with_interval(Duration::from_secs(15))),
             stream: stream::Behaviour::new(),
         }
     }

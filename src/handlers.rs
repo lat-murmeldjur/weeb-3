@@ -47,11 +47,14 @@ use crate::SWAP_PROTOCOL;
 pub async fn ceive(
     peer: PeerId,
     network_id: u64,
+    self_ephemeral: libp2p::core::Multiaddr,
     mut stream: Stream,
     a: libp2p::core::Multiaddr,
     pk: &ecdsa::SecretKey,
     chan: &mpsc::Sender<PeerFile>,
 ) -> bool {
+    web_sys::console::log_1(&JsValue::from("Handshake stage 1 0"));
+
     let mut step_0 = etiquette_1::Syn::default();
 
     step_0.observed_underlay = a.clone().to_vec();
@@ -71,6 +74,8 @@ pub async fn ceive(
     };
     let _ = stream.flush().await;
 
+    web_sys::console::log_1(&JsValue::from("Handshake stage 1 1"));
+
     let mut buf_nondiscard_0 = Vec::new();
     let mut buf_discard_0: [u8; 255] = [0; 255];
     loop {
@@ -86,6 +91,8 @@ pub async fn ceive(
         }
     }
 
+    web_sys::console::log_1(&JsValue::from("Handshake stage 1 2"));
+
     let rec_0_u = etiquette_1::SynAck::decode_length_delimited(&mut Cursor::new(buf_nondiscard_0));
 
     let rec_0 = match rec_0_u {
@@ -95,7 +102,14 @@ pub async fn ceive(
         }
     };
 
-    let underlay = libp2p::core::Multiaddr::try_from(rec_0.syn.unwrap().observed_underlay).unwrap();
+    web_sys::console::log_1(&JsValue::from(format!(
+        "Handshake stage 1 3 2 \n {:#?}",
+        rec_0
+    )));
+
+    let underlay = self_ephemeral.to_vec();
+
+    web_sys::console::log_1(&JsValue::from("Handshake stage 1 3 3"));
 
     let peer_overlay = rec_0.ack.clone().unwrap().address.unwrap().overlay;
 
@@ -105,6 +119,8 @@ pub async fn ceive(
         &rec_0.ack.clone().unwrap().address.unwrap().signature,
         network_id,
     );
+
+    web_sys::console::log_1(&JsValue::from("Handshake stage 1 3"));
 
     // web_sys::console::log_1(&JsValue::from(format!("Got underlay {}!", underlay)));
 
@@ -126,7 +142,7 @@ pub async fn ceive(
 
     let mut bufidb: [u8; 8] = [0; 8];
     byteorder::BigEndian::write_u64(&mut bufidb, 10_u64);
-    let byteslice3 = [hsprefix.to_vec(), underlay.to_vec()].concat();
+    let byteslice3 = [hsprefix.to_vec(), underlay.clone()].concat();
     let byteslice4 = [byteslice3, overlay.to_vec()].concat();
     let byteslice5 = [byteslice4, bufidb.to_vec()].concat();
 
@@ -144,6 +160,8 @@ pub async fn ceive(
     step_1.full_node = true;
     step_1.welcome_message = "... Ara Ara ...".to_string();
 
+    web_sys::console::log_1(&JsValue::from("Handshake stage 1 4"));
+
     let mut bufw_1 = Vec::new();
 
     let step_1_len = step_1.encoded_len();
@@ -158,7 +176,12 @@ pub async fn ceive(
     };
     let _ = stream.flush().await;
 
+    web_sys::console::log_1(&JsValue::from("Handshake stage 1 5"));
+
     let _ = stream.close().await;
+
+    web_sys::console::log_1(&JsValue::from("Handshake stage 1 6"));
+
     web_sys::console::log_1(&JsValue::from(format!(
         "Connected Peer {:#?} with address {}!",
         peer, beneficiary
@@ -665,11 +688,14 @@ pub async fn trieve(
 pub async fn connection_handler(
     peer: PeerId,
     network_id: u64,
+    self_ephemeral: libp2p::core::Multiaddr,
     mut control: stream::Control,
     a: &libp2p::core::Multiaddr,
     pk: &ecdsa::SecretKey,
     chan: &mpsc::Sender<PeerFile>,
 ) -> bool {
+    web_sys::console::log_1(&JsValue::from("Handshake stage 0"));
+
     let stream = match control.open_stream(peer, HANDSHAKE_PROTOCOL).await {
         Ok(stream) => stream,
         Err(error @ stream::OpenStreamError::UnsupportedProtocol(_)) => {
@@ -682,15 +708,31 @@ pub async fn connection_handler(
         }
     };
 
-    if !ceive(peer, network_id, stream, a.clone(), &pk.clone(), chan).await {
+    web_sys::console::log_1(&JsValue::from("Handshake stage 1"));
+
+    if !ceive(
+        peer,
+        network_id,
+        self_ephemeral,
+        stream,
+        a.clone(),
+        &pk.clone(),
+        chan,
+    )
+    .await
+    {
         web_sys::console::log_1(&JsValue::from("Handshake protocol failed"));
         return false;
     }
+
+    web_sys::console::log_1(&JsValue::from("Handshake stage 2"));
 
     web_sys::console::log_1(&JsValue::from(format!(
         "Handshake complete for peer: {}!",
         peer
     )));
+
+    web_sys::console::log_1(&JsValue::from("Handshake stage 3"));
 
     return true;
 }

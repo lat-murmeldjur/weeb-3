@@ -8,15 +8,13 @@ use web3::{
     types::{Address, H160, H256, TransactionReceipt, U256},
 };
 
-use num::BigUint;
-
 use base64;
 use ethers::abi::{Token, encode};
 use ethers::signers::LocalWallet;
 use ethers::types::{Address as EthAddress, H256 as EthH256, Signature, U256 as EthU256};
 use ethers::utils::keccak256;
 use hex;
-use prost::Message;
+// use prost::Message;
 use serde::Serialize;
 
 #[derive(Clone, Debug)]
@@ -26,11 +24,11 @@ pub struct Cheque {
     pub cumulative_payout: EthU256,
 }
 
-#[derive(Clone, Debug)]
-pub struct SignedCheque {
-    pub cheque: Cheque,
-    pub signature: Vec<u8>,
-}
+// #[derive(Clone, Debug)]
+// pub struct SignedCheque {
+//     pub cheque: Cheque,
+//     pub signature: Vec<u8>,
+// }
 
 #[derive(Serialize)]
 struct SignedChequeJson {
@@ -51,6 +49,7 @@ impl SignedChequeJson {
 
         let cumulative_payout = cheque.cumulative_payout.as_u128();
 
+        #[allow(deprecated)]
         let signature = base64::encode(signature);
         Self {
             chequebook,
@@ -61,11 +60,11 @@ impl SignedChequeJson {
     }
 }
 
-#[derive(Clone, PartialEq, Message)]
-pub struct EmitCheque {
-    #[prost(bytes = "vec", tag = "1")]
-    pub cheque: Vec<u8>,
-}
+// #[derive(Clone, PartialEq, Message)]
+// pub struct EmitCheque {
+//     #[prost(bytes = "vec", tag = "1")]
+//     pub cheque: Vec<u8>,
+// }
 
 pub struct ChequeSigner {
     wallet: LocalWallet,

@@ -1,5 +1,6 @@
-use libp2p::core::Multiaddr;
+use libp2p::{Multiaddr, multiaddr::Protocol};
 use std::convert::TryFrom;
+use std::str::FromStr;
 
 pub const UNDERLAY_LIST_PREFIX: u8 = 0x99;
 
@@ -74,4 +75,80 @@ fn read_uvarint(src: &[u8]) -> (u64, usize) {
     }
 
     (0, 0)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum UnderlayFormat {
+    BeeWss,
+    DNSTransformedWss,
+    Other,
+}
+
+pub fn detect_underlay_format(addr: &Multiaddr) -> UnderlayFormat {
+    let mut iter = addr.iter();
+
+    match iter.next() {
+        Some(Protocol::Ip4(_)) => {
+            match (
+                iter.next(),
+                iter.next(),
+                iter.next(),
+                iter.next(),
+                iter.next(),
+            ) {
+                (
+                    Some(Protocol::Tcp(_)),
+                    Some(Protocol::Tls),
+                    Some(Protocol::Sni(_)),
+                    Some(Protocol::Ws(_)),
+                    Some(Protocol::P2p(_)),
+                ) => {
+                    if iter.next().is_none() {
+                        return UnderlayFormat::BeeWss;
+                    }
+                }
+                _ => {}
+            }
+        }
+        Some(Protocol::Dns4(_)) => match (iter.next(), iter.next(), iter.next(), iter.next()) {
+            (
+                Some(Protocol::Tcp(_)),
+                Some(Protocol::Tls),
+                Some(Protocol::Ws(_)),
+                Some(Protocol::P2p(_)),
+            ) => {
+                if iter.next().is_none() {
+                    return UnderlayFormat::DNSTransformedWss;
+                }
+            }
+            _ => {}
+        },
+        _ => {}
+    }
+
+    UnderlayFormat::Other
+}
+
+pub fn beewss_to_dns_transformed(addr: &Multiaddr) -> Multiaddr {
+    let mut hostname = None;
+    let mut tcp_port = None;
+    let mut peer_id = None;
+
+    for proto in addr.iter() {
+        match proto {
+            Protocol::Sni(h) => hostname = Some(h.to_string()),
+            Protocol::Tcp(p) => tcp_port = Some(p),
+            Protocol::P2p(id) => peer_id = Some(id.to_string()),
+            _ => {}
+        }
+    }
+
+    let addr_str = format!(
+        "/dns4/{}/tcp/{}/tls/ws/p2p/{}",
+        hostname.expect("BeeWss requires SNI"),
+        tcp_port.expect("BeeWss requires TCP port"),
+        peer_id.expect("BeeWss requires PeerId"),
+    );
+
+    Multiaddr::from_str(&addr_str).expect("constructed DNS-transformed WSS multiaddr must be valid")
 }

@@ -56,7 +56,7 @@ libp2p = { git = "https://github.com/libp2p/rust-libp2p.git", features = [
 "ping", 
 "secp256k1", 
 "wasm-bindgen", 
-"webrtc-websys",
+"websocket-websys",
 "yamux",
 ] }
 libp2p-stream = { git = "https://github.com/libp2p/rust-libp2p.git" }
