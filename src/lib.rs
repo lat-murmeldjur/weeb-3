@@ -1620,58 +1620,68 @@ impl Sekirei {
         let hive_joiner = async {
             let mut timelast = Date::now();
             loop {
+                let mut handshake_joiner = Vec::new();
+
                 #[allow(irrefutable_let_patterns)]
                 while let that = connections_instructions_chan_incoming.try_recv() {
                     if !that.is_err() {
-                        let (bzzaddr0, bootn, _dialat) = that.unwrap();
+                        let handle = async {
+                            web_sys::console::log_1(&JsValue::from(format!(
+                                "Entering Handshake Joiner"
+                            )));
+                            let (bzzaddr0, bootn, _dialat) = that.unwrap();
 
-                        let addr3 = libp2p::core::Multiaddr::try_from(bzzaddr0.underlay).unwrap();
-                        let id = match try_from_multiaddr(&addr3) {
-                            Some(aok) => aok,
-                            _ => continue,
-                        };
+                            let addr3 =
+                                libp2p::core::Multiaddr::try_from(bzzaddr0.underlay).unwrap();
+                            let id = match try_from_multiaddr(&addr3) {
+                                Some(aok) => aok,
+                                _ => return,
+                            };
 
-                        let nid: u64;
-                        {
-                            let nid0 = self.network_id.lock().await.clone();
-                            nid = nid0.clone();
-                        }
-
-                        if bootn {
-                            let mut bootnodes_set = wings.bootnodes.lock().await;
-                            bootnodes_set.insert(id.to_string());
-                        }
-
-                        // if dialat + 1000 > now {
-                        //     // 6400
-                        //     async_std::task::sleep(Duration::from_millis(1000 + dialat - now))
-                        //         .await;
-                        // }
-
-                        let self_ephemeral: Multiaddr = loop {
+                            let nid: u64;
                             {
-                                let map = wings.self_ephemerals.lock().await;
-                                if let Some(addr) = map.get(&id) {
-                                    break addr.clone(); // found it, break the loop with the cloned address
-                                }
+                                let nid0 = self.network_id.lock().await.clone();
+                                nid = nid0.clone();
                             }
-                            async_std::task::sleep(Duration::from_millis(100)).await;
-                        };
 
-                        connection_handler(
-                            id,
-                            nid,
-                            self_ephemeral,
-                            ctrl3.clone(),
-                            &addr3.clone(),
-                            &(*self.secret_key.lock().await),
-                            &accounting_peer_chan_outgoing.clone(),
-                        )
-                        .await;
+                            if bootn {
+                                let mut bootnodes_set = wings.bootnodes.lock().await;
+                                bootnodes_set.insert(id.to_string());
+                            }
+
+                            // if dialat + 1000 > now {
+                            //     // 6400
+                            //     async_std::task::sleep(Duration::from_millis(1000 + dialat - now))
+                            //         .await;
+                            // }
+
+                            let self_ephemeral: Multiaddr = loop {
+                                {
+                                    let map = wings.self_ephemerals.lock().await;
+                                    if let Some(addr) = map.get(&id) {
+                                        break addr.clone(); // found it, break the loop with the cloned address
+                                    }
+                                }
+                                async_std::task::sleep(Duration::from_millis(100)).await;
+                            };
+
+                            connection_handler(
+                                id,
+                                nid,
+                                self_ephemeral,
+                                ctrl3.clone(),
+                                &addr3.clone(),
+                                &(*self.secret_key.lock().await),
+                                &accounting_peer_chan_outgoing.clone(),
+                            )
+                            .await;
+                        };
+                        handshake_joiner.push(handle);
                     } else {
                         break;
                     }
                 }
+                join_all(handshake_joiner).await;
 
                 let timenow = Date::now();
                 let seg = timenow - timelast;
