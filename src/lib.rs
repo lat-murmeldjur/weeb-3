@@ -173,8 +173,8 @@ pub struct Sekirei {
         )>,
     ),
     bootnode_port: (
-        mpsc::Sender<(String, mpsc::Sender<String>)>,
-        mpsc::Receiver<(String, mpsc::Sender<String>)>,
+        mpsc::Sender<(String, mpsc::Sender<String>, bool)>,
+        mpsc::Receiver<(String, mpsc::Sender<String>, bool)>,
     ),
     network_id: Mutex<u64>,
     ongoing_connections: Mutex<u64>,
@@ -198,7 +198,12 @@ pub struct Wings {
 
 #[wasm_bindgen]
 impl Sekirei {
-    pub async fn change_bootnode_address(&self, address: String, _id: String) -> Vec<u8> {
+    pub async fn change_bootnode_address(
+        &self,
+        address: String,
+        _id: String,
+        usable_in_protocols: bool,
+    ) -> Vec<u8> {
         let parse_id = _id.parse::<u64>();
 
         match parse_id {
@@ -213,7 +218,10 @@ impl Sekirei {
         web_sys::console::log_1(&"bootnode change triggered".into());
 
         let (chan_out, chan_in) = mpsc::channel::<String>();
-        let _ = self.bootnode_port.0.send((address, chan_out));
+        let _ = self
+            .bootnode_port
+            .0
+            .send((address, chan_out, usable_in_protocols));
 
         let k0 = async {
             let mut timelast: f64;
@@ -240,16 +248,29 @@ impl Sekirei {
 
         let result = k0.await;
 
-        return encode_resources(
-            vec![(
-                format!("Bootnode connect status: {}", result)
-                    .as_bytes()
-                    .to_vec(),
-                "text/plain".to_string(),
+        if !usable_in_protocols {
+            return encode_resources(
+                vec![(
+                    format!("Bootnode connect status: {}", result)
+                        .as_bytes()
+                        .to_vec(),
+                    "text/plain".to_string(),
+                    "... result ...".to_string(),
+                )],
                 "... result ...".to_string(),
-            )],
-            "... result ...".to_string(),
-        );
+            );
+        } else {
+            return encode_resources(
+                vec![(
+                    format!("Bootstrap connect status: {}", result)
+                        .as_bytes()
+                        .to_vec(),
+                    "text/plain".to_string(),
+                    "... result ...".to_string(),
+                )],
+                "... result ...".to_string(),
+            );
+        }
     }
 
     pub async fn post_upload(
@@ -523,7 +544,7 @@ impl Sekirei {
             String,
             mpsc::Sender<Vec<u8>>,
         )>();
-        let (b_out, b_in) = mpsc::channel::<(String, mpsc::Sender<String>)>();
+        let (b_out, b_in) = mpsc::channel::<(String, mpsc::Sender<String>, bool)>();
 
         return Sekirei {
             secret_key: Mutex::new(secret_key),
@@ -811,11 +832,11 @@ impl Sekirei {
                     )
                     .await
                     {
-                        self.interface_log(format!("Current Event Handled {:#?}", event));
-                        web_sys::console::log_1(&JsValue::from(format!(
-                            "Current Event Handled {:#?}",
-                            event
-                        )));
+                        // self.interface_log(format!("Current Event Handled {:#?}", event));
+                        // web_sys::console::log_1(&JsValue::from(format!(
+                        //     "Current Event Handled {:#?}",
+                        //     event
+                        // )));
 
                         if !event.is_err() {
                             match event.unwrap() {
@@ -889,7 +910,7 @@ impl Sekirei {
                 while let bootnode_change = self.bootnode_port.1.try_recv() {
                     if !bootnode_change.is_err() {
                         let handle = async {
-                            let (baddr, chan) = bootnode_change.unwrap();
+                            let (baddr, chan, usable) = bootnode_change.unwrap();
 
                             let addr33 = match baddr.parse::<Multiaddr>() {
                                 Ok(aok) => aok,
@@ -938,7 +959,7 @@ impl Sekirei {
 
                                     let _ = connections_instructions_chan_outgoing.send((
                                         bzzaddr,
-                                        true,
+                                        !usable,
                                         Date::now() as u64,
                                     ));
                                 } else {
@@ -952,7 +973,7 @@ impl Sekirei {
 
                                     let _ = connections_instructions_chan_outgoing.send((
                                         bzzaddr,
-                                        true,
+                                        !usable,
                                         Date::now() as u64,
                                     ));
                                 }
@@ -1110,7 +1131,7 @@ impl Sekirei {
                                     }
                                 }
                             }
-                            if datenow > daten + 1000.0 && false {
+                            if datenow > daten + 1000.0 {
                                 {
                                     let mut map = wings.ongoing_refreshments.lock().await;
                                     map.insert(peer);

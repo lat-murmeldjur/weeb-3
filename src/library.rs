@@ -59,7 +59,7 @@ impl SekireiNo103 {
             async_std::task::sleep(Duration::from_millis(600)).await;
             if !bootnode_multiaddr.is_empty() {
                 let _ = s
-                    .change_bootnode_address(bootnode_multiaddr, network_id)
+                    .change_bootnode_address(bootnode_multiaddr, network_id, false)
                     .await;
             }
         });

@@ -539,11 +539,10 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
                 console::log_1(&"oninput bootnode callback".into());
 
                 spawn_local(async move {
-                    let (bna, nid) = parsebootconnect();
-                    let result = sekirei00.change_bootnode_address(bna, nid).await;
+                    let (bna, nid) = parsebootconnect("bootNodeMASettings".to_string());
+                    let result = sekirei00.change_bootnode_address(bna, nid, false).await;
 
                     let (data, indx) = decode_resources(result);
-
                     render_result(data, indx).await;
                 });
 
@@ -1237,8 +1236,41 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
     */
     let initial_connect_handle = async {
         async_std::task::sleep(Duration::from_millis(600)).await;
-        let (bna, nid) = parsebootconnect();
-        sekirei9.change_bootnode_address(bna, nid).await;
+
+        let sekirei10 = sekirei9.clone();
+        let sekirei11 = sekirei9.clone();
+        let sekirei12 = sekirei9.clone();
+        let sekirei13 = sekirei9.clone();
+
+        let k0 = async move {
+            let (bna, nid) = parsebootconnect("bootNodeMASettings".to_string());
+            let result = sekirei10.change_bootnode_address(bna, nid, false).await;
+            let (data, indx) = decode_resources(result);
+            render_result(data, indx).await;
+        };
+
+        let k1 = async move {
+            let (bna, nid) = parsebootconnect("bootNodeMASettings0".to_string());
+            let result = sekirei11.change_bootnode_address(bna, nid, true).await;
+            let (data, indx) = decode_resources(result);
+            render_result(data, indx).await;
+        };
+
+        let k2 = async move {
+            let (bna, nid) = parsebootconnect("bootNodeMASettings1".to_string());
+            let result = sekirei12.change_bootnode_address(bna, nid, true).await;
+            let (data, indx) = decode_resources(result);
+            render_result(data, indx).await;
+        };
+
+        let k3 = async move {
+            let (bna, nid) = parsebootconnect("bootNodeMASettings2".to_string());
+            let result = sekirei13.change_bootnode_address(bna, nid, true).await;
+            let (data, indx) = decode_resources(result);
+            render_result(data, indx).await;
+        };
+
+        join!(k0, k1, k2, k3);
     };
 
     join!(
@@ -1435,16 +1467,19 @@ async fn render_result(data: Vec<(Vec<u8>, String, String)>, indx: String) {
     }
 }
 
-pub fn parsebootconnect() -> (String, String) {
+pub fn parsebootconnect(boot_node_masettings_id: String) -> (String, String) {
     let document = web_sys::window().unwrap().document().unwrap();
 
     let bootnode_input = document
-        .get_element_by_id("bootNodeMASettings")
-        .expect("#bootNodeMASettings should exist");
+        .get_element_by_id(&boot_node_masettings_id)
+        .expect(&format!("#{} should exist", boot_node_masettings_id));
 
     let bootnode_input = bootnode_input
         .dyn_ref::<HtmlInputElement>()
-        .expect("#bootNodeMASettings should be a HtmlInputElement");
+        .expect(&format!(
+            "#{} should be a HtmlInputElement",
+            boot_node_masettings_id
+        ));
 
     web_sys::console::log_1(&"g0 bootnode change triggered".into());
     match bootnode_input.value().parse::<String>() {

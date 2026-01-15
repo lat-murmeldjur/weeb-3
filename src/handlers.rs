@@ -463,6 +463,15 @@ pub async fn issue(
         peer
     )));
 
+    let signer_key = get_chequebook_signer_key().await;
+    if signer_key.len() != 32 {
+        let _ = chan.send((peer, false)).unwrap_or(());
+        web_sys::console::log_1(&JsValue::from(format!(
+            "Issue fail 1 - no chequebook signer"
+        )));
+        return;
+    }
+
     let mut non_empty = etiquette_0::Headers::default();
 
     let mut price_header = etiquette_0::Header::default();
@@ -531,13 +540,6 @@ pub async fn issue(
         }
     };
     let beneficiary = EthAddress::from_slice(&beneficiary_bytes);
-
-    let signer_key = get_chequebook_signer_key().await;
-    if signer_key.len() != 32 {
-        let _ = chan.send((peer, false)).unwrap_or(());
-        web_sys::console::log_1(&JsValue::from(format!("Issue fail 1")));
-        return;
-    }
 
     let wallet = match LocalWallet::from_bytes(&signer_key) {
         Ok(w) => w,
