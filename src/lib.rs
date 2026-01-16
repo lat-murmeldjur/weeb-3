@@ -1507,17 +1507,38 @@ impl Sekirei {
                         let handle = async {
                             let (d, soc, checkad, stamp, feedback) = incoming_request.unwrap();
 
-                            let _address = push_chunk(
-                                d,
-                                soc,
-                                checkad,
-                                stamp,
+                            let address = push_chunk(
+                                d.clone(),
+                                soc.clone(),
+                                checkad.clone(),
+                                stamp.clone(),
                                 ctrl8.clone(),
                                 &wings.overlay_peers,
                                 &wings.accounting_peers,
                                 &refreshment_instructions_chan_outgoing,
                             )
                             .await;
+
+                            let chunk = retrieve_chunk(
+                                &checkad,
+                                ctrl8.clone(),
+                                &wings.overlay_peers.clone(),
+                                &wings.accounting_peers.clone(),
+                                &refreshment_instructions_chan_outgoing.clone(),
+                            )
+                            .await;
+
+                            if chunk.len() == 0 {
+                                chunk_upload_chan_outgoing.send((
+                                    d.clone(),
+                                    soc.clone(),
+                                    checkad.clone(),
+                                    stamp.clone(),
+                                    feedback.clone(),
+                                ));
+
+                                self.interface_log(format!("reuploading chunk Y0N"));
+                            }
 
                             let _ = feedback.send(true);
                         };
@@ -1561,7 +1582,7 @@ impl Sekirei {
                 if !connections {
                     {
                         let overlay_peers_map = wings.overlay_peers.lock().await;
-                        if overlay_peers_map.len() > 0 {
+                        if overlay_peers_map.len() > 7 {
                             connections = true;
                         }
                     }

@@ -393,7 +393,7 @@ pub async fn retrieve_chunk(
         let (chunk_out, chunk_in) = mpsc::channel::<Vec<u8>>();
 
         let _ = async_std::future::timeout(
-            Duration::from_secs(10),
+            Duration::from_secs(100),
             retrieve_handler(closest_peer_id, caddr.clone(), control.clone(), &chunk_out),
         )
         .await;
