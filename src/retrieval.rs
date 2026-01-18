@@ -33,7 +33,7 @@ use crate::{
     // // // // // // // //
     mpsc,
     // // // // // // // //
-    //  persistence::{cache_chunk, retrieve_cached_chunk},
+    persistence::{cache_chunk, retrieve_cached_chunk},
     // // // // // // // //
     price,
     // // // // // // // //
@@ -301,15 +301,15 @@ pub async fn retrieve_chunk(
     #[allow(unused_assignments)]
     let mut cd = vec![];
 
-    // cd = retrieve_cached_chunk(&caddr).await;
-    // if cd.len() > 0 {
-    //     (chunk_valid, soc) = verify_chunk(&caddr, &cd);
-    //     if chunk_valid {
-    //         error_count = max_error;
-    //     } else {
-    //         cd = vec![];
-    //     };
-    // };
+    cd = retrieve_cached_chunk(&caddr).await;
+    if cd.len() > 0 {
+        (chunk_valid, soc) = verify_chunk(&caddr, &cd);
+        if chunk_valid {
+            error_count = max_error;
+        } else {
+            cd = vec![];
+        };
+    };
 
     while error_count < max_error {
         let mut seer = true;
@@ -441,7 +441,7 @@ pub async fn retrieve_chunk(
                             apply_credit(accounting_peer, req_price).await;
                         }
                     }
-                    // cache_chunk(&caddr, &cd).await;
+                    cache_chunk(&caddr, &cd).await;
                     break;
                 } else {
                     error_count += 1;
