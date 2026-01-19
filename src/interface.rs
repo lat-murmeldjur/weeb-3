@@ -18,6 +18,7 @@ use web_sys::{
     HtmlSpanElement,
     MessageEvent,
     RequestInit,
+    Response,
     ServiceWorkerRegistration,
     //
     console,
@@ -1533,6 +1534,41 @@ async fn render_result(data: Vec<(Vec<u8>, String, String)>, indx: String) {
             );
 
             let _ = service_worker1.post_message(&JsValue::from(msgobj));
+
+            let mut elapsed = 0;
+            let timeout_ms = 10000;
+
+            let window = web_sys::window().unwrap();
+
+            loop {
+                let resp =
+                    wasm_bindgen_futures::JsFuture::from(window.fetch_with_str(&path03)).await;
+
+                let mut ok = false;
+
+                if let Ok(val) = resp {
+                    let response: Response = val.dyn_into().unwrap();
+
+                    if response.status() == 200 {
+                        if let Some(ct) = response.headers().get("Content-Type").ok().flatten() {
+                            if !ct.contains("text/html") {
+                                ok = true;
+                            }
+                        }
+                    }
+                }
+
+                if ok {
+                    break;
+                }
+
+                if elapsed >= timeout_ms {
+                    panic!("Asset never became fetchable: {}", path03);
+                }
+
+                async_std::task::sleep(Duration::from_millis(100)).await;
+                elapsed += 100;
+            }
         }
 
         let sep = "/".to_string();

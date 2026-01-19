@@ -93,6 +93,7 @@ web-sys = { version = "0.3.77", features = [
   'ServiceWorkerRegistration',
   'ReadableStream',
   'Request',
+  'Response',
   'RequestCache',
   'RequestMode',
   'RequestCredentials',
