@@ -38,11 +38,6 @@ const cacheFirst = async (request) => {
   } catch (e) {
   }
   
-  let cachedIndex = await cache.match('/weeb-3/index.html');
-  if (cachedIndex) {
-    return cachedIndex;
-  }
-  
   let fetched = await fetch(request);
   cache.put(request, fetched.clone());
   return fetched;
