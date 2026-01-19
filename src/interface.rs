@@ -16,9 +16,11 @@ use web_sys::{
     HtmlInputElement,
     HtmlSelectElement,
     HtmlSpanElement,
+    MessageChannel,
     MessageEvent,
     RequestInit,
     Response,
+    ServiceWorker,
     ServiceWorkerRegistration,
     //
     console,
@@ -1533,14 +1535,7 @@ async fn render_result(data: Vec<(Vec<u8>, String, String)>, indx: String) {
                 &JsValue::from_str(&path03),
             );
 
-            let _ = service_worker1.post_message(&JsValue::from(msgobj));
-
-            let mut elapsed = 0;
-            let timeout_ms = 10000;
-
-            let window = web_sys::window().unwrap();
-
-            async_std::task::sleep(Duration::from_millis(300)).await;
+            post_and_wait_cache(&service_worker1, &JsValue::from(msgobj)).await;
         }
 
         let sep = "/".to_string();
@@ -1565,6 +1560,44 @@ async fn render_result(data: Vec<(Vec<u8>, String, String)>, indx: String) {
             .unwrap()
             .prepend_with_node_1(&new_element)
             .unwrap();
+    }
+}
+
+async fn post_and_wait_cache(service_worker: &ServiceWorker, msgobj: &JsValue) {
+    match MessageChannel::new() {
+        Ok(channel) => {
+            let port1 = channel.port1();
+            let port2 = channel.port2();
+
+            let promise = js_sys::Promise::new(&mut |resolve, _reject| {
+                let closure = Closure::wrap(Box::new(move |event: MessageEvent| {
+                    let data = event.data();
+                    let msg_type = js_sys::Reflect::get(&data, &JsValue::from_str("type"))
+                        .unwrap_or(JsValue::NULL);
+                    if msg_type == JsValue::from_str("CACHE_RESPONSE") {
+                        resolve.call1(&JsValue::NULL, &data).unwrap();
+                    }
+                }) as Box<dyn FnMut(MessageEvent)>);
+
+                port1.set_onmessage(Some(closure.as_ref().unchecked_ref()));
+                closure.forget(); // keep alive
+            });
+
+            match service_worker.post_message_with_transferable(msgobj, &js_sys::Array::of1(&port2))
+            {
+                Ok(_) => match wasm_bindgen_futures::JsFuture::from(promise).await {
+                    Ok(resp) => {
+                        web_sys::console::log_1(&JsValue::from(format!(
+                            "Cached successfully: {:#?}",
+                            resp
+                        )));
+                    }
+                    Err(err) => web_sys::console::error_1(&err),
+                },
+                Err(err) => web_sys::console::error_1(&err),
+            }
+        }
+        Err(err) => web_sys::console::error_1(&err),
     }
 }
 

@@ -5,6 +5,8 @@ const putInCache = async (request, response) => {
 };
 
 self.addEventListener('message', async function(event) {
+  const port = event.ports && event.ports[0];
+
   let asset0 = new Blob([event.data.data0[0]], { type: event.data.mime0 });
 
   const reqHeaders = new Headers();
@@ -25,6 +27,14 @@ self.addEventListener('message', async function(event) {
   });
 
   await putInCache(request0, response0);
+
+  if (port) {
+    port.postMessage({
+      type: "CACHE_RESPONSE",
+      cached: event.data.path0
+    });
+  }
+
   console.log('Message event processed:', event);
 });
 
