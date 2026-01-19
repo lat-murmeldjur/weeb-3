@@ -1,24 +1,32 @@
 const putInCache = async (request, response) => {
   const cache = await caches.open('default0');
-  var cacheput0 = await cache.put(request, response);
-  console.log(cacheput0);
+  await cache.put(request, response);
+  console.log('Cached:', request.url);
 };
 
 self.addEventListener('message', async function(event) {
-  let asset0 = new Blob([event.data.data0[0]], {type: event.data.mime0});
+  let asset0 = new Blob([event.data.data0[0]], { type: event.data.mime0 });
 
   const reqHeaders = new Headers();
   reqHeaders.set("Cache-Control", "public, max-age=60000000000000");
+
+  const encodedPath = encodeURI(event.data.path0);
+
   const options = {
     headers: reqHeaders,
   };
 
-  const request0 = new Request(event.data.path0, options);
-  const response0 = new Response(asset0, { headers: { 'Content-Type': event.data.mime0, 'Content-Length': event.data.data0[0].length } });
+  const request0 = new Request(encodedPath, options);
+  const response0 = new Response(asset0, { 
+    headers: { 
+      'Content-Type': event.data.mime0, 
+      'Content-Length': event.data.data0[0].length 
+    } 
+  });
 
   await putInCache(request0, response0);
-  console.log(event);
-})
+  console.log('Message event processed:', event);
+});
 
 const cacheFirst = async (request) => {
   const cache = await caches.open('default0');
