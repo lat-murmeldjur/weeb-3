@@ -883,8 +883,13 @@ impl Sekirei {
                                                 }
                                             };
                                             connected_peers_map.remove(&peer_id);
+
                                             self.interface_log(format!("Disconnected from peer {}", &ol0));
                                         };
+                                        let mut connection_attempts_map = wings.connection_attempts.lock().await;
+                                        if connection_attempts_map.contains(&peer_id) {
+                                            connection_attempts_map.remove(&peer_id);
+                                        }
                                     }
                                     let mut accounting = wings.accounting_peers.lock().await;
                                     if accounting.contains_key(&peer_id) {
@@ -1538,9 +1543,9 @@ impl Sekirei {
                                 ));
 
                                 self.interface_log(format!("reuploading chunk Y0N"));
+                            } else {
+                                let _ = feedback.send(true);
                             }
-
-                            let _ = feedback.send(true);
                         };
                         request_joiner.push(handle);
                     } else {
