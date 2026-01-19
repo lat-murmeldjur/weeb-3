@@ -1402,7 +1402,7 @@ fn create_ielement(indx: String) -> Element {
     let _ = i.set_attribute("src", &indx);
     let _ = i.set_attribute("width", "90%");
     let _ = i.set_attribute("height", "90%");
-    let _ = i.set_attribute("sandbox", "allow-scripts");
+    // let _ = i.set_attribute("sandbox", "allow-scripts");
     return i;
 }
 
