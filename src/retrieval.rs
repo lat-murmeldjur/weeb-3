@@ -441,7 +441,7 @@ pub async fn retrieve_chunk(
                             apply_credit(accounting_peer, req_price).await;
                         }
                     }
-                    // cache_chunk(&caddr, &cd).await;
+                    cache_chunk(&caddr, &cd).await;
                     break;
                 } else {
                     error_count += 1;
