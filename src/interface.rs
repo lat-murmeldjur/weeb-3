@@ -1636,7 +1636,7 @@ pub fn parsebootconnect(boot_node_masettings_id: String) -> (String, String) {
 pub async fn get_service_worker() -> Option<web_sys::ServiceWorker> {
     let service0 = web_sys::window().unwrap().navigator().service_worker();
 
-    match JsFuture::from(service0.register("./service.js")).await {
+    match JsFuture::from(service0.register("/weeb-3/service.js")).await {
         Ok(registration) => {
             let _ = JsFuture::from(
                 registration
