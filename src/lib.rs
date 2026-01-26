@@ -1,6 +1,8 @@
 #![cfg(target_arch = "wasm32")]
 
+use async_lock::Semaphore;
 use async_std::sync::{Arc, Mutex};
+use wasm_bindgen_futures::spawn_local;
 
 use rand::rngs::OsRng;
 use std::collections::{HashMap, HashSet};
@@ -1109,7 +1111,7 @@ impl Sekirei {
                     #[allow(irrefutable_let_patterns)]
                     while let re_out = refreshment_instructions_chan_incoming.try_recv() {
                         if !re_out.is_err() {
-                            let (peer, amount) = re_out.unwrap();
+                            let (peer, _amount) = re_out.unwrap();
                             {
                                 let map = wings.ongoing_refreshments.lock().await;
                                 if map.contains(&peer) {
@@ -1120,6 +1122,7 @@ impl Sekirei {
                             let mut daten = Date::now();
                             let datenow = daten;
                             let mut cheque_amt: u64 = 0;
+                            let mut amount2 = 0;
                             {
                                 let accounting = wings.accounting_peers.lock().await;
                                 let accounting_peer_lock = match accounting.get(&peer) {
@@ -1130,6 +1133,7 @@ impl Sekirei {
                                 daten = accounting_peer.refreshment;
                                 if datenow > accounting_peer.refreshment + 1000.0 {
                                     accounting_peer.refreshment = datenow;
+                                    amount2 = accounting_peer.threshold;
                                 } else {
                                     if accounting_peer.balance > REFRESH_RATE {
                                         cheque_amt = accounting_peer.balance - REFRESH_RATE;
@@ -1144,10 +1148,10 @@ impl Sekirei {
                                 let ctrl7 = ctrl4.clone();
                                 let rco = refreshment_chan_outgoing.clone();
                                 let handle = async move {
-                                    refresh_handler(peer, amount, ctrl7, &rco).await;
+                                    refresh_handler(peer, amount2, ctrl7, &rco).await;
                                 };
                                 refresh_joiner.push(handle);
-                            } else if cheque_amt > 0 {
+                            } else if cheque_amt > 0 && false {
                                 let mut map = wings.ongoing_cheques.lock().await;
                                 if !map.contains_key(&peer) {
                                     map.insert(peer, cheque_amt);
@@ -1169,12 +1173,19 @@ impl Sekirei {
                     while let re_in = refreshment_chan_incoming.try_recv() {
                         if !re_in.is_err() {
                             let (peer, amount) = re_in.unwrap();
+
+                            web_sys::console::log_1(&JsValue::from(format!(
+                                "Applied refreshment {}",
+                                amount
+                            )));
+
                             if amount > 0 {
                                 let accounting = wings.accounting_peers.lock().await;
                                 let accounting_peer_lock = match accounting.get(&peer) {
                                     Some(aok) => aok,
                                     _ => continue,
                                 };
+
                                 apply_refreshment(accounting_peer_lock, amount).await;
                             }
                             let mut map = wings.ongoing_refreshments.lock().await;
@@ -1512,7 +1523,7 @@ impl Sekirei {
                         let handle = async {
                             let (d, soc, checkad, stamp, feedback) = incoming_request.unwrap();
 
-                            let address = push_chunk(
+                            let _address = push_chunk(
                                 d.clone(),
                                 soc.clone(),
                                 checkad.clone(),
@@ -1534,7 +1545,7 @@ impl Sekirei {
                             .await;
 
                             if chunk.len() == 0 {
-                                chunk_upload_chan_outgoing.send((
+                                let _ = chunk_upload_chan_outgoing.send((
                                     d.clone(),
                                     soc.clone(),
                                     checkad.clone(),
@@ -1581,9 +1592,10 @@ impl Sekirei {
         let retrieve_chunk_handle = async {
             let mut timelast = Date::now();
             let mut connections = false;
-            loop {
-                let mut request_joiner = Vec::new();
 
+            let retrieve_sem = Arc::new(Semaphore::new(4096));
+
+            loop {
                 if !connections {
                     {
                         let overlay_peers_map = wings.overlay_peers.lock().await;
@@ -1591,45 +1603,50 @@ impl Sekirei {
                             connections = true;
                         }
                     }
+
                     async_std::task::sleep(Duration::from_millis(PROTO_LOOP_INTERRUPTOR as u64))
                         .await;
                     continue;
                 }
 
-                #[allow(irrefutable_let_patterns)]
-                for _i in 0..4096 {
-                    let incoming_request = chunk_retrieve_chan_incoming.try_recv();
-                    if !incoming_request.is_err() {
-                        let handle = async {
-                            let (n, chan) = incoming_request.unwrap();
+                let mut dispatched = 0usize;
 
+                loop {
+                    match chunk_retrieve_chan_incoming.try_recv() {
+                        Ok((n, chan)) => {
+                            let sem = retrieve_sem.clone();
                             let ctrl9 = ctrl6.clone();
+                            let overlay_peers = wings.overlay_peers.clone();
+                            let accounting_peers = wings.accounting_peers.clone();
+                            let refresh_chan = refreshment_instructions_chan_outgoing.clone();
 
-                            let chunk_data = retrieve_chunk(
-                                &n,
-                                ctrl9,
-                                &wings.overlay_peers.clone(),
-                                &wings.accounting_peers.clone(),
-                                &refreshment_instructions_chan_outgoing.clone(),
-                            )
-                            .await;
+                            dispatched += 1;
 
-                            chan.send(chunk_data).unwrap();
-                        };
-                        request_joiner.push(handle);
-                    } else {
-                        break;
+                            spawn_local(async move {
+                                let _permit = sem.acquire().await;
+
+                                let chunk_data = retrieve_chunk(
+                                    &n,
+                                    ctrl9,
+                                    &overlay_peers,
+                                    &accounting_peers,
+                                    &refresh_chan,
+                                )
+                                .await;
+
+                                let _ = chan.send(chunk_data);
+                            });
+                        }
+                        Err(_) => break,
                     }
                 }
 
-                if request_joiner.len() > 0 {
+                if dispatched > 0 {
                     self.interface_log(format!(
-                        "Making ({}) chunk retrieval requests",
-                        request_joiner.len()
+                        "Dispatched ({}) chunk retrieval requests",
+                        dispatched
                     ));
                 }
-
-                join_all(request_joiner).await;
 
                 let timenow = Date::now();
                 let seg = timenow - timelast;

@@ -33,7 +33,7 @@ use crate::{
     // // // // // // // //
     mpsc,
     // // // // // // // //
-    persistence::{cache_chunk, retrieve_cached_chunk},
+    //    persistence::{cache_chunk, retrieve_cached_chunk},
     // // // // // // // //
     price,
     // // // // // // // //
@@ -51,6 +51,8 @@ use crate::{
 use alloy::primitives::keccak256;
 use async_std::sync::Arc;
 use byteorder::ByteOrder;
+
+use async_lock::Semaphore;
 
 use libp2p::futures::{StreamExt, stream::FuturesUnordered};
 
@@ -110,9 +112,7 @@ pub async fn retrieve_data(
 ) -> Vec<u8> {
     let root_chunk = get_chunk(data_address.to_vec(), &chunk_retrieve_chan).await;
 
-    #[allow(unused_assignments)]
-    let mut root_span: u64 = 0;
-
+    let root_span: u64;
     if root_chunk.len() >= 8 {
         root_span = u64::from_le_bytes(root_chunk[0..8].try_into().unwrap());
     } else {
@@ -150,7 +150,9 @@ pub async fn retrieve_data(
     let mut orig = root_chunk[8..].to_vec();
 
     let mut data: Vec<u8> = Vec::with_capacity((root_span + 8) as usize);
-    data.append(&mut root_chunk[0..8].to_vec());
+    data.extend_from_slice(&root_chunk[0..8]);
+
+    let retrieve_sem = Arc::new(Semaphore::new(2048));
 
     let mut done = false;
     while !done {
@@ -159,98 +161,82 @@ pub async fn retrieve_data(
         }
 
         let subs = orig.len() / address_length;
-        let mut content_holder_2: Vec<Vec<u8>> = vec![];
+
+        let mut content_holder_2: Vec<Vec<u8>> = Vec::with_capacity(subs);
         for i in 0..subs {
-            content_holder_2.push((&orig[i * address_length..(i + 1) * address_length]).to_vec());
+            content_holder_2.push(orig[i * address_length..(i + 1) * address_length].to_vec());
         }
 
         let mut joiner = FuturesUnordered::new();
 
-        done = true;
-        let mut waves_done = false;
-        let mut i = 0;
         let mut content_holder_3: HashMap<usize, Vec<u8>> = HashMap::new();
         let mut content_holder_4: HashMap<usize, Vec<u8>> = HashMap::new();
-        let wave_size = 2048;
 
-        while !waves_done {
-            for j in 0..wave_size {
-                if i + j >= content_holder_2.len() {
-                    waves_done = true;
-                    break;
-                }
+        done = true;
 
-                let addr = &content_holder_2[i + j];
-                let index = i + j;
+        for (index, addr) in content_holder_2.iter().cloned().enumerate() {
+            let sem = retrieve_sem.clone();
+            let chan = chunk_retrieve_chan.clone();
 
-                let handle = async move {
-                    return (
-                        get_chunk(addr.clone(), &chunk_retrieve_chan).await,
-                        index.clone(),
-                        addr.clone(),
-                    );
-                };
-                joiner.push(handle);
-            }
+            joiner.push(async move {
+                let _permit = sem.acquire().await;
+                let chunk = get_chunk(addr.clone(), &chan).await;
+                (index, addr, chunk)
+            });
+        }
 
-            while let Some((result0, result1, result2)) = joiner.next().await {
-                if result0.len() > 8 {
-                    let result_span = u64::from_le_bytes(result0[0..8].try_into().unwrap());
-                    if result_span > 4096 {
-                        done = false;
-                        content_holder_3.insert(result1, result0[8..].to_vec());
-                    } else {
-                        content_holder_3.insert(result1, result2);
-                        content_holder_4.insert(result1, result0[8..].to_vec());
-                    }
+        while let Some((index, addr, result0)) = joiner.next().await {
+            if result0.len() > 8 {
+                let result_span = u64::from_le_bytes(result0[0..8].try_into().unwrap());
+
+                if result_span > 4096 {
+                    done = false;
+                    content_holder_3.insert(index, result0[8..].to_vec());
                 } else {
-                    web_sys::console::log_1(&JsValue::from(format!(
-                        "chunk not found: {}",
-                        hex::encode(result2),
-                    )));
-                    return vec![];
+                    content_holder_3.insert(index, addr);
+                    content_holder_4.insert(index, result0[8..].to_vec());
                 }
+            } else {
+                web_sys::console::log_1(&JsValue::from(format!(
+                    "chunk not found: {}",
+                    hex::encode(addr),
+                )));
+                return vec![];
             }
-
-            i = i + wave_size;
         }
 
         if !done {
-            web_sys::console::log_1(&JsValue::from(format!("marker 00")));
-            orig = Vec::new();
+            web_sys::console::log_1(&JsValue::from("marker 00"));
+            orig.clear();
+
             for i in 0..subs {
                 match content_holder_3.get(&i) {
-                    Some(data0) => {
-                        if data0.len() > 0 {
-                            orig.append(&mut data0[..].to_vec());
-                        } else {
-                            return vec![];
-                        }
+                    Some(data0) if !data0.is_empty() => {
+                        orig.extend_from_slice(data0);
                     }
-                    None => return vec![],
+                    _ => return vec![],
                 }
             }
-            web_sys::console::log_1(&JsValue::from(format!("marker 0")));
+
+            web_sys::console::log_1(&JsValue::from("marker 0"));
         } else {
-            web_sys::console::log_1(&JsValue::from(format!("marker 10")));
+            web_sys::console::log_1(&JsValue::from("marker 10"));
+
             for i in 0..subs {
                 match content_holder_4.get(&i) {
-                    Some(data0) => {
-                        if data0.len() > 0 {
-                            data.append(&mut data0[..].to_vec());
-                        } else {
-                            return vec![];
-                        }
+                    Some(data0) if !data0.is_empty() => {
+                        data.extend_from_slice(data0);
                     }
-                    None => return vec![],
+                    _ => return vec![],
                 }
             }
-            web_sys::console::log_1(&JsValue::from(format!("marker 11")));
+
+            web_sys::console::log_1(&JsValue::from("marker 11"));
         }
     }
 
     if data.len() == (root_span + 8) as usize {
-        return data;
+        data
     } else {
         web_sys::console::log_1(&JsValue::from(format!(
             "retrieved result length ({}) not matching span ({}) + 8 for data address {}",
@@ -258,7 +244,7 @@ pub async fn retrieve_data(
             root_span,
             hex::encode(data_address),
         )));
-        return vec![];
+        vec![]
     }
 }
 
@@ -301,15 +287,15 @@ pub async fn retrieve_chunk(
     #[allow(unused_assignments)]
     let mut cd = vec![];
 
-    cd = retrieve_cached_chunk(&caddr).await;
-    if cd.len() > 0 {
-        (chunk_valid, soc) = verify_chunk(&caddr, &cd);
-        if chunk_valid {
-            error_count = max_error;
-        } else {
-            cd = vec![];
-        };
-    };
+    // cd = retrieve_cached_chunk(&caddr).await;
+    // if cd.len() > 0 {
+    //     (chunk_valid, soc) = verify_chunk(&caddr, &cd);
+    //     if chunk_valid {
+    //         error_count = max_error;
+    //     } else {
+    //         cd = vec![];
+    //     };
+    // };
 
     while error_count < max_error {
         let mut seer = true;
@@ -441,7 +427,7 @@ pub async fn retrieve_chunk(
                             apply_credit(accounting_peer, req_price).await;
                         }
                     }
-                    cache_chunk(&caddr, &cd).await;
+                    // cache_chunk(&caddr, &cd).await;
                     break;
                 } else {
                     error_count += 1;

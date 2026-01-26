@@ -16,7 +16,7 @@ pub async fn set_payment_threshold(a: &Mutex<PeerAccounting>, amount: u64) {
     let mut account = a.lock().await;
     account.threshold = amount;
     if amount > REFRESH_RATE * 2 {
-        account.payment_threshold = amount - REFRESH_RATE;
+        account.payment_threshold = REFRESH_RATE * 2;
     }
 }
 

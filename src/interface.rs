@@ -19,7 +19,7 @@ use web_sys::{
     MessageChannel,
     MessageEvent,
     RequestInit,
-    Response,
+    // Response,
     ServiceWorker,
     ServiceWorkerRegistration,
     //

@@ -604,6 +604,8 @@ pub async fn trieve(
     mut stream: Stream,
     chan: &mpsc::Sender<Vec<u8>>,
 ) {
+    web_sys::console::log_1(&JsValue::from(format!("starting trieve")));
+
     let empty = etiquette_0::Headers::default();
 
     let mut buf_empty = Vec::new();
@@ -684,6 +686,7 @@ pub async fn trieve(
 
     let rec_1 = rec_0.data;
 
+    web_sys::console::log_1(&JsValue::from(format!("trieve complete")));
     chan.send(rec_1).unwrap();
 }
 
