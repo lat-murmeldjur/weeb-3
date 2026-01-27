@@ -1508,7 +1508,7 @@ impl Sekirei {
                 if !connections {
                     {
                         let overlay_peers_map = wings.overlay_peers.lock().await;
-                        if overlay_peers_map.len() > 0 {
+                        if overlay_peers_map.len() > 2 {
                             connections = true;
                         }
                     }
@@ -1603,7 +1603,7 @@ impl Sekirei {
                 if !connections {
                     {
                         let overlay_peers_map = wings.overlay_peers.lock().await;
-                        if overlay_peers_map.len() > 7 {
+                        if overlay_peers_map.len() > 2 {
                             connections = true;
                         }
                     }

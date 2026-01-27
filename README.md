@@ -29,6 +29,8 @@ Note this server uses an unsecure self-signed certificate to provide https, whic
 - Chrome (Android)
 - Brave (on Windows 11)
 - Edge 
+- Firefox (on Windows 11)
+- Firefox (on Android)
 
 Testing and modifying for other browsers is planned.
 
