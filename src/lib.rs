@@ -1501,6 +1501,9 @@ impl Sekirei {
         let push_chunk_handle = async {
             let mut timelast = Date::now();
             let mut connections = false;
+
+            let push_sem = Arc::new(Semaphore::new(1024));
+
             loop {
                 if !connections {
                     {
@@ -1514,68 +1517,69 @@ impl Sekirei {
                     continue;
                 }
 
-                let mut request_joiner = vec![];
+                let mut dispatched = 0;
 
                 #[allow(irrefutable_let_patterns)]
-                for _i in 0..1024 {
+                loop {
+                    let sem = push_sem.clone();
                     let incoming_request = chunk_upload_chan_incoming.try_recv();
-                    if !incoming_request.is_err() {
-                        let handle = async {
-                            let (d, soc, checkad, stamp, feedback) = incoming_request.unwrap();
+                    if incoming_request.is_err() {
+                        break;
+                    }
 
-                            let _address = push_chunk(
+                    dispatched += 1;
+
+                    let (d, soc, checkad, stamp, feedback) = incoming_request.unwrap();
+
+                    let ctrl8 = ctrl8.clone();
+                    let overlay_peers = wings.overlay_peers.clone();
+                    let accounting_peers = wings.accounting_peers.clone();
+                    let refreshment = refreshment_instructions_chan_outgoing.clone();
+                    let chunk_upload_chan_outgoing = chunk_upload_chan_outgoing.clone();
+
+                    spawn_local(async move {
+                        let permit = sem.acquire().await;
+
+                        let _address = push_chunk(
+                            d.clone(),
+                            soc.clone(),
+                            checkad.clone(),
+                            stamp.clone(),
+                            ctrl8.clone(),
+                            &overlay_peers,
+                            &accounting_peers,
+                            &refreshment,
+                        )
+                        .await;
+
+                        let chunk = retrieve_chunk(
+                            &checkad,
+                            ctrl8.clone(),
+                            &overlay_peers,
+                            &accounting_peers,
+                            &refreshment,
+                        )
+                        .await;
+
+                        if chunk.len() == 0 {
+                            let _ = chunk_upload_chan_outgoing.send((
                                 d.clone(),
                                 soc.clone(),
                                 checkad.clone(),
                                 stamp.clone(),
-                                ctrl8.clone(),
-                                &wings.overlay_peers,
-                                &wings.accounting_peers,
-                                &refreshment_instructions_chan_outgoing,
-                            )
-                            .await;
+                                feedback.clone(),
+                            ));
+                        } else {
+                            let _ = feedback.send(true);
+                        }
 
-                            let chunk = retrieve_chunk(
-                                &checkad,
-                                ctrl8.clone(),
-                                &wings.overlay_peers.clone(),
-                                &wings.accounting_peers.clone(),
-                                &refreshment_instructions_chan_outgoing.clone(),
-                            )
-                            .await;
-
-                            if chunk.len() == 0 {
-                                let _ = chunk_upload_chan_outgoing.send((
-                                    d.clone(),
-                                    soc.clone(),
-                                    checkad.clone(),
-                                    stamp.clone(),
-                                    feedback.clone(),
-                                ));
-
-                                self.interface_log(format!("reuploading chunk Y0N"));
-                            } else {
-                                let _ = feedback.send(true);
-                            }
-                        };
-                        request_joiner.push(handle);
-                    } else {
-                        break;
-                    }
+                        drop(permit);
+                    });
                 }
 
-                if request_joiner.len() > 0 {
-                    self.interface_log(format!(
-                        "Making {} pushsync requests",
-                        request_joiner.len()
-                    ));
+                if dispatched > 0 {
+                    self.interface_log(format!("Making {} pushsync requests", dispatched));
                 }
-
-                let _ = join_all(request_joiner).await;
-
-                // while let Some(()) = request_joiner.next().await {
-                //     web_sys::console::log_1(&JsValue::from(format!("push chunk completed")));
-                // }
 
                 let timenow = Date::now();
                 let seg = timenow - timelast;

@@ -498,7 +498,7 @@ pub async fn push_data(
 
                 for i in 0..chunk_l0c {
                     count_yield += 1;
-                    if count_yield > 512 {
+                    if count_yield > 1024 {
                         // relax push chunk channel
                         #[allow(irrefutable_let_patterns)]
                         while let kresult = result_chan_in.try_recv() {
@@ -507,7 +507,7 @@ pub async fn push_data(
                                     count_yield -= 1;
                                 }
                             } else {
-                                if count_yield < 256 {
+                                if count_yield < 1024 {
                                     break;
                                 }
                                 async_std::task::sleep(Duration::from_millis(
