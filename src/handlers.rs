@@ -50,7 +50,7 @@ pub async fn ceive(
     self_ephemeral: libp2p::core::Multiaddr,
     mut stream: Stream,
     a: libp2p::core::Multiaddr,
-    pk: &ecdsa::SecretKey,
+    pk: &Arc<Mutex<ecdsa::SecretKey>>,
     chan: &mpsc::Sender<PeerFile>,
 ) -> bool {
     web_sys::console::log_1(&JsValue::from("Handshake stage 1 0"));
@@ -124,29 +124,34 @@ pub async fn ceive(
 
     // web_sys::console::log_1(&JsValue::from(format!("Got underlay {}!", underlay)));
 
-    let mut step_1 = etiquette_1::Ack::default();
-
-    let signer: PrivateKeySigner = PrivateKeySigner::from_slice(&pk.to_bytes()).unwrap();
-    let addrep = signer.address();
-    let addre = addrep.to_vec();
-
-    let mut bufidl: [u8; 8] = [0; 8];
-    byteorder::LittleEndian::write_u64(&mut bufidl, 10_u64);
-    let byteslice = [addre.as_slice(), &bufidl].concat();
+    let overlay;
+    let signature;
     let nonce: [u8; 32] = [0; 32];
-    let byteslice2 = [byteslice, (&nonce).to_vec()].concat();
-    let overlayp = keccak256(byteslice2);
-    let overlay = &overlayp;
+    let mut step_1 = etiquette_1::Ack::default();
+    {
+        let signer: PrivateKeySigner =
+            PrivateKeySigner::from_slice(&pk.lock().await.to_bytes()).unwrap();
+        let addrep = signer.address();
+        let addre = addrep.to_vec();
 
-    let hsprefix: &[u8] = &"bee-handshake-".to_string().into_bytes();
+        let mut bufidl: [u8; 8] = [0; 8];
+        byteorder::LittleEndian::write_u64(&mut bufidl, 10_u64);
+        let byteslice = [addre.as_slice(), &bufidl].concat();
 
-    let mut bufidb: [u8; 8] = [0; 8];
-    byteorder::BigEndian::write_u64(&mut bufidb, 10_u64);
-    let byteslice3 = [hsprefix.to_vec(), underlay.clone()].concat();
-    let byteslice4 = [byteslice3, overlay.to_vec()].concat();
-    let byteslice5 = [byteslice4, bufidb.to_vec()].concat();
+        let byteslice2 = [byteslice, (&nonce).to_vec()].concat();
+        let overlayp = keccak256(byteslice2);
+        overlay = overlayp;
 
-    let signature = signer.sign_message(&byteslice5).await.unwrap();
+        let hsprefix: &[u8] = &"bee-handshake-".to_string().into_bytes();
+
+        let mut bufidb: [u8; 8] = [0; 8];
+        byteorder::BigEndian::write_u64(&mut bufidb, 10_u64);
+        let byteslice3 = [hsprefix.to_vec(), underlay.clone()].concat();
+        let byteslice4 = [byteslice3, overlay.to_vec()].concat();
+        let byteslice5 = [byteslice4, bufidb.to_vec()].concat();
+
+        signature = signer.sign_message(&byteslice5).await.unwrap();
+    }
 
     let mut step_1_ad = etiquette_1::BzzAddress::default();
 
@@ -696,7 +701,7 @@ pub async fn connection_handler(
     self_ephemeral: libp2p::core::Multiaddr,
     mut control: stream::Control,
     a: &libp2p::core::Multiaddr,
-    pk: &ecdsa::SecretKey,
+    pk: &Arc<Mutex<ecdsa::SecretKey>>,
     chan: &mpsc::Sender<PeerFile>,
 ) -> bool {
     web_sys::console::log_1(&JsValue::from("Handshake stage 0"));
@@ -721,7 +726,7 @@ pub async fn connection_handler(
         self_ephemeral,
         stream,
         a.clone(),
-        &pk.clone(),
+        &pk,
         chan,
     )
     .await

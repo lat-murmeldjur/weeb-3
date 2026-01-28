@@ -149,7 +149,7 @@ const PROTO_LOOP_INTERRUPTOR: f64 = 50.0;
 #[wasm_bindgen]
 pub struct Sekirei {
     swarm: Arc<Mutex<Swarm<Behaviour>>>,
-    secret_key: Mutex<SecretKey>,
+    secret_key: Arc<Mutex<SecretKey>>,
     wings: Mutex<Arc<Wings>>,
     log_port: (mpsc::Sender<String>, mpsc::Receiver<String>),
     message_port: (
@@ -549,7 +549,7 @@ impl Sekirei {
         let (b_out, b_in) = mpsc::channel::<(String, mpsc::Sender<String>, bool)>();
 
         return Sekirei {
-            secret_key: Mutex::new(secret_key),
+            secret_key: Arc::new(Mutex::new(secret_key)),
             swarm: Arc::new(Mutex::new(swarm)),
             wings: Mutex::new(Arc::new(Wings {
                 connected_peers: connected_peers,
@@ -1718,7 +1718,7 @@ impl Sekirei {
                                 self_ephemeral,
                                 ctrl3.clone(),
                                 &addr3.clone(),
-                                &(*self.secret_key.lock().await),
+                                &(self.secret_key.clone()),
                                 &accounting_peer_chan_outgoing.clone(),
                             )
                             .await;
