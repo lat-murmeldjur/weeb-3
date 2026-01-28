@@ -1,5 +1,4 @@
 #![cfg(target_arch = "wasm32")]
-
 use async_lock::Semaphore;
 use async_std::sync::{Arc, Mutex};
 use wasm_bindgen_futures::spawn_local;
@@ -862,7 +861,7 @@ impl Sekirei {
                                 }) => {
                                     //
                                 }
-                                Some(SwarmEvent::ConnectionClosed { peer_id, .. }) => {
+                                Some(SwarmEvent::ConnectionClosed { peer_id, endpoint, .. }) => {
                                     {
                                         let mut connected_peers_map = wings.connected_peers.lock().await;
                                         let mut overlay_peers_map = wings.overlay_peers.lock().await;
@@ -885,12 +884,19 @@ impl Sekirei {
                                                 }
                                             };
                                             connected_peers_map.remove(&peer_id);
-
-                                            self.interface_log(format!("Disconnected from peer {}", &ol0));
+                                            self.interface_log(format!("Disconnected from peer {} {:#?}", &ol0, endpoint));
                                         };
                                         let mut connection_attempts_map = wings.connection_attempts.lock().await;
                                         if connection_attempts_map.contains(&peer_id) {
                                             connection_attempts_map.remove(&peer_id);
+                                        }
+                                        let mut bzzaddr = etiquette_2::BzzAddress::default();
+                                        match endpoint {
+                                            libp2p::core::ConnectedPoint::Dialer { ref address, .. } => {
+                                                bzzaddr.underlay = address.to_vec();
+                                                let _ = connections_instructions_chan_outgoing.send((bzzaddr, false, (Date::now() as u64)));
+                                            }
+                                            _ => {}
                                         }
                                     }
                                     let mut accounting = wings.accounting_peers.lock().await;
@@ -1711,6 +1717,8 @@ impl Sekirei {
                                 }
                                 async_std::task::sleep(Duration::from_millis(100)).await;
                             };
+
+                            async_std::task::sleep(Duration::from_millis(100)).await;
 
                             connection_handler(
                                 id,
