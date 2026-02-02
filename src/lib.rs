@@ -886,9 +886,15 @@ impl Sekirei {
                                             connected_peers_map.remove(&peer_id);
                                             self.interface_log(format!("Disconnected from peer {} {:#?}", &ol0, endpoint));
                                         };
+                                        {
                                         let mut connection_attempts_map = wings.connection_attempts.lock().await;
-                                        if connection_attempts_map.contains(&peer_id) {
-                                            connection_attempts_map.remove(&peer_id);
+                                            if connection_attempts_map.contains(&peer_id) {
+                                                connection_attempts_map.remove(&peer_id);
+                                            }
+                                        }
+                                        {
+                                            let mut map = wings.self_ephemerals.lock().await;
+                                            map.remove(&peer_id);
                                         }
                                         let mut bzzaddr = etiquette_2::BzzAddress::default();
                                         match endpoint {
@@ -1670,73 +1676,74 @@ impl Sekirei {
             }
         };
 
+        const MAX_CONCURRENT_HANDSHAKES: usize = 2;
+        let handshake_semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_HANDSHAKES));
         let hive_joiner = async {
             let mut timelast = Date::now();
-            loop {
-                let mut handshake_joiner = Vec::new();
 
+            loop {
                 #[allow(irrefutable_let_patterns)]
                 while let that = connections_instructions_chan_incoming.try_recv() {
-                    if !that.is_err() {
-                        let handle = async {
-                            web_sys::console::log_1(&JsValue::from(format!(
-                                "Entering Handshake Joiner"
-                            )));
-                            let (bzzaddr0, bootn, _dialat) = that.unwrap();
-
-                            let addr3 =
-                                libp2p::core::Multiaddr::try_from(bzzaddr0.underlay).unwrap();
-                            let id = match try_from_multiaddr(&addr3) {
-                                Some(aok) => aok,
-                                _ => return,
-                            };
-
-                            let nid: u64;
-                            {
-                                let nid0 = self.network_id.lock().await.clone();
-                                nid = nid0.clone();
-                            }
-
-                            if bootn {
-                                let mut bootnodes_set = wings.bootnodes.lock().await;
-                                bootnodes_set.insert(id.to_string());
-                            }
-
-                            // if dialat + 1000 > now {
-                            //     // 6400
-                            //     async_std::task::sleep(Duration::from_millis(1000 + dialat - now))
-                            //         .await;
-                            // }
-
-                            let self_ephemeral: Multiaddr = loop {
-                                {
-                                    let map = wings.self_ephemerals.lock().await;
-                                    if let Some(addr) = map.get(&id) {
-                                        break addr.clone(); // found it, break the loop with the cloned address
-                                    }
-                                }
-                                async_std::task::sleep(Duration::from_millis(100)).await;
-                            };
-
-                            async_std::task::sleep(Duration::from_millis(100)).await;
-
-                            connection_handler(
-                                id,
-                                nid,
-                                self_ephemeral,
-                                ctrl3.clone(),
-                                &addr3.clone(),
-                                &(self.secret_key.clone()),
-                                &accounting_peer_chan_outgoing.clone(),
-                            )
-                            .await;
-                        };
-                        handshake_joiner.push(handle);
-                    } else {
+                    if that.is_err() {
                         break;
                     }
+
+                    let that = that.unwrap();
+                    let semaphore = handshake_semaphore.clone();
+                    let ctrl3 = ctrl3.clone();
+                    let accounting_peer_chan_outgoing = accounting_peer_chan_outgoing.clone();
+                    let secret_key = self.secret_key.clone();
+                    let nid: u64;
+                    {
+                        let nid0 = self.network_id.lock().await.clone();
+                        nid = nid0.clone();
+                    }
+
+                    let wings = wings.clone();
+
+                    spawn_local(async move {
+                        let _permit = semaphore.acquire().await;
+
+                        web_sys::console::log_1(&JsValue::from("Entering Handshake Joiner"));
+
+                        let (bzzaddr0, bootn, _dialat) = that;
+
+                        let addr3 = libp2p::core::Multiaddr::try_from(bzzaddr0.underlay).unwrap();
+
+                        let id = match try_from_multiaddr(&addr3) {
+                            Some(aok) => aok,
+                            None => return,
+                        };
+
+                        if bootn {
+                            let mut bootnodes_set = wings.bootnodes.lock().await;
+                            bootnodes_set.insert(id.to_string());
+                        }
+
+                        let self_ephemeral: Multiaddr = loop {
+                            {
+                                let map = wings.self_ephemerals.lock().await;
+                                if let Some(addr) = map.get(&id) {
+                                    break addr.clone();
+                                }
+                            }
+                            async_std::task::sleep(Duration::from_millis(100)).await;
+                        };
+
+                        async_std::task::sleep(Duration::from_millis(100)).await;
+
+                        connection_handler(
+                            id,
+                            nid,
+                            self_ephemeral,
+                            ctrl3,
+                            &addr3,
+                            &secret_key,
+                            &accounting_peer_chan_outgoing,
+                        )
+                        .await;
+                    });
                 }
-                join_all(handshake_joiner).await;
 
                 let timenow = Date::now();
                 let seg = timenow - timelast;
