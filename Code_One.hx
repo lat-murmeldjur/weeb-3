@@ -22,6 +22,7 @@ class Code_One {
 		Sys.putEnv("RUSTFLAGS", null);
 
 		if ( build[0] && wbuild[0]) {
+			clientele('cp', [ './static/example.html', './docs/' ], count);
 			clientele('cp', [ './static/index.html', './docs/' ], count);
 			clientele('cp', [ './static/404.html', './docs/' ], count);
 			clientele('cp', [ './static/weeb_3.js', './docs/' ], count);

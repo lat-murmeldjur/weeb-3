@@ -2,13 +2,39 @@
 
 use crate::{Sekirei, decode_resources};
 use async_std::sync::Arc;
+use async_std::task;
 use js_sys::Object;
 use js_sys::Reflect;
 use js_sys::{Array, Uint8Array};
+use libp2p::futures::future::join_all;
 use std::time::Duration;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::spawn_local;
 use web_sys::{File, FilePropertyBag};
+
+#[wasm_bindgen]
+pub struct BootstrapNode {
+    multiaddr: String,
+    usable: bool,
+}
+
+#[wasm_bindgen]
+impl BootstrapNode {
+    #[wasm_bindgen(constructor)]
+    pub fn new(multiaddr: String, usable: bool) -> BootstrapNode {
+        BootstrapNode { multiaddr, usable }
+    }
+
+    #[wasm_bindgen(getter)]
+    pub fn multiaddr(&self) -> String {
+        self.multiaddr.clone()
+    }
+
+    #[wasm_bindgen(getter)]
+    pub fn usable(&self) -> bool {
+        self.usable
+    }
+}
 
 fn resource_to_js(bytes: Vec<u8>, mime: String, path: String) -> Object {
     let obj = Object::new();
@@ -48,8 +74,9 @@ impl SekireiNo103 {
     }
 
     #[wasm_bindgen(js_name = start)]
-    pub fn start(&self, bootnode_multiaddr: String, network_id: String) {
+    pub fn start(&self, bootstrap_nodes: Vec<BootstrapNode>, network_id: String) {
         let s = self.inner.clone();
+
         spawn_local(async move {
             let s0 = s.clone();
             spawn_local(async move {
@@ -57,11 +84,21 @@ impl SekireiNo103 {
             });
 
             async_std::task::sleep(Duration::from_millis(600)).await;
-            if !bootnode_multiaddr.is_empty() {
-                let _ = s
-                    .change_bootnode_address(bootnode_multiaddr, network_id, false)
-                    .await;
-            }
+
+            let futures = bootstrap_nodes.into_iter().map(|node| {
+                let s_clone = s.clone();
+                let nid = network_id.clone();
+
+                async move {
+                    if !node.multiaddr.is_empty() {
+                        let _ = s_clone
+                            .change_bootnode_address(node.multiaddr, nid, node.usable)
+                            .await;
+                    }
+                }
+            });
+
+            join_all(futures).await;
         });
     }
 
