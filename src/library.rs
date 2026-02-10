@@ -2,7 +2,6 @@
 
 use crate::{Sekirei, decode_resources};
 use async_std::sync::Arc;
-use async_std::task;
 use js_sys::Object;
 use js_sys::Reflect;
 use js_sys::{Array, Uint8Array};
@@ -109,7 +108,6 @@ impl SekireiNo103 {
 
         let out = Array::new();
 
-        // Helper to build { path, file } objects
         fn make_entry(path: &str, file: &JsValue) -> JsValue {
             let obj = Object::new();
             Reflect::set(&obj, &JsValue::from("path"), &JsValue::from(path)).expect("set path");
@@ -117,7 +115,6 @@ impl SekireiNo103 {
             obj.into()
         }
 
-        // Keep your "index" file first
         if let Some(pos) = data.iter().position(|(_, _, p)| *p == indx) {
             let (bytes, mime, path) = data.remove(pos);
             let file = make_js_file(bytes, &mime, &path); // JsValue or File→JsValue
@@ -132,6 +129,28 @@ impl SekireiNo103 {
         }
 
         out
+    }
+
+    #[wasm_bindgen(js_name = postPushChunk)]
+    pub async fn post_push_chunk_js(
+        &self,
+        data: Vec<u8>,          // including span, soc parts, etc, everything
+        soc: bool,              // whether this is an soc
+        chunk_address: Vec<u8>, // soc address if soc, cac address if cac
+        stamp: Vec<u8>,         // stamp bytes
+    ) -> String {
+        let raw = self
+            .inner
+            .post_push_chunk(data, soc, chunk_address, stamp)
+            .await;
+
+        let (resources, indx) = decode_resources(raw);
+
+        if let Some((bytes, _mime, _path)) = resources.into_iter().find(|(_, _, p)| *p == indx) {
+            String::from_utf8(bytes).unwrap_or_else(|_| "Invalid UTF-8 result".to_string())
+        } else {
+            "No upload result returned".to_string()
+        }
     }
 
     pub async fn upload(
@@ -182,20 +201,38 @@ impl SekireiNo103 {
 
 /*
 
-import init, { Sekirei_No_103 } from "./pkg/weeb_3.js";
+import init, { SekireiNo103, BootstrapNode } from "./pkg/weeb_3.js";
 await init();
 
-const node = new Sekirei_No_103();
-node.start("/ip4/203.0.113.5/udp/8443/webrtc-direct/p2p/12D3K...", "10");
+const node = new SekireiNo103();
 
-// retrieve now returns: Array<{ path: string, file: File }>
-const entries = await node.retrieve("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+const BOOTSTRAP_NODES = [
+  new BootstrapNode(
+    "/ip4/167.235.96.31/tcp/32535/tls/sni/167-235-96-31.k2k4r8n9x80nshvozftjmg4klymgjtdflwxiovfx63yc6917dlrteva4.libp2p.direct/ws/p2p/QmYkyg5ZU3DzxhqfGyLYLVbk9DMdBagxe9q1AmHKNgt8ps",
+    true
+  ),
+  // … additional bootstrap nodes …
+];
+
+node.start(BOOTSTRAP_NODES, "10");
+
+const entries = await node.retrieve(
+  "695fceb3a8c212cd123e2e40d86ec08b52fe4fe6ca46687ce9ea69b8f05471f6aa25b5d4d41bf78b1db3479c048fd5fd8137ba844604821b71786196306b68e7"
+);
 
 for (const { path, file } of entries) {
   console.log(path, file.name, file.type, file.size);
-
   const url = URL.createObjectURL(file);
-  // do something with url...
+  // use url (preview, download, etc.)
 }
+
+// upload chunk with stamp (of course fill out Uint8Arrays with valid data)
+
+const data = new Uint8Array();
+const soc = false;
+const chunkAddress = new Uint8Array();
+const stamp = new Uint8Array();
+
+const result = await node.postPushChunk(data, soc, chunkAddress, stamp);
 
 */

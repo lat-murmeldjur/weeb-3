@@ -155,6 +155,10 @@ pub struct Sekirei {
         mpsc::Sender<(Vec<u8>, mpsc::Sender<Vec<u8>>)>,
         mpsc::Receiver<(Vec<u8>, mpsc::Sender<Vec<u8>>)>,
     ),
+    chunk_push_port: (
+        mpsc::Sender<(Vec<u8>, bool, Vec<u8>, Vec<u8>, mpsc::Sender<bool>)>,
+        mpsc::Receiver<(Vec<u8>, bool, Vec<u8>, Vec<u8>, mpsc::Sender<bool>)>,
+    ),
     upload_port: (
         mpsc::Sender<(
             Vec<Resource>,
@@ -426,6 +430,61 @@ impl Sekirei {
         );
     }
 
+    pub async fn post_push_chunk(
+        &self,
+        d: Vec<u8>,
+        soc: bool,
+        chunk_address: Vec<u8>,
+        stamp: Vec<u8>,
+    ) -> Vec<u8> {
+        let (chan_out, chan_in) = mpsc::channel::<bool>();
+
+        let chunk_address0 = chunk_address.clone();
+
+        let _ = self
+            .chunk_push_port
+            .0
+            .send((d, soc, chunk_address, stamp, chan_out));
+
+        let mut timelast = Date::now();
+
+        loop {
+            if let Ok(result) = chan_in.try_recv() {
+                if result {
+                    let result_data = vec![(
+                        format!("Upload result: success").as_bytes().to_vec(),
+                        "text/plain".to_string(),
+                        "Upload result".to_string(),
+                    )];
+                    let result_hex = hex::encode(&chunk_address0);
+
+                    return encode_resources(result_data, result_hex);
+                } else {
+                    let result_data = vec![(
+                        format!("Upload result: failure").as_bytes().to_vec(),
+                        "text/plain".to_string(),
+                        "... result ...".to_string(),
+                    )];
+                    let result_hex = hex::encode(&chunk_address0);
+
+                    return encode_resources(result_data, result_hex);
+                }
+            }
+
+            let timenow = Date::now();
+            let seg = timenow - timelast;
+
+            if seg < EVENT_LOOP_INTERRUPTOR {
+                async_std::task::sleep(Duration::from_millis(
+                    (EVENT_LOOP_INTERRUPTOR - seg) as u64,
+                ))
+                .await;
+            }
+
+            timelast = Date::now();
+        }
+    }
+
     pub async fn acquire(&self, address: String) -> Vec<u8> {
         let (chan_out, chan_in) = mpsc::channel::<Vec<u8>>();
         let valaddr_0 = hex::decode(&address);
@@ -546,6 +605,8 @@ impl Sekirei {
             mpsc::Sender<Vec<u8>>,
         )>();
         let (b_out, b_in) = mpsc::channel::<(String, mpsc::Sender<String>, bool)>();
+        let (chunk_push_port_out, chunk_push_port_in) =
+            mpsc::channel::<(Vec<u8>, bool, Vec<u8>, Vec<u8>, mpsc::Sender<bool>)>();
 
         return Sekirei {
             secret_key: Arc::new(Mutex::new(secret_key)),
@@ -564,6 +625,7 @@ impl Sekirei {
             log_port: (log_port_out, log_port_in),
             message_port: (m_out, m_in),
             upload_port: (u_out, u_in),
+            chunk_push_port: (chunk_push_port_out, chunk_push_port_in),
             bootnode_port: (b_out, b_in),
             network_id: Mutex::new(10_u64),
             ongoing_connections: Mutex::new(0_u64),
@@ -1422,6 +1484,41 @@ impl Sekirei {
             }
         };
 
+        let push_chunk_port_handle = async {
+            let mut timelast = Date::now();
+
+            loop {
+                #[allow(irrefutable_let_patterns)]
+                while let incoming = self.chunk_push_port.1.try_recv() {
+                    if !incoming.is_err() {
+                        let (d, soc, chunk_address, stamp, feedback) = incoming.unwrap();
+
+                        let _ = chunk_upload_chan_outgoing.send((
+                            d,
+                            soc,
+                            chunk_address,
+                            stamp,
+                            feedback,
+                        ));
+                    } else {
+                        break;
+                    }
+                }
+
+                let timenow = Date::now();
+                let seg = timenow - timelast;
+
+                if seg < PROTO_LOOP_INTERRUPTOR {
+                    async_std::task::sleep(Duration::from_millis(
+                        (PROTO_LOOP_INTERRUPTOR - seg) as u64,
+                    ))
+                    .await;
+                }
+
+                timelast = Date::now();
+            }
+        };
+
         let retrieve_data_handle = async {
             let mut timelast = Date::now();
             loop {
@@ -1765,6 +1862,7 @@ impl Sekirei {
             push_handle,
             push_data_handle,
             push_chunk_handle,
+            push_chunk_port_handle,
             swarm_event_handle_0,
             swarm_event_handle_1,
             swarm_event_handle_2,
