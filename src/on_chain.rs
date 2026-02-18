@@ -17,6 +17,8 @@ use hex;
 // use prost::Message;
 use serde::Serialize;
 
+use crate::{is_mainnet, is_testnet_official};
+
 #[derive(Clone, Debug)]
 pub struct Cheque {
     pub chequebook: EthAddress,
@@ -165,13 +167,62 @@ impl ChequebookClient {
     }
 }
 
-const POSTAGE_CONTRACT_ADDR: &str = "cdfdC3752caaA826fE62531E0000C40546eC56A6";
-const SBZZ_TOKEN_CONTRACT_ADDR: &str = "543dDb01Ba47acB11de34891cD86B675F04840db";
+const TESTNET_POSTAGE_CONTRACT_ADDR: &str = "cdfdC3752caaA826fE62531E0000C40546eC56A6";
+const MAINNET_POSTAGE_CONTRACT_ADDR: &str = "45a1502382541Cd610CC9068e88727426b696293";
+
+const TESTNET_TOKEN_CONTRACT_ADDR: &str = "543dDb01Ba47acB11de34891cD86B675F04840db";
+const MAINNET_TOKEN_CONTRACT_ADDR: &str = "dBF3Ea6F5beE45c02255B2c26a16F300502F68da";
+
 const BATCH_CREATED_TOPIC: &str =
     "9b088e2c89b322a3c1d81515e1c88db3d386d022926f0e2d0b9b5813b7413d58";
-const PRICE_ORACLE_ADDR: &str = "1814e9b3951Df0CB8e12b2bB99c5594514588936";
+
+const TESTNET_PRICE_ORACLE_ADDR: &str = "1814e9b3951Df0CB8e12b2bB99c5594514588936";
+const TESTNET_CHEQUEBOOK_FACTORY_ADDR: &str = "0fF044F6bB4F684a5A149B46D7eC03ea659F98A1";
+
+const MAINNET_PRICE_ORACLE_ADDR: &str = "A57A50a831B31c904A770edBCb706E03afCdbd94";
+const MAINNET_CHEQUEBOOK_FACTORY_ADDR: &str = "c2d5a532cf69aa9a1378737d8ccdef884b6e7420";
+
 const BUCKET_DEPTH: u8 = 16;
-const CHEQUEBOOK_FACTORY_ADDR: &str = "0fF044F6bB4F684a5A149B46D7eC03ea659F98A1";
+
+fn select_postage_contract_addr() -> Result<&'static str, JsError> {
+    if is_mainnet() {
+        Ok(MAINNET_POSTAGE_CONTRACT_ADDR)
+    } else if is_testnet_official() {
+        Ok(TESTNET_POSTAGE_CONTRACT_ADDR)
+    } else {
+        Err(JsError::new("No active network selected"))
+    }
+}
+
+fn select_token_contract_addr() -> Result<&'static str, JsError> {
+    if is_mainnet() {
+        Ok(MAINNET_TOKEN_CONTRACT_ADDR)
+    } else if is_testnet_official() {
+        Ok(TESTNET_TOKEN_CONTRACT_ADDR)
+    } else {
+        Err(JsError::new("No active network selected"))
+    }
+}
+
+fn select_price_oracle_addr() -> Result<&'static str, JsError> {
+    if is_mainnet() {
+        Ok(MAINNET_PRICE_ORACLE_ADDR)
+    } else if is_testnet_official() {
+        Ok(TESTNET_PRICE_ORACLE_ADDR)
+    } else {
+        Err(JsError::new("No active network selected"))
+    }
+}
+
+fn select_chequebook_factory_addr() -> Result<&'static str, JsError> {
+    if is_mainnet() {
+        Ok(MAINNET_CHEQUEBOOK_FACTORY_ADDR)
+    } else if is_testnet_official() {
+        Ok(TESTNET_CHEQUEBOOK_FACTORY_ADDR)
+    } else {
+        Err(JsError::new("No active network selected"))
+    }
+}
 
 pub type Web3Inst = web3::Web3<Eip1193>;
 pub type PostageContract = Contract<Eip1193>;
@@ -217,19 +268,24 @@ pub async fn connected_accounts(w3: &Web3Inst) -> Result<Vec<Address>, JsError> 
 }
 
 pub async fn postage_contract(w3: &Web3Inst) -> Result<PostageContract, JsError> {
-    let addr = ensure_addr(POSTAGE_CONTRACT_ADDR)?;
+    let addr_str = select_postage_contract_addr()?;
+    let addr = ensure_addr(addr_str)?;
+
     Contract::from_json(w3.eth(), addr, include_bytes!("./postagestamp.json"))
         .map_err(|e| JsError::new(&format!("Failed to load Postage contract: {e}")))
 }
 
 pub async fn token_contract(w3: &Web3Inst) -> Result<TokenContract, JsError> {
-    let addr = ensure_addr(SBZZ_TOKEN_CONTRACT_ADDR)?;
+    let addr_str = select_token_contract_addr()?;
+    let addr = ensure_addr(addr_str)?;
     Contract::from_json(w3.eth(), addr, include_bytes!("./sbzz.json"))
         .map_err(|e| JsError::new(&format!("Failed to load SBZZ token contract: {e}")))
 }
 
 pub async fn chequebook_factory(w3: &Web3Inst) -> Result<ChequebookFactory, JsError> {
-    let addr = ensure_addr(CHEQUEBOOK_FACTORY_ADDR)?;
+    let addr_str = select_chequebook_factory_addr()?;
+    let addr = ensure_addr(addr_str)?;
+
     Contract::from_json(w3.eth(), addr, include_bytes!("./factory.json"))
         .map_err(|e| JsError::new(&format!("Failed to load chequebook factory contract: {e}")))
 }
@@ -356,7 +412,8 @@ pub async fn create_postage_batch(
 
 pub fn parse_batch_id_from_receipt(receipt: &TransactionReceipt) -> Option<Vec<u8>> {
     let topic = H256::from_slice(&hex::decode(BATCH_CREATED_TOPIC).ok()?);
-    let contract = H160::from_slice(&hex::decode(POSTAGE_CONTRACT_ADDR).ok()?);
+    let addr_str = select_postage_contract_addr().ok()?;
+    let contract = H160::from_slice(&hex::decode(addr_str).ok()?);
 
     for log in receipt.logs.iter() {
         if log.topics.get(0) == Some(&topic) && log.address == contract {
@@ -446,7 +503,11 @@ pub async fn buy_postage_batch_with_payer(
     }
 
     let mut approve_opts = Options::default();
-    let spender = Address::from_slice(&hex::decode(POSTAGE_CONTRACT_ADDR).unwrap());
+    let addr_str = select_postage_contract_addr()?;
+    let spender = Address::from_slice(
+        &hex::decode(addr_str).map_err(|_| JsError::new("Invalid postage contract address"))?,
+    );
+
     let approve_gas = token
         .estimate_gas("approve", (spender, approve_amt), payer, Options::default())
         .await
@@ -532,7 +593,9 @@ pub struct BatchPurchaseResult {
 pub fn parse_chequebook_address_from_receipt(receipt: &TransactionReceipt) -> Option<Address> {
     let topic_bytes = keccak256(b"SimpleSwapDeployed(address)");
     let topic = H256::from_slice(&topic_bytes);
-    let factory = H160::from_slice(&hex::decode(CHEQUEBOOK_FACTORY_ADDR).ok()?);
+    let addr_str = select_chequebook_factory_addr().ok()?;
+    let factory = H160::from_slice(&hex::decode(addr_str).ok()?);
+
     for log in receipt.logs.iter() {
         if log.address == factory && log.topics.get(0) == Some(&topic) {
             let data = log.data.0.as_slice();
@@ -639,7 +702,8 @@ fn add_buffer(g: U256) -> U256 {
 }
 
 async fn price_oracle_contract(w3: &Web3Inst) -> Result<PriceOracleContract, JsError> {
-    let addr = ensure_addr(PRICE_ORACLE_ADDR)?;
+    let addr_str = select_price_oracle_addr()?;
+    let addr = ensure_addr(addr_str)?;
 
     Contract::from_json(w3.eth(), addr, include_bytes!("./priceoracle.json"))
         .map_err(|e| JsError::new(&format!("Failed to load PriceOracle contract: {e}")))

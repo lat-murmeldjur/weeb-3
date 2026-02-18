@@ -1,6 +1,7 @@
 #![cfg(target_arch = "wasm32")]
 use async_lock::Semaphore;
 use async_std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
 use wasm_bindgen_futures::spawn_local;
 
 use rand::rngs::OsRng;
@@ -80,6 +81,25 @@ use upload::*;
 
 mod ens;
 use ens::*;
+
+static MAINNET: AtomicBool = AtomicBool::new(false);
+static TESTNET_OFFICIAL: AtomicBool = AtomicBool::new(true);
+
+pub fn set_mainnet(value: bool) {
+    MAINNET.store(value, Ordering::Relaxed);
+}
+
+pub fn is_mainnet() -> bool {
+    MAINNET.load(Ordering::Relaxed)
+}
+
+pub fn set_testnet_official(value: bool) {
+    TESTNET_OFFICIAL.store(value, Ordering::Relaxed);
+}
+
+pub fn is_testnet_official() -> bool {
+    TESTNET_OFFICIAL.load(Ordering::Relaxed)
+}
 
 pub mod weeb_3 {
     pub mod etiquette_0 {
@@ -215,7 +235,21 @@ impl Sekirei {
             Ok(parsed_id) => {
                 web_sys::console::log_1(&JsValue::from(format!("Parsed network id {}", parsed_id)));
                 let mut nid = self.network_id.lock().await;
-                *nid = parsed_id;
+
+                if *nid != parsed_id {
+                    if parsed_id == 1 {
+                        set_mainnet(true);
+                        set_testnet_official(false);
+                    }
+
+                    if parsed_id == 10 {
+                        set_testnet_official(true);
+                        set_mainnet(false);
+                    }
+
+                    *nid = parsed_id;
+                    self.disconnect_all_peers().await;
+                }
             }
             _ => {}
         };
@@ -276,6 +310,40 @@ impl Sekirei {
                 "... result ...".to_string(),
             );
         }
+    }
+
+    async fn disconnect_all_peers(&self) {
+        {
+            let mut swarm = self.swarm.lock_arc().await;
+            let peers: Vec<_> = swarm.connected_peers().cloned().collect();
+            for peer in peers {
+                let _ = swarm.disconnect_peer_id(peer);
+            }
+        }
+
+        let wings = self.wings.lock().await;
+
+        wings.connected_peers.lock().await.clear();
+        wings.overlay_peers.lock().await.clear();
+        wings.connection_attempts.lock().await.clear();
+        wings.accounting_peers.lock().await.clear();
+        wings.bootnodes.lock().await.clear();
+        wings.ongoing_refreshments.lock().await.clear();
+        wings.ongoing_cheques.lock().await.clear();
+        wings.swap_beneficiaries.lock().await.clear();
+        wings.self_ephemerals.lock().await.clear();
+
+        {
+            let mut ongoing = self.ongoing_connections.lock().await;
+            *ongoing = 0;
+        }
+
+        {
+            let mut connected = self.connections.lock().await;
+            *connected = 0;
+        }
+
+        web_sys::console::log_1(&JsValue::from("All peers disconnected"));
     }
 
     pub async fn post_upload(
