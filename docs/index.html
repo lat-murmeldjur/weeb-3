@@ -114,82 +114,183 @@
             <div id="logsField"></div>
             </div>
         </div>
-                <script src="https://cdn.jsdelivr.net/npm/@walletconnect/ethereum-provider@2.23.3/dist/index.umd.js"></script>
+                        <script src="https://cdn.jsdelivr.net/npm/@walletconnect/ethereum-provider@2.23.3/dist/index.umd.js"></script>
+
         <script>
-            window.weeb3EnsureEip1193 = async function(projectId) {
-
-            if (window.ethereum?.request && !window.ethereum.connect) {
-                try {
-                    const accounts = await window.ethereum.request({ method: "eth_requestAccounts" });
-                    return { ok: true, accounts };
-                } catch (e) {
-                    return { ok:false, error:String(e?.message || e) };
+        function normalizeEthError(err) {
+            try {
+                if (err && typeof err === "object") {
+                    if (typeof err.code !== "number") {
+                        return { code: 4001, message: String(err.message || "Request rejected"), data: err };
+                    }
+                    if (typeof err.message !== "string") {
+                        return { code: err.code, message: JSON.stringify(err), data: err };
+                    }
+                    return err;
                 }
+                return { code: 4001, message: String(err) };
+            } catch (_) {
+                return { code: 4001, message: "Unknown provider error" };
             }
+        }
 
-            const WC = window["@walletconnect/ethereum-provider"];
-            if (!WC?.EthereumProvider)
-                return { ok:false, error:"WalletConnect not loaded" };
-
-            let uriResolve;
-            const uriPromise = new Promise(r => uriResolve = r);
-
-            const provider = await WC.EthereumProvider.init({
-                projectId,
-                chains: [11155111],
-                optionalChains: [1],
-                showQrModal: false,
-                rpcMap: {
-                    11155111: "https://rpc.sepolia.org",
-                    1: "https://cloudflare-eth.com"
-                },
-                metadata: {
-                    name: "weeb-3",
-                    description: "Swarm uploader",
-                    url: location.origin,
-                    icons: [location.origin + "/icon.png"]
-                }
-            });
-
-            provider.on("display_uri", uri => {
-                uriResolve(uri);
-
-                const link =
-                    "https://metamask.app.link/wc?uri=" +
-                    encodeURIComponent(uri);
-
-                location.href = link;
-            });
-
-            provider.connect();
-
-            await uriPromise;
-
-            await new Promise((resolve, reject) => {
-                provider.once("connect", resolve);
-                setTimeout(() => reject("Wallet connection timeout"), 90000);
-            });
-
-            window.ethereum = provider;
+        async function getInjectedAccounts(injected) {
+            try {
+                const accs = await injected.request({ method: "eth_accounts" });
+                if (accs && accs.length) return accs;
+            } catch (_) {}
 
             try {
-                let chainId = await provider.request({ method:"eth_chainId" });
+                return await injected.request({ method: "eth_requestAccounts" });
+            } catch (e) {
+                throw normalizeEthError(e);
+            }
+        }
 
-                if (chainId !== "0xaa36a7") {
-                    try {
-                        await provider.request({
-                            method:"wallet_switchEthereumChain",
-                            params:[{ chainId:"0xaa36a7" }]
-                        });
-                        chainId = "0xaa36a7";
-                    } catch (_) {}
+        function normalizeChainIdToHex(chainId) {
+            if (typeof chainId === "number") return ("0x" + chainId.toString(16)).toLowerCase();
+            const s = String(chainId).trim().toLowerCase();
+            if (s.startsWith("0x")) return s;
+            if (/^\d+$/.test(s)) return ("0x" + Number(s).toString(16)).toLowerCase();
+            return s;
+        }
+
+        window.weeb3EnsureEip1193 = async function(projectId) {
+            try {
+                if (window.ethereum && typeof window.ethereum.request === "function" && !window.ethereum.connect) {
+                    const accounts = await getInjectedAccounts(window.ethereum);
+                    return { ok: true, accounts, chainId: await window.ethereum.request({ method:"eth_chainId" }) };
                 }
 
-                const accounts = await provider.request({ method:"eth_accounts" });
+                const wc = window["@walletconnect/ethereum-provider"];
+                if (!wc?.EthereumProvider)
+                    return { ok:false, error:"WalletConnect UMD not loaded" };
 
-                return { ok:true, accounts, chainId };
+                if (!projectId)
+                    return { ok:false, error:"WalletConnect projectId required" };
+
+                const SEPOLIA = 11155111;
+                const SEPOLIA_HEX = "0xaa36a7";
+
+                let wcUriResolve;
+                const wcUriPromise = new Promise(r => wcUriResolve = r);
+
+                const provider = await wc.EthereumProvider.init({
+                    projectId,
+
+                    chains: [SEPOLIA],
+                    optionalChains: [1],
+
+                    showQrModal: false,
+
+                    rpcMap: {
+                        11155111: "https://rpc.sepolia.org"
+                    },
+
+                    metadata: {
+                        name: "weeb-3",
+                        description: "Swarm uploader",
+                        url: window.location.origin,
+                        icons: [window.location.origin + "/icon.png"]
+                    }
+                });
+
+                provider.on("display_uri", (uri) => {
+
+                    wcUriResolve(uri);
+
+                    const link =
+                        "https://metamask.app.link/wc?uri=" +
+                        encodeURIComponent(uri);
+
+                    location.href = link;
+                });
+
+                await provider.connect();
+
+                await wcUriPromise;
+
+                await new Promise((resolve, reject) => {
+                    provider.once("connect", resolve);
+                    setTimeout(() => reject("Wallet connection timeout"), 90000);
+                });
+
+                window.ethereum = provider;
+
+                const origRequest = provider.request.bind(provider);
+                provider.request = (args) =>
+                    origRequest(args).catch((e) => Promise.reject(normalizeEthError(e)));
+
+                let chainIdHex = null;
+
+                try {
+                    chainIdHex = await provider.request({ method: "eth_chainId" });
+
+                    if (normalizeChainIdToHex(chainIdHex) !== SEPOLIA_HEX) {
+
+                        try {
+                            await provider.request({
+                                method: "wallet_switchEthereumChain",
+                                params: [{ chainId: SEPOLIA_HEX }]
+                            });
+
+                            chainIdHex = SEPOLIA_HEX;
+
+                        } catch (_) {
+
+                            try {
+                                await provider.request({
+                                    method: "wallet_addEthereumChain",
+                                    params: [{
+                                        chainId: SEPOLIA_HEX,
+                                        chainName: "Sepolia",
+                                        nativeCurrency: {
+                                            name: "ETH",
+                                            symbol: "ETH",
+                                            decimals: 18
+                                        },
+                                        rpcUrls: ["https://rpc.sepolia.org"],
+                                        blockExplorerUrls: ["https://sepolia.etherscan.io"]
+                                    }]
+                                });
+
+                                await provider.request({
+                                    method: "wallet_switchEthereumChain",
+                                    params: [{ chainId: SEPOLIA_HEX }]
+                                });
+
+                                chainIdHex = SEPOLIA_HEX;
+
+                            } catch (_) {}
+                        }
+                    }
+
+                } catch (_) {}
+
+                let accounts = [];
+
+                try {
+                    accounts = await provider.request({ method:"eth_accounts" });
+                } catch (_) {}
+
+                if (!accounts || !accounts.length) {
+                    accounts = await provider.request({ method:"eth_requestAccounts" });
+                }
+
+                provider.on?.("accountsChanged", (a)=>console.log("accountsChanged",a));
+                provider.on?.("disconnect",(e)=>console.log("disconnect",e));
+                provider.on?.("chainChanged",(c)=>console.log("chainChanged",c));
+
+                return {
+                    ok:true,
+                    accounts,
+                    chainId: chainIdHex
+                };
+
             } catch(e) {
-                return { ok:false, error:String(e?.message || e) };
+
+                const err = normalizeEthError(e);
+                return { ok:false, error:`${err.code}: ${err.message}` };
             }
         };
         </script>     
