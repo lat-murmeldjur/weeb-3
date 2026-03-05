@@ -114,68 +114,84 @@
             <div id="logsField"></div>
             </div>
         </div>
-        <script src="https://cdn.jsdelivr.net/npm/@walletconnect/ethereum-provider@2.23.3/dist/index.umd.js"></script>
+                <script src="https://cdn.jsdelivr.net/npm/@walletconnect/ethereum-provider@2.23.3/dist/index.umd.js"></script>
         <script>
             window.weeb3EnsureEip1193 = async function(projectId) {
-                if (window.ethereum?.request) {
-                    const accounts = await window.ethereum.request({
-                        method: "eth_requestAccounts"
-                    });
+
+            if (window.ethereum?.request && !window.ethereum.connect) {
+                try {
+                    const accounts = await window.ethereum.request({ method: "eth_requestAccounts" });
                     return { ok: true, accounts };
+                } catch (e) {
+                    return { ok:false, error:String(e?.message || e) };
                 }
-    
-                const WC = window["@walletconnect/ethereum-provider"];
-                if (!WC?.EthereumProvider)
-                    return { ok:false, error:"WalletConnect not loaded" };
-    
-                const provider = await WC.EthereumProvider.init({
-                    projectId,
-                    chains: [11155111],
-                    optionalChains: [1],
-                    showQrModal: false,
-                    metadata: {
-                        name: "weeb-3",
-                        description: "Swarm uploader",
-                        url: location.origin,
-                        icons: [location.origin + "/icon.png"]
-                    },
-                    rpcMap: {
-                        11155111: "https://rpc.sepolia.org"
-                    }
-                });
-    
-                let wcUriResolve;
-                const wcUriPromise = new Promise(r => wcUriResolve = r);
-    
-                provider.on("display_uri", uri => {
-                    wcUriResolve(uri);
-                    const link =
-                        "https://metamask.app.link/wc?uri=" +
-                        encodeURIComponent(uri);
-                    location.href = link;
-                });
-    
-                provider.connect();
-    
-                await wcUriPromise;
-    
-                await new Promise((resolve, reject) => {
-                    provider.once("connect", resolve);
-                    setTimeout(() => reject("Wallet connection timeout"), 90000);
-                });
-    
-                window.ethereum = provider;
-    
-                const accounts = await provider.request({
-                    method: "eth_accounts"
-                });
-    
-                return {
-                    ok: true,
-                    accounts,
-                    chainId: await provider.request({ method:"eth_chainId" })
-                };
-            };
+            }
+
+            const WC = window["@walletconnect/ethereum-provider"];
+            if (!WC?.EthereumProvider)
+                return { ok:false, error:"WalletConnect not loaded" };
+
+            let uriResolve;
+            const uriPromise = new Promise(r => uriResolve = r);
+
+            const provider = await WC.EthereumProvider.init({
+                projectId,
+                chains: [11155111],
+                optionalChains: [1],
+                showQrModal: false,
+                rpcMap: {
+                    11155111: "https://rpc.sepolia.org",
+                    1: "https://cloudflare-eth.com"
+                },
+                metadata: {
+                    name: "weeb-3",
+                    description: "Swarm uploader",
+                    url: location.origin,
+                    icons: [location.origin + "/icon.png"]
+                }
+            });
+
+            provider.on("display_uri", uri => {
+                uriResolve(uri);
+
+                const link =
+                    "https://metamask.app.link/wc?uri=" +
+                    encodeURIComponent(uri);
+
+                location.href = link;
+            });
+
+            provider.connect();
+
+            await uriPromise;
+
+            await new Promise((resolve, reject) => {
+                provider.once("connect", resolve);
+                setTimeout(() => reject("Wallet connection timeout"), 90000);
+            });
+
+            window.ethereum = provider;
+
+            try {
+                let chainId = await provider.request({ method:"eth_chainId" });
+
+                if (chainId !== "0xaa36a7") {
+                    try {
+                        await provider.request({
+                            method:"wallet_switchEthereumChain",
+                            params:[{ chainId:"0xaa36a7" }]
+                        });
+                        chainId = "0xaa36a7";
+                    } catch (_) {}
+                }
+
+                const accounts = await provider.request({ method:"eth_accounts" });
+
+                return { ok:true, accounts, chainId };
+            } catch(e) {
+                return { ok:false, error:String(e?.message || e) };
+            }
+        };
         </script>     
         <script type="module" defer>
             async function requestPersistentStorage() {
