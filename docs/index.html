@@ -114,166 +114,317 @@
             <div id="logsField"></div>
             </div>
         </div>
-        <script src="https://unpkg.com/@walletconnect/ethereum-provider@2.23.3/dist/index.umd.js"></script>
+        <script src="https://cdn.jsdelivr.net/npm/@walletconnect/ethereum-provider@2.23.3/dist/index.umd.js"></script>
         <script>
-            window.weeb3EnsureEip1193 = async function(projectId) {
+        (() => {
+          const SEPOLIA = 11155111;
+          const SEPOLIA_HEX = "0xaa36a7";
 
-                if (window.ethereum && window.ethereum.request) {
-                    const accounts = await window.ethereum.request({
-                        method: "eth_requestAccounts"
-                    });
+          const RELAYS = [
+            "wss://relay.walletconnect.com",
+            "wss://relay.walletconnect.org",
+          ];
 
-                    return { ok:true, accounts };
-                }
+          const RPC_MAP = {
+            [SEPOLIA]: "https://rpc.sepolia.org",
+          };
 
-                const WC = window["@walletconnect/ethereum-provider"];
-                if (!WC || !WC.EthereumProvider)
-                    return { ok:false, error:"WalletConnect provider missing" };
+          function getState() {
+            if (!window.__weeb3_wc_state) {
+              window.__weeb3_wc_state = {
+                provider: null,
+                relayIdx: 0,
+                connectInFlight: false,
+                openedWalletThisAttempt: false,
+                wcUri: null,
+                lastAccounts: [],
+                lastChainId: null,
+              };
+            }
+            return window.__weeb3_wc_state;
+          }
 
-                const SEPOLIA = 11155111;
-                const SEPOLIA_HEX = "0xaa36a7";
+          function normalizeChainIdToHex(chainId) {
+            if (typeof chainId === "number") return "0x" + chainId.toString(16);
+            const s = String(chainId || "").trim().toLowerCase();
+            if (s.startsWith("0x")) return s;
+            if (/^\d+$/.test(s)) return "0x" + Number(s).toString(16);
+            return s;
+          }
 
-                const RELAYS = [
-                    "wss://relay.walletconnect.com",
-                    "wss://relay.walletconnect.org"
-                ];
+          function isRelayishError(e) {
+            const msg = String((e && (e.message ?? e)) ?? "");
+            return (
+              msg.includes("relay") ||
+              msg.includes("socket connection") ||
+              msg.includes("ERR_NAME_NOT_RESOLVED") ||
+              msg.includes("Couldn't establish socket") ||
+              msg.includes("Failed to fetch")
+            );
+          }
 
-                let relayIdx = 0;
-                let provider = null;
-                let wcUriResolve;
+          function sleep(ms) {
+            return new Promise(resolve => setTimeout(resolve, ms));
+          }
 
-                const wcUriPromise = new Promise(r => wcUriResolve = r);
+          async function waitFor(fn, {
+            timeoutMs = 90000,
+            intervalMs = 400,
+            label = "condition",
+          } = {}) {
+            const start = Date.now();
+            while (Date.now() - start < timeoutMs) {
+              try {
+                if (await fn()) return true;
+              } catch (_) {}
+              await sleep(intervalMs);
+            }
+            throw new Error(`Timed out waiting for ${label} (${Math.round(timeoutMs / 1000)}s)`);
+          }
 
-                async function initProvider() {
+          function openMetaMaskForUri(uri) {
+            const enc = encodeURIComponent(uri);
+            const nativeLink = `metamask://wc?uri=${enc}`;
+            const universalLink = `https://metamask.app.link/wc?uri=${enc}`;
 
-                    const relayUrl = RELAYS[relayIdx];
+            location.href = nativeLink;
+            setTimeout(() => {
+              location.href = universalLink;
+            }, 700);
+          }
 
-                    provider = await WC.EthereumProvider.init({
-                        projectId,
-                        relayUrl,
-                        showQrModal:false,
-                        metadata:{
-                            name:"weeb3",
-                            description:"Swarm uploader",
-                            url:location.origin,
-                            icons:[location.origin + "/icon.png"]
-                        },
-                        chains:[SEPOLIA],
-                        optionalChains:[SEPOLIA],
-                        rpcMap:{
-                            [SEPOLIA]:"https://rpc.sepolia.org"
-                        }
-                    });
+          async function teardownProvider() {
+            const s = getState();
+            try {
+              await s.provider?.disconnect?.();
+            } catch (_) {}
 
-                    provider.on("display_uri", uri => {
+            s.provider = null;
+            s.connectInFlight = false;
+            s.openedWalletThisAttempt = false;
+            s.wcUri = null;
+            s.lastAccounts = [];
+            s.lastChainId = null;
+          }
 
-                        wcUriResolve(uri);
+          async function ensureProvider(projectId) {
+            const s = getState();
+            if (s.provider) return s.provider;
 
-                        const link =
-                            "https://metamask.app.link/wc?uri=" +
-                            encodeURIComponent(uri);
+            const WC = window["@walletconnect/ethereum-provider"];
+            if (!WC?.EthereumProvider) {
+              throw new Error("WalletConnect EthereumProvider not loaded");
+            }
 
-                        location.href = link;
-                    });
+            const provider = await WC.EthereumProvider.init({
+              projectId,
+              relayUrl: RELAYS[s.relayIdx],
+              chains: [SEPOLIA],
+              optionalChains: [SEPOLIA],
+              showQrModal: false,
+              metadata: {
+                name: "weeb-3",
+                description: "Swarm uploader",
+                url: location.origin,
+                icons: [location.origin + "/icon.png"],
+              },
+              rpcMap: RPC_MAP,
+            });
 
-                    return provider;
-                }
+            provider.on("display_uri", (uri) => {
+              s.wcUri = uri;
 
-                try {
+              if (!s.connectInFlight) return;
+              if (s.openedWalletThisAttempt) return;
 
-                    provider = await initProvider();
+              s.openedWalletThisAttempt = true;
+              openMetaMaskForUri(uri);
+            });
 
-                    await provider.connect();
+            provider.on("accountsChanged", (accounts) => {
+              s.lastAccounts = Array.isArray(accounts) ? accounts : [];
+              console.log("WC accountsChanged:", s.lastAccounts);
+            });
 
-                    await wcUriPromise;
+            provider.on("chainChanged", (chainId) => {
+              s.lastChainId = normalizeChainIdToHex(chainId);
+              console.log("WC chainChanged:", s.lastChainId);
+            });
 
-                    await new Promise((resolve,reject)=>{
-                        provider.once("connect", resolve);
-                        setTimeout(()=>reject("Wallet connection timeout"),90000);
-                    });
+            provider.on("connect", (info) => {
+              console.log("WC connect:", info);
+            });
 
-                } catch(e) {
+            provider.on("disconnect", () => {
+              console.log("WC disconnect");
+              s.wcUri = null;
+              s.connectInFlight = false;
+              s.openedWalletThisAttempt = false;
+              s.lastAccounts = [];
+              s.lastChainId = null;
+            });
 
-                    const msg = String(e?.message || e);
+            s.provider = provider;
+            return provider;
+          }
 
-                    if (
-                        msg.includes("relay") ||
-                        msg.includes("socket") ||
-                        msg.includes("Failed to fetch")
-                    ) {
+          async function connectWithRelayFallback(projectId) {
+            const s = getState();
+            let provider = await ensureProvider(projectId);
 
-                        relayIdx = (relayIdx + 1) % RELAYS.length;
-                        provider = null;
+            // Avoid stale session/account state.
+            if (provider.session) {
+              try {
+                await provider.disconnect();
+              } catch (_) {}
+              s.wcUri = null;
+              s.lastAccounts = [];
+              s.lastChainId = null;
+            }
 
-                        provider = await initProvider();
-                        await provider.connect();
+            s.connectInFlight = true;
+            s.openedWalletThisAttempt = false;
 
-                        await wcUriPromise;
+            try {
+              await provider.connect(); 
+              return provider;
+            } catch (e) {
+              if (!isRelayishError(e)) throw e;
 
-                        await new Promise((resolve,reject)=>{
-                            provider.once("connect", resolve);
-                            setTimeout(()=>reject("Wallet connection timeout"),90000);
-                        });
+              console.warn("Primary relay failed, retrying with fallback relay", e);
+              await teardownProvider();
+              s.relayIdx = (s.relayIdx + 1) % RELAYS.length;
 
-                    } else {
-                        return { ok:false, error:msg };
-                    }
-                }
+              provider = await ensureProvider(projectId);
+              s.connectInFlight = true;
+              s.openedWalletThisAttempt = false;
 
-                window.ethereum = provider;
-                window.eth = provider;
+              await provider.connect(); 
+              return provider;
+            } finally {
+              s.connectInFlight = false;
+            }
+          }
 
-                const accounts = await provider.request({
-                    method:"eth_accounts"
+          async function getAuthorizedAccounts(provider) {
+            const s = getState();
+
+            try {
+              const accounts = await provider.request({ method: "eth_requestAccounts" });
+              if (Array.isArray(accounts) && accounts.length > 0) {
+                s.lastAccounts = accounts;
+                return accounts;
+              }
+            } catch (e) {
+              console.warn("eth_requestAccounts failed:", e);
+            }
+
+            // Fallback: wait until eth_accounts starts returning something.
+            await waitFor(async () => {
+              const accounts = await provider.request({ method: "eth_accounts" }).catch(() => []);
+              if (Array.isArray(accounts) && accounts.length > 0) {
+                s.lastAccounts = accounts;
+                return true;
+              }
+              return Array.isArray(s.lastAccounts) && s.lastAccounts.length > 0;
+            }, { label: "authorized account" });
+
+            return s.lastAccounts;
+          }
+
+          async function ensureSepolia(provider) {
+            let chainId = normalizeChainIdToHex(
+              await provider.request({ method: "eth_chainId" })
+            );
+
+            if (chainId === SEPOLIA_HEX) return chainId;
+
+            try {
+              await provider.request({
+                method: "wallet_switchEthereumChain",
+                params: [{ chainId: SEPOLIA_HEX }],
+              });
+            } catch (e) {
+              const code = e && (e.code ?? e?.data?.originalError?.code);
+
+              if (code === 4902) {
+                await provider.request({
+                  method: "wallet_addEthereumChain",
+                  params: [{
+                    chainId: SEPOLIA_HEX,
+                    chainName: "Sepolia",
+                    nativeCurrency: { name: "ETH", symbol: "ETH", decimals: 18 },
+                    rpcUrls: ["https://rpc.sepolia.org"],
+                    blockExplorerUrls: ["https://sepolia.etherscan.io"],
+                  }],
                 });
 
-                let chainId = await provider.request({
-                    method:"eth_chainId"
+                await provider.request({
+                  method: "wallet_switchEthereumChain",
+                  params: [{ chainId: SEPOLIA_HEX }],
+                });
+              } else {
+                throw e;
+              }
+            }
+
+            await waitFor(async () => {
+              const now = normalizeChainIdToHex(
+                await provider.request({ method: "eth_chainId" })
+              );
+              return now === SEPOLIA_HEX;
+            }, { label: "Sepolia network switch" });
+
+            return SEPOLIA_HEX;
+          }
+
+          window.weeb3EnsureEip1193 = async function(projectId) {
+            try {
+              const s = getState();
+
+              // Real injected provider (desktop extension / MetaMask in-app browser).
+              // Do not take this branch if we already created our own WC provider.
+              if (window.ethereum?.request && !s.provider) {
+                const accounts = await window.ethereum.request({
+                  method: "eth_requestAccounts",
+                });
+                const chainId = await window.ethereum.request({
+                  method: "eth_chainId",
                 });
 
-                if (chainId !== SEPOLIA_HEX) {
+                return { ok: true, accounts, chainId };
+              }
 
-                    try {
+              const provider = await connectWithRelayFallback(projectId);
 
-                        await provider.request({
-                            method:"wallet_switchEthereumChain",
-                            params:[{ chainId:SEPOLIA_HEX }]
-                        });
+              // Expose WC provider as EIP-1193 provider for rust-web3.
+              window.ethereum = provider;
 
-                    } catch(e) {
+              const accounts = await getAuthorizedAccounts(provider);
+              if (!Array.isArray(accounts) || accounts.length === 0) {
+                throw new Error(
+                  "Connected, but no wallet account was authorized. Approve the account connection in MetaMask and try again."
+                );
+              }
 
-                        if (e.code === 4902) {
+              const chainId = await ensureSepolia(provider);
 
-                            await provider.request({
-                                method:"wallet_addEthereumChain",
-                                params:[{
-                                    chainId:SEPOLIA_HEX,
-                                    chainName:"Sepolia",
-                                    nativeCurrency:{
-                                        name:"ETH",
-                                        symbol:"ETH",
-                                        decimals:18
-                                    },
-                                    rpcUrls:["https://rpc.sepolia.org"],
-                                    blockExplorerUrls:["https://sepolia.etherscan.io"]
-                                }]
-                            });
+              // Set again after connect/switch just to be explicit.
+              window.ethereum = provider;
 
-                            await provider.request({
-                                method:"wallet_switchEthereumChain",
-                                params:[{ chainId:SEPOLIA_HEX }]
-                            });
-
-                        }
-                    }
-                }
-
-                return {
-                    ok:true,
-                    accounts,
-                    chainId
-                };
-            };
+              return {
+                ok: true,
+                accounts,
+                chainId,
+              };
+            } catch (e) {
+              return {
+                ok: false,
+                error: String(e?.message || e),
+              };
+            }
+          };
+        })();
         </script>
         <script type="module" defer>
             async function requestPersistentStorage() {
