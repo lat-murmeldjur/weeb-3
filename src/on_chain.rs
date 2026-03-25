@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::str::FromStr;
 
 use wasm_bindgen::JsError;
@@ -15,7 +14,6 @@ use ethers::types::{Address as EthAddress, H256 as EthH256, Signature, U256 as E
 use ethers::utils::keccak256;
 use hex;
 // use prost::Message;
-use serde::Serialize;
 
 use crate::{is_mainnet, is_testnet_official};
 
@@ -32,15 +30,10 @@ pub struct Cheque {
 //     pub signature: Vec<u8>,
 // }
 
-#[derive(Serialize)]
 struct SignedChequeJson {
-    #[serde(rename = "Chequebook")]
     chequebook: String,
-    #[serde(rename = "Beneficiary")]
     beneficiary: String,
-    #[serde(rename = "CumulativePayout")]
-    cumulative_payout: u128,
-    #[serde(rename = "Signature")]
+    cumulative_payout: String,
     signature: String,
 }
 
@@ -49,7 +42,7 @@ impl SignedChequeJson {
         let chequebook = format!("{:#x}", cheque.chequebook);
         let beneficiary = format!("{:#x}", cheque.beneficiary);
 
-        let cumulative_payout = cheque.cumulative_payout.as_u128();
+        let cumulative_payout = cheque.cumulative_payout.to_string();
 
         #[allow(deprecated)]
         let signature = base64::encode(signature);
@@ -59,6 +52,14 @@ impl SignedChequeJson {
             cumulative_payout,
             signature,
         }
+    }
+
+    fn to_bytes(&self) -> Vec<u8> {
+        format!(
+            r#"{{"Chequebook":"{}","Beneficiary":"{}","CumulativePayout":{},"Signature":"{}"}}"#,
+            self.chequebook, self.beneficiary, self.cumulative_payout, self.signature
+        )
+        .into_bytes()
     }
 }
 
@@ -126,7 +127,6 @@ impl ChequeSigner {
 pub struct ChequebookClient {
     signer: ChequeSigner,
     chequebook: EthAddress,
-    last_payouts: HashMap<EthAddress, EthU256>,
 }
 
 impl ChequebookClient {
@@ -134,36 +134,24 @@ impl ChequebookClient {
         Self {
             signer: ChequeSigner::new(wallet, chain_id),
             chequebook,
-            last_payouts: HashMap::new(),
         }
     }
 
-    pub fn cumulative_payout_for(&self, beneficiary: &EthAddress) -> EthU256 {
-        self.last_payouts
-            .get(beneficiary)
-            .cloned()
-            .unwrap_or_else(EthU256::zero)
-    }
-
     pub fn prepare_emit_cheque_bytes(
-        &mut self,
+        &self,
         beneficiary: EthAddress,
-        amount: EthU256,
+        cumulative_payout: EthU256,
     ) -> Option<Vec<u8>> {
-        let last = self.cumulative_payout_for(&beneficiary);
-        let cumulative = last.checked_add(amount)?;
-
         let cheque = Cheque {
             chequebook: self.chequebook,
             beneficiary,
-            cumulative_payout: cumulative,
+            cumulative_payout,
         };
 
         let signature = self.signer.sign(&cheque)?;
-        self.last_payouts.insert(beneficiary, cumulative);
 
         let json = SignedChequeJson::from_cheque(&cheque, &signature);
-        serde_json::to_vec(&json).ok()
+        Some(json.to_bytes())
     }
 }
 

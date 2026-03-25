@@ -34,7 +34,10 @@ use crate::weeb_3::etiquette_7;
 use crate::weeb_3::etiquette_8;
 
 use crate::on_chain::ChequebookClient;
-use crate::persistence::{get_chequebook_address, get_chequebook_signer_key};
+use crate::persistence::{
+    get_chequebook_address, get_chequebook_last_issued_cheque_payout, get_chequebook_signer_key,
+    set_chequebook_last_issued_cheque_payout,
+};
 use ethers::signers::LocalWallet;
 use ethers::types::{Address as EthAddress, U256 as EthU256};
 
@@ -43,6 +46,85 @@ use crate::PSEUDOSETTLE_PROTOCOL;
 use crate::PUSHSYNC_PROTOCOL;
 use crate::RETRIEVAL_PROTOCOL;
 use crate::SWAP_PROTOCOL;
+
+struct OutgoingChequeState {
+    beneficiary_bytes: Vec<u8>,
+    beneficiary: EthAddress,
+    chequebook_bytes: Vec<u8>,
+    chequebook: EthAddress,
+    stored_cumulative_payout: EthU256,
+    effective_deduction: EthU256,
+    cheque_delta: EthU256,
+    cumulative_payout: EthU256,
+}
+
+fn outgoing_cheque_trace(peer: &PeerId, state: &OutgoingChequeState) -> String {
+    return format!(
+        "peer={} beneficiary={:#x} chequebook={:#x} stored_cumulative_payout={} effective_deduction={} cheque_delta={} cumulative_payout={}",
+        peer,
+        state.beneficiary,
+        state.chequebook,
+        state.stored_cumulative_payout,
+        state.effective_deduction,
+        state.cheque_delta,
+        state.cumulative_payout
+    );
+}
+
+async fn prepare_outgoing_cheque_state(
+    peer: &PeerId,
+    amount: u64,
+    beneficiaries: Arc<Mutex<HashMap<PeerId, (web3::types::Address, bool)>>>,
+    price: U256,
+    deduction: U256,
+) -> Option<OutgoingChequeState> {
+    let beneficiary_bytes_opt = {
+        let map = beneficiaries.lock().await;
+        map.get(peer).cloned()
+    };
+    let beneficiary_bytes = beneficiary_bytes_opt?.0.as_bytes().to_vec();
+    let beneficiary = EthAddress::from_slice(&beneficiary_bytes);
+
+    let chequebook_bytes = get_chequebook_address().await;
+    if chequebook_bytes.len() != 20 {
+        return None;
+    }
+    let chequebook = EthAddress::from_slice(&chequebook_bytes);
+
+    let last_payout_bytes =
+        get_chequebook_last_issued_cheque_payout(&chequebook_bytes, &beneficiary_bytes).await;
+    let stored_cumulative_payout = if last_payout_bytes.is_empty() {
+        EthU256::zero()
+    } else if last_payout_bytes.len() <= 32 {
+        let mut last_payout_buf = [0u8; 32];
+        let start = 32 - last_payout_bytes.len();
+        last_payout_buf[start..].copy_from_slice(&last_payout_bytes);
+        EthU256::from_big_endian(&last_payout_buf)
+    } else {
+        return None;
+    };
+
+    let effective_deduction = if stored_cumulative_payout.is_zero() {
+        EthU256::from(deduction)
+    } else {
+        EthU256::zero()
+    };
+    let cheque_delta = EthU256::from(amount).checked_mul(EthU256::from(price))?;
+    let cumulative_payout = stored_cumulative_payout
+        .checked_add(cheque_delta)?
+        .checked_add(effective_deduction)?;
+
+    return Some(OutgoingChequeState {
+        beneficiary_bytes,
+        beneficiary,
+        chequebook_bytes,
+        chequebook,
+        stored_cumulative_payout,
+        effective_deduction,
+        cheque_delta,
+        cumulative_payout,
+    });
+}
 
 pub async fn ceive(
     peer: PeerId,
@@ -162,7 +244,7 @@ pub async fn ceive(
     step_1.address = Some(step_1_ad);
     step_1.nonce = nonce.to_vec();
     step_1.network_id = network_id;
-    step_1.full_node = true;
+    step_1.full_node = false;
     step_1.welcome_message = "... Ara Ara ...".to_string();
 
     web_sys::console::log_1(&JsValue::from("Handshake stage 1 4"));
@@ -477,6 +559,32 @@ pub async fn issue(
         return;
     }
 
+    let wallet = match LocalWallet::from_bytes(&signer_key) {
+        Ok(w) => w,
+        Err(_) => {
+            let _ = chan.send((peer, false)).unwrap_or(());
+            web_sys::console::log_1(&JsValue::from(format!("Issue fail 2")));
+            return;
+        }
+    };
+
+    let cheque_state =
+        match prepare_outgoing_cheque_state(&peer, amount, beneficiaries.clone(), price, deduction)
+            .await
+        {
+            Some(state) => state,
+            None => {
+                let _ = chan.send((peer, false)).unwrap_or(());
+                web_sys::console::log_1(&JsValue::from(format!("Issue fail 3")));
+                return;
+            }
+        };
+
+    web_sys::console::log_1(&JsValue::from(format!(
+        "Issue cheque attempt {}",
+        outgoing_cheque_trace(&peer, &cheque_state)
+    )));
+
     let mut non_empty = etiquette_0::Headers::default();
 
     let mut price_header = etiquette_0::Header::default();
@@ -490,7 +598,7 @@ pub async fn issue(
     deduction_header.key = "deduction".to_string();
 
     let mut buf = [0u8; 32];
-    deduction.to_big_endian(&mut buf);
+    cheque_state.effective_deduction.to_big_endian(&mut buf);
     deduction_header.value = BigUint::from_bytes_be(&buf).to_bytes_be();
 
     non_empty.headers = vec![price_header, deduction_header];
@@ -507,8 +615,11 @@ pub async fn issue(
         Ok(_) => {}
         Err(_) => {
             chan.send((peer, false)).unwrap();
+            web_sys::console::log_1(&JsValue::from(format!(
+                "Issue cheque send failed {}",
+                outgoing_cheque_trace(&peer, &cheque_state)
+            )));
             web_sys::console::log_1(&JsValue::from(format!("Issue fail -2")));
-
             return;
         }
     };
@@ -521,8 +632,11 @@ pub async fn issue(
             Ok(a) => a,
             Err(_) => {
                 chan.send((peer, false)).unwrap();
+                web_sys::console::log_1(&JsValue::from(format!(
+                    "Issue cheque send failed {}",
+                    outgoing_cheque_trace(&peer, &cheque_state)
+                )));
                 web_sys::console::log_1(&JsValue::from(format!("Issue fail -1")));
-
                 return;
             }
         };
@@ -532,55 +646,22 @@ pub async fn issue(
         }
     }
 
-    let beneficiary_bytes_opt = {
-        let map = beneficiaries.lock().await;
-        map.get(&peer).cloned()
-    };
-    let beneficiary_bytes = match beneficiary_bytes_opt {
-        Some(b) => b.0.as_bytes().to_vec(),
-        _ => {
-            let _ = chan.send((peer, false)).unwrap_or(());
-            web_sys::console::log_1(&JsValue::from(format!("Issue fail 0")));
+    let client = ChequebookClient::new(cheque_state.chequebook, wallet, 11155111);
+
+    let cheque_json = match client
+        .prepare_emit_cheque_bytes(cheque_state.beneficiary, cheque_state.cumulative_payout)
+    {
+        Some(cheque_data) => cheque_data,
+        None => {
+            let _ = chan.send((peer, false));
+            web_sys::console::log_1(&JsValue::from(format!(
+                "Issue cheque send failed {}",
+                outgoing_cheque_trace(&peer, &cheque_state)
+            )));
+            web_sys::console::log_1(&"Issue fail 5".into());
             return;
         }
     };
-    let beneficiary = EthAddress::from_slice(&beneficiary_bytes);
-
-    let wallet = match LocalWallet::from_bytes(&signer_key) {
-        Ok(w) => w,
-        Err(_) => {
-            let _ = chan.send((peer, false)).unwrap_or(());
-            web_sys::console::log_1(&JsValue::from(format!("Issue fail 2")));
-            return;
-        }
-    };
-
-    let cb_addr_bytes = get_chequebook_address().await;
-    if cb_addr_bytes.len() != 20 {
-        let _ = chan.send((peer, false)).unwrap_or(());
-        web_sys::console::log_1(&JsValue::from(format!("Issue fail 3")));
-        return;
-    }
-
-    let chequebook_addr = EthAddress::from_slice(&cb_addr_bytes);
-
-    let mut client = ChequebookClient::new(chequebook_addr, wallet, 11155111);
-
-    let exchange_rate = EthU256::from(price);
-    let deduction = EthU256::from(deduction);
-    let send_amount = EthU256::from(amount)
-        .checked_mul(exchange_rate)
-        .and_then(|v| v.checked_add(deduction));
-
-    let cheque_json =
-        match send_amount.and_then(|amt| client.prepare_emit_cheque_bytes(beneficiary, amt)) {
-            Some(b) => b,
-            None => {
-                let _ = chan.send((peer, false));
-                web_sys::console::log_1(&"Issue fail 4".into());
-                return;
-            }
-        };
 
     let mut msg = etiquette_8::EmitCheque::default();
     msg.cheque = cheque_json;
@@ -592,13 +673,44 @@ pub async fn issue(
 
     if let Err(_) = stream.write_all(&bufw).await {
         let _ = chan.send((peer, false));
-        web_sys::console::log_1(&"Issue fail 5".into());
+        web_sys::console::log_1(&JsValue::from(format!(
+            "Issue cheque send failed {}",
+            outgoing_cheque_trace(&peer, &cheque_state)
+        )));
+        web_sys::console::log_1(&"Issue fail 6".into());
         return;
     }
 
     let _ = stream.flush().await;
+
+    let mut cumulative_payout_buf = [0u8; 32];
+    cheque_state
+        .cumulative_payout
+        .to_big_endian(&mut cumulative_payout_buf);
+    let cumulative_payout_bytes = cumulative_payout_buf.to_vec();
+    if !set_chequebook_last_issued_cheque_payout(
+        &cheque_state.chequebook_bytes,
+        &cheque_state.beneficiary_bytes,
+        &cumulative_payout_bytes,
+    )
+    .await
+    {
+        let _ = stream.close().await;
+        let _ = chan.send((peer, false));
+        web_sys::console::log_1(&JsValue::from(format!(
+            "Issue cheque send failed {}",
+            outgoing_cheque_trace(&peer, &cheque_state)
+        )));
+        web_sys::console::log_1(&"Issue fail 7".into());
+        return;
+    }
+
     let _ = stream.close().await;
 
+    web_sys::console::log_1(&JsValue::from(format!(
+        "Issue cheque send success {}",
+        outgoing_cheque_trace(&peer, &cheque_state)
+    )));
     web_sys::console::log_1(&JsValue::from(format!("Issue complete")));
     let _ = chan.send((peer, true)).unwrap_or(());
 }

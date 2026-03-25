@@ -1293,7 +1293,7 @@ impl Sekirei {
                                     refresh_handler(peer, amount2, ctrl7, &rco).await;
                                 };
                                 refresh_joiner.push(handle);
-                            } else if cheque_amt > 0 && false {
+                            } else if cheque_amt > 0 {
                                 let mut map = wings.ongoing_cheques.lock().await;
                                 if !map.contains_key(&peer) {
                                     map.insert(peer, cheque_amt);

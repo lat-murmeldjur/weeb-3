@@ -430,3 +430,34 @@ pub async fn get_chequebook_address() -> Vec<u8> {
 pub async fn set_chequebook_address(addr: &Vec<u8>) -> bool {
     return set_batch_field("chequebook_address".to_string(), addr).await;
 }
+
+fn chequebook_last_issued_cheque_payout_key(chequebook: &[u8], beneficiary: &[u8]) -> String {
+    return format!(
+        "swap_chequebook_last_issued_cheque_{}_{}",
+        hex::encode(chequebook),
+        hex::encode(beneficiary)
+    );
+}
+
+pub async fn get_chequebook_last_issued_cheque_payout(
+    chequebook: &[u8],
+    beneficiary: &[u8],
+) -> Vec<u8> {
+    return get_batch_field(chequebook_last_issued_cheque_payout_key(
+        chequebook,
+        beneficiary,
+    ))
+    .await;
+}
+
+pub async fn set_chequebook_last_issued_cheque_payout(
+    chequebook: &[u8],
+    beneficiary: &[u8],
+    payout: &Vec<u8>,
+) -> bool {
+    return set_batch_field(
+        chequebook_last_issued_cheque_payout_key(chequebook, beneficiary),
+        payout,
+    )
+    .await;
+}
