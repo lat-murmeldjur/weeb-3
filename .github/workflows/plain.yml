@@ -1,40 +1,115 @@
-# This is a basic workflow to help you get started with Actions
-
 name: CI
 
-# Controls when the workflow will run
 on:
-  # Triggers the workflow on push or pull request events but only for the "main" branch
   push:
-    branches: [ "main" ]
+    branches: ["main"]
   pull_request:
-    branches: [ "main" ]
-
-  # Allows you to run this workflow manually from the Actions tab
+    branches: ["main"]
   workflow_dispatch:
 
-# A workflow run is made up of one or more jobs that can run sequentially or in parallel
 jobs:
-  # This workflow contains a single job called "build"
   build:
-    # The type of runner that the job will run on
     runs-on: ubuntu-latest
-
-    # Steps represent a sequence of tasks that will be executed as part of the job
+    permissions:
+      contents: read
     steps:
-      # Checks-out your repository under $GITHUB_WORKSPACE, so your job can access it
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v5
         with:
-          submodules: 'true'
+          submodules: "true"
       - name: Install Protoc
         uses: arduino/setup-protoc@v3
-      # Runs wasm build
-      - name: Wasm Build
-        run: |
-          cargo install wasm-pack
-          RUSTFLAGS='--cfg getrandom_backend="wasm_js"' wasm-pack build --target web --out-dir static
-      # Runs cargo build
-      - name: Build 
+      - name: Install wasm target
+        run: rustup target add wasm32-unknown-unknown
+      - name: Install wasm-pack
+        run: cargo install wasm-pack --locked
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+      - name: Build
         run: cargo build --verbose
+      - name: Build npm package
+        env:
+          NPM_SCOPE: ${{ vars.NPM_SCOPE }}
+        run: |
+          set -euo pipefail
+          SCOPE_ARGS=()
+          if [ -n "${NPM_SCOPE:-}" ]; then
+            SCOPE_ARGS=(--scope "$NPM_SCOPE")
+          fi
+          RUSTFLAGS='--cfg getrandom_backend="wasm_js"' wasm-pack build --target web --out-dir static --out-name weeb_3 "${SCOPE_ARGS[@]}"
+          cd static
+          npm pkg delete files || true
+          npm pkg delete sideEffects || true
+          npm pkg delete exports || true
+          npm pkg delete keywords || true
+          npm pkg delete publishConfig || true
+          npm pkg set \
+            description="A Swarm client for browsers" \
+            main="./weeb_3.js" \
+            module="./weeb_3.js" \
+            types="./weeb_3.d.ts" \
+            repository.type="git" \
+            repository.url="git+https://github.com/lat-murmeldjur/weeb-3.git" \
+            bugs.url="https://github.com/lat-murmeldjur/weeb-3/issues" \
+            homepage="https://github.com/lat-murmeldjur/weeb-3#readme" \
+            publishConfig.access="public" \
+            publishConfig.registry="https://registry.npmjs.org/"
+          npm pkg set \
+            files[0]="snippets/web3-0742d85b024bb6f5/inline0.js" \
+            files[1]="weeb_3.d.ts" \
+            files[2]="weeb_3.js" \
+            files[3]="weeb_3_bg.wasm" \
+            files[4]="weeb_3_bg.wasm.d.ts" \
+            sideEffects[0]="./snippets/*" \
+            keywords[0]="bee" \
+            keywords[1]="browser" \
+            keywords[2]="swarm" \
+            keywords[3]="wasm" \
+            keywords[4]="webassembly" \
+            'exports[.].types=./weeb_3.d.ts' \
+            'exports[.].import=./weeb_3.js' \
+            'exports[.].default=./weeb_3.js'
+          if [ "${GITHUB_EVENT_NAME}" = "push" ] && [ "${GITHUB_REF}" = "refs/heads/main" ]; then
+            BASE_VERSION="$(node -p "require('./package.json').version.split('-')[0]")"
+            npm version "${BASE_VERSION}-main.${GITHUB_RUN_NUMBER}.${GITHUB_RUN_ATTEMPT}" --no-git-tag-version
+          fi
+      - name: Check npm pack contents
+        run: npm pack --dry-run ./static
+      - name: Upload npm package artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: npm-package
+          path: |
+            static/LICENSE
+            static/README.md
+            static/package.json
+            static/snippets/web3-0742d85b024bb6f5/inline0.js
+            static/weeb_3.d.ts
+            static/weeb_3.js
+            static/weeb_3_bg.wasm
+            static/weeb_3_bg.wasm.d.ts
 
-
+  publish-npm:
+    needs: build
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Download npm package artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: npm-package
+          path: .
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+      - name: Publish npm package
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish ./static

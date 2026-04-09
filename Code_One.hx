@@ -18,7 +18,7 @@ class Code_One {
 		clientele('cargo', ['build'], count, build);
 
 		Sys.putEnv("RUSTFLAGS", "--cfg getrandom_backend=\"wasm_js\"");
-		clientele('wasm-pack', [ '-v', 'build', '--target', 'web', '--out-dir', 'static'], count, wbuild);
+		clientele('wasm-pack', [ '-v', 'build', '--target', 'web', '--out-dir', 'static', '--out-name', 'weeb_3'], count, wbuild);
 		Sys.putEnv("RUSTFLAGS", null);
 
 		if ( build[0] && wbuild[0]) {
