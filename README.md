@@ -45,7 +45,7 @@ If you need to publish under an npm scope, set the `NPM_SCOPE` repository variab
 
 The GitHub Actions workflow rebuilds the wasm package from `static`, rewrites the generated `static/package.json` into the publishable npm shape, checks the tarball with `npm pack --dry-run`, and publishes it on every push to `main`.
 
-Published versions are derived from the Cargo version and the GitHub Actions run number as `<cargo-version>-main.<run_number>.<run_attempt>`, so each publish stays unique without hand-editing `package.json`.
+Published versions are rewritten to unique stable semver numbers derived from the Cargo version plus the GitHub Actions run number and retry attempt, so each `main` publish gets a new release version without hand-editing `package.json`.
 
 To make the publish step fully automatic, configure npm trusted publishing for this repository and the `plain.yml` workflow.
 

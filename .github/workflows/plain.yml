@@ -73,7 +73,8 @@ jobs:
             'exports[.].default=./weeb_3.js'
           if [ "${GITHUB_EVENT_NAME}" = "push" ] && [ "${GITHUB_REF}" = "refs/heads/main" ]; then
             BASE_VERSION="$(node -p "require('./package.json').version.split('-')[0]")"
-            npm version "${BASE_VERSION}-main.${GITHUB_RUN_NUMBER}.${GITHUB_RUN_ATTEMPT}" --no-git-tag-version
+            RELEASE_VERSION="$(node -e "const [major, minor, patch] = process.argv[1].split('.').map(Number); const run = Number(process.argv[2]); const attempt = Number(process.argv[3]); console.log([major, minor, patch + run * 1000 + attempt].join('.'))" "$BASE_VERSION" "$GITHUB_RUN_NUMBER" "$GITHUB_RUN_ATTEMPT")"
+            npm version "$RELEASE_VERSION" --no-git-tag-version
           fi
       - name: Check npm pack contents
         run: npm pack --dry-run ./static
