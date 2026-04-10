@@ -31,7 +31,7 @@ jobs:
         run: cargo build --verbose
       - name: Build npm package
         env:
-          NPM_SCOPE: ${{ vars.NPM_SCOPE }}
+          NPM_SCOPE: ${{ vars.NPM_SCOPE || github.repository_owner }}
         run: |
           set -euo pipefail
           SCOPE_ARGS=()
@@ -46,6 +46,7 @@ jobs:
           npm pkg delete keywords || true
           npm pkg delete publishConfig || true
           npm pkg set \
+            name="@${NPM_SCOPE}/weeb_3" \
             description="A Swarm client for browsers" \
             main="./weeb_3.js" \
             module="./weeb_3.js" \
@@ -113,4 +114,4 @@ jobs:
       - name: Publish npm package
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: npm publish ./static
+        run: npm publish ./static --access public

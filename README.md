@@ -32,14 +32,14 @@ The wasm-pack build now prepares the generated `static/package.json` for publish
 After publishing, the package can be used with the same API shape as `static/example.html`:
 
 ```js
-import init, { SekireiNo103, BootstrapNode } from "weeb_3";
+import init, { SekireiNo103, BootstrapNode } from "@lat-murmeldjur/weeb_3";
 
 await init();
 
 const weeb3node = new SekireiNo103();
 ```
 
-If you need to publish under an npm scope, set the `NPM_SCOPE` repository variable in GitHub Actions before pushing to `main`.
+The workflow defaults to publishing under the GitHub repository owner scope. If you need a different npm scope, set the `NPM_SCOPE` repository variable in GitHub Actions before pushing to `main`.
 
 ## Automated publishing
 
