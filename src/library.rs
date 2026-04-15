@@ -1,6 +1,6 @@
 #![cfg(target_arch = "wasm32")]
 
-use crate::{Sekirei, decode_resources};
+use crate::{Weeb3, decode_resources};
 use async_std::sync::Arc;
 use js_sys::Object;
 use js_sys::Reflect;
@@ -59,16 +59,16 @@ fn make_js_file(bytes: Vec<u8>, mime: &str, name: &str) -> File {
 }
 
 #[wasm_bindgen]
-pub struct SekireiNo103 {
-    inner: Arc<Sekirei>,
+pub struct Weeb3No103 {
+    inner: Arc<Weeb3>,
 }
 
 #[wasm_bindgen]
-impl SekireiNo103 {
+impl Weeb3No103 {
     #[wasm_bindgen(constructor)]
-    pub fn new() -> SekireiNo103 {
-        SekireiNo103 {
-            inner: Arc::new(Sekirei::new("".to_string())),
+    pub fn new() -> Weeb3No103 {
+        Weeb3No103 {
+            inner: Arc::new(Weeb3::new("".to_string())),
         }
     }
 
@@ -201,10 +201,10 @@ impl SekireiNo103 {
 
 /*
 
-import init, { SekireiNo103, BootstrapNode } from "./pkg/weeb_3.js";
+import init, { Weeb3No103, BootstrapNode } from "./pkg/weeb_3.js";
 await init();
 
-const node = new SekireiNo103();
+const node = new Weeb3No103();
 
 const BOOTSTRAP_NODES = [
   new BootstrapNode(

@@ -166,7 +166,7 @@ const PROTO_LOOP_INTERRUPTOR: f64 = 50.0;
 // }
 
 #[wasm_bindgen]
-pub struct Sekirei {
+pub struct Weeb3 {
     swarm: Arc<Mutex<Swarm<Behaviour>>>,
     secret_key: Arc<Mutex<SecretKey>>,
     wings: Mutex<Arc<Wings>>,
@@ -222,7 +222,7 @@ pub struct Wings {
 }
 
 #[wasm_bindgen]
-impl Sekirei {
+impl Weeb3 {
     pub async fn change_bootnode_address(
         &self,
         address: String,
@@ -612,7 +612,7 @@ impl Sekirei {
         );
     }
 
-    pub fn new(_st: String) -> Sekirei {
+    pub fn new(_st: String) -> Weeb3 {
         // tracing_wasm::set_as_global_default(); // uncomment to turn on tracing
         // init_panic_hook();
 
@@ -676,7 +676,7 @@ impl Sekirei {
         let (chunk_push_port_out, chunk_push_port_in) =
             mpsc::channel::<(Vec<u8>, bool, Vec<u8>, Vec<u8>, mpsc::Sender<bool>)>();
 
-        return Sekirei {
+        return Weeb3 {
             secret_key: Arc::new(Mutex::new(secret_key)),
             swarm: Arc::new(Mutex::new(swarm)),
             wings: Mutex::new(Arc::new(Wings {

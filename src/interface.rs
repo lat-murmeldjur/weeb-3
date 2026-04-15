@@ -27,7 +27,7 @@ use web_sys::{
 };
 
 use crate::{
-    Sekirei, decode_resources, encrey, join, join_all,
+    Weeb3, decode_resources, encrey, join, join_all,
     nav::{clear_path, read_path},
     on_chain::{
         buy_postage_batch_with_payer, chequebook_balance, deploy_chequebook_with_payer,
@@ -61,23 +61,23 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
         None => None,
     };
 
-    let sekirei = Arc::new(Sekirei::new("".to_string()));
+    let weeb3 = Arc::new(Weeb3::new("".to_string()));
 
-    let sekirei0 = sekirei.clone();
+    let weeb30 = weeb3.clone();
 
-    let sekirei_async = async move {
-        sekirei0.run("".to_string()).await;
+    let weeb3_async = async move {
+        weeb30.run("".to_string()).await;
     };
 
-    let sekirei1 = sekirei.clone();
-    let sekirei2 = sekirei.clone();
-    let sekirei3 = sekirei.clone();
-    let sekirei4 = sekirei.clone();
-    let sekirei5 = sekirei.clone();
-    let sekirei6 = sekirei.clone();
-    let sekirei7 = sekirei.clone();
-    let sekirei8 = sekirei.clone();
-    let sekirei9 = sekirei.clone();
+    let weeb31 = weeb3.clone();
+    let weeb32 = weeb3.clone();
+    let weeb33 = weeb3.clone();
+    let weeb34 = weeb3.clone();
+    let weeb35 = weeb3.clone();
+    let weeb36 = weeb3.clone();
+    let weeb37 = weeb3.clone();
+    let weeb38 = weeb3.clone();
+    let weeb39 = weeb3.clone();
 
     let chequebook_state = Rc::new(RefCell::new(None::<Address>));
 
@@ -94,12 +94,12 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
         let mut handles = vec![];
         for reference in references {
             let handle = async {
-                let sekirei00 = sekirei6.clone();
+                let weeb300 = weeb36.clone();
                 web_sys::console::log_1(&JsValue::from(format!(
                     "Loading /bzz/ reference from path {:#?}",
                     reference
                 )));
-                let result = sekirei00.acquire(reference).await;
+                let result = weeb300.acquire(reference).await;
                 let (data, indx) = decode_resources(result);
                 render_result(data, indx).await;
             };
@@ -129,7 +129,7 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
         let callback =
             wasm_bindgen::closure::Closure::<dyn FnMut(web_sys::MessageEvent)>::new(move |_msg| {
                 console::log_1(&"oninput callback triggered".into());
-                let sekirei00 = sekirei1.clone();
+                let weeb300 = weeb31.clone();
                 let document = web_sys::window().unwrap().document().unwrap();
 
                 let input_field = document
@@ -143,7 +143,7 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
                     Ok(text) => spawn_local(async move {
                         console::log_1(&"oninput callback string".into());
 
-                        let result = sekirei00.acquire(text).await;
+                        let result = weeb300.acquire(text).await;
 
                         let (data, indx) = decode_resources(result);
 
@@ -402,7 +402,7 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
             move |_msg| {
                 console::log_1(&"oninput file callback".into());
 
-                let sekirei00 = sekirei2.clone();
+                let weeb300 = weeb32.clone();
 
                 let document = web_sys::window().unwrap().document().unwrap();
 
@@ -504,7 +504,7 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
 
                     web_sys::console::log_1(&JsValue::from(format!("IF Upload Marker 0")));
 
-                    let result = sekirei00
+                    let result = weeb300
                         .post_upload(
                             file,
                             file_enc.checked() && !upload_to_feed.checked(),
@@ -537,72 +537,72 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
 
         let callback4 =
             wasm_bindgen::closure::Closure::<dyn FnMut(web_sys::MessageEvent)>::new(move |_msg| {
-                let sekirei00 = sekirei3.clone();
+                let weeb300 = weeb33.clone();
 
                 console::log_1(&"oninput bootnode callback".into());
 
                 spawn_local(async move {
-                    let sekirei10 = sekirei00.clone();
-                    let sekirei11 = sekirei00.clone();
-                    let sekirei12 = sekirei00.clone();
-                    let sekirei13 = sekirei00.clone();
-                    let sekirei14 = sekirei00.clone();
-                    let sekirei15 = sekirei00.clone();
-                    let sekirei16 = sekirei00.clone();
-                    let sekirei17 = sekirei00.clone();
+                    let weeb310 = weeb300.clone();
+                    let weeb311 = weeb300.clone();
+                    let weeb312 = weeb300.clone();
+                    let weeb313 = weeb300.clone();
+                    let weeb314 = weeb300.clone();
+                    let weeb315 = weeb300.clone();
+                    let weeb316 = weeb300.clone();
+                    let weeb317 = weeb300.clone();
 
                     let k0 = async move {
                         let (bna, nid) = parsebootconnect("bootNodeMASettings".to_string());
-                        let result = sekirei10.change_bootnode_address(bna, nid, true).await;
+                        let result = weeb310.change_bootnode_address(bna, nid, true).await;
                         let (data, indx) = decode_resources(result);
                         render_result(data, indx).await;
                     };
 
                     let k1 = async move {
                         let (bna, nid) = parsebootconnect("bootNodeMASettings0".to_string());
-                        let result = sekirei11.change_bootnode_address(bna, nid, true).await;
+                        let result = weeb311.change_bootnode_address(bna, nid, true).await;
                         let (data, indx) = decode_resources(result);
                         render_result(data, indx).await;
                     };
 
                     let k2 = async move {
                         let (bna, nid) = parsebootconnect("bootNodeMASettings1".to_string());
-                        let result = sekirei12.change_bootnode_address(bna, nid, true).await;
+                        let result = weeb312.change_bootnode_address(bna, nid, true).await;
                         let (data, indx) = decode_resources(result);
                         render_result(data, indx).await;
                     };
 
                     let k3 = async move {
                         let (bna, nid) = parsebootconnect("bootNodeMASettings2".to_string());
-                        let result = sekirei13.change_bootnode_address(bna, nid, true).await;
+                        let result = weeb313.change_bootnode_address(bna, nid, true).await;
                         let (data, indx) = decode_resources(result);
                         render_result(data, indx).await;
                     };
 
                     let k4 = async move {
                         let (bna, nid) = parsebootconnect("bootNodeMASettings3".to_string());
-                        let result = sekirei14.change_bootnode_address(bna, nid, true).await;
+                        let result = weeb314.change_bootnode_address(bna, nid, true).await;
                         let (data, indx) = decode_resources(result);
                         render_result(data, indx).await;
                     };
 
                     let k5 = async move {
                         let (bna, nid) = parsebootconnect("bootNodeMASettings4".to_string());
-                        let result = sekirei15.change_bootnode_address(bna, nid, true).await;
+                        let result = weeb315.change_bootnode_address(bna, nid, true).await;
                         let (data, indx) = decode_resources(result);
                         render_result(data, indx).await;
                     };
 
                     let k6 = async move {
                         let (bna, nid) = parsebootconnect("bootNodeMASettings5".to_string());
-                        let result = sekirei16.change_bootnode_address(bna, nid, true).await;
+                        let result = weeb316.change_bootnode_address(bna, nid, true).await;
                         let (data, indx) = decode_resources(result);
                         render_result(data, indx).await;
                     };
 
                     let k7 = async move {
                         let (bna, nid) = parsebootconnect("bootNodeMASettings6".to_string());
-                        let result = sekirei17.change_bootnode_address(bna, nid, true).await;
+                        let result = weeb317.change_bootnode_address(bna, nid, true).await;
                         let (data, indx) = decode_resources(result);
                         render_result(data, indx).await;
                     };
@@ -625,7 +625,7 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
 
         let callback5 =
             wasm_bindgen::closure::Closure::<dyn FnMut(web_sys::MessageEvent)>::new(move |_msg| {
-                let sekirei00 = sekirei4.clone();
+                let weeb300 = weeb34.clone();
 
                 console::log_1(&"oninput reset stamp callback".into());
 
@@ -638,7 +638,7 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
                 .unwrap_or(false)
             {
                 spawn_local(async move {
-                    let result = sekirei00.reset_stamp().await;
+                    let result = weeb300.reset_stamp().await;
 
                     let (data, indx) = decode_resources(result);
 
@@ -1014,7 +1014,7 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
                     let url = js_sys::Reflect::get(&obj, &JsValue::from_str("url"))
                         .unwrap_or(JsValue::NULL);
                     let reference = url.as_string().unwrap_or_default();
-                    let sekirei00 = sekirei7.clone();
+                    let weeb300 = weeb37.clone();
 
                     let ports: Array = event.ports().into();
                     let port = ports.get(0).dyn_into::<web_sys::MessagePort>().ok();
@@ -1024,7 +1024,7 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
                             "Loading /bzz/ reference from service worker {:#?}",
                             reference
                         )));
-                        let result = sekirei00.acquire(reference).await;
+                        let result = weeb300.acquire(reference).await;
                         let (data, indx) = decode_resources(result);
                         render_result(data.clone(), indx.clone()).await;
 
@@ -1086,11 +1086,11 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
                         .as_string()
                         .unwrap_or_default();
 
-                    let sekirei00 = sekirei8.clone();
+                    let weeb300 = weeb38.clone();
                     let port = event.ports().get(0).dyn_into::<web_sys::MessagePort>().ok();
 
                     wasm_bindgen_futures::spawn_local(async move {
-                        let result = sekirei00
+                        let result = weeb300
                             .post_upload(file, encryption, index_string, add_to_feed, feed_topic)
                             .await;
 
@@ -1129,12 +1129,12 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
 
         loop {
             #[allow(irrefutable_let_patterns)]
-            let logs_current = sekirei5.get_current_logs().await;
+            let logs_current = weeb35.get_current_logs().await;
             for log_message in logs_current.iter() {
                 render_log_message(&log_message);
             }
 
-            let ongoing = sekirei5.get_ongoing_connections().await;
+            let ongoing = weeb35.get_ongoing_connections().await;
 
             let _ = web_sys::window()
                 .unwrap()
@@ -1146,7 +1146,7 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
                 .unwrap()
                 .set_inner_html(&ongoing.to_string());
 
-            let connections = sekirei5.get_connections().await;
+            let connections = weeb35.get_connections().await;
 
             let _ = web_sys::window()
                 .unwrap()
@@ -1301,67 +1301,67 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
     let initial_connect_handle = async {
         async_std::task::sleep(Duration::from_millis(600)).await;
 
-        let sekirei10 = sekirei9.clone();
-        let sekirei11 = sekirei9.clone();
-        let sekirei12 = sekirei9.clone();
-        let sekirei13 = sekirei9.clone();
-        let sekirei14 = sekirei9.clone();
-        let sekirei15 = sekirei9.clone();
-        let sekirei16 = sekirei9.clone();
-        let sekirei17 = sekirei9.clone();
+        let weeb310 = weeb39.clone();
+        let weeb311 = weeb39.clone();
+        let weeb312 = weeb39.clone();
+        let weeb313 = weeb39.clone();
+        let weeb314 = weeb39.clone();
+        let weeb315 = weeb39.clone();
+        let weeb316 = weeb39.clone();
+        let weeb317 = weeb39.clone();
 
         let k0 = async move {
             let (bna, nid) = parsebootconnect("bootNodeMASettings".to_string());
-            let result = sekirei10.change_bootnode_address(bna, nid, true).await;
+            let result = weeb310.change_bootnode_address(bna, nid, true).await;
             let (data, indx) = decode_resources(result);
             render_result(data, indx).await;
         };
 
         let k1 = async move {
             let (bna, nid) = parsebootconnect("bootNodeMASettings0".to_string());
-            let result = sekirei11.change_bootnode_address(bna, nid, true).await;
+            let result = weeb311.change_bootnode_address(bna, nid, true).await;
             let (data, indx) = decode_resources(result);
             render_result(data, indx).await;
         };
 
         let k2 = async move {
             let (bna, nid) = parsebootconnect("bootNodeMASettings1".to_string());
-            let result = sekirei12.change_bootnode_address(bna, nid, true).await;
+            let result = weeb312.change_bootnode_address(bna, nid, true).await;
             let (data, indx) = decode_resources(result);
             render_result(data, indx).await;
         };
 
         let k3 = async move {
             let (bna, nid) = parsebootconnect("bootNodeMASettings2".to_string());
-            let result = sekirei13.change_bootnode_address(bna, nid, true).await;
+            let result = weeb313.change_bootnode_address(bna, nid, true).await;
             let (data, indx) = decode_resources(result);
             render_result(data, indx).await;
         };
 
         let k4 = async move {
             let (bna, nid) = parsebootconnect("bootNodeMASettings3".to_string());
-            let result = sekirei14.change_bootnode_address(bna, nid, true).await;
+            let result = weeb314.change_bootnode_address(bna, nid, true).await;
             let (data, indx) = decode_resources(result);
             render_result(data, indx).await;
         };
 
         let k5 = async move {
             let (bna, nid) = parsebootconnect("bootNodeMASettings4".to_string());
-            let result = sekirei15.change_bootnode_address(bna, nid, true).await;
+            let result = weeb315.change_bootnode_address(bna, nid, true).await;
             let (data, indx) = decode_resources(result);
             render_result(data, indx).await;
         };
 
         let k6 = async move {
             let (bna, nid) = parsebootconnect("bootNodeMASettings5".to_string());
-            let result = sekirei16.change_bootnode_address(bna, nid, true).await;
+            let result = weeb316.change_bootnode_address(bna, nid, true).await;
             let (data, indx) = decode_resources(result);
             render_result(data, indx).await;
         };
 
         let k7 = async move {
             let (bna, nid) = parsebootconnect("bootNodeMASettings6".to_string());
-            let result = sekirei17.change_bootnode_address(bna, nid, true).await;
+            let result = weeb317.change_bootnode_address(bna, nid, true).await;
             let (data, indx) = decode_resources(result);
             render_result(data, indx).await;
         };
@@ -1370,7 +1370,7 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
     };
 
     join!(
-        sekirei_async,
+        weeb3_async,
         interface_async,
         path_load_init,
         // fetch_test,
