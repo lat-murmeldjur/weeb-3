@@ -98,13 +98,17 @@ self.addEventListener("fetch", (event) => {
     return;
   }
 
+  if (url.origin !== new URL(self.registration.scope).origin) {
+    event.respondWith(fetch(req));
+    return;
+  }
+
   event.respondWith((async () => {
     if (req.mode === "navigate") {
       console.log("navigate attempt for", req.url);
       return cacheFirst(req);
     }
 
-    // try cache first anyway
     const cache = await caches.open('default0');
     const responseFromCache = await cache.match(req);
     if (responseFromCache) {
@@ -120,7 +124,6 @@ self.addEventListener("fetch", (event) => {
     } catch (e) {
     }
 
-    // if no cache hit find tab where fetch originated from
     let client = null;
     if (event.clientId) {
       client = await self.clients.get(event.clientId);
@@ -155,7 +158,7 @@ const fetchFromLibRs = async (request, client) => {
       const { ok, body, mime, path } = event.data;
       console.log("Message from interface:", {
         ok,
-        bodyType: body ? body.constructor.name : body, // show if it's Uint8Array, undefined, etc.
+        bodyType: body ? body.constructor.name : body,
         bodyLen: body && body.length ? body.length : 0,
         mime,
         path
@@ -225,7 +228,7 @@ async function postToLibRs(request, event) {
     client.postMessage(
       {
         type: "UPLOAD_REQUEST",
-        file: file,           // Preserve the File with original name + type
+        file: file,
         encryption,
         indexString,
         addToFeed,
