@@ -34,8 +34,8 @@ rust-embed = { version = "8.7.1", features = ["include-exclude", "interpolate-fo
 tokio = { version = "1.38.0", default-features = false, features = ["macros", "net", "rt", "signal", "rt-multi-thread"] }
 tower-http = { git = "https://github.com/tower-rs/tower-http.git", features = ["cors"] }
 mime_guess = { git = "https://github.com/abonander/mime_guess.git" }
-libp2p = { git = "https://github.com/libp2p/rust-libp2p.git", rev = "055186dc3b38f60ee4ff79d7ac71603f9e18124f", features = [ "ecdsa", "ed25519", "macros", "ping", "tokio"] }
-libp2p-webrtc = { git = "https://github.com/libp2p/rust-libp2p.git", rev = "055186dc3b38f60ee4ff79d7ac71603f9e18124f", features = [ "tokio"] }
+libp2p = { git = "https://github.com/libp2p/rust-libp2p.git", rev = "8072a73f62f07adc273e4270a22564f94462b58c", features = [ "ecdsa", "ed25519", "macros", "ping", "tokio"] }
+libp2p-webrtc = { git = "https://github.com/libp2p/rust-libp2p.git", rev = "8072a73f62f07adc273e4270a22564f94462b58c", features = [ "tokio"] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 ethers = { git = "https://github.com/gakonst/ethers-rs.git" }
@@ -49,7 +49,7 @@ getrandom = { version = "0.3.3", features = ["wasm_js"] }
 alloy-signer-local = { git = "https://github.com/alloy-rs/alloy.git" }
 async-std = { git = "https://github.com/async-rs/async-std.git" }
 #console_error_panic_hook = { git = "https://github.com/rustwasm/console_error_panic_hook.git" }
-libp2p = { git = "https://github.com/libp2p/rust-libp2p.git", rev = "055186dc3b38f60ee4ff79d7ac71603f9e18124f", features = [ 
+libp2p = { git = "https://github.com/libp2p/rust-libp2p.git", rev = "8072a73f62f07adc273e4270a22564f94462b58c", features = [ 
 "autonat",
 "dcutr",
 "ecdsa",
@@ -62,7 +62,7 @@ libp2p = { git = "https://github.com/libp2p/rust-libp2p.git", rev = "055186dc3b3
 "websocket-websys",
 "yamux",
 ] }
-libp2p-stream = { git = "https://github.com/libp2p/rust-libp2p.git", rev = "055186dc3b38f60ee4ff79d7ac71603f9e18124f" }
+libp2p-stream = { git = "https://github.com/libp2p/rust-libp2p.git", rev = "8072a73f62f07adc273e4270a22564f94462b58c" }
 wasm-bindgen = "0.2.100"
 wasm-bindgen-futures = "0.4.50"
 js-sys = { version = "0.3.77" }

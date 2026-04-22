@@ -159,6 +159,14 @@ const SWAP_PROTOCOL: StreamProtocol = StreamProtocol::new("/swarm/swap/1.0.0/swa
 const PROTOCOL_ROUND_TIME: f64 = 300.0;
 const EVENT_LOOP_INTERRUPTOR: f64 = 50.0;
 const PROTO_LOOP_INTERRUPTOR: f64 = 50.0;
+const HANDSHAKE_BUILD_LIMIT: usize = 8;
+const HANDSHAKE_DISPATCH_INTERVAL_MS: f64 = 500.0;
+const HANDSHAKE_SELF_EPHEMERAL_POLL_MS: u64 = 100;
+const HANDSHAKE_START_DELAY_MS: u64 = 100;
+
+pub fn timed_log(message: impl AsRef<str>) {
+    web_sys::console::log_1(&JsValue::from(message.as_ref()));
+}
 
 //
 // pub fn init_panic_hook() {
@@ -975,6 +983,11 @@ impl Weeb3 {
                                     if let BehaviourEvent::Identify(identify_event) = out_event {
                                         if let identify::Event::Received { peer_id, info, .. } = identify_event {
                                             let observed_addr: Multiaddr = info.observed_addr.clone();
+                                            swarm.add_external_address(observed_addr.clone());
+                                            swarm
+                                                .behaviour_mut()
+                                                .identify
+                                                .push(std::iter::once(peer_id.clone()));
                                             let mut map = wings.self_ephemerals.lock().await;
                                             map.insert(peer_id.clone(), observed_addr.clone());
                                             self.interface_log(format!(
@@ -1841,73 +1854,128 @@ impl Weeb3 {
             }
         };
 
-        const MAX_CONCURRENT_HANDSHAKES: usize = 2;
-        let handshake_semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_HANDSHAKES));
+        let handshake_semaphore = Arc::new(Semaphore::new(HANDSHAKE_BUILD_LIMIT));
         let hive_joiner = async {
             let mut timelast = Date::now();
+            let mut last_handshake_dispatch = Date::now() - HANDSHAKE_DISPATCH_INTERVAL_MS;
 
             loop {
-                #[allow(irrefutable_let_patterns)]
-                while let that = connections_instructions_chan_incoming.try_recv() {
-                    if that.is_err() {
-                        break;
-                    }
+                let dispatch_due =
+                    (Date::now() - last_handshake_dispatch) >= HANDSHAKE_DISPATCH_INTERVAL_MS;
 
-                    let that = that.unwrap();
-                    let semaphore = handshake_semaphore.clone();
-                    let ctrl3 = ctrl3.clone();
-                    let accounting_peer_chan_outgoing = accounting_peer_chan_outgoing.clone();
-                    let secret_key = self.secret_key.clone();
-                    let nid: u64;
-                    {
-                        let nid0 = self.network_id.lock().await.clone();
-                        nid = nid0.clone();
-                    }
+                if dispatch_due {
+                    if let Ok(that) = connections_instructions_chan_incoming.try_recv() {
+                        last_handshake_dispatch = Date::now();
 
-                    let wings = wings.clone();
-
-                    spawn_local(async move {
-                        let _permit = semaphore.acquire().await;
-
-                        web_sys::console::log_1(&JsValue::from("Entering Handshake Joiner"));
-
-                        let (bzzaddr0, bootn, _dialat) = that;
-
-                        let addr3 = libp2p::core::Multiaddr::try_from(bzzaddr0.underlay).unwrap();
-
-                        let id = match try_from_multiaddr(&addr3) {
-                            Some(aok) => aok,
-                            None => return,
+                        let (bzzaddr0, bootn, dialat) = that;
+                        let ready_connections = {
+                            let connections = self.connections.lock().await;
+                            *connections
+                        };
+                        let established_connections = {
+                            let connected_peers = wings.connected_peers.lock().await;
+                            connected_peers.len() as u64
+                        };
+                        let ongoing_connections = {
+                            let ongoing = self.ongoing_connections.lock().await;
+                            *ongoing as usize
                         };
 
-                        if bootn {
-                            let mut bootnodes_set = wings.bootnodes.lock().await;
-                            bootnodes_set.insert(id.to_string());
+                        let semaphore = handshake_semaphore.clone();
+                        let ctrl3 = ctrl3.clone();
+                        let accounting_peer_chan_outgoing = accounting_peer_chan_outgoing.clone();
+                        let secret_key = self.secret_key.clone();
+                        let nid: u64;
+                        {
+                            let nid0 = self.network_id.lock().await.clone();
+                            nid = nid0.clone();
                         }
 
-                        let self_ephemeral: Multiaddr = loop {
-                            {
-                                let map = wings.self_ephemerals.lock().await;
-                                if let Some(addr) = map.get(&id) {
-                                    break addr.clone();
+                        let wings = wings.clone();
+
+                        spawn_local(async move {
+                            let _permit = semaphore.acquire().await;
+                            let handshake_started = Date::now();
+                            let addr3 = match libp2p::core::Multiaddr::try_from(bzzaddr0.underlay) {
+                                Ok(addr) => addr,
+                                Err(_) => {
+                                    timed_log("Handshake dispatch skipped invalid underlay");
+                                    return;
                                 }
+                            };
+
+                            let id = match try_from_multiaddr(&addr3) {
+                                Some(peer_id) => peer_id,
+                                None => {
+                                    timed_log("Handshake dispatch skipped invalid peer id");
+                                    return;
+                                }
+                            };
+
+                            timed_log(format!(
+                                "Entering Handshake Joiner peer={} bootnode={} queued_ms={} established_connections={} ready_connections={} ongoing_connections={} build_limit={}",
+                                id,
+                                bootn,
+                                (handshake_started - dialat as f64).max(0.0),
+                                established_connections,
+                                ready_connections,
+                                ongoing_connections,
+                                HANDSHAKE_BUILD_LIMIT
+                            ));
+
+                            if bootn {
+                                let mut bootnodes_set = wings.bootnodes.lock().await;
+                                bootnodes_set.insert(id.to_string());
                             }
-                            async_std::task::sleep(Duration::from_millis(100)).await;
-                        };
 
-                        async_std::task::sleep(Duration::from_millis(100)).await;
+                            let self_ephemeral_wait_started = Date::now();
+                            let mut self_ephemeral_polls = 0u32;
+                            let self_ephemeral: Multiaddr = loop {
+                                {
+                                    let map = wings.self_ephemerals.lock().await;
+                                    if let Some(addr) = map.get(&id) {
+                                        break addr.clone();
+                                    }
+                                }
+                                self_ephemeral_polls += 1;
+                                async_std::task::sleep(Duration::from_millis(
+                                    HANDSHAKE_SELF_EPHEMERAL_POLL_MS,
+                                ))
+                                .await;
+                            };
 
-                        connection_handler(
-                            id,
-                            nid,
-                            self_ephemeral,
-                            ctrl3,
-                            &addr3,
-                            &secret_key,
-                            &accounting_peer_chan_outgoing,
-                        )
-                        .await;
-                    });
+                            timed_log(format!(
+                                "Handshake self ephemeral ready peer={} wait_ms={} polls={}",
+                                id,
+                                (Date::now() - self_ephemeral_wait_started).max(0.0),
+                                self_ephemeral_polls
+                            ));
+
+                            async_std::task::sleep(Duration::from_millis(
+                                HANDSHAKE_START_DELAY_MS,
+                            ))
+                            .await;
+
+                            let success = connection_handler(
+                                id,
+                                nid,
+                                self_ephemeral,
+                                ctrl3,
+                                &addr3,
+                                &secret_key,
+                                &accounting_peer_chan_outgoing,
+                            )
+                            .await;
+
+                            let elapsed = Date::now() - handshake_started;
+                            timed_log(format!(
+                                "Handshake Joiner finished peer={} success={} elapsed_ms={}",
+                                id,
+                                success,
+                                elapsed
+                            ));
+                        });
+                    }
                 }
 
                 let timenow = Date::now();
