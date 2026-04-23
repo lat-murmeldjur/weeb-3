@@ -282,7 +282,7 @@ pub async fn retrieve_chunk(
     let mut current_max_po = 0;
 
     let mut error_count = 0;
-    let mut max_error = 8;
+    let mut max_error = 20;
 
     #[allow(unused_assignments)]
     let mut cd = vec![];
@@ -325,34 +325,27 @@ pub async fn retrieve_chunk(
             if selected {
                 skiplist.insert(closest_peer_id);
             } else {
-                if overdraftlist.is_empty() {
-                    web_sys::console::log_1(&JsValue::from(format!(
-                        "unable to retrieve chunk {} - no more peers to try",
-                        hex::encode(chunk_address)
-                    )));
-                    return vec![];
-                } else {
+                if !overdraftlist.is_empty() {
                     for k in overdraftlist.iter() {
                         let _ =
-                            refresh_chan.send((k.clone(), 10 * crate::accounting::REFRESH_RATE));
+                            refresh_chan.send((k.clone(), 100 * crate::accounting::REFRESH_RATE));
                         skiplist.remove(k);
                     }
                     overdraftlist.clear();
-
-                    let round_now = Date::now();
-
-                    let seg = round_now - round_commence;
-                    if seg < PROTOCOL_ROUND_TIME {
-                        async_std::task::sleep(Duration::from_millis(
-                            (PROTOCOL_ROUND_TIME - seg) as u64,
-                        ))
-                        .await;
-                    }
-
-                    round_commence = Date::now();
-
-                    continue;
                 }
+                let round_now = Date::now();
+
+                let seg = round_now - round_commence;
+                if seg < PROTOCOL_ROUND_TIME {
+                    async_std::task::sleep(Duration::from_millis(
+                        (PROTOCOL_ROUND_TIME - seg) as u64,
+                    ))
+                    .await;
+                }
+
+                round_commence = Date::now();
+
+                continue;
             }
 
             let req_price = price(&closest_overlay, &caddr);

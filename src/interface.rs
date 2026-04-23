@@ -1158,7 +1158,7 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
                 .unwrap()
                 .set_inner_html(&connections.to_string());
 
-            async_std::task::sleep(Duration::from_millis(600)).await
+            async_std::task::sleep(Duration::from_millis(160)).await
         }
     };
 
@@ -1299,7 +1299,7 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
         };
     */
     let initial_connect_handle = async {
-        async_std::task::sleep(Duration::from_millis(600)).await;
+        async_std::task::sleep(Duration::from_millis(160)).await;
 
         let weeb310 = weeb39.clone();
         let weeb311 = weeb39.clone();
@@ -1547,7 +1547,7 @@ async fn render_result(data: Vec<(Vec<u8>, String, String)>, indx: String) {
         path00.push_str(&sep);
         path00.push_str(&indx);
 
-        async_std::task::sleep(Duration::from_millis(600)).await;
+        async_std::task::sleep(Duration::from_millis(160)).await;
 
         let new_element = create_ielement(path00);
 

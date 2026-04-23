@@ -156,13 +156,10 @@ const SWAP_PROTOCOL: StreamProtocol = StreamProtocol::new("/swarm/swap/1.0.0/swa
 // const PULL_PROTOCOL: StreamProtocol = StreamProtocol::new("/swarm/pullsync/1.4.0/pullsync");
 // const PUSH_PROTOCOL: StreamProtocol = StreamProtocol::new("/swarm/pushsync/1.3.0/pushsync");
 
-const PROTOCOL_ROUND_TIME: f64 = 300.0;
-const EVENT_LOOP_INTERRUPTOR: f64 = 50.0;
-const PROTO_LOOP_INTERRUPTOR: f64 = 50.0;
-const HANDSHAKE_BUILD_LIMIT: usize = 8;
-const HANDSHAKE_DISPATCH_INTERVAL_MS: f64 = 500.0;
+const PROTOCOL_ROUND_TIME: f64 = 160.0;
+const EVENT_LOOP_INTERRUPTOR: f64 = 90.0;
+const PROTO_LOOP_INTERRUPTOR: f64 = 90.0;
 const HANDSHAKE_SELF_EPHEMERAL_POLL_MS: u64 = 100;
-const HANDSHAKE_START_DELAY_MS: u64 = 100;
 
 pub fn timed_log(message: impl AsRef<str>) {
     web_sys::console::log_1(&JsValue::from(message.as_ref()));
@@ -727,12 +724,12 @@ impl Weeb3 {
 
     pub async fn get_ongoing_connections(&self) -> u64 {
         let ongoing = self.ongoing_connections.lock().await;
-        return *ongoing;
+        return ongoing.clone();
     }
 
     pub async fn get_connections(&self) -> u64 {
         let connected = self.connections.lock().await;
-        return *connected;
+        return connected.clone();
     }
 
     pub fn interface_log(&self, log0: String) {
@@ -1003,6 +1000,41 @@ impl Weeb3 {
                                     ..
                                 }) => {
                                     //
+                                }
+                                Some(SwarmEvent::OutgoingConnectionError { peer_id, error, .. }) => {
+                                    if let Some(peer_id) = peer_id {
+                                        let mut connection_attempts_map = wings.connection_attempts.lock().await;
+                                        if connection_attempts_map.contains(&peer_id) {
+                                            let mut ongoing = self.ongoing_connections.lock().await;
+                                            if *ongoing > 0 {
+                                                *ongoing = *ongoing - 1
+                                            };
+                                        };
+                                        connection_attempts_map.remove(&peer_id);
+                                    }
+
+                                    let retry_address = match &error {
+                                        libp2p::swarm::DialError::LocalPeerId { address } => {
+                                            Some(address.clone())
+                                        }
+                                        libp2p::swarm::DialError::WrongPeerId { address, .. } => {
+                                            Some(address.clone())
+                                        }
+                                        libp2p::swarm::DialError::Transport(errors) => errors
+                                            .first()
+                                            .map(|(address, _)| address.clone()),
+                                        _ => None,
+                                    };
+
+                                    if let Some(address) = retry_address {
+                                        let mut bzzaddr = etiquette_2::BzzAddress::default();
+                                        bzzaddr.underlay = address.to_vec();
+                                        let _ = connections_instructions_chan_outgoing.send((
+                                            bzzaddr,
+                                            false,
+                                            Date::now() as u64,
+                                        ));
+                                    }
                                 }
                                 Some(SwarmEvent::ConnectionClosed { peer_id, endpoint, .. }) => {
                                     {
@@ -1306,7 +1338,7 @@ impl Weeb3 {
                                     refresh_handler(peer, amount2, ctrl7, &rco).await;
                                 };
                                 refresh_joiner.push(handle);
-                            } else if cheque_amt > 0 {
+                            } else if cheque_amt > 0 && false {
                                 let mut map = wings.ongoing_cheques.lock().await;
                                 if !map.contains_key(&peer) {
                                     map.insert(peer, cheque_amt);
@@ -1695,18 +1727,6 @@ impl Weeb3 {
             let push_sem = Arc::new(Semaphore::new(1024));
 
             loop {
-                if !connections {
-                    {
-                        let overlay_peers_map = wings.overlay_peers.lock().await;
-                        if overlay_peers_map.len() > 2 {
-                            connections = true;
-                        }
-                    }
-                    async_std::task::sleep(Duration::from_millis(PROTO_LOOP_INTERRUPTOR as u64))
-                        .await;
-                    continue;
-                }
-
                 let mut dispatched = 0;
 
                 #[allow(irrefutable_let_patterns)]
@@ -1790,19 +1810,6 @@ impl Weeb3 {
             let retrieve_sem = Arc::new(Semaphore::new(4096));
 
             loop {
-                if !connections {
-                    {
-                        let overlay_peers_map = wings.overlay_peers.lock().await;
-                        if overlay_peers_map.len() > 7 {
-                            connections = true;
-                        }
-                    }
-
-                    async_std::task::sleep(Duration::from_millis(PROTO_LOOP_INTERRUPTOR as u64))
-                        .await;
-                    continue;
-                }
-
                 let mut dispatched = 0usize;
 
                 loop {
@@ -1854,34 +1861,13 @@ impl Weeb3 {
             }
         };
 
-        let handshake_semaphore = Arc::new(Semaphore::new(HANDSHAKE_BUILD_LIMIT));
         let hive_joiner = async {
             let mut timelast = Date::now();
-            let mut last_handshake_dispatch = Date::now() - HANDSHAKE_DISPATCH_INTERVAL_MS;
 
             loop {
-                let dispatch_due =
-                    (Date::now() - last_handshake_dispatch) >= HANDSHAKE_DISPATCH_INTERVAL_MS;
-
-                if dispatch_due {
+                {
                     if let Ok(that) = connections_instructions_chan_incoming.try_recv() {
-                        last_handshake_dispatch = Date::now();
-
                         let (bzzaddr0, bootn, dialat) = that;
-                        let ready_connections = {
-                            let connections = self.connections.lock().await;
-                            *connections
-                        };
-                        let established_connections = {
-                            let connected_peers = wings.connected_peers.lock().await;
-                            connected_peers.len() as u64
-                        };
-                        let ongoing_connections = {
-                            let ongoing = self.ongoing_connections.lock().await;
-                            *ongoing as usize
-                        };
-
-                        let semaphore = handshake_semaphore.clone();
                         let ctrl3 = ctrl3.clone();
                         let accounting_peer_chan_outgoing = accounting_peer_chan_outgoing.clone();
                         let secret_key = self.secret_key.clone();
@@ -1894,7 +1880,6 @@ impl Weeb3 {
                         let wings = wings.clone();
 
                         spawn_local(async move {
-                            let _permit = semaphore.acquire().await;
                             let handshake_started = Date::now();
                             let addr3 = match libp2p::core::Multiaddr::try_from(bzzaddr0.underlay) {
                                 Ok(addr) => addr,
@@ -1913,14 +1898,8 @@ impl Weeb3 {
                             };
 
                             timed_log(format!(
-                                "Entering Handshake Joiner peer={} bootnode={} queued_ms={} established_connections={} ready_connections={} ongoing_connections={} build_limit={}",
-                                id,
-                                bootn,
-                                (handshake_started - dialat as f64).max(0.0),
-                                established_connections,
-                                ready_connections,
-                                ongoing_connections,
-                                HANDSHAKE_BUILD_LIMIT
+                                "Entering Handshake Joiner peer={} bootnode={}",
+                                id, bootn,
                             ));
 
                             if bootn {
@@ -1944,18 +1923,6 @@ impl Weeb3 {
                                 .await;
                             };
 
-                            timed_log(format!(
-                                "Handshake self ephemeral ready peer={} wait_ms={} polls={}",
-                                id,
-                                (Date::now() - self_ephemeral_wait_started).max(0.0),
-                                self_ephemeral_polls
-                            ));
-
-                            async_std::task::sleep(Duration::from_millis(
-                                HANDSHAKE_START_DELAY_MS,
-                            ))
-                            .await;
-
                             let success = connection_handler(
                                 id,
                                 nid,
@@ -1970,9 +1937,7 @@ impl Weeb3 {
                             let elapsed = Date::now() - handshake_started;
                             timed_log(format!(
                                 "Handshake Joiner finished peer={} success={} elapsed_ms={}",
-                                id,
-                                success,
-                                elapsed
+                                id, success, elapsed
                             ));
                         });
                     }
