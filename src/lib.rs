@@ -159,7 +159,8 @@ const SWAP_PROTOCOL: StreamProtocol = StreamProtocol::new("/swarm/swap/1.0.0/swa
 const PROTOCOL_ROUND_TIME: f64 = 160.0;
 const EVENT_LOOP_INTERRUPTOR: f64 = 90.0;
 const PROTO_LOOP_INTERRUPTOR: f64 = 90.0;
-const HANDSHAKE_SELF_EPHEMERAL_POLL_MS: u64 = 100;
+const STARTUP_QUEUE_POLL_MS: u64 = 25;
+const HANDSHAKE_SELF_EPHEMERAL_POLL_MS: u64 = STARTUP_QUEUE_POLL_MS;
 
 pub fn timed_log(message: impl AsRef<str>) {
     web_sys::console::log_1(&JsValue::from(message.as_ref()));
@@ -580,13 +581,13 @@ impl Weeb3 {
 
                 let timenow = Date::now();
                 let seg = timenow - timelast;
-                if seg < EVENT_LOOP_INTERRUPTOR {
+                if seg < STARTUP_QUEUE_POLL_MS as f64 {
                     //                web_sys::console::log_1(&JsValue::from(format!(
                     //                    "Ease event handle loop for {}",
                     //                    EVENT_LOOP_INTERRUPTOR - seg
                     //                )));
                     async_std::task::sleep(Duration::from_millis(
-                        (EVENT_LOOP_INTERRUPTOR - seg) as u64,
+                        (STARTUP_QUEUE_POLL_MS as f64 - seg) as u64,
                     ))
                     .await;
                 };
@@ -951,8 +952,13 @@ impl Weeb3 {
                     };
                 }
 
+                let had_work = !dial_joiner.is_empty();
                 join_all(dial_joiner).await;
-                async_std::task::sleep(Duration::from_millis(300)).await;
+                if had_work {
+                    async_std::task::yield_now().await;
+                } else {
+                    async_std::task::sleep(Duration::from_millis(STARTUP_QUEUE_POLL_MS)).await;
+                }
             }
         };
 
@@ -963,7 +969,7 @@ impl Weeb3 {
 
                     #[allow(irrefutable_let_patterns)]
                     while let event = async_std::future::timeout(
-                        Duration::from_millis(EVENT_LOOP_INTERRUPTOR as u64),
+                        Duration::from_millis(STARTUP_QUEUE_POLL_MS),
                         swarm.next(),
                     )
                     .await
@@ -1092,7 +1098,7 @@ impl Weeb3 {
                         }
                     }
                 }
-                async_std::task::sleep(Duration::from_millis(300)).await;
+                async_std::task::yield_now().await;
             }
         };
 
@@ -1178,8 +1184,13 @@ impl Weeb3 {
                         break;
                     }
                 }
+                let had_work = !bootnode_dial_joiner.is_empty();
                 join_all(bootnode_dial_joiner).await;
-                async_std::task::sleep(Duration::from_millis(300)).await;
+                if had_work {
+                    async_std::task::yield_now().await;
+                } else {
+                    async_std::task::sleep(Duration::from_millis(STARTUP_QUEUE_POLL_MS)).await;
+                }
             }
         };
 
@@ -1188,9 +1199,12 @@ impl Weeb3 {
             let mut interrupt_last = Date::now();
             loop {
                 let k1 = async {
+                    let mut worked = false;
+
                     #[allow(irrefutable_let_patterns)]
                     while let incoming_peer = accounting_peer_chan_incoming.try_recv() {
                         if !incoming_peer.is_err() {
+                            worked = true;
                             // Accounting connect
                             let peer_file: PeerFile = incoming_peer.unwrap();
                             // let ol = hex::encode(peer_file.overlay.clone());
@@ -1231,12 +1245,17 @@ impl Weeb3 {
                             break;
                         }
                     }
+
+                    worked
                 };
 
                 let k2 = async {
+                    let mut worked = false;
+
                     #[allow(irrefutable_let_patterns)]
                     while let pt_in = pricing_chan_incoming.try_recv() {
                         if !pt_in.is_err() {
+                            worked = true;
                             let (peer, amount) = pt_in.unwrap();
                             let accounting = wings.accounting_peers.lock().await;
                             let accounting_peer_lock = match accounting.get(&peer) {
@@ -1290,14 +1309,18 @@ impl Weeb3 {
                             break;
                         }
                     }
+
+                    worked
                 };
 
                 let k3 = async {
+                    let mut worked = false;
                     let mut refresh_joiner = Vec::new();
 
                     #[allow(irrefutable_let_patterns)]
                     while let re_out = refreshment_instructions_chan_incoming.try_recv() {
                         if !re_out.is_err() {
+                            worked = true;
                             let (peer, _amount) = re_out.unwrap();
                             {
                                 let map = wings.ongoing_refreshments.lock().await;
@@ -1353,12 +1376,17 @@ impl Weeb3 {
                     }
 
                     join_all(refresh_joiner).await;
+
+                    worked
                 };
 
                 let k4 = async {
+                    let mut worked = false;
+
                     #[allow(irrefutable_let_patterns)]
                     while let re_in = refreshment_chan_incoming.try_recv() {
                         if !re_in.is_err() {
+                            worked = true;
                             let (peer, amount) = re_in.unwrap();
 
                             web_sys::console::log_1(&JsValue::from(format!(
@@ -1384,12 +1412,15 @@ impl Weeb3 {
                             break;
                         }
                     }
+
+                    worked
                 };
 
                 let swap_price = Arc::new(Mutex::new(U256::from(0)));
                 let swap_deduction = Arc::new(Mutex::new(U256::from(0)));
 
                 let k5 = async {
+                    let mut worked = false;
                     let mut cheque_joiner = Vec::new();
 
                     #[allow(irrefutable_let_patterns)]
@@ -1397,6 +1428,7 @@ impl Weeb3 {
                         let swap_price_0 = swap_price.clone();
                         let swap_deduction_0 = swap_deduction.clone();
                         if !ch_out.is_err() {
+                            worked = true;
                             let set_price = {
                                 let price = swap_price_0.lock().await;
                                 price.is_zero()
@@ -1451,12 +1483,17 @@ impl Weeb3 {
                     }
 
                     join_all(cheque_joiner).await;
+
+                    worked
                 };
 
                 let k6 = async {
+                    let mut worked = false;
+
                     #[allow(irrefutable_let_patterns)]
                     while let ch_in = cheque_send_chan_incoming.try_recv() {
                         if !ch_in.is_err() {
+                            worked = true;
                             let (peer, ok) = ch_in.unwrap();
                             let amt_opt = {
                                 let mut map = wings.ongoing_cheques.lock().await;
@@ -1477,19 +1514,26 @@ impl Weeb3 {
                             break;
                         }
                     }
+
+                    worked
                 };
 
-                join!(k1, k2, k3, k4, k5, k6);
+                let (k1_worked, k2_worked, k3_worked, k4_worked, k5_worked, k6_worked) =
+                    join!(k1, k2, k3, k4, k5, k6);
+                let worked =
+                    k1_worked || k2_worked || k3_worked || k4_worked || k5_worked || k6_worked;
 
                 let timenow = Date::now();
                 let seg = timenow - interrupt_last;
-                if seg < EVENT_LOOP_INTERRUPTOR {
+                if worked {
+                    async_std::task::yield_now().await;
+                } else if seg < STARTUP_QUEUE_POLL_MS as f64 {
                     //                web_sys::console::log_1(&JsValue::from(format!(
                     //                    "Ease event handle loop for {}",
                     //                    EVENT_LOOP_INTERRUPTOR - seg
                     //                )));
                     async_std::task::sleep(Duration::from_millis(
-                        (EVENT_LOOP_INTERRUPTOR - seg) as u64,
+                        (STARTUP_QUEUE_POLL_MS as f64 - seg) as u64,
                     ))
                     .await;
                 }
@@ -1526,9 +1570,9 @@ impl Weeb3 {
 
                 let timenow = Date::now();
                 let seg = timenow - timelast;
-                if seg < PROTO_LOOP_INTERRUPTOR {
+                if seg < STARTUP_QUEUE_POLL_MS as f64 {
                     async_std::task::sleep(Duration::from_millis(
-                        (PROTO_LOOP_INTERRUPTOR - seg) as u64,
+                        (STARTUP_QUEUE_POLL_MS as f64 - seg) as u64,
                     ))
                     .await;
                 }
@@ -1656,13 +1700,13 @@ impl Weeb3 {
 
                 let timenow = Date::now();
                 let seg = timenow - timelast;
-                if seg < PROTO_LOOP_INTERRUPTOR {
+                if seg < STARTUP_QUEUE_POLL_MS as f64 {
                     // web_sys::console::log_1(&JsValue::from(format!(
                     //     "Ease retrieve handle loop for {}",
                     //     PROTO_LOOP_INTERRUPTOR - seg
                     // )));
                     async_std::task::sleep(Duration::from_millis(
-                        (PROTO_LOOP_INTERRUPTOR - seg) as u64,
+                        (STARTUP_QUEUE_POLL_MS as f64 - seg) as u64,
                     ))
                     .await;
                 }
@@ -1851,9 +1895,9 @@ impl Weeb3 {
 
                 let timenow = Date::now();
                 let seg = timenow - timelast;
-                if seg < PROTO_LOOP_INTERRUPTOR {
+                if seg < STARTUP_QUEUE_POLL_MS as f64 {
                     async_std::task::sleep(Duration::from_millis(
-                        (PROTO_LOOP_INTERRUPTOR - seg) as u64,
+                        (STARTUP_QUEUE_POLL_MS as f64 - seg) as u64,
                     ))
                     .await;
                 }
@@ -1865,91 +1909,95 @@ impl Weeb3 {
             let mut timelast = Date::now();
 
             loop {
-                {
-                    if let Ok(that) = connections_instructions_chan_incoming.try_recv() {
-                        let (bzzaddr0, bootn, dialat) = that;
-                        let ctrl3 = ctrl3.clone();
-                        let accounting_peer_chan_outgoing = accounting_peer_chan_outgoing.clone();
-                        let secret_key = self.secret_key.clone();
-                        let nid: u64;
-                        {
-                            let nid0 = self.network_id.lock().await.clone();
-                            nid = nid0.clone();
+                let mut handled_connections = false;
+                while let Ok(that) = connections_instructions_chan_incoming.try_recv() {
+                    handled_connections = true;
+                    let (bzzaddr0, bootn, _dialat) = that;
+                    let ctrl3 = ctrl3.clone();
+                    let accounting_peer_chan_outgoing = accounting_peer_chan_outgoing.clone();
+                    let secret_key = self.secret_key.clone();
+                    let nid: u64;
+                    {
+                        let nid0 = self.network_id.lock().await.clone();
+                        nid = nid0.clone();
+                    }
+
+                    let wings = wings.clone();
+
+                    spawn_local(async move {
+                        let handshake_started = Date::now();
+                        let addr3 = match libp2p::core::Multiaddr::try_from(bzzaddr0.underlay) {
+                            Ok(addr) => addr,
+                            Err(_) => {
+                                timed_log("Handshake dispatch skipped invalid underlay");
+                                return;
+                            }
+                        };
+
+                        let id = match try_from_multiaddr(&addr3) {
+                            Some(peer_id) => peer_id,
+                            None => {
+                                timed_log("Handshake dispatch skipped invalid peer id");
+                                return;
+                            }
+                        };
+
+                        timed_log(format!(
+                            "Entering Handshake Joiner peer={} bootnode={}",
+                            id, bootn,
+                        ));
+
+                        if bootn {
+                            let mut bootnodes_set = wings.bootnodes.lock().await;
+                            bootnodes_set.insert(id.to_string());
                         }
 
-                        let wings = wings.clone();
-
-                        spawn_local(async move {
-                            let handshake_started = Date::now();
-                            let addr3 = match libp2p::core::Multiaddr::try_from(bzzaddr0.underlay) {
-                                Ok(addr) => addr,
-                                Err(_) => {
-                                    timed_log("Handshake dispatch skipped invalid underlay");
-                                    return;
+                        let self_ephemeral_wait_started = Date::now();
+                        let mut self_ephemeral_polls = 0u32;
+                        let self_ephemeral: Multiaddr = loop {
+                            {
+                                let map = wings.self_ephemerals.lock().await;
+                                if let Some(addr) = map.get(&id) {
+                                    break addr.clone();
                                 }
-                            };
-
-                            let id = match try_from_multiaddr(&addr3) {
-                                Some(peer_id) => peer_id,
-                                None => {
-                                    timed_log("Handshake dispatch skipped invalid peer id");
-                                    return;
-                                }
-                            };
-
-                            timed_log(format!(
-                                "Entering Handshake Joiner peer={} bootnode={}",
-                                id, bootn,
-                            ));
-
-                            if bootn {
-                                let mut bootnodes_set = wings.bootnodes.lock().await;
-                                bootnodes_set.insert(id.to_string());
                             }
-
-                            let self_ephemeral_wait_started = Date::now();
-                            let mut self_ephemeral_polls = 0u32;
-                            let self_ephemeral: Multiaddr = loop {
-                                {
-                                    let map = wings.self_ephemerals.lock().await;
-                                    if let Some(addr) = map.get(&id) {
-                                        break addr.clone();
-                                    }
-                                }
-                                self_ephemeral_polls += 1;
-                                async_std::task::sleep(Duration::from_millis(
-                                    HANDSHAKE_SELF_EPHEMERAL_POLL_MS,
-                                ))
-                                .await;
-                            };
-
-                            let success = connection_handler(
-                                id,
-                                nid,
-                                self_ephemeral,
-                                ctrl3,
-                                &addr3,
-                                &secret_key,
-                                &accounting_peer_chan_outgoing,
-                            )
+                            self_ephemeral_polls += 1;
+                            async_std::task::sleep(Duration::from_millis(
+                                HANDSHAKE_SELF_EPHEMERAL_POLL_MS,
+                            ))
                             .await;
+                        };
 
-                            let elapsed = Date::now() - handshake_started;
-                            timed_log(format!(
-                                "Handshake Joiner finished peer={} success={} elapsed_ms={}",
-                                id, success, elapsed
-                            ));
-                        });
-                    }
+                        let success = connection_handler(
+                            id,
+                            nid,
+                            self_ephemeral,
+                            ctrl3,
+                            &addr3,
+                            &secret_key,
+                            &accounting_peer_chan_outgoing,
+                        )
+                        .await;
+
+                        let elapsed = Date::now() - handshake_started;
+                        timed_log(format!(
+                            "Handshake Joiner finished peer={} success={} elapsed_ms={}",
+                            id, success, elapsed
+                        ));
+                    });
                 }
 
-                let timenow = Date::now();
-                let seg = timenow - timelast;
-                if seg < PROTO_LOOP_INTERRUPTOR {
-                    async_std::task::sleep(Duration::from_millis(
-                        (PROTO_LOOP_INTERRUPTOR - seg) as u64,
-                    ))
-                    .await;
+                if handled_connections {
+                    async_std::task::yield_now().await;
+                } else {
+                    let timenow = Date::now();
+                    let seg = timenow - timelast;
+                    if seg < STARTUP_QUEUE_POLL_MS as f64 {
+                        async_std::task::sleep(Duration::from_millis(
+                            (STARTUP_QUEUE_POLL_MS as f64 - seg) as u64,
+                        ))
+                        .await;
+                    }
                 }
                 timelast = Date::now();
             }

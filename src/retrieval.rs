@@ -12,12 +12,12 @@ use crate::{
     // // // // // // // //
     Mutex,
     // // // // // // // //
-    PROTOCOL_ROUND_TIME,
-    // // // // // // // //
     // // // // // // // //
     PeerAccounting,
     // // // // // // // //
     PeerId,
+    // // // // // // // //
+    STARTUP_QUEUE_POLL_MS,
     // // // // // // // //
     apply_credit,
     // // // // // // // //
@@ -53,6 +53,8 @@ use async_std::sync::Arc;
 use byteorder::ByteOrder;
 
 use async_lock::Semaphore;
+
+const RETRIEVE_PEER_TIMEOUT_SECS: u64 = 8;
 
 use libp2p::futures::{StreamExt, stream::FuturesUnordered};
 
@@ -336,9 +338,9 @@ pub async fn retrieve_chunk(
                 let round_now = Date::now();
 
                 let seg = round_now - round_commence;
-                if seg < PROTOCOL_ROUND_TIME {
+                if seg < STARTUP_QUEUE_POLL_MS as f64 {
                     async_std::task::sleep(Duration::from_millis(
-                        (PROTOCOL_ROUND_TIME - seg) as u64,
+                        (STARTUP_QUEUE_POLL_MS as f64 - seg) as u64,
                     ))
                     .await;
                 }
@@ -352,9 +354,7 @@ pub async fn retrieve_chunk(
 
             {
                 let accounting_peers = accounting.lock().await;
-                if max_error > accounting_peers.len() {
-                    max_error = accounting_peers.len();
-                };
+
                 if accounting_peers.contains_key(&closest_peer_id) {
                     let accounting_peer = accounting_peers.get(&closest_peer_id).unwrap();
                     let allowed = reserve(accounting_peer, req_price, &refresh_chan).await;
@@ -372,7 +372,7 @@ pub async fn retrieve_chunk(
         let (chunk_out, chunk_in) = mpsc::channel::<Vec<u8>>();
 
         let _ = async_std::future::timeout(
-            Duration::from_secs(100),
+            Duration::from_secs(RETRIEVE_PEER_TIMEOUT_SECS),
             retrieve_handler(closest_peer_id, caddr.clone(), control.clone(), &chunk_out),
         )
         .await;
@@ -581,9 +581,11 @@ pub async fn get_data(
 
             let timenow = Date::now();
             let seg = timenow - timelast;
-            if seg < PROTOCOL_ROUND_TIME {
-                async_std::task::sleep(Duration::from_millis((PROTOCOL_ROUND_TIME - seg) as u64))
-                    .await;
+            if seg < STARTUP_QUEUE_POLL_MS as f64 {
+                async_std::task::sleep(Duration::from_millis(
+                    (STARTUP_QUEUE_POLL_MS as f64 - seg) as u64,
+                ))
+                .await;
             };
         }
 
@@ -613,9 +615,11 @@ pub async fn get_chunk(
 
             let timenow = Date::now();
             let seg = timenow - timelast;
-            if seg < PROTOCOL_ROUND_TIME {
-                async_std::task::sleep(Duration::from_millis((PROTOCOL_ROUND_TIME - seg) as u64))
-                    .await;
+            if seg < STARTUP_QUEUE_POLL_MS as f64 {
+                async_std::task::sleep(Duration::from_millis(
+                    (STARTUP_QUEUE_POLL_MS as f64 - seg) as u64,
+                ))
+                .await;
             };
         }
 

@@ -47,27 +47,13 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
 
     clear_path().await;
 
-    let stored_batch_id = get_batch_id().await;
-    if stored_batch_id.len() == 32 {
-        let validity = get_batch_validity(stored_batch_id).await;
-        web_sys::console::log_1(&JsValue::from(format!(
-            "Found batch with validity {:#?}",
-            validity
-        )));
-    }
-
-    let _service_worker = match get_service_worker().await {
-        Some(service_worker) => Some(service_worker),
-        None => None,
-    };
-
     let weeb3 = Arc::new(Weeb3::new("".to_string()));
 
     let weeb30 = weeb3.clone();
 
-    let weeb3_async = async move {
+    spawn_local(async move {
         weeb30.run("".to_string()).await;
-    };
+    });
 
     let weeb31 = weeb3.clone();
     let weeb32 = weeb3.clone();
@@ -79,15 +65,56 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
     let weeb38 = weeb3.clone();
     let weeb39 = weeb3.clone();
 
+    spawn_local(async move {
+        let weeb310 = weeb39.clone();
+        let weeb311 = weeb39.clone();
+        let weeb312 = weeb39.clone();
+        let weeb313 = weeb39.clone();
+        let weeb314 = weeb39.clone();
+        let weeb315 = weeb39.clone();
+        let weeb316 = weeb39.clone();
+        let weeb317 = weeb39.clone();
+
+        join!(
+            connect_bootnode_setting(weeb310, "bootNodeMASettings"),
+            connect_bootnode_setting(weeb311, "bootNodeMASettings0"),
+            connect_bootnode_setting(weeb312, "bootNodeMASettings1"),
+            connect_bootnode_setting(weeb313, "bootNodeMASettings2"),
+            connect_bootnode_setting(weeb314, "bootNodeMASettings3"),
+            connect_bootnode_setting(weeb315, "bootNodeMASettings4"),
+            connect_bootnode_setting(weeb316, "bootNodeMASettings5"),
+            connect_bootnode_setting(weeb317, "bootNodeMASettings6")
+        );
+    });
+
+    spawn_local(async {
+        let stored_batch_id = get_batch_id().await;
+        if stored_batch_id.len() == 32 {
+            let validity = get_batch_validity(stored_batch_id).await;
+            web_sys::console::log_1(&JsValue::from(format!(
+                "Found batch with validity {:#?}",
+                validity
+            )));
+        }
+    });
+
+    spawn_local(async {
+        let _ = get_service_worker().await;
+    });
+
     let chequebook_state = Rc::new(RefCell::new(None::<Address>));
 
-    let stored_chequebook_signer_key = get_chequebook_signer_key().await;
-    let stored_chequebook_address = get_chequebook_address().await;
+    let chequebook_state_init = chequebook_state.clone();
+    spawn_local(async move {
+        let stored_chequebook_signer_key = get_chequebook_signer_key().await;
+        let stored_chequebook_address = get_chequebook_address().await;
 
-    if !stored_chequebook_signer_key.is_empty() && !stored_chequebook_signer_key.is_empty() {
-        *chequebook_state.borrow_mut() =
-            Some(Address::from_str(&hex::encode(stored_chequebook_address)).unwrap());
-    }
+        if !stored_chequebook_signer_key.is_empty() && stored_chequebook_address.len() == 20 {
+            if let Ok(address) = Address::from_str(&hex::encode(stored_chequebook_address)) {
+                *chequebook_state_init.borrow_mut() = Some(address);
+            }
+        }
+    });
 
     let path_load_init = async {
         let references = read_path().await;
@@ -851,17 +878,41 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
                     return;
                 }
 
-                let chequebook = match *state.borrow() {
-                    Some(addr) => addr,
-                    None => {
-                        let wnd = web_sys::window().unwrap();
-                        let _ =
-                            wnd.alert_with_message("Deploy a chequebook first before depositing.");
-                        return;
-                    }
-                };
+                let chequebook = *state.borrow();
 
                 spawn_local(async move {
+                    let chequebook = match chequebook {
+                        Some(addr) => addr,
+                        None => {
+                            let stored_chequebook_signer_key = get_chequebook_signer_key().await;
+                            let stored_chequebook_address = get_chequebook_address().await;
+
+                            if !stored_chequebook_signer_key.is_empty()
+                                && stored_chequebook_address.len() == 20
+                            {
+                                match Address::from_str(&hex::encode(stored_chequebook_address)) {
+                                    Ok(addr) => {
+                                        *state.borrow_mut() = Some(addr);
+                                        addr
+                                    }
+                                    Err(_) => {
+                                        let wnd = web_sys::window().unwrap();
+                                        let _ = wnd.alert_with_message(
+                                            "Stored chequebook address is invalid.",
+                                        );
+                                        return;
+                                    }
+                                }
+                            } else {
+                                let wnd = web_sys::window().unwrap();
+                                let _ = wnd.alert_with_message(
+                                    "Deploy a chequebook first before depositing.",
+                                );
+                                return;
+                            }
+                        }
+                    };
+
                     let window = web_sys::window().unwrap();
                     if let Ok(func) =
                         js_sys::Reflect::get(&window, &JsValue::from_str("weeb3EnsureEip1193"))
@@ -1298,87 +1349,19 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
             web_sys::console::log_1(&JsValue::from(format!("Upload response: {:?}", resp_value)));
         };
     */
-    let initial_connect_handle = async {
-        async_std::task::sleep(Duration::from_millis(160)).await;
-
-        let weeb310 = weeb39.clone();
-        let weeb311 = weeb39.clone();
-        let weeb312 = weeb39.clone();
-        let weeb313 = weeb39.clone();
-        let weeb314 = weeb39.clone();
-        let weeb315 = weeb39.clone();
-        let weeb316 = weeb39.clone();
-        let weeb317 = weeb39.clone();
-
-        let k0 = async move {
-            let (bna, nid) = parsebootconnect("bootNodeMASettings".to_string());
-            let result = weeb310.change_bootnode_address(bna, nid, true).await;
-            let (data, indx) = decode_resources(result);
-            render_result(data, indx).await;
-        };
-
-        let k1 = async move {
-            let (bna, nid) = parsebootconnect("bootNodeMASettings0".to_string());
-            let result = weeb311.change_bootnode_address(bna, nid, true).await;
-            let (data, indx) = decode_resources(result);
-            render_result(data, indx).await;
-        };
-
-        let k2 = async move {
-            let (bna, nid) = parsebootconnect("bootNodeMASettings1".to_string());
-            let result = weeb312.change_bootnode_address(bna, nid, true).await;
-            let (data, indx) = decode_resources(result);
-            render_result(data, indx).await;
-        };
-
-        let k3 = async move {
-            let (bna, nid) = parsebootconnect("bootNodeMASettings2".to_string());
-            let result = weeb313.change_bootnode_address(bna, nid, true).await;
-            let (data, indx) = decode_resources(result);
-            render_result(data, indx).await;
-        };
-
-        let k4 = async move {
-            let (bna, nid) = parsebootconnect("bootNodeMASettings3".to_string());
-            let result = weeb314.change_bootnode_address(bna, nid, true).await;
-            let (data, indx) = decode_resources(result);
-            render_result(data, indx).await;
-        };
-
-        let k5 = async move {
-            let (bna, nid) = parsebootconnect("bootNodeMASettings4".to_string());
-            let result = weeb315.change_bootnode_address(bna, nid, true).await;
-            let (data, indx) = decode_resources(result);
-            render_result(data, indx).await;
-        };
-
-        let k6 = async move {
-            let (bna, nid) = parsebootconnect("bootNodeMASettings5".to_string());
-            let result = weeb316.change_bootnode_address(bna, nid, true).await;
-            let (data, indx) = decode_resources(result);
-            render_result(data, indx).await;
-        };
-
-        let k7 = async move {
-            let (bna, nid) = parsebootconnect("bootNodeMASettings6".to_string());
-            let result = weeb317.change_bootnode_address(bna, nid, true).await;
-            let (data, indx) = decode_resources(result);
-            render_result(data, indx).await;
-        };
-
-        join!(k0, k1, k2, k3, k4, k5, k6, k7);
-    };
-
     join!(
-        weeb3_async,
         interface_async,
         path_load_init,
         // fetch_test,
-        initial_connect_handle
     );
 
     #[allow(unreachable_code)]
     Ok(())
+}
+
+async fn connect_bootnode_setting(weeb3: Arc<Weeb3>, element_id: &'static str) {
+    let (bna, nid) = parsebootconnect(element_id.to_string());
+    let _ = weeb3.change_bootnode_address(bna, nid, true).await;
 }
 
 fn create_element_wmt(tmype: String, blob_url: String) -> Element {

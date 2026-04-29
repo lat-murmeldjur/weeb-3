@@ -731,9 +731,6 @@ pub async fn push_chunk(
 
             {
                 let accounting_peers = accounting.lock().await;
-                if max_error > accounting_peers.len() {
-                    max_error = accounting_peers.len();
-                };
                 if accounting_peers.contains_key(&closest_peer_id) {
                     let accounting_peer = accounting_peers.get(&closest_peer_id).unwrap();
                     let allowed = reserve(accounting_peer, req_price, &refresh_chan).await;

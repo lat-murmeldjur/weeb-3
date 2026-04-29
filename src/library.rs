@@ -6,7 +6,6 @@ use js_sys::Object;
 use js_sys::Reflect;
 use js_sys::{Array, Uint8Array};
 use libp2p::futures::future::join_all;
-use std::time::Duration;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::spawn_local;
 use web_sys::{File, FilePropertyBag};
@@ -81,8 +80,6 @@ impl Weeb3No103 {
             spawn_local(async move {
                 s0.run(String::new()).await;
             });
-
-            async_std::task::sleep(Duration::from_millis(600)).await;
 
             let futures = bootstrap_nodes.into_iter().map(|node| {
                 let s_clone = s.clone();
