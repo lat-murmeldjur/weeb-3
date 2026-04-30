@@ -284,7 +284,7 @@ pub async fn retrieve_chunk(
     let mut current_max_po = 0;
 
     let mut error_count = 0;
-    let mut max_error = 20;
+    let max_error = 20;
 
     #[allow(unused_assignments)]
     let mut cd = vec![];
@@ -329,8 +329,8 @@ pub async fn retrieve_chunk(
             } else {
                 if !overdraftlist.is_empty() {
                     for k in overdraftlist.iter() {
-                        let _ =
-                            refresh_chan.send((k.clone(), 100 * crate::accounting::REFRESH_RATE));
+                        let _ = refresh_chan
+                            .try_send((k.clone(), 100 * crate::accounting::REFRESH_RATE));
                         skiplist.remove(k);
                     }
                     overdraftlist.clear();
@@ -369,7 +369,7 @@ pub async fn retrieve_chunk(
 
         let req_price = price(&closest_overlay, &caddr);
 
-        let (chunk_out, chunk_in) = mpsc::channel::<Vec<u8>>();
+        let (chunk_out, chunk_in) = mpsc::unbounded::<Vec<u8>>();
 
         let _ = async_std::future::timeout(
             Duration::from_secs(RETRIEVE_PEER_TIMEOUT_SECS),
@@ -378,13 +378,13 @@ pub async fn retrieve_chunk(
         .await;
 
         let chunk_data = chunk_in.try_recv();
-        if chunk_data.is_err() {
-            let accounting_peers = accounting.lock().await;
-            if accounting_peers.contains_key(&closest_peer_id) {
-                let accounting_peer = accounting_peers.get(&closest_peer_id).unwrap();
-                cancel_reserve(accounting_peer, req_price).await
-            }
-        }
+        //        if chunk_data.is_err() {
+        //            let accounting_peers = accounting.lock().await;
+        //            if accounting_peers.contains_key(&closest_peer_id) {
+        //                let accounting_peer = accounting_peers.get(&closest_peer_id).unwrap();
+        //                cancel_reserve(accounting_peer, req_price).await
+        //            }
+        //        }
 
         cd = match chunk_data {
             Ok(ref x) => x.clone(),
@@ -567,68 +567,20 @@ pub async fn get_data(
     data_address: Vec<u8>,
     data_retrieve_chan: &mpsc::Sender<(Vec<u8>, mpsc::Sender<Vec<u8>>)>,
 ) -> Vec<u8> {
-    let (chan_out, chan_in) = mpsc::channel::<Vec<u8>>();
-    data_retrieve_chan.send((data_address, chan_out)).unwrap();
+    let (chan_out, chan_in) = mpsc::unbounded::<Vec<u8>>();
+    let _ = data_retrieve_chan.try_send((data_address, chan_out));
 
-    let k0 = async {
-        let mut timelast: f64;
-        #[allow(irrefutable_let_patterns)]
-        while let that = chan_in.try_recv() {
-            timelast = Date::now();
-            if !that.is_err() {
-                return that.unwrap();
-            }
-
-            let timenow = Date::now();
-            let seg = timenow - timelast;
-            if seg < STARTUP_QUEUE_POLL_MS as f64 {
-                async_std::task::sleep(Duration::from_millis(
-                    (STARTUP_QUEUE_POLL_MS as f64 - seg) as u64,
-                ))
-                .await;
-            };
-        }
-
-        return vec![];
-    };
-
-    let result = k0.await;
-
-    return result;
+    return chan_in.recv().await.unwrap_or_default();
 }
 
 pub async fn get_chunk(
     data_address: Vec<u8>,
     chunk_retrieve_chan: &mpsc::Sender<(Vec<u8>, mpsc::Sender<Vec<u8>>)>,
 ) -> Vec<u8> {
-    let (chan_out, chan_in) = mpsc::channel::<Vec<u8>>();
-    chunk_retrieve_chan.send((data_address, chan_out)).unwrap();
+    let (chan_out, chan_in) = mpsc::unbounded::<Vec<u8>>();
+    let _ = chunk_retrieve_chan.try_send((data_address, chan_out));
 
-    let k0 = async {
-        let mut timelast: f64;
-        #[allow(irrefutable_let_patterns)]
-        while let that = chan_in.try_recv() {
-            timelast = Date::now();
-            if !that.is_err() {
-                return that.unwrap();
-            }
-
-            let timenow = Date::now();
-            let seg = timenow - timelast;
-            if seg < STARTUP_QUEUE_POLL_MS as f64 {
-                async_std::task::sleep(Duration::from_millis(
-                    (STARTUP_QUEUE_POLL_MS as f64 - seg) as u64,
-                ))
-                .await;
-            };
-        }
-
-        return vec![];
-    };
-
-    let result = k0.await;
-
-    return result;
+    return chan_in.recv().await.unwrap_or_default();
 }
 
 pub async fn seek_latest_feed_update(

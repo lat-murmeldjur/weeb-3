@@ -22,8 +22,6 @@ use web_sys::{
     // Response,
     ServiceWorker,
     ServiceWorkerRegistration,
-    //
-    console,
 };
 
 use crate::{
@@ -116,7 +114,7 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
         }
     });
 
-    let path_load_init = async {
+    spawn_local(async move {
         let references = read_path().await;
         let mut handles = vec![];
         for reference in references {
@@ -133,7 +131,7 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
             handles.push(handle);
         }
         let _ = join_all(handles).await;
-    };
+    });
 
     let window = web_sys::window().unwrap();
 
@@ -155,7 +153,7 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
 
         let callback =
             wasm_bindgen::closure::Closure::<dyn FnMut(web_sys::MessageEvent)>::new(move |_msg| {
-                console::log_1(&"oninput callback triggered".into());
+                web_sys::console::log_1(&"oninput callback triggered".into());
                 let weeb300 = weeb31.clone();
                 let document = web_sys::window().unwrap().document().unwrap();
 
@@ -168,7 +166,7 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
 
                 match input_field.value().parse::<String>() {
                     Ok(text) => spawn_local(async move {
-                        console::log_1(&"oninput callback string".into());
+                        web_sys::console::log_1(&"oninput callback string".into());
 
                         let result = weeb300.acquire(text).await;
 
@@ -199,7 +197,7 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
 
         let callback2 = wasm_bindgen::closure::Closure::<dyn FnMut(web_sys::MessageEvent)>::new(
             move |_msg| {
-                console::log_1(&"uploadGetBatch callback triggered".into());
+                web_sys::console::log_1(&"uploadGetBatch callback triggered".into());
 
                 let document = web_sys::window().unwrap().document().unwrap();
 
@@ -427,7 +425,7 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
 
         let callback3 = wasm_bindgen::closure::Closure::<dyn FnMut(web_sys::MessageEvent)>::new(
             move |_msg| {
-                console::log_1(&"oninput file callback".into());
+                web_sys::console::log_1(&"oninput file callback".into());
 
                 let weeb300 = weeb32.clone();
 
@@ -547,7 +545,7 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
 
                     render_result(data, indx).await;
 
-                    console::log_1(&"oninput file callback happened".into());
+                    web_sys::console::log_1(&"oninput file callback happened".into());
                 })
             },
         );
@@ -566,7 +564,7 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
             wasm_bindgen::closure::Closure::<dyn FnMut(web_sys::MessageEvent)>::new(move |_msg| {
                 let weeb300 = weeb33.clone();
 
-                console::log_1(&"oninput bootnode callback".into());
+                web_sys::console::log_1(&"oninput bootnode callback".into());
 
                 spawn_local(async move {
                     let weeb310 = weeb300.clone();
@@ -637,7 +635,7 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
                     join!(k0, k1, k2, k3, k4, k5, k6, k7);
                 });
 
-                console::log_1(&"oninput network settings callback happened".into());
+                web_sys::console::log_1(&"oninput network settings callback happened".into());
             });
 
         web_sys::window()
@@ -654,7 +652,7 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
             wasm_bindgen::closure::Closure::<dyn FnMut(web_sys::MessageEvent)>::new(move |_msg| {
                 let weeb300 = weeb34.clone();
 
-                console::log_1(&"oninput reset stamp callback".into());
+                web_sys::console::log_1(&"oninput reset stamp callback".into());
 
                 let window = web_sys::window().unwrap();
 
@@ -1349,11 +1347,7 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
             web_sys::console::log_1(&JsValue::from(format!("Upload response: {:?}", resp_value)));
         };
     */
-    join!(
-        interface_async,
-        path_load_init,
-        // fetch_test,
-    );
+    interface_async.await;
 
     #[allow(unreachable_code)]
     Ok(())
@@ -1530,8 +1524,6 @@ async fn render_result(data: Vec<(Vec<u8>, String, String)>, indx: String) {
         path00.push_str(&sep);
         path00.push_str(&indx);
 
-        async_std::task::sleep(Duration::from_millis(160)).await;
-
         let new_element = create_ielement(path00);
 
         let document = web_sys::window().unwrap().document().unwrap();
@@ -1636,7 +1628,7 @@ pub async fn get_service_worker() -> Option<web_sys::ServiceWorker> {
             let _ = JsFuture::from(service0.ready().unwrap()).await;
         }
         Err(err) => {
-            console::warn_1(&err);
+            web_sys::console::warn_1(&err);
         }
     }
 

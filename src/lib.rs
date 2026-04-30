@@ -4,11 +4,11 @@ use async_std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
 use wasm_bindgen_futures::spawn_local;
 
+pub(crate) use async_std::channel as mpsc;
 use rand::rngs::OsRng;
 use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::num::NonZero;
-use std::sync::mpsc;
 use std::time::Duration;
 
 use tar::Archive;
@@ -157,10 +157,7 @@ const SWAP_PROTOCOL: StreamProtocol = StreamProtocol::new("/swarm/swap/1.0.0/swa
 // const PUSH_PROTOCOL: StreamProtocol = StreamProtocol::new("/swarm/pushsync/1.3.0/pushsync");
 
 const PROTOCOL_ROUND_TIME: f64 = 160.0;
-const EVENT_LOOP_INTERRUPTOR: f64 = 90.0;
-const PROTO_LOOP_INTERRUPTOR: f64 = 90.0;
 const STARTUP_QUEUE_POLL_MS: u64 = 25;
-const HANDSHAKE_SELF_EPHEMERAL_POLL_MS: u64 = STARTUP_QUEUE_POLL_MS;
 
 pub fn timed_log(message: impl AsRef<str>) {
     web_sys::console::log_1(&JsValue::from(message.as_ref()));
@@ -225,6 +222,7 @@ pub struct Wings {
     swap_beneficiaries: Arc<Mutex<HashMap<PeerId, (web3::types::Address, bool)>>>,
     connection_attempts: Arc<Mutex<HashSet<PeerId>>>,
     self_ephemerals: PeerAddrMap,
+    self_ephemeral_waiters: Arc<Mutex<HashMap<PeerId, Vec<mpsc::Sender<Multiaddr>>>>>,
 }
 
 #[wasm_bindgen]
@@ -262,36 +260,13 @@ impl Weeb3 {
 
         web_sys::console::log_1(&"bootnode change triggered".into());
 
-        let (chan_out, chan_in) = mpsc::channel::<String>();
+        let (chan_out, chan_in) = mpsc::unbounded::<String>();
         let _ = self
             .bootnode_port
             .0
-            .send((address, chan_out, usable_in_protocols));
+            .try_send((address, chan_out, usable_in_protocols));
 
-        let k0 = async {
-            let mut timelast: f64;
-            #[allow(irrefutable_let_patterns)]
-            while let that = chan_in.try_recv() {
-                let timenow = Date::now();
-                timelast = timenow;
-                if !that.is_err() {
-                    return that.unwrap();
-                }
-
-                let timenow = Date::now();
-                let seg = timenow - timelast;
-                if seg < EVENT_LOOP_INTERRUPTOR {
-                    async_std::task::sleep(Duration::from_millis(
-                        (EVENT_LOOP_INTERRUPTOR - seg) as u64,
-                    ))
-                    .await;
-                };
-            }
-
-            return "".to_string();
-        };
-
-        let result = k0.await;
+        let result = chan_in.recv().await.unwrap_or_default();
 
         if !usable_in_protocols {
             return encode_resources(
@@ -338,6 +313,7 @@ impl Weeb3 {
         wings.ongoing_cheques.lock().await.clear();
         wings.swap_beneficiaries.lock().await.clear();
         wings.self_ephemerals.lock().await.clear();
+        wings.self_ephemeral_waiters.lock().await.clear();
 
         {
             let mut ongoing = self.ongoing_connections.lock().await;
@@ -352,6 +328,53 @@ impl Weeb3 {
         web_sys::console::log_1(&JsValue::from("All peers disconnected"));
     }
 
+    async fn promote_priced_peer(&self, wings: &Arc<Wings>, peer: PeerId) {
+        let peer_file = {
+            let connected_peers_map = wings.connected_peers.lock().await;
+            match connected_peers_map.get(&peer) {
+                Some(peer_file) => peer_file.clone(),
+                None => return,
+            }
+        };
+
+        let ol = hex::encode(peer_file.overlay.clone());
+        let bootnode = {
+            let bootnodes_set = wings.bootnodes.lock().await;
+            bootnodes_set.contains(&peer.to_string())
+        };
+
+        let promoted = if !bootnode {
+            let mut overlay_peers_map = wings.overlay_peers.lock().await;
+            if overlay_peers_map.contains_key(&ol) {
+                false
+            } else {
+                overlay_peers_map.insert(ol.clone(), peer);
+                true
+            }
+        } else {
+            true
+        };
+
+        if promoted {
+            if bootnode {
+                self.interface_log(format!("Connected to bootnode {}", &ol));
+            } else {
+                self.interface_log(format!("Connected to peer {}", &ol));
+            }
+
+            {
+                let mut connections = self.connections.lock().await;
+                *connections = *connections + 1
+            }
+            {
+                let mut ongoing = self.ongoing_connections.lock().await;
+                if *ongoing > 0 {
+                    *ongoing = *ongoing - 1
+                }
+            }
+        }
+    }
+
     pub async fn post_upload(
         &self,
         file: File,
@@ -360,7 +383,7 @@ impl Weeb3 {
         add_to_feed: bool,
         feed_topic: String,
     ) -> Vec<u8> {
-        let (chan_out, chan_in) = mpsc::channel::<Vec<u8>>();
+        let (chan_out, chan_in) = mpsc::unbounded::<Vec<u8>>();
 
         let f_name = file.name();
         let f_type0 = file.type_();
@@ -455,7 +478,7 @@ impl Weeb3 {
             _ => hex::encode(keccak256(feed_topic)),
         };
 
-        let _ = self.upload_port.0.send((
+        let _ = self.upload_port.0.try_send((
             fvec0,
             encryption,
             index_document,
@@ -464,30 +487,7 @@ impl Weeb3 {
             chan_out,
         ));
 
-        let k0 = async {
-            let mut timelast: f64;
-            #[allow(irrefutable_let_patterns)]
-            while let that = chan_in.try_recv() {
-                let timenow = Date::now();
-                timelast = timenow;
-                if !that.is_err() {
-                    return that.unwrap();
-                }
-
-                let timenow = Date::now();
-                let seg = timenow - timelast;
-                if seg < EVENT_LOOP_INTERRUPTOR {
-                    async_std::task::sleep(Duration::from_millis(
-                        (EVENT_LOOP_INTERRUPTOR - seg) as u64,
-                    ))
-                    .await;
-                };
-            }
-
-            return vec![];
-        };
-
-        let result = k0.await;
+        let result = chan_in.recv().await.unwrap_or_default();
 
         return encode_resources(
             vec![(
@@ -511,94 +511,48 @@ impl Weeb3 {
         chunk_address: Vec<u8>,
         stamp: Vec<u8>,
     ) -> Vec<u8> {
-        let (chan_out, chan_in) = mpsc::channel::<bool>();
+        let (chan_out, chan_in) = mpsc::unbounded::<bool>();
 
         let chunk_address0 = chunk_address.clone();
 
         let _ = self
             .chunk_push_port
             .0
-            .send((d, soc, chunk_address, stamp, chan_out));
+            .try_send((d, soc, chunk_address, stamp, chan_out));
 
-        let mut timelast = Date::now();
+        let result = chan_in.recv().await.unwrap_or(false);
+        if result {
+            let result_data = vec![(
+                format!("Upload result: success").as_bytes().to_vec(),
+                "text/plain".to_string(),
+                "Upload result".to_string(),
+            )];
+            let result_hex = hex::encode(&chunk_address0);
 
-        loop {
-            if let Ok(result) = chan_in.try_recv() {
-                if result {
-                    let result_data = vec![(
-                        format!("Upload result: success").as_bytes().to_vec(),
-                        "text/plain".to_string(),
-                        "Upload result".to_string(),
-                    )];
-                    let result_hex = hex::encode(&chunk_address0);
+            return encode_resources(result_data, result_hex);
+        } else {
+            let result_data = vec![(
+                format!("Upload result: failure").as_bytes().to_vec(),
+                "text/plain".to_string(),
+                "... result ...".to_string(),
+            )];
+            let result_hex = hex::encode(&chunk_address0);
 
-                    return encode_resources(result_data, result_hex);
-                } else {
-                    let result_data = vec![(
-                        format!("Upload result: failure").as_bytes().to_vec(),
-                        "text/plain".to_string(),
-                        "... result ...".to_string(),
-                    )];
-                    let result_hex = hex::encode(&chunk_address0);
-
-                    return encode_resources(result_data, result_hex);
-                }
-            }
-
-            let timenow = Date::now();
-            let seg = timenow - timelast;
-
-            if seg < EVENT_LOOP_INTERRUPTOR {
-                async_std::task::sleep(Duration::from_millis(
-                    (EVENT_LOOP_INTERRUPTOR - seg) as u64,
-                ))
-                .await;
-            }
-
-            timelast = Date::now();
+            return encode_resources(result_data, result_hex);
         }
     }
 
     pub async fn acquire(&self, address: String) -> Vec<u8> {
-        let (chan_out, chan_in) = mpsc::channel::<Vec<u8>>();
+        let (chan_out, chan_in) = mpsc::unbounded::<Vec<u8>>();
         let valaddr_0 = hex::decode(&address);
         let valaddr = match valaddr_0 {
             Ok(hex) => hex,
             _ => prt(address, "".to_string()).await,
         };
 
-        let _ = self.message_port.0.send((valaddr, chan_out));
+        let _ = self.message_port.0.try_send((valaddr, chan_out));
 
-        let k0 = async {
-            let mut timelast: f64;
-            #[allow(irrefutable_let_patterns)]
-            while let that = chan_in.try_recv() {
-                let timenow = Date::now();
-                timelast = timenow;
-                if !that.is_err() {
-                    return that.unwrap();
-                }
-
-                let timenow = Date::now();
-                let seg = timenow - timelast;
-                if seg < STARTUP_QUEUE_POLL_MS as f64 {
-                    //                web_sys::console::log_1(&JsValue::from(format!(
-                    //                    "Ease event handle loop for {}",
-                    //                    EVENT_LOOP_INTERRUPTOR - seg
-                    //                )));
-                    async_std::task::sleep(Duration::from_millis(
-                        (STARTUP_QUEUE_POLL_MS as f64 - seg) as u64,
-                    ))
-                    .await;
-                };
-            }
-
-            return vec![];
-        };
-
-        let result = k0.await;
-
-        return result;
+        return chan_in.recv().await.unwrap_or_default();
     }
 
     pub async fn reset_stamp(&self) -> Vec<u8> {
@@ -665,12 +619,14 @@ impl Weeb3 {
         let swap_beneficiaries: Arc<Mutex<HashMap<PeerId, (web3::types::Address, bool)>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let self_ephemerals: PeerAddrMap = Arc::new(Mutex::new(HashMap::new()));
+        let self_ephemeral_waiters: Arc<Mutex<HashMap<PeerId, Vec<mpsc::Sender<Multiaddr>>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
 
-        let (m_out, m_in) = mpsc::channel::<(Vec<u8>, mpsc::Sender<Vec<u8>>)>();
+        let (m_out, m_in) = mpsc::unbounded::<(Vec<u8>, mpsc::Sender<Vec<u8>>)>();
 
-        let (log_port_out, log_port_in) = mpsc::channel::<String>();
+        let (log_port_out, log_port_in) = mpsc::unbounded::<String>();
 
-        let (u_out, u_in) = mpsc::channel::<(
+        let (u_out, u_in) = mpsc::unbounded::<(
             Vec<Resource>,
             bool,
             String,
@@ -678,9 +634,9 @@ impl Weeb3 {
             String,
             mpsc::Sender<Vec<u8>>,
         )>();
-        let (b_out, b_in) = mpsc::channel::<(String, mpsc::Sender<String>, bool)>();
+        let (b_out, b_in) = mpsc::unbounded::<(String, mpsc::Sender<String>, bool)>();
         let (chunk_push_port_out, chunk_push_port_in) =
-            mpsc::channel::<(Vec<u8>, bool, Vec<u8>, Vec<u8>, mpsc::Sender<bool>)>();
+            mpsc::unbounded::<(Vec<u8>, bool, Vec<u8>, Vec<u8>, mpsc::Sender<bool>)>();
 
         return Weeb3 {
             secret_key: Arc::new(Mutex::new(secret_key)),
@@ -695,6 +651,7 @@ impl Weeb3 {
                 swap_beneficiaries: swap_beneficiaries,
                 connection_attempts: connection_attempts,
                 self_ephemerals: self_ephemerals,
+                self_ephemeral_waiters: self_ephemeral_waiters,
             })),
             log_port: (log_port_out, log_port_in),
             message_port: (m_out, m_in),
@@ -734,7 +691,7 @@ impl Weeb3 {
     }
 
     pub fn interface_log(&self, log0: String) {
-        let _ = self.log_port.0.send(log0.to_string());
+        let _ = self.log_port.0.try_send(log0.to_string());
         web_sys::console::log_1(&JsValue::from(log0));
     }
 
@@ -763,36 +720,38 @@ impl Weeb3 {
 
         let wings = self.wings.lock().await;
 
-        let (peers_instructions_chan_outgoing, peers_instructions_chan_incoming) = mpsc::channel();
+        let (peers_instructions_chan_outgoing, peers_instructions_chan_incoming) =
+            mpsc::unbounded();
         let (connections_instructions_chan_outgoing, connections_instructions_chan_incoming) =
-            mpsc::channel::<(etiquette_2::BzzAddress, bool, u64)>();
+            mpsc::unbounded::<(etiquette_2::BzzAddress, bool, u64)>();
 
-        let (accounting_peer_chan_outgoing, accounting_peer_chan_incoming) = mpsc::channel();
+        let (accounting_peer_chan_outgoing, accounting_peer_chan_incoming) =
+            mpsc::unbounded::<PeerFile>();
 
-        let (pricing_chan_outgoing, pricing_chan_incoming) = mpsc::channel::<(PeerId, u64)>();
+        let (pricing_chan_outgoing, pricing_chan_incoming) = mpsc::unbounded::<(PeerId, u64)>();
 
         let (refreshment_instructions_chan_outgoing, refreshment_instructions_chan_incoming) =
-            mpsc::channel::<(PeerId, u64)>();
+            mpsc::unbounded::<(PeerId, u64)>();
 
         let (refreshment_chan_outgoing, refreshment_chan_incoming) =
-            mpsc::channel::<(PeerId, u64)>();
+            mpsc::unbounded::<(PeerId, u64)>();
 
         let (data_retrieve_chan_outgoing, data_retrieve_chan_incoming) =
-            mpsc::channel::<(Vec<u8>, mpsc::Sender<Vec<u8>>)>();
+            mpsc::unbounded::<(Vec<u8>, mpsc::Sender<Vec<u8>>)>();
 
         let (chunk_retrieve_chan_outgoing, chunk_retrieve_chan_incoming) =
-            mpsc::channel::<(Vec<u8>, mpsc::Sender<Vec<u8>>)>();
+            mpsc::unbounded::<(Vec<u8>, mpsc::Sender<Vec<u8>>)>();
 
         let (data_upload_chan_outgoing, data_upload_chan_incoming) =
-            mpsc::channel::<(Vec<Vec<u8>>, u8, Vec<u8>, Vec<u8>, mpsc::Sender<Vec<u8>>)>();
+            mpsc::unbounded::<(Vec<Vec<u8>>, u8, Vec<u8>, Vec<u8>, mpsc::Sender<Vec<u8>>)>();
 
         let (chunk_upload_chan_outgoing, chunk_upload_chan_incoming) =
-            mpsc::channel::<(Vec<u8>, bool, Vec<u8>, Vec<u8>, mpsc::Sender<bool>)>();
+            mpsc::unbounded::<(Vec<u8>, bool, Vec<u8>, Vec<u8>, mpsc::Sender<bool>)>();
 
         let (cheque_instructions_chan_outgoing, cheque_instructions_chan_incoming) =
-            mpsc::channel::<(PeerId, u64)>();
+            mpsc::unbounded::<(PeerId, u64)>();
         let (cheque_send_chan_outgoing, cheque_send_chan_incoming) =
-            mpsc::channel::<(PeerId, bool)>();
+            mpsc::unbounded::<(PeerId, bool)>();
 
         let mut ctrl0;
         let mut ctrl1;
@@ -822,143 +781,141 @@ impl Weeb3 {
 
         let pricing_inbound_handle = async move {
             while let Some((peer, stream)) = incoming_pricing_streams.next().await {
-                pricing_handler(peer, stream, &pricing_chan_outgoing.clone()).await;
+                let pricing_chan_outgoing = pricing_chan_outgoing.clone();
+                spawn_local(async move {
+                    pricing_handler(peer, stream, &pricing_chan_outgoing).await;
+                });
+                async_std::task::yield_now().await;
             }
         };
 
         let gossip_inbound_handle = async move {
             while let Some((peer, stream)) = incoming_gossip_streams.next().await {
-                gossip_handler(peer, stream, &peers_instructions_chan_outgoing.clone()).await;
+                let peers_instructions_chan_outgoing = peers_instructions_chan_outgoing.clone();
+                spawn_local(async move {
+                    gossip_handler(peer, stream, &peers_instructions_chan_outgoing).await;
+                });
+                async_std::task::yield_now().await;
             }
         };
 
         let swarm_event_handle_0 = async {
             loop {
-                let mut dial_joiner = Vec::new();
+                let mut paddr = match peers_instructions_chan_incoming.recv().await {
+                    Ok(paddr) => paddr,
+                    Err(_) => break,
+                };
 
-                #[allow(irrefutable_let_patterns)]
-                while let paddr0 = peers_instructions_chan_incoming.try_recv() {
-                    if !paddr0.is_err() {
-                        let handle = async {
-                            // web_sys::console::log_1(&JsValue::from(format!(
-                            //     "Current Conn Handled {:#?}",
-                            //     paddr
-                            // )));
+                loop {
+                    let paddr_current = paddr.clone();
+                    let wings = wings.clone();
+                    let swarm = self.swarm.clone();
+                    let connections_instructions_chan_outgoing =
+                        connections_instructions_chan_outgoing.clone();
 
-                            let paddr = match paddr0 {
-                                Ok(aok) => aok,
-                                _ => {
-                                    return;
-                                }
-                            };
+                    spawn_local(async move {
+                        let und_addrs = deserialize_underlays(&paddr_current.clone().underlay);
 
-                            let und_addrs = deserialize_underlays(&paddr.clone().underlay);
+                        for addr3 in und_addrs.iter() {
+                            web_sys::console::log_1(&JsValue::from(format!(
+                                "Current Conn Handled {:#?}",
+                                addr3.to_string()
+                            )));
 
-                            for addr3 in und_addrs.iter() {
-                                web_sys::console::log_1(&JsValue::from(format!(
-                                    "Current Conn Handled {:#?}",
-                                    addr3.to_string()
-                                )));
-
-                                if detect_underlay_format(&addr3) == UnderlayFormat::BeeWss {
-                                    let _pid: PeerId = match try_from_multiaddr(&addr3.clone()) {
-                                        Some(aok) => {
-                                            let connected_peers_map =
-                                                wings.connected_peers.lock().await;
-                                            if connected_peers_map.contains_key(&aok) {
-                                                continue;
-                                            }
-                                            let mut connection_attempts_map =
-                                                wings.connection_attempts.lock().await;
-                                            if connection_attempts_map.contains(&aok) {
-                                                continue;
-                                            } else {
-                                                connection_attempts_map.insert(aok);
-                                            }
-                                            aok
-                                        }
-                                        _ => {
-                                            continue;
-                                        }
-                                    };
-
-                                    let mut paddr5 = paddr.clone();
-                                    {
-                                        let mut swarm = self.swarm.lock_arc().await;
-                                        web_sys::console::log_1(&JsValue::from(format!("dial 0",)));
-                                        let addr30 = beewss_to_dns_transformed(&addr3);
-                                        let _ = swarm.dial(addr30.clone());
-                                        paddr5.underlay = addr30.to_vec();
-                                    }
-
-                                    let _ = connections_instructions_chan_outgoing.send((
-                                        paddr5.clone(),
-                                        false,
-                                        Date::now() as u64,
-                                    ));
-                                }
-                            }
-
-                            let addr4 =
-                                match libp2p::core::Multiaddr::try_from(paddr.clone().underlay) {
-                                    Ok(aok) => aok,
-                                    _ => {
-                                        return;
-                                    }
-                                };
-
-                            if detect_underlay_format(&addr4) == UnderlayFormat::BeeWss {
-                                let _pid: PeerId = match try_from_multiaddr(&addr4.clone()) {
+                            if detect_underlay_format(&addr3) == UnderlayFormat::BeeWss {
+                                let _pid: PeerId = match try_from_multiaddr(&addr3.clone()) {
                                     Some(aok) => {
                                         let connected_peers_map =
                                             wings.connected_peers.lock().await;
                                         if connected_peers_map.contains_key(&aok) {
-                                            return;
+                                            continue;
                                         }
                                         let mut connection_attempts_map =
                                             wings.connection_attempts.lock().await;
                                         if connection_attempts_map.contains(&aok) {
-                                            return;
+                                            continue;
                                         } else {
                                             connection_attempts_map.insert(aok);
                                         }
                                         aok
                                     }
                                     _ => {
-                                        return;
+                                        continue;
                                     }
                                 };
 
-                                let mut paddr5 = paddr.clone();
+                                let mut paddr5 = paddr_current.clone();
                                 {
-                                    let mut swarm = self.swarm.lock_arc().await;
-
-                                    web_sys::console::log_1(&JsValue::from(format!("dial 1",)));
-                                    let addr40 = beewss_to_dns_transformed(&addr4);
-                                    let _ = swarm.dial(addr40.clone());
-                                    paddr5.underlay = addr40.to_vec();
+                                    let mut swarm = swarm.lock_arc().await;
+                                    web_sys::console::log_1(&JsValue::from(format!("dial 0",)));
+                                    let addr30 = beewss_to_dns_transformed(&addr3);
+                                    let _ = swarm.dial(addr30.clone());
+                                    paddr5.underlay = addr30.to_vec();
                                 }
 
-                                let _ = connections_instructions_chan_outgoing.send((
+                                let _ = connections_instructions_chan_outgoing.try_send((
                                     paddr5.clone(),
                                     false,
                                     Date::now() as u64,
                                 ));
                             }
-                        };
-                        dial_joiner.push(handle);
-                    } else {
-                        break;
-                    };
+                        }
+
+                        let addr4 =
+                            match libp2p::core::Multiaddr::try_from(paddr_current.clone().underlay)
+                            {
+                                Ok(aok) => aok,
+                                _ => {
+                                    return;
+                                }
+                            };
+
+                        if detect_underlay_format(&addr4) == UnderlayFormat::BeeWss {
+                            let _pid: PeerId = match try_from_multiaddr(&addr4.clone()) {
+                                Some(aok) => {
+                                    let connected_peers_map = wings.connected_peers.lock().await;
+                                    if connected_peers_map.contains_key(&aok) {
+                                        return;
+                                    }
+                                    let mut connection_attempts_map =
+                                        wings.connection_attempts.lock().await;
+                                    if connection_attempts_map.contains(&aok) {
+                                        return;
+                                    } else {
+                                        connection_attempts_map.insert(aok);
+                                    }
+                                    aok
+                                }
+                                _ => {
+                                    return;
+                                }
+                            };
+
+                            let mut paddr5 = paddr_current.clone();
+                            {
+                                let mut swarm = swarm.lock_arc().await;
+
+                                web_sys::console::log_1(&JsValue::from(format!("dial 1",)));
+                                let addr40 = beewss_to_dns_transformed(&addr4);
+                                let _ = swarm.dial(addr40.clone());
+                                paddr5.underlay = addr40.to_vec();
+                            }
+
+                            let _ = connections_instructions_chan_outgoing.try_send((
+                                paddr5.clone(),
+                                false,
+                                Date::now() as u64,
+                            ));
+                        }
+                    });
+
+                    match peers_instructions_chan_incoming.try_recv() {
+                        Ok(next) => paddr = next,
+                        Err(_) => break,
+                    }
                 }
 
-                let had_work = !dial_joiner.is_empty();
-                join_all(dial_joiner).await;
-                if had_work {
-                    async_std::task::yield_now().await;
-                } else {
-                    async_std::task::sleep(Duration::from_millis(STARTUP_QUEUE_POLL_MS)).await;
-                }
+                async_std::task::yield_now().await;
             }
         };
 
@@ -993,6 +950,17 @@ impl Weeb3 {
                                                 .push(std::iter::once(peer_id.clone()));
                                             let mut map = wings.self_ephemerals.lock().await;
                                             map.insert(peer_id.clone(), observed_addr.clone());
+                                            drop(map);
+
+                                            let waiters = {
+                                                let mut waiters =
+                                                    wings.self_ephemeral_waiters.lock().await;
+                                                waiters.remove(&peer_id).unwrap_or_default()
+                                            };
+                                            for waiter in waiters {
+                                                let _ = waiter.try_send(observed_addr.clone());
+                                            }
+
                                             self.interface_log(format!(
                                                 "Observed address {} for peer {} stored/overwritten",
                                                 observed_addr, peer_id
@@ -1035,7 +1003,7 @@ impl Weeb3 {
                                     if let Some(address) = retry_address {
                                         let mut bzzaddr = etiquette_2::BzzAddress::default();
                                         bzzaddr.underlay = address.to_vec();
-                                        let _ = connections_instructions_chan_outgoing.send((
+                                        let _ = connections_instructions_chan_outgoing.try_send((
                                             bzzaddr,
                                             false,
                                             Date::now() as u64,
@@ -1081,7 +1049,7 @@ impl Weeb3 {
                                         match endpoint {
                                             libp2p::core::ConnectedPoint::Dialer { ref address, .. } => {
                                                 bzzaddr.underlay = address.to_vec();
-                                                let _ = connections_instructions_chan_outgoing.send((bzzaddr, false, (Date::now() as u64)));
+                                                let _ = connections_instructions_chan_outgoing.try_send((bzzaddr, false, (Date::now() as u64)));
                                             }
                                             _ => {}
                                         }
@@ -1104,230 +1072,214 @@ impl Weeb3 {
 
         let swarm_event_handle_2 = async {
             loop {
-                let mut bootnode_dial_joiner = Vec::new();
+                let mut bootnode_change = match self.bootnode_port.1.recv().await {
+                    Ok(change) => change,
+                    Err(_) => break,
+                };
 
-                #[allow(irrefutable_let_patterns)]
-                while let bootnode_change = self.bootnode_port.1.try_recv() {
-                    if !bootnode_change.is_err() {
-                        let handle = async {
-                            let (baddr, chan, usable) = bootnode_change.unwrap();
+                loop {
+                    let (baddr, chan, usable) = bootnode_change;
+                    let wings = wings.clone();
+                    let swarm = self.swarm.clone();
+                    let connections_instructions_chan_outgoing =
+                        connections_instructions_chan_outgoing.clone();
 
-                            let addr33 = match baddr.parse::<Multiaddr>() {
-                                Ok(aok) => aok,
-                                _ => {
-                                    let _ = chan
-                                        .send("parse multiaddress for bootnode failed".to_string());
-                                    return;
-                                }
-                            };
-
-                            // let bn_id: PeerId = match try_from_multiaddr(&addr33.clone()) {
-                            //     Some(aok) => aok,
-                            //     _ => {
-                            //         let _ = chan.send("parse peerid for bootnode failed".to_string());
-                            //         break;
-                            //     }
-                            // };
-                            let _pid: PeerId = match try_from_multiaddr(&addr33.clone()) {
-                                Some(aok) => {
-                                    let mut connection_attempts_map =
-                                        wings.connection_attempts.lock().await;
-                                    if connection_attempts_map.contains(&aok) {
-                                        return;
-                                    } else {
-                                        connection_attempts_map.insert(aok);
-                                    }
-                                    aok
-                                }
-                                _ => return,
-                            };
-                            {
-                                let mut swarm = self.swarm.lock_arc().await;
-                                web_sys::console::log_1(&JsValue::from(format!(
-                                    "dial 2 :: {:#?}",
-                                    addr33
-                                )));
-                                if detect_underlay_format(&addr33) == UnderlayFormat::BeeWss {
-                                    let addr30 = beewss_to_dns_transformed(&addr33);
-                                    let _ = swarm.dial(addr30.clone());
-
-                                    let _ = chan.send("dialing bootnode".to_string());
-
-                                    let mut bzzaddr = etiquette_2::BzzAddress::default();
-
-                                    bzzaddr.underlay = addr30.to_vec();
-
-                                    let _ = connections_instructions_chan_outgoing.send((
-                                        bzzaddr,
-                                        !usable,
-                                        Date::now() as u64,
-                                    ));
-                                } else {
-                                    let _ = swarm.dial(addr33.clone());
-
-                                    let _ = chan.send("dialing bootnode".to_string());
-
-                                    let mut bzzaddr = etiquette_2::BzzAddress::default();
-
-                                    bzzaddr.underlay = addr33.to_vec();
-
-                                    let _ = connections_instructions_chan_outgoing.send((
-                                        bzzaddr,
-                                        !usable,
-                                        Date::now() as u64,
-                                    ));
-                                }
+                    spawn_local(async move {
+                        let addr33 = match baddr.parse::<Multiaddr>() {
+                            Ok(aok) => aok,
+                            _ => {
+                                let _ = chan
+                                    .try_send("parse multiaddress for bootnode failed".to_string());
+                                return;
                             }
                         };
-                        bootnode_dial_joiner.push(handle);
-                    } else {
-                        break;
+
+                        // let bn_id: PeerId = match try_from_multiaddr(&addr33.clone()) {
+                        //     Some(aok) => aok,
+                        //     _ => {
+                        //         let _ = chan.try_send("parse peerid for bootnode failed".to_string());
+                        //         break;
+                        //     }
+                        // };
+                        let _pid: PeerId = match try_from_multiaddr(&addr33.clone()) {
+                            Some(aok) => {
+                                let mut connection_attempts_map =
+                                    wings.connection_attempts.lock().await;
+                                if connection_attempts_map.contains(&aok) {
+                                    return;
+                                } else {
+                                    connection_attempts_map.insert(aok);
+                                }
+                                aok
+                            }
+                            _ => return,
+                        };
+                        {
+                            let mut swarm = swarm.lock_arc().await;
+                            web_sys::console::log_1(&JsValue::from(format!(
+                                "dial 2 :: {:#?}",
+                                addr33
+                            )));
+                            if detect_underlay_format(&addr33) == UnderlayFormat::BeeWss {
+                                let addr30 = beewss_to_dns_transformed(&addr33);
+                                let _ = swarm.dial(addr30.clone());
+
+                                let _ = chan.try_send("dialing bootnode".to_string());
+
+                                let mut bzzaddr = etiquette_2::BzzAddress::default();
+
+                                bzzaddr.underlay = addr30.to_vec();
+
+                                let _ = connections_instructions_chan_outgoing.try_send((
+                                    bzzaddr,
+                                    !usable,
+                                    Date::now() as u64,
+                                ));
+                            } else {
+                                let _ = swarm.dial(addr33.clone());
+
+                                let _ = chan.try_send("dialing bootnode".to_string());
+
+                                let mut bzzaddr = etiquette_2::BzzAddress::default();
+
+                                bzzaddr.underlay = addr33.to_vec();
+
+                                let _ = connections_instructions_chan_outgoing.try_send((
+                                    bzzaddr,
+                                    !usable,
+                                    Date::now() as u64,
+                                ));
+                            }
+                        }
+                    });
+
+                    match self.bootnode_port.1.try_recv() {
+                        Ok(change) => bootnode_change = change,
+                        Err(_) => break,
                     }
                 }
-                let had_work = !bootnode_dial_joiner.is_empty();
-                join_all(bootnode_dial_joiner).await;
-                if had_work {
-                    async_std::task::yield_now().await;
-                } else {
-                    async_std::task::sleep(Duration::from_millis(STARTUP_QUEUE_POLL_MS)).await;
-                }
+
+                async_std::task::yield_now().await;
             }
         };
 
-        let event_handle = async {
-            let mut timelast = Date::now();
-            let mut interrupt_last = Date::now();
+        let accounting_event_handle = async {
             loop {
-                let k1 = async {
-                    let mut worked = false;
+                let mut peer_file = match accounting_peer_chan_incoming.recv().await {
+                    Ok(peer_file) => peer_file,
+                    Err(_) => break,
+                };
 
-                    #[allow(irrefutable_let_patterns)]
-                    while let incoming_peer = accounting_peer_chan_incoming.try_recv() {
-                        if !incoming_peer.is_err() {
-                            worked = true;
-                            // Accounting connect
-                            let peer_file: PeerFile = incoming_peer.unwrap();
-                            // let ol = hex::encode(peer_file.overlay.clone());
-                            {
-                                let mut accounting = wings.accounting_peers.lock().await;
-                                if !accounting.contains_key(&peer_file.peer_id) {
-                                    accounting.insert(
-                                        peer_file.peer_id,
-                                        Mutex::new(PeerAccounting {
-                                            balance: 0,
-                                            threshold: 0,
-                                            payment_threshold: 0,
-                                            reserve: 0,
-                                            refreshment: 0.0,
-                                            id: peer_file.peer_id,
-                                        }),
-                                    );
-                                }
-                            }
+                loop {
+                    // Accounting connect
+                    let peer = peer_file.peer_id.clone();
+                    let threshold_ready;
 
-                            {
-                                let mut connected_peers_map = wings.connected_peers.lock().await;
-                                connected_peers_map
-                                    .insert(peer_file.peer_id.clone(), peer_file.clone());
-                            }
-                            {
-                                let mut swap_beneficiaries_map =
-                                    wings.swap_beneficiaries.lock().await;
-
-                                swap_beneficiaries_map
-                                    .insert(peer_file.peer_id, (peer_file.beneficiary, false));
-                            }
-                            {
-                                let mut ongoing = self.ongoing_connections.lock().await;
-                                *ongoing = *ongoing + 1;
-                            }
+                    {
+                        let mut accounting = wings.accounting_peers.lock().await;
+                        if !accounting.contains_key(&peer_file.peer_id) {
+                            accounting.insert(
+                                peer_file.peer_id.clone(),
+                                Mutex::new(PeerAccounting {
+                                    balance: 0,
+                                    threshold: 0,
+                                    payment_threshold: 0,
+                                    reserve: 0,
+                                    refreshment: 0.0,
+                                    id: peer_file.peer_id.clone(),
+                                }),
+                            );
+                            threshold_ready = false;
                         } else {
-                            break;
+                            let accounting_peer_lock = accounting.get(&peer_file.peer_id).unwrap();
+                            let accounting_peer = accounting_peer_lock.lock().await;
+                            threshold_ready = accounting_peer.threshold > 0;
                         }
                     }
 
-                    worked
-                };
+                    {
+                        let mut connected_peers_map = wings.connected_peers.lock().await;
+                        connected_peers_map.insert(peer_file.peer_id.clone(), peer_file.clone());
+                    }
+                    {
+                        let mut swap_beneficiaries_map = wings.swap_beneficiaries.lock().await;
 
-                let k2 = async {
-                    let mut worked = false;
-
-                    #[allow(irrefutable_let_patterns)]
-                    while let pt_in = pricing_chan_incoming.try_recv() {
-                        if !pt_in.is_err() {
-                            worked = true;
-                            let (peer, amount) = pt_in.unwrap();
-                            let accounting = wings.accounting_peers.lock().await;
-                            let accounting_peer_lock = match accounting.get(&peer) {
-                                Some(aok) => aok,
-                                _ => continue,
-                            };
-                            set_payment_threshold(accounting_peer_lock, amount).await;
-                            {
-                                let bootnodes_set = wings.bootnodes.lock().await;
-                                let ol: String;
-                                {
-                                    let connected_peers_map = wings.connected_peers.lock().await;
-                                    ol = hex::encode(
-                                        connected_peers_map.get(&peer).unwrap().overlay.clone(),
-                                    );
-                                }
-                                if !bootnodes_set.contains(&peer.to_string()) {
-                                    let mut overlay_peers_map = wings.overlay_peers.lock().await;
-                                    if !overlay_peers_map.contains_key(&ol.to_string()) {
-                                        self.interface_log(format!("Connected to peer {}", &ol));
-                                        overlay_peers_map.insert(ol, peer);
-
-                                        {
-                                            let mut connections = self.connections.lock().await;
-                                            *connections = *connections + 1
-                                        }
-                                        {
-                                            let mut ongoing = self.ongoing_connections.lock().await;
-                                            if *ongoing > 0 {
-                                                *ongoing = *ongoing - 1
-                                            }
-                                        }
-                                    }
-                                } else {
-                                    self.interface_log(format!("Connected to bootnode {}", &ol));
-
-                                    {
-                                        let mut connections = self.connections.lock().await;
-                                        *connections = *connections + 1
-                                    }
-                                    {
-                                        let mut ongoing = self.ongoing_connections.lock().await;
-                                        if *ongoing > 0 {
-                                            *ongoing = *ongoing - 1
-                                        }
-                                    }
-                                }
-                            }
-                        } else {
-                            let _ = pt_in;
-                            break;
-                        }
+                        swap_beneficiaries_map
+                            .insert(peer_file.peer_id, (peer_file.beneficiary, false));
                     }
 
-                    worked
+                    if threshold_ready {
+                        self.promote_priced_peer(&wings, peer).await;
+                    } else {
+                        let mut ongoing = self.ongoing_connections.lock().await;
+                        *ongoing = *ongoing + 1;
+                    }
+
+                    match accounting_peer_chan_incoming.try_recv() {
+                        Ok(next) => peer_file = next,
+                        Err(_) => break,
+                    }
+                }
+
+                async_std::task::yield_now().await;
+            }
+        };
+
+        let pricing_event_handle = async {
+            loop {
+                let mut pricing = match pricing_chan_incoming.recv().await {
+                    Ok(pricing) => pricing,
+                    Err(_) => break,
                 };
 
-                let k3 = async {
-                    let mut worked = false;
-                    let mut refresh_joiner = Vec::new();
+                loop {
+                    let (peer, amount) = pricing;
+                    {
+                        let mut accounting = wings.accounting_peers.lock().await;
+                        if !accounting.contains_key(&peer) {
+                            accounting.insert(
+                                peer.clone(),
+                                Mutex::new(PeerAccounting {
+                                    balance: 0,
+                                    threshold: 0,
+                                    payment_threshold: 0,
+                                    reserve: 0,
+                                    refreshment: 0.0,
+                                    id: peer.clone(),
+                                }),
+                            );
+                        }
 
-                    #[allow(irrefutable_let_patterns)]
-                    while let re_out = refreshment_instructions_chan_incoming.try_recv() {
-                        if !re_out.is_err() {
-                            worked = true;
-                            let (peer, _amount) = re_out.unwrap();
-                            {
-                                let map = wings.ongoing_refreshments.lock().await;
-                                if map.contains(&peer) {
-                                    continue;
-                                }
-                            }
+                        let accounting_peer_lock = accounting.get(&peer).unwrap();
+                        set_payment_threshold(accounting_peer_lock, amount).await;
+                    }
+
+                    self.promote_priced_peer(&wings, peer).await;
+
+                    match pricing_chan_incoming.try_recv() {
+                        Ok(next) => pricing = next,
+                        Err(_) => break,
+                    }
+                }
+
+                async_std::task::yield_now().await;
+            }
+        };
+
+        let refreshment_instruction_handle = async {
+            loop {
+                let mut refresh_instruction =
+                    match refreshment_instructions_chan_incoming.recv().await {
+                        Ok(instruction) => instruction,
+                        Err(_) => break,
+                    };
+                let mut refresh_joiner = Vec::new();
+
+                loop {
+                    let (peer, _amount) = refresh_instruction;
+                    {
+                        let map = wings.ongoing_refreshments.lock().await;
+                        if !map.contains(&peer) {
                             #[allow(unused_assignments)]
                             let mut daten = Date::now();
                             let datenow = daten;
@@ -1337,24 +1289,28 @@ impl Weeb3 {
                                 let accounting = wings.accounting_peers.lock().await;
                                 let accounting_peer_lock = match accounting.get(&peer) {
                                     Some(aok) => aok,
-                                    _ => continue,
+                                    _ => match refreshment_instructions_chan_incoming.try_recv() {
+                                        Ok(next) => {
+                                            refresh_instruction = next;
+                                            continue;
+                                        }
+                                        Err(_) => break,
+                                    },
                                 };
                                 let mut accounting_peer = accounting_peer_lock.lock().await;
                                 daten = accounting_peer.refreshment;
                                 if datenow > accounting_peer.refreshment + 1000.0 {
                                     accounting_peer.refreshment = datenow;
                                     amount2 = accounting_peer.threshold;
-                                } else {
-                                    if accounting_peer.balance > REFRESH_RATE {
-                                        cheque_amt = accounting_peer.balance - REFRESH_RATE;
-                                    }
+                                } else if accounting_peer.balance > REFRESH_RATE {
+                                    cheque_amt = accounting_peer.balance - REFRESH_RATE;
                                 }
                             }
+
                             if datenow > daten + 1000.0 {
-                                {
-                                    let mut map = wings.ongoing_refreshments.lock().await;
-                                    map.insert(peer);
-                                }
+                                let mut map = wings.ongoing_refreshments.lock().await;
+                                map.insert(peer);
+
                                 let ctrl7 = ctrl4.clone();
                                 let rco = refreshment_chan_outgoing.clone();
                                 let handle = async move {
@@ -1365,246 +1321,219 @@ impl Weeb3 {
                                 let mut map = wings.ongoing_cheques.lock().await;
                                 if !map.contains_key(&peer) {
                                     map.insert(peer, cheque_amt);
-                                    let _ =
-                                        cheque_instructions_chan_outgoing.send((peer, cheque_amt));
+                                    let _ = cheque_instructions_chan_outgoing
+                                        .try_send((peer, cheque_amt));
                                 }
                             }
-                        } else {
-                            let _ = re_out;
-                            break;
                         }
                     }
 
-                    join_all(refresh_joiner).await;
+                    match refreshment_instructions_chan_incoming.try_recv() {
+                        Ok(next) => refresh_instruction = next,
+                        Err(_) => break,
+                    }
+                }
 
-                    worked
+                join_all(refresh_joiner).await;
+                async_std::task::yield_now().await;
+            }
+        };
+
+        let refreshment_apply_handle = async {
+            loop {
+                let mut refreshment = match refreshment_chan_incoming.recv().await {
+                    Ok(refreshment) => refreshment,
+                    Err(_) => break,
                 };
 
-                let k4 = async {
-                    let mut worked = false;
+                loop {
+                    let (peer, amount) = refreshment;
 
-                    #[allow(irrefutable_let_patterns)]
-                    while let re_in = refreshment_chan_incoming.try_recv() {
-                        if !re_in.is_err() {
-                            worked = true;
-                            let (peer, amount) = re_in.unwrap();
+                    web_sys::console::log_1(&JsValue::from(format!(
+                        "Applied refreshment {}",
+                        amount
+                    )));
 
-                            web_sys::console::log_1(&JsValue::from(format!(
-                                "Applied refreshment {}",
-                                amount
-                            )));
+                    if amount > 0 {
+                        let accounting = wings.accounting_peers.lock().await;
+                        if let Some(accounting_peer_lock) = accounting.get(&peer) {
+                            apply_refreshment(accounting_peer_lock, amount).await;
+                        }
+                    }
+                    let mut map = wings.ongoing_refreshments.lock().await;
+                    if map.contains(&peer) {
+                        map.remove(&peer);
+                    }
 
-                            if amount > 0 {
-                                let accounting = wings.accounting_peers.lock().await;
-                                let accounting_peer_lock = match accounting.get(&peer) {
-                                    Some(aok) => aok,
-                                    _ => continue,
-                                };
+                    match refreshment_chan_incoming.try_recv() {
+                        Ok(next) => refreshment = next,
+                        Err(_) => break,
+                    }
+                }
 
+                async_std::task::yield_now().await;
+            }
+        };
+
+        let swap_price = Arc::new(Mutex::new(U256::from(0)));
+        let swap_deduction = Arc::new(Mutex::new(U256::from(0)));
+
+        let cheque_instruction_handle = async {
+            loop {
+                let mut cheque_instruction = match cheque_instructions_chan_incoming.recv().await {
+                    Ok(instruction) => instruction,
+                    Err(_) => break,
+                };
+                let mut cheque_joiner = Vec::new();
+
+                loop {
+                    let swap_price_0 = swap_price.clone();
+                    let swap_deduction_0 = swap_deduction.clone();
+                    let set_price = {
+                        let price = swap_price_0.lock().await;
+                        price.is_zero()
+                    };
+
+                    if set_price {
+                        let (oracle_price, cheque_deduction) = get_price_from_oracle().await;
+
+                        let mut price = swap_price_0.lock().await;
+                        if price.is_zero() {
+                            *price = oracle_price;
+                        }
+
+                        let mut deduction = swap_deduction_0.lock().await;
+                        if deduction.is_zero() {
+                            *deduction = cheque_deduction;
+                        }
+                    }
+
+                    let (peer, amount) = cheque_instruction;
+                    let ctrl_swap = ctrl5.clone();
+                    let cheque_chan = cheque_send_chan_outgoing.clone();
+                    let peers_for_cheque = wings.swap_beneficiaries.clone();
+                    let handle = async move {
+                        let price: U256 = {
+                            let current_price = swap_price_0.lock().await;
+                            *current_price
+                        };
+
+                        let deduction: U256 = {
+                            let current_deduction = swap_deduction_0.lock().await;
+                            *current_deduction
+                        };
+
+                        issue_handler(
+                            peer,
+                            amount,
+                            ctrl_swap,
+                            &cheque_chan,
+                            peers_for_cheque,
+                            price,
+                            deduction,
+                        )
+                        .await;
+                    };
+                    cheque_joiner.push(handle);
+
+                    match cheque_instructions_chan_incoming.try_recv() {
+                        Ok(next) => cheque_instruction = next,
+                        Err(_) => break,
+                    }
+                }
+
+                join_all(cheque_joiner).await;
+                async_std::task::yield_now().await;
+            }
+        };
+
+        let cheque_apply_handle = async {
+            loop {
+                let mut cheque_result = match cheque_send_chan_incoming.recv().await {
+                    Ok(result) => result,
+                    Err(_) => break,
+                };
+
+                loop {
+                    let (peer, ok) = cheque_result;
+                    let amt_opt = {
+                        let mut map = wings.ongoing_cheques.lock().await;
+                        map.remove(&peer)
+                    };
+                    if ok {
+                        if let Some(amount) = amt_opt {
+                            let accounting = wings.accounting_peers.lock().await;
+                            if let Some(accounting_peer_lock) = accounting.get(&peer) {
                                 apply_refreshment(accounting_peer_lock, amount).await;
                             }
-                            let mut map = wings.ongoing_refreshments.lock().await;
-                            if map.contains(&peer) {
-                                map.remove(&peer);
-                            }
-                        } else {
-                            let _ = re_in;
-                            break;
                         }
                     }
 
-                    worked
-                };
-
-                let swap_price = Arc::new(Mutex::new(U256::from(0)));
-                let swap_deduction = Arc::new(Mutex::new(U256::from(0)));
-
-                let k5 = async {
-                    let mut worked = false;
-                    let mut cheque_joiner = Vec::new();
-
-                    #[allow(irrefutable_let_patterns)]
-                    while let ch_out = cheque_instructions_chan_incoming.try_recv() {
-                        let swap_price_0 = swap_price.clone();
-                        let swap_deduction_0 = swap_deduction.clone();
-                        if !ch_out.is_err() {
-                            worked = true;
-                            let set_price = {
-                                let price = swap_price_0.lock().await;
-                                price.is_zero()
-                            };
-
-                            if set_price {
-                                let (oracle_price, cheque_deduction) =
-                                    get_price_from_oracle().await;
-
-                                let mut price = swap_price_0.lock().await;
-                                if price.is_zero() {
-                                    *price = oracle_price;
-                                }
-
-                                let mut deduction = swap_deduction_0.lock().await;
-                                if deduction.is_zero() {
-                                    *deduction = cheque_deduction;
-                                }
-                            }
-
-                            let (peer, amount) = ch_out.unwrap();
-                            let ctrl_swap = ctrl5.clone();
-                            let cheque_chan = cheque_send_chan_outgoing.clone();
-                            let peers_for_cheque = wings.swap_beneficiaries.clone();
-                            let handle = async move {
-                                let price: U256 = {
-                                    let current_price = swap_price_0.lock().await;
-                                    *current_price
-                                };
-
-                                let deduction: U256 = {
-                                    let current_deduction = swap_deduction_0.lock().await;
-                                    *current_deduction
-                                };
-
-                                issue_handler(
-                                    peer,
-                                    amount,
-                                    ctrl_swap,
-                                    &cheque_chan,
-                                    peers_for_cheque,
-                                    price,
-                                    deduction,
-                                )
-                                .await;
-                            };
-                            cheque_joiner.push(handle);
-                        } else {
-                            let _ = ch_out;
-                            break;
-                        }
+                    match cheque_send_chan_incoming.try_recv() {
+                        Ok(next) => cheque_result = next,
+                        Err(_) => break,
                     }
-
-                    join_all(cheque_joiner).await;
-
-                    worked
-                };
-
-                let k6 = async {
-                    let mut worked = false;
-
-                    #[allow(irrefutable_let_patterns)]
-                    while let ch_in = cheque_send_chan_incoming.try_recv() {
-                        if !ch_in.is_err() {
-                            worked = true;
-                            let (peer, ok) = ch_in.unwrap();
-                            let amt_opt = {
-                                let mut map = wings.ongoing_cheques.lock().await;
-                                map.remove(&peer)
-                            };
-                            if ok {
-                                if let Some(amount) = amt_opt {
-                                    let accounting = wings.accounting_peers.lock().await;
-                                    let accounting_peer_lock = match accounting.get(&peer) {
-                                        Some(aok) => aok,
-                                        _ => continue,
-                                    };
-                                    apply_refreshment(accounting_peer_lock, amount).await;
-                                }
-                            }
-                        } else {
-                            let _ = ch_in;
-                            break;
-                        }
-                    }
-
-                    worked
-                };
-
-                let (k1_worked, k2_worked, k3_worked, k4_worked, k5_worked, k6_worked) =
-                    join!(k1, k2, k3, k4, k5, k6);
-                let worked =
-                    k1_worked || k2_worked || k3_worked || k4_worked || k5_worked || k6_worked;
-
-                let timenow = Date::now();
-                let seg = timenow - interrupt_last;
-                if worked {
-                    async_std::task::yield_now().await;
-                } else if seg < STARTUP_QUEUE_POLL_MS as f64 {
-                    //                web_sys::console::log_1(&JsValue::from(format!(
-                    //                    "Ease event handle loop for {}",
-                    //                    EVENT_LOOP_INTERRUPTOR - seg
-                    //                )));
-                    async_std::task::sleep(Duration::from_millis(
-                        (STARTUP_QUEUE_POLL_MS as f64 - seg) as u64,
-                    ))
-                    .await;
                 }
-                let timenow = Date::now();
-                interrupt_last = timenow;
 
-                if timelast + EVENT_LOOP_INTERRUPTOR < timenow {
-                    timelast = timenow
-                }
-                //
+                async_std::task::yield_now().await;
             }
         };
 
         let retrieve_handle = async {
-            let mut timelast = Date::now();
             loop {
-                #[allow(irrefutable_let_patterns)]
-                while let incoming_request = self.message_port.1.try_recv() {
-                    if !incoming_request.is_err() {
-                        let (n, chan) = incoming_request.unwrap();
+                let mut incoming_request = match self.message_port.1.recv().await {
+                    Ok(request) => request,
+                    Err(_) => break,
+                };
+                let mut dispatched = 0usize;
 
-                        let _ = chan.send(
-                            retrieve_resource(
-                                &n,
-                                &data_retrieve_chan_outgoing.clone(),
-                                &chunk_retrieve_chan_outgoing.clone(),
-                            )
-                            .await,
+                loop {
+                    let (n, chan) = incoming_request;
+                    let data_retrieve_chan = data_retrieve_chan_outgoing.clone();
+                    let chunk_retrieve_chan = chunk_retrieve_chan_outgoing.clone();
+
+                    dispatched += 1;
+
+                    spawn_local(async move {
+                        let _ = chan.try_send(
+                            retrieve_resource(&n, &data_retrieve_chan, &chunk_retrieve_chan).await,
                         );
-                    } else {
-                        break;
+                    });
+
+                    match self.message_port.1.try_recv() {
+                        Ok(request) => incoming_request = request,
+                        Err(_) => break,
                     }
                 }
 
-                let timenow = Date::now();
-                let seg = timenow - timelast;
-                if seg < STARTUP_QUEUE_POLL_MS as f64 {
-                    async_std::task::sleep(Duration::from_millis(
-                        (STARTUP_QUEUE_POLL_MS as f64 - seg) as u64,
-                    ))
-                    .await;
+                if dispatched > 0 {
+                    async_std::task::yield_now().await;
                 }
-                timelast = Date::now();
             }
         };
 
         let push_handle = async {
-            let mut timelast = Date::now();
             loop {
-                #[allow(irrefutable_let_patterns)]
-                while let incoming_request = self.upload_port.1.try_recv() {
-                    if !incoming_request.is_err() {
-                        let (file0, enc, index, feed, topic, chan) = incoming_request.unwrap();
+                let mut incoming_request = match self.upload_port.1.recv().await {
+                    Ok(request) => request,
+                    Err(_) => break,
+                };
 
-                        let batch_owner = get_batch_owner_key().await;
-                        let batch_id = get_batch_id().await;
+                loop {
+                    let (file0, enc, index, feed, topic, chan) = incoming_request;
 
-                        if batch_owner.len() == 0 {
-                            self.interface_log("No batch found for uploads".to_string());
+                    let batch_owner = get_batch_owner_key().await;
+                    let batch_id = get_batch_id().await;
 
-                            chan.send(vec![]).unwrap();
-                            continue;
-                        }
+                    if batch_owner.len() == 0 {
+                        self.interface_log("No batch found for uploads".to_string());
 
-                        if batch_id.len() == 0 {
-                            self.interface_log("No batchId found for uploads".to_string());
+                        let _ = chan.try_send(vec![]);
+                    } else if batch_id.len() == 0 {
+                        self.interface_log("No batchId found for uploads".to_string());
 
-                            chan.send(vec![]).unwrap();
-                            continue;
-                        }
-
+                        let _ = chan.try_send(vec![]);
+                    } else {
                         let push_reference = upload_resource(
                             file0,
                             enc,
@@ -1623,167 +1552,140 @@ impl Weeb3 {
                             "Writing response to interface push request"
                         )));
 
-                        chan.send(push_reference).unwrap();
-                    } else {
-                        break;
+                        let _ = chan.try_send(push_reference);
+                    }
+
+                    match self.upload_port.1.try_recv() {
+                        Ok(request) => incoming_request = request,
+                        Err(_) => break,
                     }
                 }
 
-                let timenow = Date::now();
-                let seg = timenow - timelast;
-                if seg < PROTO_LOOP_INTERRUPTOR {
-                    async_std::task::sleep(Duration::from_millis(
-                        (PROTO_LOOP_INTERRUPTOR - seg) as u64,
-                    ))
-                    .await;
-                }
-                timelast = Date::now();
+                async_std::task::yield_now().await;
             }
         };
 
         let push_chunk_port_handle = async {
-            let mut timelast = Date::now();
-
             loop {
-                #[allow(irrefutable_let_patterns)]
-                while let incoming = self.chunk_push_port.1.try_recv() {
-                    if !incoming.is_err() {
-                        let (d, soc, chunk_address, stamp, feedback) = incoming.unwrap();
+                let mut incoming = match self.chunk_push_port.1.recv().await {
+                    Ok(request) => request,
+                    Err(_) => break,
+                };
 
-                        let _ = chunk_upload_chan_outgoing.send((
-                            d,
-                            soc,
-                            chunk_address,
-                            stamp,
-                            feedback,
-                        ));
-                    } else {
-                        break;
+                loop {
+                    let (d, soc, chunk_address, stamp, feedback) = incoming;
+
+                    let _ = chunk_upload_chan_outgoing.try_send((
+                        d,
+                        soc,
+                        chunk_address,
+                        stamp,
+                        feedback,
+                    ));
+
+                    match self.chunk_push_port.1.try_recv() {
+                        Ok(request) => incoming = request,
+                        Err(_) => break,
                     }
                 }
 
-                let timenow = Date::now();
-                let seg = timenow - timelast;
-
-                if seg < PROTO_LOOP_INTERRUPTOR {
-                    async_std::task::sleep(Duration::from_millis(
-                        (PROTO_LOOP_INTERRUPTOR - seg) as u64,
-                    ))
-                    .await;
-                }
-
-                timelast = Date::now();
+                async_std::task::yield_now().await;
             }
         };
 
         let retrieve_data_handle = async {
-            let mut timelast = Date::now();
             loop {
-                let mut request_joiner = Vec::new();
+                let mut incoming_request = match data_retrieve_chan_incoming.recv().await {
+                    Ok(request) => request,
+                    Err(_) => break,
+                };
+                let mut dispatched = 0usize;
 
-                #[allow(irrefutable_let_patterns)]
-                while let incoming_request = data_retrieve_chan_incoming.try_recv() {
-                    if !incoming_request.is_err() {
-                        let handle = async {
-                            let (n, chan) = incoming_request.unwrap();
-                            let retrieved_data =
-                                retrieve_data(&n, &chunk_retrieve_chan_outgoing.clone()).await;
-                            chan.send(retrieved_data).unwrap();
-                        };
-                        request_joiner.push(handle);
-                    } else {
-                        break;
+                loop {
+                    let (n, chan) = incoming_request;
+                    let chunk_retrieve_chan_outgoing = chunk_retrieve_chan_outgoing.clone();
+
+                    dispatched += 1;
+
+                    spawn_local(async move {
+                        let retrieved_data =
+                            retrieve_data(&n, &chunk_retrieve_chan_outgoing.clone()).await;
+                        let _ = chan.try_send(retrieved_data);
+                    });
+
+                    match data_retrieve_chan_incoming.try_recv() {
+                        Ok(request) => incoming_request = request,
+                        Err(_) => break,
                     }
                 }
 
-                join_all(request_joiner).await;
-
-                let timenow = Date::now();
-                let seg = timenow - timelast;
-                if seg < STARTUP_QUEUE_POLL_MS as f64 {
-                    // web_sys::console::log_1(&JsValue::from(format!(
-                    //     "Ease retrieve handle loop for {}",
-                    //     PROTO_LOOP_INTERRUPTOR - seg
-                    // )));
-                    async_std::task::sleep(Duration::from_millis(
-                        (STARTUP_QUEUE_POLL_MS as f64 - seg) as u64,
-                    ))
-                    .await;
+                if dispatched > 0 {
+                    async_std::task::yield_now().await;
                 }
-                timelast = Date::now();
             }
         };
 
         let push_data_handle = async {
-            let mut timelast = Date::now();
             loop {
+                let mut incoming_request = match data_upload_chan_incoming.recv().await {
+                    Ok(request) => request,
+                    Err(_) => break,
+                };
                 let mut request_joiner = Vec::new();
 
-                #[allow(irrefutable_let_patterns)]
-                while let incoming_request = data_upload_chan_incoming.try_recv() {
-                    if !incoming_request.is_err() {
-                        let handle = async {
-                            let (n, mode, batch_owner, batch_id, chan) = incoming_request.unwrap();
+                loop {
+                    let chunk_upload_chan = chunk_upload_chan_outgoing.clone();
+                    let handle = async move {
+                        let (n, mode, batch_owner, batch_id, chan) = incoming_request;
 
-                            let encrypted_data = match mode {
-                                0 => false,
-                                _ => true,
-                            };
-
-                            let batch_bucket_limit = get_batch_bucket_limit().await;
-
-                            let data_reference = push_data(
-                                n,
-                                encrypted_data,
-                                batch_owner,
-                                batch_id,
-                                batch_bucket_limit,
-                                &chunk_upload_chan_outgoing.clone(),
-                            )
-                            .await;
-
-                            chan.send(data_reference).unwrap();
+                        let encrypted_data = match mode {
+                            0 => false,
+                            _ => true,
                         };
-                        request_joiner.push(handle);
-                    } else {
-                        break;
+
+                        let batch_bucket_limit = get_batch_bucket_limit().await;
+
+                        let data_reference = push_data(
+                            n,
+                            encrypted_data,
+                            batch_owner,
+                            batch_id,
+                            batch_bucket_limit,
+                            &chunk_upload_chan,
+                        )
+                        .await;
+
+                        let _ = chan.try_send(data_reference);
+                    };
+                    request_joiner.push(handle);
+
+                    match data_upload_chan_incoming.try_recv() {
+                        Ok(request) => incoming_request = request,
+                        Err(_) => break,
                     }
                 }
 
                 join_all(request_joiner).await;
-
-                let timenow = Date::now();
-                let seg = timenow - timelast;
-                if seg < PROTO_LOOP_INTERRUPTOR {
-                    async_std::task::sleep(Duration::from_millis(
-                        (PROTO_LOOP_INTERRUPTOR - seg) as u64,
-                    ))
-                    .await;
-                }
-                timelast = Date::now();
+                async_std::task::yield_now().await;
             }
         };
 
         let push_chunk_handle = async {
-            let mut timelast = Date::now();
-            let mut connections = false;
-
             let push_sem = Arc::new(Semaphore::new(1024));
 
             loop {
+                let mut incoming_request = match chunk_upload_chan_incoming.recv().await {
+                    Ok(request) => request,
+                    Err(_) => break,
+                };
                 let mut dispatched = 0;
 
-                #[allow(irrefutable_let_patterns)]
                 loop {
                     let sem = push_sem.clone();
-                    let incoming_request = chunk_upload_chan_incoming.try_recv();
-                    if incoming_request.is_err() {
-                        break;
-                    }
 
                     dispatched += 1;
 
-                    let (d, soc, checkad, stamp, feedback) = incoming_request.unwrap();
+                    let (d, soc, checkad, stamp, feedback) = incoming_request;
 
                     let ctrl8 = ctrl8.clone();
                     let overlay_peers = wings.overlay_peers.clone();
@@ -1816,7 +1718,7 @@ impl Weeb3 {
                         .await;
 
                         if chunk.len() == 0 {
-                            let _ = chunk_upload_chan_outgoing.send((
+                            let _ = chunk_upload_chan_outgoing.try_send((
                                 d.clone(),
                                 soc.clone(),
                                 checkad.clone(),
@@ -1824,64 +1726,63 @@ impl Weeb3 {
                                 feedback.clone(),
                             ));
                         } else {
-                            let _ = feedback.send(true);
+                            let _ = feedback.try_send(true);
                         }
 
                         drop(permit);
                     });
+
+                    match chunk_upload_chan_incoming.try_recv() {
+                        Ok(request) => incoming_request = request,
+                        Err(_) => break,
+                    }
                 }
 
                 if dispatched > 0 {
                     self.interface_log(format!("Making {} pushsync requests", dispatched));
                 }
 
-                let timenow = Date::now();
-                let seg = timenow - timelast;
-                if seg < PROTO_LOOP_INTERRUPTOR {
-                    async_std::task::sleep(Duration::from_millis(
-                        (PROTO_LOOP_INTERRUPTOR - seg) as u64,
-                    ))
-                    .await;
-                }
-                timelast = Date::now();
+                async_std::task::yield_now().await;
             }
         };
 
         let retrieve_chunk_handle = async {
-            let mut timelast = Date::now();
-            let mut connections = false;
-
             let retrieve_sem = Arc::new(Semaphore::new(4096));
 
             loop {
+                let mut incoming_request = match chunk_retrieve_chan_incoming.recv().await {
+                    Ok(request) => request,
+                    Err(_) => break,
+                };
                 let mut dispatched = 0usize;
 
                 loop {
+                    let (n, chan) = incoming_request;
+                    let sem = retrieve_sem.clone();
+                    let ctrl9 = ctrl6.clone();
+                    let overlay_peers = wings.overlay_peers.clone();
+                    let accounting_peers = wings.accounting_peers.clone();
+                    let refresh_chan = refreshment_instructions_chan_outgoing.clone();
+
+                    dispatched += 1;
+
+                    spawn_local(async move {
+                        let _permit = sem.acquire().await;
+
+                        let chunk_data = retrieve_chunk(
+                            &n,
+                            ctrl9,
+                            &overlay_peers,
+                            &accounting_peers,
+                            &refresh_chan,
+                        )
+                        .await;
+
+                        let _ = chan.try_send(chunk_data);
+                    });
+
                     match chunk_retrieve_chan_incoming.try_recv() {
-                        Ok((n, chan)) => {
-                            let sem = retrieve_sem.clone();
-                            let ctrl9 = ctrl6.clone();
-                            let overlay_peers = wings.overlay_peers.clone();
-                            let accounting_peers = wings.accounting_peers.clone();
-                            let refresh_chan = refreshment_instructions_chan_outgoing.clone();
-
-                            dispatched += 1;
-
-                            spawn_local(async move {
-                                let _permit = sem.acquire().await;
-
-                                let chunk_data = retrieve_chunk(
-                                    &n,
-                                    ctrl9,
-                                    &overlay_peers,
-                                    &accounting_peers,
-                                    &refresh_chan,
-                                )
-                                .await;
-
-                                let _ = chan.send(chunk_data);
-                            });
-                        }
+                        Ok(request) => incoming_request = request,
                         Err(_) => break,
                     }
                 }
@@ -1892,26 +1793,18 @@ impl Weeb3 {
                         dispatched
                     ));
                 }
-
-                let timenow = Date::now();
-                let seg = timenow - timelast;
-                if seg < STARTUP_QUEUE_POLL_MS as f64 {
-                    async_std::task::sleep(Duration::from_millis(
-                        (STARTUP_QUEUE_POLL_MS as f64 - seg) as u64,
-                    ))
-                    .await;
-                }
-                timelast = Date::now();
+                async_std::task::yield_now().await;
             }
         };
 
         let hive_joiner = async {
-            let mut timelast = Date::now();
-
             loop {
-                let mut handled_connections = false;
-                while let Ok(that) = connections_instructions_chan_incoming.try_recv() {
-                    handled_connections = true;
+                let mut that = match connections_instructions_chan_incoming.recv().await {
+                    Ok(instruction) => instruction,
+                    Err(_) => break,
+                };
+
+                loop {
                     let (bzzaddr0, bootn, _dialat) = that;
                     let ctrl3 = ctrl3.clone();
                     let accounting_peer_chan_outgoing = accounting_peer_chan_outgoing.clone();
@@ -1952,20 +1845,36 @@ impl Weeb3 {
                             bootnodes_set.insert(id.to_string());
                         }
 
-                        let self_ephemeral_wait_started = Date::now();
-                        let mut self_ephemeral_polls = 0u32;
-                        let self_ephemeral: Multiaddr = loop {
-                            {
+                        let self_ephemeral: Multiaddr = {
+                            let existing = {
                                 let map = wings.self_ephemerals.lock().await;
-                                if let Some(addr) = map.get(&id) {
-                                    break addr.clone();
+                                map.get(&id).cloned()
+                            };
+                            match existing {
+                                Some(addr) => addr,
+                                None => {
+                                    let (waiter_out, waiter_in) = mpsc::unbounded::<Multiaddr>();
+                                    {
+                                        let mut waiters = wings.self_ephemeral_waiters.lock().await;
+                                        waiters.entry(id).or_default().push(waiter_out);
+                                    }
+
+                                    let existing = {
+                                        let map = wings.self_ephemerals.lock().await;
+                                        map.get(&id).cloned()
+                                    };
+                                    if let Some(addr) = existing {
+                                        let mut waiters = wings.self_ephemeral_waiters.lock().await;
+                                        waiters.remove(&id);
+                                        addr
+                                    } else {
+                                        match waiter_in.recv().await {
+                                            Ok(addr) => addr,
+                                            Err(_) => return,
+                                        }
+                                    }
                                 }
                             }
-                            self_ephemeral_polls += 1;
-                            async_std::task::sleep(Duration::from_millis(
-                                HANDSHAKE_SELF_EPHEMERAL_POLL_MS,
-                            ))
-                            .await;
                         };
 
                         let success = connection_handler(
@@ -1985,26 +1894,24 @@ impl Weeb3 {
                             id, success, elapsed
                         ));
                     });
-                }
 
-                if handled_connections {
-                    async_std::task::yield_now().await;
-                } else {
-                    let timenow = Date::now();
-                    let seg = timenow - timelast;
-                    if seg < STARTUP_QUEUE_POLL_MS as f64 {
-                        async_std::task::sleep(Duration::from_millis(
-                            (STARTUP_QUEUE_POLL_MS as f64 - seg) as u64,
-                        ))
-                        .await;
+                    match connections_instructions_chan_incoming.try_recv() {
+                        Ok(instruction) => that = instruction,
+                        Err(_) => break,
                     }
                 }
-                timelast = Date::now();
+
+                async_std::task::yield_now().await;
             }
         };
 
         join!(
-            event_handle,
+            accounting_event_handle,
+            pricing_event_handle,
+            refreshment_instruction_handle,
+            refreshment_apply_handle,
+            cheque_instruction_handle,
+            cheque_apply_handle,
             retrieve_handle,
             retrieve_data_handle,
             retrieve_chunk_handle,

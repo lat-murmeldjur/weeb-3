@@ -6,9 +6,9 @@ use byteorder::ByteOrder;
 use num::{BigUint, ToPrimitive};
 use prost::Message;
 
+use crate::mpsc;
 use std::collections::HashMap;
 use std::io::Cursor;
-use std::sync::mpsc;
 
 use crate::stream;
 use libp2p::{
@@ -274,7 +274,7 @@ pub async fn ceive(
         peer, beneficiary
     )));
 
-    chan.send(PeerFile {
+    chan.try_send(PeerFile {
         peer_id: peer,
         overlay: peer_overlay.clone(),
         beneficiary: beneficiary,
@@ -358,7 +358,7 @@ pub async fn pricing_handler(peer: PeerId, mut stream: Stream, chan: &mpsc::Send
         .to_u64()
         .unwrap();
 
-    let _ = chan.send((peer, pt));
+    let _ = chan.try_send((peer, pt));
 }
 
 pub async fn gossip_handler(
@@ -435,7 +435,7 @@ pub async fn gossip_handler(
         //     "Got gossip of peer {:#?}!",
         //     hex::encode(&peer.overlay)
         // )));
-        chan.send(peer).unwrap();
+        chan.try_send(peer).unwrap();
     }
 }
 
@@ -456,7 +456,7 @@ pub async fn fresh(
     match stream.write_all(&buf_empty).await {
         Ok(_) => {}
         Err(_) => {
-            chan.send((peer, 0)).unwrap();
+            chan.try_send((peer, 0)).unwrap();
             return;
         }
     };
@@ -468,7 +468,7 @@ pub async fn fresh(
         let n = match stream.read(&mut buf_discard_0).await {
             Ok(a) => a,
             Err(_) => {
-                chan.send((peer, 0)).unwrap();
+                chan.try_send((peer, 0)).unwrap();
                 return;
             }
         };
@@ -491,7 +491,7 @@ pub async fn fresh(
     match stream.write_all(&bufw_1).await {
         Ok(_) => {}
         Err(_) => {
-            chan.send((peer, 0)).unwrap();
+            chan.try_send((peer, 0)).unwrap();
             return;
         }
     };
@@ -504,7 +504,7 @@ pub async fn fresh(
         let n = match stream.read(&mut buf_discard_0).await {
             Ok(a) => a,
             Err(_) => {
-                chan.send((peer, 0)).unwrap();
+                chan.try_send((peer, 0)).unwrap();
                 return;
             }
         };
@@ -520,7 +520,7 @@ pub async fn fresh(
     let rec_0 = match rec_0_u {
         Ok(x) => x,
         Err(x) => {
-            chan.send((peer, 0)).unwrap();
+            chan.try_send((peer, 0)).unwrap();
             web_sys::console::log_1(&JsValue::from(format!("Error in protocol {:#?}!", x)));
             return;
         }
@@ -529,9 +529,9 @@ pub async fn fresh(
     let refr_am = BigUint::from_bytes_be(&rec_0.amount).to_u64().unwrap();
 
     if amount > 0 {
-        chan.send((peer, refr_am)).unwrap();
+        chan.try_send((peer, refr_am)).unwrap();
     } else {
-        chan.send((peer, 0)).unwrap();
+        chan.try_send((peer, 0)).unwrap();
     }
 }
 
@@ -552,7 +552,7 @@ pub async fn issue(
 
     let signer_key = get_chequebook_signer_key().await;
     if signer_key.len() != 32 {
-        let _ = chan.send((peer, false)).unwrap_or(());
+        let _ = chan.try_send((peer, false)).unwrap_or(());
         web_sys::console::log_1(&JsValue::from(format!(
             "Issue fail 1 - no chequebook signer"
         )));
@@ -562,7 +562,7 @@ pub async fn issue(
     let wallet = match LocalWallet::from_bytes(&signer_key) {
         Ok(w) => w,
         Err(_) => {
-            let _ = chan.send((peer, false)).unwrap_or(());
+            let _ = chan.try_send((peer, false)).unwrap_or(());
             web_sys::console::log_1(&JsValue::from(format!("Issue fail 2")));
             return;
         }
@@ -574,7 +574,7 @@ pub async fn issue(
         {
             Some(state) => state,
             None => {
-                let _ = chan.send((peer, false)).unwrap_or(());
+                let _ = chan.try_send((peer, false)).unwrap_or(());
                 web_sys::console::log_1(&JsValue::from(format!("Issue fail 3")));
                 return;
             }
@@ -614,7 +614,7 @@ pub async fn issue(
     match stream.write_all(&buf_non_empty).await {
         Ok(_) => {}
         Err(_) => {
-            chan.send((peer, false)).unwrap();
+            chan.try_send((peer, false)).unwrap();
             web_sys::console::log_1(&JsValue::from(format!(
                 "Issue cheque send failed {}",
                 outgoing_cheque_trace(&peer, &cheque_state)
@@ -631,7 +631,7 @@ pub async fn issue(
         let n = match stream.read(&mut buf_discard_0).await {
             Ok(a) => a,
             Err(_) => {
-                chan.send((peer, false)).unwrap();
+                chan.try_send((peer, false)).unwrap();
                 web_sys::console::log_1(&JsValue::from(format!(
                     "Issue cheque send failed {}",
                     outgoing_cheque_trace(&peer, &cheque_state)
@@ -653,7 +653,7 @@ pub async fn issue(
     {
         Some(cheque_data) => cheque_data,
         None => {
-            let _ = chan.send((peer, false));
+            let _ = chan.try_send((peer, false));
             web_sys::console::log_1(&JsValue::from(format!(
                 "Issue cheque send failed {}",
                 outgoing_cheque_trace(&peer, &cheque_state)
@@ -672,7 +672,7 @@ pub async fn issue(
     msg.encode_length_delimited(&mut bufw).unwrap();
 
     if let Err(_) = stream.write_all(&bufw).await {
-        let _ = chan.send((peer, false));
+        let _ = chan.try_send((peer, false));
         web_sys::console::log_1(&JsValue::from(format!(
             "Issue cheque send failed {}",
             outgoing_cheque_trace(&peer, &cheque_state)
@@ -696,7 +696,7 @@ pub async fn issue(
     .await
     {
         let _ = stream.close().await;
-        let _ = chan.send((peer, false));
+        let _ = chan.try_send((peer, false));
         web_sys::console::log_1(&JsValue::from(format!(
             "Issue cheque send failed {}",
             outgoing_cheque_trace(&peer, &cheque_state)
@@ -712,7 +712,7 @@ pub async fn issue(
         outgoing_cheque_trace(&peer, &cheque_state)
     )));
     web_sys::console::log_1(&JsValue::from(format!("Issue complete")));
-    let _ = chan.send((peer, true)).unwrap_or(());
+    let _ = chan.try_send((peer, true)).unwrap_or(());
 }
 
 pub async fn trieve(
@@ -804,7 +804,7 @@ pub async fn trieve(
     let rec_1 = rec_0.data;
 
     web_sys::console::log_1(&JsValue::from(format!("trieve complete")));
-    chan.send(rec_1).unwrap();
+    chan.try_send(rec_1).unwrap();
 }
 
 pub async fn connection_handler(
@@ -873,12 +873,12 @@ pub async fn refresh_handler(
         Ok(stream) => stream,
         Err(error @ stream::OpenStreamError::UnsupportedProtocol(_)) => {
             web_sys::console::log_1(&JsValue::from(format!("{} {}", peer, error)));
-            chan.send((peer, 0)).unwrap();
+            chan.try_send((peer, 0)).unwrap();
             return;
         }
         Err(error) => {
             web_sys::console::log_1(&JsValue::from(format!("{} {}", peer, error)));
-            chan.send((peer, 0)).unwrap();
+            chan.try_send((peer, 0)).unwrap();
             return;
         }
     };
@@ -900,12 +900,12 @@ pub async fn issue_handler(
         Ok(stream) => stream,
         Err(error @ stream::OpenStreamError::UnsupportedProtocol(_)) => {
             web_sys::console::log_1(&JsValue::from(format!("{} {}", peer, error)));
-            let _ = chan.send((peer, false));
+            let _ = chan.try_send((peer, false));
             return;
         }
         Err(error) => {
             web_sys::console::log_1(&JsValue::from(format!("{} {}", peer, error)));
-            let _ = chan.send((peer, false));
+            let _ = chan.try_send((peer, false));
             return;
         }
     };
@@ -983,7 +983,7 @@ pub async fn sync(
     match stream.write_all(&buf_empty).await {
         Ok(_) => {}
         Err(_) => {
-            chan.send(false).unwrap();
+            chan.try_send(false).unwrap();
             return;
         }
     };
@@ -995,7 +995,7 @@ pub async fn sync(
         let n = match stream.read(&mut buf_discard_0).await {
             Ok(a) => a,
             Err(_) => {
-                chan.send(false).unwrap();
+                chan.try_send(false).unwrap();
                 return;
             }
         };
@@ -1022,7 +1022,7 @@ pub async fn sync(
         match stream.write(&bufw_1[i..j].to_vec()).await {
             Ok(_) => {}
             Err(_) => {
-                chan.send(false).unwrap();
+                chan.try_send(false).unwrap();
                 return;
             }
         };
@@ -1041,7 +1041,7 @@ pub async fn sync(
         let n = match stream.read(&mut buf_discard_0).await {
             Ok(a) => a,
             Err(_) => {
-                chan.send(false).unwrap();
+                chan.try_send(false).unwrap();
                 return;
             }
         };
@@ -1057,7 +1057,7 @@ pub async fn sync(
         Ok(x) => x,
         Err(x) => {
             web_sys::console::log_1(&JsValue::from(format!("Error in protocol {:#?}!", x)));
-            chan.send(false).unwrap();
+            chan.try_send(false).unwrap();
             return;
         }
     };
@@ -1069,5 +1069,5 @@ pub async fn sync(
     //        _peer
     //    )));
 
-    chan.send(true).unwrap();
+    chan.try_send(true).unwrap();
 }

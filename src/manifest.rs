@@ -1,4 +1,4 @@
-use std::sync::mpsc;
+use crate::mpsc;
 
 use crate::{
     //

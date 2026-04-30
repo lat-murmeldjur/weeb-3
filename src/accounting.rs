@@ -1,13 +1,13 @@
 // #![allow(warnings)]
 #![cfg(target_arch = "wasm32")]
 use async_std::sync::Mutex;
-use std::sync::mpsc;
 
 use libp2p::PeerId;
 
 use js_sys::Date;
 
 use crate::conventions::{PeerAccounting, get_proximity};
+use crate::mpsc;
 
 pub const REFRESH_RATE: u64 = 450000;
 pub const PO_PRICE: u64 = 10000;
@@ -28,7 +28,7 @@ pub async fn reserve(
     let mut account = a.lock().await;
     if account.balance >= account.payment_threshold && account.refreshment + 1000.0 < Date::now() {
         // start refreshing
-        let _ = chan.send((account.id.clone(), account.threshold));
+        let _ = chan.try_send((account.id.clone(), account.threshold));
     }
     if account.reserve + account.balance + amount < account.threshold {
         account.reserve += amount;
