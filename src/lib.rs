@@ -1279,51 +1279,62 @@ impl Weeb3 {
                     let (peer, _amount) = refresh_instruction;
                     {
                         let map = wings.ongoing_refreshments.lock().await;
-                        if !map.contains(&peer) {
-                            #[allow(unused_assignments)]
-                            let mut daten = Date::now();
-                            let datenow = daten;
-                            let mut cheque_amt: u64 = 0;
-                            let mut amount2 = 0;
-                            {
-                                let accounting = wings.accounting_peers.lock().await;
-                                let accounting_peer_lock = match accounting.get(&peer) {
-                                    Some(aok) => aok,
-                                    _ => match refreshment_instructions_chan_incoming.try_recv() {
-                                        Ok(next) => {
-                                            refresh_instruction = next;
-                                            continue;
-                                        }
-                                        Err(_) => break,
-                                    },
-                                };
-                                let mut accounting_peer = accounting_peer_lock.lock().await;
-                                daten = accounting_peer.refreshment;
-                                if datenow > accounting_peer.refreshment + 1000.0 {
-                                    accounting_peer.refreshment = datenow;
-                                    amount2 = accounting_peer.threshold;
-                                } else if accounting_peer.balance > REFRESH_RATE {
-                                    cheque_amt = accounting_peer.balance - REFRESH_RATE;
+                        if map.contains(&peer) {
+                            match refreshment_instructions_chan_incoming.try_recv() {
+                                Ok(next) => {
+                                    refresh_instruction = next;
+                                    continue;
                                 }
+                                Err(_) => break,
                             }
+                        }
+                    }
 
-                            if datenow > daten + 1000.0 {
+                    #[allow(unused_assignments)]
+                    let mut daten = Date::now();
+                    let datenow = daten;
+                    let mut cheque_amt: u64 = 0;
+                    let mut amount2 = 0;
+                    let mut accounting_ready = false;
+                    {
+                        let accounting = wings.accounting_peers.lock().await;
+                        if let Some(accounting_peer_lock) = accounting.get(&peer) {
+                            accounting_ready = true;
+                            let mut accounting_peer = accounting_peer_lock.lock().await;
+                            daten = accounting_peer.refreshment;
+                            if datenow > accounting_peer.refreshment + 1000.0 {
+                                accounting_peer.refreshment = datenow;
+                                amount2 = accounting_peer.threshold;
+                            } else if accounting_peer.balance > REFRESH_RATE {
+                                cheque_amt = accounting_peer.balance - REFRESH_RATE;
+                            }
+                        }
+                    }
+
+                    if accounting_ready {
+                        if datenow > daten + 1000.0 {
+                            {
                                 let mut map = wings.ongoing_refreshments.lock().await;
                                 map.insert(peer);
+                            }
 
-                                let ctrl7 = ctrl4.clone();
-                                let rco = refreshment_chan_outgoing.clone();
-                                let handle = async move {
-                                    refresh_handler(peer, amount2, ctrl7, &rco).await;
-                                };
-                                refresh_joiner.push(handle);
-                            } else if cheque_amt > 0 && false {
-                                let mut map = wings.ongoing_cheques.lock().await;
-                                if !map.contains_key(&peer) {
-                                    map.insert(peer, cheque_amt);
-                                    let _ = cheque_instructions_chan_outgoing
-                                        .try_send((peer, cheque_amt));
-                                }
+                            web_sys::console::log_1(&JsValue::from(format!(
+                                "Starting refreshment {}",
+                                amount2
+                            )));
+
+                            let ctrl7 = ctrl4.clone();
+                            let rco = refreshment_chan_outgoing.clone();
+                            let handle = async move {
+                                refresh_handler(peer, amount2, ctrl7, &rco).await;
+                            };
+                            refresh_joiner.push(handle);
+                        } else if cheque_amt > 0 && false {
+                            let mut map = wings.ongoing_cheques.lock().await;
+                            if !map.contains_key(&peer) {
+                                map.insert(peer, cheque_amt);
+                                let _ =
+                                    cheque_instructions_chan_outgoing.try_send((peer, cheque_amt));
                             }
                         }
                     }
