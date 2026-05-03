@@ -60,17 +60,14 @@ mod manifest;
 mod manifest_upload;
 
 mod on_chain;
-use on_chain::get_price_from_oracle;
+use on_chain::{chequebook_balance, get_price_from_oracle, web3};
 
 mod nav;
 
 mod persistence;
 use persistence::{
-    get_batch_bucket_limit,
-    get_batch_id,
-    get_batch_owner_key,
-    // get_chequebook_signer_key,
-    reset_stamp,
+    get_batch_bucket_limit, get_batch_id, get_batch_owner_key, get_chequebook_address,
+    get_chequebook_signer_key, reset_stamp,
 };
 
 mod retrieval;
@@ -163,6 +160,34 @@ pub fn timed_log(message: impl AsRef<str>) {
     web_sys::console::log_1(&JsValue::from(message.as_ref()));
 }
 
+pub(crate) fn interface_log_to(log_port: &mpsc::Sender<String>, log_start_ms: f64, log0: String) {
+    let elapsed_ms = (Date::now() - log_start_ms).max(0.0).round() as u64;
+    let log = format!("[+{}ms] {}", elapsed_ms, log0);
+    let _ = log_port.try_send(log.clone());
+    web_sys::console::log_1(&JsValue::from(log));
+}
+
+async fn cheques_active() -> bool {
+    if get_chequebook_signer_key().await.is_empty() {
+        return false;
+    }
+
+    let chequebook = get_chequebook_address().await;
+    if chequebook.len() != 20 {
+        return false;
+    }
+
+    let w3 = match web3() {
+        Ok(w3) => w3,
+        Err(_) => return false,
+    };
+
+    match chequebook_balance(&w3, web3::types::Address::from_slice(&chequebook)).await {
+        Ok(balance) => !balance.is_zero(),
+        Err(_) => false,
+    }
+}
+
 //
 // pub fn init_panic_hook() {
 //     console_error_panic_hook::set_once();
@@ -174,6 +199,7 @@ pub struct Weeb3 {
     secret_key: Arc<Mutex<SecretKey>>,
     wings: Mutex<Arc<Wings>>,
     log_port: (mpsc::Sender<String>, mpsc::Receiver<String>),
+    log_start_ms: f64,
     message_port: (
         mpsc::Sender<(Vec<u8>, mpsc::Sender<Vec<u8>>)>,
         mpsc::Receiver<(Vec<u8>, mpsc::Sender<Vec<u8>>)>,
@@ -205,8 +231,8 @@ pub struct Weeb3 {
         mpsc::Receiver<(String, mpsc::Sender<String>, bool)>,
     ),
     network_id: Mutex<u64>,
-    ongoing_connections: Mutex<u64>,
-    connections: Mutex<u64>,
+    ongoing_connections: Arc<Mutex<u64>>,
+    connections: Arc<Mutex<u64>>,
 }
 
 type PeerAddrMap = Arc<Mutex<HashMap<PeerId, Multiaddr>>>;
@@ -216,7 +242,7 @@ pub struct Wings {
     connected_peers: Arc<Mutex<HashMap<PeerId, PeerFile>>>,
     overlay_peers: Arc<Mutex<HashMap<String, PeerId>>>,
     bootnodes: Arc<Mutex<HashSet<String>>>,
-    accounting_peers: Arc<Mutex<HashMap<PeerId, Mutex<PeerAccounting>>>>,
+    accounting_peers: Arc<Mutex<HashMap<PeerId, Arc<Mutex<PeerAccounting>>>>>,
     ongoing_refreshments: Arc<Mutex<HashSet<PeerId>>>,
     ongoing_cheques: Arc<Mutex<HashMap<PeerId, u64>>>,
     swap_beneficiaries: Arc<Mutex<HashMap<PeerId, (web3::types::Address, bool)>>>,
@@ -586,10 +612,13 @@ impl Weeb3 {
         let swarm = libp2p::SwarmBuilder::with_existing_identity(keypair.clone().into())
             .with_wasm_bindgen()
             .with_other_transport(|_key| {
+                let mut yamux_config = yamux::Config::default();
+                yamux_config.set_max_num_streams(4096);
+
                 websocket_websys::Transport::default()
                     .upgrade(core::upgrade::Version::V1)
                     .authenticate(noise::Config::new(&keypair.clone().into()).unwrap())
-                    .multiplex(yamux::Config::default())
+                    .multiplex(yamux_config)
                     .boxed()
             })
             .expect("Failed to create WebSocket transport")
@@ -598,6 +627,8 @@ impl Weeb3 {
             .with_swarm_config(|_| {
                 libp2p::swarm::Config::with_wasm_executor()
                     .with_idle_connection_timeout(Duration::from_secs(36000000))
+                    .with_dial_concurrency_factor(NonZero::new(32_u8).unwrap())
+                    .with_substream_upgrade_protocol_override(core::upgrade::Version::V1Lazy)
                     .with_max_negotiating_inbound_streams(NonZero::new(10000_usize).unwrap().into())
                     .with_per_connection_event_buffer_size(10000_usize)
                     .with_notify_handler_buffer_size(NonZero::new(10000_usize).unwrap().into())
@@ -609,7 +640,7 @@ impl Weeb3 {
         let overlay_peers: Arc<Mutex<HashMap<String, PeerId>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let bootnodes: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
-        let accounting_peers: Arc<Mutex<HashMap<PeerId, Mutex<PeerAccounting>>>> =
+        let accounting_peers: Arc<Mutex<HashMap<PeerId, Arc<Mutex<PeerAccounting>>>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let ongoing_refreshments: Arc<Mutex<HashSet<PeerId>>> =
             Arc::new(Mutex::new(HashSet::new()));
@@ -654,13 +685,14 @@ impl Weeb3 {
                 self_ephemeral_waiters: self_ephemeral_waiters,
             })),
             log_port: (log_port_out, log_port_in),
+            log_start_ms: Date::now(),
             message_port: (m_out, m_in),
             upload_port: (u_out, u_in),
             chunk_push_port: (chunk_push_port_out, chunk_push_port_in),
             bootnode_port: (b_out, b_in),
             network_id: Mutex::new(10_u64),
-            ongoing_connections: Mutex::new(0_u64),
-            connections: Mutex::new(0_u64),
+            ongoing_connections: Arc::new(Mutex::new(0_u64)),
+            connections: Arc::new(Mutex::new(0_u64)),
         };
     }
 
@@ -691,8 +723,7 @@ impl Weeb3 {
     }
 
     pub fn interface_log(&self, log0: String) {
-        let _ = self.log_port.0.try_send(log0.to_string());
-        web_sys::console::log_1(&JsValue::from(log0));
+        interface_log_to(&self.log_port.0, self.log_start_ms, log0);
     }
 
     pub async fn run(&self, _st: String) -> () {
@@ -921,151 +952,177 @@ impl Weeb3 {
 
         let swarm_event_handle_1 = async {
             loop {
-                {
+                let event = {
                     let mut swarm = self.swarm.lock_arc().await;
-
-                    #[allow(irrefutable_let_patterns)]
-                    while let event = async_std::future::timeout(
+                    async_std::future::timeout(
                         Duration::from_millis(STARTUP_QUEUE_POLL_MS),
                         swarm.next(),
                     )
                     .await
-                    {
-                        // self.interface_log(format!("Current Event Handled {:#?}", event));
-                        // web_sys::console::log_1(&JsValue::from(format!(
-                        //     "Current Event Handled {:#?}",
-                        //     event
-                        // )));
+                };
 
-                        if !event.is_err() {
-                            match event.unwrap() {
-                                Some(SwarmEvent::Behaviour(out_event)) => {
-                                    if let BehaviourEvent::Identify(identify_event) = out_event {
-                                        if let identify::Event::Received { peer_id, info, .. } = identify_event {
-                                            let observed_addr: Multiaddr = info.observed_addr.clone();
-                                            swarm.add_external_address(observed_addr.clone());
-                                            swarm
-                                                .behaviour_mut()
-                                                .identify
-                                                .push(std::iter::once(peer_id.clone()));
-                                            let mut map = wings.self_ephemerals.lock().await;
-                                            map.insert(peer_id.clone(), observed_addr.clone());
-                                            drop(map);
-
-                                            let waiters = {
-                                                let mut waiters =
-                                                    wings.self_ephemeral_waiters.lock().await;
-                                                waiters.remove(&peer_id).unwrap_or_default()
-                                            };
-                                            for waiter in waiters {
-                                                let _ = waiter.try_send(observed_addr.clone());
-                                            }
-
-                                            self.interface_log(format!(
-                                                "Observed address {} for peer {} stored/overwritten",
-                                                observed_addr, peer_id
-                                            ));
-                                        }
-                                    }
-                                }
-                                Some(SwarmEvent::ConnectionEstablished {
-                                    // peer_id,
-                                    // established_in,
-                                    ..
-                                }) => {
-                                    //
-                                }
-                                Some(SwarmEvent::OutgoingConnectionError { peer_id, error, .. }) => {
-                                    if let Some(peer_id) = peer_id {
-                                        let mut connection_attempts_map = wings.connection_attempts.lock().await;
-                                        if connection_attempts_map.contains(&peer_id) {
-                                            let mut ongoing = self.ongoing_connections.lock().await;
-                                            if *ongoing > 0 {
-                                                *ongoing = *ongoing - 1
-                                            };
-                                        };
-                                        connection_attempts_map.remove(&peer_id);
-                                    }
-
-                                    let retry_address = match &error {
-                                        libp2p::swarm::DialError::LocalPeerId { address } => {
-                                            Some(address.clone())
-                                        }
-                                        libp2p::swarm::DialError::WrongPeerId { address, .. } => {
-                                            Some(address.clone())
-                                        }
-                                        libp2p::swarm::DialError::Transport(errors) => errors
-                                            .first()
-                                            .map(|(address, _)| address.clone()),
-                                        _ => None,
-                                    };
-
-                                    if let Some(address) = retry_address {
-                                        let mut bzzaddr = etiquette_2::BzzAddress::default();
-                                        bzzaddr.underlay = address.to_vec();
-                                        let _ = connections_instructions_chan_outgoing.try_send((
-                                            bzzaddr,
-                                            false,
-                                            Date::now() as u64,
-                                        ));
-                                    }
-                                }
-                                Some(SwarmEvent::ConnectionClosed { peer_id, endpoint, .. }) => {
-                                    {
-                                        let mut connected_peers_map = wings.connected_peers.lock().await;
-                                        let mut overlay_peers_map = wings.overlay_peers.lock().await;
-                                        if connected_peers_map.contains_key(&peer_id) {
-                                            let ol0 = hex::encode(connected_peers_map.get(&peer_id).unwrap().overlay.clone());
-                                            if overlay_peers_map.contains_key(&ol0) {
-                                                overlay_peers_map.remove(&ol0);
-                                                {
-                                                   let mut connections = self.connections.lock().await;
-                                                    if *connections > 0 {
-                                                        *connections = *connections - 1
-                                                    }
-                                                }
-                                            } else {
-                                                {
-                                                   let mut ongoing = self.ongoing_connections.lock().await;
-                                                    if *ongoing > 0 {
-                                                        *ongoing = *ongoing - 1
-                                                    }
-                                                }
-                                            };
-                                            connected_peers_map.remove(&peer_id);
-                                            self.interface_log(format!("Disconnected from peer {} {:#?}", &ol0, endpoint));
-                                        };
-                                        {
-                                        let mut connection_attempts_map = wings.connection_attempts.lock().await;
-                                            if connection_attempts_map.contains(&peer_id) {
-                                                connection_attempts_map.remove(&peer_id);
-                                            }
-                                        }
-                                        {
-                                            let mut map = wings.self_ephemerals.lock().await;
-                                            map.remove(&peer_id);
-                                        }
-                                        let mut bzzaddr = etiquette_2::BzzAddress::default();
-                                        match endpoint {
-                                            libp2p::core::ConnectedPoint::Dialer { ref address, .. } => {
-                                                bzzaddr.underlay = address.to_vec();
-                                                let _ = connections_instructions_chan_outgoing.try_send((bzzaddr, false, (Date::now() as u64)));
-                                            }
-                                            _ => {}
-                                        }
-                                    }
-                                    let mut accounting = wings.accounting_peers.lock().await;
-                                    if accounting.contains_key(&peer_id) {
-                                        accounting.remove(&peer_id);
-                                    };
-                                }
-                                _ => {}
-                            }
-                        } else {
-                            break;
-                        }
+                let event = match event {
+                    Ok(Some(event)) => event,
+                    Ok(None) | Err(_) => {
+                        async_std::task::yield_now().await;
+                        continue;
                     }
-                }
+                };
+
+                let wings = wings.clone();
+                let swarm = self.swarm.clone();
+                let connections_instructions_chan_outgoing =
+                    connections_instructions_chan_outgoing.clone();
+                let connections = self.connections.clone();
+                let ongoing_connections = self.ongoing_connections.clone();
+                let log_port = self.log_port.0.clone();
+                let log_start_ms = self.log_start_ms;
+
+                spawn_local(async move {
+                    let interface_log = |log0: String| {
+                        interface_log_to(&log_port, log_start_ms, log0);
+                    };
+
+                    match event {
+                        SwarmEvent::Behaviour(out_event) => {
+                            if let BehaviourEvent::Identify(identify_event) = out_event {
+                                if let identify::Event::Received { peer_id, info, .. } =
+                                    identify_event
+                                {
+                                    let observed_addr: Multiaddr = info.observed_addr.clone();
+
+                                    {
+                                        let mut swarm = swarm.lock_arc().await;
+                                        swarm.add_external_address(observed_addr.clone());
+                                        swarm
+                                            .behaviour_mut()
+                                            .identify
+                                            .push(std::iter::once(peer_id.clone()));
+                                    }
+
+                                    {
+                                        let mut map = wings.self_ephemerals.lock().await;
+                                        map.insert(peer_id.clone(), observed_addr.clone());
+                                    }
+
+                                    let waiters = {
+                                        let mut waiters = wings.self_ephemeral_waiters.lock().await;
+                                        waiters.remove(&peer_id).unwrap_or_default()
+                                    };
+                                    for waiter in waiters {
+                                        let _ = waiter.try_send(observed_addr.clone());
+                                    }
+
+                                    interface_log(format!(
+                                        "Observed address {} for peer {} stored/overwritten",
+                                        observed_addr, peer_id
+                                    ));
+                                }
+                            }
+                        }
+                        SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
+                            if let Some(peer_id) = peer_id {
+                                let had_attempt = {
+                                    let mut connection_attempts_map =
+                                        wings.connection_attempts.lock().await;
+                                    connection_attempts_map.remove(&peer_id)
+                                };
+
+                                if had_attempt {
+                                    let mut ongoing = ongoing_connections.lock().await;
+                                    if *ongoing > 0 {
+                                        *ongoing -= 1;
+                                    }
+                                }
+                            }
+
+                            let retry_address = match &error {
+                                libp2p::swarm::DialError::LocalPeerId { address } => {
+                                    Some(address.clone())
+                                }
+                                libp2p::swarm::DialError::WrongPeerId { address, .. } => {
+                                    Some(address.clone())
+                                }
+                                libp2p::swarm::DialError::Transport(errors) => {
+                                    errors.first().map(|(address, _)| address.clone())
+                                }
+                                _ => None,
+                            };
+
+                            if let Some(address) = retry_address {
+                                let mut bzzaddr = etiquette_2::BzzAddress::default();
+                                bzzaddr.underlay = address.to_vec();
+                                let _ = connections_instructions_chan_outgoing.try_send((
+                                    bzzaddr,
+                                    false,
+                                    Date::now() as u64,
+                                ));
+                            }
+                        }
+                        SwarmEvent::ConnectionClosed {
+                            peer_id, endpoint, ..
+                        } => {
+                            let removed_overlay = {
+                                let mut connected_peers_map = wings.connected_peers.lock().await;
+                                connected_peers_map
+                                    .remove(&peer_id)
+                                    .map(|peer_file| hex::encode(peer_file.overlay))
+                            };
+
+                            if let Some(ol0) = removed_overlay {
+                                let promoted_peer = {
+                                    let mut overlay_peers_map = wings.overlay_peers.lock().await;
+                                    overlay_peers_map.remove(&ol0).is_some()
+                                };
+
+                                if promoted_peer {
+                                    let mut connections = connections.lock().await;
+                                    if *connections > 0 {
+                                        *connections -= 1;
+                                    }
+                                } else {
+                                    let mut ongoing = ongoing_connections.lock().await;
+                                    if *ongoing > 0 {
+                                        *ongoing -= 1;
+                                    }
+                                }
+
+                                interface_log(format!(
+                                    "Disconnected from peer {} {:#?}",
+                                    &ol0, endpoint
+                                ));
+                            }
+
+                            {
+                                let mut connection_attempts_map =
+                                    wings.connection_attempts.lock().await;
+                                connection_attempts_map.remove(&peer_id);
+                            }
+
+                            {
+                                let mut map = wings.self_ephemerals.lock().await;
+                                map.remove(&peer_id);
+                            }
+
+                            if let libp2p::core::ConnectedPoint::Dialer { ref address, .. } =
+                                endpoint
+                            {
+                                let mut bzzaddr = etiquette_2::BzzAddress::default();
+                                bzzaddr.underlay = address.to_vec();
+                                let _ = connections_instructions_chan_outgoing.try_send((
+                                    bzzaddr,
+                                    false,
+                                    Date::now() as u64,
+                                ));
+                            }
+
+                            let mut accounting = wings.accounting_peers.lock().await;
+                            accounting.remove(&peer_id);
+                        }
+                        _ => {}
+                    }
+                });
+
                 async_std::task::yield_now().await;
             }
         };
@@ -1173,29 +1230,34 @@ impl Weeb3 {
                 loop {
                     // Accounting connect
                     let peer = peer_file.peer_id.clone();
-                    let threshold_ready;
-
-                    {
+                    let accounting_peer = {
                         let mut accounting = wings.accounting_peers.lock().await;
-                        if !accounting.contains_key(&peer_file.peer_id) {
+                        if let Some(accounting_peer_lock) =
+                            accounting.get(&peer_file.peer_id).cloned()
+                        {
+                            Some(accounting_peer_lock)
+                        } else {
                             accounting.insert(
                                 peer_file.peer_id.clone(),
-                                Mutex::new(PeerAccounting {
+                                Arc::new(Mutex::new(PeerAccounting {
                                     balance: 0,
                                     threshold: 0,
                                     payment_threshold: 0,
                                     reserve: 0,
                                     refreshment: 0.0,
                                     id: peer_file.peer_id.clone(),
-                                }),
+                                })),
                             );
-                            threshold_ready = false;
-                        } else {
-                            let accounting_peer_lock = accounting.get(&peer_file.peer_id).unwrap();
-                            let accounting_peer = accounting_peer_lock.lock().await;
-                            threshold_ready = accounting_peer.threshold > 0;
+                            None
                         }
-                    }
+                    };
+
+                    let threshold_ready = if let Some(accounting_peer_lock) = accounting_peer {
+                        let accounting_peer = accounting_peer_lock.lock().await;
+                        accounting_peer.threshold > 0
+                    } else {
+                        false
+                    };
 
                     {
                         let mut connected_peers_map = wings.connected_peers.lock().await;
@@ -1234,25 +1296,25 @@ impl Weeb3 {
 
                 loop {
                     let (peer, amount) = pricing;
-                    {
+                    let accounting_peer_lock = {
                         let mut accounting = wings.accounting_peers.lock().await;
-                        if !accounting.contains_key(&peer) {
-                            accounting.insert(
-                                peer.clone(),
-                                Mutex::new(PeerAccounting {
-                                    balance: 0,
-                                    threshold: 0,
-                                    payment_threshold: 0,
-                                    reserve: 0,
-                                    refreshment: 0.0,
-                                    id: peer.clone(),
-                                }),
-                            );
+                        if let Some(accounting_peer_lock) = accounting.get(&peer).cloned() {
+                            accounting_peer_lock
+                        } else {
+                            let accounting_peer_lock = Arc::new(Mutex::new(PeerAccounting {
+                                balance: 0,
+                                threshold: 0,
+                                payment_threshold: 0,
+                                reserve: 0,
+                                refreshment: 0.0,
+                                id: peer.clone(),
+                            }));
+                            accounting.insert(peer.clone(), accounting_peer_lock.clone());
+                            accounting_peer_lock
                         }
+                    };
 
-                        let accounting_peer_lock = accounting.get(&peer).unwrap();
-                        set_payment_threshold(accounting_peer_lock, amount).await;
-                    }
+                    set_payment_threshold(&accounting_peer_lock, amount).await;
 
                     self.promote_priced_peer(&wings, peer).await;
 
@@ -1266,87 +1328,89 @@ impl Weeb3 {
             }
         };
 
+        let cheques_active_cache = Arc::new(Mutex::new(None::<bool>));
+
         let refreshment_instruction_handle = async {
             loop {
-                let mut refresh_instruction =
-                    match refreshment_instructions_chan_incoming.recv().await {
-                        Ok(instruction) => instruction,
-                        Err(_) => break,
+                let (peer, _amount) = match refreshment_instructions_chan_incoming.recv().await {
+                    Ok(instruction) => instruction,
+                    Err(_) => break,
+                };
+
+                let wings0 = wings.clone();
+                let ctrl7 = ctrl4.clone();
+                let refresh_chan = refreshment_chan_outgoing.clone();
+                let cheque_chan = cheque_instructions_chan_outgoing.clone();
+                let cheques_active_cache = cheques_active_cache.clone();
+
+                spawn_local(async move {
+                    let cheques_are_active = {
+                        let mut cache = cheques_active_cache.lock().await;
+                        match *cache {
+                            Some(active) => active,
+                            None => {
+                                let active = cheques_active().await;
+                                *cache = Some(active);
+                                active
+                            }
+                        }
                     };
-                let mut refresh_joiner = Vec::new();
 
-                loop {
-                    let (peer, _amount) = refresh_instruction;
+                    let accounting_peer = {
+                        let accounting = wings0.accounting_peers.lock().await;
+                        accounting.get(&peer).cloned()
+                    };
+
+                    let Some(accounting_peer_lock) = accounting_peer else {
+                        return;
+                    };
+
+                    let (balance, last_refreshment) = {
+                        let accounting_peer = accounting_peer_lock.lock().await;
+                        (accounting_peer.balance, accounting_peer.refreshment)
+                    };
+
+                    if balance <= REFRESH_RATE {
+                        return;
+                    }
+
                     {
-                        let map = wings.ongoing_refreshments.lock().await;
-                        if map.contains(&peer) {
-                            match refreshment_instructions_chan_incoming.try_recv() {
-                                Ok(next) => {
-                                    refresh_instruction = next;
-                                    continue;
+                        let mut map = wings0.ongoing_refreshments.lock().await;
+                        if !map.insert(peer) {
+                            return;
+                        }
+                    }
+
+                    if cheques_are_active {
+                        let cheque_amt = balance - REFRESH_RATE;
+                        if cheque_amt > 0 {
+                            let should_issue = {
+                                let mut map = wings0.ongoing_cheques.lock().await;
+                                if map.contains_key(&peer) {
+                                    false
+                                } else {
+                                    map.insert(peer, cheque_amt);
+                                    true
                                 }
-                                Err(_) => break,
-                            }
-                        }
-                    }
-
-                    #[allow(unused_assignments)]
-                    let mut daten = Date::now();
-                    let datenow = daten;
-                    let mut cheque_amt: u64 = 0;
-                    let mut amount2 = 0;
-                    let mut accounting_ready = false;
-                    {
-                        let accounting = wings.accounting_peers.lock().await;
-                        if let Some(accounting_peer_lock) = accounting.get(&peer) {
-                            accounting_ready = true;
-                            let mut accounting_peer = accounting_peer_lock.lock().await;
-                            daten = accounting_peer.refreshment;
-                            if datenow > accounting_peer.refreshment + 1000.0 {
-                                accounting_peer.refreshment = datenow;
-                                amount2 = accounting_peer.threshold;
-                            } else if accounting_peer.balance > REFRESH_RATE {
-                                cheque_amt = accounting_peer.balance - REFRESH_RATE;
-                            }
-                        }
-                    }
-
-                    if accounting_ready {
-                        if datenow > daten + 1000.0 {
-                            {
-                                let mut map = wings.ongoing_refreshments.lock().await;
-                                map.insert(peer);
-                            }
-
-                            web_sys::console::log_1(&JsValue::from(format!(
-                                "Starting refreshment {}",
-                                amount2
-                            )));
-
-                            let ctrl7 = ctrl4.clone();
-                            let rco = refreshment_chan_outgoing.clone();
-                            let handle = async move {
-                                refresh_handler(peer, amount2, ctrl7, &rco).await;
                             };
-                            refresh_joiner.push(handle);
-                        } else if cheque_amt > 0 && false {
-                            let mut map = wings.ongoing_cheques.lock().await;
-                            if !map.contains_key(&peer) {
-                                map.insert(peer, cheque_amt);
-                                let _ =
-                                    cheque_instructions_chan_outgoing.try_send((peer, cheque_amt));
+
+                            if should_issue {
+                                spawn_local(async move {
+                                    let _ = cheque_chan.try_send((peer, cheque_amt));
+                                });
                             }
                         }
                     }
 
-                    match refreshment_instructions_chan_incoming.try_recv() {
-                        Ok(next) => refresh_instruction = next,
-                        Err(_) => break,
+                    let now = Date::now();
+                    let elapsed = now - last_refreshment;
+                    if elapsed < 1000.0 {
+                        async_std::task::sleep(Duration::from_millis((1000.0 - elapsed) as u64))
+                            .await;
                     }
-                }
 
-                join_all(refresh_joiner).await;
-                async_std::task::yield_now().await;
+                    refresh_handler(peer, REFRESH_RATE * 100, ctrl7, &refresh_chan).await;
+                });
             }
         };
 
@@ -1360,15 +1424,26 @@ impl Weeb3 {
                 loop {
                     let (peer, amount) = refreshment;
 
-                    web_sys::console::log_1(&JsValue::from(format!(
-                        "Applied refreshment {}",
-                        amount
-                    )));
+                    self.interface_log(format!("Applied refreshment {}", amount));
 
                     if amount > 0 {
-                        let accounting = wings.accounting_peers.lock().await;
-                        if let Some(accounting_peer_lock) = accounting.get(&peer) {
-                            apply_refreshment(accounting_peer_lock, amount).await;
+                        let accounting_peer = {
+                            let accounting = wings.accounting_peers.lock().await;
+                            accounting.get(&peer).cloned()
+                        };
+                        if let Some(accounting_peer_lock) = accounting_peer {
+                            apply_refreshment(&accounting_peer_lock, amount).await;
+                            let mut accounting_peer = accounting_peer_lock.lock().await;
+                            accounting_peer.refreshment = Date::now();
+                        }
+                    } else {
+                        let accounting_peer = {
+                            let accounting = wings.accounting_peers.lock().await;
+                            accounting.get(&peer).cloned()
+                        };
+                        if let Some(accounting_peer_lock) = accounting_peer {
+                            let mut accounting_peer = accounting_peer_lock.lock().await;
+                            accounting_peer.refreshment = Date::now();
                         }
                     }
                     let mut map = wings.ongoing_refreshments.lock().await;
@@ -1473,9 +1548,12 @@ impl Weeb3 {
                     };
                     if ok {
                         if let Some(amount) = amt_opt {
-                            let accounting = wings.accounting_peers.lock().await;
-                            if let Some(accounting_peer_lock) = accounting.get(&peer) {
-                                apply_refreshment(accounting_peer_lock, amount).await;
+                            let accounting_peer = {
+                                let accounting = wings.accounting_peers.lock().await;
+                                accounting.get(&peer).cloned()
+                            };
+                            if let Some(accounting_peer_lock) = accounting_peer {
+                                apply_refreshment(&accounting_peer_lock, amount).await;
                             }
                         }
                     }
@@ -1758,7 +1836,7 @@ impl Weeb3 {
         };
 
         let retrieve_chunk_handle = async {
-            let retrieve_sem = Arc::new(Semaphore::new(4096));
+            let retrieve_sem = Arc::new(Semaphore::new(1024));
 
             loop {
                 let mut incoming_request = match chunk_retrieve_chan_incoming.recv().await {
@@ -1774,10 +1852,13 @@ impl Weeb3 {
                     let overlay_peers = wings.overlay_peers.clone();
                     let accounting_peers = wings.accounting_peers.clone();
                     let refresh_chan = refreshment_instructions_chan_outgoing.clone();
+                    let log_port = self.log_port.0.clone();
+                    let log_start_ms = self.log_start_ms;
 
                     dispatched += 1;
 
                     spawn_local(async move {
+                        let started = Date::now();
                         let _permit = sem.acquire().await;
 
                         let chunk_data = retrieve_chunk(
@@ -1789,6 +1870,16 @@ impl Weeb3 {
                         )
                         .await;
 
+                        interface_log_to(
+                            &log_port,
+                            log_start_ms,
+                            format!(
+                                "Retrieved chunk {} len {} in {}ms",
+                                hex::encode(&n),
+                                chunk_data.len(),
+                                (Date::now() - started).max(0.0).round() as u64,
+                            ),
+                        );
                         let _ = chan.try_send(chunk_data);
                     });
 

@@ -48,6 +48,8 @@ use crate::{
 
 use byteorder::ByteOrder;
 
+use async_std::sync::Arc;
+
 use alloy::primitives::keccak256;
 use alloy::signers::Signer;
 use alloy::signers::local::PrivateKeySigner;
@@ -615,7 +617,7 @@ pub async fn push_chunk(
     cstamp0: Vec<u8>,
     control: stream::Control,
     peers: &Mutex<HashMap<String, PeerId>>,
-    accounting: &Mutex<HashMap<PeerId, Mutex<PeerAccounting>>>,
+    accounting: &Mutex<HashMap<PeerId, Arc<Mutex<PeerAccounting>>>>,
     refresh_chan: &mpsc::Sender<(PeerId, u64)>,
 ) -> Vec<u8> {
     if (data.len() > 4104 && !soc) || (data.len() > 4201) {
@@ -651,21 +653,26 @@ pub async fn push_chunk(
             closest_peer_id = libp2p::PeerId::random();
             current_max_po = 0;
             selected = false;
-            {
+            let peer_candidates: Vec<(String, PeerId)> = {
                 let peers_map = peers.lock().await;
-                for (ov, id) in peers_map.iter() {
-                    if skiplist.contains(id) {
-                        continue;
-                    }
+                peers_map
+                    .iter()
+                    .map(|(ov, id)| (ov.clone(), id.clone()))
+                    .collect()
+            };
 
-                    let current_po = get_proximity(&caddr, &hex::decode(&ov).unwrap());
+            for (ov, id) in peer_candidates {
+                if skiplist.contains(&id) {
+                    continue;
+                }
 
-                    if current_po >= current_max_po {
-                        selected = true;
-                        closest_overlay = ov.clone();
-                        closest_peer_id = id.clone();
-                        current_max_po = current_po;
-                    }
+                let current_po = get_proximity(&caddr, &hex::decode(&ov).unwrap());
+
+                if current_po >= current_max_po {
+                    selected = true;
+                    closest_overlay = ov;
+                    closest_peer_id = id;
+                    current_max_po = current_po;
                 }
             }
 
@@ -674,8 +681,6 @@ pub async fn push_chunk(
             } else {
                 if !overdraftlist.is_empty() {
                     for k in overdraftlist.iter() {
-                        let _ = refresh_chan
-                            .try_send((k.clone(), 100 * crate::accounting::REFRESH_RATE));
                         skiplist.remove(k);
                     }
                     overdraftlist.clear();
@@ -697,16 +702,17 @@ pub async fn push_chunk(
 
             let req_price = price(&closest_overlay, &caddr);
 
-            {
+            let accounting_peer = {
                 let accounting_peers = accounting.lock().await;
-                if accounting_peers.contains_key(&closest_peer_id) {
-                    let accounting_peer = accounting_peers.get(&closest_peer_id).unwrap();
-                    let allowed = reserve(accounting_peer, req_price, &refresh_chan).await;
-                    if !allowed {
-                        overdraftlist.insert(closest_peer_id);
-                    } else {
-                        seer = false;
-                    }
+                accounting_peers.get(&closest_peer_id).cloned()
+            };
+
+            if let Some(accounting_peer) = accounting_peer {
+                let allowed = reserve(&accounting_peer, req_price).await;
+                if !allowed {
+                    overdraftlist.insert(closest_peer_id);
+                } else {
+                    seer = false;
                 }
             }
         }
@@ -739,19 +745,23 @@ pub async fn push_chunk(
 
         match receipt_received {
             Ok(true) => {
-                let accounting_peers = accounting.lock().await;
-                if accounting_peers.contains_key(&closest_peer_id) {
-                    let accounting_peer = accounting_peers.get(&closest_peer_id).unwrap();
-                    apply_credit(accounting_peer, req_price).await;
+                let accounting_peer = {
+                    let accounting_peers = accounting.lock().await;
+                    accounting_peers.get(&closest_peer_id).cloned()
+                };
+                if let Some(accounting_peer) = accounting_peer {
+                    apply_credit(&accounting_peer, req_price, refresh_chan).await;
                 }
                 break; // move this to receipt validation later
             }
             _ => {
                 error_count += 1;
-                let accounting_peers = accounting.lock().await;
-                if accounting_peers.contains_key(&closest_peer_id) {
-                    let accounting_peer = accounting_peers.get(&closest_peer_id).unwrap();
-                    cancel_reserve(accounting_peer, req_price).await
+                let accounting_peer = {
+                    let accounting_peers = accounting.lock().await;
+                    accounting_peers.get(&closest_peer_id).cloned()
+                };
+                if let Some(accounting_peer) = accounting_peer {
+                    cancel_reserve(&accounting_peer, req_price).await
                 }
             }
         };

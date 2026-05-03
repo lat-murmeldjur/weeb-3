@@ -4,8 +4,6 @@ use async_std::sync::Mutex;
 
 use libp2p::PeerId;
 
-use js_sys::Date;
-
 use crate::conventions::{PeerAccounting, get_proximity};
 use crate::mpsc;
 
@@ -20,31 +18,31 @@ pub async fn set_payment_threshold(a: &Mutex<PeerAccounting>, amount: u64) {
     }
 }
 
-pub async fn reserve(
-    a: &Mutex<PeerAccounting>,
-    amount: u64,
-    chan: &mpsc::Sender<(PeerId, u64)>,
-) -> bool {
+pub async fn reserve(a: &Mutex<PeerAccounting>, amount: u64) -> bool {
     let mut account = a.lock().await;
-    if account.balance >= account.payment_threshold && account.refreshment + 1000.0 < Date::now() {
-        // start refreshing
-        let _ = chan.try_send((account.id.clone(), account.threshold));
-    }
-    if account.reserve + account.balance + amount < account.threshold {
+    if account.reserve + account.balance + amount <= account.threshold {
         account.reserve += amount;
         return true;
     }
     return false;
 }
 
-pub async fn apply_credit(a: &Mutex<PeerAccounting>, amount: u64) {
+pub async fn apply_credit(
+    a: &Mutex<PeerAccounting>,
+    amount: u64,
+    chan: &mpsc::Sender<(PeerId, u64)>,
+) {
     let mut account = a.lock().await;
     account.balance += amount;
     if account.reserve > amount {
         account.reserve -= amount;
-        return;
+    } else {
+        account.reserve = 0;
     }
-    account.reserve = 0;
+
+    if account.balance >= REFRESH_RATE {
+        let _ = chan.try_send((account.id.clone(), account.balance));
+    }
 }
 
 pub async fn apply_refreshment(a: &Mutex<PeerAccounting>, amount: u64) {

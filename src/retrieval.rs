@@ -12,12 +12,9 @@ use crate::{
     // // // // // // // //
     Mutex,
     // // // // // // // //
-    // // // // // // // //
     PeerAccounting,
     // // // // // // // //
     PeerId,
-    // // // // // // // //
-    STARTUP_QUEUE_POLL_MS,
     // // // // // // // //
     apply_credit,
     // // // // // // // //
@@ -46,15 +43,22 @@ use crate::{
     valid_cac,
     // // // // // // // //
     valid_soc,
+    // // // // // // // //
 };
 
 use alloy::primitives::keccak256;
 use async_std::sync::Arc;
 use byteorder::ByteOrder;
+use std::{collections::BTreeMap, future::Future, pin::Pin};
 
-use async_lock::Semaphore;
+const RETRIEVE_PEER_TIMEOUT_SECS: u64 = 10;
+const RETRIEVE_HEDGE_AFTER_MS: u64 = 1360;
 
-const RETRIEVE_PEER_TIMEOUT_SECS: u64 = 8;
+struct RetrieveAttemptResult {
+    chunk: Vec<u8>,
+    valid: bool,
+    soc: bool,
+}
 
 use libp2p::futures::{StreamExt, stream::FuturesUnordered};
 
@@ -108,6 +112,148 @@ pub async fn retrieve_resource(
     return encode_resources(data_vector_e, index);
 }
 
+fn split_chunk_references(data: &[u8], address_length: usize) -> Option<Vec<Vec<u8>>> {
+    if address_length == 0 || data.len() % address_length != 0 {
+        return None;
+    }
+
+    Some(
+        data.chunks(address_length)
+            .map(|address| address.to_vec())
+            .collect(),
+    )
+}
+
+async fn select_retrieve_peer(
+    caddr: &Vec<u8>,
+    peers: &Arc<Mutex<HashMap<String, PeerId>>>,
+    accounting: &Arc<Mutex<HashMap<PeerId, Arc<Mutex<PeerAccounting>>>>>,
+    skiplist: &mut HashSet<PeerId>,
+    overdraftlist: &mut HashSet<PeerId>,
+) -> Option<(PeerId, u64)> {
+    loop {
+        let mut closest_overlay = "".to_string();
+        let mut closest_peer_id: Option<PeerId> = None;
+        let mut current_max_po = 0;
+        let peer_candidates: Vec<(String, PeerId)> = {
+            let peers_map = peers.lock().await;
+            peers_map
+                .iter()
+                .map(|(ov, id)| (ov.clone(), id.clone()))
+                .collect()
+        };
+
+        for (ov, id) in peer_candidates {
+            if skiplist.contains(&id) {
+                continue;
+            }
+
+            let current_po = get_proximity(caddr, &hex::decode(&ov).unwrap());
+
+            if current_po >= current_max_po || closest_peer_id.is_none() {
+                closest_overlay = ov;
+                closest_peer_id = Some(id);
+                current_max_po = current_po;
+            }
+        }
+
+        let Some(peer) = closest_peer_id else {
+            return None;
+        };
+
+        skiplist.insert(peer.clone());
+        let req_price = price(&closest_overlay, caddr);
+
+        let accounting_peer = {
+            let accounting_peers = accounting.lock().await;
+            accounting_peers.get(&peer).cloned()
+        };
+
+        if let Some(accounting_peer) = accounting_peer {
+            let allowed = reserve(&accounting_peer, req_price).await;
+            if allowed {
+                return Some((peer, req_price));
+            }
+
+            overdraftlist.insert(peer);
+        }
+    }
+}
+
+fn reset_overdraft(skiplist: &mut HashSet<PeerId>, overdraftlist: &mut HashSet<PeerId>) {
+    for peer in overdraftlist.drain() {
+        skiplist.remove(&peer);
+    }
+}
+
+async fn retrieve_attempt(
+    selected: (PeerId, u64),
+    caddr: Vec<u8>,
+    control: stream::Control,
+    accounting: Arc<Mutex<HashMap<PeerId, Arc<Mutex<PeerAccounting>>>>>,
+    refresh_chan: mpsc::Sender<(PeerId, u64)>,
+    result_chan: mpsc::Sender<RetrieveAttemptResult>,
+) {
+    let (peer, req_price) = selected;
+    let (chunk_out, chunk_in) = mpsc::unbounded::<Vec<u8>>();
+
+    let _ = async_std::future::timeout(
+        Duration::from_secs(RETRIEVE_PEER_TIMEOUT_SECS),
+        retrieve_handler(peer.clone(), caddr.clone(), control, &chunk_out),
+    )
+    .await;
+
+    let mut result = RetrieveAttemptResult {
+        chunk: vec![],
+        valid: false,
+        soc: false,
+    };
+
+    match chunk_in.try_recv() {
+        Ok(chunk) => {
+            let (chunk_valid, soc) = verify_chunk(&caddr, &chunk);
+            if chunk_valid {
+                let accounting_peer = {
+                    let accounting_peers = accounting.lock().await;
+                    accounting_peers.get(&peer).cloned()
+                };
+                if let Some(accounting_peer) = accounting_peer {
+                    apply_credit(&accounting_peer, req_price, &refresh_chan).await;
+                }
+                result = RetrieveAttemptResult {
+                    chunk,
+                    valid: true,
+                    soc,
+                };
+            } else {
+                let accounting_peer = {
+                    let accounting_peers = accounting.lock().await;
+                    accounting_peers.get(&peer).cloned()
+                };
+                if let Some(accounting_peer) = accounting_peer {
+                    cancel_reserve(&accounting_peer, req_price).await
+                }
+            }
+        }
+        Err(error) => {
+            let accounting_peer = {
+                let accounting_peers = accounting.lock().await;
+                accounting_peers.get(&peer).cloned()
+            };
+            if let Some(accounting_peer) = accounting_peer {
+                cancel_reserve(&accounting_peer, req_price).await
+            }
+            web_sys::console::log_1(&JsValue::from(format!(
+                "unable to retrieve chunk {} error {}",
+                hex::encode(&caddr),
+                error
+            )));
+        }
+    }
+
+    let _ = result_chan.try_send(result);
+}
+
 pub async fn retrieve_data(
     data_address: &Vec<u8>,
     chunk_retrieve_chan: &mpsc::Sender<(Vec<u8>, mpsc::Sender<Vec<u8>>)>,
@@ -141,7 +287,7 @@ pub async fn retrieve_data(
 
     let address_length = data_address.len();
 
-    if root_chunk.len() < 8 + address_length {
+    if root_chunk.len() < 8 + address_length || (root_chunk.len() - 8) % address_length != 0 {
         web_sys::console::log_1(&JsValue::from(format!(
             "chunk too short: {}",
             hex::encode(data_address),
@@ -149,93 +295,68 @@ pub async fn retrieve_data(
         return vec![];
     }
 
-    let mut orig = root_chunk[8..].to_vec();
-
     let mut data: Vec<u8> = Vec::with_capacity((root_span + 8) as usize);
     data.extend_from_slice(&root_chunk[0..8]);
 
-    let retrieve_sem = Arc::new(Semaphore::new(2048));
+    let root_refs = match split_chunk_references(&root_chunk[8..], address_length) {
+        Some(addresses) => addresses,
+        None => return vec![],
+    };
 
-    let mut done = false;
-    while !done {
-        if orig.len() % address_length != 0 {
+    let mut joiner: FuturesUnordered<
+        Pin<Box<dyn Future<Output = (Vec<usize>, Vec<u8>, Vec<u8>)>>>,
+    > = FuturesUnordered::new();
+    for (index, addr) in root_refs.into_iter().enumerate() {
+        let chan = chunk_retrieve_chan.clone();
+        joiner.push(Box::pin(async move {
+            let chunk = get_chunk(addr.clone(), &chan).await;
+            (vec![index], addr, chunk)
+        }));
+    }
+
+    let mut leaf_chunks: BTreeMap<Vec<usize>, Vec<u8>> = BTreeMap::new();
+
+    while let Some((order, addr, result0)) = joiner.next().await {
+        if result0.len() <= 8 {
+            web_sys::console::log_1(&JsValue::from(format!(
+                "chunk not found: {}",
+                hex::encode(addr),
+            )));
             return vec![];
         }
 
-        let subs = orig.len() / address_length;
+        let result_span = u64::from_le_bytes(result0[0..8].try_into().unwrap());
 
-        let mut content_holder_2: Vec<Vec<u8>> = Vec::with_capacity(subs);
-        for i in 0..subs {
-            content_holder_2.push(orig[i * address_length..(i + 1) * address_length].to_vec());
-        }
+        if result_span > 4096 {
+            let child_refs = match split_chunk_references(&result0[8..], address_length) {
+                Some(addresses) => addresses,
+                None => return vec![],
+            };
 
-        let mut joiner = FuturesUnordered::new();
-
-        let mut content_holder_3: HashMap<usize, Vec<u8>> = HashMap::new();
-        let mut content_holder_4: HashMap<usize, Vec<u8>> = HashMap::new();
-
-        done = true;
-
-        for (index, addr) in content_holder_2.iter().cloned().enumerate() {
-            let sem = retrieve_sem.clone();
-            let chan = chunk_retrieve_chan.clone();
-
-            joiner.push(async move {
-                let _permit = sem.acquire().await;
-                let chunk = get_chunk(addr.clone(), &chan).await;
-                (index, addr, chunk)
-            });
-        }
-
-        while let Some((index, addr, result0)) = joiner.next().await {
-            if result0.len() > 8 {
-                let result_span = u64::from_le_bytes(result0[0..8].try_into().unwrap());
-
-                if result_span > 4096 {
-                    done = false;
-                    content_holder_3.insert(index, result0[8..].to_vec());
-                } else {
-                    content_holder_3.insert(index, addr);
-                    content_holder_4.insert(index, result0[8..].to_vec());
-                }
-            } else {
-                web_sys::console::log_1(&JsValue::from(format!(
-                    "chunk not found: {}",
-                    hex::encode(addr),
-                )));
-                return vec![];
+            for (child_index, child_addr) in child_refs.into_iter().enumerate() {
+                let mut child_order = order.clone();
+                child_order.push(child_index);
+                let chan = chunk_retrieve_chan.clone();
+                joiner.push(Box::pin(async move {
+                    let chunk = get_chunk(child_addr.clone(), &chan).await;
+                    (child_order, child_addr, chunk)
+                }));
             }
-        }
-
-        if !done {
-            web_sys::console::log_1(&JsValue::from("marker 00"));
-            orig.clear();
-
-            for i in 0..subs {
-                match content_holder_3.get(&i) {
-                    Some(data0) if !data0.is_empty() => {
-                        orig.extend_from_slice(data0);
-                    }
-                    _ => return vec![],
-                }
-            }
-
-            web_sys::console::log_1(&JsValue::from("marker 0"));
         } else {
-            web_sys::console::log_1(&JsValue::from("marker 10"));
-
-            for i in 0..subs {
-                match content_holder_4.get(&i) {
-                    Some(data0) if !data0.is_empty() => {
-                        data.extend_from_slice(data0);
-                    }
-                    _ => return vec![],
-                }
-            }
-
-            web_sys::console::log_1(&JsValue::from("marker 11"));
+            leaf_chunks.insert(order, result0[8..].to_vec());
         }
     }
+
+    web_sys::console::log_1(&JsValue::from("marker 10"));
+
+    for (_order, chunk_data) in leaf_chunks {
+        if chunk_data.is_empty() {
+            return vec![];
+        }
+        data.extend_from_slice(&chunk_data);
+    }
+
+    web_sys::console::log_1(&JsValue::from("marker 11"));
 
     if data.len() == (root_span + 8) as usize {
         data
@@ -254,7 +375,7 @@ pub async fn retrieve_chunk(
     chunk_address: &Vec<u8>,
     control: stream::Control,
     peers: &Arc<Mutex<HashMap<String, PeerId>>>,
-    accounting: &Arc<Mutex<HashMap<PeerId, Mutex<PeerAccounting>>>>,
+    accounting: &Arc<Mutex<HashMap<PeerId, Arc<Mutex<PeerAccounting>>>>>,
     refresh_chan: &mpsc::Sender<(PeerId, u64)>,
 ) -> Vec<u8> {
     let mut caddr: Vec<u8> = chunk_address.to_vec();
@@ -267,21 +388,9 @@ pub async fn retrieve_chunk(
         encred = true;
     }
 
-    #[allow(unused_assignments)]
-    let mut chunk_valid = false;
     let mut soc = false;
     let mut skiplist: HashSet<PeerId> = HashSet::new();
     let mut overdraftlist: HashSet<PeerId> = HashSet::new();
-
-    let mut closest_overlay = "".to_string();
-    let mut closest_peer_id = libp2p::PeerId::random();
-
-    #[allow(unused_assignments)]
-    let mut selected = false;
-    let mut round_commence = Date::now();
-
-    #[allow(unused_assignments)]
-    let mut current_max_po = 0;
 
     let mut error_count = 0;
     let max_error = 20;
@@ -299,142 +408,85 @@ pub async fn retrieve_chunk(
     //     };
     // };
 
+    let (attempt_out, attempt_in) = mpsc::unbounded::<RetrieveAttemptResult>();
+    let mut in_flight = 0_usize;
+    let mut last_attempt_started = 0.0;
+
     while error_count < max_error {
-        let mut seer = true;
-
-        while seer {
-            closest_overlay = "".to_string();
-            closest_peer_id = libp2p::PeerId::random();
-            current_max_po = 0;
-            selected = false;
-            {
-                let peers_map = peers.lock().await;
-                for (ov, id) in peers_map.iter() {
-                    if skiplist.contains(id) {
-                        continue;
-                    }
-
-                    let current_po = get_proximity(&caddr, &hex::decode(&ov).unwrap());
-
-                    if current_po >= current_max_po || selected == false {
-                        selected = true;
-                        closest_overlay = ov.clone();
-                        closest_peer_id = id.clone();
-                        current_max_po = current_po;
-                    }
+        if in_flight > 0 {
+            if let Ok(result) = attempt_in.try_recv() {
+                in_flight = in_flight.saturating_sub(1);
+                if result.valid {
+                    cd = result.chunk;
+                    soc = result.soc;
+                    break;
                 }
-            }
-            if selected {
-                skiplist.insert(closest_peer_id);
-            } else {
-                if !overdraftlist.is_empty() {
-                    for k in overdraftlist.iter() {
-                        let _ = refresh_chan
-                            .try_send((k.clone(), 100 * crate::accounting::REFRESH_RATE));
-                        skiplist.remove(k);
-                    }
-                    overdraftlist.clear();
-                }
-                let round_now = Date::now();
-
-                let seg = round_now - round_commence;
-                if seg < STARTUP_QUEUE_POLL_MS as f64 {
-                    async_std::task::sleep(Duration::from_millis(
-                        (STARTUP_QUEUE_POLL_MS as f64 - seg) as u64,
-                    ))
-                    .await;
-                }
-
-                round_commence = Date::now();
-
+                error_count += 1;
+                cd = vec![];
                 continue;
-            }
-
-            let req_price = price(&closest_overlay, &caddr);
-
-            {
-                let accounting_peers = accounting.lock().await;
-
-                if accounting_peers.contains_key(&closest_peer_id) {
-                    let accounting_peer = accounting_peers.get(&closest_peer_id).unwrap();
-                    let allowed = reserve(accounting_peer, req_price, &refresh_chan).await;
-                    if !allowed {
-                        overdraftlist.insert(closest_peer_id);
-                    } else {
-                        seer = false;
-                    }
-                }
             }
         }
 
-        let req_price = price(&closest_overlay, &caddr);
+        let now = Date::now();
+        let due = in_flight == 0 || now - last_attempt_started >= RETRIEVE_HEDGE_AFTER_MS as f64;
 
-        let (chunk_out, chunk_in) = mpsc::unbounded::<Vec<u8>>();
-
-        let _ = async_std::future::timeout(
-            Duration::from_secs(RETRIEVE_PEER_TIMEOUT_SECS),
-            retrieve_handler(closest_peer_id, caddr.clone(), control.clone(), &chunk_out),
-        )
-        .await;
-
-        let chunk_data = chunk_in.try_recv();
-        //        if chunk_data.is_err() {
-        //            let accounting_peers = accounting.lock().await;
-        //            if accounting_peers.contains_key(&closest_peer_id) {
-        //                let accounting_peer = accounting_peers.get(&closest_peer_id).unwrap();
-        //                cancel_reserve(accounting_peer, req_price).await
-        //            }
-        //        }
-
-        cd = match chunk_data {
-            Ok(ref x) => x.clone(),
-            Err(x) => {
-                let accounting_peers = accounting.lock().await;
-                if accounting_peers.contains_key(&closest_peer_id) {
-                    let accounting_peer = accounting_peers.get(&closest_peer_id).unwrap();
-                    cancel_reserve(accounting_peer, req_price).await
-                }
-                web_sys::console::log_1(&JsValue::from(format!(
-                    "unable to retrieve chunk {} error {}",
-                    hex::encode(chunk_address),
-                    x
-                )));
-                vec![]
+        if due {
+            reset_overdraft(&mut skiplist, &mut overdraftlist);
+            if let Some(selected) =
+                select_retrieve_peer(&caddr, peers, accounting, &mut skiplist, &mut overdraftlist)
+                    .await
+            {
+                let control = control.clone();
+                let accounting = accounting.clone();
+                let refresh_chan = refresh_chan.clone();
+                let attempt_out = attempt_out.clone();
+                let caddr = caddr.clone();
+                wasm_bindgen_futures::spawn_local(async move {
+                    retrieve_attempt(
+                        selected,
+                        caddr,
+                        control,
+                        accounting,
+                        refresh_chan,
+                        attempt_out,
+                    )
+                    .await;
+                });
+                in_flight += 1;
+                last_attempt_started = Date::now();
+            } else if overdraftlist.is_empty() {
+                async_std::task::sleep(Duration::from_millis(50)).await;
+                continue;
+            } else {
+                reset_overdraft(&mut skiplist, &mut overdraftlist);
+                async_std::task::sleep(Duration::from_millis(50)).await;
+                continue;
             }
-        };
+        }
 
-        // chan send?
+        if in_flight == 0 {
+            continue;
+        }
 
-        match chunk_data {
-            Ok(_x) => {
-                (chunk_valid, soc) = verify_chunk(&caddr, &cd);
-                if chunk_valid {
-                    web_sys::console::log_1(&JsValue::from(format!(
-                        "chunk valid {}",
-                        hex::encode(&caddr),
-                    )));
-                    {
-                        let accounting_peers = accounting.lock().await;
-                        if accounting_peers.contains_key(&closest_peer_id) {
-                            let accounting_peer = accounting_peers.get(&closest_peer_id).unwrap();
-                            apply_credit(accounting_peer, req_price).await;
-                        }
-                    }
-                    // cache_chunk(&caddr, &cd).await;
+        let elapsed = Date::now() - last_attempt_started;
+        let wait_ms = (RETRIEVE_HEDGE_AFTER_MS as f64 - elapsed).max(0.0).round() as u64;
+        if wait_ms == 0 {
+            continue;
+        }
+
+        match async_std::future::timeout(Duration::from_millis(wait_ms), attempt_in.recv()).await {
+            Ok(Ok(result)) => {
+                in_flight = in_flight.saturating_sub(1);
+                if result.valid {
+                    cd = result.chunk;
+                    soc = result.soc;
                     break;
-                } else {
-                    error_count += 1;
-                    {
-                        let accounting_peers = accounting.lock().await;
-                        if accounting_peers.contains_key(&closest_peer_id) {
-                            let accounting_peer = accounting_peers.get(&closest_peer_id).unwrap();
-                            cancel_reserve(accounting_peer, req_price).await
-                        }
-                    }
-                    cd = vec![];
                 }
+                error_count += 1;
+                cd = vec![];
             }
-            _ => {}
+            Ok(Err(_)) => break,
+            Err(_) => {}
         };
     }
 
@@ -474,21 +526,11 @@ pub fn verify_chunk(caddr: &Vec<u8>, cd: &Vec<u8>) -> (bool, bool) {
     if !contaddrd {
         let soc = valid_soc(&cd, &caddr);
         if !soc {
-            web_sys::console::log_1(&JsValue::from(format!(
-                "invalid soc {}",
-                hex::encode(&caddr)
-            )));
             return (false, false);
         } else {
-            web_sys::console::log_1(&JsValue::from(format!("valid soc {}", hex::encode(&caddr))));
             return (true, true);
         }
     } else {
-        web_sys::console::log_1(&JsValue::from(format!(
-            "valid cac {} {}",
-            cd.len(),
-            hex::encode(&caddr)
-        )));
         return (true, false);
     }
 }

@@ -118,3 +118,8 @@ mime_guess = { git = "https://github.com/abonander/mime_guess.git" }
 indexed_db_futures = { git = "https://github.com/Alorel/rust-indexed-db.git", features = ["serde", "indices", "async-upgrade"] }
 base64 = "0.22.1"
 async-lock = { git = "https://github.com/smol-rs/async-lock" }
+
+[dev-dependencies]
+headless_chrome = "1.0.21"
+anyhow_crates_io = { package = "anyhow", version = "1" }
+serde_json_crates_io = { package = "serde_json", version = "1" }
