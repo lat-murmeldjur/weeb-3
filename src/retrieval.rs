@@ -52,7 +52,7 @@ use byteorder::ByteOrder;
 use std::{collections::BTreeMap, future::Future, pin::Pin};
 
 const RETRIEVE_PEER_TIMEOUT_SECS: u64 = 10;
-const RETRIEVE_HEDGE_AFTER_MS: u64 = 1360;
+const RETRIEVE_HEDGE_AFTER_MS: u64 = 760;
 
 struct RetrieveAttemptResult {
     chunk: Vec<u8>,
