@@ -1377,7 +1377,7 @@ fn create_element_wmt(tmype: String, blob_url: String) -> Element {
 fn create_ielement(indx: String) -> Element {
     let document = web_sys::window().unwrap().document().unwrap();
 
-    let i = document.create_element("iframe").unwrap();
+    let i = document.create_element("embed").unwrap();
     let _ = i.set_attribute("src", &indx);
     let _ = i.set_attribute("width", "90%");
     let _ = i.set_attribute("height", "90%");
