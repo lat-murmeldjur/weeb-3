@@ -155,6 +155,11 @@ const SWAP_PROTOCOL: StreamProtocol = StreamProtocol::new("/swarm/swap/1.0.0/swa
 
 const PROTOCOL_ROUND_TIME: f64 = 160.0;
 const STARTUP_QUEUE_POLL_MS: u64 = 25;
+const PUSH_CHUNK_CONFIRMATION_PEERS: usize = 2;
+const RETRIEVE_CHECK_CONFIRMATION_PEERS: usize = 2;
+const PUSH_CHUNK_CONCURRENCY: usize = 128;
+const PUSH_CHUNK_RETRY_DELAY_MS: u64 = 500;
+const PUSH_CHUNK_QUEUE_BACKOFF_MS: u64 = 25;
 
 pub fn timed_log(message: impl AsRef<str>) {
     web_sys::console::log_1(&JsValue::from(message.as_ref()));
@@ -1760,7 +1765,7 @@ impl Weeb3 {
         };
 
         let push_chunk_handle = async {
-            let push_sem = Arc::new(Semaphore::new(1024));
+            let push_sem = Arc::new(Semaphore::new(PUSH_CHUNK_CONCURRENCY));
 
             loop {
                 let mut incoming_request = match chunk_upload_chan_incoming.recv().await {
@@ -1770,7 +1775,12 @@ impl Weeb3 {
                 let mut dispatched = 0;
 
                 loop {
-                    let sem = push_sem.clone();
+                    let Some(permit) = push_sem.try_acquire_arc() else {
+                        async_std::task::sleep(Duration::from_millis(PUSH_CHUNK_QUEUE_BACKOFF_MS))
+                            .await;
+                        let _ = chunk_upload_chan_outgoing.try_send(incoming_request);
+                        break;
+                    };
 
                     dispatched += 1;
 
@@ -1781,32 +1791,53 @@ impl Weeb3 {
                     let accounting_peers = wings.accounting_peers.clone();
                     let refreshment = refreshment_instructions_chan_outgoing.clone();
                     let chunk_upload_chan_outgoing = chunk_upload_chan_outgoing.clone();
+                    let log_port = self.log_port.0.clone();
+                    let log_start_ms = self.log_start_ms;
 
                     spawn_local(async move {
-                        let permit = sem.acquire().await;
+                        let address = {
+                            let _permit = permit;
+                            push_chunk(
+                                d.clone(),
+                                soc.clone(),
+                                checkad.clone(),
+                                stamp.clone(),
+                                ctrl8.clone(),
+                                &overlay_peers,
+                                &accounting_peers,
+                                &refreshment,
+                            )
+                            .await
+                        };
 
-                        let _address = push_chunk(
-                            d.clone(),
-                            soc.clone(),
-                            checkad.clone(),
-                            stamp.clone(),
-                            ctrl8.clone(),
-                            &overlay_peers,
-                            &accounting_peers,
-                            &refreshment,
-                        )
-                        .await;
-
-                        let chunk = retrieve_chunk(
-                            &checkad,
-                            ctrl8.clone(),
-                            &overlay_peers,
-                            &accounting_peers,
-                            &refreshment,
-                        )
-                        .await;
+                        let chunk = if address.len() > 0 {
+                            retrieve_check_chunk(
+                                &checkad,
+                                ctrl8.clone(),
+                                &overlay_peers,
+                                &accounting_peers,
+                                &refreshment,
+                            )
+                            .await
+                        } else {
+                            vec![]
+                        };
 
                         if chunk.len() == 0 {
+                            if address.len() > 0 {
+                                interface_log_to(
+                                    &log_port,
+                                    log_start_ms,
+                                    format!(
+                                        "Retrieve check failed for chunk {}",
+                                        hex::encode(&checkad)
+                                    ),
+                                );
+                            }
+                            async_std::task::sleep(Duration::from_millis(
+                                PUSH_CHUNK_RETRY_DELAY_MS,
+                            ))
+                            .await;
                             let _ = chunk_upload_chan_outgoing.try_send((
                                 d.clone(),
                                 soc.clone(),
@@ -1817,8 +1848,6 @@ impl Weeb3 {
                         } else {
                             let _ = feedback.try_send(true);
                         }
-
-                        drop(permit);
                     });
 
                     match chunk_upload_chan_incoming.try_recv() {
@@ -1836,12 +1865,13 @@ impl Weeb3 {
         };
 
         let retrieve_chunk_handle = async {
-            let retrieve_sem = Arc::new(Semaphore::new(1024));
+            let retrieve_sem = Arc::new(Semaphore::new(576));
+            let retrieve_dispatch_yield_every = 128usize;
 
             loop {
                 let mut incoming_request = match chunk_retrieve_chan_incoming.recv().await {
                     Ok(request) => request,
-                    Err(_) => break,
+                    Err(_) => continue,
                 };
                 let mut dispatched = 0usize;
 
@@ -1882,6 +1912,10 @@ impl Weeb3 {
                         );
                         let _ = chan.try_send(chunk_data);
                     });
+
+                    if dispatched % retrieve_dispatch_yield_every == 0 {
+                        async_std::task::yield_now().await;
+                    }
 
                     match chunk_retrieve_chan_incoming.try_recv() {
                         Ok(request) => incoming_request = request,

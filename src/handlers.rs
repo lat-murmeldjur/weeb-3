@@ -244,7 +244,7 @@ pub async fn ceive(
     step_1.address = Some(step_1_ad);
     step_1.nonce = nonce.to_vec();
     step_1.network_id = network_id;
-    step_1.full_node = false;
+    step_1.full_node = true;
     step_1.welcome_message = "... Ara Ara ...".to_string();
 
     web_sys::console::log_1(&JsValue::from("Handshake stage 1 4"));

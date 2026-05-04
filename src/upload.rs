@@ -14,6 +14,8 @@ use crate::{
     //                                                                        //
     PROTOCOL_ROUND_TIME,
     //                                                                        //
+    PUSH_CHUNK_CONFIRMATION_PEERS,
+    //                                                                        //
     PeerAccounting,
     //                                                                        //
     PeerId,
@@ -59,6 +61,24 @@ use serde_json::json;
 use wasm_bindgen::JsCast;
 
 const BATCH_BUCKET_TRIALS: usize = 1024;
+const PUSH_CHUNK_ATTEMPT_RETRY_WAIT_MS: u64 = 50;
+
+fn reset_push_overdraft(skiplist: &mut HashSet<PeerId>, overdraftlist: &mut HashSet<PeerId>) {
+    for peer in overdraftlist.drain() {
+        skiplist.remove(&peer);
+    }
+}
+
+async fn wait_for_chunk_pushes(receipts: Vec<mpsc::Receiver<bool>>) -> bool {
+    for receipt in receipts {
+        match receipt.recv().await {
+            Ok(true) => {}
+            _ => return false,
+        }
+    }
+
+    true
+}
 
 pub async fn stamp_chunk(
     stamp_signer_key: Vec<u8>,
@@ -314,7 +334,7 @@ pub async fn upload_resource(
 
     let (soc_actual, soc_address) = make_soc(&soc_wrapped_content, owner_bytes_0, id_bytes).await;
 
-    let (result_chan_out, _result_chan_in) = mpsc::unbounded::<bool>();
+    let (result_chan_out, result_chan_in) = mpsc::unbounded::<bool>();
 
     let batch_bucket_limit = get_batch_bucket_limit().await;
 
@@ -330,8 +350,16 @@ pub async fn upload_resource(
         return vec![];
     }
 
-    let _update_reference =
-        chunk_upload_chan.try_send((soc_actual, true, soc_address, cstamp0, result_chan_out));
+    if chunk_upload_chan
+        .try_send((soc_actual, true, soc_address, cstamp0, result_chan_out))
+        .is_err()
+    {
+        return vec![];
+    }
+
+    if result_chan_in.recv().await != Ok(true) {
+        return vec![];
+    }
 
     return feed_reference;
 }
@@ -441,14 +469,23 @@ pub async fn push_data(
             return vec![];
         }
 
-        let (result_chan_out, _result_chan_in) = mpsc::unbounded::<bool>();
+        let (result_chan_out, result_chan_in) = mpsc::unbounded::<bool>();
 
-        let _ = chunk_upload_chan.try_send((data0, soc, cha.clone(), cstamp0, result_chan_out));
+        if chunk_upload_chan
+            .try_send((data0, soc, cha.clone(), cstamp0, result_chan_out))
+            .is_err()
+        {
+            return vec![];
+        }
 
         // web_sys::console::log_1(&JsValue::from(format!(
         //     "push_data returning {:#?}!",
         //     hex::encode(&k)
         // )));
+
+        if result_chan_in.recv().await != Ok(true) {
+            return vec![];
+        }
 
         return [cha, encrey0].concat();
     } else {
@@ -464,7 +501,7 @@ pub async fn push_data(
         let next_level = true;
         let mut span_carriage = 4096;
 
-        let (result_chan_out, result_chan_in) = mpsc::unbounded::<bool>();
+        let mut chunk_receipts: Vec<mpsc::Receiver<bool>> = vec![];
 
         while next_level {
             let mut sc = 0;
@@ -482,10 +519,8 @@ pub async fn push_data(
                 for i in 0..chunk_l0c {
                     count_yield += 1;
                     if count_yield > 1024 {
-                        // relax push chunk channel
-                        if result_chan_in.recv().await.is_ok() && count_yield > 0 {
-                            count_yield -= 1;
-                        }
+                        async_std::task::yield_now().await;
+                        count_yield = 0;
                     }
 
                     let data_start = i * 4096 as usize;
@@ -581,19 +616,25 @@ pub async fn push_data(
 
                         // (span as u64).to_le_bytes().to_vec(),
 
-                        let _ = chunk_upload_chan.try_send((
-                            data0,
-                            soc,
-                            cha,
-                            cstamp0,
-                            result_chan_out.clone(),
-                        ));
+                        let (result_chan_out, result_chan_in) = mpsc::unbounded::<bool>();
+
+                        if chunk_upload_chan
+                            .try_send((data0, soc, cha, cstamp0, result_chan_out))
+                            .is_err()
+                        {
+                            return vec![];
+                        }
+                        chunk_receipts.push(result_chan_in);
                     }
                 }
             }
 
             if levels[level].len() == 1 {
-                return levels[level][0].clone();
+                let reference = levels[level][0].clone();
+                if !wait_for_chunk_pushes(chunk_receipts).await {
+                    return vec![];
+                }
+                return reference;
             } else {
                 data.clear();
                 data.shrink_to_fit();
@@ -631,6 +672,7 @@ pub async fn push_chunk(
 
     let mut skiplist: HashSet<PeerId> = HashSet::new();
     let mut overdraftlist: HashSet<PeerId> = HashSet::new();
+    let mut success_count = 0usize;
 
     let mut closest_overlay = "".to_string();
     let mut closest_peer_id = libp2p::PeerId::random();
@@ -643,9 +685,9 @@ pub async fn push_chunk(
     let mut current_max_po = 0;
 
     let mut error_count = 0;
-    let max_error = 20;
+    let max_error = 19;
 
-    while error_count < max_error {
+    while error_count < max_error && success_count < PUSH_CHUNK_CONFIRMATION_PEERS {
         let mut seer = true;
 
         while seer {
@@ -680,11 +722,9 @@ pub async fn push_chunk(
                 skiplist.insert(closest_peer_id);
             } else {
                 if !overdraftlist.is_empty() {
-                    for k in overdraftlist.iter() {
-                        skiplist.remove(k);
-                    }
-                    overdraftlist.clear();
+                    reset_push_overdraft(&mut skiplist, &mut overdraftlist);
                 }
+                error_count += 1;
                 let round_now = Date::now();
 
                 let seg = round_now - round_commence;
@@ -696,6 +736,10 @@ pub async fn push_chunk(
                 }
 
                 round_commence = Date::now();
+
+                if error_count >= max_error {
+                    break;
+                }
 
                 continue;
             }
@@ -715,6 +759,10 @@ pub async fn push_chunk(
                     seer = false;
                 }
             }
+        }
+
+        if !selected {
+            break;
         }
 
         let req_price = price(&closest_overlay, &caddr);
@@ -752,7 +800,7 @@ pub async fn push_chunk(
                 if let Some(accounting_peer) = accounting_peer {
                     apply_credit(&accounting_peer, req_price, refresh_chan).await;
                 }
-                break; // move this to receipt validation later
+                success_count += 1;
             }
             _ => {
                 error_count += 1;
@@ -763,11 +811,23 @@ pub async fn push_chunk(
                 if let Some(accounting_peer) = accounting_peer {
                     cancel_reserve(&accounting_peer, req_price).await
                 }
+                async_std::task::sleep(Duration::from_millis(PUSH_CHUNK_ATTEMPT_RETRY_WAIT_MS))
+                    .await;
             }
         };
     }
 
-    return caddr;
+    if success_count >= PUSH_CHUNK_CONFIRMATION_PEERS {
+        return caddr;
+    }
+
+    web_sys::console::log_1(&JsValue::from(format!(
+        "unable to push chunk {} through {} separate peers",
+        hex::encode(&caddr),
+        PUSH_CHUNK_CONFIRMATION_PEERS
+    )));
+
+    vec![]
 }
 
 pub fn encrypt(span: usize, cd: &Vec<u8>, encrey: &Vec<u8>) -> Vec<u8> {

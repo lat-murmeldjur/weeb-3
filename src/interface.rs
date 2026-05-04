@@ -1369,6 +1369,8 @@ fn create_element_wmt(tmype: String, blob_url: String) -> Element {
     let i = document.create_element("embed").unwrap();
     let _ = i.set_attribute("src", &blob_url);
     let _ = i.set_attribute("type", &tmype);
+    // let _ = i.set_attribute("allow", "fullscreen");
+
     return i;
 }
 
