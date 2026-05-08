@@ -45,6 +45,9 @@ use addresses::{
     UnderlayFormat, beewss_to_dns_transformed, deserialize_underlays, detect_underlay_format,
 };
 
+mod bzz_stream;
+use bzz_stream::*;
+
 mod conventions;
 use conventions::*;
 
@@ -72,6 +75,8 @@ use persistence::{
 
 mod retrieval;
 use retrieval::*;
+
+mod streaming_player;
 
 mod upload;
 use upload::*;
@@ -157,7 +162,8 @@ const PROTOCOL_ROUND_TIME: f64 = 160.0;
 const STARTUP_QUEUE_POLL_MS: u64 = 25;
 const PUSH_CHUNK_CONFIRMATION_PEERS: usize = 2;
 const RETRIEVE_CHECK_CONFIRMATION_PEERS: usize = 2;
-const PUSH_CHUNK_CONCURRENCY: usize = 128;
+const PUSH_CHUNK_CONCURRENCY: usize = 1280;
+const HANDSHAKE_RETRY_DELAY_MS: u64 = 500;
 const PUSH_CHUNK_RETRY_DELAY_MS: u64 = 500;
 const PUSH_CHUNK_QUEUE_BACKOFF_MS: u64 = 25;
 
@@ -205,9 +211,14 @@ pub struct Weeb3 {
     wings: Mutex<Arc<Wings>>,
     log_port: (mpsc::Sender<String>, mpsc::Receiver<String>),
     log_start_ms: f64,
-    message_port: (
-        mpsc::Sender<(Vec<u8>, mpsc::Sender<Vec<u8>>)>,
-        mpsc::Receiver<(Vec<u8>, mpsc::Sender<Vec<u8>>)>,
+    message_port: (ChunkRetrieveSender, ChunkRetrieveReceiver),
+    resolve_port: (
+        mpsc::Sender<BzzResolveRequest>,
+        mpsc::Receiver<BzzResolveRequest>,
+    ),
+    range_port: (
+        mpsc::Sender<BzzRangeRequest>,
+        mpsc::Receiver<BzzRangeRequest>,
     ),
     chunk_push_port: (
         mpsc::Sender<(Vec<u8>, bool, Vec<u8>, Vec<u8>, mpsc::Sender<bool>)>,
@@ -232,15 +243,119 @@ pub struct Weeb3 {
         )>,
     ),
     bootnode_port: (
-        mpsc::Sender<(String, mpsc::Sender<String>, bool)>,
-        mpsc::Receiver<(String, mpsc::Sender<String>, bool)>,
+        mpsc::Sender<(String, mpsc::Sender<String>, bool, u64)>,
+        mpsc::Receiver<(String, mpsc::Sender<String>, bool, u64)>,
     ),
     network_id: Mutex<u64>,
+    transfer_paused: Arc<AtomicBool>,
+    retrieve_cancel_generations: RetrieveGenerationMap,
+    connection_generation: Arc<Mutex<u64>>,
     ongoing_connections: Arc<Mutex<u64>>,
     connections: Arc<Mutex<u64>>,
 }
 
 type PeerAddrMap = Arc<Mutex<HashMap<PeerId, Multiaddr>>>;
+type RetrieveGenerationMap = Arc<Mutex<HashMap<String, u64>>>;
+type ChunkRetrieveSender = mpsc::Sender<ChunkRetrieveRequest>;
+type ChunkRetrieveReceiver = mpsc::Receiver<ChunkRetrieveRequest>;
+
+#[derive(Clone, Debug)]
+pub(crate) struct RetrieveCancelToken {
+    pub stream_key: String,
+    pub generation: u64,
+}
+
+#[derive(Clone)]
+pub(crate) struct ChunkRetrieveRequest {
+    pub address: Vec<u8>,
+    pub chan: mpsc::Sender<Vec<u8>>,
+    pub cancel: Option<RetrieveCancelToken>,
+}
+
+pub(crate) fn chunk_retrieve_request(
+    address: Vec<u8>,
+    chan: mpsc::Sender<Vec<u8>>,
+) -> ChunkRetrieveRequest {
+    ChunkRetrieveRequest {
+        address,
+        chan,
+        cancel: None,
+    }
+}
+
+pub(crate) fn cancellable_chunk_retrieve_request(
+    address: Vec<u8>,
+    chan: mpsc::Sender<Vec<u8>>,
+    cancel: Option<RetrieveCancelToken>,
+) -> ChunkRetrieveRequest {
+    ChunkRetrieveRequest {
+        address,
+        chan,
+        cancel,
+    }
+}
+
+pub(crate) async fn register_retrieve_cancel_token(
+    generations: &RetrieveGenerationMap,
+    cancel: &Option<RetrieveCancelToken>,
+) {
+    let Some(cancel) = cancel else {
+        return;
+    };
+
+    let mut generations = generations.lock().await;
+    let entry = generations.entry(cancel.stream_key.clone()).or_insert(0);
+    if *entry < cancel.generation {
+        *entry = cancel.generation;
+    }
+}
+
+pub(crate) async fn retrieve_cancel_token_current(
+    generations: &RetrieveGenerationMap,
+    cancel: &Option<RetrieveCancelToken>,
+) -> bool {
+    let Some(cancel) = cancel else {
+        return true;
+    };
+
+    let generations = generations.lock().await;
+    generations
+        .get(&cancel.stream_key)
+        .map(|generation| *generation <= cancel.generation)
+        .unwrap_or(true)
+}
+
+pub(crate) fn transfer_pause_enabled(paused: &Arc<AtomicBool>) -> bool {
+    paused.load(Ordering::Relaxed)
+}
+
+pub(crate) async fn wait_transfer_unpaused(paused: &Arc<AtomicBool>) {
+    while transfer_pause_enabled(paused) {
+        async_std::task::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+type BzzResolveRequest = (String, mpsc::Sender<Option<BzzMetadata>>);
+enum BzzRangeRequest {
+    Resource {
+        resource: String,
+        start: u64,
+        end_inclusive: u64,
+        cancel: Option<RetrieveCancelToken>,
+        chan: mpsc::Sender<Option<(Vec<u8>, BzzMetadata)>>,
+    },
+    Resolved {
+        metadata: BzzMetadata,
+        start: u64,
+        end_inclusive: u64,
+        cancel: Option<RetrieveCancelToken>,
+        chan: mpsc::Sender<Option<(Vec<u8>, BzzMetadata)>>,
+    },
+    Prepare {
+        metadata: BzzMetadata,
+        chan: mpsc::Sender<bool>,
+    },
+}
 
 #[wasm_bindgen]
 pub struct Wings {
@@ -265,6 +380,7 @@ impl Weeb3 {
         usable_in_protocols: bool,
     ) -> Vec<u8> {
         let parse_id = _id.parse::<u64>();
+        let mut network_changed = false;
 
         match parse_id {
             Ok(parsed_id) => {
@@ -283,11 +399,18 @@ impl Weeb3 {
                     }
 
                     *nid = parsed_id;
-                    self.disconnect_all_peers().await;
+                    network_changed = true;
                 }
             }
             _ => {}
         };
+
+        if network_changed {
+            self.bump_connection_generation().await;
+            self.disconnect_all_peers().await;
+        }
+
+        let generation = self.current_connection_generation().await;
 
         web_sys::console::log_1(&"bootnode change triggered".into());
 
@@ -295,7 +418,7 @@ impl Weeb3 {
         let _ = self
             .bootnode_port
             .0
-            .try_send((address, chan_out, usable_in_protocols));
+            .try_send((address, chan_out, usable_in_protocols, generation));
 
         let result = chan_in.recv().await.unwrap_or_default();
 
@@ -322,6 +445,21 @@ impl Weeb3 {
                 "... result ...".to_string(),
             );
         }
+    }
+
+    async fn current_connection_generation(&self) -> u64 {
+        let generation = self.connection_generation.lock().await;
+        *generation
+    }
+
+    async fn bump_connection_generation(&self) -> u64 {
+        let mut generation = self.connection_generation.lock().await;
+        *generation = generation.saturating_add(1);
+        web_sys::console::log_1(&JsValue::from(format!(
+            "Connection generation bumped to {}",
+            *generation
+        )));
+        *generation
     }
 
     async fn disconnect_all_peers(&self) {
@@ -574,6 +712,29 @@ impl Weeb3 {
     }
 
     pub async fn acquire(&self, address: String) -> Vec<u8> {
+        if let Some(resource) = parse_bzz_resource(&address) {
+            if !resource.path.is_empty() {
+                if let Some(metadata) = self.resolve_bzz(address.clone()).await {
+                    if metadata.size == 0 {
+                        return encode_resources(
+                            vec![(vec![], metadata.mime, metadata.path.clone())],
+                            metadata.path,
+                        );
+                    }
+
+                    if let Some((bytes, metadata)) = self
+                        .acquire_resolved_range(metadata.clone(), 0, metadata.size - 1)
+                        .await
+                    {
+                        return encode_resources(
+                            vec![(bytes, metadata.mime, metadata.path.clone())],
+                            metadata.path,
+                        );
+                    }
+                }
+            }
+        }
+
         let (chan_out, chan_in) = mpsc::unbounded::<Vec<u8>>();
         let valaddr_0 = hex::decode(&address);
         let valaddr = match valaddr_0 {
@@ -581,7 +742,10 @@ impl Weeb3 {
             _ => prt(address, "".to_string()).await,
         };
 
-        let _ = self.message_port.0.try_send((valaddr, chan_out));
+        let _ = self
+            .message_port
+            .0
+            .try_send(chunk_retrieve_request(valaddr, chan_out));
 
         return chan_in.recv().await.unwrap_or_default();
     }
@@ -658,7 +822,9 @@ impl Weeb3 {
         let self_ephemeral_waiters: Arc<Mutex<HashMap<PeerId, Vec<mpsc::Sender<Multiaddr>>>>> =
             Arc::new(Mutex::new(HashMap::new()));
 
-        let (m_out, m_in) = mpsc::unbounded::<(Vec<u8>, mpsc::Sender<Vec<u8>>)>();
+        let (m_out, m_in) = mpsc::unbounded::<ChunkRetrieveRequest>();
+        let (resolve_out, resolve_in) = mpsc::unbounded::<BzzResolveRequest>();
+        let (range_out, range_in) = mpsc::unbounded::<BzzRangeRequest>();
 
         let (log_port_out, log_port_in) = mpsc::unbounded::<String>();
 
@@ -670,7 +836,7 @@ impl Weeb3 {
             String,
             mpsc::Sender<Vec<u8>>,
         )>();
-        let (b_out, b_in) = mpsc::unbounded::<(String, mpsc::Sender<String>, bool)>();
+        let (b_out, b_in) = mpsc::unbounded::<(String, mpsc::Sender<String>, bool, u64)>();
         let (chunk_push_port_out, chunk_push_port_in) =
             mpsc::unbounded::<(Vec<u8>, bool, Vec<u8>, Vec<u8>, mpsc::Sender<bool>)>();
 
@@ -692,10 +858,15 @@ impl Weeb3 {
             log_port: (log_port_out, log_port_in),
             log_start_ms: Date::now(),
             message_port: (m_out, m_in),
+            resolve_port: (resolve_out, resolve_in),
+            range_port: (range_out, range_in),
             upload_port: (u_out, u_in),
             chunk_push_port: (chunk_push_port_out, chunk_push_port_in),
             bootnode_port: (b_out, b_in),
             network_id: Mutex::new(10_u64),
+            transfer_paused: Arc::new(AtomicBool::new(false)),
+            retrieve_cancel_generations: Arc::new(Mutex::new(HashMap::new())),
+            connection_generation: Arc::new(Mutex::new(0_u64)),
             ongoing_connections: Arc::new(Mutex::new(0_u64)),
             connections: Arc::new(Mutex::new(0_u64)),
         };
@@ -729,6 +900,21 @@ impl Weeb3 {
 
     pub fn interface_log(&self, log0: String) {
         interface_log_to(&self.log_port.0, self.log_start_ms, log0);
+    }
+
+    pub async fn toggle_transfer_pause(&self) -> bool {
+        let paused = !self.transfer_paused.load(Ordering::Relaxed);
+        self.transfer_paused.store(paused, Ordering::Relaxed);
+        self.interface_log(if paused {
+            "Paused retrieve / push scheduling".to_string()
+        } else {
+            "Resumed retrieve / push scheduling".to_string()
+        });
+        paused
+    }
+
+    pub fn transfer_paused(&self) -> bool {
+        self.transfer_paused.load(Ordering::Relaxed)
     }
 
     pub async fn run(&self, _st: String) -> () {
@@ -776,7 +962,7 @@ impl Weeb3 {
             mpsc::unbounded::<(Vec<u8>, mpsc::Sender<Vec<u8>>)>();
 
         let (chunk_retrieve_chan_outgoing, chunk_retrieve_chan_incoming) =
-            mpsc::unbounded::<(Vec<u8>, mpsc::Sender<Vec<u8>>)>();
+            mpsc::unbounded::<ChunkRetrieveRequest>();
 
         let (data_upload_chan_outgoing, data_upload_chan_incoming) =
             mpsc::unbounded::<(Vec<Vec<u8>>, u8, Vec<u8>, Vec<u8>, mpsc::Sender<Vec<u8>>)>();
@@ -848,6 +1034,7 @@ impl Weeb3 {
                     let swarm = self.swarm.clone();
                     let connections_instructions_chan_outgoing =
                         connections_instructions_chan_outgoing.clone();
+                    let connection_generation = self.connection_generation.clone();
 
                     spawn_local(async move {
                         let und_addrs = deserialize_underlays(&paddr_current.clone().underlay);
@@ -859,7 +1046,7 @@ impl Weeb3 {
                             )));
 
                             if detect_underlay_format(&addr3) == UnderlayFormat::BeeWss {
-                                let _pid: PeerId = match try_from_multiaddr(&addr3.clone()) {
+                                let pid: PeerId = match try_from_multiaddr(&addr3.clone()) {
                                     Some(aok) => {
                                         let connected_peers_map =
                                             wings.connected_peers.lock().await;
@@ -881,18 +1068,32 @@ impl Weeb3 {
                                 };
 
                                 let mut paddr5 = paddr_current.clone();
-                                {
+                                let addr30 = beewss_to_dns_transformed(&addr3);
+                                let dial_result = {
                                     let mut swarm = swarm.lock_arc().await;
                                     web_sys::console::log_1(&JsValue::from(format!("dial 0",)));
-                                    let addr30 = beewss_to_dns_transformed(&addr3);
-                                    let _ = swarm.dial(addr30.clone());
+                                    swarm.dial(addr30.clone())
+                                };
+
+                                if let Err(error) = dial_result {
+                                    timed_log(format!(
+                                        "Dial failed immediately peer={} address={} error={:?}",
+                                        pid, addr30, error
+                                    ));
+                                    let mut connection_attempts_map =
+                                        wings.connection_attempts.lock().await;
+                                    connection_attempts_map.remove(&pid);
+                                    continue;
+                                }
+
+                                {
                                     paddr5.underlay = addr30.to_vec();
                                 }
 
                                 let _ = connections_instructions_chan_outgoing.try_send((
                                     paddr5.clone(),
                                     false,
-                                    Date::now() as u64,
+                                    *connection_generation.lock().await,
                                 ));
                             }
                         }
@@ -907,7 +1108,7 @@ impl Weeb3 {
                             };
 
                         if detect_underlay_format(&addr4) == UnderlayFormat::BeeWss {
-                            let _pid: PeerId = match try_from_multiaddr(&addr4.clone()) {
+                            let pid: PeerId = match try_from_multiaddr(&addr4.clone()) {
                                 Some(aok) => {
                                     let connected_peers_map = wings.connected_peers.lock().await;
                                     if connected_peers_map.contains_key(&aok) {
@@ -928,19 +1129,32 @@ impl Weeb3 {
                             };
 
                             let mut paddr5 = paddr_current.clone();
-                            {
+                            let addr40 = beewss_to_dns_transformed(&addr4);
+                            let dial_result = {
                                 let mut swarm = swarm.lock_arc().await;
-
                                 web_sys::console::log_1(&JsValue::from(format!("dial 1",)));
-                                let addr40 = beewss_to_dns_transformed(&addr4);
-                                let _ = swarm.dial(addr40.clone());
+                                swarm.dial(addr40.clone())
+                            };
+
+                            if let Err(error) = dial_result {
+                                timed_log(format!(
+                                    "Dial failed immediately peer={} address={} error={:?}",
+                                    pid, addr40, error
+                                ));
+                                let mut connection_attempts_map =
+                                    wings.connection_attempts.lock().await;
+                                connection_attempts_map.remove(&pid);
+                                return;
+                            }
+
+                            {
                                 paddr5.underlay = addr40.to_vec();
                             }
 
                             let _ = connections_instructions_chan_outgoing.try_send((
                                 paddr5.clone(),
                                 false,
-                                Date::now() as u64,
+                                *connection_generation.lock().await,
                             ));
                         }
                     });
@@ -978,6 +1192,7 @@ impl Weeb3 {
                 let swarm = self.swarm.clone();
                 let connections_instructions_chan_outgoing =
                     connections_instructions_chan_outgoing.clone();
+                let connection_generation = self.connection_generation.clone();
                 let connections = self.connections.clone();
                 let ongoing_connections = self.ongoing_connections.clone();
                 let log_port = self.log_port.0.clone();
@@ -1026,21 +1241,6 @@ impl Weeb3 {
                             }
                         }
                         SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
-                            if let Some(peer_id) = peer_id {
-                                let had_attempt = {
-                                    let mut connection_attempts_map =
-                                        wings.connection_attempts.lock().await;
-                                    connection_attempts_map.remove(&peer_id)
-                                };
-
-                                if had_attempt {
-                                    let mut ongoing = ongoing_connections.lock().await;
-                                    if *ongoing > 0 {
-                                        *ongoing -= 1;
-                                    }
-                                }
-                            }
-
                             let retry_address = match &error {
                                 libp2p::swarm::DialError::LocalPeerId { address } => {
                                     Some(address.clone())
@@ -1054,13 +1254,45 @@ impl Weeb3 {
                                 _ => None,
                             };
 
-                            if let Some(address) = retry_address {
-                                let mut bzzaddr = etiquette_2::BzzAddress::default();
-                                bzzaddr.underlay = address.to_vec();
-                                let _ = connections_instructions_chan_outgoing.try_send((
-                                    bzzaddr,
-                                    false,
-                                    Date::now() as u64,
+                            let peer_to_clear = peer_id.or_else(|| {
+                                retry_address
+                                    .as_ref()
+                                    .and_then(|address| try_from_multiaddr(address))
+                            });
+
+                            let mut should_retry = false;
+
+                            if let Some(peer_id) = peer_to_clear {
+                                let had_attempt = {
+                                    let mut connection_attempts_map =
+                                        wings.connection_attempts.lock().await;
+                                    connection_attempts_map.remove(&peer_id)
+                                };
+
+                                should_retry = had_attempt;
+
+                                if had_attempt {
+                                    let mut ongoing = ongoing_connections.lock().await;
+                                    if *ongoing > 0 {
+                                        *ongoing -= 1;
+                                    }
+                                }
+                            }
+
+                            if should_retry {
+                                if let Some(address) = retry_address {
+                                    let mut bzzaddr = etiquette_2::BzzAddress::default();
+                                    bzzaddr.underlay = address.to_vec();
+                                    let _ = connections_instructions_chan_outgoing.try_send((
+                                        bzzaddr,
+                                        false,
+                                        *connection_generation.lock().await,
+                                    ));
+                                }
+                            } else if let Some(address) = retry_address {
+                                timed_log(format!(
+                                    "Skipping retry for untracked outgoing dial error address={}",
+                                    address
                                 ));
                             }
                         }
@@ -1073,6 +1305,7 @@ impl Weeb3 {
                                     .remove(&peer_id)
                                     .map(|peer_file| hex::encode(peer_file.overlay))
                             };
+                            let was_tracked_peer = removed_overlay.is_some();
 
                             if let Some(ol0) = removed_overlay {
                                 let promoted_peer = {
@@ -1098,11 +1331,11 @@ impl Weeb3 {
                                 ));
                             }
 
-                            {
+                            let had_attempt = {
                                 let mut connection_attempts_map =
                                     wings.connection_attempts.lock().await;
-                                connection_attempts_map.remove(&peer_id);
-                            }
+                                connection_attempts_map.remove(&peer_id)
+                            };
 
                             {
                                 let mut map = wings.self_ephemerals.lock().await;
@@ -1112,13 +1345,20 @@ impl Weeb3 {
                             if let libp2p::core::ConnectedPoint::Dialer { ref address, .. } =
                                 endpoint
                             {
-                                let mut bzzaddr = etiquette_2::BzzAddress::default();
-                                bzzaddr.underlay = address.to_vec();
-                                let _ = connections_instructions_chan_outgoing.try_send((
-                                    bzzaddr,
-                                    false,
-                                    Date::now() as u64,
-                                ));
+                                if was_tracked_peer || had_attempt {
+                                    let mut bzzaddr = etiquette_2::BzzAddress::default();
+                                    bzzaddr.underlay = address.to_vec();
+                                    let _ = connections_instructions_chan_outgoing.try_send((
+                                        bzzaddr,
+                                        false,
+                                        *connection_generation.lock().await,
+                                    ));
+                                } else {
+                                    timed_log(format!(
+                                        "Skipping retry for untracked closed peer={} address={}",
+                                        peer_id, address
+                                    ));
+                                }
                             }
 
                             let mut accounting = wings.accounting_peers.lock().await;
@@ -1135,18 +1375,24 @@ impl Weeb3 {
         let swarm_event_handle_2 = async {
             loop {
                 let mut bootnode_change = match self.bootnode_port.1.recv().await {
-                    Ok(change) => change,
+                    Ok(bootnode_change) => bootnode_change,
                     Err(_) => break,
                 };
 
                 loop {
-                    let (baddr, chan, usable) = bootnode_change;
-                    let wings = wings.clone();
+                    let (baddr, chan, usable, request_generation) = bootnode_change;
                     let swarm = self.swarm.clone();
+                    let wings = wings.clone();
                     let connections_instructions_chan_outgoing =
                         connections_instructions_chan_outgoing.clone();
+                    let connection_generation = self.connection_generation.clone();
 
                     spawn_local(async move {
+                        if *connection_generation.lock().await != request_generation {
+                            let _ = chan.try_send("stale bootnode connect skipped".to_string());
+                            return;
+                        }
+
                         let addr33 = match baddr.parse::<Multiaddr>() {
                             Ok(aok) => aok,
                             _ => {
@@ -1163,56 +1409,69 @@ impl Weeb3 {
                         //         break;
                         //     }
                         // };
-                        let _pid: PeerId = match try_from_multiaddr(&addr33.clone()) {
+                        let pid: PeerId = match try_from_multiaddr(&addr33.clone()) {
                             Some(aok) => {
                                 let mut connection_attempts_map =
                                     wings.connection_attempts.lock().await;
-                                if connection_attempts_map.contains(&aok) {
-                                    return;
-                                } else {
-                                    connection_attempts_map.insert(aok);
+                                if connection_attempts_map.remove(&aok) {
+                                    timed_log(format!(
+                                        "Refreshing bootnode dial for peer {} already marked as attempting",
+                                        aok
+                                    ));
                                 }
+                                connection_attempts_map.insert(aok);
                                 aok
                             }
-                            _ => return,
+                            _ => {
+                                let _ =
+                                    chan.try_send("parse peerid for bootnode failed".to_string());
+                                return;
+                            }
                         };
+                        if *connection_generation.lock().await != request_generation {
+                            let mut connection_attempts_map =
+                                wings.connection_attempts.lock().await;
+                            connection_attempts_map.remove(&pid);
+                            let _ = chan.try_send("stale bootnode connect skipped".to_string());
+                            return;
+                        }
+                        let dial_addr = if detect_underlay_format(&addr33) == UnderlayFormat::BeeWss
                         {
+                            beewss_to_dns_transformed(&addr33)
+                        } else {
+                            addr33.clone()
+                        };
+                        let dial_result = {
                             let mut swarm = swarm.lock_arc().await;
                             web_sys::console::log_1(&JsValue::from(format!(
                                 "dial 2 :: {:#?}",
                                 addr33
                             )));
-                            if detect_underlay_format(&addr33) == UnderlayFormat::BeeWss {
-                                let addr30 = beewss_to_dns_transformed(&addr33);
-                                let _ = swarm.dial(addr30.clone());
+                            swarm.dial(dial_addr.clone())
+                        };
 
-                                let _ = chan.try_send("dialing bootnode".to_string());
-
-                                let mut bzzaddr = etiquette_2::BzzAddress::default();
-
-                                bzzaddr.underlay = addr30.to_vec();
-
-                                let _ = connections_instructions_chan_outgoing.try_send((
-                                    bzzaddr,
-                                    !usable,
-                                    Date::now() as u64,
-                                ));
-                            } else {
-                                let _ = swarm.dial(addr33.clone());
-
-                                let _ = chan.try_send("dialing bootnode".to_string());
-
-                                let mut bzzaddr = etiquette_2::BzzAddress::default();
-
-                                bzzaddr.underlay = addr33.to_vec();
-
-                                let _ = connections_instructions_chan_outgoing.try_send((
-                                    bzzaddr,
-                                    !usable,
-                                    Date::now() as u64,
-                                ));
-                            }
+                        if let Err(error) = dial_result {
+                            timed_log(format!(
+                                "Bootnode dial failed immediately peer={} address={} error={:?}",
+                                pid, dial_addr, error
+                            ));
+                            let mut connection_attempts_map =
+                                wings.connection_attempts.lock().await;
+                            connection_attempts_map.remove(&pid);
+                            let _ = chan.try_send(format!("bootnode dial failed: {:?}", error));
+                            return;
                         }
+
+                        let _ = chan.try_send("dialing bootnode".to_string());
+
+                        let mut bzzaddr = etiquette_2::BzzAddress::default();
+                        bzzaddr.underlay = dial_addr.to_vec();
+
+                        let _ = connections_instructions_chan_outgoing.try_send((
+                            bzzaddr,
+                            !usable,
+                            request_generation,
+                        ));
                     });
 
                     match self.bootnode_port.1.try_recv() {
@@ -1582,7 +1841,9 @@ impl Weeb3 {
                 let mut dispatched = 0usize;
 
                 loop {
-                    let (n, chan) = incoming_request;
+                    let request = incoming_request;
+                    let n = request.address;
+                    let chan = request.chan;
                     let data_retrieve_chan = data_retrieve_chan_outgoing.clone();
                     let chunk_retrieve_chan = chunk_retrieve_chan_outgoing.clone();
 
@@ -1595,6 +1856,150 @@ impl Weeb3 {
                     });
 
                     match self.message_port.1.try_recv() {
+                        Ok(request) => incoming_request = request,
+                        Err(_) => break,
+                    }
+                }
+
+                if dispatched > 0 {
+                    async_std::task::yield_now().await;
+                }
+            }
+        };
+
+        let resolve_bzz_handle = async {
+            loop {
+                let mut incoming_request = match self.resolve_port.1.recv().await {
+                    Ok(request) => request,
+                    Err(_) => break,
+                };
+                let mut dispatched = 0usize;
+
+                loop {
+                    let (resource, chan) = incoming_request;
+                    let data_retrieve_chan = data_retrieve_chan_outgoing.clone();
+                    let chunk_retrieve_chan = chunk_retrieve_chan_outgoing.clone();
+
+                    dispatched += 1;
+
+                    spawn_local(async move {
+                        let resolved = bzz_stream::resolve_bzz(
+                            &resource,
+                            &data_retrieve_chan,
+                            &chunk_retrieve_chan,
+                        )
+                        .await;
+                        let _ = chan.try_send(resolved);
+                    });
+
+                    match self.resolve_port.1.try_recv() {
+                        Ok(request) => incoming_request = request,
+                        Err(_) => break,
+                    }
+                }
+
+                if dispatched > 0 {
+                    async_std::task::yield_now().await;
+                }
+            }
+        };
+
+        let acquire_range_handle = async {
+            loop {
+                let mut incoming_request = match self.range_port.1.recv().await {
+                    Ok(request) => request,
+                    Err(_) => break,
+                };
+                let mut dispatched = 0usize;
+
+                loop {
+                    let request = incoming_request;
+                    let data_retrieve_chan = data_retrieve_chan_outgoing.clone();
+                    let chunk_retrieve_chan = chunk_retrieve_chan_outgoing.clone();
+                    let retrieve_cancel_generations = self.retrieve_cancel_generations.clone();
+
+                    dispatched += 1;
+
+                    spawn_local(async move {
+                        match request {
+                            BzzRangeRequest::Resource {
+                                resource,
+                                start,
+                                end_inclusive,
+                                cancel,
+                                chan,
+                            } => {
+                                register_retrieve_cancel_token(
+                                    &retrieve_cancel_generations,
+                                    &cancel,
+                                )
+                                .await;
+                                let data = if cancel.is_some() {
+                                    bzz_stream::acquire_range_cancellable(
+                                        &resource,
+                                        start,
+                                        end_inclusive,
+                                        &data_retrieve_chan,
+                                        &chunk_retrieve_chan,
+                                        cancel,
+                                        retrieve_cancel_generations,
+                                    )
+                                    .await
+                                } else {
+                                    bzz_stream::acquire_range(
+                                        &resource,
+                                        start,
+                                        end_inclusive,
+                                        &data_retrieve_chan,
+                                        &chunk_retrieve_chan,
+                                    )
+                                    .await
+                                };
+                                let _ = chan.try_send(data);
+                            }
+                            BzzRangeRequest::Resolved {
+                                metadata,
+                                start,
+                                end_inclusive,
+                                cancel,
+                                chan,
+                            } => {
+                                register_retrieve_cancel_token(
+                                    &retrieve_cancel_generations,
+                                    &cancel,
+                                )
+                                .await;
+                                let data = if cancel.is_some() {
+                                    bzz_stream::acquire_resolved_range_cancellable(
+                                        metadata,
+                                        start,
+                                        end_inclusive,
+                                        &chunk_retrieve_chan,
+                                        cancel,
+                                        Some(retrieve_cancel_generations),
+                                    )
+                                    .await
+                                } else {
+                                    bzz_stream::acquire_resolved_range(
+                                        metadata,
+                                        start,
+                                        end_inclusive,
+                                        &chunk_retrieve_chan,
+                                    )
+                                    .await
+                                };
+                                let _ = chan.try_send(data);
+                            }
+                            BzzRangeRequest::Prepare { metadata, chan } => {
+                                let prepared =
+                                    bzz_stream::prepare_bzz_stream(metadata, &chunk_retrieve_chan)
+                                        .await;
+                                let _ = chan.try_send(prepared);
+                            }
+                        }
+                    });
+
+                    match self.range_port.1.try_recv() {
                         Ok(request) => incoming_request = request,
                         Err(_) => break,
                     }
@@ -1772,17 +2177,16 @@ impl Weeb3 {
                     Ok(request) => request,
                     Err(_) => break,
                 };
-                let mut dispatched = 0;
 
                 loop {
+                    wait_transfer_unpaused(&self.transfer_paused).await;
+
                     let Some(permit) = push_sem.try_acquire_arc() else {
                         async_std::task::sleep(Duration::from_millis(PUSH_CHUNK_QUEUE_BACKOFF_MS))
                             .await;
                         let _ = chunk_upload_chan_outgoing.try_send(incoming_request);
                         break;
                     };
-
-                    dispatched += 1;
 
                     let (d, soc, checkad, stamp, feedback) = incoming_request;
 
@@ -1793,8 +2197,10 @@ impl Weeb3 {
                     let chunk_upload_chan_outgoing = chunk_upload_chan_outgoing.clone();
                     let log_port = self.log_port.0.clone();
                     let log_start_ms = self.log_start_ms;
+                    let transfer_paused = self.transfer_paused.clone();
 
                     spawn_local(async move {
+                        wait_transfer_unpaused(&transfer_paused).await;
                         let address = {
                             let _permit = permit;
                             push_chunk(
@@ -1806,17 +2212,20 @@ impl Weeb3 {
                                 &overlay_peers,
                                 &accounting_peers,
                                 &refreshment,
+                                Some(transfer_paused.clone()),
                             )
                             .await
                         };
 
                         let chunk = if address.len() > 0 {
+                            wait_transfer_unpaused(&transfer_paused).await;
                             retrieve_check_chunk(
                                 &checkad,
                                 ctrl8.clone(),
                                 &overlay_peers,
                                 &accounting_peers,
                                 &refreshment,
+                                Some(transfer_paused.clone()),
                             )
                             .await
                         } else {
@@ -1856,9 +2265,9 @@ impl Weeb3 {
                     }
                 }
 
-                if dispatched > 0 {
-                    self.interface_log(format!("Making {} pushsync requests", dispatched));
-                }
+                // if dispatched > 0 {
+                //     self.interface_log(format!("Making {} pushsync requests", dispatched));
+                // }
 
                 async_std::task::yield_now().await;
             }
@@ -1876,7 +2285,25 @@ impl Weeb3 {
                 let mut dispatched = 0usize;
 
                 loop {
-                    let (n, chan) = incoming_request;
+                    let request = incoming_request;
+                    let n = request.address;
+                    let chan = request.chan;
+                    let cancel = request.cancel;
+                    wait_transfer_unpaused(&self.transfer_paused).await;
+
+                    if !retrieve_cancel_token_current(&self.retrieve_cancel_generations, &cancel)
+                        .await
+                    {
+                        let _ = chan.try_send(vec![]);
+                        match chunk_retrieve_chan_incoming.try_recv() {
+                            Ok(request) => {
+                                incoming_request = request;
+                                continue;
+                            }
+                            Err(_) => break,
+                        }
+                    }
+
                     let sem = retrieve_sem.clone();
                     let ctrl9 = ctrl6.clone();
                     let overlay_peers = wings.overlay_peers.clone();
@@ -1884,12 +2311,23 @@ impl Weeb3 {
                     let refresh_chan = refreshment_instructions_chan_outgoing.clone();
                     let log_port = self.log_port.0.clone();
                     let log_start_ms = self.log_start_ms;
+                    let retrieve_cancel_generations = self.retrieve_cancel_generations.clone();
+                    let transfer_paused = self.transfer_paused.clone();
 
                     dispatched += 1;
 
                     spawn_local(async move {
                         let started = Date::now();
+                        wait_transfer_unpaused(&transfer_paused).await;
                         let _permit = sem.acquire().await;
+                        wait_transfer_unpaused(&transfer_paused).await;
+
+                        if !retrieve_cancel_token_current(&retrieve_cancel_generations, &cancel)
+                            .await
+                        {
+                            let _ = chan.try_send(vec![]);
+                            return;
+                        }
 
                         let chunk_data = retrieve_chunk(
                             &n,
@@ -1897,6 +2335,9 @@ impl Weeb3 {
                             &overlay_peers,
                             &accounting_peers,
                             &refresh_chan,
+                            Some(retrieve_cancel_generations),
+                            cancel,
+                            Some(transfer_paused),
                         )
                         .await;
 
@@ -1941,9 +2382,27 @@ impl Weeb3 {
                 };
 
                 loop {
-                    let (bzzaddr0, bootn, _dialat) = that;
+                    let (bzzaddr0, bootn, instruction_generation) = that;
+                    let current_generation = self.current_connection_generation().await;
+                    if instruction_generation != current_generation {
+                        timed_log(format!(
+                            "Skipping stale connection instruction generation={} current={}",
+                            instruction_generation, current_generation
+                        ));
+                        match connections_instructions_chan_incoming.try_recv() {
+                            Ok(instruction) => {
+                                that = instruction;
+                                continue;
+                            }
+                            Err(_) => break,
+                        }
+                    }
+
                     let ctrl3 = ctrl3.clone();
                     let accounting_peer_chan_outgoing = accounting_peer_chan_outgoing.clone();
+                    let connections_instructions_chan_outgoing =
+                        connections_instructions_chan_outgoing.clone();
+                    let connection_generation = self.connection_generation.clone();
                     let secret_key = self.secret_key.clone();
                     let nid: u64;
                     {
@@ -1955,6 +2414,7 @@ impl Weeb3 {
 
                     spawn_local(async move {
                         let handshake_started = Date::now();
+                        let retry_bzzaddr = bzzaddr0.clone();
                         let addr3 = match libp2p::core::Multiaddr::try_from(bzzaddr0.underlay) {
                             Ok(addr) => addr,
                             Err(_) => {
@@ -2013,6 +2473,17 @@ impl Weeb3 {
                             }
                         };
 
+                        if *connection_generation.lock().await != instruction_generation {
+                            let mut connection_attempts_map =
+                                wings.connection_attempts.lock().await;
+                            connection_attempts_map.remove(&id);
+                            timed_log(format!(
+                                "Handshake skipped stale generation peer={} generation={}",
+                                id, instruction_generation
+                            ));
+                            return;
+                        }
+
                         let success = connection_handler(
                             id,
                             nid,
@@ -2029,6 +2500,38 @@ impl Weeb3 {
                             "Handshake Joiner finished peer={} success={} elapsed_ms={}",
                             id, success, elapsed
                         ));
+
+                        if !success {
+                            {
+                                let mut connection_attempts_map =
+                                    wings.connection_attempts.lock().await;
+                                connection_attempts_map.remove(&id);
+                            }
+
+                            let already_connected = {
+                                let connected_peers_map = wings.connected_peers.lock().await;
+                                connected_peers_map.contains_key(&id)
+                            };
+
+                            if !already_connected {
+                                async_std::task::sleep(Duration::from_millis(
+                                    HANDSHAKE_RETRY_DELAY_MS,
+                                ))
+                                .await;
+                                if *connection_generation.lock().await == instruction_generation {
+                                    let _ = connections_instructions_chan_outgoing.try_send((
+                                        retry_bzzaddr,
+                                        bootn,
+                                        instruction_generation,
+                                    ));
+                                } else {
+                                    timed_log(format!(
+                                        "Handshake retry skipped stale generation peer={} generation={}",
+                                        id, instruction_generation
+                                    ));
+                                }
+                            }
+                        }
                     });
 
                     match connections_instructions_chan_incoming.try_recv() {
@@ -2049,6 +2552,8 @@ impl Weeb3 {
             cheque_instruction_handle,
             cheque_apply_handle,
             retrieve_handle,
+            resolve_bzz_handle,
+            acquire_range_handle,
             retrieve_data_handle,
             retrieve_chunk_handle,
             push_handle,
@@ -2066,6 +2571,90 @@ impl Weeb3 {
         web_sys::console::log_1(&JsValue::from(format!("Dropping All handlers")));
 
         ()
+    }
+}
+
+impl Weeb3 {
+    pub async fn resolve_bzz(&self, resource: String) -> Option<BzzMetadata> {
+        let (chan_out, chan_in) = mpsc::unbounded::<Option<BzzMetadata>>();
+        let _ = self.resolve_port.0.try_send((resource, chan_out));
+
+        chan_in.recv().await.unwrap_or(None)
+    }
+
+    pub async fn acquire_range(
+        &self,
+        resource: String,
+        start: u64,
+        end_inclusive: u64,
+    ) -> Option<(Vec<u8>, BzzMetadata)> {
+        let (chan_out, chan_in) = mpsc::unbounded::<Option<(Vec<u8>, BzzMetadata)>>();
+        let _ = self.range_port.0.try_send(BzzRangeRequest::Resource {
+            resource,
+            start,
+            end_inclusive,
+            cancel: None,
+            chan: chan_out,
+        });
+
+        chan_in.recv().await.unwrap_or(None)
+    }
+
+    pub async fn acquire_resolved_range(
+        &self,
+        metadata: BzzMetadata,
+        start: u64,
+        end_inclusive: u64,
+    ) -> Option<(Vec<u8>, BzzMetadata)> {
+        let (chan_out, chan_in) = mpsc::unbounded::<Option<(Vec<u8>, BzzMetadata)>>();
+        let _ = self.range_port.0.try_send(BzzRangeRequest::Resolved {
+            metadata,
+            start,
+            end_inclusive,
+            cancel: None,
+            chan: chan_out,
+        });
+
+        chan_in.recv().await.unwrap_or(None)
+    }
+
+    pub async fn acquire_resolved_stream_range(
+        &self,
+        metadata: BzzMetadata,
+        start: u64,
+        end_inclusive: u64,
+        stream_key: String,
+        stream_generation: u64,
+    ) -> Option<(Vec<u8>, BzzMetadata)> {
+        let (chan_out, chan_in) = mpsc::unbounded::<Option<(Vec<u8>, BzzMetadata)>>();
+        let cancel = if stream_key.is_empty() || stream_generation == 0 {
+            None
+        } else {
+            Some(RetrieveCancelToken {
+                stream_key,
+                generation: stream_generation,
+            })
+        };
+
+        let _ = self.range_port.0.try_send(BzzRangeRequest::Resolved {
+            metadata,
+            start,
+            end_inclusive,
+            cancel,
+            chan: chan_out,
+        });
+
+        chan_in.recv().await.unwrap_or(None)
+    }
+
+    pub async fn prepare_bzz_stream(&self, metadata: BzzMetadata) -> bool {
+        let (chan_out, chan_in) = mpsc::unbounded::<bool>();
+        let _ = self.range_port.0.try_send(BzzRangeRequest::Prepare {
+            metadata,
+            chan: chan_out,
+        });
+
+        chan_in.recv().await.unwrap_or(false)
     }
 }
 

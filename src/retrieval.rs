@@ -1,5 +1,7 @@
 use crate::{
     // // // // // // // //
+    ChunkRetrieveSender,
+    // // // // // // // //
     Date,
     // // // // // // // //
     Duration,
@@ -18,9 +20,15 @@ use crate::{
     // // // // // // // //
     RETRIEVE_CHECK_CONFIRMATION_PEERS,
     // // // // // // // //
+    RetrieveCancelToken,
+    // // // // // // // //
+    RetrieveGenerationMap,
+    // // // // // // // //
     apply_credit,
     // // // // // // // //
     cancel_reserve,
+    // // // // // // // //
+    chunk_retrieve_request,
     // // // // // // // //
     encode_resources,
     // // // // // // // //
@@ -38,9 +46,13 @@ use crate::{
     // // // // // // // //
     reserve,
     // // // // // // // //
+    retrieve_cancel_token_current,
+    // // // // // // // //
     retrieve_handler,
     // // // // // // // //
     stream,
+    // // // // // // // //
+    transfer_pause_enabled,
     // // // // // // // //
     valid_cac,
     // // // // // // // //
@@ -51,13 +63,12 @@ use crate::{
 use alloy::primitives::keccak256;
 use async_std::sync::Arc;
 use byteorder::ByteOrder;
-use std::{collections::BTreeMap, future::Future, pin::Pin};
+use std::{collections::BTreeMap, future::Future, pin::Pin, sync::atomic::AtomicBool};
 
 const RETRIEVE_PEER_TIMEOUT_SECS: u64 = 10;
 const RETRIEVE_HEDGE_AFTER_MS: u64 = 760;
 const RETRIEVE_DATA_DISPATCH_YIELD_EVERY: usize = 128;
 const RETRIEVE_CHECK_RETRY_WAIT_MS: u64 = 160;
-const RETRIEVE_LOOP_IDLE_WAIT_MS: u64 = 25;
 
 struct RetrieveAttemptResult {
     peer: PeerId,
@@ -74,11 +85,11 @@ type RetrieveJoiner =
 fn queue_chunk_retrieve(
     order: Vec<usize>,
     addr: Vec<u8>,
-    chunk_retrieve_chan: &mpsc::Sender<(Vec<u8>, mpsc::Sender<Vec<u8>>)>,
+    chunk_retrieve_chan: &ChunkRetrieveSender,
     joiner: &mut RetrieveJoiner,
 ) {
     let (chan_out, chan_in) = mpsc::unbounded::<Vec<u8>>();
-    let _ = chunk_retrieve_chan.try_send((addr.clone(), chan_out));
+    let _ = chunk_retrieve_chan.try_send(chunk_retrieve_request(addr.clone(), chan_out));
 
     joiner.push(Box::pin(async move {
         let chunk = chan_in.recv().await.unwrap_or_default();
@@ -93,7 +104,7 @@ fn should_yield_after_chunk_dispatch(dispatched: usize) -> bool {
 pub async fn retrieve_resource(
     chunk_address: &Vec<u8>,
     data_retrieve_chan: &mpsc::Sender<(Vec<u8>, mpsc::Sender<Vec<u8>>)>,
-    chunk_retrieve_chan: &mpsc::Sender<(Vec<u8>, mpsc::Sender<Vec<u8>>)>,
+    chunk_retrieve_chan: &ChunkRetrieveSender,
 ) -> Vec<u8> {
     let cd = get_data(chunk_address.to_vec(), &data_retrieve_chan).await;
 
@@ -140,7 +151,7 @@ pub async fn retrieve_resource(
     return encode_resources(data_vector_e, index);
 }
 
-fn split_chunk_references(data: &[u8], address_length: usize) -> Option<Vec<Vec<u8>>> {
+pub(crate) fn split_chunk_references(data: &[u8], address_length: usize) -> Option<Vec<Vec<u8>>> {
     if address_length == 0 || data.len() % address_length != 0 {
         return None;
     }
@@ -347,7 +358,7 @@ fn decode_retrieved_chunk(
 
 pub async fn retrieve_data(
     data_address: &Vec<u8>,
-    chunk_retrieve_chan: &mpsc::Sender<(Vec<u8>, mpsc::Sender<Vec<u8>>)>,
+    chunk_retrieve_chan: &ChunkRetrieveSender,
 ) -> Vec<u8> {
     let root_chunk = get_chunk(data_address.to_vec(), &chunk_retrieve_chan).await;
 
@@ -463,6 +474,9 @@ pub async fn retrieve_chunk(
     peers: &Arc<Mutex<HashMap<String, PeerId>>>,
     accounting: &Arc<Mutex<HashMap<PeerId, Arc<Mutex<PeerAccounting>>>>>,
     refresh_chan: &mpsc::Sender<(PeerId, u64)>,
+    cancel_generations: Option<RetrieveGenerationMap>,
+    cancel: Option<RetrieveCancelToken>,
+    transfer_paused: Option<Arc<AtomicBool>>,
 ) -> Vec<u8> {
     let (caddr, encrey, encred) = chunk_address_parts(chunk_address);
 
@@ -506,8 +520,29 @@ pub async fn retrieve_chunk(
             }
         }
 
+        let paused = transfer_paused
+            .as_ref()
+            .map(transfer_pause_enabled)
+            .unwrap_or(false);
+        let cancelled = if let Some(cancel_generations) = &cancel_generations {
+            !retrieve_cancel_token_current(cancel_generations, &cancel).await
+        } else {
+            false
+        };
+
+        if cancelled && in_flight == 0 {
+            break;
+        }
+
+        if paused && in_flight == 0 {
+            async_std::task::sleep(Duration::from_millis(100)).await;
+            continue;
+        }
+
         let now = Date::now();
-        let due = in_flight == 0 || now - last_attempt_started >= RETRIEVE_HEDGE_AFTER_MS as f64;
+        let due = !paused
+            && !cancelled
+            && (in_flight == 0 || now - last_attempt_started >= RETRIEVE_HEDGE_AFTER_MS as f64);
 
         if due {
             reset_overdraft(&mut skiplist, &mut overdraftlist);
@@ -515,6 +550,41 @@ pub async fn retrieve_chunk(
                 select_retrieve_peer(&caddr, peers, accounting, &mut skiplist, &mut overdraftlist)
                     .await
             {
+                let cancelled_after_select = if let Some(cancel_generations) = &cancel_generations {
+                    !retrieve_cancel_token_current(cancel_generations, &cancel).await
+                } else {
+                    false
+                };
+
+                if cancelled_after_select {
+                    let accounting_peer = {
+                        let accounting_peers = accounting.lock().await;
+                        accounting_peers.get(&selected.0).cloned()
+                    };
+                    if let Some(accounting_peer) = accounting_peer {
+                        cancel_reserve(&accounting_peer, selected.1).await;
+                    }
+                    if in_flight == 0 {
+                        break;
+                    }
+                    continue;
+                }
+
+                if transfer_paused
+                    .as_ref()
+                    .map(transfer_pause_enabled)
+                    .unwrap_or(false)
+                {
+                    let accounting_peer = {
+                        let accounting_peers = accounting.lock().await;
+                        accounting_peers.get(&selected.0).cloned()
+                    };
+                    if let Some(accounting_peer) = accounting_peer {
+                        cancel_reserve(&accounting_peer, selected.1).await;
+                    }
+                    continue;
+                }
+
                 let control = control.clone();
                 let accounting = accounting.clone();
                 let refresh_chan = refresh_chan.clone();
@@ -548,7 +618,11 @@ pub async fn retrieve_chunk(
         }
 
         let elapsed = Date::now() - last_attempt_started;
-        let wait_ms = (RETRIEVE_HEDGE_AFTER_MS as f64 - elapsed).max(0.0).round() as u64;
+        let wait_ms = if cancelled || paused {
+            250
+        } else {
+            (RETRIEVE_HEDGE_AFTER_MS as f64 - elapsed).max(0.0).round() as u64
+        };
         if wait_ms == 0 {
             continue;
         }
@@ -578,6 +652,7 @@ pub async fn retrieve_check_chunk(
     peers: &Arc<Mutex<HashMap<String, PeerId>>>,
     accounting: &Arc<Mutex<HashMap<PeerId, Arc<Mutex<PeerAccounting>>>>>,
     refresh_chan: &mpsc::Sender<(PeerId, u64)>,
+    transfer_paused: Option<Arc<AtomicBool>>,
 ) -> Vec<u8> {
     let (caddr, encrey, encred) = chunk_address_parts(chunk_address);
 
@@ -593,6 +668,14 @@ pub async fn retrieve_check_chunk(
     let mut soc = false;
 
     while error_count < max_error && success_peers.len() < RETRIEVE_CHECK_CONFIRMATION_PEERS {
+        while transfer_paused
+            .as_ref()
+            .map(transfer_pause_enabled)
+            .unwrap_or(false)
+        {
+            async_std::task::sleep(Duration::from_millis(100)).await;
+        }
+
         let Some(selected) =
             select_retrieve_peer(&caddr, peers, accounting, &mut skiplist, &mut overdraftlist)
                 .await
@@ -604,6 +687,21 @@ pub async fn retrieve_check_chunk(
             async_std::task::sleep(Duration::from_millis(RETRIEVE_CHECK_RETRY_WAIT_MS)).await;
             continue;
         };
+
+        if transfer_paused
+            .as_ref()
+            .map(transfer_pause_enabled)
+            .unwrap_or(false)
+        {
+            let accounting_peer = {
+                let accounting_peers = accounting.lock().await;
+                accounting_peers.get(&selected.0).cloned()
+            };
+            if let Some(accounting_peer) = accounting_peer {
+                cancel_reserve(&accounting_peer, selected.1).await;
+            }
+            continue;
+        }
 
         let (attempt_out, attempt_in) = mpsc::unbounded::<RetrieveAttemptResult>();
         retrieve_attempt(
@@ -737,10 +835,10 @@ pub async fn get_data(
 
 pub async fn get_chunk(
     data_address: Vec<u8>,
-    chunk_retrieve_chan: &mpsc::Sender<(Vec<u8>, mpsc::Sender<Vec<u8>>)>,
+    chunk_retrieve_chan: &ChunkRetrieveSender,
 ) -> Vec<u8> {
     let (chan_out, chan_in) = mpsc::unbounded::<Vec<u8>>();
-    let _ = chunk_retrieve_chan.try_send((data_address, chan_out));
+    let _ = chunk_retrieve_chan.try_send(chunk_retrieve_request(data_address, chan_out));
 
     return chan_in.recv().await.unwrap_or_default();
 }
@@ -748,7 +846,7 @@ pub async fn get_chunk(
 pub async fn seek_latest_feed_update(
     owner: String,
     topic: String,
-    chunk_retrieve_chan: &mpsc::Sender<(Vec<u8>, mpsc::Sender<Vec<u8>>)>,
+    chunk_retrieve_chan: &ChunkRetrieveSender,
     redundancy: u8,
 ) -> Vec<u8> {
     let mut largest_found = 0;
@@ -838,7 +936,7 @@ pub async fn seek_latest_feed_update(
 pub async fn seek_next_feed_update_index(
     owner: String,
     topic: String,
-    chunk_retrieve_chan: &mpsc::Sender<(Vec<u8>, mpsc::Sender<Vec<u8>>)>,
+    chunk_retrieve_chan: &ChunkRetrieveSender,
     redundancy: u8,
 ) -> u64 {
     let mut largest_found = 0;

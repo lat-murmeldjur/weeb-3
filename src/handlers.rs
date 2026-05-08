@@ -1053,7 +1053,7 @@ pub async fn sync(
 
     let rec_0_u = etiquette_7::Receipt::decode_length_delimited(&mut Cursor::new(buf_nondiscard_0));
 
-    let _rec_0 = match rec_0_u {
+    let rec_0 = match rec_0_u {
         Ok(x) => x,
         Err(x) => {
             web_sys::console::log_1(&JsValue::from(format!("Error in protocol {:#?}!", x)));
@@ -1062,12 +1062,43 @@ pub async fn sync(
         }
     };
 
-    //    web_sys::console::log_1(&JsValue::from(format!(
-    //        "Got receipt {:#?} with err {} from peer {}!",
-    //        hex::encode(&rec_0.address),
-    //        rec_0.err,
-    //        _peer
-    //    )));
+    if !rec_0.err.is_empty() {
+        web_sys::console::log_1(&JsValue::from(format!(
+            "Pushsync rejected chunk {} from peer {}: {}",
+            hex::encode(chunk_address),
+            _peer,
+            rec_0.err,
+        )));
+        chan.try_send(false).unwrap();
+        return;
+    }
 
+    if rec_0.address.as_slice() != chunk_address.as_slice() {
+        web_sys::console::log_1(&JsValue::from(format!(
+            "Pushsync receipt address mismatch for peer {}: expected {}, got {}",
+            _peer,
+            hex::encode(chunk_address),
+            hex::encode(&rec_0.address),
+        )));
+        chan.try_send(false).unwrap();
+        return;
+    }
+
+    if rec_0.signature.is_empty() {
+        web_sys::console::log_1(&JsValue::from(format!(
+            "Pushsync receipt missing signature for chunk {} from peer {}",
+            hex::encode(chunk_address),
+            _peer,
+        )));
+        chan.try_send(false).unwrap();
+        return;
+    }
+
+    web_sys::console::log_1(&JsValue::from(format!(
+        "Pushsync accepted chunk {} from peer {} storage_radius {}",
+        hex::encode(chunk_address),
+        _peer,
+        rec_0.storage_radius,
+    )));
     chan.try_send(true).unwrap();
 }

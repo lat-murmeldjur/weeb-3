@@ -1,5 +1,7 @@
 use crate::{
     //                                                                        //
+    ChunkRetrieveSender,
+    //                                                                        //
     Date,
     //                                                                        //
     Duration,
@@ -46,6 +48,8 @@ use crate::{
     //                                                                        //
     stream,
     //                                                                        //
+    transfer_pause_enabled,
+    //                                                                        //
 };
 
 use byteorder::ByteOrder;
@@ -60,8 +64,12 @@ use serde_json::json;
 
 use wasm_bindgen::JsCast;
 
+use std::{collections::VecDeque, sync::atomic::AtomicBool};
+
 const BATCH_BUCKET_TRIALS: usize = 1024;
 const PUSH_CHUNK_ATTEMPT_RETRY_WAIT_MS: u64 = 50;
+const PUSH_CHUNK_QUEUE_WINDOW: usize = 1280;
+const PUSH_CHUNK_QUEUE_REFILL: usize = PUSH_CHUNK_QUEUE_WINDOW / 2;
 
 fn reset_push_overdraft(skiplist: &mut HashSet<PeerId>, overdraftlist: &mut HashSet<PeerId>) {
     for peer in overdraftlist.drain() {
@@ -69,8 +77,26 @@ fn reset_push_overdraft(skiplist: &mut HashSet<PeerId>, overdraftlist: &mut Hash
     }
 }
 
-async fn wait_for_chunk_pushes(receipts: Vec<mpsc::Receiver<bool>>) -> bool {
-    for receipt in receipts {
+async fn wait_for_chunk_pushes(mut receipts: VecDeque<mpsc::Receiver<bool>>) -> bool {
+    while let Some(receipt) = receipts.pop_front() {
+        match receipt.recv().await {
+            Ok(true) => {}
+            _ => return false,
+        }
+    }
+
+    true
+}
+
+async fn wait_for_chunk_push_window(
+    receipts: &mut VecDeque<mpsc::Receiver<bool>>,
+    count: usize,
+) -> bool {
+    for _ in 0..count.min(receipts.len()) {
+        let Some(receipt) = receipts.pop_front() else {
+            break;
+        };
+
         match receipt.recv().await {
             Ok(true) => {}
             _ => return false,
@@ -99,7 +125,7 @@ pub async fn stamp_chunk(
     let (h, index0) = bump_bucket(hex::encode(&batch_id).to_string(), bucket.to_string()).await;
     index = index0;
 
-    if index > batch_bucket_limit {
+    if index >= batch_bucket_limit {
         return (vec![], true);
     };
 
@@ -153,7 +179,7 @@ pub async fn upload_resource(
     batch_id: Vec<u8>,
     data_upload_chan: &mpsc::Sender<(Vec<Vec<u8>>, u8, Vec<u8>, Vec<u8>, mpsc::Sender<Vec<u8>>)>,
     chunk_upload_chan: &mpsc::Sender<(Vec<u8>, bool, Vec<u8>, Vec<u8>, mpsc::Sender<bool>)>,
-    chunk_retrieve_chan: &mpsc::Sender<(Vec<u8>, mpsc::Sender<Vec<u8>>)>,
+    chunk_retrieve_chan: &ChunkRetrieveSender,
 ) -> Vec<u8> {
     //
     let mut node0: Vec<Node> = vec![];
@@ -170,6 +196,14 @@ pub async fn upload_resource(
             &data_upload_chan,
         )
         .await;
+
+        if core_reference.is_empty() {
+            render_log_message(&format!(
+                "Upload failed for {}; refusing to create manifest with empty data reference",
+                r0.path0
+            ));
+            return vec![];
+        }
 
         if r0.path0.len() == 0 {
             r0.path0 = hex::encode(&core_reference);
@@ -220,6 +254,11 @@ pub async fn upload_resource(
         &data_upload_chan,
     )
     .await;
+
+    if manifest_reference.is_empty() {
+        render_log_message(&"Manifest upload failed".to_string());
+        return vec![];
+    }
 
     if !feed {
         return manifest_reference;
@@ -501,7 +540,8 @@ pub async fn push_data(
         let next_level = true;
         let mut span_carriage = 4096;
 
-        let mut chunk_receipts: Vec<mpsc::Receiver<bool>> = vec![];
+        let mut chunk_receipts: VecDeque<mpsc::Receiver<bool>> = VecDeque::new();
+        let mut count_yield = 0;
 
         while next_level {
             let mut sc = 0;
@@ -514,15 +554,7 @@ pub async fn push_data(
                 }
                 let chunk_l0c = level_data.len() / 4096 + chunk_l0r;
 
-                let mut count_yield = 0;
-
                 for i in 0..chunk_l0c {
-                    count_yield += 1;
-                    if count_yield > 1024 {
-                        async_std::task::yield_now().await;
-                        count_yield = 0;
-                    }
-
                     let data_start = i * 4096 as usize;
                     let mut data_end = (i + 1) * 4096 as usize;
                     if data_end > level_data.len() {
@@ -624,7 +656,22 @@ pub async fn push_data(
                         {
                             return vec![];
                         }
-                        chunk_receipts.push(result_chan_in);
+                        chunk_receipts.push_back(result_chan_in);
+                        count_yield += 1;
+
+                        if count_yield >= PUSH_CHUNK_QUEUE_WINDOW {
+                            if !wait_for_chunk_push_window(
+                                &mut chunk_receipts,
+                                PUSH_CHUNK_QUEUE_REFILL,
+                            )
+                            .await
+                            {
+                                return vec![];
+                            }
+
+                            count_yield = chunk_receipts.len();
+                            async_std::task::yield_now().await;
+                        }
                     }
                 }
             }
@@ -660,6 +707,7 @@ pub async fn push_chunk(
     peers: &Mutex<HashMap<String, PeerId>>,
     accounting: &Mutex<HashMap<PeerId, Arc<Mutex<PeerAccounting>>>>,
     refresh_chan: &mpsc::Sender<(PeerId, u64)>,
+    transfer_paused: Option<Arc<AtomicBool>>,
 ) -> Vec<u8> {
     if (data.len() > 4104 && !soc) || (data.len() > 4201) {
         return vec![];
@@ -688,6 +736,14 @@ pub async fn push_chunk(
     let max_error = 19;
 
     while error_count < max_error && success_count < PUSH_CHUNK_CONFIRMATION_PEERS {
+        while transfer_paused
+            .as_ref()
+            .map(transfer_pause_enabled)
+            .unwrap_or(false)
+        {
+            async_std::task::sleep(Duration::from_millis(100)).await;
+        }
+
         let mut seer = true;
 
         while seer {
@@ -768,6 +824,21 @@ pub async fn push_chunk(
         let req_price = price(&closest_overlay, &caddr);
 
         let (chunk_out, chunk_in) = mpsc::unbounded::<bool>();
+
+        if transfer_paused
+            .as_ref()
+            .map(transfer_pause_enabled)
+            .unwrap_or(false)
+        {
+            let accounting_peer = {
+                let accounting_peers = accounting.lock().await;
+                accounting_peers.get(&closest_peer_id).cloned()
+            };
+            if let Some(accounting_peer) = accounting_peer {
+                cancel_reserve(&accounting_peer, req_price).await;
+            }
+            continue;
+        }
 
         let _ = async_std::future::timeout(
             Duration::from_secs(15),

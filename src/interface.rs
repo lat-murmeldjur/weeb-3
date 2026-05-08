@@ -25,7 +25,9 @@ use web_sys::{
 };
 
 use crate::{
-    Weeb3, decode_resources, encrey, join, join_all,
+    Weeb3,
+    bzz_stream::{BzzMetadata, parse_bzz_resource},
+    decode_resources, encrey, join, join_all,
     nav::{clear_path, read_path},
     on_chain::{
         buy_postage_batch_with_payer, chequebook_balance, deploy_chequebook_with_payer,
@@ -62,6 +64,7 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
     let weeb37 = weeb3.clone();
     let weeb38 = weeb3.clone();
     let weeb39 = weeb3.clone();
+    let weeb40 = weeb3.clone();
 
     spawn_local(async move {
         let weeb310 = weeb39.clone();
@@ -124,9 +127,7 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
                     "Loading /bzz/ reference from path {:#?}",
                     reference
                 )));
-                let result = weeb300.acquire(reference).await;
-                let (data, indx) = decode_resources(result);
-                render_result(data, indx).await;
+                open_bzz_resource(weeb300, reference).await;
             };
             handles.push(handle);
         }
@@ -168,11 +169,7 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
                     Ok(text) => spawn_local(async move {
                         web_sys::console::log_1(&"oninput callback string".into());
 
-                        let result = weeb300.acquire(text).await;
-
-                        let (data, indx) = decode_resources(result);
-
-                        render_result(data, indx).await;
+                        open_bzz_resource(weeb300, text).await;
                     }),
                     Err(_) => {
                         document
@@ -194,6 +191,29 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
             .dyn_ref::<HtmlInputElement>()
             .expect("#inputString should be a HtmlInputElement")
             .set_oninput(Some(callback.as_ref().unchecked_ref()));
+
+        update_transfer_pause_button(weeb40.transfer_paused());
+
+        let callback_pause =
+            wasm_bindgen::closure::Closure::<dyn FnMut(web_sys::MessageEvent)>::new(move |_msg| {
+                web_sys::console::log_1(&"transferPauseToggle callback triggered".into());
+                let weeb300 = weeb40.clone();
+
+                spawn_local(async move {
+                    let paused = weeb300.toggle_transfer_pause().await;
+                    update_transfer_pause_button(paused);
+                });
+            });
+
+        web_sys::window()
+            .unwrap()
+            .document()
+            .unwrap()
+            .get_element_by_id("transferPauseToggle")
+            .expect("#transferPauseToggle should exist")
+            .dyn_ref::<HtmlButtonElement>()
+            .expect("#transferPauseToggle should be a HtmlButtonElement")
+            .set_onclick(Some(callback_pause.as_ref().unchecked_ref()));
 
         let callback2 = wasm_bindgen::closure::Closure::<dyn FnMut(web_sys::MessageEvent)>::new(
             move |_msg| {
@@ -407,7 +427,7 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
 
                     let wnd = web_sys::window().unwrap();
                     let _ = wnd.alert_with_message(
-                "Could not initialize wallet connection. Try again or open in MetaMask in‑app browser."
+                "Could not initialize wallet connection. Try again or open in MetaMask in-app browser."
             );
                 });
             },
@@ -1059,6 +1079,15 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
                 )));
                 let ty =
                     js_sys::Reflect::get(&obj, &JsValue::from_str("type")).unwrap_or(JsValue::NULL);
+
+                if crate::streaming_player::handle_service_worker_message(
+                    &obj,
+                    &event,
+                    weeb37.clone(),
+                ) {
+                    return;
+                }
+
                 if ty == JsValue::from_str("RETRIEVE_REQUEST") {
                     let url = js_sys::Reflect::get(&obj, &JsValue::from_str("url"))
                         .unwrap_or(JsValue::NULL);
@@ -1358,6 +1387,103 @@ async fn connect_bootnode_setting(weeb3: Arc<Weeb3>, element_id: &'static str) {
     let _ = weeb3.change_bootnode_address(bna, nid, true).await;
 }
 
+async fn open_bzz_resource(weeb3: Arc<Weeb3>, resource: String) {
+    let stream_files = stream_files_when_available();
+    let has_requested_path = has_bzz_resource_path(&resource);
+
+    if stream_files || has_requested_path {
+        if let Some(metadata) = weeb3.resolve_bzz(resource.clone()).await {
+            if stream_files {
+                if crate::streaming_player::try_render_streaming_player(
+                    resource.clone(),
+                    metadata.clone(),
+                )
+                .await
+                {
+                    return;
+                }
+            }
+
+            if should_render_resolved_asset(has_requested_path, &metadata) {
+                if render_resolved_asset(weeb3.clone(), metadata).await {
+                    return;
+                }
+            }
+        }
+    }
+
+    let result = weeb3.acquire(resource).await;
+    let (data, indx) = decode_resources(result);
+    render_result(data, indx).await;
+}
+
+fn has_bzz_resource_path(resource: &str) -> bool {
+    parse_bzz_resource(resource)
+        .map(|resource| !resource.path.is_empty())
+        .unwrap_or(false)
+}
+
+fn should_render_resolved_asset(has_requested_path: bool, metadata: &BzzMetadata) -> bool {
+    has_requested_path || metadata.target_count == 1
+}
+
+async fn render_resolved_asset(weeb3: Arc<Weeb3>, metadata: BzzMetadata) -> bool {
+    if metadata.size == 0 {
+        render_result(
+            vec![(vec![], metadata.mime.clone(), metadata.path.clone())],
+            metadata.path,
+        )
+        .await;
+        return true;
+    }
+
+    if let Some((bytes, metadata)) = weeb3
+        .acquire_resolved_range(metadata.clone(), 0, metadata.size - 1)
+        .await
+    {
+        render_result(
+            vec![(bytes, metadata.mime.clone(), metadata.path.clone())],
+            metadata.path,
+        )
+        .await;
+        return true;
+    }
+
+    false
+}
+
+fn stream_files_when_available() -> bool {
+    let document = web_sys::window().unwrap().document().unwrap();
+
+    let stream_setting = match document.get_element_by_id("streamFilesWhenAvailable") {
+        Some(stream_setting) => stream_setting,
+        None => return true,
+    };
+
+    match stream_setting.dyn_ref::<HtmlInputElement>() {
+        Some(stream_setting) => stream_setting.checked(),
+        None => true,
+    }
+}
+
+fn update_transfer_pause_button(paused: bool) {
+    let document = web_sys::window().unwrap().document().unwrap();
+    let button = match document.get_element_by_id("transferPauseToggle") {
+        Some(button) => button,
+        None => return,
+    };
+
+    let button = button
+        .dyn_ref::<HtmlButtonElement>()
+        .expect("#transferPauseToggle should be a HtmlButtonElement");
+
+    if paused {
+        button.set_inner_text("... Resume retrieve / push ...");
+    } else {
+        button.set_inner_text("... Pause retrieve / push ...");
+    }
+}
+
 fn create_element_wmt(tmype: String, blob_url: String) -> Element {
     let document = web_sys::window().unwrap().document().unwrap();
     if tmype == "undefined" {
@@ -1385,7 +1511,7 @@ fn create_ielement(indx: String) -> Element {
     return i;
 }
 
-fn service_worker_missing() {
+pub(crate) fn service_worker_missing() {
     let document = web_sys::window().unwrap().document().unwrap();
     let errod = document.create_element("div").unwrap();
     errod.set_inner_html("Service worker required and not found. Loading websites from swarm requires accessing weeb-3 via https through secure certificate.");

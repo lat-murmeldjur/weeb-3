@@ -1,4 +1,4 @@
-use crate::mpsc;
+use crate::{ChunkRetrieveSender, mpsc};
 
 use crate::{
     //
@@ -46,7 +46,7 @@ async fn load_manifest_fork(
     ref_size: u8,
     fork: ManifestFork,
     data_retrieve_chan: &mpsc::Sender<(Vec<u8>, mpsc::Sender<Vec<u8>>)>,
-    chunk_retrieve_chan: &mpsc::Sender<(Vec<u8>, mpsc::Sender<Vec<u8>>)>,
+    chunk_retrieve_chan: &ChunkRetrieveSender,
 ) -> ManifestForkResult {
     let mut result = ManifestForkResult {
         parts: vec![],
@@ -235,7 +235,7 @@ pub async fn interpret_manifest(
     path_prefix_heritance: String,
     cd0: &Vec<u8>,
     data_retrieve_chan: &mpsc::Sender<(Vec<u8>, mpsc::Sender<Vec<u8>>)>,
-    chunk_retrieve_chan: &mpsc::Sender<(Vec<u8>, mpsc::Sender<Vec<u8>>)>,
+    chunk_retrieve_chan: &ChunkRetrieveSender,
 ) -> (Vec<Fork>, String) {
     let mut ind: String = "".to_string();
     let mut ind_set = false;
