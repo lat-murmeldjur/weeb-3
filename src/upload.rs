@@ -68,8 +68,13 @@ use std::{collections::VecDeque, sync::atomic::AtomicBool};
 
 const BATCH_BUCKET_TRIALS: usize = 1024;
 const PUSH_CHUNK_ATTEMPT_RETRY_WAIT_MS: u64 = 50;
+const PUSH_CHUNK_ATTEMPT_SOFT_TIMEOUT_MS: u64 = 15000;
 const PUSH_CHUNK_QUEUE_WINDOW: usize = 1280;
 const PUSH_CHUNK_QUEUE_REFILL: usize = PUSH_CHUNK_QUEUE_WINDOW / 2;
+
+struct PushAttemptResult {
+    success: bool,
+}
 
 fn reset_push_overdraft(skiplist: &mut HashSet<PeerId>, overdraftlist: &mut HashSet<PeerId>) {
     for peer in overdraftlist.drain() {
@@ -104,6 +109,40 @@ async fn wait_for_chunk_push_window(
     }
 
     true
+}
+
+async fn pushsync_attempt(
+    peer: PeerId,
+    req_price: u64,
+    caddr: Vec<u8>,
+    data: Vec<u8>,
+    cstamp0: Vec<u8>,
+    control: stream::Control,
+    accounting: Arc<Mutex<HashMap<PeerId, Arc<Mutex<PeerAccounting>>>>>,
+    refresh_chan: mpsc::Sender<(PeerId, u64)>,
+    result_chan: mpsc::Sender<PushAttemptResult>,
+) {
+    let (chunk_out, chunk_in) = mpsc::unbounded::<bool>();
+
+    // This task owns the protocol exchange and accounting even if push_chunk
+    // starts trying another peer while this one is still waiting for a receipt.
+    pushsync_handler(peer.clone(), &caddr, &data, &cstamp0, control, &chunk_out).await;
+
+    let success = matches!(chunk_in.try_recv(), Ok(true));
+    let accounting_peer = {
+        let accounting_peers = accounting.lock().await;
+        accounting_peers.get(&peer).cloned()
+    };
+
+    if let Some(accounting_peer) = accounting_peer {
+        if success {
+            apply_credit(&accounting_peer, req_price, &refresh_chan).await;
+        } else {
+            cancel_reserve(&accounting_peer, req_price).await;
+        }
+    }
+
+    let _ = result_chan.try_send(PushAttemptResult { success });
 }
 
 pub async fn stamp_chunk(
@@ -704,8 +743,8 @@ pub async fn push_chunk(
     soc_address: Vec<u8>,
     cstamp0: Vec<u8>,
     control: stream::Control,
-    peers: &Mutex<HashMap<String, PeerId>>,
-    accounting: &Mutex<HashMap<PeerId, Arc<Mutex<PeerAccounting>>>>,
+    peers: &Arc<Mutex<HashMap<String, PeerId>>>,
+    accounting: &Arc<Mutex<HashMap<PeerId, Arc<Mutex<PeerAccounting>>>>>,
     refresh_chan: &mpsc::Sender<(PeerId, u64)>,
     transfer_paused: Option<Arc<AtomicBool>>,
 ) -> Vec<u8> {
@@ -721,21 +760,15 @@ pub async fn push_chunk(
     let mut skiplist: HashSet<PeerId> = HashSet::new();
     let mut overdraftlist: HashSet<PeerId> = HashSet::new();
     let mut success_count = 0usize;
-
-    let mut closest_overlay = "".to_string();
-    let mut closest_peer_id = libp2p::PeerId::random();
-
-    #[allow(unused_assignments)]
-    let mut selected = false;
     let mut round_commence = Date::now();
-
-    #[allow(unused_assignments)]
-    let mut current_max_po = 0;
-
     let mut error_count = 0;
     let max_error = 19;
+    let mut attempts_started = 0usize;
+    let mut in_flight = 0usize;
+    let mut last_attempt_started = 0.0;
+    let (attempt_out, attempt_in) = mpsc::unbounded::<PushAttemptResult>();
 
-    while error_count < max_error && success_count < PUSH_CHUNK_CONFIRMATION_PEERS {
+    while attempts_started < max_error && success_count < PUSH_CHUNK_CONFIRMATION_PEERS {
         while transfer_paused
             .as_ref()
             .map(transfer_pause_enabled)
@@ -744,13 +777,52 @@ pub async fn push_chunk(
             async_std::task::sleep(Duration::from_millis(100)).await;
         }
 
-        let mut seer = true;
+        while let Ok(result) = attempt_in.try_recv() {
+            in_flight = in_flight.saturating_sub(1);
+            if result.success {
+                success_count += 1;
+            } else {
+                error_count += 1;
+            }
+        }
 
-        while seer {
-            closest_overlay = "".to_string();
-            closest_peer_id = libp2p::PeerId::random();
-            current_max_po = 0;
-            selected = false;
+        if error_count >= max_error || success_count >= PUSH_CHUNK_CONFIRMATION_PEERS {
+            break;
+        }
+
+        let now = Date::now();
+        let due = in_flight == 0
+            || now - last_attempt_started >= PUSH_CHUNK_ATTEMPT_SOFT_TIMEOUT_MS as f64;
+
+        if !due {
+            let wait_ms = (PUSH_CHUNK_ATTEMPT_SOFT_TIMEOUT_MS as f64 - (now - last_attempt_started))
+                .max(PUSH_CHUNK_ATTEMPT_RETRY_WAIT_MS as f64)
+                .round() as u64;
+
+            match async_std::future::timeout(Duration::from_millis(wait_ms), attempt_in.recv())
+                .await
+            {
+                Ok(Ok(result)) => {
+                    in_flight = in_flight.saturating_sub(1);
+                    if result.success {
+                        success_count += 1;
+                    } else {
+                        error_count += 1;
+                    }
+                }
+                Ok(Err(_)) => break,
+                Err(_) => {}
+            }
+
+            continue;
+        }
+
+        let mut selected_peer: Option<(PeerId, u64)> = None;
+
+        while selected_peer.is_none() {
+            let mut closest_overlay = "".to_string();
+            let mut closest_peer_id: Option<PeerId> = None;
+            let mut current_max_po = 0;
             let peer_candidates: Vec<(String, PeerId)> = {
                 let peers_map = peers.lock().await;
                 peers_map
@@ -767,18 +839,16 @@ pub async fn push_chunk(
                 let current_po = get_proximity(&caddr, &hex::decode(&ov).unwrap());
 
                 if current_po >= current_max_po {
-                    selected = true;
                     closest_overlay = ov;
-                    closest_peer_id = id;
+                    closest_peer_id = Some(id);
                     current_max_po = current_po;
                 }
             }
 
-            if selected {
-                skiplist.insert(closest_peer_id);
-            } else {
+            let Some(closest_peer_id) = closest_peer_id else {
                 if !overdraftlist.is_empty() {
                     reset_push_overdraft(&mut skiplist, &mut overdraftlist);
+                    continue;
                 }
                 error_count += 1;
                 let round_now = Date::now();
@@ -798,7 +868,9 @@ pub async fn push_chunk(
                 }
 
                 continue;
-            }
+            };
+
+            skiplist.insert(closest_peer_id);
 
             let req_price = price(&closest_overlay, &caddr);
 
@@ -812,18 +884,14 @@ pub async fn push_chunk(
                 if !allowed {
                     overdraftlist.insert(closest_peer_id);
                 } else {
-                    seer = false;
+                    selected_peer = Some((closest_peer_id, req_price));
                 }
             }
         }
 
-        if !selected {
+        let Some((closest_peer_id, req_price)) = selected_peer else {
             break;
-        }
-
-        let req_price = price(&closest_overlay, &caddr);
-
-        let (chunk_out, chunk_in) = mpsc::unbounded::<bool>();
+        };
 
         if transfer_paused
             .as_ref()
@@ -840,52 +908,50 @@ pub async fn push_chunk(
             continue;
         }
 
-        let _ = async_std::future::timeout(
-            Duration::from_secs(15),
-            pushsync_handler(
+        let accounting = accounting.clone();
+        let refresh_chan = refresh_chan.clone();
+        let attempt_out = attempt_out.clone();
+        let caddr0 = caddr.clone();
+        let data0 = data.clone();
+        let cstamp00 = cstamp0.clone();
+        let control0 = control.clone();
+
+        wasm_bindgen_futures::spawn_local(async move {
+            pushsync_attempt(
                 closest_peer_id,
-                &caddr,
-                &data,
-                &cstamp0,
-                control.clone(),
-                &chunk_out,
-            ),
+                req_price,
+                caddr0,
+                data0,
+                cstamp00,
+                control0,
+                accounting,
+                refresh_chan,
+                attempt_out,
+            )
+            .await;
+        });
+
+        in_flight += 1;
+        attempts_started += 1;
+        last_attempt_started = Date::now();
+    }
+
+    while in_flight > 0 && success_count < PUSH_CHUNK_CONFIRMATION_PEERS {
+        match async_std::future::timeout(
+            Duration::from_millis(PUSH_CHUNK_ATTEMPT_SOFT_TIMEOUT_MS),
+            attempt_in.recv(),
         )
-        .await;
-
-        let receipt_received = chunk_in.try_recv();
-        // if receipt_received.is_err() {
-        //     let accounting_peers = accounting.lock().await;
-        //     if accounting_peers.contains_key(&closest_peer_id) {
-        //         let accounting_peer = accounting_peers.get(&closest_peer_id).unwrap();
-        //         cancel_reserve(accounting_peer, req_price).await
-        //     }
-        // }
-
-        match receipt_received {
-            Ok(true) => {
-                let accounting_peer = {
-                    let accounting_peers = accounting.lock().await;
-                    accounting_peers.get(&closest_peer_id).cloned()
-                };
-                if let Some(accounting_peer) = accounting_peer {
-                    apply_credit(&accounting_peer, req_price, refresh_chan).await;
+        .await
+        {
+            Ok(Ok(result)) => {
+                in_flight = in_flight.saturating_sub(1);
+                if result.success {
+                    success_count += 1;
                 }
-                success_count += 1;
             }
-            _ => {
-                error_count += 1;
-                let accounting_peer = {
-                    let accounting_peers = accounting.lock().await;
-                    accounting_peers.get(&closest_peer_id).cloned()
-                };
-                if let Some(accounting_peer) = accounting_peer {
-                    cancel_reserve(&accounting_peer, req_price).await
-                }
-                async_std::task::sleep(Duration::from_millis(PUSH_CHUNK_ATTEMPT_RETRY_WAIT_MS))
-                    .await;
-            }
-        };
+            Ok(Err(_)) => break,
+            Err(_) => break,
+        }
     }
 
     if success_count >= PUSH_CHUNK_CONFIRMATION_PEERS {

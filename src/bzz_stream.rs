@@ -14,11 +14,14 @@ use std::{
     collections::{BTreeMap, HashMap, VecDeque},
     future::Future,
     pin::Pin,
+    time::Duration,
 };
 
 const RANGE_DISPATCH_YIELD_EVERY: usize = 128;
 const RANGE_RETRIEVE_DATA_PIECE_MAX_BYTES: u64 = 4 * 1024 * 1024;
 const RANGE_TREE_CHUNK_CACHE_MAX: usize = 16384;
+const RANGE_RETRIEVE_RETRY_COUNT: usize = 2;
+const RANGE_RETRIEVE_RETRY_WAIT_MS: u64 = 120;
 
 thread_local! {
     static RANGE_TREE_CHUNK_CACHE: RefCell<RangeTreeChunkCache> =
@@ -1076,21 +1079,60 @@ pub async fn acquire_resolved_range_cancellable(
     }
 
     let end_inclusive = end_inclusive.min(metadata.size.saturating_sub(1));
-    let data = retrieve_data_range_cancellable(
-        &metadata.data_reference,
-        start + 8,
-        end_inclusive + 8,
-        chunk_retrieve_chan,
-        cancel,
-        cancel_generations,
-    )
-    .await;
+    let expected_len = (end_inclusive - start + 1) as usize;
 
-    if data.len() != (end_inclusive - start + 1) as usize {
-        return None;
+    for attempt in 0..=RANGE_RETRIEVE_RETRY_COUNT {
+        if !range_cancel_token_current(&cancel_generations, &cancel).await {
+            return None;
+        }
+
+        let data = retrieve_data_range_cancellable(
+            &metadata.data_reference,
+            start + 8,
+            end_inclusive + 8,
+            chunk_retrieve_chan,
+            cancel.clone(),
+            cancel_generations.clone(),
+        )
+        .await;
+
+        if data.len() == expected_len {
+            return Some((data, metadata));
+        }
+
+        if attempt < RANGE_RETRIEVE_RETRY_COUNT {
+            if !range_cancel_token_current(&cancel_generations, &cancel).await {
+                return None;
+            }
+
+            web_sys::console::log_1(&JsValue::from(format!(
+                "retrying bzz range {}-{} for {} after short result {}/{} attempt {}",
+                start,
+                end_inclusive,
+                metadata.etag,
+                data.len(),
+                expected_len,
+                attempt + 1,
+            )));
+            async_std::task::sleep(Duration::from_millis(
+                RANGE_RETRIEVE_RETRY_WAIT_MS * (attempt as u64 + 1),
+            ))
+            .await;
+        }
     }
 
-    Some((data, metadata))
+    None
+}
+
+async fn range_cancel_token_current(
+    cancel_generations: &Option<RetrieveGenerationMap>,
+    cancel: &Option<RetrieveCancelToken>,
+) -> bool {
+    if let (Some(generations), Some(_)) = (cancel_generations, cancel) {
+        return retrieve_cancel_token_current(generations, cancel).await;
+    }
+
+    true
 }
 
 pub async fn retrieve_data_range(

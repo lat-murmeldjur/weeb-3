@@ -21,6 +21,7 @@ pub struct PeerFile {
 #[derive(Debug)]
 pub struct PeerAccounting {
     pub balance: u64,
+    pub surplus_balance: u64,
     pub threshold: u64,
     pub payment_threshold: u64,
     pub reserve: u64,

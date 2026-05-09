@@ -65,10 +65,11 @@ use async_std::sync::Arc;
 use byteorder::ByteOrder;
 use std::{collections::BTreeMap, future::Future, pin::Pin, sync::atomic::AtomicBool};
 
-const RETRIEVE_PEER_TIMEOUT_SECS: u64 = 10;
 const RETRIEVE_HEDGE_AFTER_MS: u64 = 760;
 const RETRIEVE_DATA_DISPATCH_YIELD_EVERY: usize = 128;
 const RETRIEVE_CHECK_RETRY_WAIT_MS: u64 = 160;
+const RETRIEVE_CHUNK_MAX_ERRORS: usize = 64;
+const RETRIEVE_CHUNK_SKIPLIST_RESET_ERRORS: usize = 20;
 
 struct RetrieveAttemptResult {
     peer: PeerId,
@@ -238,11 +239,7 @@ async fn retrieve_attempt(
     let (peer, req_price) = selected;
     let (chunk_out, chunk_in) = mpsc::unbounded::<Vec<u8>>();
 
-    let _ = async_std::future::timeout(
-        Duration::from_secs(RETRIEVE_PEER_TIMEOUT_SECS),
-        retrieve_handler(peer.clone(), caddr.clone(), control, &chunk_out),
-    )
-    .await;
+    retrieve_handler(peer.clone(), caddr.clone(), control, &chunk_out).await;
 
     let result = RetrieveAttemptResult {
         peer: peer.clone(),
@@ -485,7 +482,7 @@ pub async fn retrieve_chunk(
     let mut overdraftlist: HashSet<PeerId> = HashSet::new();
 
     let mut error_count = 0;
-    let max_error = 20;
+    let mut max_error = RETRIEVE_CHUNK_MAX_ERRORS;
 
     #[allow(unused_assignments)]
     let mut cd = vec![];
@@ -545,7 +542,6 @@ pub async fn retrieve_chunk(
             && (in_flight == 0 || now - last_attempt_started >= RETRIEVE_HEDGE_AFTER_MS as f64);
 
         if due {
-            reset_overdraft(&mut skiplist, &mut overdraftlist);
             if let Some(selected) =
                 select_retrieve_peer(&caddr, peers, accounting, &mut skiplist, &mut overdraftlist)
                     .await
@@ -603,11 +599,21 @@ pub async fn retrieve_chunk(
                 });
                 in_flight += 1;
                 last_attempt_started = Date::now();
-            } else if overdraftlist.is_empty() {
+            } else if !overdraftlist.is_empty() {
+                reset_overdraft(&mut skiplist, &mut overdraftlist);
+                async_std::task::sleep(Duration::from_millis(50)).await;
+                continue;
+            } else if error_count >= RETRIEVE_CHUNK_SKIPLIST_RESET_ERRORS {
+                skiplist.clear();
+                overdraftlist.clear();
+                error_count = 0;
+                max_error = max_error.saturating_sub(RETRIEVE_CHUNK_SKIPLIST_RESET_ERRORS);
+                if max_error == 0 {
+                    break;
+                }
                 async_std::task::sleep(Duration::from_millis(50)).await;
                 continue;
             } else {
-                reset_overdraft(&mut skiplist, &mut overdraftlist);
                 async_std::task::sleep(Duration::from_millis(50)).await;
                 continue;
             }

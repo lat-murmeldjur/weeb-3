@@ -20,11 +20,20 @@ pub async fn set_payment_threshold(a: &Mutex<PeerAccounting>, amount: u64) {
 
 pub async fn reserve(a: &Mutex<PeerAccounting>, amount: u64) -> bool {
     let mut account = a.lock().await;
-    if account.reserve + account.balance + amount <= account.threshold {
-        account.reserve += amount;
-        return true;
+    let Some(new_reserve) = account.reserve.checked_add(amount) else {
+        return false;
+    };
+
+    let Some(reserved_balance) = account.balance.checked_add(new_reserve) else {
+        return false;
+    };
+
+    if reserved_balance > account.threshold {
+        return false;
     }
-    return false;
+
+    account.reserve = new_reserve;
+    true
 }
 
 pub async fn apply_credit(
@@ -33,11 +42,21 @@ pub async fn apply_credit(
     chan: &mpsc::Sender<(PeerId, u64)>,
 ) {
     let mut account = a.lock().await;
-    account.balance += amount;
+    let mut debt_increase = amount;
     if account.reserve > amount {
         account.reserve -= amount;
     } else {
         account.reserve = 0;
+    }
+
+    if account.surplus_balance > 0 {
+        let compensated = account.surplus_balance.min(debt_increase);
+        account.surplus_balance -= compensated;
+        debt_increase -= compensated;
+    }
+
+    if debt_increase > 0 {
+        account.balance = account.balance.saturating_add(debt_increase);
     }
 
     if account.balance >= REFRESH_RATE {
@@ -45,14 +64,23 @@ pub async fn apply_credit(
     }
 }
 
-pub async fn apply_refreshment(a: &Mutex<PeerAccounting>, amount: u64) {
+pub async fn apply_refreshment(
+    a: &Mutex<PeerAccounting>,
+    amount: u64,
+) -> Option<(PeerId, u64, u64)> {
     let mut account = a.lock().await;
-    if account.balance > amount {
+    if amount >= account.balance {
+        let surplus_growth = amount - account.balance;
+        account.balance = 0;
+        account.surplus_balance = account.surplus_balance.saturating_add(surplus_growth);
+        if surplus_growth > 0 {
+            return Some((account.id.clone(), surplus_growth, account.surplus_balance));
+        }
+    } else {
         account.balance -= amount;
-        return;
     }
 
-    account.balance = 0;
+    None
 }
 
 pub async fn cancel_reserve(a: &Mutex<PeerAccounting>, amount: u64) {

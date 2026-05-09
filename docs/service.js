@@ -4,8 +4,16 @@ const MIB_BYTES = 1024 * 1024;
 const STREAM_STORAGE_WINDOW_BYTES = MIB_BYTES / 2;
 const STREAM_RESPONSE_BUFFER_BYTES = 8 * MIB_BYTES;
 const STREAM_ACTIVE_RESPONSE_BUFFER_BYTES = 2 * MIB_BYTES;
-const RANGE_RETRY_COUNT = 2;
-const RANGE_RETRY_DELAY_MS = 500;
+const STREAM_PREFETCH_AHEAD_LIMIT_BYTES = 64 * MIB_BYTES;
+const RANGE_CACHE_MEMORY_RATIO = 0.75;
+const RANGE_CACHE_DEVICE_MEMORY_RATIO = 0.45;
+const RANGE_CACHE_FALLBACK_MAX_BYTES = 3 * 1024 * MIB_BYTES;
+const RANGE_CACHE_MIN_MAX_BYTES = 512 * MIB_BYTES;
+const CLIENT_MESSAGE_TIMEOUT_MS = 120000;
+const RANGE_MESSAGE_TIMEOUT_MS = 240000;
+const RANGE_CACHE_STALE_MS = RANGE_MESSAGE_TIMEOUT_MS + 30000;
+const RANGE_RETRY_COUNT = 4;
+const RANGE_RETRY_DELAY_MS = 700;
 const STREAM_PREFETCH_STAGE_BYTES = [
   4 * MIB_BYTES,
   4 * MIB_BYTES,
@@ -23,16 +31,65 @@ const STREAM_SEEK_REQUEST_GAP_BYTES = 6 * MIB_BYTES;
 const STREAM_PREFETCH_MAX_WINDOWS = 8;
 const STREAM_INITIAL_LOOKAHEAD_CHUNKS = 8;
 const STREAM_LOOKAHEAD_CHUNKS = 8;
-const RANGE_CACHE_MAX_ENTRIES = 384;
 const metadataCache = new Map();
 const rangeCache = new Map();
 const mediaStreamStates = new Map();
 
+function isCanonicalBzzRequest(request) {
+  try {
+    return canonicalBzzResource(new URL(request.url)) !== null;
+  } catch (_) {
+    return false;
+  }
+}
+
 const putInCache = async (request, response) => {
+  if (isCanonicalBzzRequest(request)) {
+    console.log("Skipped bzz Cache API write:", request.url);
+    return;
+  }
+
   const cache = await caches.open(CACHE_NAME);
   await cache.put(request, response);
   console.log("Cached:", request.url);
 };
+
+async function purgeBzzCacheEntries() {
+  const cache = await caches.open(CACHE_NAME);
+  const requests = await cache.keys();
+  let purged = 0;
+
+  await Promise.all(requests.map(async (request) => {
+    if (isCanonicalBzzRequest(request)) {
+      await cache.delete(request);
+      purged += 1;
+    }
+  }));
+
+  if (purged > 0) {
+    console.log("Purged bzz Cache API entries:", purged);
+  }
+}
+
+function clearBzzMemoryCaches(reason) {
+  const metadataCount = metadataCache.size;
+  const rangeCount = rangeCache.size;
+  const mediaStateCount = mediaStreamStates.size;
+
+  metadataCache.clear();
+  rangeCache.clear();
+  mediaStreamStates.clear();
+
+  if (metadataCount > 0 || rangeCount > 0 || mediaStateCount > 0) {
+    console.log(
+      "Cleared bzz memory caches:",
+      reason,
+      `metadata=${metadataCount}`,
+      `ranges=${rangeCount}`,
+      `media_states=${mediaStateCount}`
+    );
+  }
+}
 
 self.addEventListener("message", async function(event) {
   const port = event.ports && event.ports[0];
@@ -85,7 +142,9 @@ const cacheFirst = async (request) => {
   }
 
   const fetched = await fetch(request);
-  cache.put(request, fetched.clone());
+  if (fetched.ok && !isCanonicalBzzRequest(request)) {
+    cache.put(request, fetched.clone());
+  }
   return fetched;
 };
 
@@ -102,7 +161,11 @@ self.addEventListener("install", (event) => {
 
 self.addEventListener("activate", event => {
   console.log("service activated, claim client");
-  event.waitUntil(self.clients.claim());
+  event.waitUntil((async () => {
+    clearBzzMemoryCaches("activate");
+    await purgeBzzCacheEntries();
+    await self.clients.claim();
+  })());
 });
 
 self.addEventListener("fetch", (event) => {
@@ -112,6 +175,14 @@ self.addEventListener("fetch", (event) => {
   const url = new URL(req.url);
 
   console.log("SW FETCH:", req.method, url.pathname, "scope:", self.registration.scope);
+
+  if (
+    req.mode === "navigate" &&
+    (req.cache === "reload" ||
+      (req.headers.get("Cache-Control") || "").includes("no-cache"))
+  ) {
+    clearBzzMemoryCaches("navigate reload");
+  }
 
   if (req.method === "POST" && url.pathname.endsWith("/weeb-3/bzz")) {
     console.log("Intercepting POST upload:", url.toString());
@@ -200,19 +271,53 @@ async function requestClient(event) {
   return allClients[0] || null;
 }
 
-function messageClient(client, message) {
-  return new Promise((resolve) => {
-    const channel = new MessageChannel();
-    const timer = setTimeout(() => {
-      resolve({ ok: false, error: "Timed out waiting for weeb-3" });
-    }, 120000);
+function closeMessagePort(port) {
+  try {
+    port.close();
+  } catch (_) {
+  }
+}
 
-    channel.port1.onmessage = (event) => {
-      clearTimeout(timer);
-      resolve(event.data || { ok: false });
+function messageClient(client, message, timeoutMs = CLIENT_MESSAGE_TIMEOUT_MS) {
+  return new Promise((resolve) => {
+    if (!client || typeof client.postMessage !== "function") {
+      resolve({ ok: false, error: "weeb-3 client is not available" });
+      return;
+    }
+
+    const channel = new MessageChannel();
+    let settled = false;
+    let timer = null;
+
+    const settle = (value) => {
+      if (settled) {
+        return;
+      }
+
+      settled = true;
+      if (timer !== null) {
+        clearTimeout(timer);
+      }
+      closeMessagePort(channel.port1);
+      resolve(value);
     };
 
-    client.postMessage(message, [channel.port2]);
+    timer = setTimeout(() => {
+      settle({ ok: false, error: "Timed out waiting for weeb-3" });
+    }, timeoutMs);
+
+    channel.port1.onmessage = (event) => {
+      settle(event.data || { ok: false });
+    };
+
+    try {
+      client.postMessage(message, [channel.port2]);
+    } catch (error) {
+      settle({
+        ok: false,
+        error: error && error.message ? error.message : "Failed to message weeb-3"
+      });
+    }
   });
 }
 
@@ -264,7 +369,7 @@ async function retrieveRange(resource, start, end, client, metadata, generation 
     message.stream_generation = generation;
   }
 
-  return messageClient(client, message);
+  return messageClient(client, message, RANGE_MESSAGE_TIMEOUT_MS);
 }
 
 function metadataIdentity(resource, metadata) {
@@ -275,18 +380,131 @@ function mediaStateKey(resource, metadata) {
   return `${metadataIdentity(resource, metadata)}|${resource}`;
 }
 
-function rangeCacheKey(resource, start, end, metadata, generation) {
-  return `${mediaStateKey(resource, metadata)}|g${generation || 0}|${start}-${end}`;
+function rangeCacheKey(resource, start, end, metadata) {
+  return `${metadataIdentity(resource, metadata)}|${metadata.size}|${start}-${end}`;
 }
 
 function deleteCachedRange(resource, start, end, metadata, generation) {
   rangeCache.delete(rangeCacheKey(resource, start, end, metadata, generation));
 }
 
+function invalidRangeResponse(message, body) {
+  return {
+    ok: false,
+    error: message,
+    body: body || new Uint8Array()
+  };
+}
+
+function checkedRangeResponse(rangeResponse, start, end, metadata) {
+  if (!rangeResponse || !rangeResponse.ok) {
+    return invalidRangeResponse(
+      rangeResponse && rangeResponse.error
+        ? rangeResponse.error
+        : "weeb-3 did not retrieve range"
+    );
+  }
+
+  const body = toUint8Array(rangeResponse.body);
+  const expectedLength = end - start + 1;
+  if (body.byteLength !== expectedLength) {
+    return {
+      ...invalidRangeResponse(
+        `weeb-3 returned ${body.byteLength} bytes for ${expectedLength} byte range`,
+        body
+      ),
+      short: true
+    };
+  }
+
+  const responseSize = Number(rangeResponse.size || metadata.size || 0);
+  if (metadata.size && responseSize && responseSize !== metadata.size) {
+    return invalidRangeResponse(
+      `weeb-3 range metadata size mismatch ${responseSize} != ${metadata.size}`,
+      body
+    );
+  }
+
+  if (metadata.etag && rangeResponse.etag && rangeResponse.etag !== metadata.etag) {
+    return invalidRangeResponse("weeb-3 range metadata etag mismatch", body);
+  }
+
+  return {
+    ...rangeResponse,
+    body
+  };
+}
+
+function rangeCacheUsedBytes() {
+  let bytes = 0;
+  for (const entry of rangeCache.values()) {
+    bytes += entry.bytes || 0;
+  }
+  return bytes;
+}
+
+function rangeCacheMaxBytes() {
+  const memory = performance && performance.memory;
+  if (memory && Number.isFinite(memory.jsHeapSizeLimit) && memory.jsHeapSizeLimit > 0) {
+    return Math.max(
+      RANGE_CACHE_MIN_MAX_BYTES,
+      Math.floor(memory.jsHeapSizeLimit * RANGE_CACHE_MEMORY_RATIO)
+    );
+  }
+
+  const deviceMemory = navigator && navigator.deviceMemory;
+  if (Number.isFinite(deviceMemory) && deviceMemory > 0) {
+    return Math.max(
+      RANGE_CACHE_MIN_MAX_BYTES,
+      Math.floor(deviceMemory * 1024 * MIB_BYTES * RANGE_CACHE_DEVICE_MEMORY_RATIO)
+    );
+  }
+
+  return RANGE_CACHE_FALLBACK_MAX_BYTES;
+}
+
 function trimRangeCache() {
-  while (rangeCache.size > RANGE_CACHE_MAX_ENTRIES) {
-    const oldestKey = rangeCache.keys().next().value;
-    rangeCache.delete(oldestKey);
+  const maxBytes = rangeCacheMaxBytes();
+  let usedBytes = rangeCacheUsedBytes();
+  if (usedBytes <= maxBytes) {
+    return;
+  }
+
+  const before = rangeCache.size;
+  const beforeBytes = usedBytes;
+  let trimmed = 0;
+
+  for (const [key, entry] of rangeCache) {
+    if (usedBytes <= maxBytes) {
+      break;
+    }
+
+    if (!entry.settledAt) {
+      continue;
+    }
+
+    rangeCache.delete(key);
+    usedBytes -= entry.bytes || 0;
+    trimmed += 1;
+  }
+
+  if (trimmed > 0) {
+    console.log(
+      "bzz media trimmed range cache",
+      `removed=${trimmed}`,
+      `before=${before}`,
+      `after=${rangeCache.size}`,
+      `bytes=${beforeBytes}->${usedBytes}`,
+      `limit=${maxBytes}`
+    );
+  }
+
+  if (usedBytes > maxBytes) {
+    console.log(
+      "bzz media kept range cache above memory target to preserve in-flight ranges",
+      `bytes=${usedBytes}`,
+      `limit=${maxBytes}`
+    );
   }
 }
 
@@ -321,6 +539,9 @@ function getMediaStreamState(resource, metadata) {
       generation: 1,
       anchorStart: null,
       highWaterEnd: -1,
+      scheduledHighWaterEnd: -1,
+      completedRanges: new Map(),
+      consecutiveFailures: 0,
       lastRequestStart: 0,
       lastRangeWasSeek: false,
       lastRangeWasStartup: false,
@@ -333,14 +554,77 @@ function getMediaStreamState(resource, metadata) {
   return state;
 }
 
+function effectiveMediaHighWaterEnd(state) {
+  return Math.max(state.highWaterEnd, state.scheduledHighWaterEnd);
+}
+
+function markMediaRangeScheduled(state, end) {
+  if (!state) {
+    return;
+  }
+
+  state.scheduledHighWaterEnd = Math.max(state.scheduledHighWaterEnd, end);
+  state.lastTouch = Date.now();
+}
+
+function markMediaRangeComplete(state, start, end) {
+  if (!state) {
+    return;
+  }
+
+  if (start <= state.highWaterEnd + 1) {
+    state.highWaterEnd = Math.max(state.highWaterEnd, end);
+  } else {
+    state.completedRanges.set(start, Math.max(end, state.completedRanges.get(start) || -1));
+  }
+
+  let advanced = true;
+  while (advanced) {
+    advanced = false;
+    for (const [rangeStart, rangeEnd] of state.completedRanges) {
+      if (rangeStart <= state.highWaterEnd + 1) {
+        state.highWaterEnd = Math.max(state.highWaterEnd, rangeEnd);
+        state.completedRanges.delete(rangeStart);
+        advanced = true;
+      }
+    }
+  }
+
+  state.scheduledHighWaterEnd = Math.max(state.scheduledHighWaterEnd, state.highWaterEnd);
+  state.consecutiveFailures = 0;
+  state.lastTouch = Date.now();
+}
+
+function noteMediaRangeFailure(state, start, reason) {
+  if (!state) {
+    return;
+  }
+
+  state.consecutiveFailures += 1;
+  state.scheduledHighWaterEnd = Math.max(state.highWaterEnd, start - 1);
+  state.lastTouch = Date.now();
+
+  console.log(
+    "bzz media range failure",
+    `start=${start}`,
+    `generation=${state.generation}`,
+    `failures=${state.consecutiveFailures}`,
+    reason || "unknown"
+  );
+}
+
 function rangeEntryMatchesResource(entry, resource, metadata) {
-  return entry.resource === resource && entry.identity === metadataIdentity(resource, metadata);
+  return entry.identity === metadataIdentity(resource, metadata);
 }
 
 function discardMediaRangesOutside(resource, metadata, generation, keepStart, keepEnd) {
   let discarded = 0;
   for (const [key, entry] of rangeCache) {
     if (!rangeEntryMatchesResource(entry, resource, metadata)) {
+      continue;
+    }
+
+    if (entry.settledAt && entry.ok) {
       continue;
     }
 
@@ -356,7 +640,7 @@ function discardMediaRangesOutside(resource, metadata, generation, keepStart, ke
 
   if (discarded > 0) {
     console.log(
-      "bzz media canceled stale ranges",
+      "bzz media canceled stale in-flight ranges",
       discarded,
       `keep=${keepStart}-${keepEnd}`,
       `generation=${generation}`
@@ -367,7 +651,7 @@ function discardMediaRangesOutside(resource, metadata, generation, keepStart, ke
 function beginMediaRange(resource, start, metadata) {
   const state = getMediaStreamState(resource, metadata);
   const previousAnchor = state.anchorStart;
-  const previousHighWater = state.highWaterEnd;
+  const previousHighWater = effectiveMediaHighWaterEnd(state);
   const previousRequestStart = state.lastRequestStart;
   const isStartup = previousAnchor === null;
   const isRequestJump =
@@ -379,11 +663,18 @@ function beginMediaRange(resource, start, metadata) {
     (isRequestJump ||
       start + STREAM_SEEK_RESET_GAP_BYTES < previousAnchor ||
       start > previousHighWater + STREAM_SEEK_RESET_GAP_BYTES);
+  const isPrefetchRunaway =
+    previousAnchor !== null &&
+    previousHighWater >
+      start + STREAM_RESPONSE_BUFFER_BYTES + STREAM_PREFETCH_AHEAD_LIMIT_BYTES;
 
-  if (isSeek) {
+  if (isSeek || isPrefetchRunaway) {
     state.generation += 1;
     state.anchorStart = start;
     state.highWaterEnd = start - 1;
+    state.scheduledHighWaterEnd = start - 1;
+    state.completedRanges.clear();
+    state.consecutiveFailures = 0;
     discardMediaRangesOutside(
       resource,
       metadata,
@@ -392,8 +683,9 @@ function beginMediaRange(resource, start, metadata) {
       Math.min(metadata.size - 1, start + STREAM_SEEK_KEEP_AHEAD_BYTES - 1)
     );
     console.log(
-      "bzz media seek reset",
+      isSeek ? "bzz media seek reset" : "bzz media prefetch lead reset",
       `${start}/${metadata.size}`,
+      `previous_high_water=${previousHighWater}`,
       `generation=${state.generation}`
     );
   } else if (isStartup) {
@@ -401,7 +693,7 @@ function beginMediaRange(resource, start, metadata) {
   }
 
   state.lastRequestStart = start;
-  state.lastRangeWasSeek = isSeek;
+  state.lastRangeWasSeek = isSeek || isPrefetchRunaway;
   state.lastRangeWasStartup = isStartup;
   state.lastTouch = Date.now();
   return state;
@@ -411,15 +703,57 @@ function cachedRangePromise(resource, start, end, client, metadata, generation =
   const key = rangeCacheKey(resource, start, end, metadata, generation);
   let entry = rangeCache.get(key);
   if (entry) {
-    return entry.promise;
+    if (!entry.settledAt && Date.now() - entry.createdAt > RANGE_CACHE_STALE_MS) {
+      rangeCache.delete(key);
+      console.log(
+        "bzz media expired stale range",
+        `${start}-${end}/${metadata.size}`,
+        `generation=${generation}`
+      );
+    } else if (!entry.settledAt && entry.generation !== generation) {
+      rangeCache.delete(key);
+      console.log(
+        "bzz media replaced stale in-flight range",
+        `${start}-${end}/${metadata.size}`,
+        `old_generation=${entry.generation}`,
+        `generation=${generation}`
+      );
+    } else if (entry.settledAt && !entry.ok) {
+      rangeCache.delete(key);
+    } else {
+      entry.generation = generation;
+      rangeCache.delete(key);
+      rangeCache.set(key, entry);
+      return entry.promise;
+    }
   }
 
+  const createdAt = Date.now();
   const promise = retrieveRange(resource, start, end, client, metadata, generation).then(
     (rangeResponse) => {
-      if (!rangeResponse.ok) {
-        rangeCache.delete(key);
+      const checked = checkedRangeResponse(rangeResponse, start, end, metadata);
+      if (entry) {
+        entry.settledAt = Date.now();
+        entry.ok = checked.ok && !checked.short;
+        entry.bytes = entry.ok ? checked.body.byteLength : 0;
       }
-      return rangeResponse;
+      if (!checked.ok) {
+        rangeCache.delete(key);
+      } else {
+        trimRangeCache();
+      }
+      return checked;
+    },
+    (error) => {
+      if (entry) {
+        entry.settledAt = Date.now();
+        entry.ok = false;
+        entry.bytes = 0;
+      }
+      rangeCache.delete(key);
+      return invalidRangeResponse(
+        error && error.message ? error.message : "weeb-3 range request failed"
+      );
     }
   );
 
@@ -429,7 +763,11 @@ function cachedRangePromise(resource, start, end, client, metadata, generation =
     identity: metadataIdentity(resource, metadata),
     start,
     end,
-    generation
+    generation,
+    createdAt,
+    settledAt: null,
+    ok: false,
+    bytes: 0
   };
   rangeCache.set(key, entry);
   trimRangeCache();
@@ -458,7 +796,12 @@ async function readCachedRange(resource, start, end, client, metadata, generatio
     const window = windows[i];
     const rangeResponse = responses[i];
     if (!rangeResponse.ok) {
-      return { ok: false, error: rangeResponse.error || "weeb-3 did not retrieve range" };
+      deleteCachedRange(resource, window.start, window.end, metadata, generation);
+      return {
+        ok: false,
+        short: !!rangeResponse.short,
+        error: rangeResponse.error || "weeb-3 did not retrieve range"
+      };
     }
 
     const storageBody = toUint8Array(rangeResponse.body);
@@ -539,17 +882,19 @@ function prefetchMediaWindows(
   let scheduled = 0;
 
   if (state) {
-    state.highWaterEnd = Math.max(state.highWaterEnd, responseRange.end);
+    markMediaRangeComplete(state, responseRange.start, responseRange.end);
+    markMediaRangeScheduled(state, responseRange.end);
   }
 
   return new Promise((resolve) => {
     let active = 0;
     let logged = false;
+    let failed = false;
 
     const isCurrentGeneration = () => !state || state.generation === generation;
 
     const finishIfDone = () => {
-      if (active === 0 && (!isCurrentGeneration() || position > targetEnd)) {
+      if (active === 0 && (!isCurrentGeneration() || failed || position > targetEnd)) {
         if (scheduled > 0) {
           console.log(
             `bzz media ${label} done`,
@@ -574,6 +919,11 @@ function prefetchMediaWindows(
         return;
       }
 
+      if (failed) {
+        finishIfDone();
+        return;
+      }
+
       if (state) {
         position = Math.max(position, state.highWaterEnd + 1);
       }
@@ -588,7 +938,7 @@ function prefetchMediaWindows(
           generation
         );
         if (state) {
-          state.highWaterEnd = Math.max(state.highWaterEnd, window.end);
+          markMediaRangeScheduled(state, window.end);
         }
         position = window.end + 1;
         scheduled += 1;
@@ -605,7 +955,38 @@ function prefetchMediaWindows(
         }
 
         Promise.resolve(window.promise)
-          .catch(() => undefined)
+          .then(
+            (rangeResponse) => {
+              if (!isCurrentGeneration()) {
+                return;
+              }
+
+              if (rangeResponse && rangeResponse.ok && !rangeResponse.short) {
+                markMediaRangeComplete(state, window.start, window.end);
+              } else {
+                failed = true;
+                noteMediaRangeFailure(
+                  state,
+                  window.start,
+                  rangeResponse && rangeResponse.error
+                    ? rangeResponse.error
+                    : "prefetch range failed"
+                );
+              }
+            },
+            (error) => {
+              if (!isCurrentGeneration()) {
+                return;
+              }
+
+              failed = true;
+              noteMediaRangeFailure(
+                state,
+                window.start,
+                error && error.message ? error.message : "prefetch range rejected"
+              );
+            }
+          )
           .finally(() => {
             active -= 1;
             launchMore();
@@ -627,6 +1008,11 @@ function prefetchMediaWindows(
 
 async function prefetchMediaStages(resource, responseRange, requestedEnd, client, metadata, state) {
   const generation = state ? state.generation : 0;
+  const prefetchLimitEnd = Math.min(
+    requestedEnd,
+    responseRange.end + STREAM_PREFETCH_AHEAD_LIMIT_BYTES,
+    metadata.size - 1
+  );
   if (state) {
     if (state.prefetchRunning && state.prefetchGeneration === generation) {
       console.log(
@@ -651,16 +1037,24 @@ async function prefetchMediaStages(resource, responseRange, requestedEnd, client
         responseRange.end,
         state ? state.highWaterEnd : responseRange.end
       );
-      if (currentEnd >= requestedEnd || currentEnd >= metadata.size - 1) {
+      if (currentEnd >= prefetchLimitEnd || currentEnd >= metadata.size - 1) {
         return;
       }
 
-      const targetEnd = Math.min(currentEnd + stageBytes, requestedEnd, metadata.size - 1);
-      await prefetchMediaWindows(resource, responseRange, requestedEnd, client, metadata, state, {
-        targetEnd,
-        maxActive: STREAM_PREFETCH_MAX_WINDOWS,
-        label: `prefetch stage ${i + 1} ${Math.round(stageBytes / MIB_BYTES)}MiB`
-      });
+      const targetEnd = Math.min(currentEnd + stageBytes, prefetchLimitEnd, metadata.size - 1);
+      await prefetchMediaWindows(
+        resource,
+        responseRange,
+        prefetchLimitEnd,
+        client,
+        metadata,
+        state,
+        {
+          targetEnd,
+          maxActive: STREAM_PREFETCH_MAX_WINDOWS,
+          label: `prefetch stage ${i + 1} ${Math.round(stageBytes / MIB_BYTES)}MiB`
+        }
+      );
     }
   } finally {
     if (state && state.prefetchGeneration === generation) {
@@ -722,7 +1116,7 @@ function retrieveRangeStream(resource, start, end, client, metadata) {
         client,
         metadata
       );
-      const rangeResponse = await readCachedRange(
+      const rangeResponse = await readCachedRangeWithRetry(
         resource,
         window.start,
         window.end,
@@ -893,6 +1287,9 @@ async function handleCanonicalBzz(request, event, resource) {
       `${responseRange.start}-${responseRange.end}/${metadata.size}`
     );
     for (const responseStorage of responseStorageWindows) {
+      if (mediaState) {
+        markMediaRangeScheduled(mediaState, responseStorage.end);
+      }
       cachedRangePromise(
         resource,
         responseStorage.start,
@@ -912,15 +1309,22 @@ async function handleCanonicalBzz(request, event, resource) {
     );
 
     if (!rangeResponse.ok) {
+      noteMediaRangeFailure(
+        mediaState,
+        responseRange.start,
+        rangeResponse.error || "weeb-3 did not retrieve range"
+      );
       return new Response(rangeResponse.error || "weeb-3 did not retrieve range", { status: 503 });
     }
 
     const body = rangeResponse.body;
     if (rangeResponse.short) {
+      noteMediaRangeFailure(mediaState, responseRange.start, "weeb-3 returned a short range");
       return new Response("weeb-3 returned a short range", { status: 502 });
     }
 
     if (streamable) {
+      markMediaRangeComplete(mediaState, responseRange.start, responseRange.end);
       keepPrefetchAlive(
         event,
         prefetchMediaStages(resource, responseRange, parsedRange.end, client, metadata, mediaState)
@@ -953,6 +1357,7 @@ async function handleCanonicalBzz(request, event, resource) {
       `${startupRange.start}-${startupRange.end}/${metadata.size}`
     );
     for (const startupStorage of startupStorageWindows) {
+      markMediaRangeScheduled(mediaState, startupStorage.end);
       cachedRangePromise(
         resource,
         startupStorage.start,
@@ -972,6 +1377,11 @@ async function handleCanonicalBzz(request, event, resource) {
     );
 
     if (!rangeResponse.ok) {
+      noteMediaRangeFailure(
+        mediaState,
+        startupRange.start,
+        rangeResponse.error || "weeb-3 did not retrieve startup range"
+      );
       return new Response(rangeResponse.error || "weeb-3 did not retrieve startup range", {
         status: 503
       });
@@ -979,9 +1389,11 @@ async function handleCanonicalBzz(request, event, resource) {
 
     const body = rangeResponse.body;
     if (rangeResponse.short) {
+      noteMediaRangeFailure(mediaState, startupRange.start, "weeb-3 returned a short startup range");
       return new Response("weeb-3 returned a short startup range", { status: 502 });
     }
 
+    markMediaRangeComplete(mediaState, startupRange.start, startupRange.end);
     keepPrefetchAlive(
       event,
       prefetchMediaStages(resource, startupRange, metadata.size - 1, client, metadata, mediaState)
@@ -1043,8 +1455,10 @@ const fetchFromLibRs = async (request, client) => {
           headers: { "Content-Type": mime }
         });
 
-        const cache = await caches.open(CACHE_NAME);
-        await cache.put(request, response.clone());
+        if (!isCanonicalBzzRequest(request)) {
+          const cache = await caches.open(CACHE_NAME);
+          await cache.put(request, response.clone());
+        }
 
         resolve(response);
       } else {

@@ -90,7 +90,7 @@ fn handle_resolve_bzz_message(obj: &js_sys::Object, event: &MessageEvent, weeb3:
         }
 
         if let Some(port) = port {
-            port.post_message(&resp).unwrap();
+            let _ = port.post_message(&resp);
         }
     });
 }
@@ -167,7 +167,7 @@ fn handle_retrieve_range_message(obj: &js_sys::Object, event: &MessageEvent, wee
         }
 
         if let Some(port) = port {
-            port.post_message(&resp).unwrap();
+            let _ = port.post_message(&resp);
         }
     });
 }
@@ -192,7 +192,7 @@ fn handle_prepare_bzz_stream_message(
         Reflect::set(&resp, &"type".into(), &"PREPARE_BZZ_STREAM_RESPONSE".into()).unwrap();
 
         if let Some(port) = port {
-            port.post_message(&resp).unwrap();
+            let _ = port.post_message(&resp);
         }
     });
 }
@@ -279,9 +279,22 @@ fn create_streaming_player(mime: &str, src: &str) -> Element {
     let _ = player.set_attribute("preload", "metadata");
     if is_video {
         let _ = player.set_attribute("playsinline", "");
-        let _ = player.set_attribute("muted", "");
-        let _ = Reflect::set(player.as_ref(), &JsValue::from_str("muted"), &JsValue::TRUE);
     }
+    let _ = Reflect::set(
+        player.as_ref(),
+        &JsValue::from_str("muted"),
+        &JsValue::FALSE,
+    );
+    let _ = Reflect::set(
+        player.as_ref(),
+        &JsValue::from_str("defaultMuted"),
+        &JsValue::FALSE,
+    );
+    let _ = Reflect::set(
+        player.as_ref(),
+        &JsValue::from_str("volume"),
+        &JsValue::from_f64(1.0),
+    );
     let _ = Reflect::set(
         player.as_ref(),
         &JsValue::from_str("autoplay"),
