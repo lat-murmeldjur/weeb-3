@@ -848,9 +848,12 @@ pub async fn push_chunk(
             let Some(closest_peer_id) = closest_peer_id else {
                 if !overdraftlist.is_empty() {
                     reset_push_overdraft(&mut skiplist, &mut overdraftlist);
+                    async_std::task::sleep(Duration::from_millis(PUSH_CHUNK_ATTEMPT_RETRY_WAIT_MS))
+                        .await;
+
                     continue;
                 }
-                error_count += 1;
+
                 let round_now = Date::now();
 
                 let seg = round_now - round_commence;

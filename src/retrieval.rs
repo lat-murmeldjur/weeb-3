@@ -689,7 +689,6 @@ pub async fn retrieve_check_chunk(
             if !overdraftlist.is_empty() {
                 reset_overdraft(&mut skiplist, &mut overdraftlist);
             }
-            error_count += 1;
             async_std::task::sleep(Duration::from_millis(RETRIEVE_CHECK_RETRY_WAIT_MS)).await;
             continue;
         };
