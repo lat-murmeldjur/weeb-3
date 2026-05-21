@@ -142,9 +142,9 @@ use crate::weeb_3::etiquette_2;
 // use crate::weeb_3::etiquette_6;
 // use crate::weeb_3::etiquette_8;
 
-const HANDSHAKE_PROTOCOL: StreamProtocol = StreamProtocol::new("/swarm/handshake/14.0.0/handshake");
+const HANDSHAKE_PROTOCOL: StreamProtocol = StreamProtocol::new("/swarm/handshake/15.0.0/handshake");
 const PRICING_PROTOCOL: StreamProtocol = StreamProtocol::new("/swarm/pricing/1.0.0/pricing");
-const GOSSIP_PROTOCOL: StreamProtocol = StreamProtocol::new("/swarm/hive/1.1.0/peers");
+const GOSSIP_PROTOCOL: StreamProtocol = StreamProtocol::new("/swarm/hive/2.0.0/peers");
 const PSEUDOSETTLE_PROTOCOL: StreamProtocol =
     StreamProtocol::new("/swarm/pseudosettle/1.0.0/pseudosettle");
 const RETRIEVAL_PROTOCOL: StreamProtocol = StreamProtocol::new("/swarm/retrieval/1.4.0/retrieval");

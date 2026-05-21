@@ -402,11 +402,27 @@ pub async fn read_file(file: web_sys::File) -> Vec<Vec<u8>> {
     }
 }
 
-fn generate_sign_data(underlay: &[u8], overlay: &[u8], network_id: u64) -> Vec<u8> {
+pub const EMPTY_CHEQUEBOOK_ADDRESS: [u8; 20] = [0; 20];
+
+pub fn generate_sign_data(
+    underlay: &[u8],
+    overlay: &[u8],
+    network_id: u64,
+    nonce: &[u8],
+    timestamp: i64,
+    chequebook_address: &[u8],
+) -> Vec<u8> {
     let mut out = b"bee-handshake-".to_vec();
     out.extend_from_slice(underlay);
     out.extend_from_slice(overlay);
     out.extend_from_slice(&network_id.to_be_bytes());
+    out.extend_from_slice(nonce);
+    out.extend_from_slice(&(timestamp as u64).to_be_bytes());
+    if chequebook_address.is_empty() {
+        out.extend_from_slice(&EMPTY_CHEQUEBOOK_ADDRESS);
+    } else {
+        out.extend_from_slice(chequebook_address);
+    }
     out
 }
 
@@ -434,9 +450,19 @@ pub fn parse_address(
     underlay: &[u8],
     overlay: &[u8],
     signature: &[u8],
+    nonce: &[u8],
+    timestamp: i64,
     network_id: u64,
+    chequebook_address: &[u8],
 ) -> web3::types::Address {
-    let sign_data = generate_sign_data(underlay, overlay, network_id);
+    let sign_data = generate_sign_data(
+        underlay,
+        overlay,
+        network_id,
+        nonce,
+        timestamp,
+        chequebook_address,
+    );
     let recovered = recover_address(signature, &sign_data);
 
     if recovered.len() != 20 {

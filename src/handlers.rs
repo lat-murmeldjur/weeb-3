@@ -199,7 +199,16 @@ pub async fn ceive(
         &rec_0.ack.clone().unwrap().address.unwrap().underlay,
         &rec_0.ack.clone().unwrap().address.unwrap().overlay,
         &rec_0.ack.clone().unwrap().address.unwrap().signature,
+        &rec_0.ack.clone().unwrap().address.unwrap().nonce,
+        rec_0.ack.clone().unwrap().address.unwrap().timestamp,
         network_id,
+        &rec_0
+            .ack
+            .clone()
+            .unwrap()
+            .address
+            .unwrap()
+            .chequebook_address,
     );
 
     web_sys::console::log_1(&JsValue::from("Handshake stage 1 3"));
@@ -209,6 +218,8 @@ pub async fn ceive(
     let overlay;
     let signature;
     let nonce: [u8; 32] = [0; 32];
+    let timestamp = (js_sys::Date::now() / 1000.0).floor() as i64;
+    let chequebook_address = EMPTY_CHEQUEBOOK_ADDRESS.to_vec();
     let mut step_1 = etiquette_1::Ack::default();
     {
         let signer: PrivateKeySigner =
@@ -217,20 +228,21 @@ pub async fn ceive(
         let addre = addrep.to_vec();
 
         let mut bufidl: [u8; 8] = [0; 8];
-        byteorder::LittleEndian::write_u64(&mut bufidl, 10_u64);
+        byteorder::LittleEndian::write_u64(&mut bufidl, network_id);
         let byteslice = [addre.as_slice(), &bufidl].concat();
 
         let byteslice2 = [byteslice, (&nonce).to_vec()].concat();
         let overlayp = keccak256(byteslice2);
         overlay = overlayp;
 
-        let hsprefix: &[u8] = &"bee-handshake-".to_string().into_bytes();
-
-        let mut bufidb: [u8; 8] = [0; 8];
-        byteorder::BigEndian::write_u64(&mut bufidb, 10_u64);
-        let byteslice3 = [hsprefix.to_vec(), underlay.clone()].concat();
-        let byteslice4 = [byteslice3, overlay.to_vec()].concat();
-        let byteslice5 = [byteslice4, bufidb.to_vec()].concat();
+        let byteslice5 = generate_sign_data(
+            &underlay,
+            overlay.as_slice(),
+            network_id,
+            &nonce,
+            timestamp,
+            &chequebook_address,
+        );
 
         signature = signer.sign_message(&byteslice5).await.unwrap();
     }
@@ -240,9 +252,11 @@ pub async fn ceive(
     step_1_ad.overlay = overlay.to_vec();
     step_1_ad.underlay = underlay.to_vec();
     step_1_ad.signature = signature.as_bytes().to_vec();
+    step_1_ad.nonce = nonce.to_vec();
+    step_1_ad.timestamp = timestamp;
+    step_1_ad.chequebook_address = chequebook_address;
 
     step_1.address = Some(step_1_ad);
-    step_1.nonce = nonce.to_vec();
     step_1.network_id = network_id;
     step_1.full_node = true;
     step_1.welcome_message = "... Ara Ara ...".to_string();
