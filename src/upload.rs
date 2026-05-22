@@ -36,13 +36,15 @@ use crate::{
     //                                                                        //
     mpsc,
     //                                                                        //
-    persistence::{bump_bucket, get_batch_bucket_limit, get_feed_owner_key, set_feed_owner_key},
-    //                                                                        //
     price,
     //                                                                        //
     pushsync_handler,
     //                                                                        //
     reserve,
+    //                                                                        //
+    secure_vault::{
+        secure_create_feed_update_soc_with_stamp, secure_ensure_feed_owner, secure_stamp_chunk,
+    },
     //                                                                        //
     seek_next_feed_update_index,
     //                                                                        //
@@ -64,16 +66,64 @@ use serde_json::json;
 
 use wasm_bindgen::JsCast;
 
-use std::{collections::VecDeque, sync::atomic::AtomicBool};
+use libp2p::futures::{StreamExt, future::join_all, stream::FuturesUnordered};
+
+use std::{future::Future, pin::Pin, sync::atomic::AtomicBool};
 
 const BATCH_BUCKET_TRIALS: usize = 1024;
+const STAMP_CHUNK_WINDOW: usize = 64;
 const PUSH_CHUNK_ATTEMPT_RETRY_WAIT_MS: u64 = 50;
 const PUSH_CHUNK_ATTEMPT_SOFT_TIMEOUT_MS: u64 = 15000;
-const PUSH_CHUNK_QUEUE_WINDOW: usize = 1280;
-const PUSH_CHUNK_QUEUE_REFILL: usize = PUSH_CHUNK_QUEUE_WINDOW / 2;
+const PUSH_CHUNK_QUEUE_WINDOW: usize = 256;
+
+type ChunkUploadRequest = (
+    Vec<u8>,
+    bool,
+    Vec<u8>,
+    Vec<u8>,
+    mpsc::Sender<bool>,
+    mpsc::Sender<bool>,
+);
+type ChunkUploadSender = mpsc::Sender<ChunkUploadRequest>;
+type StampFuture = Pin<Box<dyn Future<Output = (usize, Option<StampedChunk>)>>>;
+type ChunkPushReceiptFuture = Pin<Box<dyn Future<Output = bool>>>;
+type ChunkPushReceipts = FuturesUnordered<ChunkPushReceiptFuture>;
 
 struct PushAttemptResult {
     success: bool,
+}
+
+fn record_push_attempt_result(
+    result: PushAttemptResult,
+    in_flight: &mut usize,
+    success_count: &mut usize,
+    error_count: &mut usize,
+) {
+    *in_flight = in_flight.saturating_sub(1);
+    if result.success {
+        *success_count += 1;
+    } else {
+        *error_count += 1;
+    }
+}
+
+fn drain_push_attempt_results(
+    attempt_in: &mpsc::Receiver<PushAttemptResult>,
+    in_flight: &mut usize,
+    success_count: &mut usize,
+    error_count: &mut usize,
+) {
+    while let Ok(result) = attempt_in.try_recv() {
+        record_push_attempt_result(result, in_flight, success_count, error_count);
+    }
+}
+
+struct StampedChunk {
+    reference: Vec<u8>,
+    data: Vec<u8>,
+    soc: bool,
+    address: Vec<u8>,
+    stamp: Vec<u8>,
 }
 
 fn reset_push_overdraft(skiplist: &mut HashSet<PeerId>, overdraftlist: &mut HashSet<PeerId>) {
@@ -82,29 +132,75 @@ fn reset_push_overdraft(skiplist: &mut HashSet<PeerId>, overdraftlist: &mut Hash
     }
 }
 
-async fn wait_for_chunk_pushes(mut receipts: VecDeque<mpsc::Receiver<bool>>) -> bool {
-    while let Some(receipt) = receipts.pop_front() {
-        match receipt.recv().await {
-            Ok(true) => {}
-            _ => return false,
+fn track_chunk_push_receipt(receipts: &mut ChunkPushReceipts, receipt: mpsc::Receiver<bool>) {
+    receipts.push(Box::pin(
+        async move { matches!(receipt.recv().await, Ok(true)) },
+    ));
+}
+
+async fn wait_for_chunk_pushes(receipts: &mut ChunkPushReceipts) -> bool {
+    while let Some(success) = receipts.next().await {
+        if !success {
+            return false;
         }
     }
 
     true
 }
 
-async fn wait_for_chunk_push_window(
-    receipts: &mut VecDeque<mpsc::Receiver<bool>>,
-    count: usize,
+async fn wait_for_next_chunk_push(receipts: &mut ChunkPushReceipts) -> bool {
+    match receipts.next().await {
+        Some(success) => success,
+        None => false,
+    }
+}
+
+async fn flush_stamp_window(
+    stamp_joiner: &mut Vec<StampFuture>,
+    level_refs: &mut Vec<Vec<u8>>,
+    chunk_receipts: &mut ChunkPushReceipts,
+    chunk_slot_receipts: &mut ChunkPushReceipts,
+    chunk_upload_chan: &ChunkUploadSender,
 ) -> bool {
-    for _ in 0..count.min(receipts.len()) {
-        let Some(receipt) = receipts.pop_front() else {
-            break;
+    if stamp_joiner.is_empty() {
+        return true;
+    }
+
+    let mut stamped = join_all(std::mem::take(stamp_joiner)).await;
+    stamped.sort_by_key(|(chunk_index, _)| *chunk_index);
+
+    for (_, stamped_chunk) in stamped {
+        let Some(stamped_chunk) = stamped_chunk else {
+            return false;
         };
 
-        match receipt.recv().await {
-            Ok(true) => {}
-            _ => return false,
+        let (result_chan_out, result_chan_in) = mpsc::unbounded::<bool>();
+        let (slot_chan_out, slot_chan_in) = mpsc::unbounded::<bool>();
+
+        if chunk_upload_chan
+            .try_send((
+                stamped_chunk.data,
+                stamped_chunk.soc,
+                stamped_chunk.address,
+                stamped_chunk.stamp,
+                result_chan_out,
+                slot_chan_out,
+            ))
+            .is_err()
+        {
+            return false;
+        }
+
+        level_refs.push(stamped_chunk.reference);
+        track_chunk_push_receipt(chunk_receipts, result_chan_in);
+        track_chunk_push_receipt(chunk_slot_receipts, slot_chan_in);
+
+        if chunk_slot_receipts.len() >= PUSH_CHUNK_QUEUE_WINDOW {
+            if !wait_for_next_chunk_push(chunk_slot_receipts).await {
+                return false;
+            }
+
+            async_std::task::yield_now().await;
         }
     }
 
@@ -146,57 +242,12 @@ async fn pushsync_attempt(
 }
 
 pub async fn stamp_chunk(
-    stamp_signer_key: Vec<u8>,
-    batch_id: Vec<u8>,
-    batch_bucket_limit: u32,
+    _stamp_signer_key: Vec<u8>,
+    _batch_id: Vec<u8>,
+    _batch_bucket_limit: u32,
     chunk_address: Vec<u8>,
 ) -> (Vec<u8>, bool) {
-    let stamp_signer: PrivateKeySigner = match PrivateKeySigner::from_slice(&stamp_signer_key) {
-        Ok(aok) => aok,
-        _ => return (vec![], false),
-    };
-
-    let bucket = u32::from_be_bytes(chunk_address[..4].try_into().unwrap()) >> (32 - 16);
-
-    #[allow(unused_assignments)]
-    let mut index = 0;
-
-    let (h, index0) = bump_bucket(hex::encode(&batch_id).to_string(), bucket.to_string()).await;
-    index = index0;
-
-    if index >= batch_bucket_limit {
-        return (vec![], true);
-    };
-
-    if !h {
-        return (vec![], false);
-    };
-
-    let index_bytes = [bucket.to_be_bytes(), index.to_be_bytes()].concat();
-
-    let timestamp: u64 = (Date::now() as u64) * 1000000;
-    let timestamp_bytes = timestamp.to_be_bytes().to_vec();
-
-    let to_sign_digest = keccak256(
-        [
-            chunk_address,
-            batch_id.clone(),
-            index_bytes.clone(),
-            timestamp_bytes.clone(),
-        ]
-        .concat(),
-    );
-
-    let signature = stamp_signer
-        .sign_message(to_sign_digest.as_slice())
-        .await
-        .unwrap()
-        .as_bytes()
-        .to_vec();
-
-    let stamp = [batch_id, index_bytes, timestamp_bytes, signature].concat();
-
-    (stamp, false)
+    secure_stamp_chunk(chunk_address).await
 }
 
 pub struct Resource {
@@ -217,7 +268,7 @@ pub async fn upload_resource(
     batch_owner: Vec<u8>,
     batch_id: Vec<u8>,
     data_upload_chan: &mpsc::Sender<(Vec<Vec<u8>>, u8, Vec<u8>, Vec<u8>, mpsc::Sender<Vec<u8>>)>,
-    chunk_upload_chan: &mpsc::Sender<(Vec<u8>, bool, Vec<u8>, Vec<u8>, mpsc::Sender<bool>)>,
+    chunk_upload_chan: &ChunkUploadSender,
     chunk_retrieve_chan: &ChunkRetrieveSender,
 ) -> Vec<u8> {
     //
@@ -283,6 +334,11 @@ pub async fn upload_resource(
     )
     .await;
 
+    if core_manifest.is_empty() {
+        render_log_message(&"Manifest creation failed".to_string());
+        return vec![];
+    }
+
     let core_manifest0 = core_manifest.clone();
 
     let manifest_reference = upload_data(
@@ -303,22 +359,11 @@ pub async fn upload_resource(
         return manifest_reference;
     }
 
-    let mut owner_bytes_0 = get_feed_owner_key().await;
-
-    if owner_bytes_0.len() == 0 {
-        owner_bytes_0 = encrey();
-        let saved = set_feed_owner_key(&owner_bytes_0).await;
-        if !saved {
-            return vec![];
-        };
+    let feed_owner = match secure_ensure_feed_owner().await {
+        Some(feed_owner) => feed_owner,
+        None => return vec![],
     };
 
-    let soc_signer: PrivateKeySigner = match PrivateKeySigner::from_slice(&owner_bytes_0.clone()) {
-        Ok(aok) => aok,
-        _ => return vec![],
-    };
-
-    let feed_owner = soc_signer.address().to_vec();
     let feed_metadata = serde_json::to_vec(&json!({
         "swarm-feed-owner": hex::encode(&feed_owner),
         "swarm-feed-topic": topic,
@@ -341,8 +386,14 @@ pub async fn upload_resource(
         &data_upload_chan,
     )
     .await;
+    if stub_reference.is_empty() {
+        return vec![];
+    }
 
     let root_fork = create_fork("/".to_string(), stub_reference, feed_metadata).await;
+    if root_fork.is_empty() {
+        return vec![];
+    }
 
     let feed_manifest = create_manifest(
         encryption,
@@ -359,6 +410,10 @@ pub async fn upload_resource(
         &data_upload_chan,
     )
     .await;
+
+    if feed_manifest.is_empty() {
+        return vec![];
+    }
 
     let feed_reference = upload_data(
         vec![feed_manifest],
@@ -401,35 +456,37 @@ pub async fn upload_resource(
     soc_wrapped_content.append(&mut wrapped_span.to_vec());
     soc_wrapped_content.append(&mut wrapped_content);
 
-    let index_bytes = index_up.to_le_bytes().to_vec();
-    // let owner_bytes = feed_owner.clone();
-    let topic_bytes = match hex::decode(topic) {
-        Ok(aok) => aok,
-        _ => return vec![],
+    let feed_update = match secure_create_feed_update_soc_with_stamp(
+        topic.clone(),
+        index_up,
+        soc_wrapped_content,
+    )
+    .await
+    {
+        Some(feed_update) => feed_update,
+        None => return vec![],
     };
 
-    let id_bytes = keccak256([topic_bytes, index_bytes].concat()).to_vec();
-
-    let (soc_actual, soc_address) = make_soc(&soc_wrapped_content, owner_bytes_0, id_bytes).await;
+    if feed_update.bucket_full {
+        return vec![];
+    }
 
     let (result_chan_out, result_chan_in) = mpsc::unbounded::<bool>();
+    let (slot_chan_out, _slot_chan_in) = mpsc::unbounded::<bool>();
 
-    let batch_bucket_limit = get_batch_bucket_limit().await;
-
-    let (cstamp0, _bucket_full) = stamp_chunk(
-        batch_owner.clone(),
-        batch_id.clone(),
-        batch_bucket_limit,
-        soc_address.clone(),
-    )
-    .await;
-
-    if cstamp0.len() == 0 {
+    if feed_update.stamp.len() == 0 {
         return vec![];
     }
 
     if chunk_upload_chan
-        .try_send((soc_actual, true, soc_address, cstamp0, result_chan_out))
+        .try_send((
+            feed_update.soc_chunk,
+            true,
+            feed_update.soc_address,
+            feed_update.stamp,
+            result_chan_out,
+            slot_chan_out,
+        ))
         .is_err()
     {
         return vec![];
@@ -474,13 +531,90 @@ pub async fn upload_data(
     return result;
 }
 
+async fn stamp_push_chunk(
+    ch_d: Vec<u8>,
+    span: usize,
+    encryption: bool,
+    batch_owner: Vec<u8>,
+    batch_id: Vec<u8>,
+    batch_bucket_limit: u32,
+) -> Option<StampedChunk> {
+    let mut soc = false;
+    let mut encrey0 = vec![];
+
+    let mut data0 = match encryption {
+        true => {
+            encrey0 = encrey();
+            encrypt(span, &ch_d, &encrey0)
+        }
+        false => [(span as u64).to_le_bytes().to_vec(), ch_d.clone()].concat(),
+    };
+
+    let mut cstamp0: Vec<u8> = vec![];
+    let mut bucket_full: bool;
+    let mut cha = content_address(&data0);
+
+    for _ in 0..BATCH_BUCKET_TRIALS {
+        (cstamp0, bucket_full) = stamp_chunk(
+            batch_owner.clone(),
+            batch_id.clone(),
+            batch_bucket_limit,
+            cha.clone(),
+        )
+        .await;
+
+        if !bucket_full {
+            break;
+        } else {
+            render_log_message(&"Restamping chunk to avoid bucket overflow".to_string());
+            match encryption {
+                true => {
+                    encrey0 = encrey();
+                    data0 = encrypt(span, &ch_d, &encrey0);
+                    cha = content_address(&data0);
+                }
+                false => {
+                    soc = true;
+                    let ob = encrey();
+                    let idb = encrey();
+
+                    let mut soc_wrapped_content: Vec<u8> = vec![];
+                    soc_wrapped_content.append(&mut (span as u64).to_le_bytes().to_vec());
+                    soc_wrapped_content.append(&mut ch_d.clone());
+
+                    let (data00, cha0) = make_soc(&soc_wrapped_content, ob, idb).await;
+
+                    data0 = data00;
+                    cha = cha0;
+                }
+            }
+        }
+    }
+
+    if cstamp0.len() == 0 {
+        render_log_message(&"Stamp length 0".to_string());
+
+        return None;
+    }
+
+    let reference = [cha.clone(), encrey0].concat();
+
+    Some(StampedChunk {
+        reference,
+        data: data0,
+        soc,
+        address: cha,
+        stamp: cstamp0,
+    })
+}
+
 pub async fn push_data(
     mut data: Vec<Vec<u8>>,
     encryption: bool,
     batch_owner: Vec<u8>,
     batch_id: Vec<u8>,
     batch_bucket_limit: u32,
-    chunk_upload_chan: &mpsc::Sender<(Vec<u8>, bool, Vec<u8>, Vec<u8>, mpsc::Sender<bool>)>,
+    chunk_upload_chan: &ChunkUploadSender,
 ) -> Vec<u8> {
     let mut span_length = 0;
 
@@ -548,9 +682,17 @@ pub async fn push_data(
         }
 
         let (result_chan_out, result_chan_in) = mpsc::unbounded::<bool>();
+        let (slot_chan_out, _slot_chan_in) = mpsc::unbounded::<bool>();
 
         if chunk_upload_chan
-            .try_send((data0, soc, cha.clone(), cstamp0, result_chan_out))
+            .try_send((
+                data0,
+                soc,
+                cha.clone(),
+                cstamp0,
+                result_chan_out,
+                slot_chan_out,
+            ))
             .is_err()
         {
             return vec![];
@@ -579,12 +721,14 @@ pub async fn push_data(
         let next_level = true;
         let mut span_carriage = 4096;
 
-        let mut chunk_receipts: VecDeque<mpsc::Receiver<bool>> = VecDeque::new();
-        let mut count_yield = 0;
+        let mut chunk_receipts: ChunkPushReceipts = FuturesUnordered::new();
+        let mut chunk_slot_receipts: ChunkPushReceipts = FuturesUnordered::new();
 
         while next_level {
             let mut sc = 0;
             levels.push(Vec::new());
+            let mut stamp_joiner: Vec<StampFuture> = Vec::new();
+            let mut stamp_order = 0usize;
 
             for level_data in &data {
                 let mut chunk_l0r = level_data.len() % 4096;
@@ -615,109 +759,73 @@ pub async fn push_data(
                     }
 
                     if data_end - data_start == address_length && level > 0 {
-                        levels[level].push(ch_d);
-                    } else {
-                        let mut soc = false;
-                        let mut encrey0 = vec![];
-
-                        let mut data0 = match encryption {
-                            true => {
-                                encrey0 = encrey();
-                                encrypt(span, &ch_d, &encrey0)
-                            }
-                            false => [(span as u64).to_le_bytes().to_vec(), ch_d.clone()].concat(),
-                        };
-
-                        let mut cstamp0: Vec<u8> = vec![];
-                        let mut bucket_full: bool;
-                        let mut cha = content_address(&data0);
-
-                        for _ in 0..BATCH_BUCKET_TRIALS {
-                            (cstamp0, bucket_full) = stamp_chunk(
-                                batch_owner.clone(),
-                                batch_id.clone(),
-                                batch_bucket_limit,
-                                cha.clone(),
-                            )
-                            .await;
-
-                            if !bucket_full {
-                                break;
-                            } else {
-                                render_log_message(
-                                    &"Restamping chunk to avoid bucket overflow".to_string(),
-                                );
-                                match encryption {
-                                    true => {
-                                        encrey0 = encrey();
-                                        data0 = encrypt(span, &ch_d, &encrey0);
-                                        cha = content_address(&data0);
-                                    }
-                                    false => {
-                                        soc = true;
-                                        let ob = encrey();
-                                        let idb = encrey();
-
-                                        let mut soc_wrapped_content: Vec<u8> = vec![];
-                                        soc_wrapped_content
-                                            .append(&mut (span as u64).to_le_bytes().to_vec());
-                                        soc_wrapped_content.append(&mut ch_d.clone());
-
-                                        let (data00, cha0) =
-                                            make_soc(&soc_wrapped_content, ob, idb).await;
-
-                                        data0 = data00;
-                                        cha = cha0;
-                                    }
-                                }
-                            }
-                        }
-
-                        if cstamp0.len() == 0 {
-                            render_log_message(&"Stamp length 0".to_string());
-
-                            return vec![];
-                        }
-                        //    stamp_signer_key: Vec<u8>,
-                        //    batch_id: Vec<u8>,
-                        //    batch_bucket_limit: u32,
-                        //    chunk_address: Vec<u8>,
-
-                        levels[level].push([cha.clone(), encrey0].concat());
-
-                        // (span as u64).to_le_bytes().to_vec(),
-
-                        let (result_chan_out, result_chan_in) = mpsc::unbounded::<bool>();
-
-                        if chunk_upload_chan
-                            .try_send((data0, soc, cha, cstamp0, result_chan_out))
-                            .is_err()
+                        if !flush_stamp_window(
+                            &mut stamp_joiner,
+                            &mut levels[level],
+                            &mut chunk_receipts,
+                            &mut chunk_slot_receipts,
+                            chunk_upload_chan,
+                        )
+                        .await
                         {
                             return vec![];
                         }
-                        chunk_receipts.push_back(result_chan_in);
-                        count_yield += 1;
 
-                        if count_yield >= PUSH_CHUNK_QUEUE_WINDOW {
-                            if !wait_for_chunk_push_window(
+                        levels[level].push(ch_d);
+                    } else {
+                        let chunk_index = stamp_order;
+                        stamp_order += 1;
+
+                        let batch_owner0 = batch_owner.clone();
+                        let batch_id0 = batch_id.clone();
+
+                        stamp_joiner.push(Box::pin(async move {
+                            (
+                                chunk_index,
+                                stamp_push_chunk(
+                                    ch_d,
+                                    span,
+                                    encryption,
+                                    batch_owner0,
+                                    batch_id0,
+                                    batch_bucket_limit,
+                                )
+                                .await,
+                            )
+                        }));
+
+                        if stamp_joiner.len() >= STAMP_CHUNK_WINDOW {
+                            if !flush_stamp_window(
+                                &mut stamp_joiner,
+                                &mut levels[level],
                                 &mut chunk_receipts,
-                                PUSH_CHUNK_QUEUE_REFILL,
+                                &mut chunk_slot_receipts,
+                                chunk_upload_chan,
                             )
                             .await
                             {
                                 return vec![];
                             }
-
-                            count_yield = chunk_receipts.len();
-                            async_std::task::yield_now().await;
                         }
                     }
                 }
             }
 
+            if !flush_stamp_window(
+                &mut stamp_joiner,
+                &mut levels[level],
+                &mut chunk_receipts,
+                &mut chunk_slot_receipts,
+                chunk_upload_chan,
+            )
+            .await
+            {
+                return vec![];
+            }
+
             if levels[level].len() == 1 {
                 let reference = levels[level][0].clone();
-                if !wait_for_chunk_pushes(chunk_receipts).await {
+                if !wait_for_chunk_pushes(&mut chunk_receipts).await {
                     return vec![];
                 }
                 return reference;
@@ -762,28 +870,35 @@ pub async fn push_chunk(
     let mut success_count = 0usize;
     let mut round_commence = Date::now();
     let mut error_count = 0;
-    let max_error = 19;
-    let mut attempts_started = 0usize;
+    let max_error = 21 - PUSH_CHUNK_CONFIRMATION_PEERS;
     let mut in_flight = 0usize;
     let mut last_attempt_started = 0.0;
     let (attempt_out, attempt_in) = mpsc::unbounded::<PushAttemptResult>();
 
-    while attempts_started < max_error && success_count < PUSH_CHUNK_CONFIRMATION_PEERS {
+    while error_count < max_error && success_count < PUSH_CHUNK_CONFIRMATION_PEERS {
+        drain_push_attempt_results(
+            &attempt_in,
+            &mut in_flight,
+            &mut success_count,
+            &mut error_count,
+        );
+
+        if error_count >= max_error || success_count >= PUSH_CHUNK_CONFIRMATION_PEERS {
+            break;
+        }
+
         while transfer_paused
             .as_ref()
             .map(transfer_pause_enabled)
             .unwrap_or(false)
         {
             async_std::task::sleep(Duration::from_millis(100)).await;
-        }
-
-        while let Ok(result) = attempt_in.try_recv() {
-            in_flight = in_flight.saturating_sub(1);
-            if result.success {
-                success_count += 1;
-            } else {
-                error_count += 1;
-            }
+            drain_push_attempt_results(
+                &attempt_in,
+                &mut in_flight,
+                &mut success_count,
+                &mut error_count,
+            );
         }
 
         if error_count >= max_error || success_count >= PUSH_CHUNK_CONFIRMATION_PEERS {
@@ -803,12 +918,12 @@ pub async fn push_chunk(
                 .await
             {
                 Ok(Ok(result)) => {
-                    in_flight = in_flight.saturating_sub(1);
-                    if result.success {
-                        success_count += 1;
-                    } else {
-                        error_count += 1;
-                    }
+                    record_push_attempt_result(
+                        result,
+                        &mut in_flight,
+                        &mut success_count,
+                        &mut error_count,
+                    );
                 }
                 Ok(Err(_)) => break,
                 Err(_) => {}
@@ -820,6 +935,17 @@ pub async fn push_chunk(
         let mut selected_peer: Option<(PeerId, u64)> = None;
 
         while selected_peer.is_none() {
+            drain_push_attempt_results(
+                &attempt_in,
+                &mut in_flight,
+                &mut success_count,
+                &mut error_count,
+            );
+
+            if error_count >= max_error || success_count >= PUSH_CHUNK_CONFIRMATION_PEERS {
+                break;
+            }
+
             let mut closest_overlay = "".to_string();
             let mut closest_peer_id: Option<PeerId> = None;
             let mut current_max_po = 0;
@@ -866,7 +992,7 @@ pub async fn push_chunk(
 
                 round_commence = Date::now();
 
-                if error_count >= max_error {
+                if error_count >= max_error || success_count >= PUSH_CHUNK_CONFIRMATION_PEERS {
                     break;
                 }
 
@@ -935,11 +1061,11 @@ pub async fn push_chunk(
         });
 
         in_flight += 1;
-        attempts_started += 1;
         last_attempt_started = Date::now();
     }
 
-    while in_flight > 0 && success_count < PUSH_CHUNK_CONFIRMATION_PEERS {
+    while in_flight > 0 && error_count < max_error && success_count < PUSH_CHUNK_CONFIRMATION_PEERS
+    {
         match async_std::future::timeout(
             Duration::from_millis(PUSH_CHUNK_ATTEMPT_SOFT_TIMEOUT_MS),
             attempt_in.recv(),
@@ -947,10 +1073,12 @@ pub async fn push_chunk(
         .await
         {
             Ok(Ok(result)) => {
-                in_flight = in_flight.saturating_sub(1);
-                if result.success {
-                    success_count += 1;
-                }
+                record_push_attempt_result(
+                    result,
+                    &mut in_flight,
+                    &mut success_count,
+                    &mut error_count,
+                );
             }
             Ok(Err(_)) => break,
             Err(_) => break,

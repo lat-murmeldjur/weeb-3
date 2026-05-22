@@ -667,13 +667,29 @@ pub async fn retrieve_check_chunk(
     let mut success_peers: HashSet<PeerId> = HashSet::new();
 
     let mut error_count = 0;
-    let max_error = 19;
+    let max_error = 21 - RETRIEVE_CHECK_CONFIRMATION_PEERS;
 
     #[allow(unused_assignments)]
     let mut cd = vec![];
     let mut soc = false;
+    let (attempt_out, attempt_in) = mpsc::unbounded::<RetrieveAttemptResult>();
 
     while error_count < max_error && success_peers.len() < RETRIEVE_CHECK_CONFIRMATION_PEERS {
+        while let Ok(result) = attempt_in.try_recv() {
+            if result.valid {
+                if success_peers.insert(result.peer) && cd.is_empty() {
+                    cd = result.chunk;
+                    soc = result.soc;
+                }
+            } else {
+                error_count += 1;
+            }
+        }
+
+        if error_count >= max_error || success_peers.len() >= RETRIEVE_CHECK_CONFIRMATION_PEERS {
+            break;
+        }
+
         while transfer_paused
             .as_ref()
             .map(transfer_pause_enabled)
@@ -708,28 +724,15 @@ pub async fn retrieve_check_chunk(
             continue;
         }
 
-        let (attempt_out, attempt_in) = mpsc::unbounded::<RetrieveAttemptResult>();
         retrieve_attempt(
             selected,
             caddr.clone(),
             control.clone(),
             accounting.clone(),
             refresh_chan.clone(),
-            attempt_out,
+            attempt_out.clone(),
         )
         .await;
-
-        match attempt_in.recv().await {
-            Ok(result) if result.valid => {
-                if success_peers.insert(result.peer) && cd.len() == 0 {
-                    cd = result.chunk;
-                    soc = result.soc;
-                }
-            }
-            _ => {
-                error_count += 1;
-            }
-        }
     }
 
     if success_peers.len() < RETRIEVE_CHECK_CONFIRMATION_PEERS {

@@ -216,6 +216,9 @@ pub async fn create_manifest(
                     data_upload_chan,
                 ))
                 .await;
+                if tip_mf.is_empty() {
+                    return vec![];
+                }
 
                 current_data_reference = upload_data(
                     vec![tip_mf],
@@ -225,6 +228,9 @@ pub async fn create_manifest(
                     data_upload_chan,
                 )
                 .await;
+                if current_data_reference.is_empty() {
+                    return vec![];
+                }
 
                 for j in 0..vforks.len() {
                     let i = vforks.len() - 1 - j;
@@ -241,6 +247,9 @@ pub async fn create_manifest(
                         current_metadata,
                     )
                     .await;
+                    if current_fork.is_empty() {
+                        return vec![];
+                    }
 
                     if i > 0 {
                         let current_manifest = Box::pin(create_manifest(
@@ -258,6 +267,9 @@ pub async fn create_manifest(
                             data_upload_chan,
                         ))
                         .await;
+                        if current_manifest.is_empty() {
+                            return vec![];
+                        }
 
                         current_data_reference = upload_data(
                             vec![current_manifest],
@@ -267,6 +279,9 @@ pub async fn create_manifest(
                             data_upload_chan,
                         )
                         .await;
+                        if current_data_reference.is_empty() {
+                            return vec![];
+                        }
                     } else {
                         fork_bases.push(current_fork);
                     }
@@ -297,6 +312,9 @@ pub async fn create_manifest(
                     data_upload_chan,
                 ))
                 .await;
+                if group_manifest.is_empty() {
+                    return vec![];
+                }
 
                 fncutoff = 0;
 
@@ -308,6 +326,9 @@ pub async fn create_manifest(
                     data_upload_chan,
                 )
                 .await;
+                if group_data_reference.is_empty() {
+                    return vec![];
+                }
 
                 let group_fork = create_fork(
                     common_prefix.to_string(),
@@ -315,6 +336,9 @@ pub async fn create_manifest(
                     vec![],
                 )
                 .await;
+                if group_fork.is_empty() {
+                    return vec![];
+                }
 
                 fork_bases.push(group_fork);
             }
@@ -345,8 +369,14 @@ pub async fn create_manifest(
             data_upload_chan,
         )
         .await;
+        if stub_reference.is_empty() {
+            return vec![];
+        }
 
         let mut root_fork = create_fork("/".to_string(), stub_reference, root_metadata).await;
+        if root_fork.is_empty() {
+            return vec![];
+        }
         fork_bases_virtual.push(root_fork[0..3].to_vec());
         manifest_bytes_vec.append(&mut root_fork);
     }
@@ -478,13 +508,11 @@ pub async fn create_fork(path: String, reference: Vec<u8>, metadata: Vec<u8>) ->
     if reference.len() == 32 || reference.len() == 64 {
         node.append(&mut reference.clone());
     } else {
-        for _ in 0..32 {
-            node.push(0_u8);
-        }
         web_sys::console::log_1(&JsValue::from(format!(
             "Manifest reference default length {:#?}!",
             hex::encode(&reference)
         )));
+        return vec![];
     }
     if metadata.len() > 0 {
         let xl0 = 2 + metadata.len();

@@ -31,15 +31,19 @@ use crate::{
     nav::{clear_path, read_path},
     on_chain::{
         buy_postage_batch_with_payer, chequebook_balance, deploy_chequebook_with_payer,
-        deposit_to_chequebook, get_batch_validity, token_contract,
+        deposit_to_chequebook, token_contract,
     },
     persistence::{
-        get_batch_bucket_limit, get_batch_id, get_batch_owner_key, get_chequebook_address,
-        get_chequebook_signer_key, set_batch_bucket_limit, set_batch_id, set_batch_owner_key,
-        set_chequebook_address, set_chequebook_signer_key,
+        get_chequebook_address, get_chequebook_signer_key, set_chequebook_address,
+        set_chequebook_signer_key,
+    },
+    secure_vault::{
+        secure_batch_state_for_wallet, secure_commit_batch_purchase,
+        secure_open_vault_from_user_action, secure_preload_vault_module,
+        secure_prepare_batch_purchase,
     },
 };
-use alloy::{network::EthereumWallet, signers::local::PrivateKeySigner};
+use alloy::signers::local::PrivateKeySigner;
 
 #[wasm_bindgen]
 pub async fn interweeb(_st: String) -> Result<(), JsError> {
@@ -50,6 +54,8 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
     let weeb3 = Arc::new(Weeb3::new("".to_string()));
 
     let weeb30 = weeb3.clone();
+
+    secure_preload_vault_module();
 
     spawn_local(async move {
         weeb30.run("".to_string()).await;
@@ -86,17 +92,6 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
             connect_bootnode_setting(weeb316, "bootNodeMASettings5"),
             connect_bootnode_setting(weeb317, "bootNodeMASettings6")
         );
-    });
-
-    spawn_local(async {
-        let stored_batch_id = get_batch_id().await;
-        if stored_batch_id.len() == 32 {
-            let validity = get_batch_validity(stored_batch_id).await;
-            web_sys::console::log_1(&JsValue::from(format!(
-                "Found batch with validity {:#?}",
-                validity
-            )));
-        }
     });
 
     spawn_local(async {
@@ -311,16 +306,25 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
                                             }
                                         };
 
-                                        let stored_stamp_signer_key = get_batch_owner_key().await;
-                                        let stored_batch_id = get_batch_id().await;
-                                        let bucket_limit = get_batch_bucket_limit().await;
-                                        if !stored_stamp_signer_key.is_empty()
-                                            && !stored_batch_id.is_empty()
-                                            && bucket_limit > 0
+                                        let secure_state = match secure_batch_state_for_wallet(
+                                            payer.as_bytes(),
+                                        )
+                                        .await
                                         {
+                                            Some(state) => state,
+                                            None => {
+                                                let wnd = web_sys::window().unwrap();
+                                                let _ = wnd.alert_with_message(
+                                                    "Could not check weeb-3-secure for the connected wallet",
+                                                );
+                                                return;
+                                            }
+                                        };
+
+                                        if secure_state.usable() {
                                             let wnd = web_sys::window().unwrap();
                                             let _ = wnd.alert_with_message(
-                                                "Already have a batch for uploads",
+                                                "Already have a secure batch for uploads",
                                             );
                                             return;
                                         }
@@ -338,32 +342,34 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
                                             }
                                         }
 
-                                        let stamp_signer_key = encrey();
-                                        let stamp_signer: PrivateKeySigner =
-                                            match PrivateKeySigner::from_slice(&stamp_signer_key) {
-                                                Ok(s) => s,
-                                                Err(_) => {
-                                                    let wnd = web_sys::window().unwrap();
-                                                    let _ = wnd.alert_with_message(
-                                                        "Failed to create local stamp signer key",
-                                                    );
-                                                    return;
-                                                }
-                                            };
-                                        let _wallet = EthereumWallet::from(stamp_signer.clone());
-                                        let owner_h160_bytes: [u8; 20] =
-                                            *stamp_signer.address().as_ref();
-                                        let owner = Address::from(owner_h160_bytes);
+                                        let prepared = match secure_prepare_batch_purchase(
+                                            batch_depth,
+                                            validity,
+                                        )
+                                        .await
+                                        {
+                                            Some(prepared) if prepared.owner.len() == 20 => {
+                                                prepared
+                                            }
+                                            _ => {
+                                                let wnd = web_sys::window().unwrap();
+                                                let _ = wnd.alert_with_message(
+                                                    "Failed to prepare secure batch owner",
+                                                );
+                                                return;
+                                            }
+                                        };
+                                        let owner = Address::from_slice(&prepared.owner);
 
                                         web_sys::console::log_1(&JsValue::from(format!(
-                                            "StampSigner addr 0x{} | payer 0x{}",
-                                            hex::encode(owner_h160_bytes),
+                                            "Secure batch owner 0x{} | payer 0x{}",
+                                            hex::encode(&prepared.owner),
                                             hex::encode(payer.as_bytes())
                                         )));
 
                                         let purchase = match buy_postage_batch_with_payer(
-                                            validity,
-                                            batch_depth,
+                                            prepared.validity_days,
+                                            prepared.depth,
                                             owner,
                                             payer,
                                         )
@@ -380,23 +386,16 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
                                             }
                                         };
 
-                                        if !set_batch_owner_key(&stamp_signer_key).await {
+                                        if !secure_commit_batch_purchase(
+                                            &purchase.batch_id,
+                                            purchase.bucket_limit,
+                                            prepared.depth,
+                                        )
+                                        .await
+                                        {
                                             let wnd = web_sys::window().unwrap();
                                             let _ = wnd.alert_with_message(
-                                                "Failed to save batch owner key",
-                                            );
-                                            return;
-                                        }
-                                        if !set_batch_id(&purchase.batch_id).await {
-                                            let wnd = web_sys::window().unwrap();
-                                            let _ =
-                                                wnd.alert_with_message("Failed to save batch id");
-                                            return;
-                                        }
-                                        if !set_batch_bucket_limit(purchase.bucket_limit).await {
-                                            let wnd = web_sys::window().unwrap();
-                                            let _ = wnd.alert_with_message(
-                                                "Failed to save batch bucket depth",
+                                                "Failed to save batch in weeb-3-secure",
                                             );
                                             return;
                                         }
@@ -406,8 +405,8 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
                                             hex::encode(purchase.approve_tx.as_bytes()),
                                             hex::encode(purchase.create_tx.as_bytes()),
                                             hex::encode(&purchase.batch_id),
-                                            batch_depth,
-                                            validity,
+                                            prepared.depth,
+                                            prepared.validity_days,
                                             purchase.last_price,
                                         )));
 
@@ -415,7 +414,7 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
                                         let _ = wnd.alert_with_message(&format!(
                                     "Storage batch ready.\nBatch ID: 0x{}\nDepth: {}\nStorage slots per bucket: {}",
                                     hex::encode(&purchase.batch_id),
-                                    batch_depth,
+                                    prepared.depth,
                                     purchase.bucket_limit
                                 ));
                                         return;
@@ -468,33 +467,8 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
                     Some(aok) => aok,
                     _ => return,
                 };
+                secure_open_vault_from_user_action();
                 spawn_local(async move {
-                    let stored_stamp_signer_key = get_batch_owner_key().await;
-                    let stored_batch_id = get_batch_id().await;
-                    let bucket_limit = get_batch_bucket_limit().await;
-
-                    if stored_stamp_signer_key.len() == 0
-                        || stored_batch_id.len() == 0
-                        || bucket_limit == 0
-                    {
-                        let window = web_sys::window().unwrap();
-                        let _ = window.alert_with_message("Require a postage batch for uploads. To get one, connect metamask wallet with sepolia Eth / sepolia Bzz with the 'Create Storage on Swarm for Uploads' button");
-                        return;
-                    }
-
-                    let validity = get_batch_validity(stored_batch_id).await;
-
-                    if validity == U256::from(0) {
-                        let window = web_sys::window().unwrap();
-                        let _ = window.alert_with_message(
-                            "Postage batch validity reached zero. Getting a new batch is required.",
-                        );
-
-                        set_batch_owner_key(&vec![]).await;
-                        set_batch_id(&vec![]).await;
-                        set_batch_bucket_limit(0).await;
-                    }
-
                     let file_enc = document
                         .get_element_by_id("uploadFileEncrypt")
                         .expect("#uploadFileEncrypt should exist");
