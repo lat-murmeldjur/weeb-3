@@ -33,11 +33,11 @@ use crate::weeb_3::etiquette_6;
 use crate::weeb_3::etiquette_7;
 use crate::weeb_3::etiquette_8;
 
-use crate::on_chain::ChequebookClient;
 use crate::persistence::{
     get_chequebook_address, get_chequebook_last_issued_cheque_payout, get_chequebook_signer_key,
     set_chequebook_last_issued_cheque_payout,
 };
+use crate::{network_profile::active_profile, on_chain::ChequebookClient};
 use ethers::signers::LocalWallet;
 use ethers::types::{Address as EthAddress, U256 as EthU256};
 
@@ -46,6 +46,16 @@ use crate::PSEUDOSETTLE_PROTOCOL;
 use crate::PUSHSYNC_PROTOCOL;
 use crate::RETRIEVAL_PROTOCOL;
 use crate::SWAP_PROTOCOL;
+
+const DEBUG_HANDLER_LOGS: bool = false;
+
+macro_rules! handler_log {
+    ($($arg:tt)*) => {
+        if DEBUG_HANDLER_LOGS {
+            web_sys::console::log_1(&JsValue::from(format!($($arg)*)));
+        }
+    };
+}
 
 struct OutgoingChequeState {
     beneficiary_bytes: Vec<u8>,
@@ -135,7 +145,7 @@ pub async fn ceive(
     pk: &Arc<Mutex<ecdsa::SecretKey>>,
     chan: &mpsc::Sender<PeerFile>,
 ) -> bool {
-    web_sys::console::log_1(&JsValue::from("Handshake stage 1 0"));
+    handler_log!("Handshake stage 1 0");
 
     let mut step_0 = etiquette_1::Syn::default();
 
@@ -156,7 +166,7 @@ pub async fn ceive(
     };
     let _ = stream.flush().await;
 
-    web_sys::console::log_1(&JsValue::from("Handshake stage 1 1"));
+    handler_log!("Handshake stage 1 1");
 
     let mut buf_nondiscard_0 = Vec::new();
     let mut buf_discard_0: [u8; 255] = [0; 255];
@@ -173,7 +183,7 @@ pub async fn ceive(
         }
     }
 
-    web_sys::console::log_1(&JsValue::from("Handshake stage 1 2"));
+    handler_log!("Handshake stage 1 2");
 
     let rec_0_u = etiquette_1::SynAck::decode_length_delimited(&mut Cursor::new(buf_nondiscard_0));
 
@@ -184,14 +194,11 @@ pub async fn ceive(
         }
     };
 
-    web_sys::console::log_1(&JsValue::from(format!(
-        "Handshake stage 1 3 2 \n {:#?}",
-        rec_0
-    )));
+    handler_log!("Handshake stage 1 3 2 \n {:#?}", rec_0);
 
     let underlay = self_ephemeral.to_vec();
 
-    web_sys::console::log_1(&JsValue::from("Handshake stage 1 3 3"));
+    handler_log!("Handshake stage 1 3 3");
 
     let peer_overlay = rec_0.ack.clone().unwrap().address.unwrap().overlay;
 
@@ -211,9 +218,7 @@ pub async fn ceive(
             .chequebook_address,
     );
 
-    web_sys::console::log_1(&JsValue::from("Handshake stage 1 3"));
-
-    // web_sys::console::log_1(&JsValue::from(format!("Got underlay {}!", underlay)));
+    handler_log!("Handshake stage 1 3");
 
     let overlay;
     let signature;
@@ -261,7 +266,7 @@ pub async fn ceive(
     step_1.full_node = true;
     step_1.welcome_message = "... Ara Ara ...".to_string();
 
-    web_sys::console::log_1(&JsValue::from("Handshake stage 1 4"));
+    handler_log!("Handshake stage 1 4");
 
     let mut bufw_1 = Vec::new();
 
@@ -277,16 +282,13 @@ pub async fn ceive(
     };
     let _ = stream.flush().await;
 
-    web_sys::console::log_1(&JsValue::from("Handshake stage 1 5"));
+    handler_log!("Handshake stage 1 5");
 
     let _ = stream.close().await;
 
-    web_sys::console::log_1(&JsValue::from("Handshake stage 1 6"));
+    handler_log!("Handshake stage 1 6");
 
-    web_sys::console::log_1(&JsValue::from(format!(
-        "Connected Peer {:#?} with address {}!",
-        peer, beneficiary
-    )));
+    handler_log!("Connected Peer {:#?} with address {}!", peer, beneficiary);
 
     chan.try_send(PeerFile {
         peer_id: peer,
@@ -299,10 +301,7 @@ pub async fn ceive(
 }
 
 pub async fn pricing_handler(peer: PeerId, mut stream: Stream, chan: &mpsc::Sender<(PeerId, u64)>) {
-    web_sys::console::log_1(&JsValue::from(format!(
-        "Opened pricing handle for peer {}!",
-        peer
-    )));
+    handler_log!("Opened pricing handle for peer {}!", peer);
 
     let mut buf_nondiscard_0 = Vec::new();
     let mut buf_discard_0: [u8; 255] = [0; 255];
@@ -358,15 +357,12 @@ pub async fn pricing_handler(peer: PeerId, mut stream: Stream, chan: &mpsc::Send
     let rec_0 = match rec_0_u {
         Ok(x) => x,
         Err(_x) => {
-            web_sys::console::log_1(&JsValue::from(format!("Error in protocol {:#?}!", _x)));
+            handler_log!("Error in protocol {:#?}!", _x);
             return;
         }
     };
 
-    web_sys::console::log_1(&JsValue::from(format!(
-        "Got AnnouncePaymentThreshold {:#?}!",
-        rec_0
-    )));
+    handler_log!("Got AnnouncePaymentThreshold {:#?}!", rec_0);
 
     let pt = BigUint::from_bytes_be(&rec_0.payment_threshold)
         .to_u64()
@@ -380,10 +376,7 @@ pub async fn gossip_handler(
     mut stream: Stream,
     chan: &mpsc::Sender<etiquette_2::BzzAddress>,
 ) {
-    web_sys::console::log_1(&JsValue::from(format!(
-        "Opened gossip handle for peer {}!",
-        peer
-    )));
+    handler_log!("Opened gossip handle for peer {}!", peer);
 
     let mut buf_nondiscard_0 = Vec::new();
     let mut buf_discard_0: [u8; 255] = [0; 255];
@@ -437,18 +430,12 @@ pub async fn gossip_handler(
     let rec_0 = match rec_0_u {
         Ok(x) => x,
         Err(x) => {
-            web_sys::console::log_1(&JsValue::from(format!("Error in protocol {:#?}!", x)));
+            handler_log!("Error in protocol {:#?}!", x);
             return;
         }
     };
 
-    // web_sys::console::log_1(&JsValue::from(format!("Got Peers Message {:#?}!", rec_0)));
-
     for peer in rec_0.peers {
-        // web_sys::console::log_1(&JsValue::from(format!(
-        //     "Got gossip of peer {:#?}!",
-        //     hex::encode(&peer.overlay)
-        // )));
         chan.try_send(peer).unwrap();
     }
 }
@@ -535,7 +522,7 @@ pub async fn fresh(
         Ok(x) => x,
         Err(x) => {
             chan.try_send((peer, 0)).unwrap();
-            web_sys::console::log_1(&JsValue::from(format!("Error in protocol {:#?}!", x)));
+            handler_log!("Error in protocol {:#?}!", x);
             return;
         }
     };
@@ -559,17 +546,12 @@ pub async fn issue(
     price: U256,
     deduction: U256,
 ) {
-    web_sys::console::log_1(&JsValue::from(format!(
-        "Opened issue handle for peer {}!",
-        peer
-    )));
+    handler_log!("Opened issue handle for peer {}!", peer);
 
     let signer_key = get_chequebook_signer_key().await;
     if signer_key.len() != 32 {
         let _ = chan.try_send((peer, false)).unwrap_or(());
-        web_sys::console::log_1(&JsValue::from(format!(
-            "Issue fail 1 - no chequebook signer"
-        )));
+        handler_log!("Issue fail 1 - no chequebook signer");
         return;
     }
 
@@ -577,7 +559,7 @@ pub async fn issue(
         Ok(w) => w,
         Err(_) => {
             let _ = chan.try_send((peer, false)).unwrap_or(());
-            web_sys::console::log_1(&JsValue::from(format!("Issue fail 2")));
+            handler_log!("Issue fail 2");
             return;
         }
     };
@@ -589,15 +571,15 @@ pub async fn issue(
             Some(state) => state,
             None => {
                 let _ = chan.try_send((peer, false)).unwrap_or(());
-                web_sys::console::log_1(&JsValue::from(format!("Issue fail 3")));
+                handler_log!("Issue fail 3");
                 return;
             }
         };
 
-    web_sys::console::log_1(&JsValue::from(format!(
+    handler_log!(
         "Issue cheque attempt {}",
         outgoing_cheque_trace(&peer, &cheque_state)
-    )));
+    );
 
     let mut non_empty = etiquette_0::Headers::default();
 
@@ -629,11 +611,11 @@ pub async fn issue(
         Ok(_) => {}
         Err(_) => {
             chan.try_send((peer, false)).unwrap();
-            web_sys::console::log_1(&JsValue::from(format!(
+            handler_log!(
                 "Issue cheque send failed {}",
                 outgoing_cheque_trace(&peer, &cheque_state)
-            )));
-            web_sys::console::log_1(&JsValue::from(format!("Issue fail -2")));
+            );
+            handler_log!("Issue fail -2");
             return;
         }
     };
@@ -646,11 +628,11 @@ pub async fn issue(
             Ok(a) => a,
             Err(_) => {
                 chan.try_send((peer, false)).unwrap();
-                web_sys::console::log_1(&JsValue::from(format!(
+                handler_log!(
                     "Issue cheque send failed {}",
                     outgoing_cheque_trace(&peer, &cheque_state)
-                )));
-                web_sys::console::log_1(&JsValue::from(format!("Issue fail -1")));
+                );
+                handler_log!("Issue fail -1");
                 return;
             }
         };
@@ -660,7 +642,11 @@ pub async fn issue(
         }
     }
 
-    let client = ChequebookClient::new(cheque_state.chequebook, wallet, 11155111);
+    let client = ChequebookClient::new(
+        cheque_state.chequebook,
+        wallet,
+        active_profile().wallet_chain_id,
+    );
 
     let cheque_json = match client
         .prepare_emit_cheque_bytes(cheque_state.beneficiary, cheque_state.cumulative_payout)
@@ -668,11 +654,11 @@ pub async fn issue(
         Some(cheque_data) => cheque_data,
         None => {
             let _ = chan.try_send((peer, false));
-            web_sys::console::log_1(&JsValue::from(format!(
+            handler_log!(
                 "Issue cheque send failed {}",
                 outgoing_cheque_trace(&peer, &cheque_state)
-            )));
-            web_sys::console::log_1(&"Issue fail 5".into());
+            );
+            handler_log!("Issue fail 5");
             return;
         }
     };
@@ -687,11 +673,11 @@ pub async fn issue(
 
     if let Err(_) = stream.write_all(&bufw).await {
         let _ = chan.try_send((peer, false));
-        web_sys::console::log_1(&JsValue::from(format!(
+        handler_log!(
             "Issue cheque send failed {}",
             outgoing_cheque_trace(&peer, &cheque_state)
-        )));
-        web_sys::console::log_1(&"Issue fail 6".into());
+        );
+        handler_log!("Issue fail 6");
         return;
     }
 
@@ -711,21 +697,21 @@ pub async fn issue(
     {
         let _ = stream.close().await;
         let _ = chan.try_send((peer, false));
-        web_sys::console::log_1(&JsValue::from(format!(
+        handler_log!(
             "Issue cheque send failed {}",
             outgoing_cheque_trace(&peer, &cheque_state)
-        )));
-        web_sys::console::log_1(&"Issue fail 7".into());
+        );
+        handler_log!("Issue fail 7");
         return;
     }
 
     let _ = stream.close().await;
 
-    web_sys::console::log_1(&JsValue::from(format!(
+    handler_log!(
         "Issue cheque send success {}",
         outgoing_cheque_trace(&peer, &cheque_state)
-    )));
-    web_sys::console::log_1(&JsValue::from(format!("Issue complete")));
+    );
+    handler_log!("Issue complete");
     let _ = chan.try_send((peer, true)).unwrap_or(());
 }
 
@@ -735,8 +721,6 @@ pub async fn trieve(
     mut stream: Stream,
     chan: &mpsc::Sender<Vec<u8>>,
 ) {
-    // web_sys::console::log_1(&JsValue::from(format!("starting trieve")));
-
     let empty = etiquette_0::Headers::default();
 
     let mut buf_empty = Vec::new();
@@ -808,16 +792,13 @@ pub async fn trieve(
     let rec_0 = match rec_0_u {
         Ok(x) => x,
         Err(x) => {
-            web_sys::console::log_1(&JsValue::from(format!("Error in protocol {:#?}!", x)));
-            {
-                return;
-            };
+            handler_log!("Error in protocol {:#?}!", x);
+            return;
         }
     };
 
     let rec_1 = rec_0.data;
 
-    // web_sys::console::log_1(&JsValue::from(format!("trieve complete")));
     chan.try_send(rec_1).unwrap();
 }
 
@@ -830,21 +811,21 @@ pub async fn connection_handler(
     pk: &Arc<Mutex<ecdsa::SecretKey>>,
     chan: &mpsc::Sender<PeerFile>,
 ) -> bool {
-    web_sys::console::log_1(&JsValue::from("Handshake stage 0"));
+    handler_log!("Handshake stage 0");
 
     let stream = match control.open_stream(peer, HANDSHAKE_PROTOCOL).await {
         Ok(stream) => stream,
         Err(error @ stream::OpenStreamError::UnsupportedProtocol(_)) => {
-            web_sys::console::log_1(&JsValue::from(format!("{} {}", peer, error)));
+            handler_log!("{} {}", peer, error);
             return false;
         }
         Err(error) => {
-            web_sys::console::log_1(&JsValue::from(format!("{} {}", peer, error)));
+            handler_log!("{} {}", peer, error);
             return false;
         }
     };
 
-    web_sys::console::log_1(&JsValue::from("Handshake stage 1"));
+    handler_log!("Handshake stage 1");
 
     if !ceive(
         peer,
@@ -857,18 +838,15 @@ pub async fn connection_handler(
     )
     .await
     {
-        web_sys::console::log_1(&JsValue::from("Handshake protocol failed"));
+        handler_log!("Handshake protocol failed");
         return false;
     }
 
-    web_sys::console::log_1(&JsValue::from("Handshake stage 2"));
+    handler_log!("Handshake stage 2");
 
-    web_sys::console::log_1(&JsValue::from(format!(
-        "Handshake complete for peer: {}!",
-        peer
-    )));
+    handler_log!("Handshake complete for peer: {}!", peer);
 
-    web_sys::console::log_1(&JsValue::from("Handshake stage 3"));
+    handler_log!("Handshake stage 3");
 
     return true;
 }
@@ -886,12 +864,12 @@ pub async fn refresh_handler(
     {
         Ok(stream) => stream,
         Err(error @ stream::OpenStreamError::UnsupportedProtocol(_)) => {
-            web_sys::console::log_1(&JsValue::from(format!("{} {}", peer, error)));
+            handler_log!("{} {}", peer, error);
             chan.try_send((peer, 0)).unwrap();
             return;
         }
         Err(error) => {
-            web_sys::console::log_1(&JsValue::from(format!("{} {}", peer, error)));
+            handler_log!("{} {}", peer, error);
             chan.try_send((peer, 0)).unwrap();
             return;
         }
@@ -913,12 +891,12 @@ pub async fn issue_handler(
     let stream = match control.clone().open_stream(peer, SWAP_PROTOCOL).await {
         Ok(stream) => stream,
         Err(error @ stream::OpenStreamError::UnsupportedProtocol(_)) => {
-            web_sys::console::log_1(&JsValue::from(format!("{} {}", peer, error)));
+            handler_log!("{} {}", peer, error);
             let _ = chan.try_send((peer, false));
             return;
         }
         Err(error) => {
-            web_sys::console::log_1(&JsValue::from(format!("{} {}", peer, error)));
+            handler_log!("{} {}", peer, error);
             let _ = chan.try_send((peer, false));
             return;
         }
@@ -936,11 +914,11 @@ pub async fn retrieve_handler(
     let stream = match control.clone().open_stream(peer, RETRIEVAL_PROTOCOL).await {
         Ok(stream) => stream,
         Err(error @ stream::OpenStreamError::UnsupportedProtocol(_)) => {
-            web_sys::console::log_1(&JsValue::from(format!("{} {}", peer, error)));
+            handler_log!("{} {}", peer, error);
             return;
         }
         Err(error) => {
-            web_sys::console::log_1(&JsValue::from(format!("{} {}", peer, error)));
+            handler_log!("{} {}", peer, error);
             return;
         }
     };
@@ -959,11 +937,11 @@ pub async fn pushsync_handler(
     let stream = match control.clone().open_stream(peer, PUSHSYNC_PROTOCOL).await {
         Ok(stream) => stream,
         Err(error @ stream::OpenStreamError::UnsupportedProtocol(_)) => {
-            web_sys::console::log_1(&JsValue::from(format!("{} {}", peer, error)));
+            handler_log!("{} {}", peer, error);
             return;
         }
         Err(error) => {
-            web_sys::console::log_1(&JsValue::from(format!("{} {}", peer, error)));
+            handler_log!("{} {}", peer, error);
             return;
         }
     };
@@ -1070,49 +1048,49 @@ pub async fn sync(
     let rec_0 = match rec_0_u {
         Ok(x) => x,
         Err(x) => {
-            web_sys::console::log_1(&JsValue::from(format!("Error in protocol {:#?}!", x)));
+            handler_log!("Error in protocol {:#?}!", x);
             chan.try_send(false).unwrap();
             return;
         }
     };
 
     if !rec_0.err.is_empty() {
-        web_sys::console::log_1(&JsValue::from(format!(
+        handler_log!(
             "Pushsync rejected chunk {} from peer {}: {}",
             hex::encode(chunk_address),
             _peer,
             rec_0.err,
-        )));
+        );
         chan.try_send(false).unwrap();
         return;
     }
 
     if rec_0.address.as_slice() != chunk_address.as_slice() {
-        web_sys::console::log_1(&JsValue::from(format!(
+        handler_log!(
             "Pushsync receipt address mismatch for peer {}: expected {}, got {}",
             _peer,
             hex::encode(chunk_address),
             hex::encode(&rec_0.address),
-        )));
+        );
         chan.try_send(false).unwrap();
         return;
     }
 
     if rec_0.signature.is_empty() {
-        web_sys::console::log_1(&JsValue::from(format!(
+        handler_log!(
             "Pushsync receipt missing signature for chunk {} from peer {}",
             hex::encode(chunk_address),
             _peer,
-        )));
+        );
         chan.try_send(false).unwrap();
         return;
     }
 
-    web_sys::console::log_1(&JsValue::from(format!(
+    handler_log!(
         "Pushsync accepted chunk {} from peer {} storage_radius {}",
         hex::encode(chunk_address),
         _peer,
         rec_0.storage_radius,
-    )));
+    );
     chan.try_send(true).unwrap();
 }

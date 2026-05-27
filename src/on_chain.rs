@@ -15,7 +15,7 @@ use ethers::utils::keccak256;
 use hex;
 // use prost::Message;
 
-use crate::{is_mainnet, is_testnet_official};
+use crate::{is_mainnet, is_testnet_official, network_profile::active_profile};
 
 #[derive(Clone, Debug)]
 pub struct Cheque {
@@ -266,8 +266,12 @@ pub async fn postage_contract(w3: &Web3Inst) -> Result<PostageContract, JsError>
 pub async fn token_contract(w3: &Web3Inst) -> Result<TokenContract, JsError> {
     let addr_str = select_token_contract_addr()?;
     let addr = ensure_addr(addr_str)?;
-    Contract::from_json(w3.eth(), addr, include_bytes!("./sbzz.json"))
-        .map_err(|e| JsError::new(&format!("Failed to load SBZZ token contract: {e}")))
+    Contract::from_json(w3.eth(), addr, include_bytes!("./sbzz.json")).map_err(|e| {
+        JsError::new(&format!(
+            "Failed to load {} token contract: {e}",
+            active_profile().bzz_symbol
+        ))
+    })
 }
 
 pub async fn chequebook_factory(w3: &Web3Inst) -> Result<ChequebookFactory, JsError> {
@@ -442,15 +446,17 @@ pub async fn buy_postage_batch_with_payer(
     let w3 = web3()?;
 
     {
+        let profile = active_profile();
         let cid = w3
             .eth()
             .chain_id()
             .await
             .map_err(|e| JsError::new(&format!("chain_id failed: {e:?}")))?;
-        if cid != U256::from(11155111u64) {
-            return Err(JsError::new(
-                "Wrong network. Please switch to Sepolia (11155111).",
-            ));
+        if cid != U256::from(profile.wallet_chain_id) {
+            return Err(JsError::new(&format!(
+                "Wrong network. Please switch wallet to chain {} for {:?}.",
+                profile.wallet_chain_id, profile.mode
+            )));
         }
     }
 
@@ -461,14 +467,16 @@ pub async fn buy_postage_batch_with_payer(
     let initial_per_chunk = compute_initial_balance_per_chunk(lp, validity_days);
     let approve_amt = total_approve_amount(initial_per_chunk, depth);
 
-    let sbzz_balance: U256 = token
+    let bzz_balance: U256 = token
         .query("balanceOf", (payer,), None, Options::default(), None)
         .await
         .map_err(|e| JsError::new(&format!("balanceOf() failed: {e}")))?;
-    if sbzz_balance < approve_amt {
+    if bzz_balance < approve_amt {
         return Err(JsError::new(&format!(
-            "Insufficient SBZZ. Need {}, have {}. Reduce depth/validity or top up.",
-            approve_amt, sbzz_balance
+            "Insufficient {}. Need {}, have {}. Reduce depth/validity or top up.",
+            active_profile().bzz_symbol,
+            approve_amt,
+            bzz_balance
         )));
     }
 
@@ -635,15 +643,17 @@ pub async fn deploy_chequebook_with_payer(
     let w3 = web3()?;
 
     {
+        let profile = active_profile();
         let cid = w3
             .eth()
             .chain_id()
             .await
             .map_err(|e| JsError::new(&format!("chain_id failed: {e:?}")))?;
-        if cid != U256::from(11155111u64) {
-            return Err(JsError::new(
-                "Wrong network. Please switch to Sepolia (11155111).",
-            ));
+        if cid != U256::from(profile.wallet_chain_id) {
+            return Err(JsError::new(&format!(
+                "Wrong network. Please switch wallet to chain {} for {:?}.",
+                profile.wallet_chain_id, profile.mode
+            )));
         }
     }
 

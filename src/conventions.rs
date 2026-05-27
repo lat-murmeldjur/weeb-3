@@ -6,8 +6,6 @@ use libp2p::{Multiaddr, PeerId};
 use alloy::primitives::keccak256;
 use alloy::primitives::{Signature, normalize_v};
 
-use wasm_bindgen::prelude::*;
-
 pub const MAX_PO: u8 = 31;
 pub const SPAN_SIZE: usize = 8;
 
@@ -263,6 +261,34 @@ pub fn encode_resources(data_array: Vec<(Vec<u8>, String, String)>, indx: String
     output
 }
 
+pub(crate) fn normalize_feed_topic(topic: &str) -> String {
+    let trimmed = topic.trim();
+    let unprefixed = strip_hex_prefix(trimmed);
+
+    match hex::decode(unprefixed) {
+        Ok(topic_bytes) if topic_bytes.len() == 32 => hex::encode(topic_bytes),
+        _ => hex::encode(keccak256(trimmed)),
+    }
+}
+
+pub(crate) fn strip_hex_prefix(value: &str) -> &str {
+    value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+        .unwrap_or(value)
+}
+
+pub(crate) fn upload_result(message: &str, index: &str) -> Vec<u8> {
+    encode_resources(
+        vec![(
+            message.as_bytes().to_vec(),
+            "text/plain".to_string(),
+            "... result ...".to_string(),
+        )],
+        index.to_string(),
+    )
+}
+
 pub fn decode_resources(encoded_data: Vec<u8>) -> (Vec<(Vec<u8>, String, String)>, String) {
     let mut output: Vec<(Vec<u8>, String, String)> = vec![];
     let mut ind = "".to_string();
@@ -343,9 +369,10 @@ pub async fn read_file(file: web_sys::File) -> Vec<Vec<u8>> {
     let partition_size = 69001216.0_f64;
 
     if fils <= partition_size {
-        let content_buf = wasm_bindgen_futures::JsFuture::from(file.array_buffer())
-            .await
-            .unwrap();
+        let content_buf = match wasm_bindgen_futures::JsFuture::from(file.array_buffer()).await {
+            Ok(buf) => buf,
+            Err(_) => return vec![],
+        };
 
         let content_u8a = js_sys::Uint8Array::new(&content_buf);
 
@@ -361,29 +388,16 @@ pub async fn read_file(file: web_sys::File) -> Vec<Vec<u8>> {
             let content_slice = file.slice_with_f64_and_f64(start, end);
 
             let content_buf = match content_slice {
-                Ok(b) => wasm_bindgen_futures::JsFuture::from(b.array_buffer())
-                    .await
-                    .unwrap(),
-                Err(v) => {
-                    web_sys::console::log_1(&JsValue::from(format!(
-                        "Failed to turn content slice into array buffer: {:#?}",
-                        v
-                    )));
-                    return vec![];
-                }
+                Ok(b) => match wasm_bindgen_futures::JsFuture::from(b.array_buffer()).await {
+                    Ok(buf) => buf,
+                    Err(_) => return vec![],
+                },
+                Err(_) => return vec![],
             };
 
             let content_u8a = js_sys::Uint8Array::new(&content_buf);
 
             let slice = content_u8a.to_vec();
-
-            web_sys::console::log_1(&JsValue::from(format!(
-                "Slice start: {} end: {} length: {} from filesize: {}",
-                start,
-                end,
-                slice.len(),
-                fils,
-            )));
             content.push(slice);
 
             start = end;

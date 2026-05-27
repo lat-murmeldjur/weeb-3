@@ -7,4 +7,9 @@ Cargo.lock
 !*/static/cert.pem
 !*/static/key.pem
 !*/static/example.html
-
+!*/static/.gitignore
+!*/static/issue-1-json-sync-example.html
+!*/static/404.html
+!*/static/snippets/
+!*/static/snippets/web3-0742d85b024bb6f5/
+!*/static/snippets/web3-0742d85b024bb6f5/inline0.js

@@ -1,0 +1,365 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>weeb-3 issue #1 JSON sync example</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+      }
+      body {
+        margin: 0;
+        padding: max(2.4vw, 3.1vh);
+        background: Canvas;
+        color: CanvasText;
+      }
+      h1, h2, h3 { margin: 1rem 0 .5rem; }
+      section {
+        border-top: 1px solid currentColor;
+        margin-top: 1rem;
+        padding-top: .75rem;
+      }
+      label { display: block; margin: .4rem 0; }
+      input, textarea, button {
+        box-sizing: border-box;
+        max-width: 100%;
+      }
+      input[type="text"], input[type="number"], textarea {
+        width: min(100%, 55rem);
+      }
+      textarea {
+        min-height: 14rem;
+      }
+      button { margin: .2rem .4rem .2rem 0; }
+      pre {
+        overflow: auto;
+        max-height: 18rem;
+        white-space: pre-wrap;
+      }
+      .row {
+        display: flex;
+        flex-wrap: wrap;
+        gap: .5rem;
+        align-items: end;
+      }
+      .row label { margin: 0; }
+      .small { width: 8rem; }
+      .status {
+        display: inline-block;
+        margin: .3rem 0;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>weeb-3 issue #1 JSON sync example</h1>
+    <p>
+      This is the per-wallet app data flow from issue #1: local JSON, disk import/export,
+      Swarm feed export, Swarm feed import by owner address and fixed app topic.
+    </p>
+    <p>
+      <a href="./example.html">Open the full npm capability example</a>
+    </p>
+
+    <section>
+      <h2>Runtime</h2>
+      <div class="row">
+        <button id="renderInterface">renderInterface()</button>
+        <button id="networkState">networkState()</button>
+        <button id="connectTestnet">connectProfile("testnet")</button>
+        <button id="connectMainnet">connectProfile("mainnet")</button>
+        <button id="readyState">readyState()</button>
+      </div>
+      <span id="runtimeStatus" class="status"></span>
+      <div id="embeddedInterface"></div>
+      <pre id="runtimeOut"></pre>
+    </section>
+
+    <section>
+      <h2>App JSON</h2>
+      <div class="row">
+        <label>
+          localStorage key
+          <input id="storageKey" type="text" value="oneplusone.links" />
+        </label>
+        <label>
+          Fixed app topic
+          <input id="topic" type="text" value="oneplusone-app:links:v1" />
+        </label>
+      </div>
+      <label>
+        JSON payload
+        <textarea id="jsonPayload"></textarea>
+      </label>
+      <div class="row">
+        <button id="seedJson">Seed Safe Links JSON</button>
+        <button id="loadLocal">Load From localStorage</button>
+        <button id="saveLocal">Save To localStorage</button>
+        <button id="downloadJson">Download JSON</button>
+        <label>
+          Import JSON From Disk
+          <input id="jsonFile" type="file" accept="application/json,.json" />
+        </label>
+      </div>
+      <pre id="jsonOut"></pre>
+    </section>
+
+    <section>
+      <h2>Batch And Feed Export</h2>
+      <div class="row">
+        <label>
+          Depth
+          <input id="depth" class="small" type="number" value="17" min="17" max="30" />
+        </label>
+        <label>
+          Validity days
+          <input id="validityDays" class="small" type="number" value="365" min="1" />
+        </label>
+        <button id="batchState">batchState()</button>
+        <button id="buyBatch">buyBatch()</button>
+        <button id="checkOrBuyBatch">Check Or Buy Batch</button>
+      </div>
+      <div class="row">
+        <button id="feedIdentity">feedIdentity()</button>
+        <button id="exportFeed">Export JSON To Swarm Feed</button>
+      </div>
+      <pre id="exportOut"></pre>
+    </section>
+
+    <section>
+      <h2>Feed Import</h2>
+      <label>
+        Feed owner address
+        <input id="owner" type="text" placeholder="0x..." />
+      </label>
+      <div class="row">
+        <button id="feedTopic">feedTopic()</button>
+        <button id="importFeed">Import JSON From Swarm Feed</button>
+      </div>
+      <pre id="importOut"></pre>
+    </section>
+
+    <section>
+      <h2>Log</h2>
+      <pre id="log"></pre>
+    </section>
+
+    <script type="module">
+      import init, { Weeb3No103 } from "./weeb_3.js";
+
+      await init();
+
+      const node = new Weeb3No103();
+      const encoder = new TextEncoder();
+      const decoder = new TextDecoder();
+      let interfaceRendered = false;
+
+      const $ = (id) => document.getElementById(id);
+
+      function show(id, value) {
+        $(id).textContent = typeof value === "string"
+          ? value
+          : JSON.stringify(value, jsonReplacer, 2);
+      }
+
+      function log(message, value) {
+        const body = value === undefined
+          ? message
+          : `${message}\n${JSON.stringify(value, jsonReplacer, 2)}`;
+        $("log").textContent = `${new Date().toISOString()} ${body}\n\n${$("log").textContent}`;
+      }
+
+      function jsonReplacer(_key, value) {
+        if (value instanceof Uint8Array) {
+          return {
+            type: "Uint8Array",
+            bytes: value.byteLength,
+            preview: Array.from(value.slice(0, 24)),
+          };
+        }
+        return value;
+      }
+
+      function storageKey() {
+        return $("storageKey").value.trim() || "oneplusone.links";
+      }
+
+      function topic() {
+        return $("topic").value.trim() || "oneplusone-app:links:v1";
+      }
+
+      function depth() {
+        return Number($("depth").value || 17);
+      }
+
+      function validityDays() {
+        return Number($("validityDays").value || 365);
+      }
+
+      function normalizedJson() {
+        const normalized = JSON.stringify(JSON.parse($("jsonPayload").value), null, 2);
+        $("jsonPayload").value = normalized;
+        return normalized;
+      }
+
+      function bytesFromText(text) {
+        return encoder.encode(text);
+      }
+
+      function textFromBytes(bytes) {
+        return decoder.decode(bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes));
+      }
+
+      function downloadBytes(filename, bytes, mime) {
+        const url = URL.createObjectURL(new Blob([bytes], { type: mime }));
+        const link = document.createElement("a");
+        link.href = url;
+        link.download = filename;
+        link.click();
+        setTimeout(() => URL.revokeObjectURL(url), 1000);
+      }
+
+      async function checkOrBuyBatch(outId) {
+        const state = await node.batchState(depth(), validityDays());
+        show(outId, state);
+
+        if (state.usableBatch) {
+          log("batch ready", state);
+          return state;
+        }
+
+        if (state.hasFunds === false) {
+          throw new Error("No usable batch and not enough BZZ for the selected depth and duration.");
+        }
+
+        const bought = await node.buyBatch(depth(), validityDays());
+        show(outId, bought);
+        if (!bought.ok) {
+          throw new Error(bought.error || "buyBatch failed");
+        }
+        log("batch bought", bought);
+        return bought;
+      }
+
+      $("renderInterface").onclick = () => {
+        if (!interfaceRendered) {
+          node.renderInterface($("embeddedInterface"));
+          interfaceRendered = true;
+        }
+        $("runtimeStatus").textContent = "embedded interface rendered";
+      };
+
+      $("networkState").onclick = async () => show("runtimeOut", await node.networkState());
+      $("connectTestnet").onclick = async () => show("runtimeOut", await node.connectProfile("testnet"));
+      $("connectMainnet").onclick = async () => show("runtimeOut", await node.connectProfile("mainnet"));
+      $("readyState").onclick = async () => show("runtimeOut", await node.readyState(1, 10000));
+
+      $("seedJson").onclick = () => {
+        $("jsonPayload").value = JSON.stringify({
+          version: 1,
+          app: "oneplusone",
+          links: [
+            {
+              peer: "0x1111111111111111111111111111111111111111",
+              safe: "0x2222222222222222222222222222222222222222",
+              label: "demo 2-of-2 association",
+              chainId: 100
+            }
+          ],
+          updatedAt: new Date().toISOString()
+        }, null, 2);
+        show("jsonOut", { seeded: true });
+      };
+
+      $("loadLocal").onclick = () => {
+        $("jsonPayload").value = localStorage.getItem(storageKey()) || "[]";
+        show("jsonOut", { loaded: storageKey(), bytes: $("jsonPayload").value.length });
+      };
+
+      $("saveLocal").onclick = () => {
+        const text = normalizedJson();
+        localStorage.setItem(storageKey(), text);
+        show("jsonOut", { saved: storageKey(), bytes: bytesFromText(text).byteLength });
+      };
+
+      $("downloadJson").onclick = () => {
+        const text = normalizedJson();
+        downloadBytes("oneplusone-links.json", bytesFromText(text), "application/json");
+        show("jsonOut", { downloaded: "oneplusone-links.json" });
+      };
+
+      $("jsonFile").onchange = async (event) => {
+        const file = event.target.files[0];
+        if (!file) return;
+        $("jsonPayload").value = JSON.stringify(JSON.parse(await file.text()), null, 2);
+        show("jsonOut", { imported: file.name, bytes: file.size });
+      };
+
+      $("batchState").onclick = async () => show("exportOut", await node.batchState(depth(), validityDays()));
+      $("buyBatch").onclick = async () => show("exportOut", await node.buyBatch(depth(), validityDays()));
+      $("checkOrBuyBatch").onclick = async () => {
+        try {
+          await checkOrBuyBatch("exportOut");
+        } catch (error) {
+          show("exportOut", { ok: false, error: error.message || String(error) });
+        }
+      };
+
+      $("feedIdentity").onclick = async () => {
+        const identity = await node.feedIdentity(topic());
+        if (identity.feedOwner) $("owner").value = identity.feedOwner;
+        show("exportOut", identity);
+      };
+
+      $("exportFeed").onclick = async () => {
+        try {
+          await checkOrBuyBatch("exportOut");
+          const text = normalizedJson();
+          localStorage.setItem(storageKey(), text);
+          const result = await node.postFeedBytes(
+            topic(),
+            bytesFromText(text),
+            "application/json",
+            "oneplusone-links.json",
+            false
+          );
+          if (result.feedOwner) $("owner").value = result.feedOwner;
+          show("exportOut", result);
+          log("exported JSON to Swarm feed", result);
+        } catch (error) {
+          show("exportOut", { ok: false, error: error.message || String(error) });
+        }
+      };
+
+      $("feedTopic").onclick = () => show("importOut", node.feedTopic(topic()));
+
+      $("importFeed").onclick = async () => {
+        try {
+          const result = await node.acquireFeedBytes($("owner").value.trim(), topic());
+          if (result.status !== "ok") {
+            show("importOut", result);
+            return;
+          }
+          const text = JSON.stringify(JSON.parse(textFromBytes(result.body)), null, 2);
+          $("jsonPayload").value = text;
+          localStorage.setItem(storageKey(), text);
+          show("importOut", {
+            status: result.status,
+            owner: result.feedOwner || $("owner").value.trim() || "current wallet",
+            topic: result.feedTopic,
+            path: result.path,
+            bytes: result.body.byteLength,
+            saved: storageKey()
+          });
+          log("imported JSON from Swarm feed");
+        } catch (error) {
+          show("importOut", { ok: false, error: error.message || String(error) });
+        }
+      };
+
+      $("seedJson").click();
+      show("runtimeOut", await node.networkState());
+      log("issue #1 JSON sync example loaded");
+    </script>
+  </body>
+</html>

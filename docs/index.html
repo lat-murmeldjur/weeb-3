@@ -1,84 +1,203 @@
 <html>
     <head>
         <meta content="text/html;charset=utf-8" http-equiv="Content-Type" />
+        <meta name="viewport" content="width=device-width, initial-scale=1" />
         <link
             rel="icon"
             href="https://docs.libp2p.io/logos/libp2p_color_symbol.svg"
             sizes="any"
         />
+        <style id="weeb3InterfaceStyle">
+            * {
+                box-sizing: border-box;
+                font-weight: normal;
+            }
+            html, body {
+                max-width: 100%;
+                overflow-x: hidden;
+            }
+            body {
+                margin: 0;
+                --frame: max(4.8vw, 6.2vh);
+                background: #fff;
+                color: #000;
+                color-scheme: light;
+            }
+            body.dark {
+                background: #000;
+                color: #FFFFFF;
+                color-scheme: dark;
+            }
+            body.dark * { color: #FFFFFF; }
+            body.light {
+                background: #fff;
+                color: #000;
+            }
+            @media (prefers-color-scheme: dark) {
+                body:not(.light) {
+                    background: #000;
+                    color: #FFFFFF;
+                    color-scheme: dark;
+                }
+                body:not(.light) * { color: #FFFFFF; }
+            }
+            body.dark select option { background: #000; color: #FFFFFF; }
+            @media (prefers-color-scheme: dark) {
+                body:not(.light) select option { background: #000; color: #FFFFFF; }
+            }
+            #wrapper {
+                max-width: 100vw;
+                overflow-x: hidden;
+                padding: var(--frame);
+            }
+            #head {
+                display: flex;
+                align-items: flex-start;
+                gap: 1ch;
+                max-width: 100%;
+                min-width: 0;
+            }
+            #headRows { min-width: 0; flex: 1 1 auto; }
+            #headRows h3 { margin: 0; }
+            #headActions {
+                flex: 0 0 auto;
+                margin-left: auto;
+            }
+            #sectionButtons { display: flex; flex-wrap: wrap; column-gap: 1ch; }
+            #sectionButtons button, #logsToggle, #themeToggle {
+                all: unset;
+                cursor: pointer;
+            }
+            #themeToggle { white-space: nowrap; }
+            #jpBrand {
+                margin: 0;
+                letter-spacing: .1em;
+                padding-top: .1em;
+                writing-mode: vertical-rl;
+                text-orientation: upright;
+                font-family: "Yu Gothic", "Hiragino Kaku Gothic ProN", Meiryo, sans-serif;
+            }
+            input, select, textarea, button, iframe, embed {
+                max-width: 100%;
+            }
+            section, #resultField, #progressField, #progressActions, #logsField {
+                max-width: 100%;
+                overflow-wrap: anywhere;
+            }
+            #logsPanel {
+                max-width: 50%;
+                width: 50%;
+            }
+            pre, #progressRows {
+                margin: 0;
+                max-width: 100%;
+                overflow-wrap: anywhere;
+                white-space: pre-wrap;
+            }
+            #progressRows:empty, #progressActions:empty { display: none; }
+            @media (max-width: 720px) {
+                body {
+                    --frame: max(2.4vw, 3.1vh);
+                    font-size: 12.8px;
+                }
+                input, select, textarea, button { font-size: 1em; }
+                #headRows > h3:first-child > span { display: block; }
+                #sectionButtons {
+                    align-items: flex-start;
+                    display: flex;
+                    flex-direction: column;
+                    row-gap: .25em;
+                }
+                #sectionButtons button { display: block; }
+                #logsPanel {
+                    max-width: 100%;
+                    width: 100%;
+                }
+            }
+        </style>
     </head>
     <body>
         <div id="wrapper">
-            <div>
-                <span>Connecting: </span>
-                <span id="ongoing">0</span>
-                <span> </span>
-                <span>Connected: </span>
-                <span id="connections">0</span>
+            <div id="head">
+                <h3 id="jpBrand" lang="ja">ウィーブ3</h3>
+                <div id="headRows">
+                    <h3>
+                        <span>[ Connecting: <span id="ongoing">0</span> ]</span>
+                        <span>[ Connected: <span id="connections">0</span> ]</span>
+                        <span>Weeb-3</span>
+                    </h3>
+                    <br>
+                    <h3 id="sectionButtons">
+                        <button id="settingsToggle">[ Settings + ]</button>
+                        <button id="navigationToggle">[ Navigation + ]</button>
+                        <button id="storageToggle">[ Create Storage on Swarm + ]</button>
+                        <button id="uploadToggle">[ Upload + ]</button>
+                        <button id="bandwidthToggle">[ Bandwidth + ]</button>
+                    </h3>
+                </div>
+                <div id="headActions">
+                    <button id="themeToggle">[ Dark Mode ]</button>
+                </div>
             </div>
-            <h1>Weeb-3</h1>
-            <h2>Settings</h2>
-            <div>
-                <label>Swarm Bootnode Multiaddress</label>
-            </div>
-            <div>
-                <label> Bootnode </label>
+            <br>
+            <section id="settingsPanel" hidden aria-hidden="true">
                 <div>
-                  <input type="text" id="bootNodeMASettings" value="/ip4/167.235.96.31/tcp/32535/tls/sni/167-235-96-31.k2k4r8n9x80nshvozftjmg4klymgjtdflwxiovfx63yc6917dlrteva4.libp2p.direct/ws/p2p/QmYkyg5ZU3DzxhqfGyLYLVbk9DMdBagxe9q1AmHKNgt8ps" size="90">
+                    <label>Bootnode Multiaddress</label>
+                    <div>
+                      <input type="text" id="bootNodeMASettings" value="/ip4/167.235.96.31/tcp/32535/tls/sni/167-235-96-31.k2k4r8n9x80nshvozftjmg4klymgjtdflwxiovfx63yc6917dlrteva4.libp2p.direct/ws/p2p/QmYkyg5ZU3DzxhqfGyLYLVbk9DMdBagxe9q1AmHKNgt8ps" size="90">
+                    </div>
+                    <label> Further bootstrap nodes </label>
+                    <div>
+                      <input type="text" id="bootNodeMASettings0" value="/ip4/49.12.172.37/tcp/32530/tls/sni/49-12-172-37.k2k4r8kibjadgpqco81quegou963p7lbcd9ti0bw8lrcc95ystm6by9d.libp2p.direct/ws/p2p/QmRHeoLCHjHoMur8PQpuV8acNJMmKPT61c3ZMLpTqY7og4" size="90">
+                    </div>
+                    <div>
+                      <input type="text" id="bootNodeMASettings1" value="/ip4/49.12.172.37/tcp/32533/tls/sni/49-12-172-37.k2k4r8pnvqpufzwaf4ic1o1fo0onfh4p9b37gp0rdxzdte2kcd7ewp4w.libp2p.direct/ws/p2p/QmfCwr7FVxbYz1GPQ2NN2r5iduXSQDLefqzkBAB9JfZYgF" size="90">
+                    </div>
+                    <div>
+                      <input type="text" id="bootNodeMASettings2" value="/ip4/167.235.96.31/tcp/32536/tls/sni/167-235-96-31.k2k4r8omeryzle2ywg941xs6vgwlq4cr0b3qe83ub7rn9n8ysmcwfqru.libp2p.direct/ws/p2p/QmcPvejw1r1BQ6aUuK6Y18mcLAcYyg9iEmiD1TRpyaox7s" size="90">
+                    </div>
+                    <div>
+                      <input type="text" id="bootNodeMASettings3" value="/ip4/49.12.172.37/tcp/32531/tls/sni/49-12-172-37.k2k4r8l8l5hzyp48440rjqlfdjpr03jfgioal93akbigy0tomtft4w44.libp2p.direct/ws/p2p/QmTFvqc5wMkbsXjqnTxQbVss5t8T1292BupJZ9VyU1GMRV" size="90">
+                    </div>
+                    <div>
+                      <input type="text" id="bootNodeMASettings4" value="/ip4/49.12.172.37/tcp/32532/tls/sni/49-12-172-37.k2k4r8pr3m3aug5nudg2y039qfj2gxw6wnlx0e0ghzxufcn38soyp9z4.libp2p.direct/ws/p2p/QmfSx1ujzboapD5h2CiqTJqUy46FeTDwXBszB3XUCfKEEj" size="90">
+                    </div>
+                    <div>
+                      <input type="text" id="bootNodeMASettings5" value="/ip4/167.235.96.31/tcp/32537/tls/sni/167-235-96-31.k2k4r8m6hc1wyzz789uubmz6cxmeuquzfi5b06zdh4l7e5ve199oay7j.libp2p.direct/ws/p2p/QmVoPN964YuoGpqc6BGJpLGmUn2goaqRm5vkCi5e7H9w98" size="90">
+                    </div>
+                    <div>
+                      <input type="text" id="bootNodeMASettings6" value="/ip4/167.235.96.31/tcp/32538/tls/sni/167-235-96-31.k2k4r8nqwaetj1eljpu4qzeebnnujzu997pdh1i1ia2dcpcjjv9gc1s0.libp2p.direct/ws/p2p/Qma2pmuYLCzcmsFHHLyWRPxxt7eN9MKqhnJaShKomn2zEK" size="90">
+                    </div>
                 </div>
-                <label> Further bootstrap nodes </label>
                 <div>
-                  <input type="text" id="bootNodeMASettings0" value="/ip4/49.12.172.37/tcp/32530/tls/sni/49-12-172-37.k2k4r8kibjadgpqco81quegou963p7lbcd9ti0bw8lrcc95ystm6by9d.libp2p.direct/ws/p2p/QmRHeoLCHjHoMur8PQpuV8acNJMmKPT61c3ZMLpTqY7og4" size="90">
+                    <label>Swarm Network Id</label>
                 </div>
                 <div>
-                  <input type="text" id="bootNodeMASettings1" value="/ip4/49.12.172.37/tcp/32533/tls/sni/49-12-172-37.k2k4r8pnvqpufzwaf4ic1o1fo0onfh4p9b37gp0rdxzdte2kcd7ewp4w.libp2p.direct/ws/p2p/QmfCwr7FVxbYz1GPQ2NN2r5iduXSQDLefqzkBAB9JfZYgF" size="90">
+                    <input type="number" id="networkIDSettings" value="10" min="0" max="65535">
+                    <button id="networkModeToggle"> Testnet </button>
+                    <button id="networkSet"> Change network settings </button>
+                </div>
+            </section>
+            <section id="navigationPanel" hidden aria-hidden="true">
+                <input type="text" id="inputString" placeholder="Enter Swarm Hash or ENS site domain to display" size="64">
+                <div>
+                    <input id="streamFilesWhenAvailable" name="streamFilesWhenAvailable" type="checkbox" checked>
+                    <label for="streamFilesWhenAvailable">Stream files when available</label>
                 </div>
                 <div>
-                  <input type="text" id="bootNodeMASettings2" value="/ip4/167.235.96.31/tcp/32536/tls/sni/167-235-96-31.k2k4r8omeryzle2ywg941xs6vgwlq4cr0b3qe83ub7rn9n8ysmcwfqru.libp2p.direct/ws/p2p/QmcPvejw1r1BQ6aUuK6Y18mcLAcYyg9iEmiD1TRpyaox7s" size="90">
+                    <button id="transferPauseToggle"> Pause retrieve / push </button>
                 </div>
-                <div>
-                  <input type="text" id="bootNodeMASettings3" value="/ip4/49.12.172.37/tcp/32531/tls/sni/49-12-172-37.k2k4r8l8l5hzyp48440rjqlfdjpr03jfgioal93akbigy0tomtft4w44.libp2p.direct/ws/p2p/QmTFvqc5wMkbsXjqnTxQbVss5t8T1292BupJZ9VyU1GMRV" size="90">
-                </div>
-                <div>
-                  <input type="text" id="bootNodeMASettings4" value="/ip4/49.12.172.37/tcp/32532/tls/sni/49-12-172-37.k2k4r8pr3m3aug5nudg2y039qfj2gxw6wnlx0e0ghzxufcn38soyp9z4.libp2p.direct/ws/p2p/QmfSx1ujzboapD5h2CiqTJqUy46FeTDwXBszB3XUCfKEEj" size="90">
-                </div>
-                <div>
-                  <input type="text" id="bootNodeMASettings5" value="/ip4/167.235.96.31/tcp/32537/tls/sni/167-235-96-31.k2k4r8m6hc1wyzz789uubmz6cxmeuquzfi5b06zdh4l7e5ve199oay7j.libp2p.direct/ws/p2p/QmVoPN964YuoGpqc6BGJpLGmUn2goaqRm5vkCi5e7H9w98" size="90">
-                </div>
-                <div>
-                  <input type="text" id="bootNodeMASettings6" value="/ip4/167.235.96.31/tcp/32538/tls/sni/167-235-96-31.k2k4r8nqwaetj1eljpu4qzeebnnujzu997pdh1i1ia2dcpcjjv9gc1s0.libp2p.direct/ws/p2p/Qma2pmuYLCzcmsFHHLyWRPxxt7eN9MKqhnJaShKomn2zEK" size="90">
-                </div>
-
-            </div>
-            <div>
-                <label>Swarm Network Id</label>
-            </div>
-            <div>
-                <input type="number" id="networkIDSettings" value="10" min="0" max="65535">
-                <button id="networkSet">... Change network settings ...</button>
-            </div>
-            <h2>Navigation</h2>
-            <input type="text" id="inputString" placeholder="Enter Swarm Hash or ENS site domain to display" size="64">
-            <div>
-                <input id="streamFilesWhenAvailable" name="streamFilesWhenAvailable" type="checkbox" checked>
-                <label for="streamFilesWhenAvailable">Stream files when available</label>
-            </div>
-            <div>
-                <button id="transferPauseToggle">... Pause retrieve / push ...</button>
-            </div>
-            <div id="resultField"></div>
-
-            <div>
-                <h2>Create Storage on Swarm</h2>
+            </section>
+            <section id="storagePanel" hidden aria-hidden="true">
                 <div>
                     <div>
-                        <label>Create storage valid for (days)</label>
+                        <label>Create storage valid for (days):</label>
                     </div>
                     <div>
                         <input type="number" id="batchValidityDays" value="365" min="0">
                     </div>
                     <div>
-                        <label>Create storage with size</label>
+                        <label>Create storage with size:</label>
                     </div>
                     <div>
                         <select id="batchSize">
@@ -93,39 +212,68 @@
                             <option name="batchsize" value="8">128 GB</option>
                         </select>
                     </div>
-                    <button id="uploadGetBatch">... Create Storage on Swarm for Uploads ...</button>
-                    <button id="uploadResetStamp">... Reuse Space on Swarm for New Uploads ...</button>
+                    <button id="uploadGetBatch"> Create Storage on Swarm for Uploads </button>
+                    <button id="uploadResetStamp"> Reuse Space on Swarm for New Uploads </button>
                 </div>
-                <h2>Upload</h2>
+            </section>
+            <section id="uploadPanel" hidden aria-hidden="true">
                 <div>
-                    <input id="uploadFileSelect" type="file">... Select File to Upload on   Swarm ...</input>
+                    <input id="uploadFileSelect" type="file">
                     <input id="uploadFileEncrypt" name="encryption" type="checkbox" checked>
-                    <label for="encryption">Encrypt Upload</label>
+                    <label for="uploadFileEncrypt">Encrypt Upload</label>
                     <input type="text" id="indexString" placeholder="(Optional) Enter Index     Document path for collection upload     (.tar)" size="64">
-                    <button id="uploadFile">... Upload on Swarm ...</button>
+                    <button id="uploadFile"> Upload on Swarm </button>
+                </div>
                 <div>
                     <input id="uploadAddToFeed" name="addtofeed" type="checkbox">
-                    <label for="addtofeed">Add upload reference to feed</label>
+                    <label for="uploadAddToFeed">Add upload reference to feed</label>
                     <input type="text" id="feedTopicString" placeholder="Swarm Feed Topic">
                 </div>
-            </div>
-            <h2>Bandwidth</h2>
-            <div>
-                <button id="deployChequebook">... Deploy chequebook ...</button>
-            </div>
-            <div>
-                <button id="depositCash">... Deposit cash ...</button>
-                <input type="text" id="depositAmount" placeholder="Amount">
-            </div>
-            <h2>Logs</h2>
-            <div id="logsField"></div>
-            </div>
+            </section>
+            <section id="bandwidthPanel" hidden aria-hidden="true">
+                <div>
+                    <button id="deployChequebook"> Deploy chequebook </button>
+                </div>
+                <div>
+                    <button id="depositCash"> Deposit cash </button>
+                    <input type="text" id="depositAmount" placeholder="Amount">
+                </div>
+            </section>
+            <br>
+            <div id="resultField"></div>
+            <h3 id="logsBar">
+                <button id="logsToggle">[ Logs - ]</button>
+            </h3>
+            <section id="logsPanel" aria-hidden="false">
+                <div id="progressField">
+                    <div id="progressActions"></div>
+                    <pre id="progressRows"></pre>
+                </div>
+                <div id="logsField"></div>
+            </section>
         </div>
         <script>
         (() => {
-            const SEPOLIA = 11155111;
+            const NETWORKS = {
+                11155111: {
+                    chainName: "Sepolia",
+                    rpcUrls: ["https://rpc.sepolia.org"],
+                    nativeCurrency: { name: "Sepolia Ether", symbol: "ETH", decimals: 18 },
+                    blockExplorerUrls: ["https://sepolia.etherscan.io"],
+                },
+                100: {
+                    chainName: "Gnosis",
+                    rpcUrls: ["https://rpc.gnosischain.com"],
+                    nativeCurrency: { name: "xDAI", symbol: "xDAI", decimals: 18 },
+                    blockExplorerUrls: ["https://gnosisscan.io"],
+                },
+            };
             const WALLETCONNECT_SRC = "https://cdn.jsdelivr.net/npm/@walletconnect/ethereum-provider@2.23.3/dist/index.umd.js";
             let walletConnectScriptPromise = null;
+            const WC_DEBUG = false;
+            const wcDebug = (...args) => {
+                if (WC_DEBUG) console.log(...args);
+            };
 
             const RELAYS = [
                 "wss://relay.walletconnect.com",
@@ -142,6 +290,7 @@
                         wcUri: null,
                         lastAccounts: [],
                         lastChainId: null,
+                        targetChainId: null,
                     };
                 }
                 return window.__weeb3_wc_state;
@@ -153,6 +302,18 @@
                 if (s.startsWith("0x")) return s;
                 if (/^\d+$/.test(s)) return ("0x" + Number(s).toString(16)).toLowerCase();
                 return s;
+            }
+
+            function targetWalletChainId(explicitChainId) {
+                const numeric = Number(explicitChainId);
+                if (Number.isInteger(numeric) && NETWORKS[numeric]) return numeric;
+
+                const swarmNetworkId = Number(document.getElementById("networkIDSettings")?.value || 10);
+                return swarmNetworkId === 1 ? 100 : 11155111;
+            }
+
+            function chainIdHex(chainId) {
+                return ("0x" + Number(chainId).toString(16)).toLowerCase();
             }
 
             function sleep(ms) {
@@ -228,11 +389,15 @@
                 s.openedWalletThisAttempt = false;
                 s.lastAccounts = [];
                 s.lastChainId = null;
+                s.targetChainId = null;
             }
 
-            async function ensureProvider(projectId) {
+            async function ensureProvider(projectId, targetChainId) {
                 const s = getState();
-                if (s.provider) return s.provider;
+                if (s.provider && s.targetChainId === targetChainId) return s.provider;
+                if (s.provider && s.targetChainId !== targetChainId) {
+                    await teardownProvider();
+                }
 
                 await ensureWalletConnectScript();
 
@@ -241,11 +406,12 @@
                     throw new Error("WalletConnect EthereumProvider not loaded");
                 }
 
+                const network = NETWORKS[targetChainId] || NETWORKS[11155111];
                 const provider = await WC.EthereumProvider.init({
                     projectId,
                     relayUrl: RELAYS[s.relayIdx],
-                    chains: [SEPOLIA],
-                    optionalChains: [SEPOLIA],
+                    chains: [targetChainId],
+                    optionalChains: [targetChainId],
                     showQrModal: false,
                     metadata: {
                         name: "weeb-3",
@@ -254,13 +420,13 @@
                         icons: [location.origin + "/icon.png"],
                     },
                     rpcMap: {
-                        [SEPOLIA]: "https://rpc.sepolia.org",
+                        [targetChainId]: network.rpcUrls[0],
                     },
                 });
 
                 provider.on("display_uri", (uri) => {
                     s.wcUri = uri;
-                    console.log("WC display_uri ready");
+                    wcDebug("WC display_uri ready");
 
                     if (!s.connectInFlight) return;
                     if (s.openedWalletThisAttempt) return;
@@ -270,11 +436,11 @@
                 });
 
                 provider.on("connect", (info) => {
-                    console.log("WC connected:", info);
+                    wcDebug("WC connected:", info);
                 });
 
                 provider.on("disconnect", (info) => {
-                    console.log("WC disconnected:", info);
+                    wcDebug("WC disconnected:", info);
                     s.wcUri = null;
                     s.connectInFlight = false;
                     s.openedWalletThisAttempt = false;
@@ -284,24 +450,25 @@
 
                 provider.on("accountsChanged", (accounts) => {
                     s.lastAccounts = Array.isArray(accounts) ? accounts : [];
-                    console.log("WC accountsChanged:", s.lastAccounts);
+                    wcDebug("WC accountsChanged:", s.lastAccounts);
                 });
 
                 provider.on("chainChanged", (chainId) => {
                     s.lastChainId = normalizeChainIdToHex(chainId);
-                    console.log("WC chainChanged:", s.lastChainId);
+                    wcDebug("WC chainChanged:", s.lastChainId);
                 });
 
                 s.provider = provider;
+                s.targetChainId = targetChainId;
                 return provider;
             }
 
-            async function connectWithRelayFallback(projectId) {
+            async function connectWithRelayFallback(projectId, targetChainId) {
                 const s = getState();
-                let provider = await ensureProvider(projectId);
+                let provider = await ensureProvider(projectId, targetChainId);
 
                 if (provider.session) {
-                    console.log("Reusing existing WalletConnect session");
+                    wcDebug("Reusing existing WalletConnect session");
                     return provider;
                 }
 
@@ -319,7 +486,7 @@
                     await teardownProvider();
                     s.relayIdx = (s.relayIdx + 1) % RELAYS.length;
 
-                    provider = await ensureProvider(projectId);
+                    provider = await ensureProvider(projectId, targetChainId);
                     s.connectInFlight = true;
                     s.openedWalletThisAttempt = false;
 
@@ -379,18 +546,53 @@
                 return Array.isArray(s.lastAccounts) ? s.lastAccounts : [];
             }
 
-            window.weeb3EnsureEip1193 = async function(projectId) {
+            async function ensureInjectedChain(provider, targetChainId) {
+                const expected = chainIdHex(targetChainId);
+                let current = normalizeChainIdToHex(
+                    await provider.request({ method: "eth_chainId" })
+                );
+
+                if (current === expected) return current;
+
+                try {
+                    await provider.request({
+                        method: "wallet_switchEthereumChain",
+                        params: [{ chainId: expected }],
+                    });
+                } catch (e) {
+                    const network = NETWORKS[targetChainId];
+                    if (network && (e?.code === 4902 || String(e?.message || e).includes("4902"))) {
+                        await provider.request({
+                            method: "wallet_addEthereumChain",
+                            params: [{
+                                chainId: expected,
+                                chainName: network.chainName,
+                                nativeCurrency: network.nativeCurrency,
+                                rpcUrls: network.rpcUrls,
+                                blockExplorerUrls: network.blockExplorerUrls,
+                            }],
+                        });
+                    } else {
+                        console.warn("wallet_switchEthereumChain failed:", e);
+                    }
+                }
+
+                return normalizeChainIdToHex(
+                    await provider.request({ method: "eth_chainId" })
+                );
+            }
+
+            window.weeb3EnsureEip1193 = async function(projectId, requestedChainId) {
                 try {
                     const s = getState();
+                    const targetChainId = targetWalletChainId(requestedChainId);
 
                     if (window.ethereum?.request && !s.provider) {
                         const accounts = await window.ethereum.request({
                             method: "eth_requestAccounts",
                         });
 
-                        const chainId = normalizeChainIdToHex(
-                            await window.ethereum.request({ method: "eth_chainId" })
-                        );
+                        const chainId = await ensureInjectedChain(window.ethereum, targetChainId);
 
                         return {
                             ok: true,
@@ -400,7 +602,7 @@
                         };
                     }
 
-                    const provider = await connectWithRelayFallback(projectId);
+                    const provider = await connectWithRelayFallback(projectId, targetChainId);
 
                     window.ethereum = provider;
 
@@ -436,19 +638,58 @@
             async function requestPersistentStorage() {
                 if (navigator.storage && navigator.storage.persist) {
                     const isPersisted = await navigator.storage.persist();
-                    console.log(`Persistent storage granted: ${isPersisted}`);
                     return isPersisted;
                 } else {
                     console.warn("StorageManager API or persist() not supported.");
                     return false;
                 }
             }
-        
-            requestPersistentStorage();
 
-            import init, { interweeb } from "./weeb_3.js"
-            await init();
-            interweeb(""); 
+            function bootReport(message, error) {
+                const text = error ? `${message}: ${error?.stack || error?.message || error}` : message;
+                if (error) {
+                    console.error(text);
+                } else {
+                    console.log(text);
+                }
+
+            }
+
+            window.addEventListener("error", event => {
+                bootReport("weeb-3 boot error", event.error || event.message);
+            });
+            window.addEventListener("unhandledrejection", event => {
+                bootReport("weeb-3 boot rejection", event.reason);
+            });
+
+            function withTimeout(promise, label, ms) {
+                return Promise.race([
+                    promise,
+                    new Promise((_, reject) => {
+                        setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
+                    }),
+                ]);
+            }
+
+            bootReport("weeb-3 page script loaded");
+            requestPersistentStorage().catch(error => {
+                bootReport("weeb-3 storage persistence failed", error);
+            });
+
+            (async () => {
+                try {
+                    bootReport("weeb-3 module loading");
+                    const { default: init, interweeb } = await import("/weeb-3/weeb_3.js");
+                    bootReport("weeb-3 wasm init");
+                    await withTimeout(init(), "weeb-3 wasm init", 30000);
+                    bootReport("weeb-3 interface start");
+                    Promise.resolve(interweeb("")).catch(error => {
+                        bootReport("weeb-3 interface failed", error);
+                    });
+                } catch (error) {
+                    bootReport("weeb-3 boot failed", error);
+                }
+            })();
         </script>
     </body>
 </html>

@@ -1,5 +1,8 @@
-const CACHE_NAME = "default0";
+const CACHE_NAME = "default3";
 const BZZ_MARKER = "/weeb-3/bzz/";
+const BYTES_MARKER = "/weeb-3/bytes/";
+const CHUNKS_MARKER = "/weeb-3/chunks/";
+const CHUNK_MARKER = "/weeb-3/chunk/";
 const MIB_BYTES = 1024 * 1024;
 const STREAM_STORAGE_WINDOW_BYTES = MIB_BYTES / 2;
 const STREAM_RESPONSE_BUFFER_BYTES = 8 * MIB_BYTES;
@@ -9,11 +12,14 @@ const RANGE_CACHE_MEMORY_RATIO = 0.75;
 const RANGE_CACHE_DEVICE_MEMORY_RATIO = 0.45;
 const RANGE_CACHE_FALLBACK_MAX_BYTES = 3 * 1024 * MIB_BYTES;
 const RANGE_CACHE_MIN_MAX_BYTES = 512 * MIB_BYTES;
+const METADATA_CACHE_MAX_ENTRIES = 1024;
+const MEDIA_STREAM_STATE_MAX_ENTRIES = 64;
 const CLIENT_MESSAGE_TIMEOUT_MS = 120000;
 const RANGE_MESSAGE_TIMEOUT_MS = 240000;
 const RANGE_CACHE_STALE_MS = RANGE_MESSAGE_TIMEOUT_MS + 30000;
 const RANGE_RETRY_COUNT = 4;
 const RANGE_RETRY_DELAY_MS = 700;
+const DEBUG_SERVICE_WORKER = false;
 const STREAM_PREFETCH_STAGE_BYTES = [
   4 * MIB_BYTES,
   4 * MIB_BYTES,
@@ -35,9 +41,16 @@ const metadataCache = new Map();
 const rangeCache = new Map();
 const mediaStreamStates = new Map();
 
+function debugLog(...args) {
+  if (DEBUG_SERVICE_WORKER) {
+    console.log(...args);
+  }
+}
+
 function isCanonicalBzzRequest(request) {
   try {
-    return canonicalBzzResource(new URL(request.url)) !== null;
+    const url = new URL(request.url);
+    return canonicalBzzResource(url) !== null || canonicalRawResource(url) !== null;
   } catch (_) {
     return false;
   }
@@ -45,13 +58,13 @@ function isCanonicalBzzRequest(request) {
 
 const putInCache = async (request, response) => {
   if (isCanonicalBzzRequest(request)) {
-    console.log("Skipped bzz Cache API write:", request.url);
+    debugLog("Skipped bzz Cache API write:", request.url);
     return;
   }
 
   const cache = await caches.open(CACHE_NAME);
   await cache.put(request, response);
-  console.log("Cached:", request.url);
+  debugLog("Cached:", request.url);
 };
 
 async function purgeBzzCacheEntries() {
@@ -67,7 +80,7 @@ async function purgeBzzCacheEntries() {
   }));
 
   if (purged > 0) {
-    console.log("Purged bzz Cache API entries:", purged);
+    debugLog("Purged bzz Cache API entries:", purged);
   }
 }
 
@@ -81,7 +94,7 @@ function clearBzzMemoryCaches(reason) {
   mediaStreamStates.clear();
 
   if (metadataCount > 0 || rangeCount > 0 || mediaStateCount > 0) {
-    console.log(
+    debugLog(
       "Cleared bzz memory caches:",
       reason,
       `metadata=${metadataCount}`,
@@ -120,48 +133,72 @@ self.addEventListener("message", async function(event) {
     });
   }
 
-  console.log("Message event processed:", event);
+  debugLog("Message event processed:", event);
 });
 
-const cacheFirst = async (request) => {
-  const cache = await caches.open(CACHE_NAME);
-  console.log("req0: ", request);
-
-  const responseFromCache = await cache.match(request);
-  console.log("respc: ", responseFromCache);
-  if (responseFromCache) {
-    return responseFromCache;
+async function cacheAppShellResponse(cache, request, response) {
+  if (!response.ok || isCanonicalBzzRequest(request)) {
+    return;
   }
+
+  await cache.put(request, response.clone());
+
+  const url = new URL(request.url);
+  if (url.pathname === "/weeb-3/" || url.pathname === "/weeb-3/index.html") {
+    await cache.put(new URL("/weeb-3/", self.registration.scope).toString(), response.clone());
+    await cache.put(
+      new URL("/weeb-3/index.html", self.registration.scope).toString(),
+      response.clone()
+    );
+  }
+}
+
+const networkFirst = async (request) => {
+  const cache = await caches.open(CACHE_NAME);
 
   try {
-    const actualResource = await fetch(request);
-    if (actualResource.ok) {
-      return actualResource;
-    }
+    const fetched = await fetch(request);
+    await cacheAppShellResponse(cache, request, fetched);
+    return fetched;
   } catch (e) {
+    const responseFromCache = await cache.match(request);
+    if (responseFromCache) {
+      return responseFromCache;
+    }
+    return new Response("network fetch failed", { status: 502 });
   }
-
-  const fetched = await fetch(request);
-  if (fetched.ok && !isCanonicalBzzRequest(request)) {
-    cache.put(request, fetched.clone());
-  }
-  return fetched;
 };
 
+function isAppShellNavigation(request) {
+  const headerDestination = request.headers.get("Sec-Fetch-Dest") || "";
+  return request.mode === "navigate" &&
+    request.destination !== "iframe" &&
+    request.destination !== "frame" &&
+    headerDestination !== "iframe" &&
+    headerDestination !== "frame";
+}
+
 self.addEventListener("install", (event) => {
-  console.log("install");
+  debugLog("install");
   event.waitUntil(
     (async () => {
       const cache = await caches.open(CACHE_NAME);
-      await cache.addAll(["/weeb-3/index.html"]);
+      await cache.addAll(["/weeb-3/", "/weeb-3/index.html"]);
       await self.skipWaiting();
     })()
   );
 });
 
 self.addEventListener("activate", event => {
-  console.log("service activated, claim client");
+  debugLog("service activated, claim client");
   event.waitUntil((async () => {
+    const cacheNames = await caches.keys();
+    await Promise.all(cacheNames.map((name) => {
+      if (name !== CACHE_NAME) {
+        return caches.delete(name);
+      }
+      return Promise.resolve(false);
+    }));
     clearBzzMemoryCaches("activate");
     await purgeBzzCacheEntries();
     await self.clients.claim();
@@ -169,23 +206,23 @@ self.addEventListener("activate", event => {
 });
 
 self.addEventListener("fetch", (event) => {
-  console.log("fetch mode:", event.request.mode, "url:", event.request.url);
+  debugLog("fetch mode:", event.request.mode, "url:", event.request.url);
 
   const req = event.request;
   const url = new URL(req.url);
-
-  console.log("SW FETCH:", req.method, url.pathname, "scope:", self.registration.scope);
-
-  if (
+  const isReloadNavigation =
     req.mode === "navigate" &&
     (req.cache === "reload" ||
-      (req.headers.get("Cache-Control") || "").includes("no-cache"))
-  ) {
+      (req.headers.get("Cache-Control") || "").includes("no-cache"));
+
+  debugLog("SW FETCH:", req.method, url.pathname, "scope:", self.registration.scope);
+
+  if (isReloadNavigation) {
     clearBzzMemoryCaches("navigate reload");
   }
 
   if (req.method === "POST" && url.pathname.endsWith("/weeb-3/bzz")) {
-    console.log("Intercepting POST upload:", url.toString());
+    debugLog("Intercepting POST upload:", url.toString());
     event.respondWith(postToLibRs(req, event));
     return;
   }
@@ -198,17 +235,27 @@ self.addEventListener("fetch", (event) => {
   const bzzResource = canonicalBzzResource(url);
   if (
     bzzResource &&
-    req.mode !== "navigate" &&
+    !isAppShellNavigation(req) &&
     (req.method === "GET" || req.method === "HEAD")
   ) {
     event.respondWith(handleCanonicalBzz(req, event, bzzResource));
     return;
   }
 
+  const rawResource = canonicalRawResource(url);
+  if (
+    rawResource &&
+    !isAppShellNavigation(req) &&
+    (req.method === "GET" || req.method === "HEAD")
+  ) {
+    event.respondWith(handleCanonicalRaw(req, event, rawResource));
+    return;
+  }
+
   event.respondWith((async () => {
     if (req.mode === "navigate") {
-      console.log("navigate attempt for", req.url);
-      return cacheFirst(req);
+      debugLog("navigate attempt for", req.url);
+      return networkFirst(req);
     }
 
     const cache = await caches.open(CACHE_NAME);
@@ -228,7 +275,7 @@ self.addEventListener("fetch", (event) => {
 
     const client = await requestClient(event);
 
-    console.log("acquire attempt for", req.url);
+    debugLog("acquire attempt for", req.url);
     return await fetchFromLibRs(req, client);
   })());
 });
@@ -244,11 +291,48 @@ function canonicalBzzResource(url) {
     return null;
   }
 
+  const reference = resource.split("/", 1)[0];
+  if (!isSwarmReference(reference)) {
+    return null;
+  }
+
   try {
     return decodeURIComponent(resource);
   } catch (_) {
     return resource;
   }
+}
+
+function canonicalRawResource(url) {
+  const markers = [
+    { marker: BYTES_MARKER, type: "bytes" },
+    { marker: CHUNKS_MARKER, type: "chunk" },
+    { marker: CHUNK_MARKER, type: "chunk" }
+  ];
+
+  for (const { marker, type } of markers) {
+    const idx = url.pathname.indexOf(marker);
+    if (idx < 0) {
+      continue;
+    }
+
+    const resource = url.pathname.substring(idx + marker.length);
+    if (!resource) {
+      return null;
+    }
+
+    try {
+      return { type, reference: decodeURIComponent(resource) };
+    } catch (_) {
+      return { type, reference: resource };
+    }
+  }
+
+  return null;
+}
+
+function isSwarmReference(reference) {
+  return /^(?:[a-fA-F0-9]{64}|[a-fA-F0-9]{128})$/.test(reference);
 }
 
 function sleep(ms) {
@@ -324,6 +408,8 @@ function messageClient(client, message, timeoutMs = CLIENT_MESSAGE_TIMEOUT_MS) {
 async function resolveBzz(resource, client) {
   const cached = metadataCache.get(resource);
   if (cached) {
+    metadataCache.delete(resource);
+    metadataCache.set(resource, cached);
     return cached;
   }
 
@@ -345,7 +431,18 @@ async function resolveBzz(resource, client) {
   };
 
   metadataCache.set(resource, metadata);
+  trimMetadataCache();
   return metadata;
+}
+
+function trimMetadataCache() {
+  while (metadataCache.size > METADATA_CACHE_MAX_ENTRIES) {
+    const first = metadataCache.keys().next().value;
+    if (first === undefined) {
+      break;
+    }
+    metadataCache.delete(first);
+  }
 }
 
 async function retrieveRange(resource, start, end, client, metadata, generation = 0) {
@@ -489,7 +586,7 @@ function trimRangeCache() {
   }
 
   if (trimmed > 0) {
-    console.log(
+    debugLog(
       "bzz media trimmed range cache",
       `removed=${trimmed}`,
       `before=${before}`,
@@ -500,7 +597,7 @@ function trimRangeCache() {
   }
 
   if (usedBytes > maxBytes) {
-    console.log(
+    debugLog(
       "bzz media kept range cache above memory target to preserve in-flight ranges",
       `bytes=${usedBytes}`,
       `limit=${maxBytes}`
@@ -550,8 +647,24 @@ function getMediaStreamState(resource, metadata) {
       lastTouch: Date.now()
     };
     mediaStreamStates.set(key, state);
+    trimMediaStreamStates(key);
   }
   return state;
+}
+
+function trimMediaStreamStates(activeKey) {
+  if (mediaStreamStates.size <= MEDIA_STREAM_STATE_MAX_ENTRIES) {
+    return;
+  }
+
+  for (const [key, state] of mediaStreamStates) {
+    if (mediaStreamStates.size <= MEDIA_STREAM_STATE_MAX_ENTRIES) {
+      break;
+    }
+    if (key !== activeKey && !state.prefetchRunning) {
+      mediaStreamStates.delete(key);
+    }
+  }
 }
 
 function effectiveMediaHighWaterEnd(state) {
@@ -604,7 +717,7 @@ function noteMediaRangeFailure(state, start, reason) {
   state.scheduledHighWaterEnd = Math.max(state.highWaterEnd, start - 1);
   state.lastTouch = Date.now();
 
-  console.log(
+  debugLog(
     "bzz media range failure",
     `start=${start}`,
     `generation=${state.generation}`,
@@ -639,7 +752,7 @@ function discardMediaRangesOutside(resource, metadata, generation, keepStart, ke
   }
 
   if (discarded > 0) {
-    console.log(
+    debugLog(
       "bzz media canceled stale in-flight ranges",
       discarded,
       `keep=${keepStart}-${keepEnd}`,
@@ -682,7 +795,7 @@ function beginMediaRange(resource, start, metadata) {
       Math.max(0, start - STREAM_RESPONSE_BUFFER_BYTES),
       Math.min(metadata.size - 1, start + STREAM_SEEK_KEEP_AHEAD_BYTES - 1)
     );
-    console.log(
+    debugLog(
       isSeek ? "bzz media seek reset" : "bzz media prefetch lead reset",
       `${start}/${metadata.size}`,
       `previous_high_water=${previousHighWater}`,
@@ -705,14 +818,14 @@ function cachedRangePromise(resource, start, end, client, metadata, generation =
   if (entry) {
     if (!entry.settledAt && Date.now() - entry.createdAt > RANGE_CACHE_STALE_MS) {
       rangeCache.delete(key);
-      console.log(
+      debugLog(
         "bzz media expired stale range",
         `${start}-${end}/${metadata.size}`,
         `generation=${generation}`
       );
     } else if (!entry.settledAt && entry.generation !== generation) {
       rangeCache.delete(key);
-      console.log(
+      debugLog(
         "bzz media replaced stale in-flight range",
         `${start}-${end}/${metadata.size}`,
         `old_generation=${entry.generation}`,
@@ -831,7 +944,7 @@ async function readCachedRangeWithRetry(resource, start, end, client, metadata, 
       return lastResponse;
     }
 
-    console.log(
+    debugLog(
       "bzz media range retry",
       `${start}-${end}/${metadata.size}`,
       "attempt",
@@ -896,7 +1009,7 @@ function prefetchMediaWindows(
     const finishIfDone = () => {
       if (active === 0 && (!isCurrentGeneration() || failed || position > targetEnd)) {
         if (scheduled > 0) {
-          console.log(
+          debugLog(
             `bzz media ${label} done`,
             `${responseRange.end + 1}-${state ? state.highWaterEnd : targetEnd}/${metadata.size}`,
             `windows=${scheduled}`,
@@ -909,7 +1022,7 @@ function prefetchMediaWindows(
 
     const launchMore = () => {
       if (!isCurrentGeneration()) {
-        console.log(
+        debugLog(
           `bzz media ${label} stopped stale`,
           `${responseRange.end + 1}-${targetEnd}/${metadata.size}`,
           `generation=${generation}`,
@@ -946,7 +1059,7 @@ function prefetchMediaWindows(
 
         if (!logged) {
           logged = true;
-          console.log(
+          debugLog(
             `bzz media ${label}`,
             `${responseRange.end + 1}-${targetEnd}/${metadata.size}`,
             `max_active=${maxActive}`,
@@ -1015,7 +1128,7 @@ async function prefetchMediaStages(resource, responseRange, requestedEnd, client
   );
   if (state) {
     if (state.prefetchRunning && state.prefetchGeneration === generation) {
-      console.log(
+      debugLog(
         "bzz media prefetch already running",
         `${responseRange.start}-${responseRange.end}/${metadata.size}`,
         `generation=${generation}`
@@ -1234,6 +1347,55 @@ function toUint8Array(body) {
   return new Uint8Array();
 }
 
+async function handleCanonicalRaw(request, event, rawResource) {
+  const parts = rawResource.reference.split("/");
+  const reference = parts[0] || rawResource.reference;
+  if (parts.slice(1).some((part) => part.length > 0)) {
+    return new Response("raw route accepts one swarm reference", { status: 400 });
+  }
+  if (!isSwarmReference(reference)) {
+    return new Response("invalid swarm reference", { status: 400 });
+  }
+
+  const headers = new Headers();
+  headers.set("Content-Type", "application/octet-stream");
+  headers.set("Content-Disposition", `attachment; filename="${reference}"`);
+  headers.set("Cache-Control", "no-store");
+
+  if (request.method === "HEAD") {
+    return new Response(null, {
+      status: 200,
+      headers
+    });
+  }
+
+  const client = await requestClient(event);
+  if (!client) {
+    return new Response("Request ghosted by client", { status: 502 });
+  }
+
+  const response = await messageClient(
+    client,
+    {
+      type: rawResource.type === "chunk" ? "RETRIEVE_CHUNK_REQUEST" : "RETRIEVE_BYTES_REQUEST",
+      url: reference
+    },
+    RANGE_MESSAGE_TIMEOUT_MS
+  );
+
+  if (!response || !response.ok) {
+    return new Response("weeb-3 did not retrieve resource", { status: 404 });
+  }
+
+  const body = toUint8Array(response.body);
+  headers.set("Content-Length", String(body.byteLength));
+
+  return new Response(body, {
+    status: 200,
+    headers
+  });
+}
+
 async function handleCanonicalBzz(request, event, resource) {
   const client = await requestClient(event);
   if (!client) {
@@ -1280,7 +1442,7 @@ async function handleCanonicalBzz(request, event, resource) {
       responseRange.end,
       metadata.size
     );
-    console.log(
+    debugLog(
       "bzz media range",
       request.headers.get("Range"),
       "=>",
@@ -1352,7 +1514,7 @@ async function handleCanonicalBzz(request, event, resource) {
       startupRange.end,
       metadata.size
     );
-    console.log(
+    debugLog(
       "bzz media startup range",
       `${startupRange.start}-${startupRange.end}/${metadata.size}`
     );
@@ -1425,8 +1587,8 @@ function isStreamableMime(mime) {
 
 const fetchFromLibRs = async (request, client) => {
   const allClients = await self.clients.matchAll({ includeUncontrolled: true, type: "window" });
-  console.log("all clients", allClients.map(c => c.id));
-  console.log("actual client", client ? client.id : "none");
+  debugLog("all clients", allClients.map(c => c.id));
+  debugLog("actual client", client ? client.id : "none");
 
   if (!client) {
     return new Response("Request ghosted by client", { status: 502 });
@@ -1443,7 +1605,7 @@ const fetchFromLibRs = async (request, client) => {
     const channel = new MessageChannel();
     channel.port1.onmessage = async (event) => {
       const { ok, body, mime, path } = event.data;
-      console.log("Message from interface:", {
+      debugLog("Message from interface:", {
         ok,
         bodyType: body ? body.constructor.name : body,
         bodyLen: body && body.length ? body.length : 0,
@@ -1474,7 +1636,7 @@ const fetchFromLibRs = async (request, client) => {
 };
 
 async function postToLibRs(request, event) {
-  console.log("attempting upload (multipart/form-data)");
+  debugLog("attempting upload (multipart/form-data)");
 
   const url = new URL(request.url);
 
@@ -1485,7 +1647,7 @@ async function postToLibRs(request, event) {
 
   const formData = await request.formData();
   const file = formData.get("file");
-  console.log("Got file:", file?.name, file?.type, file?.size);
+  debugLog("Got file:", file?.name, file?.type, file?.size);
 
   if (!(file instanceof File)) {
     return new Response("No file in form data", { status: 400 });

@@ -1,9 +1,19 @@
-use std::{cell::RefCell, rc::Rc, str::FromStr, time::Duration};
+use std::{
+    cell::{Cell, RefCell},
+    io::Cursor,
+    rc::Rc,
+    str::FromStr,
+    time::Duration,
+};
 
-use web3::types::{Address, U256};
+use web3::{
+    contract::Options,
+    types::{Address, U256},
+};
 
 use async_std::sync::Arc;
-use js_sys::{Array, Date, Uint8Array};
+use js_sys::{Array, Uint8Array};
+use tar::{Builder, Header};
 use wasm_bindgen::{JsCast, JsError, JsValue, prelude::*};
 use wasm_bindgen_futures::{JsFuture, spawn_local};
 
@@ -11,27 +21,31 @@ use web_sys::{
     Blob,
     BlobPropertyBag,
     Element,
+    Event,
     HtmlButtonElement,
     HtmlElement,
     HtmlInputElement,
     HtmlSelectElement,
     HtmlSpanElement,
-    MessageChannel,
     MessageEvent,
-    RequestInit,
     // Response,
-    ServiceWorker,
     ServiceWorkerRegistration,
 };
 
 use crate::{
     Weeb3,
-    bzz_stream::{BzzMetadata, parse_bzz_resource},
-    decode_resources, encrey, join, join_all,
-    nav::{clear_path, read_path},
+    bzz_stream::{BzzMetadata, bzz_reference_hex, normalize_bzz_path},
+    decode_resources, encrey,
+    interface_conventions::{install_interface_conventions, set_bracket_button_label},
+    join_all,
+    nav::{ResourceRoute, clear_path, parse_resource_route, read_routes},
+    network_profile::{
+        NetworkMode, is_browser_dialable_underlay, profile_for_mode, profile_for_swarm_network_id,
+    },
     on_chain::{
-        buy_postage_batch_with_payer, chequebook_balance, deploy_chequebook_with_payer,
-        deposit_to_chequebook, token_contract,
+        buy_postage_batch_with_payer, chequebook_balance, chunk_count_for_depth,
+        compute_initial_balance_per_chunk, deploy_chequebook_with_payer, deposit_to_chequebook,
+        get_batch_validity, last_price, postage_contract, token_contract,
     },
     persistence::{
         get_chequebook_address, get_chequebook_signer_key, set_chequebook_address,
@@ -45,21 +59,63 @@ use crate::{
 };
 use alloy::signers::local::PrivateKeySigner;
 
+#[path = "interface_runtime_conventions.rs"]
+mod interface_runtime_conventions;
+use interface_runtime_conventions::*;
+pub(crate) use interface_runtime_conventions::{get_service_worker, service_worker_missing};
+
+const BOOTNODE_INPUT_IDS: [&str; 8] = [
+    "bootNodeMASettings",
+    "bootNodeMASettings0",
+    "bootNodeMASettings1",
+    "bootNodeMASettings2",
+    "bootNodeMASettings3",
+    "bootNodeMASettings4",
+    "bootNodeMASettings5",
+    "bootNodeMASettings6",
+];
+
+const DEBUG_INTERFACE_LOGS: bool = false;
+
+thread_local! {
+    static NETWORK_APPLY_GENERATION: Cell<u64> = Cell::new(0);
+}
+
+fn interface_debug(value: &JsValue) {
+    if DEBUG_INTERFACE_LOGS {
+        web_sys::console::log_1(value);
+    }
+}
+
 #[wasm_bindgen]
 pub async fn interweeb(_st: String) -> Result<(), JsError> {
     //    init_panic_hook();
 
     clear_path().await;
-
     let weeb3 = Arc::new(Weeb3::new("".to_string()));
+    weeb3.interface_log("Node created".to_string());
+    mount_interface(weeb3, true, true).await
+}
 
-    let weeb30 = weeb3.clone();
+pub(crate) async fn mount_interface(
+    weeb3: Arc<Weeb3>,
+    start_runtime: bool,
+    read_initial_routes: bool,
+) -> Result<(), JsError> {
+    if start_runtime {
+        let weeb30 = weeb3.clone();
+        weeb3.interface_log("Node runtime starting".to_string());
+        spawn_local(async move {
+            weeb30.interface_log("Node runtime booting".to_string());
+            weeb30.run("".to_string()).await;
+        });
+    }
+
+    async_std::task::yield_now().await;
 
     secure_preload_vault_module();
-
-    spawn_local(async move {
-        weeb30.run("".to_string()).await;
-    });
+    install_interface_conventions();
+    weeb3.interface_log("Interface mounted".to_string());
 
     let weeb31 = weeb3.clone();
     let weeb32 = weeb3.clone();
@@ -71,27 +127,11 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
     let weeb38 = weeb3.clone();
     let weeb39 = weeb3.clone();
     let weeb40 = weeb3.clone();
+    let weeb41 = weeb3.clone();
 
+    let initial_network_apply_generation = next_network_apply_generation();
     spawn_local(async move {
-        let weeb310 = weeb39.clone();
-        let weeb311 = weeb39.clone();
-        let weeb312 = weeb39.clone();
-        let weeb313 = weeb39.clone();
-        let weeb314 = weeb39.clone();
-        let weeb315 = weeb39.clone();
-        let weeb316 = weeb39.clone();
-        let weeb317 = weeb39.clone();
-
-        join!(
-            connect_bootnode_setting(weeb310, "bootNodeMASettings"),
-            connect_bootnode_setting(weeb311, "bootNodeMASettings0"),
-            connect_bootnode_setting(weeb312, "bootNodeMASettings1"),
-            connect_bootnode_setting(weeb313, "bootNodeMASettings2"),
-            connect_bootnode_setting(weeb314, "bootNodeMASettings3"),
-            connect_bootnode_setting(weeb315, "bootNodeMASettings4"),
-            connect_bootnode_setting(weeb316, "bootNodeMASettings5"),
-            connect_bootnode_setting(weeb317, "bootNodeMASettings6")
-        );
+        connect_all_bootnode_settings(weeb39, initial_network_apply_generation).await;
     });
 
     spawn_local(async {
@@ -112,22 +152,24 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
         }
     });
 
-    spawn_local(async move {
-        let references = read_path().await;
-        let mut handles = vec![];
-        for reference in references {
-            let handle = async {
-                let weeb300 = weeb36.clone();
-                web_sys::console::log_1(&JsValue::from(format!(
-                    "Loading /bzz/ reference from path {:#?}",
-                    reference
-                )));
-                open_bzz_resource(weeb300, reference).await;
-            };
-            handles.push(handle);
-        }
-        let _ = join_all(handles).await;
-    });
+    if read_initial_routes {
+        spawn_local(async move {
+            let routes = read_routes().await;
+            let mut handles = vec![];
+            for route in routes {
+                let handle = async {
+                    let weeb300 = weeb36.clone();
+                    interface_debug(&JsValue::from(format!(
+                        "Loading weeb-3 route from path {:#?}",
+                        route
+                    )));
+                    open_resource(weeb300, route).await;
+                };
+                handles.push(handle);
+            }
+            let _ = join_all(handles).await;
+        });
+    }
 
     let window = web_sys::window().unwrap();
 
@@ -140,7 +182,7 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
         .unwrap();
 
     let interface_async = async move {
-        web_sys::console::log_1(&JsValue::from(format!("host2 {:#?}", host2)));
+        interface_debug(&JsValue::from(format!("host2 {:#?}", host2)));
 
         let chequebook_state_deploy = chequebook_state.clone();
         let chequebook_state_deposit = chequebook_state.clone();
@@ -149,7 +191,7 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
 
         let callback =
             wasm_bindgen::closure::Closure::<dyn FnMut(web_sys::MessageEvent)>::new(move |_msg| {
-                web_sys::console::log_1(&"oninput callback triggered".into());
+                interface_debug(&"oninput callback triggered".into());
                 let weeb300 = weeb31.clone();
                 let document = web_sys::window().unwrap().document().unwrap();
 
@@ -162,9 +204,9 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
 
                 match input_field.value().parse::<String>() {
                     Ok(text) => spawn_local(async move {
-                        web_sys::console::log_1(&"oninput callback string".into());
+                        interface_debug(&"oninput callback string".into());
 
-                        open_bzz_resource(weeb300, text).await;
+                        open_resource_input(weeb300, text).await;
                     }),
                     Err(_) => {
                         document
@@ -191,7 +233,7 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
 
         let callback_pause =
             wasm_bindgen::closure::Closure::<dyn FnMut(web_sys::MessageEvent)>::new(move |_msg| {
-                web_sys::console::log_1(&"transferPauseToggle callback triggered".into());
+                interface_debug(&"transferPauseToggle callback triggered".into());
                 let weeb300 = weeb40.clone();
 
                 spawn_local(async move {
@@ -212,7 +254,7 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
 
         let callback2 = wasm_bindgen::closure::Closure::<dyn FnMut(web_sys::MessageEvent)>::new(
             move |_msg| {
-                web_sys::console::log_1(&"uploadGetBatch callback triggered".into());
+                interface_debug(&"uploadGetBatch callback triggered".into());
 
                 let document = web_sys::window().unwrap().document().unwrap();
 
@@ -248,186 +290,119 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
                     }
                 };
 
-                web_sys::console::log_1(&JsValue::from(format!(
+                interface_debug(&JsValue::from(format!(
                     "Selected batch depth: {}",
                     batch_depth
                 )));
 
                 spawn_local(async move {
-                    let window = web_sys::window().unwrap();
-                    if let Ok(func) =
-                        js_sys::Reflect::get(&window, &JsValue::from_str("weeb3EnsureEip1193"))
-                    {
-                        if let Ok(f) = func.dyn_into::<js_sys::Function>() {
-                            let project_id = JsValue::from_str("64c5f91181ce0a3192a783346a475d23");
-                            if let Ok(promise_val) = f.call1(&JsValue::NULL, &project_id) {
-                                if let Ok(promise) = promise_val.dyn_into::<js_sys::Promise>() {
-                                    let res = JsFuture::from(promise).await;
-                                    if let Ok(obj) = res {
-                                        let ok = js_sys::Reflect::get(&obj, &"ok".into())
-                                            .ok()
-                                            .and_then(|v| v.as_bool())
-                                            .unwrap_or(false);
-                                        if !ok {
-                                            let err = js_sys::Reflect::get(&obj, &"error".into())
-                                                .ok()
-                                                .and_then(|v| v.as_string())
-                                                .unwrap_or_else(|| "WalletConnect failed".into());
-                                            let wnd = web_sys::window().unwrap();
-                                            let _ = wnd.alert_with_message(&format!(
-                                                "Wallet connect failed: {}",
-                                                err
-                                            ));
-                                            return;
-                                        }
+                    let payer = match connect_wallet_address().await {
+                        Ok(payer) => payer,
+                        Err(error) => {
+                            let wnd = web_sys::window().unwrap();
+                            let _ = wnd
+                                .alert_with_message(&format!("Wallet connect failed: {}", error));
+                            return;
+                        }
+                    };
 
-                                        let mut payer_opt: Option<Address> = None;
-                                        if let Ok(accs_val) =
-                                            js_sys::Reflect::get(&obj, &"accounts".into())
-                                        {
-                                            if !accs_val.is_undefined() && !accs_val.is_null() {
-                                                let accs = js_sys::Array::from(&accs_val);
-                                                let first = accs.get(0);
-                                                if let Some(addr_str) = first.as_string() {
-                                                    if let Ok(addr) = Address::from_str(&addr_str) {
-                                                        payer_opt = Some(addr);
-                                                    }
-                                                }
-                                            }
-                                        }
-                                        let payer = match payer_opt {
-                                            Some(a) => a,
-                                            None => {
-                                                let wnd = web_sys::window().unwrap();
-                                                let _ = wnd.alert_with_message(
-                                            "Connected but no account found. If using MetaMask Mobile, ensure the connection succeeded and try again."
-                                        );
-                                                return;
-                                            }
-                                        };
+                    let secure_state = match secure_batch_state_for_wallet(payer.as_bytes()).await {
+                        Some(state) => state,
+                        None => {
+                            let wnd = web_sys::window().unwrap();
+                            let _ = wnd.alert_with_message(
+                                "Could not check weeb-3-secure for the connected wallet",
+                            );
+                            return;
+                        }
+                    };
 
-                                        let secure_state = match secure_batch_state_for_wallet(
-                                            payer.as_bytes(),
-                                        )
-                                        .await
-                                        {
-                                            Some(state) => state,
-                                            None => {
-                                                let wnd = web_sys::window().unwrap();
-                                                let _ = wnd.alert_with_message(
-                                                    "Could not check weeb-3-secure for the connected wallet",
-                                                );
-                                                return;
-                                            }
-                                        };
+                    if secure_state.usable() {
+                        let wnd = web_sys::window().unwrap();
+                        let _ = wnd.alert_with_message("Already have a secure batch for uploads");
+                        return;
+                    }
 
-                                        if secure_state.usable() {
-                                            let wnd = web_sys::window().unwrap();
-                                            let _ = wnd.alert_with_message(
-                                                "Already have a secure batch for uploads",
-                                            );
-                                            return;
-                                        }
+                    let profile = current_network_profile();
 
-                                        if let Ok(w3) = crate::on_chain::web3() {
-                                            if let Ok(cid) = w3.eth().chain_id().await {
-                                                use web3::types::U256;
-                                                if cid != U256::from(11155111u64) {
-                                                    let wnd = web_sys::window().unwrap();
-                                                    let _ = wnd.alert_with_message(
-                                                        "Wallet is not on Sepolia (11155111). Please switch to Sepolia in your wallet and try again."
-                                                    );
-                                                    return;
-                                                }
-                                            }
-                                        }
-
-                                        let prepared = match secure_prepare_batch_purchase(
-                                            batch_depth,
-                                            validity,
-                                        )
-                                        .await
-                                        {
-                                            Some(prepared) if prepared.owner.len() == 20 => {
-                                                prepared
-                                            }
-                                            _ => {
-                                                let wnd = web_sys::window().unwrap();
-                                                let _ = wnd.alert_with_message(
-                                                    "Failed to prepare secure batch owner",
-                                                );
-                                                return;
-                                            }
-                                        };
-                                        let owner = Address::from_slice(&prepared.owner);
-
-                                        web_sys::console::log_1(&JsValue::from(format!(
-                                            "Secure batch owner 0x{} | payer 0x{}",
-                                            hex::encode(&prepared.owner),
-                                            hex::encode(payer.as_bytes())
-                                        )));
-
-                                        let purchase = match buy_postage_batch_with_payer(
-                                            prepared.validity_days,
-                                            prepared.depth,
-                                            owner,
-                                            payer,
-                                        )
-                                        .await
-                                        {
-                                            Ok(p) => p,
-                                            Err(e) => {
-                                                let wnd = web_sys::window().unwrap();
-                                                let _ = wnd.alert_with_message(&format!(
-                                            "Batch purchase failed: {:?}. Ensure wallet is on Sepolia and has SBZZ + Sepolia ETH.",
-                                            e
-                                        ));
-                                                return;
-                                            }
-                                        };
-
-                                        if !secure_commit_batch_purchase(
-                                            &purchase.batch_id,
-                                            purchase.bucket_limit,
-                                            prepared.depth,
-                                        )
-                                        .await
-                                        {
-                                            let wnd = web_sys::window().unwrap();
-                                            let _ = wnd.alert_with_message(
-                                                "Failed to save batch in weeb-3-secure",
-                                            );
-                                            return;
-                                        }
-
-                                        web_sys::console::log_1(&JsValue::from(format!(
-                                            "Approve tx 0x{}, Create tx 0x{}, Batch id 0x{}, depth {}, validity {}d, lastPrice {}",
-                                            hex::encode(purchase.approve_tx.as_bytes()),
-                                            hex::encode(purchase.create_tx.as_bytes()),
-                                            hex::encode(&purchase.batch_id),
-                                            prepared.depth,
-                                            prepared.validity_days,
-                                            purchase.last_price,
-                                        )));
-
-                                        let wnd = web_sys::window().unwrap();
-                                        let _ = wnd.alert_with_message(&format!(
-                                    "Storage batch ready.\nBatch ID: 0x{}\nDepth: {}\nStorage slots per bucket: {}",
-                                    hex::encode(&purchase.batch_id),
-                                    prepared.depth,
-                                    purchase.bucket_limit
+                    if let Ok(w3) = crate::on_chain::web3() {
+                        if let Ok(cid) = w3.eth().chain_id().await {
+                            if cid != U256::from(profile.wallet_chain_id) {
+                                let wnd = web_sys::window().unwrap();
+                                let _ = wnd.alert_with_message(&format!(
+                                    "Wallet is not on {:?} chain ({}). Please switch in your wallet and try again.",
+                                    profile.mode, profile.wallet_chain_id
                                 ));
-                                        return;
-                                    }
-                                }
+                                return;
                             }
                         }
                     }
 
+                    let prepared = match secure_prepare_batch_purchase(batch_depth, validity).await
+                    {
+                        Some(prepared) if prepared.owner.len() == 20 => prepared,
+                        _ => {
+                            let wnd = web_sys::window().unwrap();
+                            let _ = wnd.alert_with_message("Failed to prepare secure batch owner");
+                            return;
+                        }
+                    };
+                    let owner = Address::from_slice(&prepared.owner);
+
+                    interface_debug(&JsValue::from(format!(
+                        "Secure batch owner 0x{} | payer 0x{}",
+                        hex::encode(&prepared.owner),
+                        hex::encode(payer.as_bytes())
+                    )));
+
+                    let purchase = match buy_postage_batch_with_payer(
+                        prepared.validity_days,
+                        prepared.depth,
+                        owner,
+                        payer,
+                    )
+                    .await
+                    {
+                        Ok(p) => p,
+                        Err(e) => {
+                            let wnd = web_sys::window().unwrap();
+                            let _ = wnd.alert_with_message(&format!(
+                                "Batch purchase failed: {:?}. Ensure wallet is on {:?} and has {} + {}.",
+                                e, profile.mode, profile.bzz_symbol, profile.base_symbol
+                            ));
+                            return;
+                        }
+                    };
+
+                    if !secure_commit_batch_purchase(
+                        &purchase.batch_id,
+                        purchase.bucket_limit,
+                        prepared.depth,
+                    )
+                    .await
+                    {
+                        let wnd = web_sys::window().unwrap();
+                        let _ = wnd.alert_with_message("Failed to save batch in weeb-3-secure");
+                        return;
+                    }
+
+                    interface_debug(&JsValue::from(format!(
+                        "Approve tx 0x{}, Create tx 0x{}, Batch id 0x{}, depth {}, validity {}d, lastPrice {}",
+                        hex::encode(purchase.approve_tx.as_bytes()),
+                        hex::encode(purchase.create_tx.as_bytes()),
+                        hex::encode(&purchase.batch_id),
+                        prepared.depth,
+                        prepared.validity_days,
+                        purchase.last_price,
+                    )));
+
                     let wnd = web_sys::window().unwrap();
-                    let _ = wnd.alert_with_message(
-                "Could not initialize wallet connection. Try again or open in MetaMask in-app browser."
-            );
+                    let _ = wnd.alert_with_message(&format!(
+                        "Storage batch ready.\nBatch ID: 0x{}\nDepth: {}\nStorage slots per bucket: {}",
+                        hex::encode(&purchase.batch_id),
+                        prepared.depth,
+                        purchase.bucket_limit
+                    ));
                 });
             },
         );
@@ -442,9 +417,31 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
             .expect("#uploadGetBatch should be a HtmlButtonElement")
             .set_onclick(Some(callback2.as_ref().unchecked_ref()));
 
-        let callback3 = wasm_bindgen::closure::Closure::<dyn FnMut(web_sys::MessageEvent)>::new(
-            move |_msg| {
-                web_sys::console::log_1(&"oninput file callback".into());
+        if let Some(button) = web_sys::window()
+            .unwrap()
+            .document()
+            .unwrap()
+            .get_element_by_id("uploadPrereqCheck")
+            .and_then(|button| button.dyn_into::<HtmlButtonElement>().ok())
+        {
+            let callback_prereq =
+                wasm_bindgen::closure::Closure::<dyn FnMut(web_sys::MessageEvent)>::new({
+                    let weeb41 = weeb41.clone();
+                    move |_msg| {
+                        let weeb300 = weeb41.clone();
+                        spawn_local(async move {
+                            check_upload_prerequisites(weeb300).await;
+                        });
+                    }
+                });
+
+            button.set_onclick(Some(callback_prereq.as_ref().unchecked_ref()));
+            callback_prereq.forget();
+        }
+
+        let callback3 =
+            wasm_bindgen::closure::Closure::<dyn FnMut(web_sys::MessageEvent)>::new(move |_msg| {
+                interface_debug(&"oninput file callback".into());
 
                 let weeb300 = weeb32.clone();
 
@@ -503,7 +500,7 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
                         }
                     }
 
-                    web_sys::console::log_1(&JsValue::from(format!(
+                    interface_debug(&JsValue::from(format!(
                         "selected file length {:#?}",
                         file.size()
                     )));
@@ -521,7 +518,7 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
                         Err(_) => "".to_string(),
                     };
 
-                    web_sys::console::log_1(&JsValue::from(format!("IF Upload Marker 0")));
+                    interface_debug(&JsValue::from(format!("IF Upload Marker 0")));
 
                     let result = weeb300
                         .post_upload(
@@ -533,16 +530,15 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
                         )
                         .await;
 
-                    web_sys::console::log_1(&JsValue::from(format!("IF Upload Marker 1")));
+                    interface_debug(&JsValue::from(format!("IF Upload Marker 1")));
 
                     let (data, indx) = decode_resources(result);
 
                     render_result(data, indx).await;
 
-                    web_sys::console::log_1(&"oninput file callback happened".into());
+                    interface_debug(&"oninput file callback happened".into());
                 })
-            },
-        );
+            });
 
         web_sys::window()
             .unwrap()
@@ -554,82 +550,20 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
             .expect("#uploadFile should be a HtmlButtonElement")
             .set_onclick(Some(callback3.as_ref().unchecked_ref()));
 
+        let weeb_network_toggle = weeb33.clone();
         let callback4 =
             wasm_bindgen::closure::Closure::<dyn FnMut(web_sys::MessageEvent)>::new(move |_msg| {
                 let weeb300 = weeb33.clone();
 
-                web_sys::console::log_1(&"oninput bootnode callback".into());
+                interface_debug(&"oninput bootnode callback".into());
 
+                let apply_generation = next_network_apply_generation();
+                let network_id = current_network_id_input();
                 spawn_local(async move {
-                    let weeb310 = weeb300.clone();
-                    let weeb311 = weeb300.clone();
-                    let weeb312 = weeb300.clone();
-                    let weeb313 = weeb300.clone();
-                    let weeb314 = weeb300.clone();
-                    let weeb315 = weeb300.clone();
-                    let weeb316 = weeb300.clone();
-                    let weeb317 = weeb300.clone();
-
-                    let k0 = async move {
-                        let (bna, nid) = parsebootconnect("bootNodeMASettings".to_string());
-                        let result = weeb310.change_bootnode_address(bna, nid, true).await;
-                        let (data, indx) = decode_resources(result);
-                        render_result(data, indx).await;
-                    };
-
-                    let k1 = async move {
-                        let (bna, nid) = parsebootconnect("bootNodeMASettings0".to_string());
-                        let result = weeb311.change_bootnode_address(bna, nid, true).await;
-                        let (data, indx) = decode_resources(result);
-                        render_result(data, indx).await;
-                    };
-
-                    let k2 = async move {
-                        let (bna, nid) = parsebootconnect("bootNodeMASettings1".to_string());
-                        let result = weeb312.change_bootnode_address(bna, nid, true).await;
-                        let (data, indx) = decode_resources(result);
-                        render_result(data, indx).await;
-                    };
-
-                    let k3 = async move {
-                        let (bna, nid) = parsebootconnect("bootNodeMASettings2".to_string());
-                        let result = weeb313.change_bootnode_address(bna, nid, true).await;
-                        let (data, indx) = decode_resources(result);
-                        render_result(data, indx).await;
-                    };
-
-                    let k4 = async move {
-                        let (bna, nid) = parsebootconnect("bootNodeMASettings3".to_string());
-                        let result = weeb314.change_bootnode_address(bna, nid, true).await;
-                        let (data, indx) = decode_resources(result);
-                        render_result(data, indx).await;
-                    };
-
-                    let k5 = async move {
-                        let (bna, nid) = parsebootconnect("bootNodeMASettings4".to_string());
-                        let result = weeb315.change_bootnode_address(bna, nid, true).await;
-                        let (data, indx) = decode_resources(result);
-                        render_result(data, indx).await;
-                    };
-
-                    let k6 = async move {
-                        let (bna, nid) = parsebootconnect("bootNodeMASettings5".to_string());
-                        let result = weeb316.change_bootnode_address(bna, nid, true).await;
-                        let (data, indx) = decode_resources(result);
-                        render_result(data, indx).await;
-                    };
-
-                    let k7 = async move {
-                        let (bna, nid) = parsebootconnect("bootNodeMASettings6".to_string());
-                        let result = weeb317.change_bootnode_address(bna, nid, true).await;
-                        let (data, indx) = decode_resources(result);
-                        render_result(data, indx).await;
-                    };
-
-                    join!(k0, k1, k2, k3, k4, k5, k6, k7);
+                    apply_network_settings_and_connect(weeb300, apply_generation, network_id).await;
                 });
 
-                web_sys::console::log_1(&"oninput network settings callback happened".into());
+                interface_debug(&"oninput network settings callback happened".into());
             });
 
         web_sys::window()
@@ -642,11 +576,13 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
             .expect("#networkSet should be a HtmlButtonElement")
             .set_onclick(Some(callback4.as_ref().unchecked_ref()));
 
+        install_network_profile_toggle(weeb_network_toggle);
+
         let callback5 =
             wasm_bindgen::closure::Closure::<dyn FnMut(web_sys::MessageEvent)>::new(move |_msg| {
                 let weeb300 = weeb34.clone();
 
-                web_sys::console::log_1(&"oninput reset stamp callback".into());
+                interface_debug(&"oninput reset stamp callback".into());
 
                 let window = web_sys::window().unwrap();
 
@@ -680,154 +616,93 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
             move |_msg| {
                 let state = chequebook_state_deploy.clone();
                 spawn_local(async move {
-                    let window = web_sys::window().unwrap();
-                    if let Ok(func) =
-                        js_sys::Reflect::get(&window, &JsValue::from_str("weeb3EnsureEip1193"))
+                    let payer = match connect_wallet_address().await {
+                        Ok(payer) => payer,
+                        Err(error) => {
+                            let wnd = web_sys::window().unwrap();
+                            let _ = wnd
+                                .alert_with_message(&format!("Wallet connect failed: {}", error));
+                            return;
+                        }
+                    };
+
+                    let stored_chequebook_signer_key = get_chequebook_signer_key().await;
+                    let stored_chequebook_address = get_chequebook_address().await;
+
+                    if !stored_chequebook_signer_key.is_empty()
+                        && stored_chequebook_address.len() == 20
                     {
-                        if let Ok(f) = func.dyn_into::<js_sys::Function>() {
-                            let project_id = JsValue::from_str("64c5f91181ce0a3192a783346a475d23");
-                            if let Ok(promise_val) = f.call1(&JsValue::NULL, &project_id) {
-                                if let Ok(promise) = promise_val.dyn_into::<js_sys::Promise>() {
-                                    let res = JsFuture::from(promise).await;
-                                    if let Ok(obj) = res {
-                                        let ok = js_sys::Reflect::get(&obj, &"ok".into())
-                                            .ok()
-                                            .and_then(|v| v.as_bool())
-                                            .unwrap_or(false);
-                                        if !ok {
-                                            let err = js_sys::Reflect::get(&obj, &"error".into())
-                                                .ok()
-                                                .and_then(|v| v.as_string())
-                                                .unwrap_or_else(|| "WalletConnect failed".into());
-                                            let wnd = web_sys::window().unwrap();
-                                            let _ = wnd.alert_with_message(&format!(
-                                                "Wallet connect failed: {}",
-                                                err
-                                            ));
-                                            return;
-                                        }
+                        let wnd = web_sys::window().unwrap();
+                        let _ = wnd.alert_with_message(&format!(
+                            "Already have a chequebook deployed at address {}",
+                            hex::encode(stored_chequebook_address)
+                        ));
+                        return;
+                    }
 
-                                        let stored_chequebook_signer_key =
-                                            get_chequebook_signer_key().await;
-                                        let stored_chequebook_address =
-                                            get_chequebook_address().await;
+                    let profile = current_network_profile();
 
-                                        if !stored_chequebook_signer_key.is_empty()
-                                            && !stored_chequebook_signer_key.is_empty()
-                                        {
-                                            let wnd = web_sys::window().unwrap();
-                                            let _ = wnd.alert_with_message(&format!(
-                                                "Already have a chequebook deployed at address {}",
-                                                hex::encode(stored_chequebook_address)
-                                            ));
-                                            return;
-                                        }
-
-                                        let mut payer_opt: Option<Address> = None;
-                                        if let Ok(accs_val) =
-                                            js_sys::Reflect::get(&obj, &"accounts".into())
-                                        {
-                                            if !accs_val.is_undefined() && !accs_val.is_null() {
-                                                let accs = js_sys::Array::from(&accs_val);
-                                                let first = accs.get(0);
-                                                if let Some(addr_str) = first.as_string() {
-                                                    if let Ok(addr) = Address::from_str(&addr_str) {
-                                                        payer_opt = Some(addr);
-                                                    }
-                                                }
-                                            }
-                                        }
-                                        let payer = match payer_opt {
-                                            Some(a) => a,
-                                            None => {
-                                                let wnd = web_sys::window().unwrap();
-                                                let _ = wnd.alert_with_message(
-                                            "Connected but no account found. If using MetaMask Mobile, ensure the connection succeeded and try again."
-                                        );
-                                                return;
-                                            }
-                                        };
-
-                                        if let Ok(w3) = crate::on_chain::web3() {
-                                            if let Ok(cid) = w3.eth().chain_id().await {
-                                                if cid != U256::from(11155111u64) {
-                                                    let wnd = web_sys::window().unwrap();
-                                                    let _ = wnd.alert_with_message(
-                                                        "Wallet is not on Sepolia (11155111). Please switch to Sepolia in your wallet and try again."
-                                                    );
-                                                    return;
-                                                }
-                                            }
-                                        }
-
-                                        let cheque_signer_key = encrey();
-                                        let cheque_signer: PrivateKeySigner =
-                                            match PrivateKeySigner::from_slice(&cheque_signer_key) {
-                                                Ok(s) => s,
-                                                Err(_) => {
-                                                    let wnd = web_sys::window().unwrap();
-                                                    let _ = wnd.alert_with_message(
-                                                        "Failed to create chequebook signer key",
-                                                    );
-                                                    return;
-                                                }
-                                            };
-                                        let issuer_h160_bytes: [u8; 20] =
-                                            *cheque_signer.address().as_ref();
-                                        let issuer = Address::from(issuer_h160_bytes);
-
-                                        let deployment =
-                                            match deploy_chequebook_with_payer(issuer, payer).await
-                                            {
-                                                Ok(d) => d,
-                                                Err(e) => {
-                                                    let wnd = web_sys::window().unwrap();
-                                                    let _ = wnd.alert_with_message(&format!(
-                                                        "Chequebook deployment failed: {:?}",
-                                                        e
-                                                    ));
-                                                    return;
-                                                }
-                                            };
-
-                                        if !set_chequebook_signer_key(&cheque_signer_key).await {
-                                            let wnd = web_sys::window().unwrap();
-                                            let _ = wnd.alert_with_message(
-                                                "Chequebook deployed, but failed to save signer key locally.",
-                                            );
-                                        }
-
-                                        if !set_chequebook_address(
-                                            &deployment.chequebook.as_bytes().to_vec(),
-                                        )
-                                        .await
-                                        {
-                                            let wnd = web_sys::window().unwrap();
-                                            let _ = wnd.alert_with_message(
-                                                "Chequebook deployed, but failed to save address locally.",
-                                            );
-                                        }
-
-                                        *state.borrow_mut() = Some(deployment.chequebook);
-
-                                        let wnd = web_sys::window().unwrap();
-                                        let _ = wnd.alert_with_message(&format!(
-                                            "Chequebook deployed at 0x{}.\nIssuer: 0x{}\nDeployment tx: 0x{}",
-                                            hex::encode(deployment.chequebook.as_bytes()),
-                                            hex::encode(issuer_h160_bytes),
-                                            hex::encode(deployment.tx.as_bytes())
-                                        ));
-                                        return;
-                                    }
-                                }
+                    if let Ok(w3) = crate::on_chain::web3() {
+                        if let Ok(cid) = w3.eth().chain_id().await {
+                            if cid != U256::from(profile.wallet_chain_id) {
+                                let wnd = web_sys::window().unwrap();
+                                let _ = wnd.alert_with_message(&format!(
+                                    "Wallet is not on {:?} chain ({}). Please switch in your wallet and try again.",
+                                    profile.mode, profile.wallet_chain_id
+                                ));
+                                return;
                             }
                         }
                     }
 
+                    let cheque_signer_key = encrey();
+                    let cheque_signer = match PrivateKeySigner::from_slice(&cheque_signer_key) {
+                        Ok(s) => s,
+                        Err(_) => {
+                            let wnd = web_sys::window().unwrap();
+                            let _ =
+                                wnd.alert_with_message("Failed to create chequebook signer key");
+                            return;
+                        }
+                    };
+                    let issuer_h160_bytes: [u8; 20] = *cheque_signer.address().as_ref();
+                    let issuer = Address::from(issuer_h160_bytes);
+
+                    let deployment = match deploy_chequebook_with_payer(issuer, payer).await {
+                        Ok(d) => d,
+                        Err(e) => {
+                            let wnd = web_sys::window().unwrap();
+                            let _ = wnd.alert_with_message(&format!(
+                                "Chequebook deployment failed: {:?}",
+                                e
+                            ));
+                            return;
+                        }
+                    };
+
+                    if !set_chequebook_signer_key(&cheque_signer_key).await {
+                        let wnd = web_sys::window().unwrap();
+                        let _ = wnd.alert_with_message(
+                            "Chequebook deployed, but failed to save signer key locally.",
+                        );
+                    }
+
+                    if !set_chequebook_address(&deployment.chequebook.as_bytes().to_vec()).await {
+                        let wnd = web_sys::window().unwrap();
+                        let _ = wnd.alert_with_message(
+                            "Chequebook deployed, but failed to save address locally.",
+                        );
+                    }
+
+                    *state.borrow_mut() = Some(deployment.chequebook);
+
                     let wnd = web_sys::window().unwrap();
-                    let _ = wnd.alert_with_message(
-                "Could not initialize wallet connection. Try again or open in MetaMask in-app browser."
-            );
+                    let _ = wnd.alert_with_message(&format!(
+                        "Chequebook deployed at 0x{}.\nIssuer: 0x{}\nDeployment tx: 0x{}",
+                        hex::encode(deployment.chequebook.as_bytes()),
+                        hex::encode(issuer_h160_bytes),
+                        hex::encode(deployment.tx.as_bytes())
+                    ));
                 });
             },
         );
@@ -905,132 +780,72 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
                         }
                     };
 
-                    let window = web_sys::window().unwrap();
-                    if let Ok(func) =
-                        js_sys::Reflect::get(&window, &JsValue::from_str("weeb3EnsureEip1193"))
-                    {
-                        if let Ok(f) = func.dyn_into::<js_sys::Function>() {
-                            let project_id = JsValue::from_str("64c5f91181ce0a3192a783346a475d23");
-                            if let Ok(promise_val) = f.call1(&JsValue::NULL, &project_id) {
-                                if let Ok(promise) = promise_val.dyn_into::<js_sys::Promise>() {
-                                    let res = JsFuture::from(promise).await;
-                                    if let Ok(obj) = res {
-                                        let ok = js_sys::Reflect::get(&obj, &"ok".into())
-                                            .ok()
-                                            .and_then(|v| v.as_bool())
-                                            .unwrap_or(false);
-                                        if !ok {
-                                            let err = js_sys::Reflect::get(&obj, &"error".into())
-                                                .ok()
-                                                .and_then(|v| v.as_string())
-                                                .unwrap_or_else(|| "WalletConnect failed".into());
-                                            let wnd = web_sys::window().unwrap();
-                                            let _ = wnd.alert_with_message(&format!(
-                                                "Wallet connect failed: {}",
-                                                err
-                                            ));
-                                            return;
-                                        }
+                    let payer = match connect_wallet_address().await {
+                        Ok(payer) => payer,
+                        Err(error) => {
+                            let wnd = web_sys::window().unwrap();
+                            let _ = wnd
+                                .alert_with_message(&format!("Wallet connect failed: {}", error));
+                            return;
+                        }
+                    };
 
-                                        let mut payer_opt: Option<Address> = None;
-                                        if let Ok(accs_val) =
-                                            js_sys::Reflect::get(&obj, &"accounts".into())
-                                        {
-                                            if !accs_val.is_undefined() && !accs_val.is_null() {
-                                                let accs = js_sys::Array::from(&accs_val);
-                                                let first = accs.get(0);
-                                                if let Some(addr_str) = first.as_string() {
-                                                    if let Ok(addr) = Address::from_str(&addr_str) {
-                                                        payer_opt = Some(addr);
-                                                    }
-                                                }
-                                            }
-                                        }
-                                        let payer = match payer_opt {
-                                            Some(a) => a,
-                                            None => {
-                                                let wnd = web_sys::window().unwrap();
-                                                let _ = wnd.alert_with_message(
-                                            "Connected but no account found. If using MetaMask Mobile, ensure the connection succeeded and try again."
-                                        );
-                                                return;
-                                            }
-                                        };
+                    let w3 = match crate::on_chain::web3() {
+                        Ok(w) => w,
+                        Err(e) => {
+                            let wnd = web_sys::window().unwrap();
+                            let _ = wnd
+                                .alert_with_message(&format!("Failed to initialize web3: {:?}", e));
+                            return;
+                        }
+                    };
 
-                                        let w3 = match crate::on_chain::web3() {
-                                            Ok(w) => w,
-                                            Err(e) => {
-                                                let wnd = web_sys::window().unwrap();
-                                                let _ = wnd.alert_with_message(&format!(
-                                                    "Failed to initialize web3: {:?}",
-                                                    e
-                                                ));
-                                                return;
-                                            }
-                                        };
+                    let profile = current_network_profile();
 
-                                        if let Ok(cid) = w3.eth().chain_id().await {
-                                            if cid != U256::from(11155111u64) {
-                                                let wnd = web_sys::window().unwrap();
-                                                let _ = wnd.alert_with_message(
-                                                    "Wallet is not on Sepolia (11155111). Please switch to Sepolia in your wallet and try again."
-                                                );
-                                                return;
-                                            }
-                                        }
-
-                                        let token = match token_contract(&w3).await {
-                                            Ok(t) => t,
-                                            Err(e) => {
-                                                let wnd = web_sys::window().unwrap();
-                                                let _ = wnd.alert_with_message(&format!(
-                                                    "Failed to load token contract: {:?}",
-                                                    e
-                                                ));
-                                                return;
-                                            }
-                                        };
-
-                                        let receipt = match deposit_to_chequebook(
-                                            &token, chequebook, payer, amount,
-                                        )
-                                        .await
-                                        {
-                                            Ok(r) => r,
-                                            Err(e) => {
-                                                let wnd = web_sys::window().unwrap();
-                                                let _ = wnd.alert_with_message(&format!(
-                                                    "Deposit failed: {:?}",
-                                                    e
-                                                ));
-                                                return;
-                                            }
-                                        };
-
-                                        let mut balance_note = String::new();
-                                        if let Ok(balance) =
-                                            chequebook_balance(&w3, chequebook).await
-                                        {
-                                            balance_note = format!("\nNew balance: {}", balance);
-                                        }
-
-                                        let wnd = web_sys::window().unwrap();
-                                        let _ = wnd.alert_with_message(&format!(
-                                            "Deposit submitted.\nTx: 0x{}{}",
-                                            hex::encode(receipt.transaction_hash.as_bytes()),
-                                            balance_note
-                                        ));
-                                        return;
-                                    }
-                                }
-                            }
+                    if let Ok(cid) = w3.eth().chain_id().await {
+                        if cid != U256::from(profile.wallet_chain_id) {
+                            let wnd = web_sys::window().unwrap();
+                            let _ = wnd.alert_with_message(&format!(
+                                "Wallet is not on {:?} chain ({}). Please switch in your wallet and try again.",
+                                profile.mode, profile.wallet_chain_id
+                            ));
+                            return;
                         }
                     }
 
+                    let token = match token_contract(&w3).await {
+                        Ok(t) => t,
+                        Err(e) => {
+                            let wnd = web_sys::window().unwrap();
+                            let _ = wnd.alert_with_message(&format!(
+                                "Failed to load token contract: {:?}",
+                                e
+                            ));
+                            return;
+                        }
+                    };
+
+                    let receipt =
+                        match deposit_to_chequebook(&token, chequebook, payer, amount).await {
+                            Ok(r) => r,
+                            Err(e) => {
+                                let wnd = web_sys::window().unwrap();
+                                let _ = wnd.alert_with_message(&format!("Deposit failed: {:?}", e));
+                                return;
+                            }
+                        };
+
+                    let mut balance_note = String::new();
+                    if let Ok(balance) = chequebook_balance(&w3, chequebook).await {
+                        balance_note = format!("\nNew balance: {}", balance);
+                    }
+
                     let wnd = web_sys::window().unwrap();
-                    let _ = wnd.alert_with_message(
-                "Could not initialize wallet connection. Try again or open in MetaMask in-app browser."
-            );
+                    let _ = wnd.alert_with_message(&format!(
+                        "Deposit submitted.\nTx: 0x{}{}",
+                        hex::encode(receipt.transaction_hash.as_bytes()),
+                        balance_note
+                    ));
                 });
             },
         );
@@ -1047,7 +862,7 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
 
         let service_closure = Closure::wrap(Box::new(move |event: MessageEvent| {
             if let Ok(obj) = event.data().dyn_into::<js_sys::Object>() {
-                web_sys::console::log_1(&JsValue::from(format!(
+                interface_debug(&JsValue::from(format!(
                     "Attempting to load reference received from service worker {:#?}",
                     obj
                 )));
@@ -1072,27 +887,26 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
                     let port = ports.get(0).dyn_into::<web_sys::MessagePort>().ok();
 
                     wasm_bindgen_futures::spawn_local(async move {
-                        web_sys::console::log_1(&JsValue::from(format!(
+                        interface_debug(&JsValue::from(format!(
                             "Loading /bzz/ reference from service worker {:#?}",
                             reference
                         )));
                         let result = weeb300.acquire(reference).await;
                         let (data, indx) = decode_resources(result);
-                        render_result(data.clone(), indx.clone()).await;
-
-                        let resp = js_sys::Object::new();
-                        js_sys::Reflect::set(&resp, &"ok".into(), &true.into()).unwrap();
-                        js_sys::Reflect::set(&resp, &"type".into(), &"RETRIEVE_RESPONSE".into())
-                            .unwrap();
-                        js_sys::Reflect::set(&resp, &"indx".into(), &indx.clone().into()).unwrap();
-
                         let head_resource = data
                             .iter()
                             .find(|(_, _, path)| *path == indx)
                             .or_else(|| data.get(0));
 
+                        let resp = js_sys::Object::new();
+                        js_sys::Reflect::set(&resp, &"ok".into(), &head_resource.is_some().into())
+                            .unwrap();
+                        js_sys::Reflect::set(&resp, &"type".into(), &"RETRIEVE_RESPONSE".into())
+                            .unwrap();
+                        js_sys::Reflect::set(&resp, &"indx".into(), &indx.clone().into()).unwrap();
+
                         if let Some((bytes, mime, path)) = head_resource {
-                            web_sys::console::log_1(&JsValue::from(format!(
+                            interface_debug(&JsValue::from(format!(
                                 "service message resource len {}",
                                 bytes.len()
                             )));
@@ -1106,6 +920,57 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
                             js_sys::Reflect::set(&resp, &"path".into(), &path.clone().into())
                                 .unwrap();
                         }
+
+                        if let Some(port) = port {
+                            port.post_message(&resp).unwrap();
+                        }
+                    });
+                }
+                if ty == JsValue::from_str("RETRIEVE_BYTES_REQUEST")
+                    || ty == JsValue::from_str("RETRIEVE_CHUNK_REQUEST")
+                {
+                    let url = js_sys::Reflect::get(&obj, &JsValue::from_str("url"))
+                        .unwrap_or(JsValue::NULL);
+                    let reference = url.as_string().unwrap_or_default();
+                    let retrieve_chunk = ty == JsValue::from_str("RETRIEVE_CHUNK_REQUEST");
+                    let weeb300 = weeb37.clone();
+
+                    let ports: Array = event.ports().into();
+                    let port = ports.get(0).dyn_into::<web_sys::MessagePort>().ok();
+
+                    wasm_bindgen_futures::spawn_local(async move {
+                        let bytes = if retrieve_chunk {
+                            weeb300.retrieve_chunk_bytes(reference.clone()).await
+                        } else {
+                            weeb300.retrieve_bytes(reference.clone()).await
+                        };
+
+                        let resp = js_sys::Object::new();
+                        js_sys::Reflect::set(&resp, &"ok".into(), &(!bytes.is_empty()).into())
+                            .unwrap();
+                        js_sys::Reflect::set(
+                            &resp,
+                            &"type".into(),
+                            &if retrieve_chunk {
+                                "RETRIEVE_CHUNK_RESPONSE"
+                            } else {
+                                "RETRIEVE_BYTES_RESPONSE"
+                            }
+                            .into(),
+                        )
+                        .unwrap();
+                        js_sys::Reflect::set(&resp, &"path".into(), &reference.clone().into())
+                            .unwrap();
+                        js_sys::Reflect::set(
+                            &resp,
+                            &"mime".into(),
+                            &"application/octet-stream".into(),
+                        )
+                        .unwrap();
+
+                        let u8arr = js_sys::Uint8Array::new_with_length(bytes.len() as u32);
+                        u8arr.copy_from(&bytes);
+                        js_sys::Reflect::set(&resp, &"body".into(), &u8arr).unwrap();
 
                         if let Some(port) = port {
                             port.post_message(&resp).unwrap();
@@ -1172,13 +1037,13 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
         {
             Ok(aok) => aok,
             Err(err) => {
-                web_sys::console::log_1(&JsValue::from(format!(
-                    "Service listener error {:#?}",
-                    err
-                )));
+                interface_debug(&JsValue::from(format!("Service listener error {:#?}", err)));
             }
         };
 
+        let mut last_progress_revision = 0u64;
+        let mut last_ongoing = None::<u64>;
+        let mut last_connections = None::<u64>;
         loop {
             #[allow(irrefutable_let_patterns)]
             let logs_current = weeb35.get_current_logs().await;
@@ -1188,48 +1053,60 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
 
             let ongoing = weeb35.get_ongoing_connections().await;
 
-            let _ = web_sys::window()
-                .unwrap()
-                .document()
-                .unwrap()
-                .get_element_by_id("ongoing")
-                .expect("#ongoing should exist")
-                .dyn_ref::<HtmlSpanElement>()
-                .unwrap()
-                .set_inner_html(&ongoing.to_string());
+            if last_ongoing != Some(ongoing) {
+                web_sys::window()
+                    .unwrap()
+                    .document()
+                    .unwrap()
+                    .get_element_by_id("ongoing")
+                    .expect("#ongoing should exist")
+                    .dyn_ref::<HtmlSpanElement>()
+                    .unwrap()
+                    .set_text_content(Some(&ongoing.to_string()));
+                last_ongoing = Some(ongoing);
+            }
 
             let connections = weeb35.get_connections().await;
 
-            let _ = web_sys::window()
-                .unwrap()
-                .document()
-                .unwrap()
-                .get_element_by_id("connections")
-                .expect("#connections should exist")
-                .dyn_ref::<HtmlSpanElement>()
-                .unwrap()
-                .set_inner_html(&connections.to_string());
+            if last_connections != Some(connections) {
+                web_sys::window()
+                    .unwrap()
+                    .document()
+                    .unwrap()
+                    .get_element_by_id("connections")
+                    .expect("#connections should exist")
+                    .dyn_ref::<HtmlSpanElement>()
+                    .unwrap()
+                    .set_text_content(Some(&connections.to_string()));
+                last_connections = Some(connections);
+            }
+
+            if let Some((revision, progress_rows)) =
+                weeb35.get_progress_snapshot(last_progress_revision).await
+            {
+                render_progress_rows(progress_rows);
+                last_progress_revision = revision;
+            }
 
             async_std::task::sleep(Duration::from_millis(160)).await
         }
     };
 
-    /*
-        let fetch_test = async move {
-            async_std::task::sleep(Duration::from_millis(6400)).await;
+    let _fetch_test = async move {
+        async_std::task::sleep(Duration::from_millis(6400)).await;
 
-            let host3 = web_sys::window()
-                .unwrap()
-                .document()
-                .unwrap()
-                .location()
-                .unwrap()
-                .origin()
-                .unwrap();
+        let host3 = web_sys::window()
+            .unwrap()
+            .document()
+            .unwrap()
+            .location()
+            .unwrap()
+            .origin()
+            .unwrap();
 
-            let url = format!("{}/weeb-3/bzz", host3);
+        let url = format!("{}/weeb-3/bzz", host3);
 
-            let ascii_art = r#"@@@@%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%@@@
+        let ascii_art = r#"@@@@%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%@@@
 %@%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%@
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%@@@%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
@@ -1318,450 +1195,40 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
 @@@@@@@@@@@@@@@@@@@%#####%%@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@%%@@@@@@@%%%%%%%%%#%@@@@@%@@
 @@@@@@@@@@@@@@@@@@@%%%%####@%@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@%%@@@@@@@%%%%%%%%%*#%@@@@@@@"#;
 
-            let u8arr = js_sys::Uint8Array::from(ascii_art.as_bytes());
+        let u8arr = js_sys::Uint8Array::from(ascii_art.as_bytes());
 
-            let blob_parts = js_sys::Array::new();
-            blob_parts.push(&u8arr);
-            let props = web_sys::BlobPropertyBag::new();
-            props.set_type("text/plain");
-            let blob =
-                web_sys::Blob::new_with_u8_array_sequence_and_options(&blob_parts, &props).unwrap();
+        let blob_parts = js_sys::Array::new();
+        blob_parts.push(&u8arr);
+        let props = web_sys::BlobPropertyBag::new();
+        props.set_type("text/plain");
+        let blob =
+            web_sys::Blob::new_with_u8_array_sequence_and_options(&blob_parts, &props).unwrap();
 
-            let form = web_sys::FormData::new().unwrap();
-            form.append_with_blob_and_filename("file", &blob, "sel.txt")
-                .unwrap();
+        let form = web_sys::FormData::new().unwrap();
+        form.append_with_blob_and_filename("file", &blob, "sel.txt")
+            .unwrap();
 
-            let opts = web_sys::RequestInit::new();
-            opts.set_method("POST");
+        let opts = web_sys::RequestInit::new();
+        opts.set_method("POST");
 
-            let headers = web_sys::Headers::new().unwrap();
-            headers.set("swarm-encrypt", "true").unwrap();
-            opts.set_headers(&headers);
-            opts.set_body(&wasm_bindgen::JsValue::from(form)); // <-- important: JsValue
+        let headers = web_sys::Headers::new().unwrap();
+        headers.set("swarm-encrypt", "true").unwrap();
+        opts.set_headers(&headers);
+        opts.set_body(&wasm_bindgen::JsValue::from(form)); // <-- important: JsValue
 
-            let request = web_sys::Request::new_with_str_and_init(&url, &opts).unwrap();
-            let window = web_sys::window().unwrap();
-            let resp_value = JsFuture::from(window.fetch_with_request(&request)).await;
-            web_sys::console::log_1(&JsValue::from(format!("Upload response: {:?}", resp_value)));
+        let request = web_sys::Request::new_with_str_and_init(&url, &opts).unwrap();
+        let window = web_sys::window().unwrap();
+        let resp_value = JsFuture::from(window.fetch_with_request(&request)).await;
+        web_sys::console::log_1(&JsValue::from(format!("Upload response: {:?}", resp_value)));
 
-            let window = web_sys::window().unwrap();
-            let resp_value = JsFuture::from(window.fetch_with_request(&request)).await;
+        let window = web_sys::window().unwrap();
+        let resp_value = JsFuture::from(window.fetch_with_request(&request)).await;
 
-            web_sys::console::log_1(&JsValue::from(format!("Upload response: {:?}", resp_value)));
-        };
-    */
+        web_sys::console::log_1(&JsValue::from(format!("Upload response: {:?}", resp_value)));
+    };
+
     interface_async.await;
 
     #[allow(unreachable_code)]
     Ok(())
-}
-
-async fn connect_bootnode_setting(weeb3: Arc<Weeb3>, element_id: &'static str) {
-    let (bna, nid) = parsebootconnect(element_id.to_string());
-    let _ = weeb3.change_bootnode_address(bna, nid, true).await;
-}
-
-async fn open_bzz_resource(weeb3: Arc<Weeb3>, resource: String) {
-    let stream_files = stream_files_when_available();
-    let has_requested_path = has_bzz_resource_path(&resource);
-
-    if stream_files || has_requested_path {
-        if let Some(metadata) = weeb3.resolve_bzz(resource.clone()).await {
-            if stream_files {
-                if crate::streaming_player::try_render_streaming_player(
-                    resource.clone(),
-                    metadata.clone(),
-                )
-                .await
-                {
-                    return;
-                }
-            }
-
-            if should_render_resolved_asset(has_requested_path, &metadata) {
-                if render_resolved_asset(weeb3.clone(), metadata).await {
-                    return;
-                }
-            }
-        }
-    }
-
-    let result = weeb3.acquire(resource).await;
-    let (data, indx) = decode_resources(result);
-    render_result(data, indx).await;
-}
-
-fn has_bzz_resource_path(resource: &str) -> bool {
-    parse_bzz_resource(resource)
-        .map(|resource| !resource.path.is_empty())
-        .unwrap_or(false)
-}
-
-fn should_render_resolved_asset(has_requested_path: bool, metadata: &BzzMetadata) -> bool {
-    has_requested_path || metadata.target_count == 1
-}
-
-async fn render_resolved_asset(weeb3: Arc<Weeb3>, metadata: BzzMetadata) -> bool {
-    if metadata.size == 0 {
-        render_result(
-            vec![(vec![], metadata.mime.clone(), metadata.path.clone())],
-            metadata.path,
-        )
-        .await;
-        return true;
-    }
-
-    if let Some((bytes, metadata)) = weeb3
-        .acquire_resolved_range(metadata.clone(), 0, metadata.size - 1)
-        .await
-    {
-        render_result(
-            vec![(bytes, metadata.mime.clone(), metadata.path.clone())],
-            metadata.path,
-        )
-        .await;
-        return true;
-    }
-
-    false
-}
-
-fn stream_files_when_available() -> bool {
-    let document = web_sys::window().unwrap().document().unwrap();
-
-    let stream_setting = match document.get_element_by_id("streamFilesWhenAvailable") {
-        Some(stream_setting) => stream_setting,
-        None => return true,
-    };
-
-    match stream_setting.dyn_ref::<HtmlInputElement>() {
-        Some(stream_setting) => stream_setting.checked(),
-        None => true,
-    }
-}
-
-fn update_transfer_pause_button(paused: bool) {
-    let document = web_sys::window().unwrap().document().unwrap();
-    let button = match document.get_element_by_id("transferPauseToggle") {
-        Some(button) => button,
-        None => return,
-    };
-
-    let button = button
-        .dyn_ref::<HtmlButtonElement>()
-        .expect("#transferPauseToggle should be a HtmlButtonElement");
-
-    if paused {
-        button.set_inner_text("... Resume retrieve / push ...");
-    } else {
-        button.set_inner_text("... Pause retrieve / push ...");
-    }
-}
-
-fn create_element_wmt(tmype: String, blob_url: String) -> Element {
-    let document = web_sys::window().unwrap().document().unwrap();
-    if tmype == "undefined" {
-        let e = document.create_element("div").unwrap();
-        e.set_inner_html("Not found");
-        return e;
-    }
-
-    let i = document.create_element("embed").unwrap();
-    let _ = i.set_attribute("src", &blob_url);
-    let _ = i.set_attribute("type", &tmype);
-    // let _ = i.set_attribute("allow", "fullscreen");
-
-    return i;
-}
-
-fn create_ielement(indx: String) -> Element {
-    let document = web_sys::window().unwrap().document().unwrap();
-
-    let i = document.create_element("embed").unwrap();
-    let _ = i.set_attribute("src", &indx);
-    let _ = i.set_attribute("width", "90%");
-    let _ = i.set_attribute("height", "90%");
-    // let _ = i.set_attribute("sandbox", "allow-scripts");
-    return i;
-}
-
-pub(crate) fn service_worker_missing() {
-    let document = web_sys::window().unwrap().document().unwrap();
-    let errod = document.create_element("div").unwrap();
-    errod.set_inner_html("Service worker required and not found. Loading websites from swarm requires accessing weeb-3 via https through secure certificate.");
-    let _r = document
-        .get_element_by_id("resultField")
-        .expect("#resultField should exist")
-        .dyn_ref::<HtmlElement>()
-        .unwrap()
-        .prepend_with_node_1(&errod)
-        .unwrap();
-}
-
-fn render_log_message(log: &String) {
-    let document = web_sys::window().unwrap().document().unwrap();
-    let log_message_div = document.create_element("div").unwrap();
-    log_message_div.set_inner_html(&log);
-    let _r = document
-        .get_element_by_id("logsField")
-        .expect("#logsField should exist")
-        .dyn_ref::<HtmlElement>()
-        .unwrap()
-        .prepend_with_node_1(&log_message_div)
-        .unwrap();
-}
-
-async fn render_result(data: Vec<(Vec<u8>, String, String)>, indx: String) {
-    let host2 = web_sys::window()
-        .unwrap()
-        .document()
-        .unwrap()
-        .location()
-        .unwrap()
-        .origin()
-        .unwrap();
-
-    web_sys::console::log_1(&JsValue::from(format!(
-        "data array length {:#?}",
-        data.len()
-    )));
-
-    if data.len() == 0 {
-        let new_element = create_element_wmt("undefined".to_string(), "".to_string());
-
-        let document = web_sys::window().unwrap().document().unwrap();
-
-        let _r = document
-            .get_element_by_id("resultField")
-            .expect("#resultField should exist")
-            .dyn_ref::<HtmlElement>()
-            .unwrap()
-            .prepend_with_node_1(&new_element)
-            .unwrap();
-    } else if data.len() == 1 {
-        web_sys::console::log_1(&JsValue::from(format!(
-            "data length {:#?}",
-            data[0].0.len()
-        )));
-
-        let props = BlobPropertyBag::new();
-        props.set_type(&data[0].1);
-
-        let data2: Uint8Array = JsValue::from(data[0].0.clone()).into();
-        let bytes = Array::new();
-        bytes.push(&data2);
-
-        let blob = Blob::new_with_u8_array_sequence_and_options(&bytes, &props).unwrap();
-
-        let blob_url = web_sys::Url::create_object_url_with_blob(&blob).unwrap();
-
-        let new_element = create_element_wmt(blob.type_(), blob_url);
-
-        let document = web_sys::window().unwrap().document().unwrap();
-
-        let _r = document
-            .get_element_by_id("resultField")
-            .expect("#resultField should exist")
-            .dyn_ref::<HtmlElement>()
-            .unwrap()
-            .prepend_with_node_1(&new_element)
-            .unwrap();
-    } else {
-        let date3 = Date::now().to_string();
-
-        let service_worker1 = match get_service_worker().await {
-            Some(service_worker) => service_worker,
-            None => {
-                return;
-            }
-        };
-
-        for (data3, mime3, path3) in data {
-            let opts = RequestInit::new();
-
-            opts.set_method("GET");
-
-            let req_headers = web_sys::Headers::new().unwrap();
-            let _ = req_headers.append("Referrer-Policy", "strict-origin-when-cross-origin");
-            opts.set_headers(&req_headers);
-
-            let sep = "/".to_string();
-            let mut path03 = host2.clone();
-            path03.push_str(&sep);
-            path03.push_str(&"weeb-3".to_string());
-            path03.push_str(&sep);
-            path03.push_str(&date3);
-            path03.push_str(&sep);
-            path03.push_str(&path3);
-
-            let props = BlobPropertyBag::new();
-            props.set_type(&mime3);
-            let data2: Uint8Array = JsValue::from(data3).into();
-            let bytes = Array::new();
-            bytes.push(&data2);
-
-            let msgobj = js_sys::Object::new();
-
-            let _ = js_sys::Reflect::set(&msgobj, &JsValue::from_str("data0"), &bytes);
-            let _ = js_sys::Reflect::set(
-                &msgobj,
-                &JsValue::from_str("mime0"),
-                &JsValue::from_str(&mime3),
-            );
-            let _ = js_sys::Reflect::set(
-                &msgobj,
-                &JsValue::from_str("path0"),
-                &JsValue::from_str(&path03),
-            );
-
-            post_and_wait_cache(&service_worker1, &JsValue::from(msgobj)).await;
-        }
-
-        let sep = "/".to_string();
-        let mut path00 = host2.clone();
-        path00.push_str(&sep);
-        path00.push_str(&"weeb-3".to_string());
-        path00.push_str(&sep);
-        path00.push_str(&date3);
-        path00.push_str(&sep);
-        path00.push_str(&indx);
-
-        let new_element = create_ielement(path00);
-
-        let document = web_sys::window().unwrap().document().unwrap();
-
-        let _r = document
-            .get_element_by_id("resultField")
-            .expect("#resultField should exist")
-            .dyn_ref::<HtmlElement>()
-            .unwrap()
-            .prepend_with_node_1(&new_element)
-            .unwrap();
-    }
-}
-
-async fn post_and_wait_cache(service_worker: &ServiceWorker, msgobj: &JsValue) {
-    match MessageChannel::new() {
-        Ok(channel) => {
-            let port1 = channel.port1();
-            let port2 = channel.port2();
-
-            let promise = js_sys::Promise::new(&mut |resolve, _reject| {
-                let closure = Closure::wrap(Box::new(move |event: MessageEvent| {
-                    let data = event.data();
-                    let msg_type = js_sys::Reflect::get(&data, &JsValue::from_str("type"))
-                        .unwrap_or(JsValue::NULL);
-                    if msg_type == JsValue::from_str("CACHE_RESPONSE") {
-                        resolve.call1(&JsValue::NULL, &data).unwrap();
-                    }
-                }) as Box<dyn FnMut(MessageEvent)>);
-
-                port1.set_onmessage(Some(closure.as_ref().unchecked_ref()));
-                closure.forget(); // keep alive
-            });
-
-            match service_worker.post_message_with_transferable(msgobj, &js_sys::Array::of1(&port2))
-            {
-                Ok(_) => match wasm_bindgen_futures::JsFuture::from(promise).await {
-                    Ok(resp) => {
-                        web_sys::console::log_1(&JsValue::from(format!(
-                            "Cached successfully: {:#?}",
-                            resp
-                        )));
-                    }
-                    Err(err) => web_sys::console::error_1(&err),
-                },
-                Err(err) => web_sys::console::error_1(&err),
-            }
-        }
-        Err(err) => web_sys::console::error_1(&err),
-    }
-}
-
-pub fn parsebootconnect(boot_node_masettings_id: String) -> (String, String) {
-    let document = web_sys::window().unwrap().document().unwrap();
-
-    let bootnode_input = document
-        .get_element_by_id(&boot_node_masettings_id)
-        .expect(&format!("#{} should exist", boot_node_masettings_id));
-
-    let bootnode_input = bootnode_input
-        .dyn_ref::<HtmlInputElement>()
-        .expect(&format!(
-            "#{} should be a HtmlInputElement",
-            boot_node_masettings_id
-        ));
-
-    web_sys::console::log_1(&"g0 bootnode change triggered".into());
-    match bootnode_input.value().parse::<String>() {
-        Ok(bootnode_address) => {
-            web_sys::console::log_1(&"g1 bootnode change triggered".into());
-
-            let network_id_input = document
-                .get_element_by_id("networkIDSettings")
-                .expect("#networkIDSettings should exist");
-
-            let network_id_input = network_id_input
-                .dyn_ref::<HtmlInputElement>()
-                .expect("#networkIDSettings should be a HtmlInputElement");
-
-            match network_id_input.value().parse::<String>() {
-                Ok(network_id) => return (bootnode_address, network_id),
-                _ => return (bootnode_address, "10".to_string()),
-            };
-        }
-        _ => {}
-    };
-    return ("".to_string(), "".to_string());
-}
-
-pub async fn get_service_worker() -> Option<web_sys::ServiceWorker> {
-    let service0 = web_sys::window().unwrap().navigator().service_worker();
-
-    match JsFuture::from(service0.register("/weeb-3/service.js")).await {
-        Ok(registration) => {
-            let _ = JsFuture::from(
-                registration
-                    .unchecked_into::<ServiceWorkerRegistration>()
-                    .update()
-                    .unwrap(),
-            )
-            .await;
-            let _ = JsFuture::from(service0.ready().unwrap()).await;
-        }
-        Err(err) => {
-            web_sys::console::warn_1(&err);
-        }
-    }
-
-    let registration0 = JsFuture::from(service0.get_registration()).await;
-
-    let registration1: ServiceWorkerRegistration = match registration0 {
-        Ok(registration) => {
-            let reg = registration.dyn_into();
-            match reg {
-                Ok(reg) => reg,
-                _ => {
-                    service_worker_missing();
-                    return None;
-                }
-            }
-        }
-        _ => {
-            service_worker_missing();
-            return None;
-        }
-    };
-
-    let service_worker0 = registration1.active();
-
-    let _service_worker1 = match service_worker0 {
-        Some(service_worker) => {
-            return Some(service_worker);
-        }
-        _ => {
-            service_worker_missing();
-            return None;
-        }
-    };
 }

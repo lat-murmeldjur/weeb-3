@@ -5,10 +5,22 @@ use crate::{
     //
     mpsc,
     //
+    upload::{DataUploadRequest, UploadProgressSender},
+    //
     upload_data,
 };
 
 use serde_json::json;
+
+const DEBUG_MANIFEST_UPLOAD_LOGS: bool = false;
+
+macro_rules! manifest_upload_log {
+    ($($arg:tt)*) => {
+        if DEBUG_MANIFEST_UPLOAD_LOGS {
+            web_sys::console::log_1(&JsValue::from(format!($($arg)*)));
+        }
+    };
+}
 
 #[derive(Clone)]
 pub struct Node {
@@ -30,7 +42,8 @@ pub async fn create_manifest(
     errordoc: String,
     batch_owner: Vec<u8>,
     batch_id: Vec<u8>,
-    data_upload_chan: &mpsc::Sender<(Vec<Vec<u8>>, u8, Vec<u8>, Vec<u8>, mpsc::Sender<Vec<u8>>)>,
+    data_upload_chan: &mpsc::Sender<DataUploadRequest>,
+    progress: Option<UploadProgressSender>,
 ) -> Vec<u8> {
     let mut fncutoff = first_node_cutoff;
 
@@ -50,19 +63,19 @@ pub async fn create_manifest(
         }
     }
 
-    web_sys::console::log_1(&JsValue::from(format!(
+    manifest_upload_log!(
         "Manifest length after obfuscation key: {}",
         manifest_bytes_vec.len()
-    )));
+    );
 
     manifest_bytes_vec.append(
         &mut hex::decode("5768b3b6a7db56d21d1abff40d41cebfc83448fed8d7e9b06ec0d3b073f28f").unwrap(),
     );
 
-    web_sys::console::log_1(&JsValue::from(format!(
+    manifest_upload_log!(
         "Manifest length after mf version: {}",
         manifest_bytes_vec.len()
-    )));
+    );
 
     let mut ref_length: u8 = 32;
 
@@ -76,10 +89,10 @@ pub async fn create_manifest(
         } else if reference.len() == 64 {
             ref_length = 64;
         } else {
-            web_sys::console::log_1(&JsValue::from(format!(
+            manifest_upload_log!(
                 "Manifest reference irregular length {:#?}!",
                 hex::encode(&reference)
-            )));
+            );
             return vec![];
         }
     }
@@ -93,10 +106,10 @@ pub async fn create_manifest(
         }
     };
 
-    web_sys::console::log_1(&JsValue::from(format!(
+    manifest_upload_log!(
         "Manifest length after reference: {}",
         manifest_bytes_vec.len()
-    )));
+    );
 
     // index bytes ?
 
@@ -106,10 +119,10 @@ pub async fn create_manifest(
         manifest_bytes_vec.push(0_u8);
     }
 
-    web_sys::console::log_1(&JsValue::from(format!(
+    manifest_upload_log!(
         "Manifest length after index bytes: {}",
         manifest_bytes_vec.len()
-    )));
+    );
 
     let mut fork_bases: Vec<Vec<u8>> = vec![];
     let mut fork_bases_virtual: Vec<Vec<u8>> = vec![];
@@ -214,6 +227,7 @@ pub async fn create_manifest(
                     batch_owner.clone(),
                     batch_id.clone(),
                     data_upload_chan,
+                    progress.clone(),
                 ))
                 .await;
                 if tip_mf.is_empty() {
@@ -226,6 +240,7 @@ pub async fn create_manifest(
                     batch_owner.clone(),
                     batch_id.clone(),
                     data_upload_chan,
+                    progress.clone(),
                 )
                 .await;
                 if current_data_reference.is_empty() {
@@ -265,6 +280,7 @@ pub async fn create_manifest(
                             batch_owner.clone(),
                             batch_id.clone(),
                             data_upload_chan,
+                            progress.clone(),
                         ))
                         .await;
                         if current_manifest.is_empty() {
@@ -277,6 +293,7 @@ pub async fn create_manifest(
                             batch_owner.clone(),
                             batch_id.clone(),
                             data_upload_chan,
+                            progress.clone(),
                         )
                         .await;
                         if current_data_reference.is_empty() {
@@ -310,6 +327,7 @@ pub async fn create_manifest(
                     batch_owner.clone(),
                     batch_id.clone(),
                     data_upload_chan,
+                    progress.clone(),
                 ))
                 .await;
                 if group_manifest.is_empty() {
@@ -324,6 +342,7 @@ pub async fn create_manifest(
                     batch_owner.clone(),
                     batch_id.clone(),
                     data_upload_chan,
+                    progress.clone(),
                 )
                 .await;
                 if group_data_reference.is_empty() {
@@ -367,6 +386,7 @@ pub async fn create_manifest(
             batch_owner.clone(),
             batch_id.clone(),
             data_upload_chan,
+            progress.clone(),
         )
         .await;
         if stub_reference.is_empty() {
@@ -381,20 +401,16 @@ pub async fn create_manifest(
         manifest_bytes_vec.append(&mut root_fork);
     }
 
-    web_sys::console::log_1(&JsValue::from(format!(
+    manifest_upload_log!(
         "Manifest length after node forks: {}",
         manifest_bytes_vec.len()
-    )));
+    );
 
     fork_bases.sort_by(|a, b| forkstring(a.to_vec()).cmp(&forkstring(b.to_vec())));
 
     let mut kj = 0;
     for log in &fork_bases {
-        web_sys::console::log_1(&JsValue::from(format!(
-            "Sorted prefix: {} {}",
-            kj,
-            forkstring(log.to_vec())
-        )));
+        manifest_upload_log!("Sorted prefix: {} {}", kj, forkstring(log.to_vec()));
         kj += 1;
     }
 
@@ -406,10 +422,10 @@ pub async fn create_manifest(
         manifest_bytes_vec.append(&mut f2.clone());
     }
 
-    web_sys::console::log_1(&JsValue::from(format!(
+    manifest_upload_log!(
         "Manifest length after data node forks: {}",
         manifest_bytes_vec.len()
-    )));
+    );
 
     // set index_bytes
 
@@ -491,10 +507,7 @@ pub async fn create_fork(path: String, reference: Vec<u8>, metadata: Vec<u8>) ->
     };
 
     if path.len() > 30 {
-        web_sys::console::log_1(&JsValue::from(format!(
-            "Fork string prefix overlength {:#?}!",
-            path
-        )));
+        manifest_upload_log!("Fork string prefix overlength {:#?}!", path);
 
         return vec![];
     } else {
@@ -508,10 +521,10 @@ pub async fn create_fork(path: String, reference: Vec<u8>, metadata: Vec<u8>) ->
     if reference.len() == 32 || reference.len() == 64 {
         node.append(&mut reference.clone());
     } else {
-        web_sys::console::log_1(&JsValue::from(format!(
+        manifest_upload_log!(
             "Manifest reference default length {:#?}!",
             hex::encode(&reference)
-        )));
+        );
         return vec![];
     }
     if metadata.len() > 0 {

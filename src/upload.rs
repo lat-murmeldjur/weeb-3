@@ -75,19 +75,45 @@ const STAMP_CHUNK_WINDOW: usize = 64;
 const PUSH_CHUNK_ATTEMPT_RETRY_WAIT_MS: u64 = 50;
 const PUSH_CHUNK_ATTEMPT_SOFT_TIMEOUT_MS: u64 = 15000;
 const PUSH_CHUNK_QUEUE_WINDOW: usize = 256;
+const DEBUG_UPLOAD_LOGS: bool = false;
 
-type ChunkUploadRequest = (
+macro_rules! upload_log {
+    ($($arg:tt)*) => {
+        if DEBUG_UPLOAD_LOGS {
+            web_sys::console::log_1(&JsValue::from(format!($($arg)*)));
+        }
+    };
+}
+
+pub(crate) type ChunkUploadRequest = (
     Vec<u8>,
     bool,
     Vec<u8>,
     Vec<u8>,
     mpsc::Sender<bool>,
     mpsc::Sender<bool>,
+    Option<UploadProgressSender>,
 );
-type ChunkUploadSender = mpsc::Sender<ChunkUploadRequest>;
+pub(crate) type ChunkUploadSender = mpsc::Sender<ChunkUploadRequest>;
+pub(crate) type DataUploadRequest = (
+    Vec<Vec<u8>>,
+    u8,
+    Vec<u8>,
+    Vec<u8>,
+    Option<UploadProgressSender>,
+    mpsc::Sender<Vec<u8>>,
+);
 type StampFuture = Pin<Box<dyn Future<Output = (usize, Option<StampedChunk>)>>>;
 type ChunkPushReceiptFuture = Pin<Box<dyn Future<Output = bool>>>;
 type ChunkPushReceipts = FuturesUnordered<ChunkPushReceiptFuture>;
+
+#[derive(Clone, Debug)]
+pub(crate) struct UploadProgressDelta {
+    pub chunks_total_delta: u64,
+    pub chunks_done_delta: u64,
+}
+
+pub(crate) type UploadProgressSender = mpsc::Sender<UploadProgressDelta>;
 
 struct PushAttemptResult {
     success: bool,
@@ -138,6 +164,70 @@ fn track_chunk_push_receipt(receipts: &mut ChunkPushReceipts, receipt: mpsc::Rec
     ));
 }
 
+pub(crate) fn report_upload_progress(
+    progress: &Option<UploadProgressSender>,
+    chunks_total_delta: u64,
+    chunks_done_delta: u64,
+) {
+    if chunks_total_delta == 0 && chunks_done_delta == 0 {
+        return;
+    }
+
+    if let Some(progress) = progress {
+        let _ = progress.try_send(UploadProgressDelta {
+            chunks_total_delta,
+            chunks_done_delta,
+        });
+    }
+}
+
+fn div_ceil_usize(value: usize, divisor: usize) -> usize {
+    if value == 0 {
+        0
+    } else {
+        ((value - 1) / divisor) + 1
+    }
+}
+
+fn count_push_data_chunks(data: &[Vec<u8>], encryption: bool) -> u64 {
+    if data.len() == 1 && data[0].len() <= 4096 {
+        return 1;
+    }
+
+    let address_length = if encryption { 64 } else { 32 };
+    let mut level = 0usize;
+    let mut lengths: Vec<usize> = data.iter().map(Vec::len).collect();
+    let mut total = 0u64;
+
+    loop {
+        let mut refs = 0usize;
+
+        for length in &lengths {
+            let chunk_count = div_ceil_usize(*length, 4096);
+            for chunk_index in 0..chunk_count {
+                let start = chunk_index * 4096;
+                let end = ((chunk_index + 1) * 4096).min(*length);
+                let chunk_len = end.saturating_sub(start);
+
+                if chunk_len == address_length && level > 0 {
+                    refs = refs.saturating_add(1);
+                } else {
+                    total = total.saturating_add(1);
+                    refs = refs.saturating_add(1);
+                }
+            }
+        }
+
+        if refs <= 1 {
+            return total.max(1);
+        }
+
+        lengths.clear();
+        lengths.push(refs.saturating_mul(address_length));
+        level = level.saturating_add(1);
+    }
+}
+
 async fn wait_for_chunk_pushes(receipts: &mut ChunkPushReceipts) -> bool {
     while let Some(success) = receipts.next().await {
         if !success {
@@ -161,6 +251,7 @@ async fn flush_stamp_window(
     chunk_receipts: &mut ChunkPushReceipts,
     chunk_slot_receipts: &mut ChunkPushReceipts,
     chunk_upload_chan: &ChunkUploadSender,
+    progress: &Option<UploadProgressSender>,
 ) -> bool {
     if stamp_joiner.is_empty() {
         return true;
@@ -185,6 +276,7 @@ async fn flush_stamp_window(
                 stamped_chunk.stamp,
                 result_chan_out,
                 slot_chan_out,
+                progress.clone(),
             ))
             .is_err()
         {
@@ -267,15 +359,16 @@ pub async fn upload_resource(
     topic: String,
     batch_owner: Vec<u8>,
     batch_id: Vec<u8>,
-    data_upload_chan: &mpsc::Sender<(Vec<Vec<u8>>, u8, Vec<u8>, Vec<u8>, mpsc::Sender<Vec<u8>>)>,
+    data_upload_chan: &mpsc::Sender<DataUploadRequest>,
     chunk_upload_chan: &ChunkUploadSender,
     chunk_retrieve_chan: &ChunkRetrieveSender,
+    progress: Option<UploadProgressSender>,
 ) -> Vec<u8> {
     //
     let mut node0: Vec<Node> = vec![];
 
     for mut r0 in resource0 {
-        web_sys::console::log_1(&JsValue::from(format!("Attempt uploading resource!",)));
+        upload_log!("Attempt uploading resource");
 
         // upload core file
         let core_reference = upload_data(
@@ -284,6 +377,7 @@ pub async fn upload_resource(
             batch_owner.clone(),
             batch_id.clone(),
             &data_upload_chan,
+            progress.clone(),
         )
         .await;
 
@@ -303,10 +397,10 @@ pub async fn upload_resource(
             index = r0.path0.clone();
         };
 
-        web_sys::console::log_1(&JsValue::from(format!(
+        upload_log!(
             "Upload resource returning {:#?}!",
             hex::encode(&core_reference)
-        )));
+        );
 
         r0.data_address = core_reference;
 
@@ -331,6 +425,7 @@ pub async fn upload_resource(
         batch_owner.clone(),
         batch_id.clone(),
         &data_upload_chan,
+        progress.clone(),
     )
     .await;
 
@@ -347,6 +442,7 @@ pub async fn upload_resource(
         batch_owner.clone(),
         batch_id.clone(),
         &data_upload_chan,
+        progress.clone(),
     )
     .await;
 
@@ -384,6 +480,7 @@ pub async fn upload_resource(
         batch_owner.clone(),
         batch_id.clone(),
         &data_upload_chan,
+        progress.clone(),
     )
     .await;
     if stub_reference.is_empty() {
@@ -408,6 +505,7 @@ pub async fn upload_resource(
         batch_owner.clone(),
         batch_id.clone(),
         &data_upload_chan,
+        progress.clone(),
     )
     .await;
 
@@ -421,6 +519,7 @@ pub async fn upload_resource(
         batch_owner.clone(),
         batch_id.clone(),
         &data_upload_chan,
+        progress.clone(),
     )
     .await;
 
@@ -478,6 +577,8 @@ pub async fn upload_resource(
         return vec![];
     }
 
+    report_upload_progress(&progress, 1, 0);
+
     if chunk_upload_chan
         .try_send((
             feed_update.soc_chunk,
@@ -486,6 +587,7 @@ pub async fn upload_resource(
             feed_update.stamp,
             result_chan_out,
             slot_chan_out,
+            progress.clone(),
         ))
         .is_err()
     {
@@ -504,7 +606,8 @@ pub async fn upload_data(
     enc: bool,
     batch_owner: Vec<u8>,
     batch_id: Vec<u8>,
-    data_upload_chan: &mpsc::Sender<(Vec<Vec<u8>>, u8, Vec<u8>, Vec<u8>, mpsc::Sender<Vec<u8>>)>,
+    data_upload_chan: &mpsc::Sender<DataUploadRequest>,
+    progress: Option<UploadProgressSender>,
 ) -> Vec<u8> {
     let (chan_out, chan_in) = mpsc::unbounded::<Vec<u8>>();
     let mut enc_mode = 0;
@@ -513,15 +616,12 @@ pub async fn upload_data(
     }
 
     data_upload_chan
-        .try_send((data, enc_mode, batch_owner, batch_id, chan_out))
+        .try_send((data, enc_mode, batch_owner, batch_id, progress, chan_out))
         .unwrap();
 
     let result = match chan_in.recv().await {
         Ok(result) => {
-            web_sys::console::log_1(&JsValue::from(format!(
-                "Upload data returning {:#?}!",
-                hex::encode(&result)
-            )));
+            upload_log!("Upload data returning {:#?}!", hex::encode(&result));
 
             result
         }
@@ -615,7 +715,11 @@ pub async fn push_data(
     batch_id: Vec<u8>,
     batch_bucket_limit: u32,
     chunk_upload_chan: &ChunkUploadSender,
+    progress: Option<UploadProgressSender>,
 ) -> Vec<u8> {
+    let total_chunks = count_push_data_chunks(&data, encryption);
+    report_upload_progress(&progress, total_chunks, 0);
+
     let mut span_length = 0;
 
     for i in &data {
@@ -692,16 +796,12 @@ pub async fn push_data(
                 cstamp0,
                 result_chan_out,
                 slot_chan_out,
+                progress.clone(),
             ))
             .is_err()
         {
             return vec![];
         }
-
-        // web_sys::console::log_1(&JsValue::from(format!(
-        //     "push_data returning {:#?}!",
-        //     hex::encode(&k)
-        // )));
 
         if result_chan_in.recv().await != Ok(true) {
             return vec![];
@@ -765,6 +865,7 @@ pub async fn push_data(
                             &mut chunk_receipts,
                             &mut chunk_slot_receipts,
                             chunk_upload_chan,
+                            &progress,
                         )
                         .await
                         {
@@ -801,6 +902,7 @@ pub async fn push_data(
                                 &mut chunk_receipts,
                                 &mut chunk_slot_receipts,
                                 chunk_upload_chan,
+                                &progress,
                             )
                             .await
                             {
@@ -817,6 +919,7 @@ pub async fn push_data(
                 &mut chunk_receipts,
                 &mut chunk_slot_receipts,
                 chunk_upload_chan,
+                &progress,
             )
             .await
             {
@@ -1089,11 +1192,11 @@ pub async fn push_chunk(
         return caddr;
     }
 
-    web_sys::console::log_1(&JsValue::from(format!(
+    upload_log!(
         "unable to push chunk {} through {} separate peers",
         hex::encode(&caddr),
         PUSH_CHUNK_CONFIRMATION_PEERS
-    )));
+    );
 
     vec![]
 }
@@ -1177,10 +1280,7 @@ pub async fn make_soc(
     let soc_signer: PrivateKeySigner = match PrivateKeySigner::from_slice(&owner) {
         Ok(aok) => aok,
         _ => {
-            web_sys::console::log_1(&JsValue::from(format!(
-                "owner key length not 32 but {}",
-                owner.len()
-            )));
+            upload_log!("owner key length not 32 but {}", owner.len());
             return (vec![], vec![]);
         }
     };
@@ -1204,10 +1304,7 @@ pub async fn make_soc(
         .to_vec();
 
     if signature.len() != 65 {
-        web_sys::console::log_1(&JsValue::from(format!(
-            "soc signature length not 64 but {}",
-            signature.len()
-        )));
+        upload_log!("soc signature length not 64 but {}", signature.len());
         return (vec![], vec![]);
     }
 

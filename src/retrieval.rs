@@ -1,63 +1,9 @@
 use crate::{
-    // // // // // // // //
-    ChunkRetrieveSender,
-    // // // // // // // //
-    Date,
-    // // // // // // // //
-    Duration,
-    // // // // // // // //
-    HashMap,
-    // // // // // // // //
-    HashSet,
-    // // // // // // // //
-    JsValue,
-    // // // // // // // //
-    Mutex,
-    // // // // // // // //
-    PeerAccounting,
-    // // // // // // // //
-    PeerId,
-    // // // // // // // //
-    RETRIEVE_CHECK_CONFIRMATION_PEERS,
-    // // // // // // // //
-    RetrieveCancelToken,
-    // // // // // // // //
-    RetrieveGenerationMap,
-    // // // // // // // //
-    apply_credit,
-    // // // // // // // //
-    cancel_reserve,
-    // // // // // // // //
-    chunk_retrieve_request,
-    // // // // // // // //
-    encode_resources,
-    // // // // // // // //
-    get_feed_address,
-    // // // // // // // //
-    get_proximity,
-    // // // // // // // //
-    manifest::interpret_manifest,
-    // // // // // // // //
-    mpsc,
-    // // // // // // // //
-    //    persistence::{cache_chunk, retrieve_cached_chunk},
-    // // // // // // // //
-    price,
-    // // // // // // // //
-    reserve,
-    // // // // // // // //
-    retrieve_cancel_token_current,
-    // // // // // // // //
-    retrieve_handler,
-    // // // // // // // //
-    stream,
-    // // // // // // // //
-    transfer_pause_enabled,
-    // // // // // // // //
-    valid_cac,
-    // // // // // // // //
-    valid_soc,
-    // // // // // // // //
+    ChunkRetrieveSender, Date, Duration, HashMap, HashSet, JsValue, Mutex, PeerAccounting, PeerId,
+    RETRIEVE_CHECK_CONFIRMATION_PEERS, RetrieveCancelToken, RetrieveGenerationMap, apply_credit,
+    cancel_reserve, chunk_retrieve_request, encode_resources, get_feed_address, get_proximity,
+    manifest::interpret_manifest, mpsc, price, reserve, retrieve_cancel_token_current,
+    retrieve_handler, stream, transfer_pause_enabled, valid_cac, valid_soc,
 };
 
 use alloy::primitives::keccak256;
@@ -70,6 +16,15 @@ const RETRIEVE_DATA_DISPATCH_YIELD_EVERY: usize = 128;
 const RETRIEVE_CHECK_RETRY_WAIT_MS: u64 = 160;
 const RETRIEVE_CHUNK_MAX_ERRORS: usize = 64;
 const RETRIEVE_CHUNK_SKIPLIST_RESET_ERRORS: usize = 20;
+const DEBUG_RETRIEVAL_LOGS: bool = false;
+
+macro_rules! retrieval_debug {
+    ($($arg:tt)*) => {
+        if DEBUG_RETRIEVAL_LOGS {
+            web_sys::console::log_1(&JsValue::from(format!($($arg)*)));
+        }
+    };
+}
 
 struct RetrieveAttemptResult {
     peer: PeerId,
@@ -125,7 +80,7 @@ pub async fn retrieve_resource(
 
         index = index0;
 
-        web_sys::console::log_1(&JsValue::from(format!("marker 20")));
+        retrieval_debug!("manifest interpreted");
 
         for f in &data_vector {
             if f.data.len() > 8 {
@@ -134,12 +89,10 @@ pub async fn retrieve_resource(
         }
     }
 
-    web_sys::console::log_1(&JsValue::from(format!("marker 21")));
+    retrieval_debug!("resource entries decoded");
 
     if data_vector_e.len() == 0 {
-        web_sys::console::log_1(&JsValue::from(format!(
-            "Unable to retrieve resource case 0"
-        )));
+        retrieval_debug!("Unable to retrieve resource case 0");
 
         return encode_resources(
             vec![(vec![], "not found".to_string(), "not found".to_string())],
@@ -147,7 +100,7 @@ pub async fn retrieve_resource(
         );
     }
 
-    web_sys::console::log_1(&JsValue::from(format!("marker 22")));
+    retrieval_debug!("resource encoded");
 
     return encode_resources(data_vector_e, index);
 }
@@ -285,11 +238,11 @@ async fn retrieve_attempt(
             if let Some(accounting_peer) = accounting_peer {
                 cancel_reserve(&accounting_peer, req_price).await
             }
-            web_sys::console::log_1(&JsValue::from(format!(
+            retrieval_debug!(
                 "unable to retrieve chunk {} error {}",
                 hex::encode(&caddr),
                 error
-            )));
+            );
         }
     }
 
@@ -318,10 +271,10 @@ fn decode_retrieved_chunk(
     if encred {
         if soc {
             if cd.len() < 97 {
-                web_sys::console::log_1(&JsValue::from(format!(
+                retrieval_debug!(
                     "unable to retrieve chunk {} - encrypted chunk no content",
                     hex::encode(chunk_address)
-                )));
+                );
                 return vec![];
             }
 
@@ -329,10 +282,10 @@ fn decode_retrieved_chunk(
             if cd00.len() >= 8 {
                 return cd00;
             } else {
-                web_sys::console::log_1(&JsValue::from(format!(
+                retrieval_debug!(
                     "unable to retrieve chunk {} - encrypted chunk no content",
                     hex::encode(chunk_address)
-                )));
+                );
                 return vec![];
             }
         }
@@ -344,10 +297,10 @@ fn decode_retrieved_chunk(
         return (&cd[97..]).to_vec();
     }
     if cd.len() == 0 {
-        web_sys::console::log_1(&JsValue::from(format!(
+        retrieval_debug!(
             "unable to retrieve chunk {} - chunk empty",
             hex::encode(chunk_address)
-        )));
+        );
     }
 
     cd
@@ -363,10 +316,7 @@ pub async fn retrieve_data(
     if root_chunk.len() >= 8 {
         root_span = u64::from_le_bytes(root_chunk[0..8].try_into().unwrap());
     } else {
-        web_sys::console::log_1(&JsValue::from(format!(
-            "chunk not found: {}",
-            hex::encode(data_address),
-        )));
+        retrieval_debug!("chunk not found: {}", hex::encode(data_address),);
         return vec![];
     }
 
@@ -374,12 +324,12 @@ pub async fn retrieve_data(
         if (root_span + 8) as usize == root_chunk.len() {
             return root_chunk;
         } else {
-            web_sys::console::log_1(&JsValue::from(format!(
+            retrieval_debug!(
                 "retrieved chunk length ({}) mismatching span ({}) + 8 for chunk {}",
                 root_chunk.len(),
                 root_span,
                 hex::encode(data_address),
-            )));
+            );
             return vec![];
         }
     }
@@ -387,10 +337,7 @@ pub async fn retrieve_data(
     let address_length = data_address.len();
 
     if root_chunk.len() < 8 + address_length || (root_chunk.len() - 8) % address_length != 0 {
-        web_sys::console::log_1(&JsValue::from(format!(
-            "chunk too short: {}",
-            hex::encode(data_address),
-        )));
+        retrieval_debug!("chunk too short: {}", hex::encode(data_address),);
         return vec![];
     }
 
@@ -416,10 +363,7 @@ pub async fn retrieve_data(
 
     while let Some((order, addr, result0)) = joiner.next().await {
         if result0.len() <= 8 {
-            web_sys::console::log_1(&JsValue::from(format!(
-                "chunk not found: {}",
-                hex::encode(addr),
-            )));
+            retrieval_debug!("chunk not found: {}", hex::encode(addr),);
             return vec![];
         }
 
@@ -455,12 +399,12 @@ pub async fn retrieve_data(
     if data.len() == (root_span + 8) as usize {
         data
     } else {
-        web_sys::console::log_1(&JsValue::from(format!(
+        retrieval_debug!(
             "retrieved result length ({}) not matching span ({}) + 8 for data address {}",
             data.len(),
             root_span,
             hex::encode(data_address),
-        )));
+        );
         vec![]
     }
 }
@@ -736,11 +680,11 @@ pub async fn retrieve_check_chunk(
     }
 
     if success_peers.len() < RETRIEVE_CHECK_CONFIRMATION_PEERS {
-        web_sys::console::log_1(&JsValue::from(format!(
+        retrieval_debug!(
             "unable to retrieve chunk {} from {} separate peers",
             hex::encode(chunk_address),
             RETRIEVE_CHECK_CONFIRMATION_PEERS
-        )));
+        );
         return vec![];
     }
 
@@ -996,10 +940,7 @@ pub async fn seek_next_feed_update_index(
         // if _exact_ frontier found return corresponding data
 
         if largest_found + 1 == smallest_not_found {
-            web_sys::console::log_1(&JsValue::from(format!(
-                "EXPLICIT HEAD {}",
-                smallest_not_found
-            )));
+            retrieval_debug!("EXPLICIT HEAD {}", smallest_not_found);
 
             return smallest_not_found;
         }

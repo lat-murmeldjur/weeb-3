@@ -22,6 +22,15 @@ const RANGE_RETRIEVE_DATA_PIECE_MAX_BYTES: u64 = 4 * 1024 * 1024;
 const RANGE_TREE_CHUNK_CACHE_MAX: usize = 16384;
 const RANGE_RETRIEVE_RETRY_COUNT: usize = 2;
 const RANGE_RETRIEVE_RETRY_WAIT_MS: u64 = 120;
+const DEBUG_BZZ_STREAM_LOGS: bool = false;
+
+macro_rules! bzz_stream_debug {
+    ($($arg:tt)*) => {
+        if DEBUG_BZZ_STREAM_LOGS {
+            web_sys::console::log_1(&JsValue::from(format!($($arg)*)));
+        }
+    };
+}
 
 thread_local! {
     static RANGE_TREE_CHUNK_CACHE: RefCell<RangeTreeChunkCache> =
@@ -507,10 +516,7 @@ async fn retrieve_data_piece(
     )
     .await;
     let Some(root_span) = data_span(&root_chunk) else {
-        web_sys::console::log_1(&JsValue::from(format!(
-            "chunk not found: {}",
-            hex::encode(data_address),
-        )));
+        bzz_stream_debug!("chunk not found: {}", hex::encode(data_address),);
         return vec![];
     };
 
@@ -524,21 +530,21 @@ async fn retrieve_data_piece(
             return root_chunk;
         }
 
-        web_sys::console::log_1(&JsValue::from(format!(
+        bzz_stream_debug!(
             "retrieved chunk length ({}) mismatching span ({}) + 8 for chunk {}",
             root_chunk.len(),
             root_span,
             hex::encode(data_address),
-        )));
+        );
         return vec![];
     }
 
     if root_span > RANGE_RETRIEVE_DATA_PIECE_MAX_BYTES {
-        web_sys::console::log_1(&JsValue::from(format!(
+        bzz_stream_debug!(
             "range data piece too large: {} bytes for chunk {}",
             root_span,
             hex::encode(data_address),
-        )));
+        );
         return vec![];
     }
 
@@ -560,12 +566,12 @@ async fn retrieve_data_piece(
     if data.len() == expected_len {
         data
     } else {
-        web_sys::console::log_1(&JsValue::from(format!(
+        bzz_stream_debug!(
             "retrieved data piece length ({}) not matching span ({}) + 8 for chunk {}",
             data.len(),
             root_span,
             hex::encode(data_address),
-        )));
+        );
         vec![]
     }
 }
@@ -649,10 +655,10 @@ pub async fn prepare_bzz_stream(
     let root_chunk =
         get_range_tree_chunk(metadata.data_reference.clone(), chunk_retrieve_chan).await;
     let Some(children) = tree_prepare_children(address_length, &root_chunk) else {
-        web_sys::console::log_1(&JsValue::from(format!(
+        bzz_stream_debug!(
             "could not prepare bzz stream tree for {}",
             hex::encode(&metadata.data_reference),
-        )));
+        );
         return false;
     };
 
@@ -669,19 +675,16 @@ pub async fn prepare_bzz_stream(
 
     while let Some((addr, chunk)) = joiner.next().await {
         if chunk.is_empty() {
-            web_sys::console::log_1(&JsValue::from(format!(
+            bzz_stream_debug!(
                 "could not prepare bzz stream tree chunk {}",
                 hex::encode(addr),
-            )));
+            );
             failed += 1;
             continue;
         }
 
         let Some(children) = tree_prepare_children(address_length, &chunk) else {
-            web_sys::console::log_1(&JsValue::from(format!(
-                "invalid bzz stream tree chunk {}",
-                hex::encode(addr),
-            )));
+            bzz_stream_debug!("invalid bzz stream tree chunk {}", hex::encode(addr),);
             failed += 1;
             continue;
         };
@@ -691,10 +694,12 @@ pub async fn prepare_bzz_stream(
             .await;
     }
 
-    web_sys::console::log_1(&JsValue::from(format!(
+    bzz_stream_debug!(
         "prepared bzz stream tree {} intermediate_chunks={} failed={}",
-        metadata.etag, prepared, failed,
-    )));
+        metadata.etag,
+        prepared,
+        failed,
+    );
     prepared > 0 || failed == 0
 }
 
@@ -987,12 +992,255 @@ fn select_bzz_target(
         .or_else(|| targets.into_iter().next())
 }
 
+fn bzz_path_starts_with(path: &str, prefix: &str) -> bool {
+    let path = normalize_bzz_path(path);
+    let prefix = normalize_bzz_path(prefix);
+    prefix.is_empty() || path.starts_with(&prefix)
+}
+
+async fn lazy_reference_target(
+    path_prefix_heritance: String,
+    reference: Vec<u8>,
+    requested_path: &str,
+    chunk_retrieve_chan: &ChunkRetrieveSender,
+) -> Option<BzzTarget> {
+    if reference.len() != 32 && reference.len() != 64 {
+        return None;
+    }
+
+    if let Some(manifest_data) =
+        get_manifest_data_if_manifest(&reference, chunk_retrieve_chan).await
+    {
+        return Box::pin(lazy_manifest_target(
+            path_prefix_heritance,
+            manifest_data,
+            requested_path,
+            chunk_retrieve_chan,
+        ))
+        .await;
+    }
+
+    if requested_path.is_empty() || bzz_paths_match(&path_prefix_heritance, requested_path) {
+        return Some(BzzTarget {
+            data_reference: reference,
+            mime: "application/octet-stream".to_string(),
+            path: normalize_bzz_path(&path_prefix_heritance),
+        });
+    }
+
+    None
+}
+
+async fn lazy_manifest_target(
+    path_prefix_heritance: String,
+    cd0: Vec<u8>,
+    requested_path: &str,
+    chunk_retrieve_chan: &ChunkRetrieveSender,
+) -> Option<BzzTarget> {
+    let parsed = parse_bzz_manifest(&cd0)?;
+    let mut requested_paths = Vec::new();
+
+    if !requested_path.is_empty() {
+        requested_paths.push(normalize_bzz_path(requested_path));
+    } else if let Some(index) = parsed.explicit_index.clone() {
+        if !index.is_empty() {
+            requested_paths.push(normalize_bzz_path(&index));
+        }
+    }
+
+    if requested_path.is_empty() {
+        requested_paths.push("index.html".to_string());
+    }
+
+    requested_paths.dedup();
+
+    for desired_path in requested_paths {
+        if let Some(target) = Box::pin(lazy_manifest_target_for_path(
+            path_prefix_heritance.clone(),
+            parsed.ref_size,
+            parsed.forks.clone(),
+            &desired_path,
+            chunk_retrieve_chan,
+        ))
+        .await
+        {
+            return Some(target);
+        }
+    }
+
+    if requested_path.is_empty() {
+        return Box::pin(lazy_first_manifest_target(
+            path_prefix_heritance,
+            parsed.ref_size,
+            parsed.forks,
+            chunk_retrieve_chan,
+        ))
+        .await;
+    }
+
+    None
+}
+
+async fn lazy_manifest_target_for_path(
+    path_prefix_heritance: String,
+    ref_size: usize,
+    forks: Vec<BzzManifestFork>,
+    requested_path: &str,
+    chunk_retrieve_chan: &ChunkRetrieveSender,
+) -> Option<BzzTarget> {
+    for fork in forks {
+        let bequeath = child_path(&path_prefix_heritance, &fork.prefix);
+
+        if !bzz_path_starts_with(requested_path, &bequeath) {
+            continue;
+        }
+
+        if fork.fork_type & 16 == 16 {
+            let Some(metadata) = fork.metadata.clone() else {
+                continue;
+            };
+
+            if metadata.get("swarm-feed-owner").is_some()
+                || metadata.get("swarm-feed-topic").is_some()
+            {
+                continue;
+            }
+
+            if let Some(mime) = metadata
+                .get("Content-Type")
+                .and_then(|str0| str0.as_str())
+                .map(|mime| mime.to_string())
+            {
+                if !bzz_paths_match(&bequeath, requested_path) {
+                    continue;
+                }
+
+                let mut data_reference = fork.reference.clone();
+                if let Some(ref_data) =
+                    get_root_manifest_data_if_manifest(&fork.reference, chunk_retrieve_chan).await
+                {
+                    if let Some(wrapped_reference) = manifest_wrapped_reference(&ref_data) {
+                        data_reference = wrapped_reference;
+                    }
+                }
+
+                return Some(BzzTarget {
+                    data_reference,
+                    mime,
+                    path: normalize_bzz_path(&bequeath),
+                });
+            }
+        }
+
+        if let Some(target) = Box::pin(lazy_reference_target(
+            bequeath,
+            fork.reference,
+            requested_path,
+            chunk_retrieve_chan,
+        ))
+        .await
+        {
+            return Some(target);
+        }
+
+        if ref_size == 0 {
+            continue;
+        }
+    }
+
+    None
+}
+
+async fn lazy_first_manifest_target(
+    path_prefix_heritance: String,
+    ref_size: usize,
+    forks: Vec<BzzManifestFork>,
+    chunk_retrieve_chan: &ChunkRetrieveSender,
+) -> Option<BzzTarget> {
+    for fork in forks {
+        let bequeath = child_path(&path_prefix_heritance, &fork.prefix);
+
+        if fork.fork_type & 16 == 16 {
+            let Some(metadata) = fork.metadata.clone() else {
+                continue;
+            };
+
+            if metadata.get("swarm-feed-owner").is_some()
+                || metadata.get("swarm-feed-topic").is_some()
+            {
+                continue;
+            }
+
+            if let Some(mime) = metadata
+                .get("Content-Type")
+                .and_then(|str0| str0.as_str())
+                .map(|mime| mime.to_string())
+            {
+                let mut data_reference = fork.reference.clone();
+                if let Some(ref_data) =
+                    get_root_manifest_data_if_manifest(&fork.reference, chunk_retrieve_chan).await
+                {
+                    if let Some(wrapped_reference) = manifest_wrapped_reference(&ref_data) {
+                        data_reference = wrapped_reference;
+                    }
+                }
+
+                return Some(BzzTarget {
+                    data_reference,
+                    mime,
+                    path: normalize_bzz_path(&bequeath),
+                });
+            }
+        }
+
+        if let Some(target) = Box::pin(lazy_reference_target(
+            bequeath,
+            fork.reference,
+            "",
+            chunk_retrieve_chan,
+        ))
+        .await
+        {
+            return Some(target);
+        }
+
+        if ref_size == 0 {
+            continue;
+        }
+    }
+
+    None
+}
+
 pub async fn resolve_bzz(
     resource: &str,
     data_retrieve_chan: &mpsc::Sender<(Vec<u8>, mpsc::Sender<Vec<u8>>)>,
     chunk_retrieve_chan: &ChunkRetrieveSender,
 ) -> Option<BzzMetadata> {
     let parsed = parse_bzz_resource(resource)?;
+
+    if let Some(target) = lazy_reference_target(
+        String::new(),
+        parsed.reference.clone(),
+        &parsed.path,
+        chunk_retrieve_chan,
+    )
+    .await
+    {
+        let root_chunk =
+            get_range_tree_chunk(target.data_reference.clone(), chunk_retrieve_chan).await;
+        let size = data_span(&root_chunk)?;
+
+        return Some(BzzMetadata {
+            etag: format!("\"{}\"", hex::encode(&target.data_reference)),
+            data_reference: target.data_reference,
+            mime: target.mime,
+            size,
+            path: normalize_bzz_path(&target.path),
+            target_count: 1,
+        });
+    }
+
     let (targets, index) = collect_reference_targets(
         String::new(),
         parsed.reference,
@@ -1013,6 +1261,78 @@ pub async fn resolve_bzz(
         path: normalize_bzz_path(&target.path),
         target_count,
     })
+}
+
+async fn latest_feed_manifest_data(
+    owner: String,
+    topic: String,
+    chunk_retrieve_chan: &ChunkRetrieveSender,
+) -> Option<Vec<u8>> {
+    let feed_data_soc = seek_latest_feed_update(owner, topic, chunk_retrieve_chan, 8).await;
+    if feed_data_soc.len() < 8 {
+        return None;
+    }
+
+    let wrapped_span = data_span(&feed_data_soc)?;
+    if wrapped_span <= 4096 {
+        return Some(feed_data_soc);
+    }
+
+    let ref_payload = &feed_data_soc[8..];
+    let ref_size = if !ref_payload.is_empty() && ref_payload.len() % 32 == 0 {
+        32
+    } else if !ref_payload.is_empty() && ref_payload.len() % 64 == 0 {
+        64
+    } else {
+        return None;
+    };
+
+    let mut content = feed_data_soc[0..8].to_vec();
+    let references = split_chunk_references(ref_payload, ref_size)?;
+    for reference in references {
+        let leaf = retrieve_data(&reference, chunk_retrieve_chan).await;
+        if leaf.len() <= 8 {
+            return None;
+        }
+        content.extend_from_slice(&leaf[8..]);
+    }
+
+    if content.len() == wrapped_span as usize + 8 {
+        Some(content)
+    } else {
+        None
+    }
+}
+
+pub async fn acquire_latest_feed(
+    owner: String,
+    topic: String,
+    chunk_retrieve_chan: &ChunkRetrieveSender,
+) -> Option<(Vec<u8>, BzzMetadata)> {
+    let feed_manifest = latest_feed_manifest_data(owner, topic, chunk_retrieve_chan).await?;
+    let target = Box::pin(lazy_manifest_target(
+        String::new(),
+        feed_manifest,
+        "",
+        chunk_retrieve_chan,
+    ))
+    .await?;
+    let root_chunk = get_range_tree_chunk(target.data_reference.clone(), chunk_retrieve_chan).await;
+    let size = data_span(&root_chunk)?;
+    let metadata = BzzMetadata {
+        etag: format!("\"{}\"", hex::encode(&target.data_reference)),
+        data_reference: target.data_reference,
+        mime: target.mime,
+        size,
+        path: normalize_bzz_path(&target.path),
+        target_count: 1,
+    };
+
+    if size == 0 {
+        return Some((vec![], metadata));
+    }
+
+    acquire_resolved_range(metadata, 0, size - 1, chunk_retrieve_chan).await
 }
 
 pub async fn acquire_range(
@@ -1105,7 +1425,7 @@ pub async fn acquire_resolved_range_cancellable(
                 return None;
             }
 
-            web_sys::console::log_1(&JsValue::from(format!(
+            bzz_stream_debug!(
                 "retrying bzz range {}-{} for {} after short result {}/{} attempt {}",
                 start,
                 end_inclusive,
@@ -1113,7 +1433,7 @@ pub async fn acquire_resolved_range_cancellable(
                 data.len(),
                 expected_len,
                 attempt + 1,
-            )));
+            );
             async_std::task::sleep(Duration::from_millis(
                 RANGE_RETRIEVE_RETRY_WAIT_MS * (attempt as u64 + 1),
             ))
@@ -1171,10 +1491,7 @@ pub async fn retrieve_data_range_cancellable(
     )
     .await;
     let Some(root_span) = data_span(&root_chunk) else {
-        web_sys::console::log_1(&JsValue::from(format!(
-            "chunk not found: {}",
-            hex::encode(data_address),
-        )));
+        bzz_stream_debug!("chunk not found: {}", hex::encode(data_address),);
         return vec![];
     };
 
@@ -1367,12 +1684,12 @@ fn data_fetch_work(
     let payload_end = 8usize.checked_add(span_usize)?;
 
     if data.len() < payload_end {
-        web_sys::console::log_1(&JsValue::from(format!(
+        bzz_stream_debug!(
             "retrieved subtree length ({}) too short for span ({}) for chunk {}",
             data.len(),
             span,
             hex::encode(addr),
-        )));
+        );
         return None;
     }
 
@@ -1429,10 +1746,7 @@ fn range_chunk_work(
     }
 
     if chunk.len() < 8 + address_length || (chunk.len() - 8) % address_length != 0 {
-        web_sys::console::log_1(&JsValue::from(format!(
-            "chunk too short: {}",
-            hex::encode(addr)
-        )));
+        bzz_stream_debug!("chunk too short: {}", hex::encode(addr));
         return None;
     }
 

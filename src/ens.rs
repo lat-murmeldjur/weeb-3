@@ -8,6 +8,14 @@ use ethers::{
     types::Address,
 };
 
+const DEBUG_ENS_LOGS: bool = false;
+
+fn ens_debug(message: String) {
+    if DEBUG_ENS_LOGS {
+        web_sys::console::log_1(&JsValue::from(message));
+    }
+}
+
 abigen!(
     RegistryContract,
     r#"[
@@ -71,10 +79,7 @@ pub async fn prt(input_address: String, inherit_rpc_url: String) -> Vec<u8> {
         _ => return vec![],
     };
 
-    web_sys::console::log_1(&JsValue::from(format!(
-        "Resolver Address {:#?}",
-        res_address
-    )));
+    ens_debug(format!("Resolver Address {:#?}", res_address));
 
     let res_contract = ResolverContract::new(res_address, client.clone());
 
@@ -84,15 +89,15 @@ pub async fn prt(input_address: String, inherit_rpc_url: String) -> Vec<u8> {
     };
 
     if contenthasd.len() > 7 {
-        web_sys::console::log_1(&JsValue::from(format!(
+        ens_debug(format!(
             "Contenthash Found {}",
             hex::encode(contenthasd[..].to_vec())
-        )));
+        ));
         if hex::encode(&[contenthasd[0]]) == "e4" {
-            web_sys::console::log_1(&JsValue::from(format!(
+            ens_debug(format!(
                 "Swarm Hash Found {}",
                 hex::encode(contenthasd[7..].to_vec())
-            )));
+            ));
             return contenthasd[7..].to_vec();
         }
     };

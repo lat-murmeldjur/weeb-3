@@ -10,6 +10,15 @@ const CLIENT_NAME: &str = "official-weeb-3-shell";
 const POPUP_NAME: &str = "weeb3-secure-vault";
 const SECURE_CALL_ATTEMPTS: usize = 3;
 const RESUME_NOTICE_ID: &str = "secureVaultResumeNotice";
+const DEBUG_SECURE_VAULT_LOGS: bool = false;
+
+macro_rules! secure_vault_log {
+    ($($arg:tt)*) => {
+        if DEBUG_SECURE_VAULT_LOGS {
+            web_sys::console::log_1(&JsValue::from(format!($($arg)*)));
+        }
+    };
+}
 
 thread_local! {
     static SECURE_MODULE: RefCell<Option<JsValue>> = RefCell::new(None);
@@ -46,11 +55,6 @@ pub struct SecureFeedUpdate {
     pub soc_chunk: Vec<u8>,
     pub soc_address: Vec<u8>,
     pub stamp: Vec<u8>,
-}
-
-pub async fn secure_batch_state() -> Option<SecureBatchState> {
-    let client = secure_client_or_resume("checkBatchState").await?;
-    check_batch_state(client).await
 }
 
 pub async fn secure_batch_state_for_wallet(wallet: &[u8]) -> Option<SecureBatchState> {
@@ -90,13 +94,13 @@ async fn check_batch_state(client: Rc<JsValue>) -> Option<SecureBatchState> {
             .unwrap_or_else(|| "unknown".to_string()),
     };
 
-    web_sys::console::log_1(&JsValue::from(format!(
+    secure_vault_log!(
         "secure batch state: hasBatch={}, batchIdLen={}, bucketLimit={}, validity={}",
         state.has_batch,
         state.batch_id.len(),
         state.batch_bucket_limit,
         state.batch_validity_status
-    )));
+    );
 
     Some(state)
 }
@@ -423,7 +427,7 @@ async fn authorize_secure_client(client: Rc<JsValue>) -> Result<Rc<JsValue>, JsV
     set_prop(
         &auth,
         "ttlMs",
-        JsValue::from_f64(6.0 * 60.0 * 60.0 * 1000.0),
+        JsValue::from_f64(168.0 * 60.0 * 60.0 * 1000.0),
     )
     .ok();
 

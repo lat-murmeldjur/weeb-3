@@ -13,7 +13,6 @@ use std::time::Duration;
 
 use tar::Archive;
 
-use alloy::primitives::keccak256;
 use web3::types::U256;
 
 use libp2p::{
@@ -49,12 +48,14 @@ mod bzz_stream;
 use bzz_stream::*;
 
 mod conventions;
-use conventions::*;
+pub(crate) use conventions::*;
 
 mod handlers;
 use handlers::*;
 
 mod interface;
+
+mod interface_conventions;
 
 mod library;
 
@@ -67,6 +68,9 @@ use on_chain::{chequebook_balance, get_price_from_oracle, web3};
 
 mod nav;
 
+mod network_profile;
+use network_profile::{NetworkMode, profile_for_swarm_network_id};
+
 mod persistence;
 use persistence::{get_chequebook_address, get_chequebook_signer_key};
 
@@ -74,7 +78,7 @@ mod retrieval;
 use retrieval::*;
 
 mod secure_vault;
-use secure_vault::{secure_ensure_authorized, secure_reset_stamp};
+use secure_vault::{secure_ensure_authorized, secure_ensure_feed_owner, secure_reset_stamp};
 
 mod streaming_player;
 
@@ -83,6 +87,9 @@ use upload::*;
 
 mod ens;
 use ens::*;
+
+mod events;
+use events::{ProgressRow, ProgressStore};
 
 static MAINNET: AtomicBool = AtomicBool::new(false);
 static TESTNET_OFFICIAL: AtomicBool = AtomicBool::new(true);
@@ -101,6 +108,50 @@ pub fn set_testnet_official(value: bool) {
 
 pub fn is_testnet_official() -> bool {
     TESTNET_OFFICIAL.load(Ordering::Relaxed)
+}
+
+fn spawn_upload_progress_listener(
+    progress_store: Arc<Mutex<ProgressStore>>,
+    progress_id: String,
+    progress_in: mpsc::Receiver<UploadProgressDelta>,
+) {
+    spawn_local(async move {
+        let mut chunks_total = 0u64;
+        let mut chunks_done = 0u64;
+        let mut last_render = 0.0;
+
+        while let Ok(delta) = progress_in.recv().await {
+            chunks_total = chunks_total.saturating_add(delta.chunks_total_delta);
+            chunks_done = chunks_done.saturating_add(delta.chunks_done_delta);
+
+            if chunks_total > 0 {
+                chunks_done = chunks_done.min(chunks_total);
+            }
+
+            let complete = chunks_total > 0 && chunks_done >= chunks_total;
+            let now = Date::now();
+            if !complete && now - last_render < 250.0 && chunks_done % 64 != 0 {
+                continue;
+            }
+
+            let percent = if chunks_total > 0 {
+                Some(((chunks_done.saturating_mul(100)) / chunks_total).min(100) as u8)
+            } else {
+                None
+            };
+            let detail = if chunks_total > 0 {
+                format!("{} of {} chunks pushed", chunks_done, chunks_total)
+            } else {
+                "waiting for chunk plan".to_string()
+            };
+
+            progress_store
+                .lock()
+                .await
+                .update(&progress_id, "push", percent, detail);
+            last_render = now;
+        }
+    });
 }
 
 pub mod weeb_3 {
@@ -160,17 +211,24 @@ const SWAP_PROTOCOL: StreamProtocol = StreamProtocol::new("/swarm/swap/1.0.0/swa
 
 const PROTOCOL_ROUND_TIME: f64 = 160.0;
 const STARTUP_QUEUE_POLL_MS: u64 = 25;
-const PUSH_CHUNK_CONFIRMATION_PEERS: usize = 8;
-const RETRIEVE_CHECK_CONFIRMATION_PEERS: usize = 8;
+const PUSH_CHUNK_CONFIRMATION_PEERS: usize = 6;
+const RETRIEVE_CHECK_CONFIRMATION_PEERS: usize = 6;
 const PUSH_CHUNK_CONCURRENCY: usize = 256;
 const HANDSHAKE_RETRY_DELAY_MS: u64 = 500;
 const HANDSHAKE_OBSERVED_ADDR_TIMEOUT_MS: u64 = 10000;
 const PRICING_CONNECT_TIMEOUT_MS: u64 = 20000;
 const PUSH_CHUNK_RETRY_DELAY_MS: u64 = 500;
 const PUSH_CHUNK_QUEUE_BACKOFF_MS: u64 = 25;
+const DEBUG_RUNTIME_LOGS: bool = false;
+
+fn runtime_debug(value: &JsValue) {
+    if DEBUG_RUNTIME_LOGS {
+        web_sys::console::log_1(value);
+    }
+}
 
 pub fn timed_log(message: impl AsRef<str>) {
-    web_sys::console::log_1(&JsValue::from(message.as_ref()));
+    runtime_debug(&JsValue::from(message.as_ref()));
 }
 
 async fn decrement_counter(counter: &Arc<Mutex<u64>>) {
@@ -306,6 +364,7 @@ pub struct Weeb3 {
             String,
             bool,
             String,
+            Option<UploadProgressSender>,
             mpsc::Sender<Vec<u8>>,
         )>,
         mpsc::Receiver<(
@@ -314,6 +373,7 @@ pub struct Weeb3 {
             String,
             bool,
             String,
+            Option<UploadProgressSender>,
             mpsc::Sender<Vec<u8>>,
         )>,
     ),
@@ -327,6 +387,7 @@ pub struct Weeb3 {
     connection_generation: Arc<Mutex<u64>>,
     ongoing_connections: Arc<Mutex<u64>>,
     connections: Arc<Mutex<u64>>,
+    progress: Arc<Mutex<ProgressStore>>,
 }
 
 type PeerAddrMap = Arc<Mutex<HashMap<PeerId, Multiaddr>>>;
@@ -455,48 +516,34 @@ impl Weeb3 {
         _id: String,
         usable_in_protocols: bool,
     ) -> Vec<u8> {
-        let parse_id = _id.parse::<u64>();
-        let mut network_changed = false;
-
-        match parse_id {
-            Ok(parsed_id) => {
-                web_sys::console::log_1(&JsValue::from(format!("Parsed network id {}", parsed_id)));
-                let mut nid = self.network_id.lock().await;
-
-                if *nid != parsed_id {
-                    if parsed_id == 1 {
-                        set_mainnet(true);
-                        set_testnet_official(false);
-                    }
-
-                    if parsed_id == 10 {
-                        set_testnet_official(true);
-                        set_mainnet(false);
-                    }
-
-                    *nid = parsed_id;
-                    network_changed = true;
-                }
-            }
-            _ => {}
-        };
-
-        if network_changed {
-            self.bump_connection_generation().await;
-            self.disconnect_all_peers().await;
-        }
+        let _ = self.set_network_id(_id).await;
 
         let generation = self.current_connection_generation().await;
 
-        web_sys::console::log_1(&"bootnode change triggered".into());
+        runtime_debug(&"bootnode change triggered".into());
+        self.interface_log(format!(
+            "Dial requested network={} usable={} address={}",
+            self.get_network_id().await,
+            usable_in_protocols,
+            address
+        ));
 
         let (chan_out, chan_in) = mpsc::unbounded::<String>();
-        let _ = self
-            .bootnode_port
-            .0
-            .try_send((address, chan_out, usable_in_protocols, generation));
+        let _ = self.bootnode_port.0.try_send((
+            address.clone(),
+            chan_out,
+            usable_in_protocols,
+            generation,
+        ));
 
         let result = chan_in.recv().await.unwrap_or_default();
+        self.interface_log(format!(
+            "Dial status network={} usable={} address={} result={}",
+            self.get_network_id().await,
+            usable_in_protocols,
+            address,
+            result
+        ));
 
         if !usable_in_protocols {
             return encode_resources(
@@ -523,6 +570,42 @@ impl Weeb3 {
         }
     }
 
+    pub async fn set_network_id(&self, id: String) -> bool {
+        let Ok(parsed_id) = id.parse::<u64>() else {
+            return false;
+        };
+
+        runtime_debug(&JsValue::from(format!("Parsed network id {}", parsed_id)));
+        let mut network_changed = false;
+        {
+            let mut nid = self.network_id.lock().await;
+            if *nid != parsed_id {
+                if let Some(profile) = profile_for_swarm_network_id(parsed_id) {
+                    match profile.mode {
+                        NetworkMode::Mainnet => {
+                            set_mainnet(true);
+                            set_testnet_official(false);
+                        }
+                        NetworkMode::Testnet => {
+                            set_testnet_official(true);
+                            set_mainnet(false);
+                        }
+                    }
+                }
+
+                *nid = parsed_id;
+                network_changed = true;
+            }
+        }
+
+        if network_changed {
+            self.bump_connection_generation().await;
+            self.disconnect_all_peers().await;
+        }
+
+        true
+    }
+
     async fn current_connection_generation(&self) -> u64 {
         let generation = self.connection_generation.lock().await;
         *generation
@@ -531,7 +614,7 @@ impl Weeb3 {
     async fn bump_connection_generation(&self) -> u64 {
         let mut generation = self.connection_generation.lock().await;
         *generation = generation.saturating_add(1);
-        web_sys::console::log_1(&JsValue::from(format!(
+        runtime_debug(&JsValue::from(format!(
             "Connection generation bumped to {}",
             *generation
         )));
@@ -571,7 +654,7 @@ impl Weeb3 {
             *connected = 0;
         }
 
-        web_sys::console::log_1(&JsValue::from("All peers disconnected"));
+        runtime_debug(&JsValue::from("All peers disconnected"));
     }
 
     async fn promote_priced_peer(&self, wings: &Arc<Wings>, peer: PeerId) {
@@ -630,8 +713,14 @@ impl Weeb3 {
         feed_topic: String,
     ) -> Vec<u8> {
         let (chan_out, chan_in) = mpsc::unbounded::<Vec<u8>>();
+        let (progress_out, progress_in) = mpsc::unbounded::<UploadProgressDelta>();
 
+        let f_size = file.size();
         let f_name = file.name();
+        let progress_id = self
+            .start_progress("upload", f_name.clone(), "read", Some(0), "reading input")
+            .await;
+        spawn_upload_progress_listener(self.progress.clone(), progress_id.clone(), progress_in);
         let f_type0 = file.type_();
         let f_type: String = match f_type0.starts_with("text/") {
             true => f_type0 + "; charset=utf-8",
@@ -650,15 +739,33 @@ impl Weeb3 {
                 false => index_string,
             };
 
-            let content0: Vec<u8> = read_file(file)
-                .await
-                .into_iter() // Take ownership of the outer vector and its inner vectors
-                .flat_map(|inner_vec| inner_vec.into_iter()) // Flatten by iterating over each inner_vec
+            let file_parts = read_file(file).await;
+            if file_parts.is_empty() && f_size > 0.0 {
+                self.finish_progress(&progress_id, "failed", "file read failed", false)
+                    .await;
+                return upload_result("upload result: failed to read file", "");
+            }
+
+            let content0: Vec<u8> = file_parts
+                .into_iter()
+                .flat_map(|inner_vec| inner_vec.into_iter())
                 .collect();
+
+            self.update_progress(&progress_id, "parse", Some(20), "reading tar archive")
+                .await;
 
             let mut archive = Archive::new(&content0[..]);
 
-            for f0 in archive.entries().unwrap() {
+            let entries = match archive.entries() {
+                Ok(entries) => entries,
+                Err(_) => {
+                    self.finish_progress(&progress_id, "failed", "invalid tar archive", false)
+                        .await;
+                    return upload_result("upload result: invalid tar archive", "");
+                }
+            };
+
+            for f0 in entries {
                 let mut f01 = match f0 {
                     Ok(aok) => aok,
                     _ => continue,
@@ -698,7 +805,9 @@ impl Weeb3 {
 
                     let mut data0: Vec<u8> = vec![];
 
-                    let _ = f01.read_to_end(&mut data0);
+                    if f01.read_to_end(&mut data0).is_err() {
+                        continue;
+                    }
 
                     fvec0.push(Resource {
                         path0: f0path,
@@ -710,54 +819,75 @@ impl Weeb3 {
                 }
             }
         } else {
+            let data = read_file(file).await;
+            if data.is_empty() && f_size > 0.0 {
+                self.finish_progress(&progress_id, "failed", "file read failed", false)
+                    .await;
+                return upload_result("upload result: failed to read file", "");
+            }
+
             fvec0.push(Resource {
                 path0: f_name.clone(),
                 filename0: f_name,
                 mime0: f_type,
-                data: read_file(file).await,
+                data,
                 data_address: vec![],
             });
         }
 
-        let topic_safe = match hex::decode(&feed_topic) {
-            Ok(_aok) => feed_topic,
-            _ => hex::encode(keccak256(feed_topic)),
-        };
+        if fvec0.is_empty() {
+            self.finish_progress(&progress_id, "failed", "no uploadable files", false)
+                .await;
+            return upload_result("upload result: no uploadable files", "");
+        }
 
-        let _ = self.upload_port.0.try_send((
-            fvec0,
-            encryption,
-            index_document,
-            add_to_feed,
-            topic_safe,
-            chan_out,
-        ));
+        let topic_safe = normalize_feed_topic(&feed_topic);
+
+        self.update_progress(&progress_id, "push", None, "upload queued")
+            .await;
+
+        if self
+            .upload_port
+            .0
+            .try_send((
+                fvec0,
+                encryption,
+                index_document,
+                add_to_feed,
+                topic_safe,
+                Some(progress_out),
+                chan_out,
+            ))
+            .is_err()
+        {
+            self.finish_progress(&progress_id, "failed", "upload queue unavailable", false)
+                .await;
+            return upload_result("upload result: upload queue unavailable", "");
+        }
 
         let result = chan_in.recv().await.unwrap_or_default();
 
         if result.is_empty() {
-            return encode_resources(
-                vec![(
-                    "upload result: failure".as_bytes().to_vec(),
-                    "text/plain".to_string(),
-                    "... result ...".to_string(),
-                )],
-                "".to_string(),
-            );
+            self.finish_progress(&progress_id, "failed", "upload failed", false)
+                .await;
+            return upload_result("upload result: failure", "");
         }
 
-        return encode_resources(
-            vec![(
-                format!(
-                    "upload result: returned address displayed here: {}",
-                    hex::encode(&result)
-                )
-                .as_bytes()
-                .to_vec(),
-                "text/plain".to_string(),
-                "... result ...".to_string(),
-            )],
-            hex::encode(&result).to_string(),
+        let reference_hex = hex::encode(&result);
+        self.finish_progress(
+            &progress_id,
+            "complete",
+            format!("reference {}", reference_hex),
+            true,
+        )
+        .await;
+
+        return upload_result(
+            &format!(
+                "upload result: returned address displayed here: {}",
+                reference_hex
+            ),
+            &hex::encode(&result),
         );
     }
 
@@ -841,6 +971,71 @@ impl Weeb3 {
             .try_send(chunk_retrieve_request(valaddr, chan_out));
 
         return chan_in.recv().await.unwrap_or_default();
+    }
+
+    pub async fn retrieve_bytes(&self, address: String) -> Vec<u8> {
+        let progress_id = self
+            .start_progress("bytes", address.clone(), "retrieve", None, "starting")
+            .await;
+        let valaddr = match hex::decode(&address) {
+            Ok(hex) => hex,
+            Err(_) => {
+                self.finish_progress(&progress_id, "failed", "invalid reference", false)
+                    .await;
+                return vec![];
+            }
+        };
+
+        let bytes = retrieve_data(&valaddr, &self.message_port.0).await;
+        let ok = !bytes.is_empty();
+        self.finish_progress(
+            &progress_id,
+            if ok { "complete" } else { "failed" },
+            format!("{} bytes", bytes.len()),
+            ok,
+        )
+        .await;
+        bytes
+    }
+
+    pub async fn retrieve_chunk_bytes(&self, address: String) -> Vec<u8> {
+        let progress_id = self
+            .start_progress("chunk", address.clone(), "retrieve", None, "starting")
+            .await;
+        let valaddr = match hex::decode(&address) {
+            Ok(hex) => hex,
+            Err(_) => {
+                self.finish_progress(&progress_id, "failed", "invalid reference", false)
+                    .await;
+                return vec![];
+            }
+        };
+
+        let (chan_out, chan_in) = mpsc::unbounded::<Vec<u8>>();
+        let _ = self
+            .message_port
+            .0
+            .try_send(chunk_retrieve_request(valaddr, chan_out));
+
+        let bytes = chan_in.recv().await.unwrap_or_default();
+        let ok = !bytes.is_empty();
+        self.finish_progress(
+            &progress_id,
+            if ok { "complete" } else { "failed" },
+            format!("{} bytes", bytes.len()),
+            ok,
+        )
+        .await;
+        bytes
+    }
+
+    pub async fn acquire_feed(&self, owner: String, topic: String) -> Vec<u8> {
+        let raw = self.acquire_feed_envelope(owner, topic).await;
+        let (data, _index) = decode_resources(raw);
+        data.into_iter()
+            .find(|(_bytes, mime, path)| mime != "not found" && path != "not found")
+            .map(|(bytes, _mime, _path)| bytes)
+            .unwrap_or_default()
     }
 
     pub async fn reset_stamp(&self) -> Vec<u8> {
@@ -929,6 +1124,7 @@ impl Weeb3 {
             String,
             bool,
             String,
+            Option<UploadProgressSender>,
             mpsc::Sender<Vec<u8>>,
         )>();
         let (b_out, b_in) = mpsc::unbounded::<(String, mpsc::Sender<String>, bool, u64)>();
@@ -971,37 +1167,84 @@ impl Weeb3 {
             connection_generation: Arc::new(Mutex::new(0_u64)),
             ongoing_connections: Arc::new(Mutex::new(0_u64)),
             connections: Arc::new(Mutex::new(0_u64)),
+            progress: Arc::new(Mutex::new(ProgressStore::new())),
         };
     }
 
     pub async fn get_current_logs(&self) -> Vec<String> {
         let mut logs: Vec<String> = vec![];
 
-        #[allow(irrefutable_let_patterns)]
-        while let data0 = self.log_port.1.try_recv() {
-            if !data0.is_err() {
-                let log_message = data0.unwrap();
-                logs.push(log_message);
-            } else {
-                break;
-            }
+        while let Ok(log_message) = self.log_port.1.try_recv() {
+            logs.push(log_message);
         }
 
-        return logs;
+        logs
     }
 
     pub async fn get_ongoing_connections(&self) -> u64 {
         let ongoing = self.ongoing_connections.lock().await;
-        return ongoing.clone();
+        *ongoing
     }
 
     pub async fn get_connections(&self) -> u64 {
         let connected = self.connections.lock().await;
-        return connected.clone();
+        *connected
+    }
+
+    pub async fn get_network_id(&self) -> u64 {
+        let network_id = self.network_id.lock().await;
+        *network_id
     }
 
     pub fn interface_log(&self, log0: String) {
         interface_log_to(&self.log_port.0, self.log_start_ms, log0);
+    }
+
+    pub(crate) async fn start_progress(
+        &self,
+        kind: impl Into<String>,
+        subject: impl Into<String>,
+        phase: impl Into<String>,
+        percent: Option<u8>,
+        detail: impl Into<String>,
+    ) -> String {
+        self.progress
+            .lock()
+            .await
+            .start(kind, subject, phase, percent, detail)
+    }
+
+    pub(crate) async fn update_progress(
+        &self,
+        id: &str,
+        phase: impl Into<String>,
+        percent: Option<u8>,
+        detail: impl Into<String>,
+    ) {
+        self.progress
+            .lock()
+            .await
+            .update(id, phase, percent, detail);
+    }
+
+    pub(crate) async fn finish_progress(
+        &self,
+        id: &str,
+        phase: impl Into<String>,
+        detail: impl Into<String>,
+        ok: bool,
+    ) {
+        self.progress.lock().await.finish(id, phase, detail, ok);
+    }
+
+    pub(crate) async fn get_progress_snapshot(
+        &self,
+        seen_revision: u64,
+    ) -> Option<(u64, Vec<ProgressRow>)> {
+        self.progress
+            .lock()
+            .await
+            .snapshot_if_changed(seen_revision)
     }
 
     pub async fn toggle_transfer_pause(&self) -> bool {
@@ -1021,27 +1264,7 @@ impl Weeb3 {
 
     pub async fn run(&self, _st: String) -> () {
         // init_panic_hook();
-        let baddr = "/ip4/49.12.172.37/tcp/32532/tls/sni/49-12-172-37.k2k4r8pr3m3aug5nudg2y039qfj2gxw6wnlx0e0ghzxufcn38soyp9z4.libp2p.direct/ws/p2p/QmfSx1ujzboapD5h2CiqTJqUy46FeTDwXBszB3XUCfKEEj".to_string();
-        let addr30 = match baddr.parse::<Multiaddr>() {
-            Ok(aok) => aok,
-            _ => return,
-        };
-
-        web_sys::console::log_1(&JsValue::from(format!(
-            "F0: {:#?}",
-            detect_underlay_format(&addr30)
-        )));
-
-        web_sys::console::log_1(&JsValue::from(format!(
-            "F1: {:#?}",
-            beewss_to_dns_transformed(&addr30)
-        )));
-
-        web_sys::console::log_1(&JsValue::from(format!(
-            "F2: {:#?}",
-            detect_underlay_format(&beewss_to_dns_transformed(&addr30))
-        )));
-
+        self.interface_log("Node runtime handlers starting".to_string());
         let wings = self.wings.lock().await;
 
         let (peers_instructions_chan_outgoing, peers_instructions_chan_incoming) =
@@ -1067,16 +1290,10 @@ impl Weeb3 {
             mpsc::unbounded::<ChunkRetrieveRequest>();
 
         let (data_upload_chan_outgoing, data_upload_chan_incoming) =
-            mpsc::unbounded::<(Vec<Vec<u8>>, u8, Vec<u8>, Vec<u8>, mpsc::Sender<Vec<u8>>)>();
+            mpsc::unbounded::<DataUploadRequest>();
 
-        let (chunk_upload_chan_outgoing, chunk_upload_chan_incoming) = mpsc::unbounded::<(
-            Vec<u8>,
-            bool,
-            Vec<u8>,
-            Vec<u8>,
-            mpsc::Sender<bool>,
-            mpsc::Sender<bool>,
-        )>();
+        let (chunk_upload_chan_outgoing, chunk_upload_chan_incoming) =
+            mpsc::unbounded::<ChunkUploadRequest>();
 
         let (cheque_instructions_chan_outgoing, cheque_instructions_chan_incoming) =
             mpsc::unbounded::<(PeerId, u64)>();
@@ -1108,6 +1325,7 @@ impl Weeb3 {
 
         incoming_pricing_streams = ctrl0.accept(PRICING_PROTOCOL).unwrap();
         incoming_gossip_streams = ctrl1.accept(GOSSIP_PROTOCOL).unwrap();
+        self.interface_log("Node protocol listeners ready".to_string());
 
         let pricing_inbound_handle = async move {
             while let Some((peer, stream)) = incoming_pricing_streams.next().await {
@@ -1152,7 +1370,7 @@ impl Weeb3 {
                         let und_addrs = deserialize_underlays(&paddr_current.clone().underlay);
 
                         for addr3 in und_addrs.iter() {
-                            web_sys::console::log_1(&JsValue::from(format!(
+                            runtime_debug(&JsValue::from(format!(
                                 "Current Conn Handled {:#?}",
                                 addr3.to_string()
                             )));
@@ -1192,7 +1410,7 @@ impl Weeb3 {
                                 }
                                 let dial_result = {
                                     let mut swarm = swarm.lock_arc().await;
-                                    web_sys::console::log_1(&JsValue::from(format!("dial 0",)));
+                                    runtime_debug(&JsValue::from(format!("dial 0",)));
                                     swarm.dial(dial_addr.clone())
                                 };
 
@@ -1275,7 +1493,7 @@ impl Weeb3 {
                             }
                             let dial_result = {
                                 let mut swarm = swarm.lock_arc().await;
-                                web_sys::console::log_1(&JsValue::from(format!("dial 1",)));
+                                runtime_debug(&JsValue::from(format!("dial 1",)));
                                 swarm.dial(dial_addr.clone())
                             };
 
@@ -1456,7 +1674,10 @@ impl Weeb3 {
                             }
                         }
                         SwarmEvent::ConnectionClosed {
-                            peer_id, endpoint, ..
+                            peer_id,
+                            endpoint,
+                            cause,
+                            ..
                         } => {
                             let removed_overlay = {
                                 let mut connected_peers_map = wings.connected_peers.lock().await;
@@ -1483,8 +1704,8 @@ impl Weeb3 {
                                 }
 
                                 interface_log(format!(
-                                    "Disconnected from peer {} {:#?}",
-                                    &ol0, endpoint
+                                    "Disconnected from peer {} endpoint={:#?} reason={:#?}",
+                                    &ol0, endpoint, cause
                                 ));
                             }
 
@@ -1640,10 +1861,7 @@ impl Weeb3 {
                         }
                         let dial_result = {
                             let mut swarm = swarm.lock_arc().await;
-                            web_sys::console::log_1(&JsValue::from(format!(
-                                "dial 2 :: {:#?}",
-                                addr33
-                            )));
+                            runtime_debug(&JsValue::from(format!("dial 2 :: {:#?}", addr33)));
                             swarm.dial(dial_addr.clone())
                         };
 
@@ -1891,6 +2109,10 @@ impl Weeb3 {
 
                 loop {
                     let (peer, amount) = pricing;
+                    self.interface_log(format!(
+                        "payment threshold received peer={} amount={}",
+                        peer, amount
+                    ));
                     let accounting_peer_lock = {
                         let mut accounting = wings.accounting_peers.lock().await;
                         if let Some(accounting_peer_lock) = accounting.get(&peer).cloned() {
@@ -2185,6 +2407,10 @@ impl Weeb3 {
                     };
                     if ok {
                         if let Some(amount) = amt_opt {
+                            self.interface_log(format!(
+                                "Cheque issued for peer {} amount {}",
+                                peer, amount
+                            ));
                             let accounting_peer = {
                                 let accounting = wings.accounting_peers.lock().await;
                                 accounting.get(&peer).cloned()
@@ -2200,6 +2426,11 @@ impl Weeb3 {
                                 }
                             }
                         }
+                    } else if let Some(amount) = amt_opt {
+                        self.interface_log(format!(
+                            "Cheque issue failed for peer {} amount {}",
+                            peer, amount
+                        ));
                     }
 
                     match cheque_send_chan_incoming.try_recv() {
@@ -2399,7 +2630,7 @@ impl Weeb3 {
                 };
 
                 loop {
-                    let (file0, enc, index, feed, topic, chan) = incoming_request;
+                    let (file0, enc, index, feed, topic, progress, chan) = incoming_request;
 
                     if !secure_ensure_authorized().await {
                         self.interface_log(
@@ -2419,9 +2650,10 @@ impl Weeb3 {
                             &data_upload_chan_outgoing.clone(),
                             &chunk_upload_chan_outgoing.clone(),
                             &chunk_retrieve_chan_outgoing.clone(),
+                            progress,
                         )
                         .await;
-                        web_sys::console::log_1(&JsValue::from(format!(
+                        runtime_debug(&JsValue::from(format!(
                             "Writing response to interface push request"
                         )));
 
@@ -2455,6 +2687,7 @@ impl Weeb3 {
                         stamp,
                         feedback,
                         slot_feedback,
+                        None,
                     ));
 
                     match self.chunk_push_port.1.try_recv() {
@@ -2510,7 +2743,7 @@ impl Weeb3 {
                 loop {
                     let chunk_upload_chan = chunk_upload_chan_outgoing.clone();
                     let handle = async move {
-                        let (n, mode, batch_owner, batch_id, chan) = incoming_request;
+                        let (n, mode, batch_owner, batch_id, progress, chan) = incoming_request;
 
                         let encrypted_data = match mode {
                             0 => false,
@@ -2524,6 +2757,7 @@ impl Weeb3 {
                             batch_id,
                             0,
                             &chunk_upload_chan,
+                            progress,
                         )
                         .await;
 
@@ -2550,6 +2784,8 @@ impl Weeb3 {
                     Ok(request) => request,
                     Err(_) => break,
                 };
+                let mut dispatched = 0usize;
+                let (wave_done_out, wave_done_in) = mpsc::unbounded::<bool>();
 
                 loop {
                     wait_transfer_unpaused(&self.transfer_paused).await;
@@ -2561,7 +2797,8 @@ impl Weeb3 {
                         break;
                     };
 
-                    let (d, soc, checkad, stamp, feedback, slot_feedback) = incoming_request;
+                    let (d, soc, checkad, stamp, feedback, slot_feedback, progress) =
+                        incoming_request;
 
                     let ctrl8 = ctrl8.clone();
                     let overlay_peers = wings.overlay_peers.clone();
@@ -2571,6 +2808,9 @@ impl Weeb3 {
                     let log_port = self.log_port.0.clone();
                     let log_start_ms = self.log_start_ms;
                     let transfer_paused = self.transfer_paused.clone();
+                    let wave_done_out = wave_done_out.clone();
+
+                    dispatched += 1;
 
                     spawn_local(async move {
                         wait_transfer_unpaused(&transfer_paused).await;
@@ -2628,9 +2868,13 @@ impl Weeb3 {
                                 stamp.clone(),
                                 feedback.clone(),
                                 slot_feedback.clone(),
+                                progress.clone(),
                             ));
+                            let _ = wave_done_out.try_send(false);
                         } else {
+                            report_upload_progress(&progress, 0, 1);
                             let _ = feedback.try_send(true);
+                            let _ = wave_done_out.try_send(true);
                         }
                     });
 
@@ -2640,9 +2884,46 @@ impl Weeb3 {
                     }
                 }
 
-                // if dispatched > 0 {
-                //     self.interface_log(format!("Making {} pushsync requests", dispatched));
-                // }
+                if dispatched > 0 {
+                    let log_port = self.log_port.0.clone();
+                    let log_start_ms = self.log_start_ms;
+                    drop(wave_done_out);
+
+                    spawn_local(async move {
+                        let mut completed = 0usize;
+                        let mut failed = 0usize;
+
+                        while completed < dispatched {
+                            match wave_done_in.recv().await {
+                                Ok(ok) => {
+                                    completed += 1;
+                                    if !ok {
+                                        failed += 1;
+                                    }
+                                }
+                                Err(_) => break,
+                            }
+                        }
+
+                        if dispatched > 1 {
+                            interface_log_to(
+                                &log_port,
+                                log_start_ms,
+                                format!(
+                                    "Completed {} of {} chunk push requests, retrying ({})",
+                                    completed, dispatched, failed
+                                ),
+                            );
+                        }
+                    });
+
+                    if dispatched > 1 {
+                        self.interface_log(format!(
+                            "Dispatched ({}) chunk push requests",
+                            dispatched
+                        ));
+                    }
+                }
 
                 async_std::task::yield_now().await;
             }
@@ -2658,6 +2939,7 @@ impl Weeb3 {
                     Err(_) => continue,
                 };
                 let mut dispatched = 0usize;
+                let (wave_done_out, wave_done_in) = mpsc::unbounded::<bool>();
 
                 loop {
                     let request = incoming_request;
@@ -2684,15 +2966,13 @@ impl Weeb3 {
                     let overlay_peers = wings.overlay_peers.clone();
                     let accounting_peers = wings.accounting_peers.clone();
                     let refresh_chan = refreshment_instructions_chan_outgoing.clone();
-                    let log_port = self.log_port.0.clone();
-                    let log_start_ms = self.log_start_ms;
                     let retrieve_cancel_generations = self.retrieve_cancel_generations.clone();
                     let transfer_paused = self.transfer_paused.clone();
+                    let wave_done_out = wave_done_out.clone();
 
                     dispatched += 1;
 
                     spawn_local(async move {
-                        let started = Date::now();
                         wait_transfer_unpaused(&transfer_paused).await;
                         let _permit = sem.acquire().await;
                         wait_transfer_unpaused(&transfer_paused).await;
@@ -2716,16 +2996,7 @@ impl Weeb3 {
                         )
                         .await;
 
-                        interface_log_to(
-                            &log_port,
-                            log_start_ms,
-                            format!(
-                                "Retrieved chunk {} len {} in {}ms",
-                                hex::encode(&n),
-                                chunk_data.len(),
-                                (Date::now() - started).max(0.0).round() as u64,
-                            ),
-                        );
+                        let _ = wave_done_out.try_send(!chunk_data.is_empty());
                         let _ = chan.try_send(chunk_data);
                     });
 
@@ -2740,10 +3011,44 @@ impl Weeb3 {
                 }
 
                 if dispatched > 0 {
-                    self.interface_log(format!(
-                        "Dispatched ({}) chunk retrieval requests",
-                        dispatched
-                    ));
+                    let log_port = self.log_port.0.clone();
+                    let log_start_ms = self.log_start_ms;
+                    drop(wave_done_out);
+
+                    spawn_local(async move {
+                        let mut completed = 0usize;
+                        let mut failed = 0usize;
+
+                        while completed < dispatched {
+                            match wave_done_in.recv().await {
+                                Ok(ok) => {
+                                    completed += 1;
+                                    if !ok {
+                                        failed += 1;
+                                    }
+                                }
+                                Err(_) => break,
+                            }
+                        }
+
+                        if dispatched > 1 {
+                            interface_log_to(
+                                &log_port,
+                                log_start_ms,
+                                format!(
+                                    "Completed {} of {} chunk retrieval requests, failed ({})",
+                                    completed, dispatched, failed
+                                ),
+                            );
+                        }
+                    });
+
+                    if dispatched > 1 {
+                        self.interface_log(format!(
+                            "Dispatched ({}) chunk retrieval requests",
+                            dispatched
+                        ));
+                    }
                 }
                 async_std::task::yield_now().await;
             }
@@ -3054,13 +3359,106 @@ impl Weeb3 {
             hive_joiner,
         );
 
-        web_sys::console::log_1(&JsValue::from(format!("Dropping All handlers")));
+        runtime_debug(&JsValue::from(format!("Dropping All handlers")));
 
         ()
     }
 }
 
 impl Weeb3 {
+    pub(crate) async fn acquire_feed_envelope(&self, owner: String, topic: String) -> Vec<u8> {
+        let progress_id = self
+            .start_progress(
+                "feed",
+                format!(
+                    "{} topic {}",
+                    if owner.trim().is_empty() {
+                        "current-wallet"
+                    } else {
+                        owner.trim()
+                    },
+                    topic.trim()
+                ),
+                "resolve",
+                None,
+                "seeking latest feed update",
+            )
+            .await;
+        let owner_bytes = if owner.trim().is_empty() {
+            match secure_ensure_feed_owner().await {
+                Some(owner) => owner,
+                None => {
+                    self.finish_progress(&progress_id, "failed", "feed owner unavailable", false)
+                        .await;
+                    return encode_resources(
+                        vec![(
+                            b"feed owner unavailable".to_vec(),
+                            "not found".to_string(),
+                            "not found".to_string(),
+                        )],
+                        "not found".to_string(),
+                    );
+                }
+            }
+        } else {
+            match hex::decode(strip_hex_prefix(owner.trim())) {
+                Ok(owner) => owner,
+                Err(_) => {
+                    self.finish_progress(&progress_id, "failed", "invalid feed owner", false)
+                        .await;
+                    return encode_resources(
+                        vec![(
+                            b"invalid feed owner".to_vec(),
+                            "not found".to_string(),
+                            "not found".to_string(),
+                        )],
+                        "not found".to_string(),
+                    );
+                }
+            }
+        };
+
+        if owner_bytes.len() != 20 {
+            self.finish_progress(&progress_id, "failed", "invalid feed owner", false)
+                .await;
+            return encode_resources(
+                vec![(
+                    b"invalid feed owner".to_vec(),
+                    "not found".to_string(),
+                    "not found".to_string(),
+                )],
+                "not found".to_string(),
+            );
+        }
+
+        let topic_safe = normalize_feed_topic(&topic);
+
+        match acquire_latest_feed(hex::encode(owner_bytes), topic_safe, &self.message_port.0).await
+        {
+            Some((bytes, metadata)) => {
+                self.finish_progress(
+                    &progress_id,
+                    "complete",
+                    format!("{} bytes", bytes.len()),
+                    true,
+                )
+                .await;
+                encode_resources(
+                    vec![(bytes, metadata.mime, metadata.path.clone())],
+                    metadata.path,
+                )
+            }
+            None => {
+                self.finish_progress(&progress_id, "failed", "feed update not found", false)
+                    .await;
+                encode_resources(
+                    vec![(vec![], "not found".to_string(), "not found".to_string())],
+                    "not found".to_string(),
+                )
+            }
+        }
+    }
+
     pub async fn resolve_bzz(&self, resource: String) -> Option<BzzMetadata> {
         let (chan_out, chan_in) = mpsc::unbounded::<Option<BzzMetadata>>();
         let _ = self.resolve_port.0.try_send((resource, chan_out));

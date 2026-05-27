@@ -1,157 +1,552 @@
 <!doctype html>
 <html lang="en">
-  <meta charset="utf-8" />
-  <title>weeb-3 embed demo</title>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>weeb-3 npm capability example</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+      }
+      body {
+        margin: 0;
+        padding: max(2.4vw, 3.1vh);
+        background: Canvas;
+        color: CanvasText;
+      }
+      h1, h2, h3 { margin: 1rem 0 .5rem; }
+      section {
+        border-top: 1px solid currentColor;
+        margin-top: 1rem;
+        padding-top: .75rem;
+      }
+      label { display: block; margin: .4rem 0; }
+      input, textarea, select, button {
+        box-sizing: border-box;
+        max-width: 100%;
+      }
+      input[type="text"], input[type="number"], textarea, select {
+        width: min(100%, 55rem);
+      }
+      textarea {
+        min-height: 8rem;
+      }
+      button { margin: .2rem .4rem .2rem 0; }
+      pre {
+        overflow: auto;
+        max-height: 18rem;
+        white-space: pre-wrap;
+      }
+      embed, iframe, video, audio, img {
+        display: block;
+        max-width: 100%;
+        margin-top: .5rem;
+      }
+      .row {
+        display: flex;
+        flex-wrap: wrap;
+        gap: .5rem;
+        align-items: end;
+      }
+      .row label { margin: 0; }
+      .small { width: 8rem; }
+      .wide { width: min(100%, 55rem); }
+    </style>
+  </head>
+  <body>
+    <h1>weeb-3 npm capability example</h1>
+    <p>
+      <a href="./issue-1-json-sync-example.html">Open the focused issue #1 JSON sync example</a>
+    </p>
 
-  <p>
-    <label>
-      Address:
-      <input
-        id="address"
-        size="70"
-        value="695fceb3a8c212cd123e2e40d86ec08b52fe4fe6ca46687ce9ea69b8f05471f6aa25b5d4d41bf78b1db3479c048fd5fd8137ba844604821b71786196306b68e7"
-      />
-    </label>
-    <button id="go">Retrieve</button>
-  </p>
+    <section>
+      <h2>Embedded Interface</h2>
+      <p>
+        This mounts the same Rust/WASM interface into a normal npm consumer page.
+        It also starts the node runtime once.
+      </p>
+      <div id="embeddedInterface"></div>
+    </section>
 
-  <div id="viewerRoot"></div>
-  <div id="meta"></div>
-  <p id="fallback" hidden>
-    Can’t preview this type. <a id="dl" href="#" download>Download file</a>
-  </p>
+    <section>
+      <h2>Network And Readiness</h2>
+      <div class="row">
+        <button id="networkState">Network State</button>
+        <button id="testnet">Switch Testnet</button>
+        <button id="mainnet">Switch Mainnet</button>
+        <button id="ready">Ready State</button>
+        <button id="progressSnapshot">Progress Snapshot</button>
+        <button id="logs">logs()</button>
+      </div>
+      <pre id="networkOut"></pre>
+    </section>
 
-  <script type="module">
+    <section>
+      <h2>Retrieve And Download</h2>
+      <label>
+        Swarm hash, or bzz/hash/path
+        <input id="retrieveRef" class="wide" type="text" value="695fceb3a8c212cd123e2e40d86ec08b52fe4fe6ca46687ce9ea69b8f05471f6aa25b5d4d41bf78b1db3479c048fd5fd8137ba844604821b71786196306b68e7" />
+      </label>
+      <button id="retrieve">retrieve()</button>
+      <button id="retrieveBytes">retrieveBytes()</button>
+      <button id="retrieveChunk">retrieveChunk()</button>
+      <div id="preview"></div>
+      <pre id="retrieveOut"></pre>
+    </section>
 
-    import init, { Weeb3No103, BootstrapNode } from "/weeb-3/weeb_3.js";
-    await init();
+    <section>
+      <h2>Upload</h2>
+      <label>
+        File
+        <input id="uploadFile" type="file" />
+      </label>
+      <label>
+        Index path for collection upload
+        <input id="uploadIndex" type="text" placeholder="index.html" />
+      </label>
+      <label>
+        Feed topic for optional feed update
+        <input id="uploadFeedTopic" type="text" value="weeb-3-example:file:v1" />
+      </label>
+      <label><input id="uploadEncrypt" type="checkbox" /> Encrypt</label>
+      <label><input id="uploadToFeed" type="checkbox" /> Add upload reference to feed</label>
+      <button id="upload">upload(file)</button>
+      <h3>Upload Bytes</h3>
+      <label>
+        Bytes filename
+        <input id="bytesName" type="text" value="hello-weeb3.json" />
+      </label>
+      <label>
+        Bytes JSON
+        <textarea id="bytesJson">{"hello":"weeb-3","kind":"postUploadBytes example"}</textarea>
+      </label>
+      <button id="postUploadBytes">postUploadBytes()</button>
+      <h3>Raw Chunk Push</h3>
+      <label>
+        Chunk text
+        <textarea id="chunkText">hello from postPushChunk</textarea>
+      </label>
+      <label><input id="chunkSoc" type="checkbox" /> SOC chunk</label>
+      <label>
+        Chunk address hex, optional for non-SOC
+        <input id="chunkAddress" type="text" placeholder="64 hex chars" />
+      </label>
+      <label>
+        Stamp hex, optional when weeb-3-secure can stamp
+        <input id="chunkStamp" type="text" placeholder="stamp bytes as hex" />
+      </label>
+      <button id="postPushChunk">postPushChunk()</button>
+      <pre id="uploadOut"></pre>
+    </section>
 
-    const weeb3node = new Weeb3No103();
+    <section>
+      <h2>Batch And Chequebook</h2>
+      <div class="row">
+        <label>
+          Depth
+          <input id="batchDepth" class="small" type="number" value="17" min="17" max="30" />
+        </label>
+        <label>
+          Validity days
+          <input id="batchDays" class="small" type="number" value="365" min="1" />
+        </label>
+        <button id="batchState">batchState()</button>
+        <button id="uploadPrerequisites">uploadPrerequisites()</button>
+        <button id="buyBatch">buyBatch()</button>
+      </div>
+      <div class="row">
+        <button id="deployChequebook">deployChequebook()</button>
+        <label>
+          Deposit amount, base units
+          <input id="depositAmount" type="text" value="1000000000000000" />
+        </label>
+        <button id="depositChequebook">depositChequebook()</button>
+        <button id="feedOwnerButton">feedOwner()</button>
+        <button id="resetStamp">resetStamp()</button>
+      </div>
+      <pre id="chainOut"></pre>
+    </section>
 
-    const BOOTSTRAP_NODES = [
-      new BootstrapNode(
-        "/ip4/167.235.96.31/tcp/32535/tls/sni/167-235-96-31.k2k4r8n9x80nshvozftjmg4klymgjtdflwxiovfx63yc6917dlrteva4.libp2p.direct/ws/p2p/QmYkyg5ZU3DzxhqfGyLYLVbk9DMdBagxe9q1AmHKNgt8ps",
-        true
-      ),
-      new BootstrapNode(
-        "/ip4/49.12.172.37/tcp/32530/tls/sni/49-12-172-37.k2k4r8kibjadgpqco81quegou963p7lbcd9ti0bw8lrcc95ystm6by9d.libp2p.direct/ws/p2p/QmRHeoLCHjHoMur8PQpuV8acNJMmKPT61c3ZMLpTqY7og4",
-        true
-      ),
-      new BootstrapNode(
-        "/ip4/49.12.172.37/tcp/32533/tls/sni/49-12-172-37.k2k4r8pnvqpufzwaf4ic1o1fo0onfh4p9b37gp0rdxzdte2kcd7ewp4w.libp2p.direct/ws/p2p/QmfCwr7FVxbYz1GPQ2NN2r5iduXSQDLefqzkBAB9JfZYgF",
-        true
-      ),
-      new BootstrapNode(
-        "/ip4/167.235.96.31/tcp/32536/tls/sni/167-235-96-31.k2k4r8omeryzle2ywg941xs6vgwlq4cr0b3qe83ub7rn9n8ysmcwfqru.libp2p.direct/ws/p2p/QmcPvejw1r1BQ6aUuK6Y18mcLAcYyg9iEmiD1TRpyaox7s",
-        true
-      ),
-      new BootstrapNode(
-        "/ip4/49.12.172.37/tcp/32531/tls/sni/49-12-172-37.k2k4r8l8l5hzyp48440rjqlfdjpr03jfgioal93akbigy0tomtft4w44.libp2p.direct/ws/p2p/QmTFvqc5wMkbsXjqnTxQbVss5t8T1292BupJZ9VyU1GMRV",
-        true
-      ),
-      new BootstrapNode(
-        "/ip4/49.12.172.37/tcp/32532/tls/sni/49-12-172-37.k2k4r8pr3m3aug5nudg2y039qfj2gxw6wnlx0e0ghzxufcn38soyp9z4.libp2p.direct/ws/p2p/QmfSx1ujzboapD5h2CiqTJqUy46FeTDwXBszB3XUCfKEEj",
-        true
-      ),
-      new BootstrapNode(
-        "/ip4/167.235.96.31/tcp/32537/tls/sni/167-235-96-31.k2k4r8m6hc1wyzz789uubmz6cxmeuquzfi5b06zdh4l7e5ve199oay7j.libp2p.direct/ws/p2p/QmVoPN964YuoGpqc6BGJpLGmUn2goaqRm5vkCi5e7H9w98",
-        true
-      ),
-      new BootstrapNode(
-        "/ip4/167.235.96.31/tcp/32538/tls/sni/167-235-96-31.k2k4r8nqwaetj1eljpu4qzeebnnujzu997pdh1i1ia2dcpcjjv9gc1s0.libp2p.direct/ws/p2p/Qma2pmuYLCzcmsFHHLyWRPxxt7eN9MKqhnJaShKomn2zEK",
-        true
-      ),
-    ];
-    
-    weeb3node.start(BOOTSTRAP_NODES, "10");
+    <section>
+      <h2>Issue #1: Wallet JSON Sync Via Swarm Feed</h2>
+      <p>
+        This models a dapp that stores user JSON locally, exports it to Swarm
+        under a fixed app topic, then imports it on another device from owner
+        address plus topic.
+      </p>
+      <div class="row">
+        <label>
+          localStorage key
+          <input id="linksKey" type="text" value="oneplusone.links" />
+        </label>
+        <label>
+          Fixed app topic
+          <input id="linksTopic" type="text" value="oneplusone-app:links:v1" />
+        </label>
+      </div>
+      <label>
+        JSON payload
+        <textarea id="linksJson"></textarea>
+      </label>
+      <div class="row">
+        <button id="seedLinks">Seed Example JSON</button>
+        <button id="loadLocalLinks">Load Local JSON</button>
+        <button id="saveLocalLinks">Save Local JSON</button>
+        <button id="downloadLinks">Download JSON</button>
+        <label>
+          Import JSON file
+          <input id="importLinksFile" type="file" accept="application/json,.json" />
+        </label>
+      </div>
+      <div class="row">
+        <button id="feedIdentity">feedIdentity()</button>
+        <button id="ensureBatch">Check Or Buy Batch</button>
+        <button id="exportLinks">Export JSON To Swarm Feed</button>
+      </div>
+      <label>
+        Feed owner for import, empty means current wallet
+        <input id="feedOwner" type="text" placeholder="0x..." />
+      </label>
+      <button id="importLinks">Import JSON From Swarm Feed</button>
+      <pre id="linksOut"></pre>
+    </section>
 
-    document.getElementById("go").addEventListener("click", async () => {
-      const addr = document.getElementById("address").value.trim();
-      meta.textContent = "";
-      viewerRoot.replaceChildren();
+    <section>
+      <h2>Example Log</h2>
+      <pre id="log"></pre>
+    </section>
 
-      try {
-        const entries = await weeb3node.retrieve(addr);
+    <script type="module">
+      import init, { Weeb3No103 } from "./weeb_3.js";
 
-        if (entries.length === 0) {
-          meta.textContent = "No files were returned for this address.";
-          if (fb) fb.hidden = false;
-          return;
+      await init();
+
+      const node = new Weeb3No103();
+      const textEncoder = new TextEncoder();
+      const textDecoder = new TextDecoder();
+      let progressRevision = 0;
+      let currentPreviewUrl = null;
+
+      node.renderInterface(document.getElementById("embeddedInterface"));
+
+      const $ = (id) => document.getElementById(id);
+
+      function show(id, value) {
+        $(id).textContent = typeof value === "string"
+          ? value
+          : JSON.stringify(value, jsonReplacer, 2);
+      }
+
+      function writeLog(message, value) {
+        const line = value === undefined
+          ? message
+          : `${message}\n${JSON.stringify(value, jsonReplacer, 2)}`;
+        $("log").textContent = `${new Date().toISOString()} ${line}\n\n${$("log").textContent}`;
+      }
+
+      function jsonReplacer(_key, value) {
+        if (value instanceof Uint8Array) {
+          return {
+            type: "Uint8Array",
+            bytes: value.byteLength,
+            preview: Array.from(value.slice(0, 24)),
+          };
+        }
+        if (value instanceof File) {
+          return {
+            type: "File",
+            name: value.name,
+            mime: value.type,
+            bytes: value.size,
+          };
+        }
+        return value;
+      }
+
+      function bytesFromText(text) {
+        return textEncoder.encode(text);
+      }
+
+      function textFromBytes(bytes) {
+        return textDecoder.decode(bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes));
+      }
+
+      function parseJsonText(text) {
+        return JSON.stringify(JSON.parse(text), null, 2);
+      }
+
+      function downloadBytes(filename, bytes, mime = "application/octet-stream") {
+        const blob = new Blob([bytes], { type: mime });
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement("a");
+        link.href = url;
+        link.download = filename;
+        link.click();
+        setTimeout(() => URL.revokeObjectURL(url), 1000);
+      }
+
+      function bytesFromHex(hex) {
+        const normalized = hex.trim().replace(/^0x/i, "");
+        if (!normalized) return new Uint8Array();
+        if (normalized.length % 2 !== 0 || !/^[0-9a-fA-F]+$/.test(normalized)) {
+          throw new Error("hex must contain complete bytes");
+        }
+        const out = new Uint8Array(normalized.length / 2);
+        for (let i = 0; i < out.length; i++) {
+          out[i] = parseInt(normalized.slice(i * 2, i * 2 + 2), 16);
+        }
+        return out;
+      }
+
+      function selectedDepth() {
+        return Number($("batchDepth").value || 17);
+      }
+
+      function selectedDays() {
+        return Number($("batchDays").value || 365);
+      }
+
+      async function checkOrBuyBatch(outId = "linksOut") {
+        const depth = selectedDepth();
+        const days = selectedDays();
+        const state = await node.batchState(depth, days);
+        show(outId, state);
+
+        if (state.usableBatch) {
+          writeLog("usable batch already available", state);
+          return state;
         }
 
-        showFile(entries[0]);
-      } catch (e) {
-        meta.textContent = "Retrieve failed: " + (e?.message ?? String(e));
-        if (fb) fb.hidden = false;
+        if (state.hasFunds === false) {
+          throw new Error("No usable batch and wallet does not report enough BZZ for the selected depth and duration.");
+        }
+
+        const bought = await node.buyBatch(depth, days);
+        show(outId, bought);
+        if (!bought.ok) {
+          throw new Error(bought.error || "buyBatch failed");
+        }
+        writeLog("batch bought", bought);
+        return bought;
       }
-    });
 
-    const viewerRoot = document.getElementById("viewerRoot");
-    const meta       = document.getElementById("meta");
-    const dl         = document.getElementById("dl");
-    const fb         = document.getElementById("fallback");
-
-    let currentUrl = null;
-
-    function inferMimeFromName(name) {
-      const ext = name.split(".").pop()?.toLowerCase();
-      switch (ext) {
-        case "jpg":
-        case "jpeg": return "image/jpeg";
-        case "png":  return "image/png";
-        case "gif":  return "image/gif";
-        case "webp": return "image/webp";
-        case "pdf":  return "application/pdf";
-        case "mp4":  return "video/mp4";
-        case "webm": return "video/webm";
-        case "mp3":  return "audio/mpeg";
-        case "wav":  return "audio/wav";
-        case "ogg":  return "audio/ogg";
-        case "txt":  return "text/plain";
-        case "json": return "application/json";
-        case "html": return "text/html";
-        default:     return "application/octet-stream";
+      function linksTopic() {
+        return $("linksTopic").value.trim() || "oneplusone-app:links:v1";
       }
-    }
 
-    function formatBytes(n) {
-      if (n < 1024) return `${n} B`;
-      const u = ["KB","MB","GB","TB"];
-      let i = -1;
-      do { n /= 1024; i++; } while (n >= 1024 && i < u.length - 1);
-      return `${n.toFixed(1)} ${u[i]}`;
-    }
-
-    function showFile(entry) {
-      const { path, file } = entry;
-
-      if (currentUrl) URL.revokeObjectURL(currentUrl);
-
-      const url = URL.createObjectURL(file);
-      currentUrl = url;
-
-      const embed = document.createElement("embed");
-      const mime = file.type && file.type.trim() !== ""
-        ? file.type
-        : inferMimeFromName(file.name || path);
-
-      embed.setAttribute("type", mime);
-      embed.setAttribute("src", url);
-
-      viewerRoot.replaceChildren(embed);
-
-      meta.textContent =
-        `${path} — ${file.name || "(no name)"} — ${mime} — ${formatBytes(file.size)}`;
-
-      if (dl) {
-        dl.href = url;
-        dl.download = file.name || path || "download";
+      function linksKey() {
+        return $("linksKey").value.trim() || "oneplusone.links";
       }
-      if (fb) fb.hidden = true;
-    }
 
-    window.addEventListener("beforeunload", () => {
-      if (currentUrl) URL.revokeObjectURL(currentUrl);
-    });
-  </script>
+      function linksJson() {
+        const normalized = parseJsonText($("linksJson").value);
+        $("linksJson").value = normalized;
+        return normalized;
+      }
+
+      $("networkState").onclick = async () => show("networkOut", await node.networkState());
+      $("testnet").onclick = async () => show("networkOut", await node.connectProfile("testnet"));
+      $("mainnet").onclick = async () => show("networkOut", await node.connectProfile("mainnet"));
+      $("ready").onclick = async () => show("networkOut", await node.readyState(1, 10000));
+      $("progressSnapshot").onclick = async () => {
+        const snapshot = await node.progressSnapshot(progressRevision);
+        if (snapshot.changed) progressRevision = snapshot.revision;
+        show("networkOut", snapshot);
+      };
+      $("logs").onclick = async () => show("networkOut", await node.logs());
+
+      $("retrieve").onclick = async () => {
+        const ref = $("retrieveRef").value.trim();
+        const entries = await node.retrieve(ref);
+        show("retrieveOut", entries);
+        const first = entries[0];
+        if (!first || !first.file) return;
+        if (currentPreviewUrl) URL.revokeObjectURL(currentPreviewUrl);
+        currentPreviewUrl = URL.createObjectURL(first.file);
+        const embed = document.createElement("embed");
+        embed.src = currentPreviewUrl;
+        embed.type = first.file.type || "application/octet-stream";
+        embed.width = "100%";
+        embed.height = "360";
+        $("preview").replaceChildren(embed);
+      };
+
+      $("retrieveBytes").onclick = async () => {
+        const ref = $("retrieveRef").value.trim();
+        const bytes = await node.retrieveBytes(ref);
+        show("retrieveOut", { method: "retrieveBytes", bytes: bytes.byteLength });
+        if (bytes.byteLength) downloadBytes(ref, bytes);
+      };
+
+      $("retrieveChunk").onclick = async () => {
+        const ref = $("retrieveRef").value.trim();
+        const bytes = await node.retrieveChunk(ref);
+        show("retrieveOut", { method: "retrieveChunk", bytes: bytes.byteLength });
+        if (bytes.byteLength) downloadBytes(ref, bytes);
+      };
+
+      $("upload").onclick = async () => {
+        const file = $("uploadFile").files[0];
+        if (!file) {
+          show("uploadOut", "Choose a file first.");
+          return;
+        }
+        const result = await node.upload(
+          file,
+          $("uploadEncrypt").checked,
+          $("uploadIndex").value.trim(),
+          $("uploadToFeed").checked,
+          $("uploadFeedTopic").value.trim()
+        );
+        show("uploadOut", result);
+      };
+
+      $("postUploadBytes").onclick = async () => {
+        const text = parseJsonText($("bytesJson").value);
+        $("bytesJson").value = text;
+        const result = await node.postUploadBytes(
+          bytesFromText(text),
+          "application/json",
+          $("bytesName").value.trim() || "bytes.json",
+          false,
+          false,
+          ""
+        );
+        show("uploadOut", result);
+      };
+
+      $("postPushChunk").onclick = async () => {
+        try {
+          const result = await node.postPushChunk(
+            bytesFromText($("chunkText").value),
+            $("chunkSoc").checked,
+            bytesFromHex($("chunkAddress").value),
+            bytesFromHex($("chunkStamp").value)
+          );
+          show("uploadOut", result);
+        } catch (error) {
+          show("uploadOut", { ok: false, error: error.message || String(error) });
+        }
+      };
+
+      $("batchState").onclick = async () => {
+        show("chainOut", await node.batchState(selectedDepth(), selectedDays()));
+      };
+      $("uploadPrerequisites").onclick = async () => {
+        show("chainOut", await node.uploadPrerequisites(selectedDepth(), selectedDays()));
+      };
+      $("buyBatch").onclick = async () => {
+        show("chainOut", await node.buyBatch(selectedDepth(), selectedDays()));
+      };
+      $("deployChequebook").onclick = async () => {
+        show("chainOut", await node.deployChequebook());
+      };
+      $("depositChequebook").onclick = async () => {
+        show("chainOut", await node.depositChequebook($("depositAmount").value.trim()));
+      };
+      $("feedOwnerButton").onclick = async () => {
+        show("chainOut", await node.feedOwner());
+      };
+      $("resetStamp").onclick = async () => {
+        show("chainOut", await node.resetStamp());
+      };
+
+      $("seedLinks").onclick = () => {
+        $("linksJson").value = JSON.stringify({
+          version: 1,
+          app: "oneplusone",
+          links: [
+            {
+              peer: "0x1111111111111111111111111111111111111111",
+              safe: "0x2222222222222222222222222222222222222222",
+              label: "demo association"
+            }
+          ],
+          updatedAt: new Date().toISOString()
+        }, null, 2);
+      };
+
+      $("loadLocalLinks").onclick = () => {
+        $("linksJson").value = localStorage.getItem(linksKey()) || "[]";
+      };
+
+      $("saveLocalLinks").onclick = () => {
+        const normalized = linksJson();
+        localStorage.setItem(linksKey(), normalized);
+        show("linksOut", { saved: linksKey(), bytes: bytesFromText(normalized).byteLength });
+      };
+
+      $("downloadLinks").onclick = () => {
+        const normalized = linksJson();
+        downloadBytes("oneplusone-links.json", bytesFromText(normalized), "application/json");
+      };
+
+      $("importLinksFile").onchange = async (event) => {
+        const file = event.target.files[0];
+        if (!file) return;
+        $("linksJson").value = parseJsonText(await file.text());
+        show("linksOut", { importedFile: file.name, bytes: file.size });
+      };
+
+      $("feedIdentity").onclick = async () => {
+        const identity = await node.feedIdentity(linksTopic());
+        if (identity.feedOwner) $("feedOwner").value = identity.feedOwner;
+        show("linksOut", identity);
+      };
+
+      $("ensureBatch").onclick = async () => {
+        try {
+          await checkOrBuyBatch("linksOut");
+        } catch (error) {
+          show("linksOut", { ok: false, error: error.message || String(error) });
+        }
+      };
+
+      $("exportLinks").onclick = async () => {
+        try {
+          await checkOrBuyBatch("linksOut");
+          const normalized = linksJson();
+          localStorage.setItem(linksKey(), normalized);
+          const result = await node.postFeedBytes(
+            linksTopic(),
+            bytesFromText(normalized),
+            "application/json",
+            "oneplusone-links.json",
+            false
+          );
+          if (result.feedOwner) $("feedOwner").value = result.feedOwner;
+          show("linksOut", result);
+        } catch (error) {
+          show("linksOut", { ok: false, error: error.message || String(error) });
+        }
+      };
+
+      $("importLinks").onclick = async () => {
+        try {
+          const result = await node.acquireFeedBytes($("feedOwner").value.trim(), linksTopic());
+          if (result.status !== "ok") {
+            show("linksOut", result);
+            return;
+          }
+          const text = parseJsonText(textFromBytes(result.body));
+          $("linksJson").value = text;
+          localStorage.setItem(linksKey(), text);
+          show("linksOut", {
+            status: result.status,
+            owner: result.feedOwner || $("feedOwner").value.trim() || "current wallet",
+            topic: result.feedTopic,
+            path: result.path,
+            bytes: result.body.byteLength,
+            saved: linksKey()
+          });
+        } catch (error) {
+          show("linksOut", { ok: false, error: error.message || String(error) });
+        }
+      };
+
+      $("seedLinks").click();
+      show("networkOut", await node.networkState());
+      writeLog("weeb-3 npm example loaded");
+    </script>
+  </body>
 </html>
