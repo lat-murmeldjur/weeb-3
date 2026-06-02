@@ -737,8 +737,18 @@ pub(super) async fn render_resolved_asset(
     metadata: BzzMetadata,
 ) -> bool {
     if should_render_canonical_bzz_frame(&metadata) {
+        if !service_worker_controlled_for_bzz_frame(&weeb3).await {
+            service_worker_missing();
+            return true;
+        }
         if let Some(url) = canonical_bzz_url(resource, &metadata) {
-            render_canonical_bzz_frame(weeb3.clone(), resource, &url, &metadata);
+            let Some(index_html) =
+                preload_canonical_bzz_frame(&weeb3, resource, &url, &metadata).await
+            else {
+                render_text_result("Could not retrieve website index");
+                return true;
+            };
+            render_canonical_bzz_frame(weeb3.clone(), resource, &url, &metadata, &index_html);
             return true;
         }
     }
@@ -767,6 +777,83 @@ pub(super) async fn render_resolved_asset(
     false
 }
 
+async fn preload_canonical_bzz_frame(
+    weeb3: &Arc<Weeb3>,
+    resource: &str,
+    url: &str,
+    metadata: &BzzMetadata,
+) -> Option<Vec<u8>> {
+    if metadata.size == 0 {
+        weeb3.interface_log(format!(
+            "website index unavailable for {}; resolved target is empty",
+            resource
+        ));
+        return None;
+    }
+
+    let progress_id = weeb3
+        .start_progress(
+            "bzz",
+            resource.to_string(),
+            "index",
+            Some(0),
+            "retrieving website index",
+        )
+        .await;
+    weeb3.interface_log(format!(
+        "website index retrieval started for {}; path {}, {} bytes",
+        resource, metadata.path, metadata.size
+    ));
+
+    let retrieved = weeb3
+        .acquire_resolved_range(metadata.clone(), 0, metadata.size - 1)
+        .await;
+
+    match retrieved {
+        Some((bytes, _)) if bytes.len() == metadata.size as usize => {
+            crate::streaming_player::warm_bzz_fetch_cache(
+                resource,
+                metadata.clone(),
+                bytes.clone(),
+            );
+            if let Some(canonical_resource) = url.strip_prefix("/weeb-3/bzz/") {
+                crate::streaming_player::warm_bzz_fetch_cache(
+                    canonical_resource,
+                    metadata.clone(),
+                    bytes.clone(),
+                );
+            }
+            weeb3
+                .finish_progress(&progress_id, "complete", "website index retrieved", true)
+                .await;
+            weeb3.interface_log(format!(
+                "website index retrieved for {}; rendering iframe",
+                resource
+            ));
+            Some(bytes)
+        }
+        Some((bytes, _)) => {
+            weeb3.interface_log(format!(
+                "website index retrieval failed for {}; received {} of {} bytes",
+                resource,
+                bytes.len(),
+                metadata.size
+            ));
+            weeb3
+                .finish_progress(&progress_id, "failed", "short website index", false)
+                .await;
+            None
+        }
+        None => {
+            weeb3.interface_log(format!("website index retrieval failed for {}", resource));
+            weeb3
+                .finish_progress(&progress_id, "failed", "website index not retrieved", false)
+                .await;
+            None
+        }
+    }
+}
+
 pub(super) fn should_render_canonical_bzz_frame(metadata: &BzzMetadata) -> bool {
     let mime = metadata.mime.split(';').next().unwrap_or("").trim();
     mime == "text/html" || mime == "application/xhtml+xml"
@@ -785,6 +872,11 @@ pub(super) fn canonical_bzz_url(resource: &str, metadata: &BzzMetadata) -> Optio
         requested_path
     } else {
         resolved_path
+    };
+    let path = if path.is_empty() && should_render_canonical_bzz_frame(metadata) {
+        "index.html".to_string()
+    } else {
+        path
     };
 
     if path.is_empty() || path.starts_with("unknown") || path == "not found" {
@@ -881,6 +973,7 @@ pub(super) fn render_canonical_bzz_frame(
     resource: &str,
     url: &str,
     metadata: &BzzMetadata,
+    index_html: &[u8],
 ) {
     let document = web_sys::window().unwrap().document().unwrap();
 
@@ -925,7 +1018,8 @@ pub(super) fn render_canonical_bzz_frame(
         Ok(frame) => frame,
         Err(_) => return,
     };
-    let _ = frame.set_attribute("src", &frame_url);
+    let _ = frame.set_attribute("srcdoc", &srcdoc_with_base(index_html, &frame_url));
+    let _ = frame.set_attribute("data-src", &frame_url);
     let _ = frame.set_attribute("width", "100%");
     let _ = frame.set_attribute("height", "640");
     let _ = frame.set_attribute("loading", "eager");
@@ -939,6 +1033,34 @@ pub(super) fn render_canonical_bzz_frame(
         .dyn_ref::<HtmlElement>()
         .unwrap()
         .prepend_with_node_1(&wrapper);
+}
+
+fn srcdoc_with_base(bytes: &[u8], canonical_url: &str) -> String {
+    let html = String::from_utf8_lossy(bytes);
+    let base = format!(r#"<base href="{}">"#, srcdoc_base_url(canonical_url));
+    let lower = html.to_ascii_lowercase();
+
+    if let Some(head_end) = lower.find("<head>") {
+        let insert = head_end + "<head>".len();
+        format!("{}{}{}", &html[..insert], base, &html[insert..])
+    } else if let Some(head_end) = lower.find("<head ") {
+        match lower[head_end..].find('>') {
+            Some(offset) => {
+                let insert = head_end + offset + 1;
+                format!("{}{}{}", &html[..insert], base, &html[insert..])
+            }
+            None => format!("{}{}", base, html),
+        }
+    } else {
+        format!("{}{}", base, html)
+    }
+}
+
+fn srcdoc_base_url(canonical_url: &str) -> String {
+    match canonical_url.rfind('/') {
+        Some(index) => canonical_url[..=index].to_string(),
+        None => canonical_url.to_string(),
+    }
 }
 
 pub(super) fn stream_files_when_available() -> bool {
@@ -1181,4 +1303,34 @@ pub async fn get_service_worker() -> Option<web_sys::ServiceWorker> {
             return None;
         }
     };
+}
+
+fn service_worker_has_controller() -> bool {
+    let service0 = web_sys::window().unwrap().navigator().service_worker();
+    js_sys::Reflect::get(service0.as_ref(), &JsValue::from_str("controller"))
+        .map(|controller| !controller.is_null() && !controller.is_undefined())
+        .unwrap_or(false)
+}
+
+async fn service_worker_controlled_for_bzz_frame(weeb3: &Arc<Weeb3>) -> bool {
+    if service_worker_has_controller() {
+        return true;
+    }
+
+    weeb3.interface_log("service worker activating for bzz frame".to_string());
+    if get_service_worker().await.is_none() {
+        weeb3.interface_log("service worker unavailable for bzz frame".to_string());
+        return false;
+    }
+
+    for _ in 0..80 {
+        if service_worker_has_controller() {
+            weeb3.interface_log("service worker controls bzz frame requests".to_string());
+            return true;
+        }
+        async_std::task::sleep(Duration::from_millis(100)).await;
+    }
+
+    weeb3.interface_log("service worker did not control bzz frame requests".to_string());
+    false
 }

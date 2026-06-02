@@ -2969,6 +2969,9 @@ impl Weeb3 {
                     let retrieve_cancel_generations = self.retrieve_cancel_generations.clone();
                     let transfer_paused = self.transfer_paused.clone();
                     let wave_done_out = wave_done_out.clone();
+                    let log_port = self.log_port.0.clone();
+                    let log_start_ms = self.log_start_ms;
+                    let address_hex = hex::encode(&n);
 
                     dispatched += 1;
 
@@ -2995,6 +2998,18 @@ impl Weeb3 {
                             Some(transfer_paused),
                         )
                         .await;
+
+                        if !chunk_data.is_empty() {
+                            interface_log_to(
+                                &log_port,
+                                log_start_ms,
+                                format!(
+                                    "retrieved chunk {} ({} bytes)",
+                                    address_hex,
+                                    chunk_data.len()
+                                ),
+                            );
+                        }
 
                         let _ = wave_done_out.try_send(!chunk_data.is_empty());
                         let _ = chan.try_send(chunk_data);

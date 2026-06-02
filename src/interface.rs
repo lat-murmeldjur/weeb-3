@@ -76,6 +76,7 @@ const BOOTNODE_INPUT_IDS: [&str; 8] = [
 ];
 
 const DEBUG_INTERFACE_LOGS: bool = false;
+const INTERFACE_BUILD_VERSION: &str = env!("WEEB3_BUILD_VERSION");
 
 thread_local! {
     static NETWORK_APPLY_GENERATION: Cell<u64> = Cell::new(0);
@@ -115,7 +116,10 @@ pub(crate) async fn mount_interface(
 
     secure_preload_vault_module();
     install_interface_conventions();
-    weeb3.interface_log("Interface mounted".to_string());
+    weeb3.interface_log(format!(
+        "Interface mounted, version {}",
+        INTERFACE_BUILD_VERSION
+    ));
 
     let weeb31 = weeb3.clone();
     let weeb32 = weeb3.clone();
@@ -151,25 +155,6 @@ pub(crate) async fn mount_interface(
             }
         }
     });
-
-    if read_initial_routes {
-        spawn_local(async move {
-            let routes = read_routes().await;
-            let mut handles = vec![];
-            for route in routes {
-                let handle = async {
-                    let weeb300 = weeb36.clone();
-                    interface_debug(&JsValue::from(format!(
-                        "Loading weeb-3 route from path {:#?}",
-                        route
-                    )));
-                    open_resource(weeb300, route).await;
-                };
-                handles.push(handle);
-            }
-            let _ = join_all(handles).await;
-        });
-    }
 
     let window = web_sys::window().unwrap();
 
@@ -1040,6 +1025,26 @@ pub(crate) async fn mount_interface(
                 interface_debug(&JsValue::from(format!("Service listener error {:#?}", err)));
             }
         };
+
+        if read_initial_routes {
+            spawn_local(async move {
+                let _ = get_service_worker().await;
+                let routes = read_routes().await;
+                let mut handles = vec![];
+                for route in routes {
+                    let handle = async {
+                        let weeb300 = weeb36.clone();
+                        interface_debug(&JsValue::from(format!(
+                            "Loading weeb-3 route from path {:#?}",
+                            route
+                        )));
+                        open_resource(weeb300, route).await;
+                    };
+                    handles.push(handle);
+                }
+                let _ = join_all(handles).await;
+            });
+        }
 
         let mut last_progress_revision = 0u64;
         let mut last_ongoing = None::<u64>;
