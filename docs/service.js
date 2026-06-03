@@ -472,30 +472,34 @@ function createRustRangeStream(clients, url, size) {
 
   return new ReadableStream({
     async pull(controller) {
-      if (position >= size) {
-        controller.close();
-        return;
-      }
+      try {
+        if (position >= size) {
+          controller.close();
+          return;
+        }
 
-      scheduleMore();
-      const start = Math.floor(position / STREAM_STORAGE_WINDOW_BYTES) * STREAM_STORAGE_WINDOW_BYTES;
-      const request = scheduled.get(start);
-      if (!request) {
-        controller.error(new Error("weeb-3 stream window was not scheduled"));
-        return;
-      }
+        scheduleMore();
+        const start = Math.floor(position / STREAM_STORAGE_WINDOW_BYTES) * STREAM_STORAGE_WINDOW_BYTES;
+        const request = scheduled.get(start);
+        if (!request) {
+          controller.error(new Error("weeb-3 stream window was not scheduled"));
+          return;
+        }
 
-      const response = await request;
-      scheduled.delete(start);
-      if (!response || !response.ok) {
-        controller.error(new Error(response && response.error ? response.error : "weeb-3 range request failed"));
-        return;
-      }
+        const response = await request;
+        scheduled.delete(start);
+        if (!response || !response.ok) {
+          controller.error(new Error(response && response.error ? response.error : "weeb-3 range request failed"));
+          return;
+        }
 
-      const body = toUint8Array(response.body);
-      position = start + body.byteLength;
-      controller.enqueue(body);
-      scheduleMore();
+        const body = toUint8Array(response.body);
+        position = start + body.byteLength;
+        controller.enqueue(body);
+        scheduleMore();
+      } catch (error) {
+        controller.error(error);
+      }
     },
     cancel() {
       scheduled.clear();
@@ -504,63 +508,75 @@ function createRustRangeStream(clients, url, size) {
 }
 
 async function forwardRequestToRust(request, event) {
-  const clients = await requestClients(event, request.url);
-  const response = await messageClients(clients, {
-    type: "WEEB3_FETCH_REQUEST",
-    url: request.url,
-    method: request.method,
-    range: request.headers.get("Range") || ""
-  });
+  try {
+    const clients = await requestClients(event, request.url);
+    const response = await messageClients(clients, {
+      type: "WEEB3_FETCH_REQUEST",
+      url: request.url,
+      method: request.method,
+      range: request.headers.get("Range") || ""
+    });
 
-  const status = Number(response.status || (response.ok ? 200 : 404));
-  const headers = responseHeaders(response.headers);
+    const status = Number(response.status || (response.ok ? 200 : 404));
+    const headers = responseHeaders(response.headers);
 
-  if (!response.ok) {
-    return new Response(response.error || "weeb-3 request failed", {
+    if (!response.ok) {
+      return new Response(response.error || "weeb-3 request failed", {
+        status,
+        headers
+      });
+    }
+
+    if (response.stream && request.method !== "HEAD") {
+      const size = Number(headers.get("Content-Length") || "0");
+      return new Response(createRustRangeStream(clients, request.url, size), {
+        status,
+        headers
+      });
+    }
+
+    return new Response(request.method === "HEAD" ? null : toUint8Array(response.body), {
       status,
       headers
     });
-  }
-
-  if (response.stream && request.method !== "HEAD") {
-    const size = Number(headers.get("Content-Length") || "0");
-    return new Response(createRustRangeStream(clients, request.url, size), {
-      status,
-      headers
+  } catch (error) {
+    return new Response(error && error.message ? error.message : "weeb-3 forwarder error", {
+      status: 502
     });
   }
-
-  return new Response(request.method === "HEAD" ? null : toUint8Array(response.body), {
-    status,
-    headers
-  });
 }
 
 async function forwardUploadToRust(request, event) {
-  const url = new URL(request.url);
-  const formData = await request.formData();
-  const file = formData.get("file");
+  try {
+    const url = new URL(request.url);
+    const formData = await request.formData();
+    const file = formData.get("file");
 
-  if (!(file instanceof File)) {
-    return new Response("No file in form data", { status: 400 });
+    if (!(file instanceof File)) {
+      return new Response("No file in form data", { status: 400 });
+    }
+
+    const clients = await requestClients(event, request.url);
+    const response = await messageClients(clients, {
+      type: "UPLOAD_REQUEST",
+      file,
+      encryption: request.headers.get("swarm-encrypt") === "true",
+      indexString: request.headers.get("swarm-index-document") || "",
+      addToFeed: request.headers.get("swarm-collection") === "true",
+      feedTopic: url.searchParams.get("feedTopic") || ""
+    });
+
+    if (!response.ok) {
+      return new Response(response.error || "Upload failed", { status: Number(response.status || 500) });
+    }
+
+    return new Response(JSON.stringify({ reference: response.reference || "" }), {
+      status: 201,
+      headers: { "Content-Type": "application/json" }
+    });
+  } catch (error) {
+    return new Response(error && error.message ? error.message : "weeb-3 upload forwarder error", {
+      status: 502
+    });
   }
-
-  const clients = await requestClients(event, request.url);
-  const response = await messageClients(clients, {
-    type: "UPLOAD_REQUEST",
-    file,
-    encryption: request.headers.get("swarm-encrypt") === "true",
-    indexString: request.headers.get("swarm-index-document") || "",
-    addToFeed: request.headers.get("swarm-collection") === "true",
-    feedTopic: url.searchParams.get("feedTopic") || ""
-  });
-
-  if (!response.ok) {
-    return new Response("Upload failed", { status: Number(response.status || 500) });
-  }
-
-  return new Response(JSON.stringify({ reference: response.reference || "" }), {
-    status: 201,
-    headers: { "Content-Type": "application/json" }
-  });
 }

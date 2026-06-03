@@ -62,7 +62,9 @@ use alloy::signers::local::PrivateKeySigner;
 #[path = "interface_runtime_conventions.rs"]
 mod interface_runtime_conventions;
 use interface_runtime_conventions::*;
-pub(crate) use interface_runtime_conventions::{get_service_worker, service_worker_missing};
+pub(crate) use interface_runtime_conventions::{
+    get_service_worker, service_worker_controls_bzz_requests,
+};
 
 const BOOTNODE_INPUT_IDS: [&str; 8] = [
     "bootNodeMASettings",

@@ -1,5 +1,9 @@
 use super::*;
 
+thread_local! {
+    static SERVICE_WORKER_MISSING_VISIBLE: Cell<bool> = Cell::new(false);
+}
+
 pub(super) async fn check_upload_prerequisites(weeb3: Arc<Weeb3>) {
     let progress_id = weeb3
         .start_progress(
@@ -682,6 +686,7 @@ pub(super) async fn open_bzz_resource(weeb3: Arc<Weeb3>, resource: String) {
                 .update_progress(&progress_id, "stream", None, "checking stream support")
                 .await;
             if crate::streaming_player::try_render_streaming_player(
+                weeb3.clone(),
                 resource.clone(),
                 metadata.clone(),
             )
@@ -737,7 +742,7 @@ pub(super) async fn render_resolved_asset(
     metadata: BzzMetadata,
 ) -> bool {
     if should_render_canonical_bzz_frame(&metadata) {
-        if !service_worker_controlled_for_bzz_frame(&weeb3).await {
+        if !service_worker_controls_bzz_requests(&weeb3, "bzz frame requests").await {
             service_worker_missing();
             return true;
         }
@@ -1115,6 +1120,13 @@ pub(super) fn create_element_wmt(tmype: String, blob_url: String) -> Element {
 }
 
 pub(crate) fn service_worker_missing() {
+    if !service_worker_install_blocked_by_context() {
+        return;
+    }
+    if SERVICE_WORKER_MISSING_VISIBLE.with(|visible| visible.replace(true)) {
+        return;
+    }
+
     let document = web_sys::window().unwrap().document().unwrap();
     let errod = document.create_element("div").unwrap();
     errod.set_inner_html("Service worker required and not found. Loading websites from swarm requires accessing weeb-3 via https through secure certificate.");
@@ -1254,83 +1266,111 @@ pub fn parsebootconnect(boot_node_masettings_id: String) -> (String, String) {
     return ("".to_string(), "".to_string());
 }
 
+fn service_worker_container() -> Option<web_sys::ServiceWorkerContainer> {
+    let window = web_sys::window()?;
+    let is_secure_context =
+        js_sys::Reflect::get(window.as_ref(), &JsValue::from_str("isSecureContext"))
+            .ok()
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false);
+    if !is_secure_context {
+        return None;
+    }
+
+    let navigator = window.navigator();
+    let service_worker =
+        js_sys::Reflect::get(navigator.as_ref(), &JsValue::from_str("serviceWorker")).ok()?;
+    if service_worker.is_null() || service_worker.is_undefined() {
+        return None;
+    }
+
+    service_worker
+        .dyn_into::<web_sys::ServiceWorkerContainer>()
+        .ok()
+}
+
+fn service_worker_install_blocked_by_context() -> bool {
+    service_worker_container().is_none()
+}
+
+async fn active_service_worker(
+    service0: &web_sys::ServiceWorkerContainer,
+) -> Option<web_sys::ServiceWorker> {
+    let registration = JsFuture::from(service0.get_registration()).await.ok()?;
+    let registration = registration.dyn_into::<ServiceWorkerRegistration>().ok()?;
+    registration.active()
+}
+
 pub async fn get_service_worker() -> Option<web_sys::ServiceWorker> {
-    let service0 = web_sys::window().unwrap().navigator().service_worker();
+    let Some(service0) = service_worker_container() else {
+        service_worker_missing();
+        return None;
+    };
 
     match JsFuture::from(service0.register("/weeb-3/service.js")).await {
         Ok(registration) => {
-            let _ = JsFuture::from(
-                registration
-                    .unchecked_into::<ServiceWorkerRegistration>()
-                    .update()
-                    .unwrap(),
-            )
-            .await;
-            let _ = JsFuture::from(service0.ready().unwrap()).await;
+            if let Ok(registration) = registration.dyn_into::<ServiceWorkerRegistration>() {
+                if let Ok(update) = registration.update() {
+                    let _ = JsFuture::from(update).await;
+                }
+
+                if let Some(service_worker) = registration.active() {
+                    return Some(service_worker);
+                }
+            }
+
+            if let Ok(ready) = service0.ready() {
+                if let Ok(registration) = JsFuture::from(ready).await {
+                    if let Ok(registration) = registration.dyn_into::<ServiceWorkerRegistration>() {
+                        if let Some(service_worker) = registration.active() {
+                            return Some(service_worker);
+                        }
+                    }
+                }
+            }
         }
         Err(err) => {
             web_sys::console::warn_1(&err);
         }
     }
 
-    let registration0 = JsFuture::from(service0.get_registration()).await;
-
-    let registration1: ServiceWorkerRegistration = match registration0 {
-        Ok(registration) => {
-            let reg = registration.dyn_into();
-            match reg {
-                Ok(reg) => reg,
-                _ => {
-                    service_worker_missing();
-                    return None;
-                }
-            }
-        }
-        _ => {
-            service_worker_missing();
-            return None;
-        }
-    };
-
-    let service_worker0 = registration1.active();
-
-    let _service_worker1 = match service_worker0 {
-        Some(service_worker) => {
-            return Some(service_worker);
-        }
-        _ => {
-            service_worker_missing();
-            return None;
-        }
-    };
+    active_service_worker(&service0).await
 }
 
 fn service_worker_has_controller() -> bool {
-    let service0 = web_sys::window().unwrap().navigator().service_worker();
+    let Some(service0) = service_worker_container() else {
+        return false;
+    };
     js_sys::Reflect::get(service0.as_ref(), &JsValue::from_str("controller"))
         .map(|controller| !controller.is_null() && !controller.is_undefined())
         .unwrap_or(false)
 }
 
-async fn service_worker_controlled_for_bzz_frame(weeb3: &Arc<Weeb3>) -> bool {
+pub(crate) async fn service_worker_controls_bzz_requests(
+    weeb3: &Arc<Weeb3>,
+    purpose: &str,
+) -> bool {
     if service_worker_has_controller() {
         return true;
     }
 
-    weeb3.interface_log("service worker activating for bzz frame".to_string());
+    weeb3.interface_log(format!("service worker activating for {}", purpose));
     if get_service_worker().await.is_none() {
-        weeb3.interface_log("service worker unavailable for bzz frame".to_string());
+        weeb3.interface_log(format!("service worker unavailable for {}", purpose));
         return false;
     }
 
-    for _ in 0..80 {
+    for _ in 0..120 {
         if service_worker_has_controller() {
-            weeb3.interface_log("service worker controls bzz frame requests".to_string());
+            weeb3.interface_log(format!("service worker controls {}", purpose));
             return true;
         }
         async_std::task::sleep(Duration::from_millis(100)).await;
     }
 
-    weeb3.interface_log("service worker did not control bzz frame requests".to_string());
+    weeb3.interface_log(format!(
+        "service worker active but does not control {}",
+        purpose
+    ));
     false
 }
