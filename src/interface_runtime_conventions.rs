@@ -39,7 +39,7 @@ pub(super) async fn collect_upload_prerequisites() -> Result<String, String> {
     let (batch_depth, validity_days) = read_batch_request_settings()?;
     let payer = connect_wallet_address().await?;
 
-    let secure_state = secure_batch_state_for_wallet(payer.as_bytes())
+    let secure_state = secure_batch_state_for_wallet(payer.as_bytes(), profile.swarm_network_id)
         .await
         .ok_or_else(|| "could not check weeb-3-secure for the connected wallet".to_string())?;
 

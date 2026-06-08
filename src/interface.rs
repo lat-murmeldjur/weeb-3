@@ -293,7 +293,14 @@ pub(crate) async fn mount_interface(
                         }
                     };
 
-                    let secure_state = match secure_batch_state_for_wallet(payer.as_bytes()).await {
+                    let profile = current_network_profile();
+
+                    let secure_state = match secure_batch_state_for_wallet(
+                        payer.as_bytes(),
+                        profile.swarm_network_id,
+                    )
+                    .await
+                    {
                         Some(state) => state,
                         None => {
                             let wnd = web_sys::window().unwrap();
@@ -310,8 +317,6 @@ pub(crate) async fn mount_interface(
                         return;
                     }
 
-                    let profile = current_network_profile();
-
                     if let Ok(w3) = crate::on_chain::web3() {
                         if let Ok(cid) = w3.eth().chain_id().await {
                             if cid != U256::from(profile.wallet_chain_id) {
@@ -325,7 +330,12 @@ pub(crate) async fn mount_interface(
                         }
                     }
 
-                    let prepared = match secure_prepare_batch_purchase(batch_depth, validity).await
+                    let prepared = match secure_prepare_batch_purchase(
+                        batch_depth,
+                        validity,
+                        profile.swarm_network_id,
+                    )
+                    .await
                     {
                         Some(prepared) if prepared.owner.len() == 20 => prepared,
                         _ => {
@@ -365,6 +375,7 @@ pub(crate) async fn mount_interface(
                         &purchase.batch_id,
                         purchase.bucket_limit,
                         prepared.depth,
+                        profile.swarm_network_id,
                     )
                     .await
                     {

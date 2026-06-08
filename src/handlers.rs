@@ -263,7 +263,7 @@ pub async fn ceive(
 
     step_1.address = Some(step_1_ad);
     step_1.network_id = network_id;
-    step_1.full_node = true;
+    step_1.full_node = false;
     step_1.welcome_message = "... Ara Ara ...".to_string();
 
     handler_log!("Handshake stage 1 4");
@@ -374,7 +374,8 @@ pub async fn pricing_handler(peer: PeerId, mut stream: Stream, chan: &mpsc::Send
 pub async fn gossip_handler(
     peer: PeerId,
     mut stream: Stream,
-    chan: &mpsc::Sender<etiquette_2::BzzAddress>,
+    chan: &mpsc::Sender<(etiquette_2::BzzAddress, u64)>,
+    generation: u64,
 ) {
     handler_log!("Opened gossip handle for peer {}!", peer);
 
@@ -436,7 +437,7 @@ pub async fn gossip_handler(
     };
 
     for peer in rec_0.peers {
-        chan.try_send(peer).unwrap();
+        chan.try_send((peer, generation)).unwrap();
     }
 }
 

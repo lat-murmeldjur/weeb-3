@@ -50,25 +50,34 @@ class Code_One {
 	}
 
 	static public function clientele(crx:String, ?arx:Array<String>, ?count:Int64, ?really:Array<Null<Bool>>):String {
-		trace('Executing: $crx $arx');
-		var process_4 = new sys.io.Process('$crx', arx);
-		var bounce = process_4.stdout.readAll().toString();
-		trace("Announcement: " + bounce);
-		if (process_4.exitCode() != 0) {
-			var message = process_4.stderr.readAll().toString();
-			var pos = haxe.macro.Context.currentPos();
-			haxe.macro.Context.warning('Warning/Error: Cannot execute process_$count ... $process_4' + message, pos);
+		if (arx == null) arx = [];
+		trace('Executing: $crx ${arx.join(" ")}');
+
+		var exit = -1;
+		try {
+			exit = Sys.command(crx, arx);
+		} catch (e:Dynamic) {
+			trace('Warning/Error: Cannot start process_$count ... $crx ' + Std.string(e));
 			if (really != null ) {
-				really[0] = false;	
+				really[0] = false;
 			}
 			count++;
-			return bounce;
+			return "";
+		}
+
+		if (exit != 0) {
+			trace('Warning/Error: Cannot execute process_$count ... $crx exited with code $exit');
+			if (really != null ) {
+				really[0] = false;
+			}
+			count++;
+			return "";
 		};
 		if (really != null ) {
-			really[0] = true;	
+			really[0] = true;
 		}
 		count++;
-		return bounce;
+		return "";
 	}
 
 	static public function temporas(?oh:String) {

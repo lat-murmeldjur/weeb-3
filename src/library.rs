@@ -1034,10 +1034,11 @@ impl Weeb3No103 {
             Ok(payer) => payer,
             Err(error) => return error_object(error),
         };
-        let secure_state = match secure_batch_state_for_wallet(payer.as_bytes()).await {
-            Some(state) => state,
-            None => return error_object("could not check weeb-3-secure batch state"),
-        };
+        let secure_state =
+            match secure_batch_state_for_wallet(payer.as_bytes(), profile.swarm_network_id).await {
+                Some(state) => state,
+                None => return error_object("could not check weeb-3-secure batch state"),
+            };
         let w3 = match web3() {
             Ok(w3) => w3,
             Err(error) => return error_object(format!("provider init failed: {error:?}")),
@@ -1165,11 +1166,14 @@ impl Weeb3No103 {
 
     #[wasm_bindgen(js_name = buyBatch)]
     pub async fn buy_batch(&self, depth: u8, validity_days: u32) -> Object {
+        let profile = active_profile();
         let payer = match request_wallet_address().await {
             Ok(payer) => payer,
             Err(error) => return error_object(error),
         };
-        if let Some(state) = secure_batch_state_for_wallet(payer.as_bytes()).await {
+        if let Some(state) =
+            secure_batch_state_for_wallet(payer.as_bytes(), profile.swarm_network_id).await
+        {
             if state.usable() {
                 let obj = ok_object();
                 set_js_str(&obj, "status", "already_ready");
@@ -1183,7 +1187,13 @@ impl Weeb3No103 {
             }
         }
 
-        let prepared = match secure_prepare_batch_purchase(depth, validity_days as u64).await {
+        let prepared = match secure_prepare_batch_purchase(
+            depth,
+            validity_days as u64,
+            profile.swarm_network_id,
+        )
+        .await
+        {
             Some(prepared) if prepared.owner.len() == 20 => prepared,
             _ => return error_object("failed to prepare secure batch owner"),
         };
@@ -1200,8 +1210,13 @@ impl Weeb3No103 {
             Err(error) => return error_object(format!("batch purchase failed: {error:?}")),
         };
 
-        if !secure_commit_batch_purchase(&purchase.batch_id, purchase.bucket_limit, prepared.depth)
-            .await
+        if !secure_commit_batch_purchase(
+            &purchase.batch_id,
+            purchase.bucket_limit,
+            prepared.depth,
+            profile.swarm_network_id,
+        )
+        .await
         {
             return error_object("failed to save batch in weeb-3-secure");
         }

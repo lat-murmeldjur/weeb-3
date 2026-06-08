@@ -3,6 +3,8 @@ use std::{cell::RefCell, rc::Rc, time::Duration};
 use wasm_bindgen::{JsCast, JsValue, closure::Closure};
 use wasm_bindgen_futures::{JsFuture, spawn_local};
 
+use crate::network_profile::active_profile;
+
 const VAULT_ORIGIN: &str = "https://weeb-3-secure.github.io";
 const VAULT_URL: &str = "https://weeb-3-secure.github.io/vault/";
 const VAULT_MODULE_URL: &str = "https://weeb-3-secure.github.io/vault/weeb3_secure_vault.js";
@@ -57,9 +59,12 @@ pub struct SecureFeedUpdate {
     pub stamp: Vec<u8>,
 }
 
-pub async fn secure_batch_state_for_wallet(wallet: &[u8]) -> Option<SecureBatchState> {
+pub async fn secure_batch_state_for_wallet(
+    wallet: &[u8],
+    network_id: u64,
+) -> Option<SecureBatchState> {
     let client = secure_client_for_wallet(wallet).await?;
-    check_batch_state(client).await
+    check_batch_state(client, network_id).await
 }
 
 pub async fn secure_ensure_authorized() -> bool {
@@ -74,8 +79,8 @@ pub fn secure_preload_vault_module() {
     });
 }
 
-async fn check_batch_state(client: Rc<JsValue>) -> Option<SecureBatchState> {
-    let options = auth_options().ok()?;
+async fn check_batch_state(client: Rc<JsValue>, network_id: u64) -> Option<SecureBatchState> {
+    let options = auth_options_for_network(network_id).ok()?;
     let state = match call_secure_client(&client, "checkBatchState", options).await {
         Ok(state) => state,
         Err(e) => {
@@ -108,9 +113,10 @@ async fn check_batch_state(client: Rc<JsValue>) -> Option<SecureBatchState> {
 pub async fn secure_prepare_batch_purchase(
     depth: u8,
     validity_days: u64,
+    network_id: u64,
 ) -> Option<SecurePreparedBatch> {
     let client = secure_client_or_resume("prepareBatchPurchase").await?;
-    let options = auth_options().ok()?;
+    let options = auth_options_for_network(network_id).ok()?;
     set_prop(&options, "depth", JsValue::from_f64(depth as f64)).ok()?;
     set_prop(
         &options,
@@ -141,11 +147,12 @@ pub async fn secure_commit_batch_purchase(
     batch_id: &[u8],
     batch_bucket_limit: u32,
     batch_depth: u8,
+    network_id: u64,
 ) -> bool {
     let Some(client) = secure_client_or_resume("commitBatchPurchase").await else {
         return false;
     };
-    let Ok(options) = auth_options() else {
+    let Ok(options) = auth_options_for_network(network_id) else {
         return false;
     };
     set_prop(
@@ -180,7 +187,7 @@ pub async fn secure_stamp_chunk(chunk_address: Vec<u8>) -> (Vec<u8>, bool) {
     let Some(client) = secure_client_or_resume("stampChunk").await else {
         return (vec![], false);
     };
-    let Ok(options) = auth_options() else {
+    let Ok(options) = auth_options_for_network(active_profile().swarm_network_id) else {
         return (vec![], false);
     };
     set_prop(&options, "chunkAddress", bytes_value(&chunk_address)).ok();
@@ -208,7 +215,7 @@ pub async fn secure_reset_stamp() -> bool {
     let Some(client) = secure_client_or_resume("resetStamp").await else {
         return false;
     };
-    let Ok(options) = auth_options() else {
+    let Ok(options) = auth_options_for_network(active_profile().swarm_network_id) else {
         return false;
     };
 
@@ -242,7 +249,7 @@ pub async fn secure_create_feed_update_soc_with_stamp(
     wrapped_content: Vec<u8>,
 ) -> Option<SecureFeedUpdate> {
     let client = secure_client_or_resume("createFeedUpdateSocWithStamp").await?;
-    let options = auth_options().ok()?;
+    let options = auth_options_for_network(active_profile().swarm_network_id).ok()?;
     set_prop(&options, "topic", JsValue::from_str(&topic)).ok()?;
     set_prop(&options, "feedIndex", JsValue::from_f64(feed_index as f64)).ok()?;
     set_prop(&options, "wrappedContent", bytes_value(&wrapped_content)).ok()?;
@@ -913,6 +920,12 @@ fn auth_options() -> Result<JsValue, JsValue> {
     let options = Object::new();
     set_prop(&options, "appId", JsValue::from_str(&current_origin()?))?;
     Ok(options.into())
+}
+
+fn auth_options_for_network(network_id: u64) -> Result<JsValue, JsValue> {
+    let options = auth_options()?;
+    set_prop(&options, "networkId", JsValue::from_f64(network_id as f64))?;
+    Ok(options)
 }
 
 fn current_origin() -> Result<String, JsValue> {

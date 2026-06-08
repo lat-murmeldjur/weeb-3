@@ -1,35 +1,40 @@
 # Weeb-3 - A Swarm client for browsers
 
-This project is a work in progress swarm client implementation relying solely on browser side technologies.
-It uses [wasm-pack](https://rustwasm.github.io/docs/wasm-pack/) to build the project for use in the browser.
+This project is a work-in-progress Swarm client implementation that relies solely on browser-side technologies. It uses [wasm-pack](https://rustwasm.github.io/wasm-pack/) to build the Rust client to WebAssembly and runs the Swarm networking, retrieval, upload, persistence, service-worker integration, and UI logic inside the browser.
+
+The codebase is still experimental. APIs, persistence formats, supported networks, and browser behavior may change while the implementation is being hardened.
 
 ## Building the code
 
-Ensure you have [`wasm-pack`](https://rustwasm.github.io/wasm-pack/), [`protoc`](https://grpc.io/docs/protoc-installation/), and [`clang`](https://clang.llvm.org/) installed.
+Ensure you have [wasm-pack](https://rustwasm.github.io/wasm-pack/), [protoc](https://grpc.io/docs/protoc-installation/), and [clang](https://clang.llvm.org/) installed.
 
 1. Build the client library:
-```shell
 
-RUSTFLAGS='--cfg getrandom_backend="wasm_js"' wasm-pack build --target web --out-dir static --out-name weeb_3
-```
+    ```bash
+    RUSTFLAGS='--cfg getrandom_backend="wasm_js"' wasm-pack build --target web --out-dir static --out-name weeb_3
+    ```
 
-2. Start the local server to serve html, js and wasm files:
-```shell
-cargo run
-```
-Note this server uses an unsecure self-signed certificate to provide https, which is not sufficient to enable Service Workers in chrome etc. This enables displaying single files from swarm, however to display websites a service worker is necessary, which requires a certificate deemed safe by the browser. You can however get your own safe certificate from - for example - github pages by forking the repository and setting the github pages to 'docs', and copying your latest version of the files from the static folder to the docs folder. 
+2. Start the local server to serve the HTML, JavaScript, and Wasm files:
 
-3. Open the URL (https://localhost:8080/weeb-3 or for the github pages hosted version https://lat-murmeldjur.github.io/weeb-3)
+    ```bash
+    cargo run
+    ```
+
+    The local server uses an insecure self-signed certificate to provide HTTPS. This is enough for loading the local application in many development flows, but it is not necessarily sufficient for enabling Service Workers in browsers such as Chrome. Single-file Swarm resources can still be displayed without the Service Worker, but rendering full Swarm websites requires a Service Worker and therefore a certificate that the browser treats as trusted.
+
+    For a trusted deployment, one option is to serve the static build from GitHub Pages or another HTTPS host with a browser-trusted certificate. A simple workflow is to fork the repository, enable GitHub Pages for the `docs` folder, and copy the latest files from `static` to `docs` after building.
+
+3. Open the application URL, for example [`https://localhost:8080/weeb-3`](https://localhost:8080/weeb-3), or the GitHub Pages hosted version at [`https://lat-murmeldjur.github.io/weeb-3`](https://lat-murmeldjur.github.io/weeb-3).
 
 ## Using the npm package
 
-The wasm-pack build now prepares the generated `static/package.json` for publishing to npm together with the assets required by the wrapper:
+The `wasm-pack` build prepares the generated `static/package.json` for publishing to npm together with the wrapper assets required by the browser package:
 
 - `static/snippets/web3-0742d85b024bb6f5/inline0.js`
 - `static/weeb_3.js`
 - `static/weeb_3_bg.wasm`
 
-After publishing, the package can be used with the same API shape as `static/example.html`:
+After publishing, the package can be used with the same API shape as the examples in `static/example.html` and `static/issue-1-json-sync-example.html`:
 
 ```js
 import init, { Weeb3No103, BootstrapNode } from "@lat-murmeldjur/weeb_3";
@@ -37,9 +42,21 @@ import init, { Weeb3No103, BootstrapNode } from "@lat-murmeldjur/weeb_3";
 await init();
 
 const weeb3node = new Weeb3No103();
+
+// Use the built-in network profile and bootnodes.
+await weeb3node.connect();
+
+// Or start with explicit browser-dialable bootnodes.
+weeb3node.start([
+  new BootstrapNode("/ip4/example/tcp/443/wss/p2p/examplePeerId", true),
+], "10");
+
+const ready = await weeb3node.ready(1, 20_000);
 ```
 
-The workflow defaults to publishing under the GitHub repository owner scope. If you need a different npm scope, set the `NPM_SCOPE` repository variable in GitHub Actions before pushing to `main`.
+The wrapper exposes the browser node as `Weeb3No103`. It can start the runtime, connect to network profiles, render the bundled interface into a container, report network and progress state, retrieve BZZ resources, retrieve raw bytes or chunks, upload `File` objects or byte arrays, publish and read feed updates, and expose feed identity helpers.
+
+The publishing workflow defaults to the GitHub repository owner scope. If a different npm scope is needed, set the `NPM_SCOPE` repository variable in GitHub Actions before pushing to `main`.
 
 ## [Notes]
 
@@ -48,148 +65,184 @@ The workflow defaults to publishing under the GitHub repository owner scope. If 
 - Chrome (on Windows 11)
 - Chrome (Android)
 - Brave (on Windows 11)
-- Edge 
+- Edge
 - Firefox (on Windows 11)
 - Firefox (on Android)
 
-Testing and modifying for other browsers is planned.
+Testing and improving support for other browsers is planned.
 
 ### How it works (architectural overview)
 
 The weeb-3 client consists of several logical components:
-- The web interface (implemented by src/interface.rs & of course static/index.html) that creates with the main weeb process and loads the service worker
-- The libp2p/swarm client (with main entry point in src/lib.rs)
-- A service worker, that enables hot-loading assets on relative paths for websites loaded from swarm (found in static/service.js)
 
-Below is a piece by piece overview of the current logic of components
+- The browser interface, implemented primarily by `static/index.html`, `src/interface.rs`, `src/interface_conventions.rs`, and `src/interface_runtime_conventions.rs`.
+- The libp2p / Swarm node, whose main entry point is `src/lib.rs`.
+- The Swarm protocol handlers and data pipelines for handshake, peer discovery, pricing, accounting, retrieval, pushsync, pseudosettle, swap, manifests, feeds, streaming, and uploads.
+- The Service Worker in `static/service.js`, which provides deterministic browser routes for Swarm content and forwards canonical requests into the Rust runtime.
+- The npm / library facade in `src/library.rs`, which wraps the same runtime for embedding in other browser applications.
+- Browser persistence, secure local state, network profiles, and on-chain integration implemented by `src/persistence.rs`, `src/secure_vault.rs`, `src/network_profile.rs`, and `src/on_chain.rs`.
+
+Below is a piece-by-piece overview of the current component logic.
 
 #### The interface
 
-As of "commit number 189" the instantiator of all components is the index.html that starts the interface (by calling the function "interweeb" from src/interface.rs).
+The default browser application is instantiated by `static/index.html`, which loads the generated Wasm module and calls `interweeb` from `src/interface.rs`.
 
-The interweeb function has the following roles (in order of appearing in the code):
-- Starting the libp2p/swarm client in an async block
-- Setting a listener on the settings text input fields, triggering changing bootnode and connection settings to the weeb process on a button based event
-- Setting a listener on the navigation text input field, triggering requests to the shared worker on content change of the navigation text input field 
-- Setting a listener on the create storage input fields, triggering connecting metamask and buying a batch with provided parameters
-- Setting a listener on the reuse space button, triggering resetting an already existing batch to clean slate
-- Setting a listener on the upload input fields, triggering uploading with the existing batch if there is one
-- Listening to logs sent back by the weeb process, as well as resources and responses of triggered requests and displaying them 
-- Starting connection to bootnode after 600 milliseconds
+`interweeb` creates a `Weeb3` node, clears legacy hash-based paths through `src/nav.rs`, and delegates the rest of the UI setup to `mount_interface`. `mount_interface` can either start the runtime itself or attach the interface to a runtime that has already been started by the package wrapper.
+
+The interface layer currently has the following roles:
+
+- Starting the libp2p / Swarm runtime in an async browser task when requested.
+- Installing UI conventions and rendering the interface shell.
+- Preloading the secure vault module before sensitive upload, feed, stamp, or cheque operations are requested.
+- Registering the Service Worker and routing Service Worker messages back to the Rust runtime.
+- Reading the configured network profile, network id, and browser-dialable bootnodes, then passing bootnode connection requests to the `Weeb3` node.
+- Wiring the navigation input so BZZ references, raw byte routes, and chunk routes can be opened from the UI.
+- Wiring upload controls for single files, tar-based collections, optional encryption, index document selection, optional feed publishing, and postage-stamp reuse or reset.
+- Wiring on-chain controls for upload prerequisites, postage batch acquisition, chequebook deployment, cheque signer persistence, and chequebook deposits through the browser wallet.
+- Providing runtime controls such as pausing and resuming transfers.
+- Rendering retrieved resources, website iframes, streaming media, raw downloads, logs, connection status, network state, and progress rows.
+
+The current interface no longer assumes that requests are handled by a shared worker. The tab owns the `Weeb3` runtime, while the Service Worker acts as a request forwarder between browser fetch events and the active controlled client.
 
 #### The weeb process
 
-Originally implemented in a shared web worker, the main weeb process was intended to function as a common resource for multiple tabs of the same origin.
-This design would have enabled having one swarm client serving multiple open tabs, however, at the cost of giving up on the possibility of being able to open webrtc connections. However, chrome on android does not support shared workers, so for the time being, the main weeb process was transfered back into the tab.
+The main Swarm client is implemented in `src/lib.rs`. It is compiled only for the `wasm32` target and is designed to run in the browser event loop.
 
-The high level architecture of the client resides in src/lib.rs, which (in order of appearing in the code) implements the following functions:
+At a high level, `src/lib.rs` does the following:
 
-- Defining and importing the swarm protocols generated by the protoc compiler
-- Defining the client (as the class Weeb3), it's in-memory registry of peers and their accounting (as the struct Wings)
-- Defining the 6 main functions of the client, namely 
-	1) Changing the bootnode address and network id
-	2) Uploading a file or a tar based collection, optionally to a feed as well
-	3) A function that enables using the running client to retreive resources (the function "acquire")
-	4) A function to reset a postage stamp to original state
-	5) Instantiation (the "new" function), that starts the libp2p client 
-	6) A function that continues running the client, asynchronously maintains/establishes connections, serves requests from the interface, and engages in protocols with the swarm (the "run" function)
-	7) Helper functions for the interface to get new log lines, connection numbers, and to submit new logs meant to be shown on the interface
+- Imports the generated protobuf protocol modules from `etiquette_0` through `etiquette_8`.
+- Defines the Swarm protocol names used by the client, including handshake, pricing, hive peer discovery, pseudosettle, retrieval, pushsync, and swap.
+- Defines network mode helpers for testnet and mainnet. The built-in profiles currently map Swarm network id `10` to the Sepolia-based testnet profile and Swarm network id `1` to the Gnosis / xDAI mainnet profile.
+- Defines the `Weeb3` client, which owns the libp2p `Swarm`, runtime channels, connection state, network id, progress store, transfer pause flag, and peer registry.
+- Defines `Wings`, the in-memory peer and accounting registry used to track connected peers, overlay addresses, bootnodes, accounting peers, settlement state, known underlays, and self-observed ephemeral addresses.
+- Exposes the runtime functions used by the interface and library wrapper.
 
-In slightly more detail, the new function does the following (in order of appearing in the code):
-- Randomises a new secret keypair
-- Starts a libp2p client with the stream libp2p behaviour enabled using webrtc transport
-- Creates a registry of peers (connected_peers, overlay_peers) and peer accounting (accounting_peers, ongoing_refreshments)
-- Creates a message port (to be listened to by the client and to be used by the acquire function)
-This message port can receive the writing end of a channel of bytes along with an address, so that it can write back the results of looking up the address to the channel received.
+The most important public `Weeb3` operations are:
 
-The run function of the client implements an asynchronous architecture that does the following functions (in order of appearance in the code):
-- Creating channels for swarm specific functions 
-	1) Receiving new peers to connect from the gossip protocol (peers_instructions_chan, connections_instructions_chan)
-	2) Accounting related functions (accounting_peer_chan, pricing_chan, refreshment_instructions_chan, refreshment_chan)
-	3) Receiving new bootnode address to connect to
-- Setting up listening to gossip protocol messages (information about existing peers) and pricing protocol messages (for receiving connected peers payment threshold updates)
-- An async routine to continously establish new libp2p-connections (dial) and consume libp2p-swarm events (swarm_event_handle) as well as dialing to bootnode
-- An async routine that wraps a number of further async routines for the following functions (event_handle):
-	1) Accounting connecting newly established peer connections (k1)
-	2) Setting payment thresholds for peers after successfully receiving payment threshold updates in the pricing protocol (k2)
-	3) Initiating refreshments/pseudosettle protocol for peers when triggered by accounting actions (k3)
-	4) Registering the results of successful refreshments towards peers (k4)
-- Two async routines that listens to high level download / upload requests 
-- Two async routines that listens to data object level download / upload requests enabling joining and splitting of chunks
-- Two async routines that enable concurrent chunk level pushsync and retrieval requests
-- An async routine that attempts to conduct handshakes with dialed connections
+1. Changing the network id and bootnode address.
+2. Disconnecting and clearing peer state when the active network profile changes.
+3. Uploading a `File` or tar collection, optionally encrypted, optionally with an index document, and optionally as a feed update.
+4. Pushing a raw chunk through pushsync.
+5. Resolving and acquiring BZZ resources.
+6. Retrieving raw bytes or individual chunks.
+7. Reading feed envelopes and feed content.
+8. Resetting the active postage stamp state.
+9. Reporting logs, connection counts, active network id, and progress snapshots.
+10. Pausing or resuming transfers.
+11. Running the asynchronous protocol loop.
 
-Currently - due to the blocking - non-blocking nature of the async framework, and to avoid a waiting thread hogging the single execution thread, the aforementioned routines intermittently try progressing every 600ms with non cpu intensive async sleeps happening in-between.
+The `new` function constructs the browser node. In the current implementation it:
+
+- Generates a fresh libp2p identity key for the browser runtime.
+- Builds a libp2p `Swarm` with the browser WebSocket / WebSys transport.
+- Uses authenticated Noise and Yamux multiplexing for libp2p connections.
+- Enables the stream behavior used by the Swarm protocol handlers.
+- Creates the peer registry, connection registry, progress store, transfer control flag, and runtime channels.
+- Initializes the default Swarm network id to `10`.
+
+The `run` function is the long-running runtime loop. It builds a channel-based asynchronous task graph for the browser runtime and coordinates the major subsystems:
+
+- Peer discovery, bootnode dialing, connection retry, and connection cleanup.
+- Incoming and outgoing libp2p stream handling.
+- Handshake, identify, pricing, and peer promotion.
+- Accounting, pseudosettle refreshes, cheque sending, and swap-related settlement messages.
+- High-level BZZ resolution, range preparation, and BZZ range retrieval.
+- Data-level retrieval and upload requests.
+- Chunk-level retrieval and pushsync with bounded concurrency.
+- Upload progress reporting.
+- Transfer pause and cancellation checks.
+- Log forwarding to the interface.
+
+The runtime is heavily asynchronous, but it is still running inside the browser's Wasm execution environment. It uses `spawn_local`, async channels, short queue polling, and protocol-specific retry delays rather than OS threads.
 
 #### The Swarm Client Subcomponents
 
-The aforementioned architecture further depends on the following code modules:
-- The protocol handlers for handshake, hive, pricing, pseudosettle and retrieval (src/handlers.rs)
-- The accounting functions, such as calculating chunk prices, reserving, crediting, refreshing (src/accounting.rs)
-- The retrieval logic such as selecting peers to retrieve chunks from, decrypting chunks, joining files and triggering manifest interpretations (src/retrieval.rs)
-- The pushsync logic such as selecting peers to push chunks to, encrypting chunks, splitting files, triggering manifest and soc creation (src/upload.rs)
-- The manifest creation logic (src/manifest_upload.rs)
-- The manifest interpretation logic (src/manifest.rs)
-- The ENS contenthash resolution logic (src/ens.rs)
-- The indexeddb in-browser storage solution (src/persistence.rs)
-- Common methods and struct declarations including DOM manipulation, calculating proximity orders, validating content addressed and single owner chunks, calculating feed addresses, and encoding/decoding resource groups to communicate through byte channels e.g. towards the interface (src/conventions.rs)
+The main runtime depends on several focused modules:
+
+- `src/handlers.rs` implements the libp2p stream handlers for Swarm protocol traffic such as handshake, hive, pricing, pseudosettle, retrieval, pushsync, and swap.
+- `src/accounting.rs` implements local accounting, price calculations, reservations, peer credit / debit tracking, refresh triggers, and settlement coordination.
+- `src/addresses.rs` normalizes and validates browser-dialable underlays, including WebSocket and secure WebSocket multiaddresses.
+- `src/retrieval.rs` implements chunk retrieval, peer selection, validation, decryption, data joining, and request coordination.
+- `src/upload.rs` implements file splitting, optional encryption, chunk creation, postage stamp use, pushsync, manifest creation, SOC creation, and feed upload support.
+- `src/manifest.rs` interprets Swarm manifests.
+- `src/manifest_upload.rs` creates manifests for uploads and collections.
+- `src/bzz_stream.rs` parses canonical BZZ resources, resolves manifests and paths, prepares range trees, and retrieves byte ranges for BZZ resources.
+- `src/streaming_player.rs` integrates range retrieval with browser fetch requests and streaming media playback.
+- `src/nav.rs` normalizes browser paths and extracts BZZ route references from the location bar.
+- `src/ens.rs` resolves ENS content hashes to Swarm references.
+- `src/events.rs` stores progress rows and progress revisions for the UI and package wrapper.
+- `src/persistence.rs` stores browser-side data in IndexedDB.
+- `src/secure_vault.rs` manages sensitive local state such as upload identities, postage-stamp state, feed ownership, and cheque signer material.
+- `src/network_profile.rs` defines the built-in testnet and mainnet profiles, wallet chain ids, token symbols, and bootnodes.
+- `src/on_chain.rs` implements browser wallet and contract interactions for postage batches, price oracle access, chequebook operations, swap token operations, and related state.
+- `src/interface_conventions.rs` and `src/interface_runtime_conventions.rs` contain DOM helpers, UI rendering, route parsing, network controls, and Service Worker runtime integration.
+- `src/library.rs` exposes the Wasm runtime to JavaScript as `Weeb3No103` and `BootstrapNode`.
+- `src/conventions.rs` and `src/interface_conventions.rs` collect common encoding, decoding, hashing, resource, UI, and protocol helper logic.
+
+The ABI files in `src/*.json` are consumed by the on-chain module and cover contracts such as the postage stamp contract, price oracle, factory, sBZZ token, and simple swap contract.
 
 #### Persistence and identity
 
-The weeb process persists 3 types of data:
-- Caching chunks retrieved previously
-- Identity related keys and identifiers used for uploads and creating feeds
-	1) Batch ID
-	2) Private key of Batch Owner
-	3) Batch Bucket Limit
-	4) Private key of Feed Owner
-- Saturation of individual Batch Buckets
+The browser runtime maintains a mix of ephemeral and persistent state.
 
-The indexeddb access is denied to loaded websites by opening websites from swarm in iframes marked with the sandbox attribute.
-The private keys are not used for blockchain purposes, the wallet responsible for buying a batch can only be connected through metamask currently.
-The libp2p node keys are chosen randomly each time the tab is reloaded, resulting in a unique overlay every time
+The libp2p identity used by a `Weeb3` runtime is generated when the node is created. That makes the live peer identity tab-local and runtime-local. Peer maps, connection attempts, active streams, and accounting state are kept in memory by the `Weeb3` and `Wings` structures.
+
+Browser persistence is used for state that should survive page reloads or browser sessions, such as retrieved chunks, chequebook data, signer material, postage-stamp state, and other runtime settings. Sensitive state is routed through the secure vault module instead of being handled directly by ordinary UI code.
+
+Wallet access is requested only for on-chain operations. The browser wallet is used for chain switching, account access, postage purchase flows, chequebook deployment, and deposits. Upload/feed identities and cheque signer keys are managed separately from the wallet account so that Swarm protocol operations do not require signing every action with the injected wallet.
+
+When the network profile changes, the runtime clears the current peer state and increments its connection generation so stale dialing, handshake, and connection events do not leak into the new network session.
 
 ### The Service Worker
 
-Quoting from the [MDN documentation](https://developer.mozilla.org/en-US/docs/Web/API/Service_Worker_API), "Service workers essentially act as proxy servers that sit between web applications, the browser, and the network (when available). They are intended, among other things, to enable the creation of effective offline experiences, intercept network requests, and take appropriate action based on whether the network is available, and update assets residing on the server. They will also allow access to push notifications and background sync APIs.".
+The Service Worker in `static/service.js` sits between the browser fetch layer and the active weeb-3 page. Its role has expanded beyond the original static cache approach.
 
-The weeb-3 interface functions can display single files, for example pictures, documents, and other single files without relying on the service worker through dynamically creating blobs with associated mime types from the data retrieved from swarm, and making them available on [virtual urls](https://developer.mozilla.org/en-US/docs/Web/API/URL/createObjectURL_static). These resources are displayed in embed tags prepended to the content of the resultField html tag.
+Single files can still be displayed without a Service Worker by creating `Blob` object URLs with the correct MIME type. This is enough for images, documents, and other standalone files. It is not enough for full websites, because browser-generated object URLs contain random identifiers and therefore cannot reliably satisfy relative paths for scripts, stylesheets, images, and other website assets.
 
-However, this createObjectUrl method inserts random strings into the virtual urls assigned to individual resources, which makes it unfeasible to be used to render complete websites, as relative paths of assets embedded in the site would be broken by such random strings. This necessitates the use of a service worker, which can intercept the http requests aimed towards the de facto server (for example github pages) and is able to create objects with deterministic url paths to be served in response to these requests, making serving relative assets possible.
+The Service Worker solves this by providing deterministic application-scoped routes:
 
-To enable this, upon detecting a website manifest, the interface sends each retrieved resource complete with relative path and mime type to the service worker (the message event listener in static/service.js), which injects it into a named cache ('default0'), before prepending the website index document as an iframe to the resultField html tag of the weeb-3 browser tab. 
+- `GET` and `HEAD` requests below `/bzz/<reference>/<path>` are interpreted as canonical BZZ resource requests.
+- Raw byte and chunk routes below `/bytes/`, `/chunks/`, and `/chunk/` are forwarded to the Rust runtime.
+- `POST` requests to the scoped `/bzz` endpoint are forwarded as upload requests, including upload headers such as encryption, collection, and index-document hints.
+- Fetch requests are forwarded to the active controlled client through `postMessage` and `MessageChannel`.
+- BZZ resources can be answered as full responses, byte-range responses, or streaming responses depending on MIME type, request headers, and resource size.
+- The app shell is cached with a network-first strategy so that the interface can continue to load when a cached shell is available.
 
-This service worker is only enabled by the browser if the browser detects that the site is served through a secure https connection based on a trusted certificate, as this functionality is clearly a security sensitive asset that can be used to intercept http requests and inject arbitrary resources. The use of this functionality also creates new surfaces of attack such as creating malicious websites that could load a malevolent service worker at runtime, to enable further malicious injections. Disableing such attacks is part of the security development topic of the planned developments section.
+This design means that rendered Swarm websites can request their own relative assets through ordinary browser fetch/navigation behavior, while the active Rust runtime resolves and retrieves the underlying Swarm data.
+
+The Service Worker is security-sensitive. Browsers only enable it for secure origins, and a trusted certificate is required for normal deployment. Because a Service Worker can intercept requests for its scope, production deployments should treat Service Worker replacement, injected pages, and malicious Swarm-hosted websites as important security boundaries. The current architecture reduces some risk by rendering Swarm websites in iframes and by keeping sensitive state behind the secure vault layer, but security hardening remains an active development area.
 
 ### Main dependencies
 
-The weeb-3 project uses the following main rust crates:
-- libp2p
-- alloy
-- ethers
-- web3-rs
-- async-std
-- wasm-bindgen
-- js-sys
-- web-sys
-- indexed_db_futures
+The weeb-3 project uses the following main Rust crates and browser bindings:
+
+- `libp2p` and `libp2p-stream` for peer identity, transport, multiplexing, stream protocols, identify, ping, autonat / dcutr support, and browser WebSocket transport.
+- `async-std` and `async-lock` for async runtime primitives that work in the browser Wasm target.
+- `wasm-bindgen`, `wasm-bindgen-futures`, `js-sys`, and `web-sys` for JavaScript, DOM, Service Worker, browser API, and Promise integration.
+- `web3`, `alloy`, `alloy-signer-local`, and `ethers` for wallet, signing, ABI, and on-chain contract interaction.
+- `indexed_db_futures` for browser IndexedDB persistence.
+- `tar` and `mime_guess` for collection upload handling and MIME inference.
+- `getrandom` with the `wasm_js` backend for browser-compatible randomness.
+- `base64`, `hex`, `byteorder`, and numeric / cryptographic helper crates for protocol encoding and Swarm data structures.
+- `tokio` and `tower-http` for the local development server used outside the Wasm target.
 
 ### Concurrency and memory limitations
 
-The architecture of the weeb process enables a high level of concurrency between different tasks, sending a high number of different types of protocol messages parallelly. The webassembly architecture currently does not support threads or utilizing multiple CPUs, and the 32bit memory addressing scheme limits the usable memory to 4 GBs. Offloading the work to multiple non-specialized web-workers would increase this limit in both dimensions as each web worker has a separate memory address space and a separate physical thread.
+The browser runtime enables a high level of concurrency between Swarm tasks by combining libp2p streams, async channels, local futures, bounded upload and retrieval concurrency, and protocol-specific retry loops. This allows many protocol messages and chunk operations to be in flight at the same time even though the Wasm runtime itself is not using native threads.
+
+The current browser architecture is still constrained by the WebAssembly execution environment. A tab-local runtime shares the browser's single-threaded Wasm event loop unless browser and build settings enable more advanced worker-based execution. Memory is also constrained by the WebAssembly address space and by practical browser limits.
+
+Moving parts of the runtime into dedicated workers could improve isolation, memory headroom, and CPU parallelism in the future. That change would need to preserve browser transport support, Service Worker communication, secure vault boundaries, and compatibility with mobile browsers.
 
 ## [Planned development]
 
-- Adding functionality to the service worker to enable triggering requests towards the shared worker, to retrieve resources when swarm references are present in a website, alternatively, achieving the same by overwriting navigation bar contents when an onclick event is detected to be a swarm reference
-- Simultaneous manifest fork lookups  
-- Multi-threading through web-workers
-- Adding the swarm ACT feature
-- Wallet related functionality such as using cheques 
-- Penetration testing against service worker replacement and other injection types of attacks
-- Penetration testing loaded websites access to keys in indexeddb / loading single executable files
-- Refinements in error propagation, reliability, robustness, status updates in ongoing processes
-
-
-
-
-
+- Further hardening of Service Worker replacement, iframe boundaries, route handling, and injected-content attack surfaces.
+- Additional security review around loaded websites, IndexedDB access, secure vault access, upload identities, postage state, and cheque signer material.
+- Better reliability, error propagation, status reporting, and recovery for long-running retrieval, upload, settlement, and connection processes.
+- Improved network profile management, bootnode handling, peer quality tracking, and dial retry behavior.
+- More complete and stable JavaScript package documentation and examples for the `Weeb3No103` wrapper.
+- Continued improvements to BZZ path handling, streaming media retrieval, byte-range serving, and manifest fork lookup performance.
+- Worker-based partitioning or multithreading where browser support and the project architecture make it practical.
+- Additional Swarm feature coverage, including ACT and other protocol features not yet fully implemented.
+- Continued wallet, postage, chequebook, and swap UX refinements.

@@ -398,7 +398,9 @@ impl MediaState {
 
     fn mark_failure(&mut self, start: u64) {
         self.consecutive_failures = self.consecutive_failures.saturating_add(1);
-        self.scheduled_high_water_end = self.scheduled_high_water_end.max(start as i64 - 1);
+        let failure_end = if start == 0 { -1 } else { start as i64 - 1 };
+        self.scheduled_high_water_end = self.scheduled_high_water_end.min(failure_end);
+        self.scheduled_high_water_end = self.scheduled_high_water_end.max(self.high_water_end);
         self.last_touch = js_sys::Date::now();
     }
 }
@@ -715,17 +717,13 @@ async fn fetch_bzz_response(
 
     if let Some(media_state) = &media_state {
         mark_media_range_complete(&resource, &metadata, start, end, media_state);
-        let requested_end = parsed_range
-            .and_then(|parsed| parsed.ok())
-            .map(|(_, requested_end)| requested_end)
-            .unwrap_or(metadata.size - 1);
         spawn_prefetch_media_stages(
             weeb3.clone(),
             resource.clone(),
             metadata.clone(),
             start,
             end,
-            requested_end,
+            metadata.size - 1,
             media_state.generation,
         );
     }
@@ -1314,7 +1312,7 @@ async fn prefetch_media_windows(
         }
 
         let loads = windows.iter().map(|(start, end)| {
-            read_range_window(
+            read_cached_range_with_retry(
                 weeb3.clone(),
                 resource.clone(),
                 metadata.clone(),
@@ -1402,21 +1400,9 @@ fn mark_media_window_failure(resource: &str, metadata: &BzzMetadata, start: u64,
     let key = media_state_key(resource, metadata);
     FETCH_CACHE.with(|cache| {
         let mut cache = cache.borrow_mut();
-        let should_reset = {
-            let state = cache.media_state_mut(&key);
-            if state.generation == generation {
-                state.mark_failure(start);
-                true
-            } else {
-                false
-            }
-        };
-        if should_reset {
-            cache.fail_pending_ranges_with_prefix(
-                &range_cache_prefix(resource, metadata),
-                "media prefetch failed",
-            );
-            cache.reset_media_state(&key);
+        let state = cache.media_state_mut(&key);
+        if state.generation == generation {
+            state.mark_failure(start);
         }
     });
 }

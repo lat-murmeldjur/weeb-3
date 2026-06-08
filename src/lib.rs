@@ -242,7 +242,7 @@ async fn queue_peer_dial_retry(
     address: Multiaddr,
     expected_generation: u64,
     connection_generation: Arc<Mutex<u64>>,
-    peers_instructions: mpsc::Sender<etiquette_2::BzzAddress>,
+    peers_instructions: mpsc::Sender<PeerDialInstruction>,
     reason: String,
 ) {
     async_std::task::sleep(Duration::from_millis(HANDSHAKE_RETRY_DELAY_MS)).await;
@@ -257,7 +257,7 @@ async fn queue_peer_dial_retry(
 
     let mut bzzaddr = etiquette_2::BzzAddress::default();
     bzzaddr.underlay = address.to_vec();
-    let _ = peers_instructions.try_send(bzzaddr);
+    let _ = peers_instructions.try_send((bzzaddr, expected_generation));
     timed_log(format!(
         "Peer dial retry queued address={} reason={}",
         address, reason
@@ -391,9 +391,11 @@ pub struct Weeb3 {
 }
 
 type PeerAddrMap = Arc<Mutex<HashMap<PeerId, Multiaddr>>>;
+type PeerGenerationMap = Arc<Mutex<HashMap<PeerId, u64>>>;
 type RetrieveGenerationMap = Arc<Mutex<HashMap<String, u64>>>;
 type ChunkRetrieveSender = mpsc::Sender<ChunkRetrieveRequest>;
 type ChunkRetrieveReceiver = mpsc::Receiver<ChunkRetrieveRequest>;
+type PeerDialInstruction = (etiquette_2::BzzAddress, u64);
 
 #[derive(Clone, Debug)]
 pub(crate) struct RetrieveCancelToken {
@@ -504,6 +506,7 @@ pub struct Wings {
     swap_beneficiaries: Arc<Mutex<HashMap<PeerId, (web3::types::Address, bool)>>>,
     connection_attempts: Arc<Mutex<HashSet<PeerId>>>,
     known_peer_underlays: PeerAddrMap,
+    known_peer_generations: PeerGenerationMap,
     self_ephemerals: PeerAddrMap,
     self_ephemeral_waiters: Arc<Mutex<HashMap<PeerId, Vec<mpsc::Sender<Multiaddr>>>>>,
 }
@@ -630,7 +633,7 @@ impl Weeb3 {
             }
         }
 
-        let wings = self.wings.lock().await;
+        let wings = { self.wings.lock().await.clone() };
 
         wings.connected_peers.lock().await.clear();
         wings.overlay_peers.lock().await.clear();
@@ -641,6 +644,7 @@ impl Weeb3 {
         wings.ongoing_cheques.lock().await.clear();
         wings.swap_beneficiaries.lock().await.clear();
         wings.known_peer_underlays.lock().await.clear();
+        wings.known_peer_generations.lock().await.clear();
         wings.self_ephemerals.lock().await.clear();
         wings.self_ephemeral_waiters.lock().await.clear();
 
@@ -1104,6 +1108,7 @@ impl Weeb3 {
             Arc::new(Mutex::new(HashMap::new()));
         let connection_attempts: Arc<Mutex<HashSet<PeerId>>> = Arc::new(Mutex::new(HashSet::new()));
         let known_peer_underlays: PeerAddrMap = Arc::new(Mutex::new(HashMap::new()));
+        let known_peer_generations: PeerGenerationMap = Arc::new(Mutex::new(HashMap::new()));
         let ongoing_cheques: Arc<Mutex<HashMap<PeerId, u64>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let swap_beneficiaries: Arc<Mutex<HashMap<PeerId, (web3::types::Address, bool)>>> =
@@ -1150,6 +1155,7 @@ impl Weeb3 {
                 swap_beneficiaries: swap_beneficiaries,
                 connection_attempts: connection_attempts,
                 known_peer_underlays: known_peer_underlays,
+                known_peer_generations: known_peer_generations,
                 self_ephemerals: self_ephemerals,
                 self_ephemeral_waiters: self_ephemeral_waiters,
             })),
@@ -1265,10 +1271,10 @@ impl Weeb3 {
     pub async fn run(&self, _st: String) -> () {
         // init_panic_hook();
         self.interface_log("Node runtime handlers starting".to_string());
-        let wings = self.wings.lock().await;
+        let wings = { self.wings.lock().await.clone() };
 
         let (peers_instructions_chan_outgoing, peers_instructions_chan_incoming) =
-            mpsc::unbounded();
+            mpsc::unbounded::<PeerDialInstruction>();
         let (connections_instructions_chan_outgoing, connections_instructions_chan_incoming) =
             mpsc::unbounded::<(etiquette_2::BzzAddress, bool, u64)>();
 
@@ -1338,12 +1344,20 @@ impl Weeb3 {
         };
 
         let gossip_peers_instructions_chan_outgoing = peers_instructions_chan_outgoing.clone();
+        let gossip_connection_generation = self.connection_generation.clone();
         let gossip_inbound_handle = async move {
             while let Some((peer, stream)) = incoming_gossip_streams.next().await {
                 let peers_instructions_chan_outgoing =
                     gossip_peers_instructions_chan_outgoing.clone();
+                let instruction_generation = *gossip_connection_generation.lock().await;
                 spawn_local(async move {
-                    gossip_handler(peer, stream, &peers_instructions_chan_outgoing).await;
+                    gossip_handler(
+                        peer,
+                        stream,
+                        &peers_instructions_chan_outgoing,
+                        instruction_generation,
+                    )
+                    .await;
                 });
                 async_std::task::yield_now().await;
             }
@@ -1357,16 +1371,37 @@ impl Weeb3 {
                 };
 
                 loop {
-                    let paddr_current = paddr.clone();
+                    let (paddr_current, instruction_generation) = paddr.clone();
+                    if instruction_generation != self.current_connection_generation().await {
+                        timed_log(format!(
+                            "Skipping stale peer instruction generation={}",
+                            instruction_generation
+                        ));
+                        match peers_instructions_chan_incoming.try_recv() {
+                            Ok(next) => {
+                                paddr = next;
+                                continue;
+                            }
+                            Err(_) => break,
+                        }
+                    }
+
                     let wings = wings.clone();
                     let swarm = self.swarm.clone();
-                    let instruction_generation = self.current_connection_generation().await;
                     let connections_instructions_chan_outgoing =
                         connections_instructions_chan_outgoing.clone();
                     let peers_instructions_chan_outgoing = peers_instructions_chan_outgoing.clone();
                     let connection_generation = self.connection_generation.clone();
 
                     spawn_local(async move {
+                        if *connection_generation.lock().await != instruction_generation {
+                            timed_log(format!(
+                                "Peer instruction skipped stale generation={}",
+                                instruction_generation
+                            ));
+                            return;
+                        }
+
                         let und_addrs = deserialize_underlays(&paddr_current.clone().underlay);
 
                         for addr3 in und_addrs.iter() {
@@ -1408,6 +1443,10 @@ impl Weeb3 {
                                     let mut known = wings.known_peer_underlays.lock().await;
                                     known.insert(pid.clone(), dial_addr.clone());
                                 }
+                                {
+                                    let mut generations = wings.known_peer_generations.lock().await;
+                                    generations.insert(pid.clone(), instruction_generation);
+                                }
                                 let dial_result = {
                                     let mut swarm = swarm.lock_arc().await;
                                     runtime_debug(&JsValue::from(format!("dial 0",)));
@@ -1423,6 +1462,11 @@ impl Weeb3 {
                                         let mut connection_attempts_map =
                                             wings.connection_attempts.lock().await;
                                         connection_attempts_map.remove(&pid);
+                                    }
+                                    {
+                                        let mut generations =
+                                            wings.known_peer_generations.lock().await;
+                                        generations.remove(&pid);
                                     }
                                     queue_peer_dial_retry(
                                         dial_addr.clone(),
@@ -1491,6 +1535,10 @@ impl Weeb3 {
                                 let mut known = wings.known_peer_underlays.lock().await;
                                 known.insert(pid.clone(), dial_addr.clone());
                             }
+                            {
+                                let mut generations = wings.known_peer_generations.lock().await;
+                                generations.insert(pid.clone(), instruction_generation);
+                            }
                             let dial_result = {
                                 let mut swarm = swarm.lock_arc().await;
                                 runtime_debug(&JsValue::from(format!("dial 1",)));
@@ -1506,6 +1554,10 @@ impl Weeb3 {
                                     let mut connection_attempts_map =
                                         wings.connection_attempts.lock().await;
                                     connection_attempts_map.remove(&pid);
+                                }
+                                {
+                                    let mut generations = wings.known_peer_generations.lock().await;
+                                    generations.remove(&pid);
                                 }
                                 queue_peer_dial_retry(
                                     dial_addr.clone(),
@@ -1637,25 +1689,42 @@ impl Weeb3 {
                                     .and_then(|address| try_from_multiaddr(address))
                             });
 
+                            let retry_generation = *connection_generation.lock().await;
                             let mut should_retry = false;
 
-                            if let Some(peer_id) = peer_to_clear {
+                            if let Some(peer_id) = peer_to_clear.clone() {
                                 let had_attempt = {
                                     let mut connection_attempts_map =
                                         wings.connection_attempts.lock().await;
                                     connection_attempts_map.remove(&peer_id)
                                 };
 
-                                should_retry = had_attempt;
+                                let peer_generation = {
+                                    let mut generations = wings.known_peer_generations.lock().await;
+                                    let generation = generations.get(&peer_id).copied();
+                                    if generation != Some(retry_generation) {
+                                        generations.remove(&peer_id);
+                                    }
+                                    generation
+                                };
+
+                                should_retry =
+                                    had_attempt && peer_generation == Some(retry_generation);
 
                                 if had_attempt {
                                     decrement_counter(&ongoing_connections).await;
+                                }
+
+                                if had_attempt && peer_generation != Some(retry_generation) {
+                                    timed_log(format!(
+                                        "Skipping outgoing retry for stale peer={} peer_generation={:?} current_generation={}",
+                                        peer_id, peer_generation, retry_generation
+                                    ));
                                 }
                             }
 
                             if should_retry {
                                 if let Some(address) = retry_address {
-                                    let retry_generation = *connection_generation.lock().await;
                                     async_std::task::sleep(Duration::from_millis(
                                         HANDSHAKE_RETRY_DELAY_MS,
                                     ))
@@ -1663,7 +1732,8 @@ impl Weeb3 {
                                     if *connection_generation.lock().await == retry_generation {
                                         let mut bzzaddr = etiquette_2::BzzAddress::default();
                                         bzzaddr.underlay = address.to_vec();
-                                        let _ = peers_instructions_chan_outgoing.try_send(bzzaddr);
+                                        let _ = peers_instructions_chan_outgoing
+                                            .try_send((bzzaddr, retry_generation));
                                     }
                                 }
                             } else if let Some(address) = retry_address {
@@ -1714,6 +1784,11 @@ impl Weeb3 {
                                     wings.connection_attempts.lock().await;
                                 connection_attempts_map.remove(&peer_id)
                             };
+                            let retry_generation = *connection_generation.lock().await;
+                            let peer_generation = {
+                                let mut generations = wings.known_peer_generations.lock().await;
+                                generations.remove(&peer_id)
+                            };
 
                             {
                                 let mut map = wings.self_ephemerals.lock().await;
@@ -1744,8 +1819,9 @@ impl Weeb3 {
                             };
 
                             if let Some(address) = retry_address {
-                                if was_tracked_peer || had_attempt {
-                                    let retry_generation = *connection_generation.lock().await;
+                                if (was_tracked_peer || had_attempt)
+                                    && peer_generation == Some(retry_generation)
+                                {
                                     async_std::task::sleep(Duration::from_millis(
                                         HANDSHAKE_RETRY_DELAY_MS,
                                     ))
@@ -1758,12 +1834,18 @@ impl Weeb3 {
                                     } else {
                                         let mut bzzaddr = etiquette_2::BzzAddress::default();
                                         bzzaddr.underlay = address.to_vec();
-                                        let _ = peers_instructions_chan_outgoing.try_send(bzzaddr);
+                                        let _ = peers_instructions_chan_outgoing
+                                            .try_send((bzzaddr, retry_generation));
                                         interface_log(format!(
                                             "Queued reconnect for peer {} {}",
                                             peer_id, address
                                         ));
                                     }
+                                } else if was_tracked_peer || had_attempt {
+                                    timed_log(format!(
+                                        "Skipping reconnect for stale peer={} address={} peer_generation={:?} current_generation={}",
+                                        peer_id, address, peer_generation, retry_generation
+                                    ));
                                 } else {
                                     timed_log(format!(
                                         "Skipping retry for untracked closed peer={} address={}",
@@ -1859,6 +1941,10 @@ impl Weeb3 {
                             let mut known = wings.known_peer_underlays.lock().await;
                             known.insert(pid.clone(), dial_addr.clone());
                         }
+                        {
+                            let mut generations = wings.known_peer_generations.lock().await;
+                            generations.insert(pid.clone(), request_generation);
+                        }
                         let dial_result = {
                             let mut swarm = swarm.lock_arc().await;
                             runtime_debug(&JsValue::from(format!("dial 2 :: {:#?}", addr33)));
@@ -1874,6 +1960,10 @@ impl Weeb3 {
                                 let mut connection_attempts_map =
                                     wings.connection_attempts.lock().await;
                                 connection_attempts_map.remove(&pid);
+                            }
+                            {
+                                let mut generations = wings.known_peer_generations.lock().await;
+                                generations.remove(&pid);
                             }
                             let _ = chan
                                 .try_send(format!("bootnode dial failed: {:?}; retrying", error));

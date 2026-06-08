@@ -26,9 +26,14 @@ pub(crate) const TESTNET_BOOTNODES: &[&str] = &[
 ];
 
 pub(crate) const MAINNET_BOOTNODES: &[&str] = &[
-    "/ip4/139.84.229.70/tcp/1634/p2p/QmRa6rSrUWJ7s68MNmV94bo2KAa9pYcp6YbFLMHZ3r7n2M",
-    "/ip4/135.181.84.53/tcp/1634/p2p/QmTxX73q8dDiVbmXU7GqMNwG3gWmjSFECuMoCsTW4xp6CK",
-    "/ip4/159.223.6.181/tcp/1634/p2p/QmP9b7MxjyEfrJrch5jUThmuFaGzvUPpWEJewCpx5Ln6i8",
+    "/ip4/109.205.181.149/tcp/31644/tls/sni/109-205-181-149.k2k4r8lwucsb3m1gkhs1i5so1t1490mrd33il7griouxnwbwdlv2fecb.libp2p.direct/ws/p2p/QmV5TJpe73ri1DHU9nYajmUsoXYzhNrXXUZcyGDnD1LHsG",
+    "/ip4/109.205.181.149/tcp/31646/tls/sni/109-205-181-149.k2k4r8lo6z0cqtvt0ckl8lbwjd2hxf2oso1cqb636xyag9dhqy1gue8d.libp2p.direct/ws/p2p/QmURpkuZxhNMe83dsyCGrnxqBGrM99aaVA3iiALj6aTuJc",
+    "/ip4/109.205.181.149/tcp/31637/tls/sni/109-205-181-149.k2k4r8nclu1rjojzhrhpn973uo4p230l1i8kx4p5fsv6dhxiklbdui7h.libp2p.direct/ws/p2p/QmYxerDASAhBU5iiM7VvVaHCpQBtVxEwtYfe1ZyQj9nFrL",
+    "/ip4/109.205.181.149/tcp/31651/tls/sni/109-205-181-149.k2k4r8p4cpdfyxi3ccgwbw4wy9zzsjzx5ufjt0wnswofp5dtlulg51h8.libp2p.direct/ws/p2p/Qmdjz6vCCjYCpfw5CZM5fK3aG1QAmQWc5hvQSq5oANt8wV",
+    "/ip4/109.205.181.149/tcp/31650/tls/sni/109-205-181-149.k2k4r8o4bzy1a2swvot681mtbf5grhnriujsl65wb65qacvaixvgkdn0.libp2p.direct/ws/p2p/Qmb3HCb53pivCSTbEq85mAfPwvhbiuH1oHVDPFhv5rMx2f",
+    "/ip4/159.223.6.181/tcp/1635/tls/sni/159-223-6-181.k2k4r8jpsxkovxvl3sf2u8bkg59z4mxmgfhs9r7ir8mcwduokkrcmku5.libp2p.direct/ws/p2p/QmP9b7MxjyEfrJrch5jUThmuFaGzvUPpWEJewCpx5Ln6i8",
+    "/ip4/126.108.216.112/tcp/1635/tls/sni/126-108-216-112.k2k4r8novlzzfbrx3cub8u6iyuccliun26jfu4rd9jxbp3osil4fyak8.libp2p.direct/ws/p2p/QmZt3Migk2xknRxt3T2KdG53LiL518qELobxsZXEYh5nuV",
+    "/ip4/216.238.102.247/tcp/1635/tls/sni/216-238-102-247.k2k4r8k8ccrb8q7ccsm6qfhq7s8g9ycdc7fe4abv8fnjs56mshu4ri7x.libp2p.direct/ws/p2p/QmQYFDafiKuWUDknur8VcTUVgJgNxJevLxzYRKDKKvvv1r",
 ];
 
 pub(crate) const TESTNET_PROFILE: NetworkProfile = NetworkProfile {
