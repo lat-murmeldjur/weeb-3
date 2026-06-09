@@ -91,8 +91,8 @@ use ens::*;
 mod events;
 use events::{ProgressRow, ProgressStore};
 
-static MAINNET: AtomicBool = AtomicBool::new(false);
-static TESTNET_OFFICIAL: AtomicBool = AtomicBool::new(true);
+static MAINNET: AtomicBool = AtomicBool::new(true);
+static TESTNET_OFFICIAL: AtomicBool = AtomicBool::new(false);
 
 pub fn set_mainnet(value: bool) {
     MAINNET.store(value, Ordering::Relaxed);
@@ -1167,7 +1167,7 @@ impl Weeb3 {
             upload_port: (u_out, u_in),
             chunk_push_port: (chunk_push_port_out, chunk_push_port_in),
             bootnode_port: (b_out, b_in),
-            network_id: Mutex::new(10_u64),
+            network_id: Mutex::new(1_u64),
             transfer_paused: Arc::new(AtomicBool::new(false)),
             retrieve_cancel_generations: Arc::new(Mutex::new(HashMap::new())),
             connection_generation: Arc::new(Mutex::new(0_u64)),

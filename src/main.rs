@@ -100,6 +100,10 @@ pub(crate) async fn serve(libp2p_transport: Multiaddr) {
     let server = Router::new()
         .route("/weeb-3/", get(get_index))
         .route("/weeb-3/index.html", get(get_index))
+        .route("/weeb-3/mainnet", get(get_index))
+        .route("/weeb-3/mainnet/", get(get_index))
+        .route("/weeb-3/testnet", get(get_index))
+        .route("/weeb-3/testnet/", get(get_index))
         .route("/example.html", get(get_example))
         .route("/weeb-3/weeb_3.js", get(get_static_file_weeb_3_js))
         .route(

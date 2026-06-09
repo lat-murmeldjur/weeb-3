@@ -1,6 +1,8 @@
 use wasm_bindgen::JsValue;
 use web_sys::window;
 
+use crate::network_profile::NetworkMode;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ResourceRoute {
     Bzz(String),
@@ -41,6 +43,40 @@ fn trim_route_prefix(input: &str) -> String {
     route.trim_start_matches('/').to_string()
 }
 
+fn network_mode_segment(segment: &str) -> Option<NetworkMode> {
+    match segment.trim().to_ascii_lowercase().as_str() {
+        "mainnet" | "gnosis" | "gnosischain" | "1" => Some(NetworkMode::Mainnet),
+        "testnet" | "sepolia" | "10" => Some(NetworkMode::Testnet),
+        _ => None,
+    }
+}
+
+fn trim_network_mode_prefix(route: &str) -> &str {
+    let route = route.trim_start_matches('/');
+    let mut parts = route.splitn(2, '/');
+    let head = parts.next().unwrap_or_default();
+    let tail = parts.next().unwrap_or_default();
+
+    if network_mode_segment(head).is_some() {
+        tail.trim_start_matches('/')
+    } else {
+        route
+    }
+}
+
+pub(crate) fn route_network_mode_from_path(pathname: &str) -> Option<NetworkMode> {
+    let route = trim_route_prefix(pathname);
+    let head = route.split('/').find(|part| !part.is_empty())?;
+    network_mode_segment(head)
+}
+
+pub(crate) fn route_network_mode_from_location() -> Option<NetworkMode> {
+    let window = window()?;
+    let location = window.location();
+    let pathname = location.pathname().ok()?;
+    route_network_mode_from_path(&pathname)
+}
+
 fn is_reference_hex(reference: &str) -> bool {
     (reference.len() == 64 || reference.len() == 128)
         && reference.as_bytes().iter().all(|b| b.is_ascii_hexdigit())
@@ -48,6 +84,7 @@ fn is_reference_hex(reference: &str) -> bool {
 
 pub(crate) fn parse_resource_route(input: &str) -> Option<ResourceRoute> {
     let route = trim_route_prefix(input);
+    let route = trim_network_mode_prefix(&route).to_string();
     let mut parts = route.splitn(2, '/');
     let head = parts.next().unwrap_or_default();
     let tail = parts.next().unwrap_or_default();

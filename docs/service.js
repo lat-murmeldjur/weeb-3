@@ -1,14 +1,16 @@
-const CACHE_NAME = "default9";
+const CACHE_NAME = "default10";
 const SCOPE = new URL(self.registration.scope);
 const SCOPE_PATH = SCOPE.pathname.endsWith("/") ? SCOPE.pathname : `${SCOPE.pathname}/`;
 const APP_ROOT = SCOPE_PATH;
 const APP_INDEX = `${SCOPE_PATH}index.html`;
-const BZZ_MARKER = `${SCOPE_PATH}bzz/`;
-const BYTES_MARKER = `${SCOPE_PATH}bytes/`;
-const CHUNKS_MARKER = `${SCOPE_PATH}chunks/`;
-const CHUNK_MARKER = `${SCOPE_PATH}chunk/`;
+const NETWORK_ROUTE_PREFIXES = ["", "mainnet/", "testnet/"];
+const RAW_ROUTE_KINDS = [
+  ["bytes", "bytes"],
+  ["chunks", "chunk"],
+  ["chunk", "chunk"]
+];
 const FETCH_TIMEOUT_MS = 240000;
-const SERVICE_WORKER_MARKER = "forwarder-default9";
+const SERVICE_WORKER_MARKER = "forwarder-default10";
 const DEBUG_SERVICE_WORKER = false;
 const MIB_BYTES = 1024 * 1024;
 const STREAM_STORAGE_WINDOW_BYTES = MIB_BYTES / 2;
@@ -47,31 +49,55 @@ function isSwarmReference(reference) {
   return /^(?:[a-fA-F0-9]{64}|[a-fA-F0-9]{128})$/.test(reference);
 }
 
+function bzzMarkers() {
+  return NETWORK_ROUTE_PREFIXES.map((prefix) => `${SCOPE_PATH}${prefix}bzz/`);
+}
+
+function rawRouteMarkers() {
+  return NETWORK_ROUTE_PREFIXES.flatMap((prefix) =>
+    RAW_ROUTE_KINDS.map(([kind, rawType]) => [`${SCOPE_PATH}${prefix}${kind}/`, rawType])
+  );
+}
+
+function isNetworkShellPath(pathname) {
+  return ["mainnet", "testnet"].some((mode) =>
+    pathname === `${SCOPE_PATH}${mode}` || pathname === `${SCOPE_PATH}${mode}/`
+  );
+}
+
+function isBzzUploadPath(pathname) {
+  return NETWORK_ROUTE_PREFIXES.some((prefix) => pathname === `${SCOPE_PATH}${prefix}bzz`);
+}
+
 function canonicalBzzResource(url) {
-  const idx = url.pathname.indexOf(BZZ_MARKER);
-  if (idx < 0) {
-    return null;
+  for (const marker of bzzMarkers()) {
+    const idx = url.pathname.indexOf(marker);
+    if (idx < 0) {
+      continue;
+    }
+
+    const resource = url.pathname.substring(idx + marker.length);
+    if (!resource) {
+      return null;
+    }
+
+    const reference = resource.split("/", 1)[0];
+    if (!isSwarmReference(reference)) {
+      return null;
+    }
+
+    try {
+      return decodeURIComponent(resource);
+    } catch (_) {
+      return resource;
+    }
   }
 
-  const resource = url.pathname.substring(idx + BZZ_MARKER.length);
-  if (!resource) {
-    return null;
-  }
-
-  const reference = resource.split("/", 1)[0];
-  if (!isSwarmReference(reference)) {
-    return null;
-  }
-
-  try {
-    return decodeURIComponent(resource);
-  } catch (_) {
-    return resource;
-  }
+  return null;
 }
 
 function canonicalRawResource(url) {
-  for (const marker of [BYTES_MARKER, CHUNKS_MARKER, CHUNK_MARKER]) {
+  for (const [marker] of rawRouteMarkers()) {
     const idx = url.pathname.indexOf(marker);
     if (idx < 0) {
       continue;
@@ -90,11 +116,6 @@ function canonicalRawResource(url) {
   }
 
   return null;
-}
-
-function hasCanonicalBzzPath(resource) {
-  const slash = resource.indexOf("/");
-  return slash >= 0 && resource.substring(slash + 1).trim().length > 0;
 }
 
 function isCanonicalRequest(request) {
@@ -179,7 +200,7 @@ self.addEventListener("fetch", (event) => {
   const request = event.request;
   const url = new URL(request.url);
 
-  if (request.method === "POST" && url.origin === SCOPE.origin && url.pathname.endsWith(`${SCOPE_PATH}bzz`)) {
+  if (request.method === "POST" && url.origin === SCOPE.origin && isBzzUploadPath(url.pathname)) {
     event.respondWith(forwardUploadToRust(request, event));
     return;
   }
@@ -189,9 +210,14 @@ self.addEventListener("fetch", (event) => {
     return;
   }
 
+  if (isAppShellNavigation(request) && isNetworkShellPath(url.pathname)) {
+    event.respondWith(networkFirst(appShellRequest(request)));
+    return;
+  }
+
   const bzzResource = canonicalBzzResource(url);
   if (bzzResource && (request.method === "GET" || request.method === "HEAD")) {
-    if (isAppShellNavigation(request) && !hasCanonicalBzzPath(bzzResource)) {
+    if (isAppShellNavigation(request)) {
       event.respondWith(networkFirst(appShellRequest(request)));
     } else {
       event.respondWith(forwardRequestToRust(request, event));
@@ -237,6 +263,10 @@ function isAppShellClient(client) {
   try {
     const url = new URL(client.url);
     if (url.pathname === APP_ROOT || url.pathname === APP_INDEX) {
+      return true;
+    }
+
+    if (isNetworkShellPath(url.pathname)) {
       return true;
     }
 

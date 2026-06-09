@@ -354,6 +354,16 @@ pub struct Weeb3No103 {
     started: Arc<AtomicBool>,
 }
 
+fn start_weeb3_runtime_once(inner: Arc<Weeb3>, started: Arc<AtomicBool>) {
+    if started.swap(true, Ordering::Relaxed) {
+        return;
+    }
+
+    spawn_local(async move {
+        inner.run(String::new()).await;
+    });
+}
+
 #[wasm_bindgen]
 impl Weeb3No103 {
     #[wasm_bindgen(constructor)]
@@ -365,14 +375,7 @@ impl Weeb3No103 {
     }
 
     fn start_runtime_once(&self) {
-        if self.started.swap(true, Ordering::Relaxed) {
-            return;
-        }
-
-        let s = self.inner.clone();
-        spawn_local(async move {
-            s.run(String::new()).await;
-        });
+        start_weeb3_runtime_once(self.inner.clone(), self.started.clone());
     }
 
     async fn boot_runtime(&self) {
@@ -382,11 +385,13 @@ impl Weeb3No103 {
 
     #[wasm_bindgen(js_name = start)]
     pub fn start(&self, bootstrap_nodes: Vec<BootstrapNode>, network_id: String) {
-        self.start_runtime_once();
         let s = self.inner.clone();
+        let started = self.started.clone();
 
         spawn_local(async move {
             let _ = s.set_network_id(network_id.clone()).await;
+            start_weeb3_runtime_once(s.clone(), started);
+
             let futures = bootstrap_nodes.into_iter().map(|node| {
                 let s_clone = s.clone();
                 let nid = network_id.clone();
@@ -443,7 +448,6 @@ impl Weeb3No103 {
 
     #[wasm_bindgen(js_name = switchNetwork)]
     pub async fn switch_network(&self, mode: String) -> Object {
-        self.start_runtime_once();
         let Some(mode) = network_mode_from_input(&mode) else {
             return error_object("unknown network mode");
         };
@@ -452,6 +456,7 @@ impl Weeb3No103 {
         if !self.inner.set_network_id(network_id.clone()).await {
             return error_object("network id switch failed");
         }
+        self.start_runtime_once();
 
         let attempts = profile.bootnodes.iter().map(|address| {
             let inner = self.inner.clone();
@@ -494,6 +499,26 @@ impl Weeb3No103 {
     #[wasm_bindgen(js_name = switch_network)]
     pub async fn switch_network_alias(&self, mode: String) -> Object {
         self.switch_network(mode).await
+    }
+
+    #[wasm_bindgen(js_name = switchMainnet)]
+    pub async fn switch_mainnet(&self) -> Object {
+        self.switch_network("mainnet".to_string()).await
+    }
+
+    #[wasm_bindgen(js_name = switch_mainnet)]
+    pub async fn switch_mainnet_alias(&self) -> Object {
+        self.switch_mainnet().await
+    }
+
+    #[wasm_bindgen(js_name = switchTestnet)]
+    pub async fn switch_testnet(&self) -> Object {
+        self.switch_network("testnet".to_string()).await
+    }
+
+    #[wasm_bindgen(js_name = switch_testnet)]
+    pub async fn switch_testnet_alias(&self) -> Object {
+        self.switch_testnet().await
     }
 
     pub async fn connect(&self) -> Object {

@@ -38,7 +38,10 @@ use crate::{
     decode_resources, encrey,
     interface_conventions::{install_interface_conventions, set_bracket_button_label},
     join_all,
-    nav::{ResourceRoute, clear_path, parse_resource_route, read_routes},
+    nav::{
+        ResourceRoute, clear_path, parse_resource_route, read_routes,
+        route_network_mode_from_location,
+    },
     network_profile::{
         NetworkMode, is_browser_dialable_underlay, profile_for_mode, profile_for_swarm_network_id,
     },
@@ -95,8 +98,18 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
     //    init_panic_hook();
 
     clear_path().await;
+    let initial_mode = route_network_mode_from_location().unwrap_or(NetworkMode::Mainnet);
+    let initial_profile = profile_for_mode(initial_mode);
+    set_network_profile_inputs(initial_mode);
+
     let weeb3 = Arc::new(Weeb3::new("".to_string()));
-    weeb3.interface_log("Node created".to_string());
+    let _ = weeb3
+        .set_network_id(initial_profile.swarm_network_id.to_string())
+        .await;
+    weeb3.interface_log(format!(
+        "Node created for {:?} network {}",
+        initial_profile.mode, initial_profile.swarm_network_id
+    ));
     mount_interface(weeb3, true, true).await
 }
 
@@ -118,6 +131,9 @@ pub(crate) async fn mount_interface(
 
     secure_preload_vault_module();
     install_interface_conventions();
+    if let Some(profile) = profile_for_swarm_network_id(weeb3.get_network_id().await) {
+        set_network_profile_inputs(profile.mode);
+    }
     weeb3.interface_log(format!(
         "Interface mounted, version {}",
         INTERFACE_BUILD_VERSION

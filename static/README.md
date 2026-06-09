@@ -33,6 +33,7 @@ The `wasm-pack` build prepares the generated `static/package.json` for publishin
 - `static/snippets/web3-0742d85b024bb6f5/inline0.js`
 - `static/weeb_3.js`
 - `static/weeb_3_bg.wasm`
+- `static/weeb_3.d.ts`
 
 After publishing, the package can be used with the same API shape as the examples in `static/example.html` and `static/issue-1-json-sync-example.html`:
 
@@ -43,18 +44,28 @@ await init();
 
 const weeb3node = new Weeb3No103();
 
-// Use the built-in network profile and bootnodes.
+// Use the built-in mainnet profile and browser-dialable bootnodes.
 await weeb3node.connect();
+console.log(await weeb3node.networkState());
+
+// Switch explicitly between the built-in profiles.
+await weeb3node.switchTestnet();
+await weeb3node.switchMainnet();
+
+// The generic form accepts "mainnet", "gnosis", or "1", and
+// "testnet", "sepolia", or "10".
+await weeb3node.switchNetwork("testnet");
+await weeb3node.switchNetwork("mainnet");
 
 // Or start with explicit browser-dialable bootnodes.
 weeb3node.start([
   new BootstrapNode("/ip4/example/tcp/443/wss/p2p/examplePeerId", true),
-], "10");
+], "1");
 
 const ready = await weeb3node.ready(1, 20_000);
 ```
 
-The wrapper exposes the browser node as `Weeb3No103`. It can start the runtime, connect to network profiles, render the bundled interface into a container, report network and progress state, retrieve BZZ resources, retrieve raw bytes or chunks, upload `File` objects or byte arrays, publish and read feed updates, and expose feed identity helpers.
+The wrapper exposes the browser node as `Weeb3No103`. It can start the runtime, connect to network profiles, switch between mainnet and testnet with `switchMainnet()` / `switchTestnet()` or `switchNetwork(mode)`, render the bundled interface into a container, report network and progress state, retrieve BZZ resources, retrieve raw bytes or chunks, upload `File` objects or byte arrays, publish and read feed updates, and expose feed identity helpers.
 
 The publishing workflow defaults to the GitHub repository owner scope. If a different npm scope is needed, set the `NPM_SCOPE` repository variable in GitHub Actions before pushing to `main`.
 
@@ -203,7 +214,8 @@ Single files can still be displayed without a Service Worker by creating `Blob` 
 
 The Service Worker solves this by providing deterministic application-scoped routes:
 
-- `GET` and `HEAD` requests below `/bzz/<reference>/<path>` are interpreted as canonical BZZ resource requests.
+- `GET` and `HEAD` requests below `/bzz/<reference>/<path>` are interpreted as canonical mainnet BZZ resource requests.
+- Testnet can be selected from routes with `/testnet`, for example `/weeb-3/testnet` to boot the interface in testnet mode or `/weeb-3/testnet/bzz/<reference>/<path>` for a testnet BZZ link.
 - Raw byte and chunk routes below `/bytes/`, `/chunks/`, and `/chunk/` are forwarded to the Rust runtime.
 - `POST` requests to the scoped `/bzz` endpoint are forwarded as upload requests, including upload headers such as encryption, collection, and index-document hints.
 - Fetch requests are forwarded to the active controlled client through `postMessage` and `MessageChannel`.

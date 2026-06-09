@@ -3,7 +3,7 @@
   <head>
     <script>
       const path = window.location.pathname.replace(/^\/weeb-3/, "");
-      if (window.self !== window.top && /^\/(?:bzz|bytes|chunk|chunks)\//.test(path)) {
+      if (window.self !== window.top && /^\/(?:(?:mainnet|testnet)\/)?(?:bzz|bytes|chunk|chunks)\//.test(path)) {
         document.write("weeb-3 service worker did not handle " + path);
       } else {
         window.location.replace("/weeb-3/#" + path + window.location.search);

@@ -140,10 +140,10 @@ pub(super) fn current_network_profile() -> crate::network_profile::NetworkProfil
         .get_element_by_id("networkIDSettings")
         .and_then(|el| el.dyn_into::<HtmlInputElement>().ok())
         .and_then(|input| input.value().parse::<u64>().ok())
-        .unwrap_or(10);
+        .unwrap_or(1);
 
     profile_for_swarm_network_id(network_id)
-        .unwrap_or_else(|| profile_for_mode(NetworkMode::Testnet))
+        .unwrap_or_else(|| profile_for_mode(NetworkMode::Mainnet))
 }
 
 pub(super) fn read_batch_request_settings() -> Result<(u8, u64), String> {
@@ -382,7 +382,7 @@ pub(super) fn current_network_id_input() -> String {
         .and_then(|document| document.get_element_by_id("networkIDSettings"))
         .and_then(|element| element.dyn_into::<HtmlInputElement>().ok())
         .map(|input| input.value())
-        .unwrap_or_else(|| "10".to_string())
+        .unwrap_or_else(|| "1".to_string())
 }
 
 pub(super) async fn connect_all_bootnode_settings(weeb3: Arc<Weeb3>, apply_generation: u64) {
@@ -821,7 +821,7 @@ async fn preload_canonical_bzz_frame(
                 metadata.clone(),
                 bytes.clone(),
             );
-            if let Some(canonical_resource) = url.strip_prefix("/weeb-3/bzz/") {
+            if let Some(canonical_resource) = strip_canonical_bzz_url_prefix(&url) {
                 crate::streaming_player::warm_bzz_fetch_cache(
                     canonical_resource,
                     metadata.clone(),
@@ -864,6 +864,27 @@ pub(super) fn should_render_canonical_bzz_frame(metadata: &BzzMetadata) -> bool 
     mime == "text/html" || mime == "application/xhtml+xml"
 }
 
+fn active_bzz_route_prefix() -> &'static str {
+    match crate::network_profile::active_profile().mode {
+        NetworkMode::Mainnet => "/weeb-3/bzz",
+        NetworkMode::Testnet => "/weeb-3/testnet/bzz",
+    }
+}
+
+fn strip_canonical_bzz_url_prefix(url: &str) -> Option<&str> {
+    for prefix in [
+        "/weeb-3/bzz/",
+        "/weeb-3/mainnet/bzz/",
+        "/weeb-3/testnet/bzz/",
+    ] {
+        if let Some(resource) = url.strip_prefix(prefix) {
+            return Some(resource);
+        }
+    }
+
+    None
+}
+
 pub(super) fn canonical_bzz_url(resource: &str, metadata: &BzzMetadata) -> Option<String> {
     let reference = bzz_reference_hex(resource)?;
     let requested_path = resource
@@ -884,10 +905,11 @@ pub(super) fn canonical_bzz_url(resource: &str, metadata: &BzzMetadata) -> Optio
         path
     };
 
+    let prefix = active_bzz_route_prefix();
     if path.is_empty() || path.starts_with("unknown") || path == "not found" {
-        Some(format!("/weeb-3/bzz/{}", reference))
+        Some(format!("{}/{}", prefix, reference))
     } else {
-        Some(format!("/weeb-3/bzz/{}/{}", reference, path))
+        Some(format!("{}/{}/{}", prefix, reference, path))
     }
 }
 

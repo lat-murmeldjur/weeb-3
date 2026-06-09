@@ -16,12 +16,25 @@ use crate::{
     bzz_stream::{BzzMetadata, bzz_reference_hex, normalize_bzz_path},
     interface::service_worker_controls_bzz_requests,
     mpsc,
+    network_profile::{NetworkMode, active_profile},
 };
 
-const BZZ_MARKER: &str = "/weeb-3/bzz/";
-const BYTES_MARKER: &str = "/weeb-3/bytes/";
-const CHUNKS_MARKER: &str = "/weeb-3/chunks/";
-const CHUNK_MARKER: &str = "/weeb-3/chunk/";
+const BZZ_MARKERS: [&str; 3] = [
+    "/weeb-3/bzz/",
+    "/weeb-3/mainnet/bzz/",
+    "/weeb-3/testnet/bzz/",
+];
+const RAW_ROUTE_MARKERS: [(&str, &str); 9] = [
+    ("/weeb-3/bytes/", "bytes"),
+    ("/weeb-3/chunks/", "chunk"),
+    ("/weeb-3/chunk/", "chunk"),
+    ("/weeb-3/mainnet/bytes/", "bytes"),
+    ("/weeb-3/mainnet/chunks/", "chunk"),
+    ("/weeb-3/mainnet/chunk/", "chunk"),
+    ("/weeb-3/testnet/bytes/", "bytes"),
+    ("/weeb-3/testnet/chunks/", "chunk"),
+    ("/weeb-3/testnet/chunk/", "chunk"),
+];
 const MIB_BYTES: u64 = 1024 * 1024;
 const STREAM_STORAGE_WINDOW_BYTES: u64 = MIB_BYTES / 2;
 const STREAM_RESPONSE_BUFFER_BYTES: u64 = 8 * MIB_BYTES;
@@ -1466,26 +1479,28 @@ fn parse_single_range(range: Option<&str>, size: u64) -> Option<Result<(u64, u64
 }
 
 fn canonical_bzz_resource(pathname: &str) -> Option<String> {
-    let idx = pathname.find(BZZ_MARKER)?;
-    let resource = pathname[idx + BZZ_MARKER.len()..].trim();
-    if resource.is_empty() {
-        return None;
+    for marker in BZZ_MARKERS {
+        let Some(idx) = pathname.find(marker) else {
+            continue;
+        };
+        let resource = pathname[idx + marker.len()..].trim();
+        if resource.is_empty() {
+            return None;
+        }
+
+        let reference = resource.split('/').next().unwrap_or_default();
+        if !is_swarm_reference(reference) {
+            return None;
+        }
+
+        return Some(decode_component(resource));
     }
 
-    let reference = resource.split('/').next().unwrap_or_default();
-    if !is_swarm_reference(reference) {
-        return None;
-    }
-
-    Some(decode_component(resource))
+    None
 }
 
 fn canonical_raw_resource(pathname: &str) -> Option<(String, String)> {
-    for (marker, raw_type) in [
-        (BYTES_MARKER, "bytes"),
-        (CHUNKS_MARKER, "chunk"),
-        (CHUNK_MARKER, "chunk"),
-    ] {
+    for (marker, raw_type) in RAW_ROUTE_MARKERS {
         if let Some(idx) = pathname.find(marker) {
             let resource = pathname[idx + marker.len()..].trim();
             if resource.is_empty() {
@@ -1721,10 +1736,15 @@ fn canonical_bzz_url(resource: &str, metadata: &BzzMetadata) -> Option<String> {
         resolved_path
     };
 
+    let prefix = match active_profile().mode {
+        NetworkMode::Mainnet => "/weeb-3/bzz",
+        NetworkMode::Testnet => "/weeb-3/testnet/bzz",
+    };
+
     if path.is_empty() || path.starts_with("unknown") || path == "not found" {
-        Some(format!("/weeb-3/bzz/{}", reference))
+        Some(format!("{}/{}", prefix, reference))
     } else {
-        Some(format!("/weeb-3/bzz/{}/{}", reference, path))
+        Some(format!("{}/{}/{}", prefix, reference, path))
     }
 }
 

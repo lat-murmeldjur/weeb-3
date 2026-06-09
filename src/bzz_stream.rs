@@ -156,13 +156,29 @@ fn strip_known_bzz_prefix(resource: &str) -> String {
     }
 
     let markers = [
+        "/weeb-3/#/testnet/bzz/",
+        "/weeb-3/#/mainnet/bzz/",
         "/weeb-3/#/bzz/",
+        "/weeb-3/testnet/bzz/",
+        "/weeb-3/mainnet/bzz/",
         "/weeb-3/bzz/",
+        "/#/testnet/bzz/",
+        "/#/mainnet/bzz/",
         "/#/bzz/",
+        "/testnet/bzz/",
+        "/mainnet/bzz/",
         "/bzz/",
+        "weeb-3/#/testnet/bzz/",
+        "weeb-3/#/mainnet/bzz/",
         "weeb-3/#/bzz/",
+        "weeb-3/testnet/bzz/",
+        "weeb-3/mainnet/bzz/",
         "weeb-3/bzz/",
+        "#/testnet/bzz/",
+        "#/mainnet/bzz/",
         "#/bzz/",
+        "testnet/bzz/",
+        "mainnet/bzz/",
         "bzz/",
     ];
 

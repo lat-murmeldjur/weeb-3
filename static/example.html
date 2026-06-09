@@ -345,8 +345,8 @@
       }
 
       $("networkState").onclick = async () => show("networkOut", await node.networkState());
-      $("testnet").onclick = async () => show("networkOut", await node.connectProfile("testnet"));
-      $("mainnet").onclick = async () => show("networkOut", await node.connectProfile("mainnet"));
+      $("testnet").onclick = async () => show("networkOut", await node.switchTestnet());
+      $("mainnet").onclick = async () => show("networkOut", await node.switchMainnet());
       $("ready").onclick = async () => show("networkOut", await node.readyState(1, 10000));
       $("progressSnapshot").onclick = async () => {
         const snapshot = await node.progressSnapshot(progressRevision);

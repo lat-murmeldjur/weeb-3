@@ -29,6 +29,12 @@ The main exports are:
 The higher-level `Weeb3No103` interface provides the main methods used by the embedding example:
 
 - `start(bootstrap_nodes, network_id)`
+- `connect()`
+- `networkState()`
+- `switchMainnet()` / `switch_mainnet()`
+- `switchTestnet()` / `switch_testnet()`
+- `switchNetwork(mode)` / `switch_network(mode)`
+- `connectProfile(mode)` / `connect_profile(mode)`
 - `retrieve(address)`
 - `upload(file, encryption, index_string, add_to_feed, feed_topic)`
 - `resetStamp()`
@@ -45,19 +51,30 @@ await init();
 
 const weeb3node = new Weeb3No103();
 
+// Connect with the built-in mainnet profile and browser-dialable bootnodes.
+await weeb3node.connect();
+console.log(await weeb3node.networkState());
+
+// Switch explicitly between built-in profiles.
+await weeb3node.switchTestnet();
+await weeb3node.switchMainnet();
+
+// Or use the generic form. Accepted values include:
+// "mainnet", "gnosis", "1", "testnet", "sepolia", and "10".
+await weeb3node.switchNetwork("testnet");
+await weeb3node.switchNetwork("mainnet");
+
+// You can still start with explicit browser-dialable bootnodes.
 const BOOTSTRAP_NODES = [
-  new BootstrapNode(
-    "/ip4/167.235.96.31/tcp/32535/tls/sni/167-235-96-31.k2k4r8n9x80nshvozftjmg4klymgjtdflwxiovfx63yc6917dlrteva4.libp2p.direct/ws/p2p/QmYkyg5ZU3DzxhqfGyLYLVbk9DMdBagxe9q1AmHKNgt8ps",
-    true
-  ),
+  new BootstrapNode("/ip4/example/tcp/443/wss/p2p/examplePeerId", true),
 ];
 
-weeb3node.start(BOOTSTRAP_NODES, "10");
+weeb3node.start(BOOTSTRAP_NODES, "1");
 ```
 
 ## Example corresponding to `example.html`
 
-This is the npm-import form of the same usage pattern shown in the project's `example.html`:
+This is a compact npm-import form of the same usage pattern shown in the project's `example.html`:
 
 ```js
 import init, { Weeb3No103, BootstrapNode } from "@lat-murmeldjur/weeb_3";
@@ -66,42 +83,7 @@ await init();
 
 const weeb3node = new Weeb3No103();
 
-const BOOTSTRAP_NODES = [
-  new BootstrapNode(
-    "/ip4/167.235.96.31/tcp/32535/tls/sni/167-235-96-31.k2k4r8n9x80nshvozftjmg4klymgjtdflwxiovfx63yc6917dlrteva4.libp2p.direct/ws/p2p/QmYkyg5ZU3DzxhqfGyLYLVbk9DMdBagxe9q1AmHKNgt8ps",
-    true
-  ),
-  new BootstrapNode(
-    "/ip4/49.12.172.37/tcp/32530/tls/sni/49-12-172-37.k2k4r8kibjadgpqco81quegou963p7lbcd9ti0bw8lrcc95ystm6by9d.libp2p.direct/ws/p2p/QmRHeoLCHjHoMur8PQpuV8acNJMmKPT61c3ZMLpTqY7og4",
-    true
-  ),
-  new BootstrapNode(
-    "/ip4/49.12.172.37/tcp/32533/tls/sni/49-12-172-37.k2k4r8pnvqpufzwaf4ic1o1fo0onfh4p9b37gp0rdxzdte2kcd7ewp4w.libp2p.direct/ws/p2p/QmfCwr7FVxbYz1GPQ2NN2r5iduXSQDLefqzkBAB9JfZYgF",
-    true
-  ),
-  new BootstrapNode(
-    "/ip4/167.235.96.31/tcp/32536/tls/sni/167-235-96-31.k2k4r8omeryzle2ywg941xs6vgwlq4cr0b3qe83ub7rn9n8ysmcwfqru.libp2p.direct/ws/p2p/QmcPvejw1r1BQ6aUuK6Y18mcLAcYyg9iEmiD1TRpyaox7s",
-    true
-  ),
-  new BootstrapNode(
-    "/ip4/49.12.172.37/tcp/32531/tls/sni/49-12-172-37.k2k4r8l8l5hzyp48440rjqlfdjpr03jfgioal93akbigy0tomtft4w44.libp2p.direct/ws/p2p/QmTFvqc5wMkbsXjqnTxQbVss5t8T1292BupJZ9VyU1GMRV",
-    true
-  ),
-  new BootstrapNode(
-    "/ip4/49.12.172.37/tcp/32532/tls/sni/49-12-172-37.k2k4r8pr3m3aug5nudg2y039qfj2gxw6wnlx0e0ghzxufcn38soyp9z4.libp2p.direct/ws/p2p/QmfSx1ujzboapD5h2CiqTJqUy46FeTDwXBszB3XUCfKEEj",
-    true
-  ),
-  new BootstrapNode(
-    "/ip4/167.235.96.31/tcp/32537/tls/sni/167-235-96-31.k2k4r8m6hc1wyzz789uubmz6cxmeuquzfi5b06zdh4l7e5ve199oay7j.libp2p.direct/ws/p2p/QmVoPN964YuoGpqc6BGJpLGmUn2goaqRm5vkCi5e7H9w98",
-    true
-  ),
-  new BootstrapNode(
-    "/ip4/167.235.96.31/tcp/32538/tls/sni/167-235-96-31.k2k4r8nqwaetj1eljpu4qzeebnnujzu997pdh1i1ia2dcpcjjv9gc1s0.libp2p.direct/ws/p2p/Qma2pmuYLCzcmsFHHLyWRPxxt7eN9MKqhnJaShKomn2zEK",
-    true
-  ),
-];
-
-weeb3node.start(BOOTSTRAP_NODES, "10");
+await weeb3node.switchMainnet();
 
 const entries = await weeb3node.retrieve(
   "695fceb3a8c212cd123e2e40d86ec08b52fe4fe6ca46687ce9ea69b8f05471f6aa25b5d4d41bf78b1db3479c048fd5fd8137ba844604821b71786196306b68e7"
