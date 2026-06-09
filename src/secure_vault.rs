@@ -26,6 +26,7 @@ thread_local! {
     static SECURE_MODULE: RefCell<Option<JsValue>> = RefCell::new(None);
     static SECURE_CLIENT: RefCell<Option<Rc<JsValue>>> = RefCell::new(None);
     static SECURE_WALLET: RefCell<Option<Vec<u8>>> = RefCell::new(None);
+    static SECURE_NETWORK_ID: RefCell<Option<u64>> = RefCell::new(None);
     static SECURE_RESUME_WAITERS: RefCell<Vec<Function>> = RefCell::new(Vec::new());
     static SECURE_CLICK_CONNECT_PROMISE: RefCell<Option<Promise>> = RefCell::new(None);
     static SECURE_CLICK_CONNECT_OPTIONS: RefCell<Option<JsValue>> = RefCell::new(None);
@@ -230,7 +231,7 @@ pub async fn secure_reset_stamp() -> bool {
 
 pub async fn secure_ensure_feed_owner() -> Option<Vec<u8>> {
     let client = secure_client_or_resume("ensureFeedOwner").await?;
-    let options = auth_options().ok()?;
+    let options = auth_options_for_network(active_network_id()).ok()?;
     let feed_owner = match call_secure_client(&client, "ensureFeedOwner", options).await {
         Ok(feed_owner) => feed_owner,
         Err(e) => {
@@ -317,9 +318,30 @@ pub fn secure_open_vault_from_user_action() {
     }
 }
 
+fn active_network_id() -> u64 {
+    active_profile().swarm_network_id
+}
+
+fn secure_network_matches(network_id: u64) -> bool {
+    SECURE_NETWORK_ID.with(|cell| {
+        cell.borrow()
+            .map(|current| current == network_id)
+            .unwrap_or(false)
+    })
+}
+
 async fn secure_client() -> Option<Rc<JsValue>> {
     if let Some(client) = SECURE_CLIENT.with(|cell| cell.borrow().clone()) {
-        return Some(client);
+        if secure_network_matches(active_network_id()) {
+            return Some(client);
+        }
+        match authorize_secure_client(client).await {
+            Ok(client) => return Some(client),
+            Err(error) => {
+                log_error("secure authorizeTempAuth for network switch failed", &error);
+                clear_secure_connection();
+            }
+        }
     }
 
     let client = match SECURE_CLICK_CONNECT_PROMISE.with(|cell| cell.borrow_mut().take()) {
@@ -422,7 +444,8 @@ async fn secure_client_or_resume(_context: &str) -> Option<Rc<JsValue>> {
 }
 
 async fn authorize_secure_client(client: Rc<JsValue>) -> Result<Rc<JsValue>, JsValue> {
-    let auth = match auth_options() {
+    let network_id = active_network_id();
+    let auth = match auth_options_for_network(network_id) {
         Ok(auth) => auth,
         Err(e) => {
             return Err(e);
@@ -446,6 +469,13 @@ async fn authorize_secure_client(client: Rc<JsValue>) -> Result<Rc<JsValue>, JsV
     let wallet = string_prop(&grant, "walletAddressHex")
         .and_then(|value| hex::decode(strip_0x(&value)).ok())
         .unwrap_or_default();
+    let grant_network_id = u64_prop(&grant, "networkId");
+    if grant_network_id != network_id {
+        return Err(JsValue::from_str(&format!(
+            "secure vault network changed during authorization: expected {}, got {}",
+            network_id, grant_network_id
+        )));
+    }
 
     if let Some(expected_wallet) = SECURE_WALLET.with(|cell| cell.borrow().clone()) {
         if !expected_wallet.is_empty() && wallet != expected_wallet {
@@ -462,6 +492,9 @@ async fn authorize_secure_client(client: Rc<JsValue>) -> Result<Rc<JsValue>, JsV
     });
     SECURE_WALLET.with(|cell| {
         *cell.borrow_mut() = Some(wallet);
+    });
+    SECURE_NETWORK_ID.with(|cell| {
+        *cell.borrow_mut() = Some(network_id);
     });
     clear_secure_resume_required();
 
@@ -541,6 +574,9 @@ fn clear_secure_connection_if_current(client: &Rc<JsValue>) {
 fn clear_secure_client() {
     clear_secure_connection();
     SECURE_WALLET.with(|cell| {
+        *cell.borrow_mut() = None;
+    });
+    SECURE_NETWORK_ID.with(|cell| {
         *cell.borrow_mut() = None;
     });
 }

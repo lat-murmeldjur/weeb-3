@@ -176,6 +176,7 @@ The main runtime depends on several focused modules:
 - `src/secure_vault.rs` manages sensitive local state such as upload identities, postage-stamp state, feed ownership, and cheque signer material.
 - `src/network_profile.rs` defines the built-in testnet and mainnet profiles, wallet chain ids, token symbols, and bootnodes.
 - `src/on_chain.rs` implements browser wallet and contract interactions for postage batches, price oracle access, chequebook operations, swap token operations, and related state.
+- Batch state held by `weeb-3-secure` is requested with the active Swarm network id, so testnet and mainnet use separate batch owners, batch ids, bucket counters, and temp-auth authorization.
 - `src/interface_conventions.rs` and `src/interface_runtime_conventions.rs` contain DOM helpers, UI rendering, route parsing, network controls, and Service Worker runtime integration.
 - `src/library.rs` exposes the Wasm runtime to JavaScript as `Weeb3No103` and `BootstrapNode`.
 - `src/conventions.rs` and `src/interface_conventions.rs` collect common encoding, decoding, hashing, resource, UI, and protocol helper logic.
