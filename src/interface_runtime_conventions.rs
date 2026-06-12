@@ -390,26 +390,55 @@ pub(super) async fn connect_all_bootnode_settings(weeb3: Arc<Weeb3>, apply_gener
         return;
     }
 
-    let futures = BOOTNODE_INPUT_IDS.into_iter().map(|element_id| {
+    let network_id = current_network_id_input();
+    let mut seen = std::collections::HashSet::<String>::new();
+    let mut dial_requests = Vec::<(String, String)>::new();
+
+    if let Ok(network_id_number) = network_id.parse::<u64>() {
+        if let Some(profile) = profile_for_swarm_network_id(network_id_number) {
+            for address in profile.bootnodes {
+                let address = address.to_string();
+                let key = format!("{}|{}", network_id, address);
+                if seen.insert(key) {
+                    dial_requests.push((address, network_id.clone()));
+                }
+            }
+        }
+    }
+
+    for element_id in BOOTNODE_INPUT_IDS {
+        let (address, node_network_id) = parsebootconnect(element_id.to_string());
+        if address.trim().is_empty() || node_network_id.trim().is_empty() {
+            continue;
+        }
+        let key = format!("{}|{}", node_network_id, address);
+        if seen.insert(key) {
+            dial_requests.push((address, node_network_id));
+        }
+    }
+
+    weeb3.interface_log(format!(
+        "Connecting {} configured bootnodes for network {}",
+        dial_requests.len(),
+        network_id
+    ));
+
+    let futures = dial_requests.into_iter().map(|(address, network_id)| {
         let weeb300 = weeb3.clone();
         async move {
-            connect_bootnode_setting(weeb300, element_id, apply_generation).await;
+            connect_bootnode_address(weeb300, address, network_id, apply_generation).await;
         }
     });
 
     join_all(futures).await;
 }
 
-pub(super) async fn connect_bootnode_setting(
+async fn connect_bootnode_address(
     weeb3: Arc<Weeb3>,
-    element_id: &'static str,
+    bna: String,
+    nid: String,
     apply_generation: u64,
 ) {
-    if !is_current_network_apply_generation(apply_generation) {
-        return;
-    }
-
-    let (bna, nid) = parsebootconnect(element_id.to_string());
     if !is_current_network_apply_generation(apply_generation) {
         return;
     }

@@ -45,7 +45,7 @@ await init();
 const weeb3node = new Weeb3No103();
 
 // Use the built-in mainnet profile and browser-dialable bootnodes.
-await weeb3node.connect();
+weeb3node.start();
 console.log(await weeb3node.networkState());
 
 // Switch explicitly between the built-in profiles.
@@ -58,9 +58,15 @@ await weeb3node.switchNetwork("testnet");
 await weeb3node.switchNetwork("mainnet");
 
 // Or start with explicit browser-dialable bootnodes.
-weeb3node.start([
-  new BootstrapNode("/ip4/example/tcp/443/wss/p2p/examplePeerId", true),
-], "1");
+weeb3node.start({
+  networkId: "1",
+  bootstrapNodes: [
+    new BootstrapNode("/ip4/example/tcp/443/wss/p2p/examplePeerId", true),
+  ],
+});
+
+// Or start with the built-in testnet profile.
+weeb3node.start({ testnet: true });
 
 const ready = await weeb3node.ready(1, 20_000);
 ```

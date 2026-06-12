@@ -28,7 +28,7 @@ The main exports are:
 
 The higher-level `Weeb3No103` interface provides the main methods used by the embedding example:
 
-- `start(bootstrap_nodes, network_id)`
+- `start(options?)`
 - `connect()`
 - `networkState()`
 - `switchMainnet()` / `switch_mainnet()`
@@ -51,8 +51,8 @@ await init();
 
 const weeb3node = new Weeb3No103();
 
-// Connect with the built-in mainnet profile and browser-dialable bootnodes.
-await weeb3node.connect();
+// Start with the built-in mainnet profile and browser-dialable bootnodes.
+weeb3node.start();
 console.log(await weeb3node.networkState());
 
 // Switch explicitly between built-in profiles.
@@ -64,12 +64,18 @@ await weeb3node.switchMainnet();
 await weeb3node.switchNetwork("testnet");
 await weeb3node.switchNetwork("mainnet");
 
-// You can still start with explicit browser-dialable bootnodes.
+// You can still start with explicit browser-dialable bootnodes and network id.
 const BOOTSTRAP_NODES = [
   new BootstrapNode("/ip4/example/tcp/443/wss/p2p/examplePeerId", true),
 ];
 
-weeb3node.start(BOOTSTRAP_NODES, "1");
+weeb3node.start({
+  networkId: "1",
+  bootstrapNodes: BOOTSTRAP_NODES,
+});
+
+// Or start with the built-in testnet profile.
+weeb3node.start({ testnet: true });
 ```
 
 ## Example corresponding to `example.html`

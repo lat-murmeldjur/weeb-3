@@ -20,7 +20,7 @@ use crate::{
     },
     secure_vault::{
         secure_batch_state_for_wallet, secure_commit_batch_purchase, secure_ensure_feed_owner,
-        secure_prepare_batch_purchase,
+        secure_open_vault_from_user_action, secure_prepare_batch_purchase,
     },
     strip_hex_prefix,
 };
@@ -249,6 +249,130 @@ fn network_profile_object(profile: NetworkProfile, current_network_id: u64) -> O
     obj
 }
 
+#[derive(Clone)]
+struct StartBootstrapNode {
+    multiaddr: String,
+    usable: bool,
+}
+
+struct StartOptions {
+    network_id: String,
+    bootstrap_nodes: Vec<StartBootstrapNode>,
+}
+
+fn js_prop(value: &JsValue, name: &str) -> JsValue {
+    Reflect::get(value, &JsValue::from_str(name)).unwrap_or(JsValue::UNDEFINED)
+}
+
+fn js_bool_prop(value: &JsValue, names: &[&str]) -> Option<bool> {
+    names.iter().find_map(|name| {
+        let prop = js_prop(value, name);
+        if prop.is_null() || prop.is_undefined() {
+            None
+        } else {
+            prop.as_bool()
+        }
+    })
+}
+
+fn js_string_prop(value: &JsValue, names: &[&str]) -> Option<String> {
+    names.iter().find_map(|name| {
+        let prop = js_prop(value, name);
+        if prop.is_null() || prop.is_undefined() {
+            return None;
+        }
+
+        if let Some(text) = prop.as_string() {
+            let text = text.trim();
+            if !text.is_empty() {
+                return Some(text.to_string());
+            }
+        }
+
+        prop.as_f64().and_then(|number| {
+            if number.is_finite() && number >= 0.0 {
+                Some(format!("{}", number as u64))
+            } else {
+                None
+            }
+        })
+    })
+}
+
+fn parse_start_bootstrap_node(value: JsValue) -> Option<StartBootstrapNode> {
+    let multiaddr = js_string_prop(&value, &["multiaddr", "address", "underlay"])?;
+    let usable = js_bool_prop(&value, &["usable", "usableInProtocols"]).unwrap_or(true);
+    Some(StartBootstrapNode { multiaddr, usable })
+}
+
+fn parse_start_bootstrap_nodes(value: JsValue) -> Vec<StartBootstrapNode> {
+    if !Array::is_array(&value) {
+        return vec![];
+    }
+
+    Array::from(&value)
+        .iter()
+        .filter_map(parse_start_bootstrap_node)
+        .collect()
+}
+
+fn start_options_from_js(options: Option<JsValue>) -> StartOptions {
+    let options = options.unwrap_or(JsValue::UNDEFINED);
+    let bare_bootnodes = Array::is_array(&options);
+
+    let explicit_network_id = if bare_bootnodes {
+        None
+    } else {
+        js_string_prop(&options, &["networkId", "network_id", "swarmNetworkId"])
+    };
+
+    let mode = if js_bool_prop(&options, &["testnet"]).unwrap_or(false) {
+        NetworkMode::Testnet
+    } else if js_bool_prop(&options, &["mainnet"]).unwrap_or(false) {
+        NetworkMode::Mainnet
+    } else if let Some(network_id) = explicit_network_id.as_deref() {
+        network_id
+            .parse::<u64>()
+            .ok()
+            .and_then(profile_for_swarm_network_id)
+            .map(|profile| profile.mode)
+            .unwrap_or(NetworkMode::Mainnet)
+    } else {
+        NetworkMode::Mainnet
+    };
+
+    let profile = profile_for_mode(mode);
+    let network_id = explicit_network_id.unwrap_or_else(|| profile.swarm_network_id.to_string());
+    let configured_nodes = if bare_bootnodes {
+        parse_start_bootstrap_nodes(options)
+    } else {
+        let nodes = js_prop(&options, "bootstrapNodes");
+        if nodes.is_null() || nodes.is_undefined() {
+            parse_start_bootstrap_nodes(js_prop(&options, "bootstrap_nodes"))
+        } else {
+            parse_start_bootstrap_nodes(nodes)
+        }
+    };
+
+    let bootstrap_nodes = if configured_nodes.is_empty() {
+        profile
+            .bootnodes
+            .iter()
+            .map(|address| StartBootstrapNode {
+                multiaddr: (*address).to_string(),
+                usable: true,
+            })
+            .collect()
+    } else {
+        configured_nodes
+    };
+
+    StartOptions {
+        network_id,
+        bootstrap_nodes,
+    }
+}
+
 async fn call_promise(
     function: &Function,
     this: &JsValue,
@@ -384,15 +508,17 @@ impl Weeb3No103 {
     }
 
     #[wasm_bindgen(js_name = start)]
-    pub fn start(&self, bootstrap_nodes: Vec<BootstrapNode>, network_id: String) {
+    pub fn start(&self, options: Option<JsValue>) {
+        let options = start_options_from_js(options);
         let s = self.inner.clone();
         let started = self.started.clone();
 
         spawn_local(async move {
+            let network_id = options.network_id;
             let _ = s.set_network_id(network_id.clone()).await;
             start_weeb3_runtime_once(s.clone(), started);
 
-            let futures = bootstrap_nodes.into_iter().map(|node| {
+            let futures = options.bootstrap_nodes.into_iter().map(|node| {
                 let s_clone = s.clone();
                 let nid = network_id.clone();
 
@@ -444,6 +570,17 @@ impl Weeb3No103 {
     #[wasm_bindgen(js_name = network_state)]
     pub async fn network_state_alias(&self) -> Object {
         self.network_state().await
+    }
+
+    #[wasm_bindgen(js_name = openSecureVault)]
+    pub fn open_secure_vault(&self) -> Object {
+        secure_open_vault_from_user_action();
+        ok_object()
+    }
+
+    #[wasm_bindgen(js_name = open_secure_vault)]
+    pub fn open_secure_vault_alias(&self) -> Object {
+        self.open_secure_vault()
     }
 
     #[wasm_bindgen(js_name = switchNetwork)]

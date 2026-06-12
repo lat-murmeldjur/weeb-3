@@ -1,0 +1,8 @@
+127.0.0.1 - - [12/Jun/2026 23:00:35] "GET /issue-1-json-sync-example.html HTTP/1.1" 200 -
+127.0.0.1 - - [12/Jun/2026 23:00:50] "GET /issue-1-json-sync-example.html HTTP/1.1" 200 -
+127.0.0.1 - - [12/Jun/2026 23:01:25] "GET /issue-1-json-sync-example.html HTTP/1.1" 200 -
+127.0.0.1 - - [12/Jun/2026 23:01:25] "GET /weeb_3.js?v=issue1-v5-reapply-clean HTTP/1.1" 200 -
+127.0.0.1 - - [12/Jun/2026 23:01:25] "GET /snippets/web3-0742d85b024bb6f5/inline0.js HTTP/1.1" 200 -
+127.0.0.1 - - [12/Jun/2026 23:01:25] "GET /weeb_3_bg.wasm?v=issue1-v5-reapply-clean HTTP/1.1" 200 -
+127.0.0.1 - - [12/Jun/2026 23:01:25] code 404, message File not found
+127.0.0.1 - - [12/Jun/2026 23:01:25] "GET /favicon.ico HTTP/1.1" 404 -

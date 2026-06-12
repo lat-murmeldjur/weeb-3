@@ -11,17 +11,28 @@ use async_std::sync::Arc;
 use byteorder::ByteOrder;
 use std::{collections::BTreeMap, future::Future, pin::Pin, sync::atomic::AtomicBool};
 
-const RETRIEVE_HEDGE_AFTER_MS: u64 = 760;
+const RETRIEVE_HEDGE_AFTER_MS: u64 = 360;
+const RETRIEVE_ATTEMPT_TIMEOUT_MS: u64 = 10_000;
+const RETRIEVE_HOT_LOOP_GUARD_MS: u64 = 25;
 const RETRIEVE_DATA_DISPATCH_YIELD_EVERY: usize = 128;
 const RETRIEVE_CHECK_RETRY_WAIT_MS: u64 = 160;
-const RETRIEVE_CHUNK_MAX_ERRORS: usize = 64;
-const RETRIEVE_CHUNK_SKIPLIST_RESET_ERRORS: usize = 20;
-const DEBUG_RETRIEVAL_LOGS: bool = false;
+const RETRIEVE_CHUNK_MAX_ATTEMPT_ERRORS: usize = 20;
+const RETRIEVE_DATA_MAX_BYTES: u64 = 4 * 1024 * 1024;
+const DEBUG_RETRIEVAL_LOGS: bool = true;
+const DEBUG_RETRIEVE_TRACE_LOGS: bool = true;
 
 macro_rules! retrieval_debug {
     ($($arg:tt)*) => {
         if DEBUG_RETRIEVAL_LOGS {
             web_sys::console::log_1(&JsValue::from(format!($($arg)*)));
+        }
+    };
+}
+
+macro_rules! retrieve_trace {
+    ($($arg:tt)*) => {
+        if DEBUG_RETRIEVE_TRACE_LOGS {
+            web_sys::console::log_1(&JsValue::from(format!("retrieve-trace: {}", format!($($arg)*))));
         }
     };
 }
@@ -172,6 +183,7 @@ async fn select_retrieve_peer(
         }
 
         async_std::task::yield_now().await;
+        async_std::task::sleep(Duration::from_millis(RETRIEVE_HOT_LOOP_GUARD_MS)).await;
     }
 }
 
@@ -191,8 +203,8 @@ async fn retrieve_attempt(
 ) {
     let (peer, req_price) = selected;
     let (chunk_out, chunk_in) = mpsc::unbounded::<Vec<u8>>();
-
-    retrieve_handler(peer.clone(), caddr.clone(), control, &chunk_out).await;
+    let chunk_hex = hex::encode(&caddr);
+    let started = Date::now();
 
     let result = RetrieveAttemptResult {
         peer: peer.clone(),
@@ -201,10 +213,64 @@ async fn retrieve_attempt(
         soc: false,
     };
 
-    match chunk_in.try_recv() {
-        Ok(chunk) => {
+    retrieval_debug!(
+        "retrieve attempt start chunk={} peer={} price={} timeout_ms={}",
+        chunk_hex,
+        peer,
+        req_price,
+        RETRIEVE_ATTEMPT_TIMEOUT_MS
+    );
+
+    let handler_peer = peer.clone();
+    let handler_caddr = caddr.clone();
+    wasm_bindgen_futures::spawn_local(async move {
+        retrieve_handler(handler_peer, handler_caddr, control, &chunk_out).await;
+    });
+
+    let retrieve_result = async_std::future::timeout(
+        Duration::from_millis(RETRIEVE_ATTEMPT_TIMEOUT_MS),
+        chunk_in.recv(),
+    )
+    .await;
+
+    if retrieve_result.is_err() {
+        let accounting_peer = {
+            let accounting_peers = accounting.lock().await;
+            accounting_peers.get(&peer).cloned()
+        };
+        if let Some(accounting_peer) = accounting_peer {
+            cancel_reserve(&accounting_peer, req_price).await
+        }
+        retrieval_debug!(
+            "retrieve attempt timeout chunk={} peer={} elapsed_ms={} timeout_ms={}",
+            chunk_hex,
+            peer,
+            Date::now() - started,
+            RETRIEVE_ATTEMPT_TIMEOUT_MS
+        );
+        let _ = result_chan.try_send(result);
+        return;
+    }
+
+    match retrieve_result {
+        Ok(Ok(chunk)) => {
+            retrieval_debug!(
+                "retrieve attempt response chunk={} peer={} bytes={} elapsed_ms={}",
+                chunk_hex,
+                peer,
+                chunk.len(),
+                Date::now() - started
+            );
             let (chunk_valid, soc) = verify_chunk(&caddr, &chunk);
             if chunk_valid {
+                retrieval_debug!(
+                    "retrieve attempt success chunk={} peer={} soc={} price={} elapsed_ms={}",
+                    chunk_hex,
+                    peer,
+                    soc,
+                    req_price,
+                    Date::now() - started
+                );
                 let _ = result_chan.try_send(RetrieveAttemptResult {
                     peer: peer.clone(),
                     chunk,
@@ -221,6 +287,13 @@ async fn retrieve_attempt(
                 }
                 return;
             } else {
+                retrieval_debug!(
+                    "retrieve attempt invalid chunk={} peer={} bytes={} elapsed_ms={}",
+                    chunk_hex,
+                    peer,
+                    chunk.len(),
+                    Date::now() - started
+                );
                 let accounting_peer = {
                     let accounting_peers = accounting.lock().await;
                     accounting_peers.get(&peer).cloned()
@@ -230,7 +303,7 @@ async fn retrieve_attempt(
                 }
             }
         }
-        Err(error) => {
+        Ok(Err(error)) => {
             let accounting_peer = {
                 let accounting_peers = accounting.lock().await;
                 accounting_peers.get(&peer).cloned()
@@ -239,12 +312,22 @@ async fn retrieve_attempt(
                 cancel_reserve(&accounting_peer, req_price).await
             }
             retrieval_debug!(
-                "unable to retrieve chunk {} error {}",
-                hex::encode(&caddr),
-                error
+                "retrieve attempt no response chunk={} peer={} error={} elapsed_ms={}",
+                chunk_hex,
+                peer,
+                error,
+                Date::now() - started
             );
         }
+        Err(_) => {}
     }
+
+    retrieval_debug!(
+        "retrieve attempt failed chunk={} peer={} elapsed_ms={}",
+        chunk_hex,
+        peer,
+        Date::now() - started
+    );
 
     let _ = result_chan.try_send(result);
 }
@@ -310,20 +393,44 @@ pub async fn retrieve_data(
     data_address: &Vec<u8>,
     chunk_retrieve_chan: &ChunkRetrieveSender,
 ) -> Vec<u8> {
+    retrieve_trace!(
+        "data start ref_len={} addr={}",
+        data_address.len(),
+        hex::encode(data_address)
+    );
     let root_chunk = get_chunk(data_address.to_vec(), &chunk_retrieve_chan).await;
 
     let root_span: u64;
     if root_chunk.len() >= 8 {
         root_span = u64::from_le_bytes(root_chunk[0..8].try_into().unwrap());
     } else {
+        retrieve_trace!("data root missing addr={}", hex::encode(data_address));
         retrieval_debug!("chunk not found: {}", hex::encode(data_address),);
         return vec![];
     }
 
+    retrieve_trace!(
+        "data root addr={} bytes={} span={}",
+        hex::encode(data_address),
+        root_chunk.len(),
+        root_span
+    );
+
     if root_span <= 4096 {
         if (root_span + 8) as usize == root_chunk.len() {
+            retrieve_trace!(
+                "data leaf complete addr={} bytes={}",
+                hex::encode(data_address),
+                root_chunk.len()
+            );
             return root_chunk;
         } else {
+            retrieve_trace!(
+                "data leaf length mismatch addr={} bytes={} span={}",
+                hex::encode(data_address),
+                root_chunk.len(),
+                root_span
+            );
             retrieval_debug!(
                 "retrieved chunk length ({}) mismatching span ({}) + 8 for chunk {}",
                 root_chunk.len(),
@@ -341,13 +448,35 @@ pub async fn retrieve_data(
         return vec![];
     }
 
-    let mut data: Vec<u8> = Vec::with_capacity((root_span + 8) as usize);
+    if root_span > RETRIEVE_DATA_MAX_BYTES {
+        retrieve_trace!(
+            "data root span too large addr={} bytes={} span={} max={}",
+            hex::encode(data_address),
+            root_chunk.len(),
+            root_span,
+            RETRIEVE_DATA_MAX_BYTES
+        );
+        return vec![];
+    }
+
+    let expected_len = match usize::try_from(root_span.saturating_add(8)) {
+        Ok(expected_len) => expected_len,
+        Err(_) => return vec![],
+    };
+
+    let mut data: Vec<u8> = Vec::with_capacity(expected_len);
     data.extend_from_slice(&root_chunk[0..8]);
 
     let root_refs = match split_chunk_references(&root_chunk[8..], address_length) {
         Some(addresses) => addresses,
         None => return vec![],
     };
+    retrieve_trace!(
+        "data tree root addr={} refs={} address_len={}",
+        hex::encode(data_address),
+        root_refs.len(),
+        address_length
+    );
 
     let mut joiner: RetrieveJoiner = FuturesUnordered::new();
     let mut dispatched = 0usize;
@@ -363,17 +492,36 @@ pub async fn retrieve_data(
 
     while let Some((order, addr, result0)) = joiner.next().await {
         if result0.len() <= 8 {
+            retrieve_trace!(
+                "data child missing root={} child={} order_depth={}",
+                hex::encode(data_address),
+                hex::encode(&addr),
+                order.len()
+            );
             retrieval_debug!("chunk not found: {}", hex::encode(addr),);
             return vec![];
         }
 
         let result_span = u64::from_le_bytes(result0[0..8].try_into().unwrap());
+        retrieve_trace!(
+            "data child root={} child={} bytes={} span={} order_depth={}",
+            hex::encode(data_address),
+            hex::encode(&addr),
+            result0.len(),
+            result_span,
+            order.len()
+        );
 
         if result_span > 4096 {
             let child_refs = match split_chunk_references(&result0[8..], address_length) {
                 Some(addresses) => addresses,
                 None => return vec![],
             };
+            retrieve_trace!(
+                "data child tree child={} refs={}",
+                hex::encode(&addr),
+                child_refs.len()
+            );
 
             for (child_index, child_addr) in child_refs.into_iter().enumerate() {
                 let mut child_order = order.clone();
@@ -387,6 +535,7 @@ pub async fn retrieve_data(
         } else {
             leaf_chunks.insert(order, result0[8..].to_vec());
         }
+        async_std::task::sleep(Duration::from_millis(RETRIEVE_HOT_LOOP_GUARD_MS)).await;
     }
 
     for (_order, chunk_data) in leaf_chunks {
@@ -396,9 +545,20 @@ pub async fn retrieve_data(
         data.extend_from_slice(&chunk_data);
     }
 
-    if data.len() == (root_span + 8) as usize {
+    if data.len() == expected_len {
+        retrieve_trace!(
+            "data complete addr={} bytes={}",
+            hex::encode(data_address),
+            data.len()
+        );
         data
     } else {
+        retrieve_trace!(
+            "data final length mismatch addr={} bytes={} span={}",
+            hex::encode(data_address),
+            data.len(),
+            root_span
+        );
         retrieval_debug!(
             "retrieved result length ({}) not matching span ({}) + 8 for data address {}",
             data.len(),
@@ -425,8 +585,8 @@ pub async fn retrieve_chunk(
     let mut skiplist: HashSet<PeerId> = HashSet::new();
     let mut overdraftlist: HashSet<PeerId> = HashSet::new();
 
+    let mut attempt_count = 0;
     let mut error_count = 0;
-    let mut max_error = RETRIEVE_CHUNK_MAX_ERRORS;
 
     #[allow(unused_assignments)]
     let mut cd = vec![];
@@ -435,7 +595,7 @@ pub async fn retrieve_chunk(
     // if cd.len() > 0 {
     //     (chunk_valid, soc) = verify_chunk(&caddr, &cd);
     //     if chunk_valid {
-    //         error_count = max_error;
+    //         error_count = RETRIEVE_CHUNK_MAX_ATTEMPT_ERRORS;
     //     } else {
     //         cd = vec![];
     //     };
@@ -445,7 +605,9 @@ pub async fn retrieve_chunk(
     let mut in_flight = 0_usize;
     let mut last_attempt_started = 0.0;
 
-    while error_count < max_error {
+    while error_count < RETRIEVE_CHUNK_MAX_ATTEMPT_ERRORS
+        && (attempt_count < RETRIEVE_CHUNK_MAX_ATTEMPT_ERRORS || in_flight > 0)
+    {
         if in_flight > 0 {
             if let Ok(result) = attempt_in.try_recv() {
                 in_flight = in_flight.saturating_sub(1);
@@ -457,6 +619,7 @@ pub async fn retrieve_chunk(
                 error_count += 1;
                 cd = vec![];
 
+                async_std::task::sleep(Duration::from_millis(RETRIEVE_HOT_LOOP_GUARD_MS)).await;
                 continue;
             }
         }
@@ -481,7 +644,9 @@ pub async fn retrieve_chunk(
         }
 
         let now = Date::now();
-        let due = !paused
+        let can_start_attempt = attempt_count < RETRIEVE_CHUNK_MAX_ATTEMPT_ERRORS;
+        let due = can_start_attempt
+            && !paused
             && !cancelled
             && (in_flight == 0 || now - last_attempt_started >= RETRIEVE_HEDGE_AFTER_MS as f64);
 
@@ -504,9 +669,11 @@ pub async fn retrieve_chunk(
                     if let Some(accounting_peer) = accounting_peer {
                         cancel_reserve(&accounting_peer, selected.1).await;
                     }
+                    skiplist.remove(&selected.0);
                     if in_flight == 0 {
                         break;
                     }
+                    async_std::task::sleep(Duration::from_millis(RETRIEVE_HOT_LOOP_GUARD_MS)).await;
                     continue;
                 }
 
@@ -522,6 +689,8 @@ pub async fn retrieve_chunk(
                     if let Some(accounting_peer) = accounting_peer {
                         cancel_reserve(&accounting_peer, selected.1).await;
                     }
+                    skiplist.remove(&selected.0);
+                    async_std::task::sleep(Duration::from_millis(RETRIEVE_HOT_LOOP_GUARD_MS)).await;
                     continue;
                 }
 
@@ -541,22 +710,15 @@ pub async fn retrieve_chunk(
                     )
                     .await;
                 });
+                attempt_count += 1;
                 in_flight += 1;
                 last_attempt_started = Date::now();
             } else if !overdraftlist.is_empty() {
                 reset_overdraft(&mut skiplist, &mut overdraftlist);
                 async_std::task::sleep(Duration::from_millis(50)).await;
                 continue;
-            } else if error_count >= RETRIEVE_CHUNK_SKIPLIST_RESET_ERRORS {
-                skiplist.clear();
-                overdraftlist.clear();
-                error_count = 0;
-                max_error = max_error.saturating_sub(RETRIEVE_CHUNK_SKIPLIST_RESET_ERRORS);
-                if max_error == 0 {
-                    break;
-                }
-                async_std::task::sleep(Duration::from_millis(50)).await;
-                continue;
+            } else if in_flight == 0 && !skiplist.is_empty() {
+                break;
             } else {
                 async_std::task::sleep(Duration::from_millis(50)).await;
                 continue;
@@ -564,16 +726,18 @@ pub async fn retrieve_chunk(
         }
 
         if in_flight == 0 {
+            async_std::task::sleep(Duration::from_millis(RETRIEVE_HOT_LOOP_GUARD_MS)).await;
             continue;
         }
 
         let elapsed = Date::now() - last_attempt_started;
-        let wait_ms = if cancelled || paused {
+        let wait_ms = if !can_start_attempt || cancelled || paused {
             250
         } else {
             (RETRIEVE_HEDGE_AFTER_MS as f64 - elapsed).max(0.0).round() as u64
         };
         if wait_ms == 0 {
+            async_std::task::sleep(Duration::from_millis(RETRIEVE_HOT_LOOP_GUARD_MS)).await;
             continue;
         }
 
@@ -665,6 +829,7 @@ pub async fn retrieve_check_chunk(
             if let Some(accounting_peer) = accounting_peer {
                 cancel_reserve(&accounting_peer, selected.1).await;
             }
+            async_std::task::sleep(Duration::from_millis(RETRIEVE_HOT_LOOP_GUARD_MS)).await;
             continue;
         }
 
@@ -795,182 +960,155 @@ pub async fn get_chunk(
     return chan_in.recv().await.unwrap_or_default();
 }
 
+fn valid_feed_update_payload(data: &[u8]) -> bool {
+    !data.is_empty()
+}
+
+fn feed_update_payload_shape(data: &[u8]) -> String {
+    if data.len() < 8 {
+        return "short".to_string();
+    }
+    let span = u64::from_le_bytes(data[0..8].try_into().unwrap_or([0; 8]));
+    let expected_inline_len = span
+        .checked_add(8)
+        .and_then(|len| usize::try_from(len).ok());
+
+    if span <= 4096 {
+        return format!(
+            "inline span={} expected={} ok={}",
+            span,
+            expected_inline_len
+                .map(|len| len.to_string())
+                .unwrap_or_else(|| "overflow".to_string()),
+            expected_inline_len == Some(data.len())
+        );
+    }
+
+    let ref_payload_len = data.len().saturating_sub(8);
+    format!(
+        "refs span={} payload={} refs32={} refs64={}",
+        span,
+        ref_payload_len,
+        ref_payload_len > 0 && ref_payload_len % 32 == 0,
+        ref_payload_len > 0 && ref_payload_len % 64 == 0
+    )
+}
+
+async fn probe_feed_update(
+    owner: &String,
+    topic: &String,
+    index: u64,
+    chunk_retrieve_chan: &ChunkRetrieveSender,
+) -> Option<Vec<u8>> {
+    let payload = get_chunk(get_feed_address(owner, topic, index), chunk_retrieve_chan).await;
+    let found = valid_feed_update_payload(&payload);
+    retrieve_trace!(
+        "feed probe index={} found={} bytes={} shape={}",
+        index,
+        found,
+        payload.len(),
+        feed_update_payload_shape(&payload)
+    );
+
+    if found { Some(payload) } else { None }
+}
+
+async fn seek_feed_frontier(
+    owner: String,
+    topic: String,
+    chunk_retrieve_chan: &ChunkRetrieveSender,
+) -> (Option<(u64, Vec<u8>)>, u64) {
+    let Some(first_payload) = probe_feed_update(&owner, &topic, 0, chunk_retrieve_chan).await
+    else {
+        retrieve_trace!("feed frontier empty first_missing=0");
+        return (None, 0);
+    };
+
+    let mut latest = (0, first_payload);
+    let mut lower_missing_candidate = 1_u64;
+    let mut upper_missing = 1_u64;
+
+    loop {
+        match probe_feed_update(&owner, &topic, upper_missing, chunk_retrieve_chan).await {
+            Some(payload) => {
+                latest = (upper_missing, payload);
+                lower_missing_candidate = match upper_missing.checked_add(1) {
+                    Some(next) => next,
+                    None => return (Some(latest), u64::MAX),
+                };
+                upper_missing = match upper_missing.checked_mul(2) {
+                    Some(next) if next >= lower_missing_candidate => next,
+                    _ => u64::MAX,
+                };
+
+                if upper_missing == u64::MAX {
+                    if let Some(payload) =
+                        probe_feed_update(&owner, &topic, upper_missing, chunk_retrieve_chan).await
+                    {
+                        latest = (upper_missing, payload);
+                        return (Some(latest), u64::MAX);
+                    }
+                    break;
+                }
+            }
+            None => break,
+        }
+    }
+
+    retrieve_trace!(
+        "feed frontier bracket latest={} first_missing_candidate={} upper_missing={}",
+        latest.0,
+        lower_missing_candidate,
+        upper_missing
+    );
+
+    let mut low = lower_missing_candidate;
+    let mut high = upper_missing;
+
+    while low < high {
+        let mid = low + (high - low) / 2;
+        retrieve_trace!("feed frontier binary low={} mid={} high={}", low, mid, high);
+
+        if let Some(payload) = probe_feed_update(&owner, &topic, mid, chunk_retrieve_chan).await {
+            latest = (mid, payload);
+            low = match mid.checked_add(1) {
+                Some(next) => next,
+                None => return (Some(latest), u64::MAX),
+            };
+        } else {
+            high = mid;
+        }
+    }
+
+    retrieve_trace!("feed frontier exact latest={} next={}", latest.0, low);
+    (Some(latest), low)
+}
+
 pub async fn seek_latest_feed_update(
     owner: String,
     topic: String,
     chunk_retrieve_chan: &ChunkRetrieveSender,
-    redundancy: u8,
+    _redundancy: u8,
 ) -> Vec<u8> {
-    let mut largest_found = 0;
-    let mut smallest_not_found = u64::MAX;
-    let mut lower_bound = 0;
-    let mut upper_bound = 2_u64.pow(redundancy.into());
-    let mut _exact_ = false;
-
-    while !_exact_ {
-        async_std::task::yield_now().await;
-        async_std::task::sleep(Duration::from_millis(50)).await;
-
-        let angle = upper_bound - lower_bound;
-        let mut joiner = FuturesUnordered::new(); // ::<dyn Future<Output = Vec<u8>>> // ::<Pin<Box<dyn Future<Output = (Vec<u8>, usize)>>>>
-
-        let mut i = 0;
-
-        // dispatch probes
-
-        while lower_bound + i <= upper_bound {
-            let j = lower_bound + i;
-            let feed_update_address = get_feed_address(&owner, &topic, j);
-            let handle = async move {
-                return (
-                    get_chunk(feed_update_address, &chunk_retrieve_chan).await,
-                    j,
-                );
-            };
-            joiner.push(handle);
-
-            if i == 0 || angle <= (redundancy as u64) {
-                i += 1;
-            } else {
-                i *= 2;
-            }
+    match seek_feed_frontier(owner, topic, chunk_retrieve_chan).await {
+        (Some((index, payload)), next_index) => {
+            retrieve_trace!("feed latest exact index={} next={}", index, next_index);
+            payload
         }
-
-        // receive results, update scores
-
-        while let Some((result0, result1)) = joiner.next().await {
-            if result0.len() == 0 && smallest_not_found > result1 {
-                smallest_not_found = result1;
-            }
-            if result0.len() > 0 && largest_found < result1 {
-                largest_found = result1;
-            }
-        }
-
-        // if _exact_ frontier found return corresponding data
-
-        if largest_found + 1 == smallest_not_found {
-            return get_chunk(
-                get_feed_address(&owner, &topic, largest_found),
-                &chunk_retrieve_chan,
-            )
-            .await;
-        }
-
-        // search above previous record height
-
-        lower_bound = largest_found + 1;
-
-        // if smallest not found update was higher than current zone lower bound, narrow search between these values
-
-        if smallest_not_found > lower_bound {
-            upper_bound = smallest_not_found;
-        } else {
-            // exit if largest found stayed zero and smallest not found is also zero
-
-            if smallest_not_found == 0 && largest_found == 0 {
-                return vec![];
-            }
-
-            // if we had a missing update below the record found height, discard hole and start from scratch regarding potential height
-
-            smallest_not_found = u64::MAX;
-
-            // set upper bound to search redundancy based limit
-
-            upper_bound = lower_bound + 2_u64.pow(redundancy.into());
-        }
+        (None, _) => vec![],
     }
-
-    return vec![];
 }
 
 pub async fn seek_next_feed_update_index(
     owner: String,
     topic: String,
     chunk_retrieve_chan: &ChunkRetrieveSender,
-    redundancy: u8,
+    _redundancy: u8,
 ) -> u64 {
-    let mut largest_found = 0;
-    let mut smallest_not_found = u64::MAX;
-    let mut lower_bound = 0;
-    let mut upper_bound = 2_u64.pow(redundancy.into());
-    let mut _exact_ = false;
-
-    while !_exact_ {
-        async_std::task::yield_now().await;
-        async_std::task::sleep(Duration::from_millis(50)).await;
-
-        let angle = upper_bound - lower_bound;
-        let mut joiner = FuturesUnordered::new(); // ::<dyn Future<Output = Vec<u8>>> // ::<Pin<Box<dyn Future<Output = (Vec<u8>, usize)>>>>
-
-        let mut i = 0;
-
-        // dispatch probes
-
-        while lower_bound + i <= upper_bound {
-            let j = lower_bound + i;
-            let feed_update_address = get_feed_address(&owner, &topic, j);
-            let handle = async move {
-                return (
-                    get_chunk(feed_update_address, &chunk_retrieve_chan).await,
-                    j,
-                );
-            };
-            joiner.push(handle);
-
-            if i == 0 || angle <= (redundancy as u64) {
-                i += 1;
-            } else {
-                i *= 2;
-            }
-        }
-
-        // receive results, update scores
-
-        while let Some((result0, result1)) = joiner.next().await {
-            if result0.len() == 0 && smallest_not_found > result1 {
-                smallest_not_found = result1;
-            }
-            if result0.len() > 0 && largest_found < result1 {
-                largest_found = result1;
-            }
-        }
-
-        // if _exact_ frontier found return corresponding data
-
-        if largest_found + 1 == smallest_not_found {
-            retrieval_debug!("EXPLICIT HEAD {}", smallest_not_found);
-
-            return smallest_not_found;
-        }
-
-        // search above previous record height
-
-        lower_bound = largest_found + 1;
-
-        // if smallest not found update was higher than current zone lower bound, narrow search between these values
-
-        if smallest_not_found > lower_bound {
-            upper_bound = smallest_not_found;
-        } else {
-            // exit if largest found stayed zero and smallest not found is also zero
-
-            if smallest_not_found == 0 && largest_found == 0 {
-                return 0;
-            }
-
-            // if we had a missing update below the record found height, discard hole and start from scratch regarding potential height
-
-            smallest_not_found = u64::MAX;
-
-            // set upper bound to search redundancy based limit
-
-            upper_bound = lower_bound + 2_u64.pow(redundancy.into());
-        }
-    }
-
-    return 0;
+    let (_latest, next_index) = seek_feed_frontier(owner, topic, chunk_retrieve_chan).await;
+    retrieve_trace!("feed next exact index={}", next_index);
+    retrieval_debug!("EXPLICIT HEAD {}", next_index);
+    next_index
 }
 
 //

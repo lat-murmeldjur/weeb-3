@@ -3,203 +3,104 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>weeb-3 issue #1 JSON sync example</title>
+    <title>weeb-3 issue #1 JSON sync</title>
     <style>
-      :root {
-        color-scheme: light dark;
-      }
       body {
-        margin: 0;
-        padding: max(2.4vw, 3.1vh);
-        background: Canvas;
-        color: CanvasText;
+        font-family: system-ui, sans-serif;
+        margin: 2rem;
+        max-width: 56rem;
       }
-      h1, h2, h3 { margin: 1rem 0 .5rem; }
       section {
-        border-top: 1px solid currentColor;
-        margin-top: 1rem;
-        padding-top: .75rem;
+        border-top: 1px solid #999;
+        margin-top: 1.25rem;
+        padding-top: 1rem;
       }
-      label { display: block; margin: .4rem 0; }
-      input, textarea, button {
-        box-sizing: border-box;
-        max-width: 100%;
+      button, input {
+        font: inherit;
+        margin: .25rem .5rem .25rem 0;
       }
-      input[type="text"], input[type="number"], textarea {
-        width: min(100%, 55rem);
+      input {
+        width: min(100%, 34rem);
       }
-      textarea {
-        min-height: 14rem;
-      }
-      button { margin: .2rem .4rem .2rem 0; }
       pre {
+        background: #111;
+        color: #eee;
         overflow: auto;
-        max-height: 18rem;
+        padding: .75rem;
         white-space: pre-wrap;
-      }
-      .row {
-        display: flex;
-        flex-wrap: wrap;
-        gap: .5rem;
-        align-items: end;
-      }
-      .row label { margin: 0; }
-      .small { width: 8rem; }
-      .status {
-        display: inline-block;
-        margin: .3rem 0;
       }
     </style>
   </head>
   <body>
-    <h1>weeb-3 issue #1 JSON sync example</h1>
-    <p>
-      This is the per-wallet app data flow from issue #1: local JSON, disk import/export,
-      Swarm feed export, Swarm feed import by owner address and fixed app topic.
-    </p>
-    <p>
-      <a href="./example.html">Open the full npm capability example</a>
-    </p>
+    <h1>weeb-3 issue #1 JSON sync</h1>
 
     <section>
-      <h2>Runtime</h2>
-      <div class="row">
-        <button id="renderInterface">renderInterface()</button>
-        <button id="networkState">networkState()</button>
-        <button id="connectTestnet">connectProfile("testnet")</button>
-        <button id="connectMainnet">connectProfile("mainnet")</button>
-        <button id="readyState">readyState()</button>
-      </div>
-      <span id="runtimeStatus" class="status"></span>
-      <div id="embeddedInterface"></div>
-      <pre id="runtimeOut"></pre>
+      <h2>1. Diagnostics</h2>
+      <button id="diagnostics">Refresh diagnostics</button>
+      <pre id="diagnosticsOut"></pre>
     </section>
 
     <section>
-      <h2>App JSON</h2>
-      <div class="row">
-        <label>
-          localStorage key
-          <input id="storageKey" type="text" value="oneplusone.links" />
-        </label>
-        <label>
-          Fixed app topic
-          <input id="topic" type="text" value="oneplusone-app:links:v1" />
-        </label>
-      </div>
+      <h2>2. Batch</h2>
+      <button id="checkBatch">Check batch</button>
+      <button id="buyBatch">Buy batch and verify</button>
+      <pre id="batchOut"></pre>
+    </section>
+
+    <section>
+      <h2>3. Upload JSON</h2>
+      <button id="uploadJson">Upload encrypted JSON</button>
+      <pre id="uploadOut"></pre>
+    </section>
+
+    <section>
+      <h2>4. Download JSON</h2>
       <label>
-        JSON payload
-        <textarea id="jsonPayload"></textarea>
-      </label>
-      <div class="row">
-        <button id="seedJson">Seed Safe Links JSON</button>
-        <button id="loadLocal">Load From localStorage</button>
-        <button id="saveLocal">Save To localStorage</button>
-        <button id="downloadJson">Download JSON</button>
-        <label>
-          Import JSON From Disk
-          <input id="jsonFile" type="file" accept="application/json,.json" />
-        </label>
-      </div>
-      <pre id="jsonOut"></pre>
-    </section>
-
-    <section>
-      <h2>Batch And Feed Export</h2>
-      <div class="row">
-        <label>
-          Depth
-          <input id="depth" class="small" type="number" value="17" min="17" max="30" />
-        </label>
-        <label>
-          Validity days
-          <input id="validityDays" class="small" type="number" value="365" min="1" />
-        </label>
-        <button id="batchState">batchState()</button>
-        <button id="buyBatch">buyBatch()</button>
-        <button id="checkOrBuyBatch">Check Or Buy Batch</button>
-      </div>
-      <div class="row">
-        <button id="feedIdentity">feedIdentity()</button>
-        <button id="exportFeed">Export JSON To Swarm Feed</button>
-      </div>
-      <pre id="exportOut"></pre>
-    </section>
-
-    <section>
-      <h2>Feed Import</h2>
-      <label>
-        Feed owner address
+        Owner address
         <input id="owner" type="text" placeholder="0x..." />
       </label>
-      <div class="row">
-        <button id="feedTopic">feedTopic()</button>
-        <button id="importFeed">Import JSON From Swarm Feed</button>
-      </div>
-      <pre id="importOut"></pre>
+      <button id="downloadJson">Download JSON from Swarm</button>
+      <pre id="downloadOut"></pre>
     </section>
 
     <section>
-      <h2>Log</h2>
-      <pre id="log"></pre>
+      <h2>5. Upload / retrieve logs</h2>
+      <pre id="progressOut"></pre>
+      <pre id="logOut"></pre>
     </section>
 
+    <span id="exampleReady" hidden>ready</span>
+
     <script type="module">
-      import init, { Weeb3No103 } from "./weeb_3.js";
+      import init, { Weeb3No103 } from "./weeb_3.js?v=issue1-v5-reapply-clean";
 
-      await init();
+      await init(new URL("./weeb_3_bg.wasm?v=issue1-v5-reapply-clean", import.meta.url));
 
-      const node = new Weeb3No103();
+      const DEFAULT_TOPIC = "oneplusone-app:links:issue-1:v5-reapply-clean";
+      const TOPIC = new URLSearchParams(location.search).get("topic")?.trim() || DEFAULT_TOPIC;
+      const DEPTH = 17;
+      const VALIDITY_DAYS = 365;
+      const ENCRYPTION = true;
       const encoder = new TextEncoder();
       const decoder = new TextDecoder();
-      let interfaceRendered = false;
+      const node = new Weeb3No103();
+      let lastUpload = null;
+      let progressRevision = 0;
+      const logLines = [];
+
+      node.start();
 
       const $ = (id) => document.getElementById(id);
 
       function show(id, value) {
-        $(id).textContent = typeof value === "string"
-          ? value
-          : JSON.stringify(value, jsonReplacer, 2);
-      }
-
-      function log(message, value) {
-        const body = value === undefined
-          ? message
-          : `${message}\n${JSON.stringify(value, jsonReplacer, 2)}`;
-        $("log").textContent = `${new Date().toISOString()} ${body}\n\n${$("log").textContent}`;
+        $(id).textContent = typeof value === "string" ? value : JSON.stringify(value, jsonReplacer, 2);
       }
 
       function jsonReplacer(_key, value) {
         if (value instanceof Uint8Array) {
-          return {
-            type: "Uint8Array",
-            bytes: value.byteLength,
-            preview: Array.from(value.slice(0, 24)),
-          };
+          return { type: "Uint8Array", bytes: value.byteLength };
         }
         return value;
-      }
-
-      function storageKey() {
-        return $("storageKey").value.trim() || "oneplusone.links";
-      }
-
-      function topic() {
-        return $("topic").value.trim() || "oneplusone-app:links:v1";
-      }
-
-      function depth() {
-        return Number($("depth").value || 17);
-      }
-
-      function validityDays() {
-        return Number($("validityDays").value || 365);
-      }
-
-      function normalizedJson() {
-        const normalized = JSON.stringify(JSON.parse($("jsonPayload").value), null, 2);
-        $("jsonPayload").value = normalized;
-        return normalized;
       }
 
       function bytesFromText(text) {
@@ -210,156 +111,265 @@
         return decoder.decode(bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes));
       }
 
-      function downloadBytes(filename, bytes, mime) {
-        const url = URL.createObjectURL(new Blob([bytes], { type: mime }));
-        const link = document.createElement("a");
-        link.href = url;
-        link.download = filename;
-        link.click();
-        setTimeout(() => URL.revokeObjectURL(url), 1000);
+      function bytesToHex(bytes) {
+        return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
       }
 
-      async function checkOrBuyBatch(outId) {
-        const state = await node.batchState(depth(), validityDays());
-        show(outId, state);
-
-        if (state.usableBatch) {
-          log("batch ready", state);
-          return state;
-        }
-
-        if (state.hasFunds === false) {
-          throw new Error("No usable batch and not enough BZZ for the selected depth and duration.");
-        }
-
-        const bought = await node.buyBatch(depth(), validityDays());
-        show(outId, bought);
-        if (!bought.ok) {
-          throw new Error(bought.error || "buyBatch failed");
-        }
-        log("batch bought", bought);
-        return bought;
+      function randomHex(byteLength) {
+        const bytes = new Uint8Array(byteLength);
+        crypto.getRandomValues(bytes);
+        return bytesToHex(bytes);
       }
 
-      $("renderInterface").onclick = () => {
-        if (!interfaceRendered) {
-          node.renderInterface($("embeddedInterface"));
-          interfaceRendered = true;
+      async function sha256Hex(text) {
+        const digest = await crypto.subtle.digest("SHA-256", bytesFromText(text));
+        return bytesToHex(new Uint8Array(digest));
+      }
+
+      function okStatus(result) {
+        return result && (result.status === "ok" || result.status === "already_ready");
+      }
+
+      function openVaultFromClick() {
+        if (typeof node.openSecureVault === "function") {
+          node.openSecureVault();
         }
-        $("runtimeStatus").textContent = "embedded interface rendered";
-      };
+      }
 
-      $("networkState").onclick = async () => show("runtimeOut", await node.networkState());
-      $("connectTestnet").onclick = async () => show("runtimeOut", await node.connectProfile("testnet"));
-      $("connectMainnet").onclick = async () => show("runtimeOut", await node.connectProfile("mainnet"));
-      $("readyState").onclick = async () => show("runtimeOut", await node.readyState(1, 10000));
+      function uploadRetrieveLog(line) {
+        return /(upload|push|retrieve|retrieval|feed|chunk|disconnect|accounting|cheque|refresh|failed|error)/i.test(line)
+          && !/(Dial status|Connected to bootnode|Connected to peer|Observed address)/i.test(line);
+      }
 
-      $("seedJson").onclick = () => {
-        $("jsonPayload").value = JSON.stringify({
-          version: 1,
+      async function refreshRuntimeLogs() {
+        try {
+          const newLines = [];
+          for (const line of Array.from(await node.logs())) {
+            if (uploadRetrieveLog(line)) {
+              newLines.push(line);
+            }
+          }
+          logLines.unshift(...newLines.reverse());
+          while (logLines.length > 140) logLines.pop();
+          $("logOut").textContent = logLines.join("\n");
+
+          const snapshot = await node.progressSnapshot(progressRevision);
+          if (snapshot.changed) {
+            progressRevision = snapshot.revision;
+            show("progressOut", Array.from(snapshot.rows || []).filter((row) => {
+              return /(upload|feed|chunk|bytes)/i.test(`${row.kind} ${row.phase} ${row.detail}`);
+            }));
+          }
+        } catch (_error) {
+        }
+      }
+
+      function makePayload() {
+        const syncId = `issue-1-${Date.now()}-${randomHex(16)}`;
+        const payload = {
           app: "oneplusone",
+          kind: "issue-1-json-sync",
+          topic: TOPIC,
+          syncId,
+          nonce: crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random()}`,
+          randomProof: randomHex(32),
+          updatedAt: new Date().toISOString(),
           links: [
             {
               peer: "0x1111111111111111111111111111111111111111",
               safe: "0x2222222222222222222222222222222222222222",
-              label: "demo 2-of-2 association",
               chainId: 100
             }
-          ],
-          updatedAt: new Date().toISOString()
-        }, null, 2);
-        show("jsonOut", { seeded: true });
-      };
+          ]
+        };
 
-      $("loadLocal").onclick = () => {
-        $("jsonPayload").value = localStorage.getItem(storageKey()) || "[]";
-        show("jsonOut", { loaded: storageKey(), bytes: $("jsonPayload").value.length });
-      };
+        return { syncId, payload, text: JSON.stringify(payload, null, 2) };
+      }
 
-      $("saveLocal").onclick = () => {
-        const text = normalizedJson();
-        localStorage.setItem(storageKey(), text);
-        show("jsonOut", { saved: storageKey(), bytes: bytesFromText(text).byteLength });
-      };
-
-      $("downloadJson").onclick = () => {
-        const text = normalizedJson();
-        downloadBytes("oneplusone-links.json", bytesFromText(text), "application/json");
-        show("jsonOut", { downloaded: "oneplusone-links.json" });
-      };
-
-      $("jsonFile").onchange = async (event) => {
-        const file = event.target.files[0];
-        if (!file) return;
-        $("jsonPayload").value = JSON.stringify(JSON.parse(await file.text()), null, 2);
-        show("jsonOut", { imported: file.name, bytes: file.size });
-      };
-
-      $("batchState").onclick = async () => show("exportOut", await node.batchState(depth(), validityDays()));
-      $("buyBatch").onclick = async () => show("exportOut", await node.buyBatch(depth(), validityDays()));
-      $("checkOrBuyBatch").onclick = async () => {
-        try {
-          await checkOrBuyBatch("exportOut");
-        } catch (error) {
-          show("exportOut", { ok: false, error: error.message || String(error) });
-        }
-      };
-
-      $("feedIdentity").onclick = async () => {
-        const identity = await node.feedIdentity(topic());
-        if (identity.feedOwner) $("owner").value = identity.feedOwner;
-        show("exportOut", identity);
-      };
-
-      $("exportFeed").onclick = async () => {
-        try {
-          await checkOrBuyBatch("exportOut");
-          const text = normalizedJson();
-          localStorage.setItem(storageKey(), text);
-          const result = await node.postFeedBytes(
-            topic(),
-            bytesFromText(text),
-            "application/json",
-            "oneplusone-links.json",
-            false
-          );
-          if (result.feedOwner) $("owner").value = result.feedOwner;
-          show("exportOut", result);
-          log("exported JSON to Swarm feed", result);
-        } catch (error) {
-          show("exportOut", { ok: false, error: error.message || String(error) });
-        }
-      };
-
-      $("feedTopic").onclick = () => show("importOut", node.feedTopic(topic()));
-
-      $("importFeed").onclick = async () => {
-        try {
-          const result = await node.acquireFeedBytes($("owner").value.trim(), topic());
-          if (result.status !== "ok") {
-            show("importOut", result);
-            return;
+      async function diagnostics() {
+        const network = await node.networkState();
+        const ready = await node.readyState(1, 0);
+        return {
+          runtime: "node.start() default mainnet",
+          network: {
+            mode: network.mode,
+            networkId: network.networkId,
+            walletChainId: network.walletChainId,
+            baseSymbol: network.baseSymbol,
+            bzzSymbol: network.bzzSymbol
+          },
+          connections: {
+            ready: ready.ready,
+            connected: ready.connections,
+            connecting: ready.connecting
+          },
+          feed: {
+            topic: TOPIC,
+            normalizedTopic: node.feedTopic(TOPIC).feedTopic,
+            identity: await node.feedIdentity(TOPIC)
+          },
+          batchRequest: {
+            depth: DEPTH,
+            validityDays: VALIDITY_DAYS,
+            encryption: ENCRYPTION
           }
-          const text = JSON.stringify(JSON.parse(textFromBytes(result.body)), null, 2);
-          $("jsonPayload").value = text;
-          localStorage.setItem(storageKey(), text);
-          show("importOut", {
-            status: result.status,
-            owner: result.feedOwner || $("owner").value.trim() || "current wallet",
-            topic: result.feedTopic,
-            path: result.path,
-            bytes: result.body.byteLength,
-            saved: storageKey()
-          });
-          log("imported JSON from Swarm feed");
+        };
+      }
+
+      async function checkBatch() {
+        return node.uploadPrerequisites(DEPTH, VALIDITY_DAYS);
+      }
+
+      async function buyBatchAndVerify() {
+        const before = await checkBatch();
+        if (before.status === "wrong_network") {
+          throw new Error("Wallet is on the wrong chain for the active network.");
+        }
+        if (before.hasFunds === false) {
+          throw new Error("Wallet does not report enough BZZ for this batch.");
+        }
+        if (before.usableBatch) {
+          return { status: "already_ready", before, after: before };
+        }
+
+        const purchase = await node.buyBatch(DEPTH, VALIDITY_DAYS);
+        if (!okStatus(purchase)) {
+          throw new Error(purchase.error || purchase.reason || "buyBatch failed");
+        }
+
+        await new Promise((resolve) => setTimeout(resolve, 900));
+        const after = await checkBatch();
+        return {
+          status: after.usableBatch ? "buy_verified" : "buy_unverified",
+          before,
+          purchase,
+          after
+        };
+      }
+
+      async function uploadJson() {
+        await refreshRuntimeLogs();
+        const batch = await checkBatch();
+        if (!batch.usableBatch) {
+          throw new Error("No usable batch yet. Check or buy a batch first.");
+        }
+
+        const payload = makePayload();
+        const upload = await node.postFeedBytes(
+          TOPIC,
+          bytesFromText(payload.text),
+          "application/json",
+          "oneplusone-links.json",
+          ENCRYPTION
+        );
+        if (!okStatus(upload)) {
+          throw new Error(upload.error || upload.reason || "feed upload failed");
+        }
+
+        const digest = await sha256Hex(payload.text);
+        lastUpload = { owner: upload.feedOwner, topic: TOPIC, digest, text: payload.text, payload: payload.payload, syncId: payload.syncId, upload };
+        $("owner").value = upload.feedOwner || "";
+
+        return {
+          status: "uploaded",
+          owner: upload.feedOwner,
+          topic: TOPIC,
+          syncId: payload.syncId,
+          digest,
+          encryption: ENCRYPTION,
+          bytes: bytesFromText(payload.text).byteLength,
+          batch,
+          upload,
+          json: payload.payload
+        };
+      }
+
+      async function downloadJson() {
+        const owner = $("owner").value.trim() || lastUpload?.owner || "";
+        if (!owner) {
+          throw new Error("Upload first, or paste an owner address.");
+        }
+
+        await refreshRuntimeLogs();
+        const result = await node.acquireFeedBytes(owner, TOPIC);
+        if (result.status !== "ok") {
+          return { status: result.status, reason: result.reason, owner, topic: TOPIC, result };
+        }
+
+        const downloadedText = textFromBytes(result.body);
+        const downloadedJson = JSON.parse(downloadedText);
+        const text = JSON.stringify(downloadedJson, null, 2);
+        const digest = await sha256Hex(text);
+        const exactTextMatch = lastUpload ? downloadedText === lastUpload.text : null;
+        const digestMatches = lastUpload ? digest === lastUpload.digest : null;
+        const syncIdMatches = lastUpload ? downloadedJson.syncId === lastUpload.syncId : null;
+
+        return {
+          status: "downloaded",
+          owner,
+          topic: result.feedTopic,
+          path: result.path,
+          bytes: result.body.byteLength,
+          syncId: downloadedJson.syncId,
+          uploadedSyncId: lastUpload?.syncId || null,
+          digest,
+          uploadedDigest: lastUpload?.digest || null,
+          matchesLastUpload: digestMatches,
+          digestMatches,
+          syncIdMatches,
+          exactTextMatch,
+          json: downloadedJson
+        };
+      }
+
+      $("diagnostics").onclick = async () => {
+        try {
+          show("diagnosticsOut", await diagnostics());
         } catch (error) {
-          show("importOut", { ok: false, error: error.message || String(error) });
+          show("diagnosticsOut", { status: "error", error: error.message || String(error) });
         }
       };
 
-      $("seedJson").click();
-      show("runtimeOut", await node.networkState());
-      log("issue #1 JSON sync example loaded");
+      $("checkBatch").onclick = async () => {
+        try {
+          openVaultFromClick();
+          show("batchOut", await checkBatch());
+        } catch (error) {
+          show("batchOut", { status: "error", error: error.message || String(error) });
+        }
+      };
+
+      $("buyBatch").onclick = async () => {
+        try {
+          openVaultFromClick();
+          show("batchOut", await buyBatchAndVerify());
+        } catch (error) {
+          show("batchOut", { status: "error", error: error.message || String(error) });
+        }
+      };
+
+      $("uploadJson").onclick = async () => {
+        try {
+          openVaultFromClick();
+          show("uploadOut", await uploadJson());
+        } catch (error) {
+          show("uploadOut", { status: "error", error: error.message || String(error) });
+        }
+      };
+
+      $("downloadJson").onclick = async () => {
+        try {
+          show("downloadOut", await downloadJson());
+        } catch (error) {
+          show("downloadOut", { status: "error", error: error.message || String(error) });
+        }
+      };
+
+      setInterval(refreshRuntimeLogs, 600);
+      await new Promise((resolve) => setTimeout(resolve, 120));
+      show("diagnosticsOut", await diagnostics());
+      await refreshRuntimeLogs();
+      $("exampleReady").hidden = false;
     </script>
   </body>
 </html>

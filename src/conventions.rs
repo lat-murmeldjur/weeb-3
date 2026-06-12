@@ -99,7 +99,7 @@ pub fn get_proximity(one: &Vec<u8>, other: &Vec<u8>) -> u8 {
 }
 
 pub fn content_address(chunk_content: &Vec<u8>) -> Vec<u8> {
-    if chunk_content.len() > 8 {
+    if chunk_content.len() > 8 && chunk_content.len() <= SPAN_SIZE + 4096 {
         let (something, something2) = chunk_content.split_at(SPAN_SIZE);
 
         let contenthash = hasher_0(&something2.to_vec());
@@ -112,7 +112,7 @@ pub fn content_address(chunk_content: &Vec<u8>) -> Vec<u8> {
 
 pub fn valid_cac(chunk_content: &Vec<u8>, address: &Vec<u8>) -> bool {
     //
-    if chunk_content.len() < SPAN_SIZE {
+    if chunk_content.len() < SPAN_SIZE || chunk_content.len() > SPAN_SIZE + 4096 {
         return false;
     }
 

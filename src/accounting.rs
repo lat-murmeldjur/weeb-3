@@ -7,7 +7,7 @@ use libp2p::PeerId;
 use crate::conventions::{PeerAccounting, get_proximity};
 use crate::mpsc;
 
-pub const REFRESH_RATE: u64 = 4500000;
+pub const REFRESH_RATE: u64 = 450000;
 pub const PO_PRICE: u64 = 10000;
 
 pub async fn set_payment_threshold(a: &Mutex<PeerAccounting>, amount: u64) {
