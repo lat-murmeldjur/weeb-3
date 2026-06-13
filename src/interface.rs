@@ -55,7 +55,7 @@ use crate::{
         set_chequebook_signer_key,
     },
     secure_vault::{
-        secure_batch_state_for_wallet, secure_commit_batch_purchase,
+        secure_batch_state_for_wallet, secure_commit_batch_purchase_and_verify,
         secure_open_vault_from_user_action, secure_preload_vault_module,
         secure_prepare_batch_purchase,
     },
@@ -387,7 +387,8 @@ pub(crate) async fn mount_interface(
                         }
                     };
 
-                    if !secure_commit_batch_purchase(
+                    if !secure_commit_batch_purchase_and_verify(
+                        payer.as_bytes(),
                         &purchase.batch_id,
                         purchase.bucket_limit,
                         prepared.depth,
@@ -396,7 +397,8 @@ pub(crate) async fn mount_interface(
                     .await
                     {
                         let wnd = web_sys::window().unwrap();
-                        let _ = wnd.alert_with_message("Failed to save batch in weeb-3-secure");
+                        let _ = wnd
+                            .alert_with_message("Failed to save or verify batch in weeb-3-secure");
                         return;
                     }
 

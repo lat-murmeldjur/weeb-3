@@ -19,8 +19,9 @@ use crate::{
         set_chequebook_signer_key,
     },
     secure_vault::{
-        secure_batch_state_for_wallet, secure_commit_batch_purchase, secure_ensure_feed_owner,
-        secure_open_vault_from_user_action, secure_prepare_batch_purchase,
+        secure_batch_state_for_wallet, secure_commit_batch_purchase_and_verify,
+        secure_ensure_feed_owner, secure_open_vault_from_user_action,
+        secure_prepare_batch_purchase,
     },
     strip_hex_prefix,
 };
@@ -1372,7 +1373,8 @@ impl Weeb3No103 {
             Err(error) => return error_object(format!("batch purchase failed: {error:?}")),
         };
 
-        if !secure_commit_batch_purchase(
+        if !secure_commit_batch_purchase_and_verify(
+            payer.as_bytes(),
             &purchase.batch_id,
             purchase.bucket_limit,
             prepared.depth,
@@ -1380,7 +1382,7 @@ impl Weeb3No103 {
         )
         .await
         {
-            return error_object("failed to save batch in weeb-3-secure");
+            return error_object("failed to save or verify batch in weeb-3-secure");
         }
 
         let obj = ok_object();

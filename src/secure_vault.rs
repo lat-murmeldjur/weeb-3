@@ -184,6 +184,36 @@ pub async fn secure_commit_batch_purchase(
     }
 }
 
+pub async fn secure_commit_batch_purchase_and_verify(
+    wallet: &[u8],
+    batch_id: &[u8],
+    batch_bucket_limit: u32,
+    batch_depth: u8,
+    network_id: u64,
+) -> bool {
+    if !secure_commit_batch_purchase(batch_id, batch_bucket_limit, batch_depth, network_id).await {
+        return false;
+    }
+
+    let Some(state) = secure_batch_state_for_wallet(wallet, network_id).await else {
+        secure_vault_log!("secure commit verification failed: batch state unavailable");
+        return false;
+    };
+
+    let saved = state.has_batch
+        && state.batch_id.as_slice() == batch_id
+        && state.batch_bucket_limit == batch_bucket_limit;
+    if !saved {
+        secure_vault_log!(
+            "secure commit verification failed: hasBatch={}, savedBatchIdLen={}, savedBucketLimit={}",
+            state.has_batch,
+            state.batch_id.len(),
+            state.batch_bucket_limit
+        );
+    }
+    saved
+}
+
 pub async fn secure_stamp_chunk(chunk_address: Vec<u8>) -> (Vec<u8>, bool) {
     let Some(client) = secure_client_or_resume("stampChunk").await else {
         return (vec![], false);

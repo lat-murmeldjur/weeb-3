@@ -34,6 +34,8 @@ rust-embed = { version = "8.7.1", features = ["include-exclude", "interpolate-fo
 tokio = { version = "1.38.0", default-features = false, features = ["macros", "net", "rt", "signal", "rt-multi-thread"] }
 tower-http = { git = "https://github.com/tower-rs/tower-http.git", features = ["cors"] }
 mime_guess = { git = "https://github.com/abonander/mime_guess.git" }
+# rcgen 0.13.2 does not compile with time 0.3.48 under Rust 1.96.
+time = "=0.3.47"
 libp2p = { git = "https://github.com/libp2p/rust-libp2p.git", rev = "8072a73f62f07adc273e4270a22564f94462b58c", features = [ "ecdsa", "ed25519", "macros", "ping", "tokio"] }
 libp2p-webrtc = { git = "https://github.com/libp2p/rust-libp2p.git", rev = "8072a73f62f07adc273e4270a22564f94462b58c", features = [ "tokio"] }
 
