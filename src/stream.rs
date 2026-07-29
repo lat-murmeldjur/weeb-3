@@ -1,11 +1,11 @@
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     collections::{BTreeMap, HashMap, VecDeque},
     time::Duration,
 };
 
 use async_std::sync::Arc;
-use js_sys::{Array, Function, Object, Reflect};
+use js_sys::{Array, ArrayBuffer, Function, Object, Reflect};
 use libp2p::futures::future::join_all;
 use wasm_bindgen::{JsCast, JsValue, closure::Closure};
 use wasm_bindgen_futures::spawn_local;
@@ -17,61 +17,77 @@ use crate::{
     interface::service_worker_controls_bzz_requests,
     mpsc,
     network_profile::{NetworkMode, active_profile},
+    retrieval_conventions::{
+        PendingGenerationRelation, next_nonzero_generation, outer_range_retry_count,
+        pending_generation_relation, pending_load_matches,
+    },
+    stream_conventions::{
+        MEDIA_PREFETCH_BATCH_YIELD_MS, MEDIA_PREFETCH_MAX_PARALLEL, MEDIA_STARTUP_RESPONSE_BYTES,
+        MEDIA_STORAGE_WINDOW_BYTES, MIB_BYTES, decode_component, if_none_match_matches,
+        if_range_allows_range, immutable_metadata_identity, media_cache_budget_bytes,
+        media_prefetch_ahead_limit_bytes, media_prefetch_stage_targets, parse_single_range,
+        route_markers, streaming_route_path, window_key, window_prefix,
+    },
 };
 
-const BZZ_MARKERS: [&str; 3] = [
-    "/weeb-3/bzz/",
-    "/weeb-3/mainnet/bzz/",
-    "/weeb-3/testnet/bzz/",
-];
-const RAW_ROUTE_MARKERS: [(&str, &str); 9] = [
-    ("/weeb-3/bytes/", "bytes"),
-    ("/weeb-3/chunks/", "chunk"),
-    ("/weeb-3/chunk/", "chunk"),
-    ("/weeb-3/mainnet/bytes/", "bytes"),
-    ("/weeb-3/mainnet/chunks/", "chunk"),
-    ("/weeb-3/mainnet/chunk/", "chunk"),
-    ("/weeb-3/testnet/bytes/", "bytes"),
-    ("/weeb-3/testnet/chunks/", "chunk"),
-    ("/weeb-3/testnet/chunk/", "chunk"),
-];
-const MIB_BYTES: u64 = 1024 * 1024;
-const STREAM_STORAGE_WINDOW_BYTES: u64 = MIB_BYTES / 2;
-const STREAM_RESPONSE_BUFFER_BYTES: u64 = 8 * MIB_BYTES;
+const STREAM_RESPONSE_BUFFER_BYTES: u64 = MEDIA_STARTUP_RESPONSE_BYTES;
 const STREAM_ACTIVE_RESPONSE_BUFFER_BYTES: u64 = 2 * MIB_BYTES;
-const STREAM_PREFETCH_AHEAD_LIMIT_BYTES: u64 = 64 * MIB_BYTES;
 const STREAM_SEEK_KEEP_AHEAD_BYTES: u64 = 16 * MIB_BYTES;
 const STREAM_SEEK_RESET_GAP_BYTES: u64 = STREAM_SEEK_KEEP_AHEAD_BYTES;
 const STREAM_SEEK_REQUEST_GAP_BYTES: u64 = 6 * MIB_BYTES;
-const STREAM_PREFETCH_MAX_WINDOWS: usize = 8;
-const RANGE_CACHE_MEMORY_RATIO: f64 = 0.75;
-const RANGE_CACHE_DEVICE_MEMORY_RATIO: f64 = 0.45;
-const RANGE_CACHE_FALLBACK_MAX_BYTES: u64 = 3 * 1024 * MIB_BYTES;
-const RANGE_CACHE_MIN_MAX_BYTES: u64 = 512 * MIB_BYTES;
 const METADATA_CACHE_MAX_ENTRIES: usize = 1024;
 const MEDIA_STREAM_STATE_MAX_ENTRIES: usize = 64;
-const RANGE_CACHE_STALE_MS: f64 = 270_000.0;
-const RANGE_RETRY_COUNT: usize = 4;
+const RANGE_SINGLEFLIGHT_MAX_LOADS: usize = 256;
+const RANGE_SINGLEFLIGHT_MAX_WAITERS: usize = 64;
 const RANGE_RETRY_DELAY_MS: u64 = 700;
 const RANGE_REQUEST_TIMEOUT_MS: u64 = 210_000;
 const STREAM_RANGE_RETRY_COUNT: usize = 1;
 const STREAM_RANGE_REQUEST_TIMEOUT_MS: u64 = 15_000;
-const STREAM_PREFETCH_BATCH_YIELD_MS: u64 = 25;
 const MEDIA_RETRY_DELAYS_MS: [u64; 6] = [1_000, 2_000, 4_000, 8_000, 16_000, 30_000];
-const STREAM_PREFETCH_STAGE_BYTES: [u64; 9] = [
-    4 * MIB_BYTES,
-    4 * MIB_BYTES,
-    4 * MIB_BYTES,
-    4 * MIB_BYTES,
-    8 * MIB_BYTES,
-    8 * MIB_BYTES,
-    8 * MIB_BYTES,
-    8 * MIB_BYTES,
-    16 * MIB_BYTES,
-];
 
 thread_local! {
+    static MEDIA_GENERATION_SEQUENCE: Cell<u64> = const { Cell::new(0) };
+    static RESULT_VIEW_GENERATION: Cell<u64> = const { Cell::new(0) };
     static FETCH_CACHE: RefCell<FetchCache> = RefCell::new(FetchCache::new());
+    static MEDIA_ELEMENT_CALLBACKS: RefCell<Vec<MediaElementCallback>> =
+        RefCell::new(Vec::new());
+    static ACTIVE_BZZ_MEDIA_URL: RefCell<Option<String>> = const { RefCell::new(None) };
+}
+
+/// Reserve the result view without cancelling already-dispatched work.
+pub(crate) fn begin_result_view_request() -> u64 {
+    RESULT_VIEW_GENERATION.with(|generation| {
+        let next = next_nonzero_generation(generation.get());
+        generation.set(next);
+        next
+    })
+}
+
+pub(crate) fn result_view_request_is_current(expected: u64) -> bool {
+    RESULT_VIEW_GENERATION.with(|generation| generation.get() == expected)
+}
+
+struct MediaElementCallback {
+    target: Element,
+    event_name: &'static str,
+    callback: Closure<dyn FnMut()>,
+}
+
+impl Drop for MediaElementCallback {
+    fn drop(&mut self) {
+        let _ = self.target.remove_event_listener_with_callback(
+            self.event_name,
+            self.callback.as_ref().unchecked_ref(),
+        );
+    }
+}
+
+pub(crate) fn next_media_generation() -> u64 {
+    MEDIA_GENERATION_SEQUENCE.with(|sequence| {
+        let next = next_nonzero_generation(sequence.get());
+        sequence.set(next);
+        next
+    })
 }
 
 fn reset_bzz_fetch_resource_activity(resource: &str, reason: &str) -> bool {
@@ -107,12 +123,47 @@ fn reset_bzz_fetch_url_activity(url: &str, reason: &str) -> bool {
         .unwrap_or(false)
 }
 
+fn suspend_bzz_fetch_resource_prefetch(resource: &str) -> bool {
+    FETCH_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        let suffix = format!("|{}", resource);
+        let media_keys = cache
+            .media_states
+            .keys()
+            .filter(|key| key.ends_with(&suffix))
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut suspended = false;
+        for key in media_keys {
+            let Some(state) = cache.media_states.get_mut(&key) else {
+                continue;
+            };
+            // Do not fail a pending window or close its waiter. Advancing only
+            // the staged scheduler generation lets the current four-window
+            // batch drain, then prevents it from extending while paused.
+            state.generation = next_media_generation();
+            state.prefetch_running = false;
+            state.prefetch_generation = 0;
+            state.last_touch = js_sys::Date::now();
+            suspended = true;
+        }
+        suspended
+    })
+}
+
+fn suspend_bzz_fetch_url_prefetch(url: &str) -> bool {
+    canonical_bzz_resource(url)
+        .map(|resource| suspend_bzz_fetch_resource_prefetch(&resource))
+        .unwrap_or(false)
+}
+
 struct FetchCache {
     metadata_order: VecDeque<String>,
     metadata: HashMap<String, BzzMetadata>,
     range_order: VecDeque<String>,
     ranges: HashMap<String, CachedRange>,
     pending_ranges: HashMap<String, PendingRange>,
+    next_range_load_id: u64,
     range_bytes: u64,
     media_states: HashMap<String, MediaState>,
 }
@@ -125,6 +176,7 @@ impl FetchCache {
             range_order: VecDeque::new(),
             ranges: HashMap::new(),
             pending_ranges: HashMap::new(),
+            next_range_load_id: 0,
             range_bytes: 0,
             media_states: HashMap::new(),
         }
@@ -149,60 +201,113 @@ impl FetchCache {
         }
     }
 
-    fn range(&mut self, key: &str, generation: u64) -> Option<Vec<u8>> {
+    fn range(&mut self, key: &str) -> Option<Vec<u8>> {
         let range = self.ranges.get(key)?;
-        if range.generation != 0 && generation != 0 && range.generation != generation {
-            return None;
-        }
         let body = range.body.clone();
         self.range_order.retain(|cached_key| cached_key != key);
         self.range_order.push_back(key.to_string());
         Some(body)
     }
 
-    fn remember_range(&mut self, key: String, body: Vec<u8>, generation: u64) {
+    fn remember_range(
+        &mut self,
+        key: String,
+        body: Vec<u8>,
+        media_state_key: &str,
+        generation: u64,
+    ) {
+        // Superseded media work still settles, but cannot repopulate a newer
+        // view's completed cache. Stable document reads use generation zero.
+        if generation > 0
+            && !self
+                .media_states
+                .get(media_state_key)
+                .is_some_and(|state| state.generation == generation)
+        {
+            return;
+        }
         let body_len = body.len() as u64;
         if let Some(old) = self.ranges.remove(&key) {
             self.range_bytes = self.range_bytes.saturating_sub(old.body.len() as u64);
         }
         self.range_order.retain(|cached_key| cached_key != &key);
         self.range_order.push_back(key.clone());
-        self.ranges.insert(key, CachedRange { body, generation });
+        self.ranges.insert(key, CachedRange { body });
         self.range_bytes = self.range_bytes.saturating_add(body_len);
         self.trim_ranges();
     }
 
-    fn range_load_role(&mut self, key: &str, generation: u64) -> RangeLoadRole {
-        if let Some(body) = self.range(key, generation) {
+    fn clear_completed_ranges(&mut self) {
+        self.range_order.clear();
+        self.ranges.clear();
+        self.range_bytes = 0;
+    }
+
+    fn range_load_role(
+        &mut self,
+        cache_key: &str,
+        pending_key: &str,
+        generation: u64,
+    ) -> RangeLoadRole {
+        if let Some(body) = self.range(cache_key) {
             return RangeLoadRole::Cached(body);
         }
 
-        if let Some(pending) = self.pending_ranges.get_mut(key) {
-            if js_sys::Date::now() - pending.created_at > RANGE_CACHE_STALE_MS {
-                if let Some(stale) = self.pending_ranges.remove(key) {
-                    stale.finish(Err("stale range request expired".to_string()));
+        if let Some(pending) = self.pending_ranges.get_mut(pending_key) {
+            match pending_generation_relation(pending.generation, generation) {
+                PendingGenerationRelation::Join => {
+                    pending.waiters.retain(|waiter| !waiter.is_closed());
+                    if pending.waiters.len() >= RANGE_SINGLEFLIGHT_MAX_WAITERS {
+                        return RangeLoadRole::Reject(
+                            "range already has too many waiting requests".to_string(),
+                        );
+                    }
+                    let (sender, receiver) = mpsc::bounded(1);
+                    pending.waiters.push(sender);
+                    return RangeLoadRole::Wait(receiver);
                 }
-            } else if pending.generation == generation || generation == 0 {
-                let (sender, receiver) = mpsc::bounded(1);
-                pending.waiters.push(sender);
-                return RangeLoadRole::Wait(receiver);
-            } else if let Some(stale) = self.pending_ranges.remove(key) {
-                stale.finish(Err("stale range generation replaced".to_string()));
+                PendingGenerationRelation::RejectStale => {
+                    return RangeLoadRole::Reject("stale range generation".to_string());
+                }
+                PendingGenerationRelation::Replace => {}
             }
         }
+        if let Some(stale) = self.pending_ranges.remove(pending_key) {
+            stale.finish(Err("stale range generation replaced".to_string()));
+        }
+        if self.pending_ranges.len() >= RANGE_SINGLEFLIGHT_MAX_LOADS {
+            return RangeLoadRole::Reject("too many range loads are already pending".to_string());
+        }
 
+        let (sender, receiver) = mpsc::bounded(1);
+        self.next_range_load_id = self.next_range_load_id.wrapping_add(1);
+        if self.next_range_load_id == 0 {
+            self.next_range_load_id = 1;
+        }
+        let load_id = self.next_range_load_id;
         self.pending_ranges.insert(
-            key.to_string(),
+            pending_key.to_string(),
             PendingRange {
                 generation,
-                created_at: js_sys::Date::now(),
-                waiters: Vec::new(),
+                load_id,
+                waiters: vec![sender],
             },
         );
-        RangeLoadRole::Lead
+        RangeLoadRole::Lead(receiver, load_id)
     }
 
-    fn finish_pending_range(&mut self, key: &str, result: Result<Vec<u8>, String>) {
+    fn finish_pending_range(
+        &mut self,
+        key: &str,
+        generation: u64,
+        load_id: u64,
+        result: Result<Vec<u8>, String>,
+    ) {
+        if !self.pending_ranges.get(key).is_some_and(|pending| {
+            pending_load_matches(pending.generation, pending.load_id, generation, load_id)
+        }) {
+            return;
+        }
         if let Some(pending) = self.pending_ranges.remove(key) {
             pending.finish(result);
         }
@@ -224,7 +329,7 @@ impl FetchCache {
 
     fn reset_media_state(&mut self, key: &str) {
         if let Some(state) = self.media_states.get_mut(key) {
-            state.generation = state.generation.saturating_add(1);
+            state.generation = next_media_generation();
             state.anchor_start = None;
             state.high_water_end = -1;
             state.scheduled_high_water_end = -1;
@@ -239,7 +344,7 @@ impl FetchCache {
     }
 
     fn trim_ranges(&mut self) {
-        let max_bytes = range_cache_max_bytes();
+        let max_bytes = range_cache_capacity_bytes();
         while self.range_bytes > max_bytes {
             let Some(oldest) = self.range_order.pop_front() else {
                 break;
@@ -252,7 +357,8 @@ impl FetchCache {
 
     fn media_state_mut(&mut self, key: &str) -> &mut MediaState {
         if !self.media_states.contains_key(key) {
-            self.media_states.insert(key.to_string(), MediaState::new());
+            self.media_states
+                .insert(key.to_string(), MediaState::new(next_media_generation()));
         }
         self.trim_media_states(key);
         self.media_states
@@ -288,18 +394,28 @@ impl FetchCache {
 
 struct CachedRange {
     body: Vec<u8>,
-    generation: u64,
 }
 
 struct PendingRange {
     generation: u64,
-    created_at: f64,
+    load_id: u64,
     waiters: Vec<mpsc::Sender<Result<Vec<u8>, String>>>,
 }
 
 impl PendingRange {
     fn finish(self, result: Result<Vec<u8>, String>) {
-        for waiter in self.waiters {
+        let mut waiters = self
+            .waiters
+            .into_iter()
+            .filter(|waiter| !waiter.is_closed())
+            .peekable();
+        while let Some(waiter) = waiters.next() {
+            if waiters.peek().is_none() {
+                // Move the final result instead of cloning a full range only to
+                // discard the original immediately after fan-out.
+                let _ = waiter.try_send(result);
+                return;
+            }
             let _ = waiter.try_send(result.clone());
         }
     }
@@ -308,43 +424,76 @@ impl PendingRange {
 enum RangeLoadRole {
     Cached(Vec<u8>),
     Wait(mpsc::Receiver<Result<Vec<u8>, String>>),
-    Lead,
+    Lead(mpsc::Receiver<Result<Vec<u8>, String>>, u64),
+    Reject(String),
 }
 
-fn range_cache_max_bytes() -> u64 {
+#[derive(Debug)]
+struct RangeReadError {
+    message: String,
+    waiter_timed_out: bool,
+}
+
+impl RangeReadError {
+    fn terminal(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            waiter_timed_out: false,
+        }
+    }
+
+    fn waiter_timeout(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            waiter_timed_out: true,
+        }
+    }
+}
+
+impl From<String> for RangeReadError {
+    fn from(message: String) -> Self {
+        Self::terminal(message)
+    }
+}
+
+impl From<&str> for RangeReadError {
+    fn from(message: &str) -> Self {
+        Self::terminal(message)
+    }
+}
+
+pub(crate) fn media_cache_max_bytes() -> u64 {
+    let mut js_heap_size_limit = None;
     let global = js_sys::global();
     if let Ok(performance) = Reflect::get(&global, &"performance".into()) {
         if let Ok(memory) = Reflect::get(&performance, &"memory".into()) {
             if let Ok(limit) = Reflect::get(&memory, &"jsHeapSizeLimit".into()) {
-                if let Some(limit) = limit
-                    .as_f64()
-                    .filter(|limit| limit.is_finite() && *limit > 0.0)
-                {
-                    return RANGE_CACHE_MIN_MAX_BYTES
-                        .max((limit * RANGE_CACHE_MEMORY_RATIO) as u64);
-                }
+                js_heap_size_limit = limit.as_f64();
             }
         }
     }
 
+    let mut device_memory_gib = None;
     if let Some(window) = web_sys::window() {
         let navigator = window.navigator();
-        if let Ok(device_memory) = Reflect::get(navigator.as_ref(), &"deviceMemory".into())
-            .and_then(|value| {
-                value
-                    .as_f64()
-                    .filter(|memory| memory.is_finite() && *memory > 0.0)
-                    .ok_or(JsValue::NULL)
-            })
-        {
-            return RANGE_CACHE_MIN_MAX_BYTES.max(
-                (device_memory * 1024.0 * MIB_BYTES as f64 * RANGE_CACHE_DEVICE_MEMORY_RATIO)
-                    as u64,
-            );
+        if let Ok(device_memory) = Reflect::get(navigator.as_ref(), &"deviceMemory".into()) {
+            device_memory_gib = device_memory.as_f64();
         }
     }
 
-    RANGE_CACHE_FALLBACK_MAX_BYTES
+    media_cache_budget_bytes(js_heap_size_limit, device_memory_gib)
+}
+
+pub(crate) fn range_cache_body_bytes() -> u64 {
+    FETCH_CACHE.with(|cache| cache.borrow().range_bytes)
+}
+
+fn range_cache_capacity_bytes() -> u64 {
+    media_cache_max_bytes().saturating_sub(crate::stream_hls::hls_payload_cache_body_bytes())
+}
+
+fn stream_prefetch_ahead_limit_bytes() -> u64 {
+    media_prefetch_ahead_limit_bytes(media_cache_max_bytes())
 }
 
 #[derive(Clone)]
@@ -369,9 +518,9 @@ struct MediaState {
 }
 
 impl MediaState {
-    fn new() -> Self {
+    fn new(generation: u64) -> Self {
         Self {
-            generation: 1,
+            generation,
             anchor_start: None,
             high_water_end: -1,
             scheduled_high_water_end: -1,
@@ -448,28 +597,44 @@ pub fn handle_service_worker_message(
     false
 }
 
-struct FetchResponse {
+pub(crate) struct FetchResponse {
     ok: bool,
     status: u16,
     headers: Vec<(String, String)>,
-    body: Option<Vec<u8>>,
+    body: Option<FetchBody>,
     error: String,
     stream: bool,
 }
 
+enum FetchBody {
+    Owned(Vec<u8>),
+    Shared(Arc<[u8]>),
+}
+
 impl FetchResponse {
-    fn ok(status: u16, headers: Vec<(String, String)>, body: Option<Vec<u8>>) -> Self {
+    pub(crate) fn ok(status: u16, headers: Vec<(String, String)>, body: Option<Vec<u8>>) -> Self {
         Self {
             ok: true,
             status,
             headers,
-            body,
+            body: body.map(FetchBody::Owned),
             error: String::new(),
             stream: false,
         }
     }
 
-    fn stream(status: u16, headers: Vec<(String, String)>) -> Self {
+    pub(crate) fn ok_shared(status: u16, headers: Vec<(String, String)>, body: Arc<[u8]>) -> Self {
+        Self {
+            ok: true,
+            status,
+            headers,
+            body: Some(FetchBody::Shared(body)),
+            error: String::new(),
+            stream: false,
+        }
+    }
+
+    pub(crate) fn stream(status: u16, headers: Vec<(String, String)>) -> Self {
         Self {
             ok: true,
             status,
@@ -480,7 +645,7 @@ impl FetchResponse {
         }
     }
 
-    fn error(status: u16, error: impl Into<String>) -> Self {
+    pub(crate) fn error(status: u16, error: impl Into<String>) -> Self {
         Self {
             ok: false,
             status,
@@ -491,7 +656,7 @@ impl FetchResponse {
         }
     }
 
-    fn into_js(self) -> Object {
+    fn into_js(self) -> (Object, Option<ArrayBuffer>) {
         let resp = Object::new();
         set_js(&resp, "ok", JsValue::from_bool(self.ok));
         set_js(&resp, "status", JsValue::from_f64(self.status as f64));
@@ -507,13 +672,21 @@ impl FetchResponse {
         }
         set_js(&resp, "headers", headers.into());
 
-        if let Some(body) = self.body {
-            let u8arr = js_sys::Uint8Array::new_with_length(body.len() as u32);
-            u8arr.copy_from(&body);
+        let transferable = if let Some(body) = self.body {
+            let bytes: &[u8] = match &body {
+                FetchBody::Owned(body) => body,
+                FetchBody::Shared(body) => body,
+            };
+            let u8arr = js_sys::Uint8Array::new_with_length(bytes.len() as u32);
+            u8arr.copy_from(bytes);
+            let buffer = u8arr.buffer();
             set_js(&resp, "body", u8arr.into());
-        }
+            Some(buffer)
+        } else {
+            None
+        };
 
-        resp
+        (resp, transferable)
     }
 }
 
@@ -527,43 +700,27 @@ fn handle_fetch_request_message(obj: &js_sys::Object, event: &MessageEvent, weeb
         .unwrap_or_else(|| "GET".into())
         .to_uppercase();
     let range = js_string_property(obj, "range").filter(|range| !range.is_empty());
+    let if_none_match =
+        js_string_property(obj, "ifNoneMatch").filter(|value| !value.trim().is_empty());
+    let if_range = js_string_property(obj, "ifRange").filter(|value| !value.trim().is_empty());
     let port = message_port(event);
 
     spawn_local(async move {
-        let subject = fetch_log_subject(&url);
-        weeb3.interface_log(format!("service fetch {} {}", method, subject));
-        let resp = fetch_request_response(weeb3.clone(), url, method, range).await;
-        let status = resp.status;
-        let ok = resp.ok;
-        let error = resp.error.clone();
-        weeb3.interface_log(if ok {
-            format!("service fetch complete {} {}", status, subject)
-        } else {
-            format!("service fetch failed {} {} {}", status, subject, error)
-        });
-        let resp = resp.into_js();
+        let resp =
+            fetch_request_response(weeb3.clone(), url, method, range, if_none_match, if_range)
+                .await;
+        let (resp, transferable) = resp.into_js();
 
         if let Some(port) = port {
-            let _ = port.post_message(&resp);
+            if let Some(buffer) = transferable {
+                let transfer = Array::new();
+                transfer.push(&buffer);
+                let _ = port.post_message_with_transferable(&resp, &transfer);
+            } else {
+                let _ = port.post_message(&resp);
+            }
         }
-    });
-}
-
-fn fetch_log_subject(url: &str) -> String {
-    let pathname = match web_sys::Url::new(url) {
-        Ok(url) => url.pathname(),
-        Err(_) => url.to_string(),
-    };
-
-    if let Some(resource) = canonical_bzz_resource(&pathname) {
-        return format!("bzz/{}", resource);
-    }
-
-    if let Some((raw_type, reference)) = canonical_raw_resource(&pathname) {
-        return format!("{}/{}", raw_type, reference);
-    }
-
-    pathname
+    })
 }
 
 async fn fetch_request_response(
@@ -571,18 +728,35 @@ async fn fetch_request_response(
     url: String,
     method: String,
     range: Option<String>,
+    if_none_match: Option<String>,
+    if_range: Option<String>,
 ) -> FetchResponse {
     if method != "GET" && method != "HEAD" {
         return FetchResponse::error(405, "method not allowed");
     }
 
-    let pathname = match web_sys::Url::new(&url) {
-        Ok(url) => url.pathname(),
-        Err(_) => url,
+    let parsed_url = web_sys::Url::new(&url).ok();
+    let pathname = match &parsed_url {
+        Some(url) => url.pathname(),
+        None => url.clone(),
     };
 
     if let Some(resource) = canonical_bzz_resource(&pathname) {
-        return fetch_bzz_response(weeb3, resource, method, range).await;
+        return fetch_bzz_response(weeb3, resource, method, range, if_none_match, if_range).await;
+    }
+
+    if let Some(response) = crate::stream_hls::try_fetch_response(
+        weeb3.clone(),
+        &url,
+        &pathname,
+        &method,
+        range.as_deref(),
+        if_none_match.as_deref(),
+        if_range.as_deref(),
+    )
+    .await
+    {
+        return response;
     }
 
     if let Some((raw_type, reference)) = canonical_raw_resource(&pathname) {
@@ -612,11 +786,11 @@ async fn fetch_raw_response(
             "Content-Type".to_string(),
             "application/octet-stream".to_string(),
         ),
+        ("Cache-Control".to_string(), "no-store".to_string()),
         (
             "Content-Disposition".to_string(),
             format!("attachment; filename=\"{}\"", reference),
         ),
-        ("Cache-Control".to_string(), "no-store".to_string()),
     ];
 
     if method == "HEAD" {
@@ -642,10 +816,20 @@ async fn fetch_bzz_response(
     resource: String,
     method: String,
     range: Option<String>,
+    if_none_match: Option<String>,
+    if_range: Option<String>,
 ) -> FetchResponse {
     let Some(metadata) = resolve_bzz_cached(weeb3.clone(), resource.clone()).await else {
         return FetchResponse::error(404, "weeb-3 did not resolve resource");
     };
+
+    if if_none_match_matches(if_none_match.as_deref(), &metadata.etag) {
+        let headers = metadata_headers(&metadata, metadata.size)
+            .into_iter()
+            .filter(|(name, _)| !name.eq_ignore_ascii_case("Content-Length"))
+            .collect();
+        return FetchResponse::ok(304, headers, None);
+    }
 
     if method == "HEAD" {
         return FetchResponse::ok(200, metadata_headers(&metadata, metadata.size), None);
@@ -656,6 +840,18 @@ async fn fetch_bzz_response(
     }
 
     let streamable = is_streamable_mime(&metadata.mime) && metadata.size > 0;
+    let range_validator_mismatch =
+        range.is_some() && !if_range_allows_range(if_range.as_deref(), &metadata.etag);
+    if range_validator_mismatch {
+        // A failed If-Range condition changes the request into a complete 200
+        // representation. Large bodies retain the ordered range stream, while
+        // already-dispatched retrieval/accounting work keeps its lifecycle.
+        if should_inline_non_streamable_response(&metadata) {
+            return full_bzz_response(weeb3, resource, metadata).await;
+        }
+        return FetchResponse::stream(200, metadata_headers(&metadata, metadata.size));
+    }
+
     let parsed_range = parse_single_range(range.as_deref(), metadata.size);
     if !streamable && parsed_range.is_none() {
         if should_inline_non_streamable_response(&metadata) {
@@ -718,8 +914,13 @@ async fn fetch_bzz_response(
     {
         Ok(bytes) => bytes,
         Err(error) => {
-            note_media_range_failure(&resource, &metadata, start, &media_state);
-            return FetchResponse::error(503, error);
+            // A waiter timeout is not a terminal transport result. Keep the
+            // shared pending load and its media generation intact so a browser
+            // retry joins the accounting-safe drain instead of redispatching.
+            if !error.waiter_timed_out {
+                note_media_range_failure(&resource, &metadata, start, &media_state);
+            }
+            return FetchResponse::error(503, error.message);
         }
     };
 
@@ -784,7 +985,7 @@ async fn full_bzz_response(
     .await
     {
         Ok(bytes) => bytes,
-        Err(error) => return FetchResponse::error(503, error),
+        Err(error) => return FetchResponse::error(503, error.message),
     };
 
     if bytes.len() != size as usize {
@@ -795,10 +996,10 @@ async fn full_bzz_response(
 }
 
 fn should_inline_non_streamable_response(metadata: &BzzMetadata) -> bool {
-    let mime = metadata.mime.split(';').next().unwrap_or("").trim();
-    mime == "text/html"
-        || mime == "application/xhtml+xml"
-        || metadata.size <= STREAM_STORAGE_WINDOW_BYTES
+    // MIME metadata is authenticated only indirectly through the manifest and
+    // must not force an arbitrarily large allocation. Large HTML/XHTML bodies
+    // can use the same ordered range stream as every other non-media resource.
+    metadata.size <= MEDIA_STORAGE_WINDOW_BYTES
 }
 
 pub(crate) fn warm_bzz_fetch_cache(resource: &str, metadata: BzzMetadata, body: Vec<u8>) {
@@ -818,19 +1019,16 @@ pub(crate) fn warm_bzz_fetch_cache(resource: &str, metadata: BzzMetadata, body: 
             }
 
             let key = range_cache_key(resource, &metadata, start, end);
-            cache.remember_range(key, body[local_start..local_end].to_vec(), 0);
+            cache.remember_range(key, body[local_start..local_end].to_vec(), "", 0);
         }
     });
 }
 
 fn metadata_identity(resource: &str, metadata: &BzzMetadata) -> String {
-    if !metadata.etag.is_empty() {
-        metadata.etag.clone()
-    } else if !metadata.data_reference.is_empty() {
-        hex::encode(&metadata.data_reference)
-    } else {
-        resource.to_string()
-    }
+    // The Swarm reference is the immutable content identity. ETags received over
+    // the service-worker message boundary are descriptive metadata and must not be
+    // able to alias cached bytes belonging to another reference.
+    immutable_metadata_identity(resource, &metadata.data_reference, &metadata.etag)
 }
 
 fn media_state_key(resource: &str, metadata: &BzzMetadata) -> String {
@@ -838,40 +1036,53 @@ fn media_state_key(resource: &str, metadata: &BzzMetadata) -> String {
 }
 
 fn range_cache_key(resource: &str, metadata: &BzzMetadata, start: u64, end: u64) -> String {
-    format!(
-        "{}|{}|{}-{}",
-        metadata_identity(resource, metadata),
+    window_key(
+        &metadata_identity(resource, metadata),
         metadata.size,
         start,
-        end
+        end,
     )
+}
+
+fn pending_range_key(cache_key: &str, generation: u64) -> String {
+    // Stable document/download streams must not share a cancellable pending
+    // slot with seekable media. Both scopes still converge on the same
+    // immutable completed-range cache after either leader finishes.
+    if generation == 0 {
+        format!("{cache_key}|pending:stable")
+    } else {
+        format!("{cache_key}|pending:media")
+    }
 }
 
 fn range_cache_prefix(resource: &str, metadata: &BzzMetadata) -> String {
-    format!(
-        "{}|{}|",
-        metadata_identity(resource, metadata),
-        metadata.size
-    )
+    window_prefix(&metadata_identity(resource, metadata), metadata.size)
 }
 
 fn range_storage_window_for_start(start: u64, size: u64) -> (u64, u64) {
-    let storage_start = (start / STREAM_STORAGE_WINDOW_BYTES) * STREAM_STORAGE_WINDOW_BYTES;
+    let storage_start = (start / MEDIA_STORAGE_WINDOW_BYTES) * MEDIA_STORAGE_WINDOW_BYTES;
     (
         storage_start,
         storage_start
-            .saturating_add(STREAM_STORAGE_WINDOW_BYTES)
+            .saturating_add(MEDIA_STORAGE_WINDOW_BYTES)
             .saturating_sub(1)
             .min(size.saturating_sub(1)),
     )
 }
 
 fn range_storage_windows_for_span(start: u64, end: u64, size: u64) -> Vec<(u64, u64)> {
+    if size == 0 || start > end || start >= size || end >= size {
+        return Vec::new();
+    }
+
     let mut windows = Vec::new();
     let mut position = start;
 
     while position <= end {
         let window = range_storage_window_for_start(position, size);
+        if window.0 > window.1 || window.1 < position {
+            return Vec::new();
+        }
         windows.push(window);
         if window.1 == u64::MAX {
             break;
@@ -892,9 +1103,12 @@ fn begin_media_range(resource: &str, metadata: &BzzMetadata, start: u64) -> Medi
         let previous_high_water = state.effective_high_water_end();
         let previous_request_start = state.last_request_start;
         let is_startup = previous_anchor.is_none();
+        // Compare forward movement with the completed/scheduled response
+        // frontier below, not only with the previous request's start. The
+        // normal continuation after an 8 MiB startup response is itself an
+        // 8 MiB start delta and must not be mistaken for a seek.
         let is_request_jump = previous_anchor.is_some()
-            && (start.saturating_add(STREAM_SEEK_REQUEST_GAP_BYTES) < previous_request_start
-                || start > previous_request_start.saturating_add(STREAM_SEEK_REQUEST_GAP_BYTES));
+            && start.saturating_add(STREAM_SEEK_REQUEST_GAP_BYTES) < previous_request_start;
         let is_seek = previous_anchor.is_some()
             && (is_request_jump
                 || start.saturating_add(STREAM_SEEK_RESET_GAP_BYTES)
@@ -904,10 +1118,10 @@ fn begin_media_range(resource: &str, metadata: &BzzMetadata, start: u64) -> Medi
             && previous_high_water
                 > start
                     .saturating_add(STREAM_RESPONSE_BUFFER_BYTES)
-                    .saturating_add(STREAM_PREFETCH_AHEAD_LIMIT_BYTES) as i64;
+                    .saturating_add(stream_prefetch_ahead_limit_bytes()) as i64;
 
         if is_seek || is_prefetch_runaway {
-            state.generation = state.generation.saturating_add(1);
+            state.generation = next_media_generation();
             state.anchor_start = Some(start);
             state.high_water_end = start as i64 - 1;
             state.scheduled_high_water_end = start as i64 - 1;
@@ -936,7 +1150,7 @@ fn response_range_for_request(
     streamable: bool,
     media_state: &Option<MediaRangeState>,
 ) -> (u64, u64) {
-    let mut response_bytes = STREAM_STORAGE_WINDOW_BYTES;
+    let mut response_bytes = MEDIA_STORAGE_WINDOW_BYTES;
     if streamable {
         let startup_like = media_state
             .as_ref()
@@ -974,7 +1188,9 @@ fn mark_range_windows_scheduled(
     let windows = range_storage_windows_for_span(start, end, metadata.size);
     FETCH_CACHE.with(|cache| {
         let mut cache = cache.borrow_mut();
-        let state = cache.media_state_mut(&key);
+        let Some(state) = cache.media_states.get_mut(&key) else {
+            return;
+        };
         if state.generation != media_state.generation {
             return;
         }
@@ -994,7 +1210,9 @@ fn mark_media_range_complete(
     let key = media_state_key(resource, metadata);
     FETCH_CACHE.with(|cache| {
         let mut cache = cache.borrow_mut();
-        let state = cache.media_state_mut(&key);
+        let Some(state) = cache.media_states.get_mut(&key) else {
+            return;
+        };
         if state.generation == media_state.generation {
             state.mark_complete(start, end);
         }
@@ -1013,21 +1231,11 @@ fn note_media_range_failure(
     let key = media_state_key(resource, metadata);
     FETCH_CACHE.with(|cache| {
         let mut cache = cache.borrow_mut();
-        let should_reset = {
-            let state = cache.media_state_mut(&key);
-            if state.generation == media_state.generation {
+        match cache.media_states.get_mut(&key) {
+            Some(state) if state.generation == media_state.generation => {
                 state.mark_failure(start);
-                true
-            } else {
-                false
             }
-        };
-        if should_reset {
-            cache.fail_pending_ranges_with_prefix(
-                &range_cache_prefix(resource, metadata),
-                "media range failed",
-            );
-            cache.reset_media_state(&key);
+            _ => {}
         }
     });
 }
@@ -1039,13 +1247,21 @@ async fn read_cached_range_with_retry(
     start: u64,
     end: u64,
     generation: u64,
-) -> Result<Vec<u8>, String> {
-    let mut last_error = "range retry did not run".to_string();
-    let retry_count = if generation > 0 {
-        STREAM_RANGE_RETRY_COUNT
-    } else {
-        RANGE_RETRY_COUNT
-    };
+) -> Result<Vec<u8>, RangeReadError> {
+    let expected_len = end
+        .checked_sub(start)
+        .and_then(|len| len.checked_add(1))
+        .and_then(|len| usize::try_from(len).ok())
+        .ok_or_else(|| "invalid or oversized range".to_string())?;
+    if metadata.size == 0 || start >= metadata.size || end >= metadata.size {
+        return Err("range lies outside the resolved resource".into());
+    }
+
+    let mut last_error = RangeReadError::terminal("range retry did not run");
+    // Generation-zero reads already retry inside the Bee range retriever. A second
+    // outer retry would start after the 210s timeout and outlive the service
+    // worker's request budget, while its detached first attempt still drains.
+    let retry_count = outer_range_retry_count(generation, STREAM_RANGE_RETRY_COUNT);
 
     for attempt in 0..=retry_count {
         match read_cached_range(
@@ -1058,13 +1274,13 @@ async fn read_cached_range_with_retry(
         )
         .await
         {
-            Ok(bytes) if bytes.len() == (end - start + 1) as usize => return Ok(bytes),
+            Ok(bytes) if bytes.len() == expected_len => return Ok(bytes),
             Ok(bytes) => {
-                last_error = format!(
+                last_error = RangeReadError::terminal(format!(
                     "weeb-3 returned {} bytes for {} byte range",
                     bytes.len(),
-                    end - start + 1
-                );
+                    expected_len
+                ));
             }
             Err(error) => last_error = error,
         }
@@ -1087,41 +1303,66 @@ async fn read_cached_range(
     start: u64,
     end: u64,
     generation: u64,
-) -> Result<Vec<u8>, String> {
+) -> Result<Vec<u8>, RangeReadError> {
+    if metadata.size == 0 || start > end || start >= metadata.size || end >= metadata.size {
+        return Err("range lies outside the resolved resource".into());
+    }
     let windows = range_storage_windows_for_span(start, end, metadata.size);
-    let loads = windows.iter().map(|(window_start, window_end)| {
-        read_range_window(
-            weeb3.clone(),
-            resource.clone(),
-            metadata.clone(),
-            *window_start,
-            *window_end,
-            generation,
-        )
-    });
-    let responses = join_all(loads).await;
-    let mut body = vec![0; (end - start + 1) as usize];
-    let mut offset = 0usize;
+    if windows.is_empty() {
+        return Err("range did not produce storage windows".into());
+    }
+    if windows.len() == 1 && windows[0] == (start, end) {
+        return read_range_window(weeb3, resource, metadata, start, end, generation).await;
+    }
 
-    for (index, response) in responses.into_iter().enumerate() {
-        let (window_start, window_end) = windows[index];
-        let storage_body = response?;
-        let expected_len = (window_end - window_start + 1) as usize;
-        if storage_body.len() != expected_len {
-            return Err(format!(
-                "weeb-3 returned {} bytes for {} byte storage window",
-                storage_body.len(),
-                expected_len
-            ));
+    let body_len = end
+        .checked_sub(start)
+        .and_then(|len| len.checked_add(1))
+        .and_then(|len| usize::try_from(len).ok())
+        .ok_or_else(|| "requested range is too large".to_string())?;
+    let mut body = vec![0; body_len];
+
+    for batch in windows.chunks(MEDIA_PREFETCH_MAX_PARALLEL) {
+        let loads = batch.iter().map(|(window_start, window_end)| {
+            read_range_window(
+                weeb3.clone(),
+                resource.clone(),
+                metadata.clone(),
+                *window_start,
+                *window_end,
+                generation,
+            )
+        });
+        let responses = join_all(loads).await;
+
+        for (index, response) in responses.into_iter().enumerate() {
+            let (window_start, window_end) = batch[index];
+            let storage_body = response?;
+            let expected_len = window_end
+                .checked_sub(window_start)
+                .and_then(|len| len.checked_add(1))
+                .and_then(|len| usize::try_from(len).ok())
+                .ok_or_else(|| "storage window is too large".to_string())?;
+            if storage_body.len() != expected_len {
+                return Err(RangeReadError::terminal(format!(
+                    "weeb-3 returned {} bytes for {} byte storage window",
+                    storage_body.len(),
+                    expected_len
+                )));
+            }
+
+            let overlap_start = start.max(window_start);
+            let overlap_end = end.min(window_end);
+            let local_start = usize::try_from(overlap_start - window_start)
+                .map_err(|_| "storage window offset overflow".to_string())?;
+            let local_end = usize::try_from(overlap_end - window_start)
+                .map_err(|_| "storage window offset overflow".to_string())?;
+            let destination_start = usize::try_from(overlap_start - start)
+                .map_err(|_| "range destination offset overflow".to_string())?;
+            let slice = &storage_body[local_start..=local_end];
+            let destination_end = destination_start + slice.len();
+            body[destination_start..destination_end].copy_from_slice(slice);
         }
-
-        let overlap_start = start.max(window_start);
-        let overlap_end = end.min(window_end);
-        let local_start = (overlap_start - window_start) as usize;
-        let local_end = (overlap_end - window_start) as usize;
-        let slice = &storage_body[local_start..=local_end];
-        body[offset..offset + slice.len()].copy_from_slice(slice);
-        offset += slice.len();
     }
 
     Ok(body)
@@ -1134,65 +1375,99 @@ async fn read_range_window(
     start: u64,
     end: u64,
     generation: u64,
-) -> Result<Vec<u8>, String> {
-    let key = range_cache_key(&resource, &metadata, start, end);
-    match FETCH_CACHE.with(|cache| cache.borrow_mut().range_load_role(&key, generation)) {
-        RangeLoadRole::Cached(body) => return Ok(body),
-        RangeLoadRole::Wait(receiver) => {
-            return receiver
-                .recv()
-                .await
-                .unwrap_or_else(|_| Err("range load was canceled".to_string()));
-        }
-        RangeLoadRole::Lead => {}
+) -> Result<Vec<u8>, RangeReadError> {
+    if metadata.size == 0 || start > end || start >= metadata.size || end >= metadata.size {
+        return Err("range window lies outside the resolved resource".into());
     }
+    let cache_key = range_cache_key(&resource, &metadata, start, end);
+    let pending_key = pending_range_key(&cache_key, generation);
+    let (receiver, leader_load_id) = match FETCH_CACHE.with(|cache| {
+        cache
+            .borrow_mut()
+            .range_load_role(&cache_key, &pending_key, generation)
+    }) {
+        RangeLoadRole::Cached(body) => return Ok(body),
+        RangeLoadRole::Wait(receiver) => (receiver, None),
+        RangeLoadRole::Lead(receiver, load_id) => (receiver, Some(load_id)),
+        RangeLoadRole::Reject(error) => return Err(error.into()),
+    };
 
     let timeout_ms = if generation > 0 {
         STREAM_RANGE_REQUEST_TIMEOUT_MS
     } else {
         RANGE_REQUEST_TIMEOUT_MS
     };
-    let result = async_std::future::timeout(Duration::from_millis(timeout_ms), {
+    if let Some(load_id) = leader_load_id {
         let weeb3 = weeb3.clone();
         let metadata = metadata.clone();
         let stream_key = media_state_key(&resource, &metadata);
-        async move {
-            if generation > 0 {
+        let leader_cache_key = cache_key.clone();
+        let leader_pending_key = pending_key.clone();
+        spawn_local(async move {
+            let result = if generation > 0 {
                 weeb3
-                    .acquire_resolved_stream_range(metadata, start, end, stream_key, generation)
+                    .acquire_resolved_stream_range(
+                        metadata,
+                        start,
+                        end,
+                        stream_key.clone(),
+                        generation,
+                    )
                     .await
             } else {
                 weeb3.acquire_resolved_range(metadata, start, end).await
+            };
+            let expected_len = end
+                .checked_sub(start)
+                .and_then(|len| len.checked_add(1))
+                .and_then(|len| usize::try_from(len).ok());
+            let load_result = match (result, expected_len) {
+                (Some((body, _metadata)), Some(expected_len)) if body.len() == expected_len => {
+                    Ok(body)
+                }
+                (Some((body, _metadata)), Some(expected_len)) => Err(format!(
+                    "weeb-3 returned {} bytes for {} byte range",
+                    body.len(),
+                    expected_len
+                )),
+                (Some(_), None) => Err("requested range is too large".to_string()),
+                (None, _) => Err(format!("weeb-3 did not retrieve range {}-{}", start, end)),
+            };
+
+            if let Ok(body) = &load_result {
+                FETCH_CACHE.with(|cache| {
+                    cache.borrow_mut().remember_range(
+                        leader_cache_key.clone(),
+                        body.clone(),
+                        &stream_key,
+                        generation,
+                    );
+                });
             }
-        }
-    })
-    .await;
 
-    let load_result = match result {
-        Ok(Some((body, _metadata))) if body.len() == (end - start + 1) as usize => Ok(body),
-        Ok(Some((body, _metadata))) => Err(format!(
-            "weeb-3 returned {} bytes for {} byte range",
-            body.len(),
-            end - start + 1
-        )),
-        Ok(None) => Err(format!("weeb-3 did not retrieve range {}-{}", start, end)),
-        Err(_) => Err(format!("timed out retrieving range {}-{}", start, end)),
-    };
-
-    if let Ok(body) = &load_result {
-        FETCH_CACHE.with(|cache| {
-            cache
-                .borrow_mut()
-                .remember_range(key.clone(), body.clone(), generation);
+            FETCH_CACHE.with(|cache| {
+                cache.borrow_mut().finish_pending_range(
+                    &leader_pending_key,
+                    generation,
+                    load_id,
+                    load_result,
+                );
+            });
         });
     }
 
-    FETCH_CACHE.with(|cache| {
-        cache
-            .borrow_mut()
-            .finish_pending_range(&key, load_result.clone());
-    });
-    load_result
+    match async_std::future::timeout(Duration::from_millis(timeout_ms), receiver.recv()).await {
+        Ok(Ok(result)) => result.map_err(RangeReadError::terminal),
+        Ok(Err(_)) => Err(RangeReadError::terminal("range load was canceled")),
+        Err(_) => {
+            let error = format!("timed out retrieving range {}-{}", start, end);
+            // Keep the shared slot while its detached transport drains. This waiter
+            // closes when we return, and a retry joins the same load instead of
+            // launching duplicate chunk/accounting work. Completion still removes
+            // only the exact generation/load id, so a seek may replace it safely.
+            Err(RangeReadError::waiter_timeout(error))
+        }
+    }
 }
 
 fn spawn_prefetch_media_stages(
@@ -1207,7 +1482,12 @@ fn spawn_prefetch_media_stages(
     let key = media_state_key(&resource, &metadata);
     let should_spawn = FETCH_CACHE.with(|cache| {
         let mut cache = cache.borrow_mut();
-        let state = cache.media_state_mut(&key);
+        let Some(state) = cache.media_states.get_mut(&key) else {
+            return false;
+        };
+        if state.generation != generation {
+            return false;
+        }
         if state.prefetch_running && state.prefetch_generation == generation {
             return false;
         }
@@ -1235,9 +1515,10 @@ fn spawn_prefetch_media_stages(
         let key = media_state_key(&resource, &metadata);
         FETCH_CACHE.with(|cache| {
             let mut cache = cache.borrow_mut();
-            let state = cache.media_state_mut(&key);
-            if state.prefetch_generation == generation {
-                state.prefetch_running = false;
+            if let Some(state) = cache.media_states.get_mut(&key) {
+                if state.generation == generation && state.prefetch_generation == generation {
+                    state.prefetch_running = false;
+                }
             }
         });
     });
@@ -1252,11 +1533,12 @@ async fn prefetch_media_stages(
     requested_end: u64,
     generation: u64,
 ) {
+    let ahead_limit_bytes = stream_prefetch_ahead_limit_bytes();
     let prefetch_limit_end = requested_end
-        .min(response_end.saturating_add(STREAM_PREFETCH_AHEAD_LIMIT_BYTES))
+        .min(response_end.saturating_add(ahead_limit_bytes))
         .min(metadata.size.saturating_sub(1));
 
-    for stage_bytes in STREAM_PREFETCH_STAGE_BYTES {
+    for stage_target_bytes in media_prefetch_stage_targets(ahead_limit_bytes) {
         if !media_generation_current(&resource, &metadata, generation) {
             return;
         }
@@ -1268,8 +1550,8 @@ async fn prefetch_media_stages(
             return;
         }
 
-        let target_end = current_end
-            .saturating_add(stage_bytes)
+        let target_end = response_end
+            .saturating_add(stage_target_bytes)
             .min(prefetch_limit_end)
             .min(metadata.size.saturating_sub(1));
         prefetch_media_windows(
@@ -1317,7 +1599,7 @@ async fn prefetch_media_windows(
 
         let mut windows = Vec::new();
         let mut next = position;
-        while next <= target_end && windows.len() < STREAM_PREFETCH_MAX_WINDOWS {
+        while next <= target_end && windows.len() < MEDIA_PREFETCH_MAX_PARALLEL {
             let window = range_storage_window_for_start(next, metadata.size);
             windows.push(window);
             mark_media_window_scheduled(&resource, &metadata, window.1, generation);
@@ -1353,7 +1635,7 @@ async fn prefetch_media_windows(
             }
         }
 
-        async_std::task::sleep(Duration::from_millis(STREAM_PREFETCH_BATCH_YIELD_MS)).await;
+        async_std::task::sleep(Duration::from_millis(MEDIA_PREFETCH_BATCH_YIELD_MS)).await;
     }
 }
 
@@ -1385,7 +1667,9 @@ fn mark_media_window_scheduled(resource: &str, metadata: &BzzMetadata, end: u64,
     let key = media_state_key(resource, metadata);
     FETCH_CACHE.with(|cache| {
         let mut cache = cache.borrow_mut();
-        let state = cache.media_state_mut(&key);
+        let Some(state) = cache.media_states.get_mut(&key) else {
+            return;
+        };
         if state.generation == generation {
             state.mark_scheduled(end);
         }
@@ -1402,7 +1686,9 @@ fn mark_media_window_complete(
     let key = media_state_key(resource, metadata);
     FETCH_CACHE.with(|cache| {
         let mut cache = cache.borrow_mut();
-        let state = cache.media_state_mut(&key);
+        let Some(state) = cache.media_states.get_mut(&key) else {
+            return;
+        };
         if state.generation == generation {
             state.mark_complete(start, end);
         }
@@ -1413,7 +1699,9 @@ fn mark_media_window_failure(resource: &str, metadata: &BzzMetadata, start: u64,
     let key = media_state_key(resource, metadata);
     FETCH_CACHE.with(|cache| {
         let mut cache = cache.borrow_mut();
-        let state = cache.media_state_mut(&key);
+        let Some(state) = cache.media_states.get_mut(&key) else {
+            return;
+        };
         if state.generation == generation {
             state.mark_failure(start);
         }
@@ -1441,49 +1729,12 @@ fn metadata_headers(metadata: &BzzMetadata, length: u64) -> Vec<(String, String)
     headers
 }
 
-fn parse_single_range(range: Option<&str>, size: u64) -> Option<Result<(u64, u64), ()>> {
-    let range = range?.trim();
-    let Some(spec) = range.strip_prefix("bytes=") else {
-        return Some(Err(()));
-    };
-    if spec.contains(',') || size == 0 {
-        return Some(Err(()));
-    }
-
-    let (start, end) = spec.split_once('-')?;
-    if start.is_empty() {
-        let suffix = end.parse::<u64>().ok()?;
-        if suffix == 0 {
-            return Some(Err(()));
-        }
-        let start = size.saturating_sub(suffix);
-        return Some(Ok((start, size - 1)));
-    }
-
-    let start = start.parse::<u64>().ok()?;
-    if start >= size {
-        return Some(Err(()));
-    }
-
-    let end = if end.is_empty() {
-        size - 1
-    } else {
-        end.parse::<u64>().ok()?.min(size - 1)
-    };
-
-    if end < start {
-        return Some(Err(()));
-    }
-
-    Some(Ok((start, end)))
-}
-
 fn canonical_bzz_resource(pathname: &str) -> Option<String> {
-    for marker in BZZ_MARKERS {
-        let Some(idx) = pathname.find(marker) else {
+    for marker in route_markers("bzz") {
+        let Some(resource) = pathname.strip_prefix(&marker) else {
             continue;
         };
-        let resource = pathname[idx + marker.len()..].trim();
+        let resource = resource.trim();
         if resource.is_empty() {
             return None;
         }
@@ -1500,24 +1751,33 @@ fn canonical_bzz_resource(pathname: &str) -> Option<String> {
 }
 
 fn canonical_raw_resource(pathname: &str) -> Option<(String, String)> {
-    for (marker, raw_type) in RAW_ROUTE_MARKERS {
-        if let Some(idx) = pathname.find(marker) {
-            let resource = pathname[idx + marker.len()..].trim();
+    for (marker, raw_type) in raw_route_markers() {
+        if let Some(resource) = pathname.strip_prefix(&marker) {
+            let resource = resource.trim();
             if resource.is_empty() {
                 return None;
             }
-            return Some((raw_type.to_string(), decode_component(resource)));
+            return Some((raw_type, decode_component(resource)));
         }
     }
 
     None
 }
 
-fn decode_component(value: &str) -> String {
-    js_sys::decode_uri_component(value)
-        .ok()
-        .and_then(|value| value.as_string())
-        .unwrap_or_else(|| value.to_string())
+fn raw_route_markers() -> Vec<(String, String)> {
+    ["", "mainnet/", "testnet/"]
+        .into_iter()
+        .flat_map(|network| {
+            [("bytes", "bytes"), ("chunks", "chunk"), ("chunk", "chunk")]
+                .into_iter()
+                .map(move |(kind, raw_type)| {
+                    (
+                        streaming_route_path(&format!("{network}{kind}/")),
+                        raw_type.to_string(),
+                    )
+                })
+        })
+        .collect()
 }
 
 fn is_swarm_reference(reference: &str) -> bool {
@@ -1529,22 +1789,39 @@ pub async fn try_render_streaming_player(
     weeb3: Arc<Weeb3>,
     resource: String,
     metadata: BzzMetadata,
+    view_generation: u64,
 ) -> bool {
     if !is_streamable_mime(&metadata.mime) {
         return false;
+    }
+    if !result_view_request_is_current(view_generation) {
+        return true;
     }
 
     let Some(src) = canonical_bzz_url(&resource, &metadata) else {
         return false;
     };
 
-    if !service_worker_controls_bzz_requests(&weeb3, "stream requests").await {
+    if !service_worker_controls_bzz_requests(&weeb3, "stream requests", || {
+        result_view_request_is_current(view_generation)
+    })
+    .await
+    {
+        if !result_view_request_is_current(view_generation) {
+            return true;
+        }
         navigate_to_bzz_url(&src);
+        return true;
+    }
+    if !result_view_request_is_current(view_generation) {
         return true;
     }
 
     let player = create_streaming_player(&metadata.mime, &src);
-    replace_result_view(&player);
+    if !replace_bzz_result_view(&player, view_generation) {
+        return true;
+    }
+    install_bzz_media_prefetch_lifecycle(&player, &src);
     install_playback_notifications(&player, &src);
     install_play_retries(&player, &src);
     start_streaming_player(&player);
@@ -1713,7 +1990,7 @@ fn js_string_property(obj: &js_sys::Object, name: &str) -> Option<String> {
 }
 
 fn message_port(event: &MessageEvent) -> Option<web_sys::MessagePort> {
-    let ports: Array = event.ports().into();
+    let ports: Array = event.ports();
     ports.get(0).dyn_into::<web_sys::MessagePort>().ok()
 }
 
@@ -1737,8 +2014,8 @@ fn canonical_bzz_url(resource: &str, metadata: &BzzMetadata) -> Option<String> {
     };
 
     let prefix = match active_profile().mode {
-        NetworkMode::Mainnet => "/weeb-3/bzz",
-        NetworkMode::Testnet => "/weeb-3/testnet/bzz",
+        NetworkMode::Mainnet => streaming_route_path("bzz"),
+        NetworkMode::Testnet => streaming_route_path("testnet/bzz"),
     };
 
     if path.is_empty() || path.starts_with("unknown") || path == "not found" {
@@ -1748,7 +2025,30 @@ fn canonical_bzz_url(resource: &str, metadata: &BzzMetadata) -> Option<String> {
     }
 }
 
-fn replace_result_view(new_element: &Element) {
+pub(crate) fn replace_stream_result_view(new_element: &Element, view_generation: u64) -> bool {
+    if !result_view_request_is_current(view_generation) {
+        return false;
+    }
+    replace_result_view_contents(new_element);
+    true
+}
+
+fn replace_bzz_result_view(new_element: &Element, view_generation: u64) -> bool {
+    if !result_view_request_is_current(view_generation) {
+        return false;
+    }
+    crate::stream_hls::release_hls_for_bzz_view();
+    release_bzz_view();
+    replace_result_view_dom(new_element);
+    true
+}
+
+pub(crate) fn replace_result_view_contents(new_element: &Element) {
+    release_current_stream_view();
+    replace_result_view_dom(new_element);
+}
+
+fn replace_result_view_dom(new_element: &Element) {
     let document = web_sys::window().unwrap().document().unwrap();
     let result = document
         .get_element_by_id("resultField")
@@ -1758,6 +2058,24 @@ fn replace_result_view(new_element: &Element) {
 
     result.set_inner_html("");
     let _ = result.append_child(new_element);
+}
+
+pub(crate) fn release_current_stream_view() {
+    crate::stream_hls::release_hls_view();
+    release_bzz_view();
+}
+
+fn release_bzz_view() {
+    ACTIVE_BZZ_MEDIA_URL.with(|active| {
+        if let Some(url) = active.borrow_mut().take() {
+            let _ = suspend_bzz_fetch_url_prefetch(&url);
+        }
+    });
+    MEDIA_ELEMENT_CALLBACKS.with(|callbacks| callbacks.borrow_mut().clear());
+}
+
+pub(crate) fn clear_completed_bzz_media_ranges() {
+    FETCH_CACHE.with(|cache| cache.borrow_mut().clear_completed_ranges());
 }
 
 fn create_streaming_player(mime: &str, src: &str) -> Element {
@@ -1802,7 +2120,7 @@ fn start_streaming_player(player: &Element) {
     call_media_method(player, "play");
 }
 
-fn call_media_method(player: &Element, method: &str) {
+pub(crate) fn call_media_method(player: &Element, method: &str) {
     let Ok(function) = Reflect::get(player.as_ref(), &JsValue::from_str(method)) else {
         return;
     };
@@ -1810,6 +2128,40 @@ fn call_media_method(player: &Element, method: &str) {
         return;
     };
     let _ = function.call0(player.as_ref());
+}
+
+pub(crate) fn retain_media_element_callback(
+    target: &Element,
+    event_name: &'static str,
+    callback: Closure<dyn FnMut()>,
+) {
+    if target
+        .add_event_listener_with_callback(event_name, callback.as_ref().unchecked_ref())
+        .is_err()
+    {
+        return;
+    }
+    MEDIA_ELEMENT_CALLBACKS.with(|callbacks| {
+        callbacks.borrow_mut().push(MediaElementCallback {
+            target: target.clone(),
+            event_name,
+            callback,
+        });
+    });
+}
+
+fn install_bzz_media_prefetch_lifecycle(player: &Element, src: &str) {
+    ACTIVE_BZZ_MEDIA_URL.with(|active| {
+        *active.borrow_mut() = Some(src.to_string());
+    });
+
+    for event_name in ["pause", "seeking"] {
+        let src = src.to_string();
+        let callback = Closure::<dyn FnMut()>::new(move || {
+            let _ = suspend_bzz_fetch_url_prefetch(&src);
+        });
+        retain_media_element_callback(player, event_name, callback);
+    }
 }
 
 fn install_playback_notifications(player: &Element, src: &str) {
@@ -1824,8 +2176,7 @@ fn install_playback_notifications(player: &Element, src: &str) {
         notify_media_playing(&src);
     });
 
-    let _ = player.add_event_listener_with_callback("playing", callback.as_ref().unchecked_ref());
-    callback.forget();
+    retain_media_element_callback(player, "playing", callback);
 }
 
 fn install_play_retries(player: &Element, src: &str) {
@@ -1844,9 +2195,7 @@ fn install_play_retries(player: &Element, src: &str) {
             start_streaming_player(&player_for_callback);
         });
 
-        let _ = event_target
-            .add_event_listener_with_callback(event_name, callback.as_ref().unchecked_ref());
-        callback.forget();
+        retain_media_element_callback(&event_target, event_name, callback);
     }
 
     {
@@ -1858,8 +2207,7 @@ fn install_play_retries(player: &Element, src: &str) {
             let _ = reset_bzz_fetch_url_activity(&src, "media error");
             schedule_media_retry(player_for_callback.clone(), src.clone());
         });
-        let _ = player.add_event_listener_with_callback("error", callback.as_ref().unchecked_ref());
-        callback.forget();
+        retain_media_element_callback(player, "error", callback);
     }
 
     for event_name in [
@@ -1896,13 +2244,14 @@ fn install_play_retries(player: &Element, src: &str) {
             start_media_retry(&player_for_callback, &src, false);
         });
 
-        let _ = event_target
-            .add_event_listener_with_callback(event_name, callback.as_ref().unchecked_ref());
-        callback.forget();
+        retain_media_element_callback(&event_target, event_name, callback);
     }
 }
 
 fn schedule_media_retry(player: Element, src: String) {
+    if !player.is_connected() {
+        return;
+    }
     let errored = player.get_attribute("data-weeb3-media-error").as_deref() == Some("1");
     if !errored {
         return;
@@ -1926,12 +2275,18 @@ fn schedule_media_retry(player: Element, src: String) {
     let _ = player.set_attribute("data-weeb3-media-retry-scheduled", "1");
     spawn_local(async move {
         async_std::task::sleep(Duration::from_millis(delay_ms)).await;
+        if !player.is_connected() {
+            return;
+        }
         let _ = player.remove_attribute("data-weeb3-media-retry-scheduled");
         start_media_retry(&player, &src, true);
     });
 }
 
 fn start_media_retry(player: &Element, src: &str, advance_attempt: bool) {
+    if !player.is_connected() {
+        return;
+    }
     let errored = player.get_attribute("data-weeb3-media-error").as_deref() == Some("1");
     if !errored {
         return;

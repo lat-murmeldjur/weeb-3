@@ -15,29 +15,36 @@ class Code_One {
 		clientele('cargo', ['fix', '--allow-staged', '--allow-dirty'], count);
 		var wbuild:Array<Null<Bool>> = [null];
 		var build:Array<Null<Bool>> = [null];
-		clientele('cargo', ['build'], count, build);
 
 		Sys.putEnv("RUSTFLAGS", "--cfg getrandom_backend=\"wasm_js\"");
 		clientele('wasm-pack', [ '-v', 'build', '--target', 'web', '--out-dir', 'static', '--out-name', 'weeb_3'], count, wbuild);
 		Sys.putEnv("RUSTFLAGS", null);
+		clientele('cargo', ['build'], count, build);
 
 		if ( build[0] && wbuild[0]) {
+			var clean:Array<Null<Bool>> = [null];
+			clientele('rm', [ '-rf', './docs/snippets' ], count, clean);
+			if (!clean[0]) {
+				trace('Warning/Error: Cannot replace generated docs snippets');
+				return;
+			}
 			clientele('cp', [ './static/example.html', './docs/' ], count);
+			clientele('cp', [ './static/hls-stream-example.html', './docs/' ], count);
 			clientele('cp', [ './static/issue-1-json-sync-example.html', './docs/' ], count);
 			clientele('cp', [ './static/index.html', './docs/' ], count);
 			clientele('cp', [ './static/404.html', './docs/' ], count);
 			clientele('cp', [ './static/weeb_3.js', './docs/' ], count);
 			clientele('cp', [ './static/weeb_3_bg.wasm', './docs/' ], count);
 			clientele('cp', [ './static/service.js', './docs/' ], count);
-
-			clientele('mkdir', [ '-p', './docs/snippets/web3-0742d85b024bb6f5' ], count);
-			clientele('cp', [ './static/snippets/web3-0742d85b024bb6f5/inline0.js', './docs/snippets/web3-0742d85b024bb6f5/inline0.js' ], count);
+			clientele('mkdir', [ '-p', './docs/snippets' ], count);
+			clientele('cp', [ '-R', './static/snippets/.', './docs/snippets/' ], count);
 
 			var mist = gitcoal(w1);
 			var dome = gitcoal(w2);
 			temporas(w3);
 
 			clientele('git', ['checkout', '-b', 'feature-$dome'], count);
+			clientele('git', ['add', '-f', './static/hls-stream-example.html', './static/hls_loader.js'], count);
 			clientele('git', ['add', '.'], count);
 			clientele('git', ['commit', '-am', '"Commit number $mist"'], count);
 			clientele('git', ['push', 'origin', 'feature-$dome'], count);

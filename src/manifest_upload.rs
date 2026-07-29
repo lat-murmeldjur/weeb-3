@@ -2,6 +2,13 @@ use crate::{
     //
     JsValue,
     //
+    erasure_coding::RedundancyLevel,
+    //
+    manifest_conventions::{
+        MANTARAY_PREFIX_MAX_BYTES, common_prefix_bytes, encode_fork,
+        encode_fork_with_separator_path, fork_prefix, ordered_indexed_forks, split_prefix_bytes,
+    },
+    //
     //
     mpsc,
     //
@@ -30,10 +37,64 @@ pub struct Node {
     pub path: String,
 }
 
+#[derive(Clone)]
+struct BytePathNode {
+    data: Vec<u8>,
+    mime: String,
+    filename: String,
+    path: Vec<u8>,
+}
+
 pub async fn create_manifest(
     obfuscated: bool,
     encrypted: bool,
+    redundancy_level: RedundancyLevel,
     input_forks: Vec<Node>,
+    data_forks: Vec<Vec<u8>>,
+    reference: Vec<u8>,
+    root_manifest: bool,
+    first_node_cutoff: usize,
+    index: String,
+    errordoc: String,
+    batch_owner: Vec<u8>,
+    batch_id: Vec<u8>,
+    data_upload_chan: &mpsc::Sender<DataUploadRequest>,
+    progress: Option<UploadProgressSender>,
+) -> Vec<u8> {
+    let input_forks = input_forks
+        .into_iter()
+        .map(|node| BytePathNode {
+            data: node.data,
+            mime: node.mime,
+            filename: node.filename,
+            path: node.path.into_bytes(),
+        })
+        .collect();
+
+    create_manifest_bytes(
+        obfuscated,
+        encrypted,
+        redundancy_level,
+        input_forks,
+        data_forks,
+        reference,
+        root_manifest,
+        first_node_cutoff,
+        index,
+        errordoc,
+        batch_owner,
+        batch_id,
+        data_upload_chan,
+        progress,
+    )
+    .await
+}
+
+async fn create_manifest_bytes(
+    obfuscated: bool,
+    encrypted: bool,
+    redundancy_level: RedundancyLevel,
+    input_forks: Vec<BytePathNode>,
     data_forks: Vec<Vec<u8>>,
     reference: Vec<u8>,
     root_manifest: bool,
@@ -125,38 +186,35 @@ pub async fn create_manifest(
     );
 
     let mut fork_bases: Vec<Vec<u8>> = vec![];
-    let mut fork_bases_virtual: Vec<Vec<u8>> = vec![];
 
-    if forks.len() > 0 {
-        let mut fork_groups0: Vec<(String, Vec<Node>)> = vec![];
+    if !forks.is_empty() {
+        let mut fork_groups0: Vec<(u8, Vec<BytePathNode>)> = vec![];
 
-        for forks0 in &forks {
-            let path0 = forks0.path.clone();
-            let leading_char = path0[0..1].to_string();
-
-            let mut exists = false;
-            for (a, b) in fork_groups0.iter_mut() {
-                if *a == leading_char {
-                    b.push(forks0.clone());
-                    exists = true;
-                    break;
-                };
-            }
-            if !exists {
-                fork_groups0.push((leading_char, vec![forks0.clone()]));
+        for fork in &forks {
+            let Some(&leading_byte) = fork.path.first() else {
+                manifest_upload_log!("Manifest path must not be empty");
+                return vec![];
             };
+
+            if let Some((_, group)) = fork_groups0
+                .iter_mut()
+                .find(|(byte, _)| *byte == leading_byte)
+            {
+                group.push(fork.clone());
+            } else {
+                fork_groups0.push((leading_byte, vec![fork.clone()]));
+            }
         }
 
-        let mut fork_groups1: Vec<(String, Vec<Node>)> = vec![];
-
+        let mut fork_groups1: Vec<(Vec<u8>, Vec<BytePathNode>)> = vec![];
         for (_, forkgroup0) in fork_groups0 {
-            let mut common_prefix = forkgroup0[0].path.clone();
-            for fork0 in &forkgroup0 {
-                while !fork0.path.starts_with(&common_prefix) {
-                    common_prefix.pop(); // Shorten the prefix
-                }
-            }
-
+            let paths = forkgroup0
+                .iter()
+                .map(|fork| fork.path.as_slice())
+                .collect::<Vec<_>>();
+            let Some(common_prefix) = common_prefix_bytes(&paths) else {
+                return vec![];
+            };
             fork_groups1.push((common_prefix, forkgroup0));
         }
 
@@ -164,66 +222,40 @@ pub async fn create_manifest(
 
         let mut cutoff_first_indicator = 0;
         for (common_prefix, mut forkgroup1) in fork_groups1 {
-            // let mut forkgroup1 = fork_groups1[common_prefix].clone();
             forkgroup1.sort_by(|a, b| a.path.cmp(&b.path));
             cutoff_first_indicator += 1;
             if forkgroup1.len() == 1 {
-                let forks0 = &forkgroup1[0];
-
-                let mut vforks: Vec<String> = vec![];
-
-                let path0: String = match cutoff_first_indicator == 1 && fncutoff > 0 {
-                    false => forks0.path.clone(),
-                    true => {
-                        if forks0.path.len() > 30 - (fncutoff % 30) {
-                            vforks.push(forks0.path[0..30 - (fncutoff % 30)].to_string());
-                            let tr = forks0.path[30 - (fncutoff % 30)..].to_string();
-                            fncutoff = 0;
-                            tr
-                        } else {
-                            forks0.path.clone()
-                        }
-                    }
+                let fork = &forkgroup1[0];
+                let first_capacity = if cutoff_first_indicator == 1 && fncutoff > 0 {
+                    MANTARAY_PREFIX_MAX_BYTES - (fncutoff % MANTARAY_PREFIX_MAX_BYTES)
+                } else {
+                    MANTARAY_PREFIX_MAX_BYTES
                 };
-
-                let mime0 = forks0.mime.clone();
-                // let filename0 = forks0.filename.clone();
-                let data_address0 = forks0.data.clone();
-
-                let mut section_begin;
-                let mut section_end;
-                let mut partial_section = path0.len() % 30;
-                if partial_section > 0 {
-                    partial_section = 1;
-                }
-                for i in 0..(path0.len() / 30) + partial_section {
-                    section_begin = i * 30;
-                    section_end = (i + 1) * 30;
-                    if (i + 1) * 30 > path0.len() {
-                        section_end = path0.len();
-                    }
-                    vforks.push(path0[section_begin..section_end].to_string())
+                let Some(vforks) = split_prefix_bytes(&fork.path, first_capacity) else {
+                    return vec![];
+                };
+                if first_capacity < MANTARAY_PREFIX_MAX_BYTES && fork.path.len() > first_capacity {
+                    fncutoff = 0;
                 }
 
-                let mut current_data_reference: Vec<u8> = data_address0;
-                let mut current_fork: Vec<u8>;
-
+                let mut current_data_reference = fork.data.clone();
                 let value_final = serde_json::to_vec(&json!({
-                        "Content-Type": mime0,
-                        "Filename": &forks0.filename.clone(),
+                    "Content-Type": &fork.mime,
+                    "Filename": &fork.filename,
                 }))
                 .unwrap();
 
-                let tip_mf = Box::pin(create_manifest(
+                let tip_mf = Box::pin(create_manifest_bytes(
                     obfuscated,
                     encrypted,
-                    vec![],                 // forks
-                    vec![],                 // data_forks
-                    current_data_reference, // reference
-                    false,                  // root manifest
-                    0,                      // weird string prefix cutoff for first element
-                    "".to_string(),         // index
-                    "".to_string(),         // errordoc
+                    redundancy_level,
+                    vec![],
+                    vec![],
+                    current_data_reference,
+                    false,
+                    0,
+                    String::new(),
+                    String::new(),
                     batch_owner.clone(),
                     batch_id.clone(),
                     data_upload_chan,
@@ -237,6 +269,7 @@ pub async fn create_manifest(
                 current_data_reference = upload_data(
                     vec![tip_mf],
                     encrypted,
+                    redundancy_level,
                     batch_owner.clone(),
                     batch_id.clone(),
                     data_upload_chan,
@@ -247,36 +280,33 @@ pub async fn create_manifest(
                     return vec![];
                 }
 
-                for j in 0..vforks.len() {
-                    let i = vforks.len() - 1 - j;
-
-                    //
-                    let mut current_metadata = vec![];
-                    if i == vforks.len() - 1 {
-                        current_metadata = value_final.clone();
-                    }
-
-                    current_fork = create_fork(
-                        vforks[i].clone(),
-                        current_data_reference.clone(),
-                        current_metadata,
-                    )
-                    .await;
-                    if current_fork.is_empty() {
+                for i in (0..vforks.len()).rev() {
+                    let current_metadata = if i == vforks.len() - 1 {
+                        value_final.clone()
+                    } else {
+                        vec![]
+                    };
+                    let Some(current_fork) = encode_fork(
+                        &vforks[i],
+                        &current_data_reference,
+                        &current_metadata,
+                        current_metadata.is_empty(),
+                    ) else {
                         return vec![];
-                    }
+                    };
 
                     if i > 0 {
-                        let current_manifest = Box::pin(create_manifest(
+                        let current_manifest = Box::pin(create_manifest_bytes(
                             obfuscated,
                             encrypted,
-                            vec![],             // forks
-                            vec![current_fork], // data_forks
-                            vec![],             // reference
-                            false,              // root manifest
-                            0,                  // weird string prefix cutoff for first element
-                            "".to_string(),     // index
-                            "".to_string(),     // errordoc
+                            redundancy_level,
+                            vec![],
+                            vec![current_fork],
+                            vec![],
+                            false,
+                            0,
+                            String::new(),
+                            String::new(),
                             batch_owner.clone(),
                             batch_id.clone(),
                             data_upload_chan,
@@ -290,6 +320,7 @@ pub async fn create_manifest(
                         current_data_reference = upload_data(
                             vec![current_manifest],
                             encrypted,
+                            redundancy_level,
                             batch_owner.clone(),
                             batch_id.clone(),
                             data_upload_chan,
@@ -304,26 +335,46 @@ pub async fn create_manifest(
                     }
                 }
             } else {
-                let mut forkgroup2: Vec<Node> = vec![];
-                for fork0 in forkgroup1 {
-                    forkgroup2.push(Node {
-                        data: fork0.data.clone(),
-                        mime: fork0.mime.clone(),
-                        filename: fork0.filename.clone(),
-                        path: fork0.path[common_prefix.len()..].to_string(),
-                    });
+                let separator_path = forkgroup1
+                    .last()
+                    .map(|fork| fork.path.clone())
+                    .unwrap_or_else(|| common_prefix.clone());
+                let mut exact_value = None;
+                let mut descendants = Vec::with_capacity(forkgroup1.len());
+                for mut fork in forkgroup1 {
+                    if fork.path.len() == common_prefix.len() {
+                        // Bee's Add semantics replace an existing value at the
+                        // same path, so the last sorted duplicate wins.
+                        exact_value = Some(fork);
+                    } else {
+                        fork.path = fork.path[common_prefix.len()..].to_vec();
+                        descendants.push(fork);
+                    }
                 }
 
-                let group_manifest = Box::pin(create_manifest(
+                let has_edge = !descendants.is_empty();
+                let (group_reference, group_metadata) = if let Some(exact) = exact_value {
+                    let metadata = serde_json::to_vec(&json!({
+                        "Content-Type": exact.mime,
+                        "Filename": exact.filename,
+                    }))
+                    .unwrap();
+                    (exact.data, metadata)
+                } else {
+                    (vec![], vec![])
+                };
+
+                let group_manifest = Box::pin(create_manifest_bytes(
                     obfuscated,
                     encrypted,
-                    forkgroup2,                     // forks
-                    vec![],                         // data_forks
-                    vec![],                         // reference
-                    false,                          // root manifest
-                    fncutoff + common_prefix.len(), // weird string prefix cutoff for first element
-                    "".to_string(),                 // index
-                    "".to_string(),                 // errordoc
+                    redundancy_level,
+                    descendants,
+                    vec![],
+                    group_reference,
+                    false,
+                    fncutoff + common_prefix.len(),
+                    String::new(),
+                    String::new(),
                     batch_owner.clone(),
                     batch_id.clone(),
                     data_upload_chan,
@@ -339,6 +390,7 @@ pub async fn create_manifest(
                 let group_data_reference = upload_data(
                     vec![group_manifest],
                     encrypted,
+                    redundancy_level,
                     batch_owner.clone(),
                     batch_id.clone(),
                     data_upload_chan,
@@ -349,15 +401,15 @@ pub async fn create_manifest(
                     return vec![];
                 }
 
-                let group_fork = create_fork(
-                    common_prefix.to_string(),
-                    group_data_reference.clone(),
-                    vec![],
-                )
-                .await;
-                if group_fork.is_empty() {
+                let Some(group_fork) = encode_fork_with_separator_path(
+                    &common_prefix,
+                    &group_data_reference,
+                    &group_metadata,
+                    has_edge,
+                    &separator_path,
+                ) else {
                     return vec![];
-                }
+                };
 
                 fork_bases.push(group_fork);
             }
@@ -383,6 +435,7 @@ pub async fn create_manifest(
         let stub_reference = upload_data(
             vec![create_stub(stub_ref_size, obfuscated).await],
             encrypted,
+            redundancy_level,
             batch_owner.clone(),
             batch_id.clone(),
             data_upload_chan,
@@ -393,65 +446,33 @@ pub async fn create_manifest(
             return vec![];
         }
 
-        let mut root_fork = create_fork("/".to_string(), stub_reference, root_metadata).await;
+        let root_fork = create_fork("/".to_string(), stub_reference, root_metadata).await;
         if root_fork.is_empty() {
             return vec![];
         }
-        fork_bases_virtual.push(root_fork[0..3].to_vec());
-        manifest_bytes_vec.append(&mut root_fork);
+        fork_bases.push(root_fork);
     }
 
-    manifest_upload_log!(
-        "Manifest length after node forks: {}",
-        manifest_bytes_vec.len()
-    );
+    let mut serialized_forks = data_forks;
+    serialized_forks.append(&mut fork_bases);
+    let Some((serialized_forks, index_bytes)) = ordered_indexed_forks(serialized_forks) else {
+        manifest_upload_log!("Manifest contains malformed or colliding fork prefixes");
+        return vec![];
+    };
 
-    fork_bases.sort_by(|a, b| forkstring(a.to_vec()).cmp(&forkstring(b.to_vec())));
+    manifest_bytes_vec[index_bytes_start..index_bytes_start + index_bytes.len()]
+        .copy_from_slice(&index_bytes);
 
-    let mut kj = 0;
-    for log in &fork_bases {
-        manifest_upload_log!("Sorted prefix: {} {}", kj, forkstring(log.to_vec()));
-        kj += 1;
+    for (position, mut fork) in serialized_forks.into_iter().enumerate() {
+        manifest_upload_log!(
+            "Sorted prefix: {} {}",
+            position,
+            hex::encode(fork_prefix(&fork))
+        );
+        manifest_bytes_vec.append(&mut fork);
     }
 
-    for f1 in &data_forks {
-        manifest_bytes_vec.append(&mut f1.clone());
-    }
-
-    for f2 in &fork_bases {
-        manifest_bytes_vec.append(&mut f2.clone());
-    }
-
-    manifest_upload_log!(
-        "Manifest length after data node forks: {}",
-        manifest_bytes_vec.len()
-    );
-
-    // set index_bytes
-
-    let mut bits_as_bytes = [0_u8; 32];
-
-    for f1 in data_forks {
-        let b: u8 = f1[2];
-
-        bits_as_bytes[(b / 8) as usize] |= 1 << (b % 8);
-    }
-
-    for f2 in fork_bases {
-        let b: u8 = f2[2];
-
-        bits_as_bytes[(b / 8) as usize] |= 1 << (b % 8);
-    }
-
-    for f3 in fork_bases_virtual {
-        let b: u8 = f3[2];
-
-        bits_as_bytes[(b / 8) as usize] |= 1 << (b % 8);
-    }
-
-    for i in 0..32 {
-        manifest_bytes_vec[index_bytes_start + i] = bits_as_bytes[i];
-    }
+    manifest_upload_log!("Manifest length after forks: {}", manifest_bytes_vec.len());
 
     {
         let obfuscation_key = &manifest_bytes_vec[0..32];
@@ -490,70 +511,16 @@ pub async fn create_manifest(
 }
 
 pub async fn create_fork(path: String, reference: Vec<u8>, metadata: Vec<u8>) -> Vec<u8> {
-    let mut node: Vec<u8> = vec![];
-
-    if metadata.len() == 0 {
-        if path.contains("/") {
-            node.push(12_u8);
-        } else {
-            node.push(4_u8);
-        }
-    } else {
-        if path.contains("/") && path.len() > 1 {
-            node.push(26_u8);
-        } else {
-            node.push(18_u8);
-        }
-    };
-
-    if path.len() > 30 {
-        manifest_upload_log!("Fork string prefix overlength {:#?}!", path);
-
-        return vec![];
-    } else {
-        node.push(path.len() as u8);
-        node.append(&mut path.as_bytes().to_vec());
-        for _ in 0..(30 - path.len()) {
-            node.push(0_u8);
-        }
-    }
-
-    if reference.len() == 32 || reference.len() == 64 {
-        node.append(&mut reference.clone());
-    } else {
+    let has_edge = metadata.is_empty();
+    encode_fork(path.as_bytes(), &reference, &metadata, has_edge).unwrap_or_else(|| {
         manifest_upload_log!(
-            "Manifest reference default length {:#?}!",
-            hex::encode(&reference)
+            "Invalid manifest fork prefix/reference/metadata: prefix_bytes={} reference_bytes={} metadata_bytes={}",
+            path.len(),
+            reference.len(),
+            metadata.len(),
         );
-        return vec![];
-    }
-    if metadata.len() > 0 {
-        let xl0 = 2 + metadata.len();
-
-        // if metadataJSONBytesSizeWithSize < 32
-        // paddingLength := 32 - metadataJSONBytesSizeWithSize
-        // } else if metadataJSONBytesSizeWithSize > 32
-        // paddingLength := 32 - metadataJSONBytesSizeWithSize % 32
-
-        //
-
-        let xl1 = match xl0 < 32 {
-            true => 32 - xl0,
-            false => 32 - (xl0 % 32),
-        };
-
-        let xl = xl0 + xl1;
-
-        node.append(&mut ((xl - 2) as u16).to_be_bytes().to_vec());
-        node.append(&mut metadata.clone());
-
-        let pdl = xl - 2 - metadata.len();
-        for _ in 0..pdl {
-            node.push(10_u8);
-        }
-    }
-
-    return node;
+        vec![]
+    })
 }
 
 pub async fn create_stub(stub_ref_size: u8, obfuscated: bool) -> Vec<u8> {
@@ -615,17 +582,4 @@ pub async fn create_stub(stub_ref_size: u8, obfuscated: bool) -> Vec<u8> {
     }
 
     return manifest_bytes_vec;
-}
-
-// nodeType <1 byte>
-// prefixLength <1 byte>
-// prefix <30 byte>
-// reference <32/64 bytes>
-// metadataBytesSize <2 bytes>
-// metadataBytes <varlen>
-
-fn forkstring(fork: Vec<u8>) -> String {
-    let pl = fork[1] as usize;
-    let prefix = fork[2..2 + pl].to_vec();
-    String::from_utf8(prefix).unwrap_or("".to_string())
 }

@@ -1,7 +1,14 @@
 use super::*;
 
+const SERVICE_WORKER_PROTOCOL: f64 = 5.0;
+const SERVICE_WORKER_CONTROL_TOTAL_TIMEOUT_MS: u64 = 30_000;
+const SERVICE_WORKER_CONTROL_MAX_FOLLOWUP_PROBES: u8 = 40;
+const SERVICE_WORKER_CONTROL_MAX_UNAVAILABLE_ROUNDS: u8 = 3;
+
 thread_local! {
     static SERVICE_WORKER_MISSING_VISIBLE: Cell<bool> = Cell::new(false);
+    static SERVICE_WORKER_SETUP_LOCK: std::rc::Rc<async_lock::Mutex<()>> =
+        std::rc::Rc::new(async_lock::Mutex::new(()));
 }
 
 pub(super) async fn check_upload_prerequisites(weeb3: Arc<Weeb3>) {
@@ -456,7 +463,12 @@ async fn connect_bootnode_address(
     if !is_current_network_apply_generation(apply_generation) {
         return;
     }
-    let _ = weeb3.change_bootnode_address(bna, nid, true).await;
+    let Ok(expected_network_id) = nid.parse::<u64>() else {
+        return;
+    };
+    let _ = weeb3
+        .connect_bootnode_for_current_network(bna, expected_network_id, true)
+        .await;
 }
 
 pub(super) fn update_network_mode_toggle(mode: NetworkMode) {
@@ -480,8 +492,23 @@ pub(super) fn update_network_mode_toggle(mode: NetworkMode) {
 }
 
 pub(super) async fn open_resource_input(weeb3: Arc<Weeb3>, input: String) {
-    if let Some(route) = parse_resource_route(&input) {
-        open_resource(weeb3, route).await;
+    if let Some(route) = parse_networked_resource_route(&input) {
+        let profile = profile_for_mode(route.network);
+        if weeb3.get_network_id().await != profile.swarm_network_id {
+            set_network_profile_inputs(route.network);
+            let apply_generation = next_network_apply_generation();
+            apply_network_settings_and_connect(
+                weeb3.clone(),
+                apply_generation,
+                profile.swarm_network_id.to_string(),
+            )
+            .await;
+            if weeb3.get_network_id().await != profile.swarm_network_id {
+                render_text_result("Could not apply the resource route network");
+                return;
+            }
+        }
+        open_resource(weeb3, route.resource).await;
     } else {
         open_bzz_resource(weeb3, input).await;
     }
@@ -497,6 +524,17 @@ pub(super) async fn open_resource(weeb3: Arc<Weeb3>, route: ResourceRoute) {
         ResourceRoute::Chunks(reference) => {
             let bytes = weeb3.retrieve_chunk_bytes(reference.clone()).await;
             download_raw_bytes(bytes, reference, "chunk").await;
+        }
+        ResourceRoute::Feed { owner, topic } => {
+            crate::stream_hls::open_feed_view(weeb3, owner, topic).await;
+        }
+        ResourceRoute::Hls {
+            media_type,
+            owner,
+            topic,
+            index,
+        } => {
+            crate::stream_hls::open_hls_feed_view(weeb3, owner, topic, media_type, index).await;
         }
     }
 }
@@ -703,24 +741,58 @@ pub(super) fn render_collection_download_button(
     prepend_progress_node(&button);
 }
 
+async fn bzz_view_request_is_current(
+    weeb3: &Arc<Weeb3>,
+    progress_id: &str,
+    view_generation: u64,
+) -> bool {
+    if crate::stream::result_view_request_is_current(view_generation) {
+        return true;
+    }
+
+    weeb3
+        .finish_progress(
+            progress_id,
+            "superseded",
+            "a newer resource selection owns the result view",
+            true,
+        )
+        .await;
+    false
+}
+
 pub(super) async fn open_bzz_resource(weeb3: Arc<Weeb3>, resource: String) {
+    let view_generation = crate::stream::begin_result_view_request();
     let stream_files = stream_files_when_available();
     let progress_id = weeb3
         .start_progress("bzz", resource.clone(), "resolve", None, "resolving")
         .await;
+    if !bzz_view_request_is_current(&weeb3, &progress_id, view_generation).await {
+        return;
+    }
 
     if let Some(metadata) = weeb3.resolve_bzz(resource.clone()).await {
+        if !bzz_view_request_is_current(&weeb3, &progress_id, view_generation).await {
+            return;
+        }
         if stream_files {
             weeb3
                 .update_progress(&progress_id, "stream", None, "checking stream support")
                 .await;
-            if crate::streaming_player::try_render_streaming_player(
+            if !bzz_view_request_is_current(&weeb3, &progress_id, view_generation).await {
+                return;
+            }
+            let streamed = crate::stream::try_render_streaming_player(
                 weeb3.clone(),
                 resource.clone(),
                 metadata.clone(),
+                view_generation,
             )
-            .await
-            {
+            .await;
+            if !bzz_view_request_is_current(&weeb3, &progress_id, view_generation).await {
+                return;
+            }
+            if streamed {
                 weeb3
                     .finish_progress(&progress_id, "streaming", "stream player started", true)
                     .await;
@@ -736,7 +808,15 @@ pub(super) async fn open_bzz_resource(weeb3: Arc<Weeb3>, resource: String) {
                 format!("{} bytes", metadata.size),
             )
             .await;
-        if render_resolved_asset(weeb3.clone(), &resource, metadata).await {
+        if !bzz_view_request_is_current(&weeb3, &progress_id, view_generation).await {
+            return;
+        }
+        let rendered =
+            render_resolved_asset(weeb3.clone(), &resource, metadata, view_generation).await;
+        if !bzz_view_request_is_current(&weeb3, &progress_id, view_generation).await {
+            return;
+        }
+        if rendered {
             weeb3
                 .finish_progress(&progress_id, "complete", "displayed selected asset", true)
                 .await;
@@ -747,7 +827,13 @@ pub(super) async fn open_bzz_resource(weeb3: Arc<Weeb3>, resource: String) {
     weeb3
         .update_progress(&progress_id, "retrieve", None, "legacy retrieve fallback")
         .await;
+    if !bzz_view_request_is_current(&weeb3, &progress_id, view_generation).await {
+        return;
+    }
     let result = weeb3.acquire(resource).await;
+    if !bzz_view_request_is_current(&weeb3, &progress_id, view_generation).await {
+        return;
+    }
     let (data, indx) = decode_resources(result);
     let ok = !data.is_empty();
     render_result(data, indx).await;
@@ -769,16 +855,31 @@ pub(super) async fn render_resolved_asset(
     weeb3: Arc<Weeb3>,
     resource: &str,
     metadata: BzzMetadata,
+    view_generation: u64,
 ) -> bool {
+    if !crate::stream::result_view_request_is_current(view_generation) {
+        return true;
+    }
+
     if should_render_canonical_bzz_frame(&metadata) {
-        if !service_worker_controls_bzz_requests(&weeb3, "bzz frame requests").await {
+        let service_worker_ready =
+            service_worker_controls_bzz_requests(&weeb3, "bzz frame requests", || {
+                crate::stream::result_view_request_is_current(view_generation)
+            })
+            .await;
+        if !crate::stream::result_view_request_is_current(view_generation) {
+            return true;
+        }
+        if !service_worker_ready {
             service_worker_missing();
             return true;
         }
         if let Some(url) = canonical_bzz_url(resource, &metadata) {
-            let Some(index_html) =
-                preload_canonical_bzz_frame(&weeb3, resource, &url, &metadata).await
-            else {
+            let index_html = preload_canonical_bzz_frame(&weeb3, resource, &url, &metadata).await;
+            if !crate::stream::result_view_request_is_current(view_generation) {
+                return true;
+            }
+            let Some(index_html) = index_html else {
                 render_text_result("Could not retrieve website index");
                 return true;
             };
@@ -800,6 +901,9 @@ pub(super) async fn render_resolved_asset(
         .acquire_resolved_range(metadata.clone(), 0, metadata.size - 1)
         .await
     {
+        if !crate::stream::result_view_request_is_current(view_generation) {
+            return true;
+        }
         render_result(
             vec![(bytes, metadata.mime.clone(), metadata.path.clone())],
             metadata.path,
@@ -808,6 +912,9 @@ pub(super) async fn render_resolved_asset(
         return true;
     }
 
+    if !crate::stream::result_view_request_is_current(view_generation) {
+        return true;
+    }
     false
 }
 
@@ -845,13 +952,9 @@ async fn preload_canonical_bzz_frame(
 
     match retrieved {
         Some((bytes, _)) if bytes.len() == metadata.size as usize => {
-            crate::streaming_player::warm_bzz_fetch_cache(
-                resource,
-                metadata.clone(),
-                bytes.clone(),
-            );
+            crate::stream::warm_bzz_fetch_cache(resource, metadata.clone(), bytes.clone());
             if let Some(canonical_resource) = strip_canonical_bzz_url_prefix(&url) {
-                crate::streaming_player::warm_bzz_fetch_cache(
+                crate::stream::warm_bzz_fetch_cache(
                     canonical_resource,
                     metadata.clone(),
                     bytes.clone(),
@@ -1209,13 +1312,16 @@ pub(super) fn render_log_message(log: &String) {
     let document = web_sys::window().unwrap().document().unwrap();
     let log_message_div = document.create_element("div").unwrap();
     log_message_div.set_text_content(Some(log));
-    let _r = document
+    let logs = document
         .get_element_by_id("logsField")
-        .expect("#logsField should exist")
-        .dyn_ref::<HtmlElement>()
-        .unwrap()
-        .prepend_with_node_1(&log_message_div)
-        .unwrap();
+        .expect("#logsField should exist");
+    let _ = logs.prepend_with_node_1(&log_message_div);
+    while logs.child_element_count() > crate::LOG_DOM_RETAINED {
+        let Some(oldest) = logs.last_element_child() else {
+            break;
+        };
+        oldest.remove();
+    }
 }
 
 pub(super) fn render_progress_rows(rows: Vec<crate::events::ProgressRow>) {
@@ -1344,12 +1450,38 @@ fn service_worker_install_blocked_by_context() -> bool {
     service_worker_container().is_none()
 }
 
+async fn service_worker_registration(
+    service0: &web_sys::ServiceWorkerContainer,
+) -> Option<ServiceWorkerRegistration> {
+    let registration = async_std::future::timeout(
+        Duration::from_secs(10),
+        JsFuture::from(service0.get_registration()),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    registration.dyn_into::<ServiceWorkerRegistration>().ok()
+}
+
 async fn active_service_worker(
     service0: &web_sys::ServiceWorkerContainer,
 ) -> Option<web_sys::ServiceWorker> {
-    let registration = JsFuture::from(service0.get_registration()).await.ok()?;
-    let registration = registration.dyn_into::<ServiceWorkerRegistration>().ok()?;
-    registration.active()
+    service_worker_registration(service0).await?.active()
+}
+
+fn configured_service_worker_url() -> Option<String> {
+    let window = web_sys::window()?;
+    let page_url = window.location().href().ok()?;
+    web_sys::Url::new_with_base(&streaming_service_worker_url(), &page_url)
+        .ok()
+        .map(|url| url.href())
+}
+
+fn warn_about_worker_conflict(worker_url: &str) {
+    web_sys::console::warn_1(&JsValue::from_str(&format!(
+        "weeb-3 left the existing Service Worker in place ({worker_url}); \
+         integrate the weeb-3 forwarding protocol or configure a non-conflicting scope"
+    )));
 }
 
 pub async fn get_service_worker() -> Option<web_sys::ServiceWorker> {
@@ -1357,71 +1489,332 @@ pub async fn get_service_worker() -> Option<web_sys::ServiceWorker> {
         service_worker_missing();
         return None;
     };
+    let setup_lock = SERVICE_WORKER_SETUP_LOCK.with(std::rc::Rc::clone);
+    let _setup_guard = setup_lock.lock().await;
 
-    match JsFuture::from(service0.register("/weeb-3/service.js")).await {
-        Ok(registration) => {
+    // An embedding application may already own this scope. A compatible host
+    // worker advertises the forwarding protocol and must be reused; an
+    // unrelated controller must never be silently replaced by renderInterface.
+    if service_worker_forwarder_ready().await {
+        return controlled_service_worker();
+    }
+    let expected_worker_url = configured_service_worker_url()?;
+    if let Some(controller) = controlled_service_worker() {
+        if controller.script_url() != expected_worker_url {
+            // A compatible host worker may be busy servicing media on a slow
+            // device. Give it one longer probe before treating its different
+            // script URL as an unrelated scope conflict.
+            if service_worker_forwarder_ready_with_timeout(1_500).await {
+                return Some(controller);
+            }
+            warn_about_worker_conflict(&controller.script_url());
+            return None;
+        }
+    }
+    if let Some(registration) = service_worker_registration(&service0).await {
+        if let Some(active) = registration.active() {
+            if active.script_url() != expected_worker_url {
+                warn_about_worker_conflict(&active.script_url());
+                return None;
+            }
+
+            // `active` does not imply that this document has a controller. In
+            // particular, a document can appear after the worker's activate
+            // event, so activation-time clients.claim() will not run again.
+            // Ask only our exact configured worker to claim the current scope.
+            let _ = request_service_worker_claim(&active).await;
+            if service_worker_forwarder_ready().await {
+                return controlled_service_worker();
+            }
+
+            // A same-URL active worker can be an older cached forwarder that
+            // predates the claim/PING protocol. Refresh only the registration
+            // owned by weeb-3; never update a different host worker.
+            if let Ok(update) = registration.update() {
+                let _ = async_std::future::timeout(Duration::from_secs(10), JsFuture::from(update))
+                    .await;
+            }
+        }
+    }
+
+    let registration_options = RegistrationOptions::new();
+    registration_options.set_scope(&streaming_service_worker_scope());
+    match async_std::future::timeout(
+        Duration::from_secs(10),
+        JsFuture::from(
+            service0.register_with_options(&streaming_service_worker_url(), &registration_options),
+        ),
+    )
+    .await
+    {
+        Ok(Ok(registration)) => {
             if let Ok(registration) = registration.dyn_into::<ServiceWorkerRegistration>() {
-                if let Ok(update) = registration.update() {
-                    let _ = JsFuture::from(update).await;
-                }
-
                 if let Some(service_worker) = registration.active() {
+                    if service_worker.script_url() != expected_worker_url {
+                        warn_about_worker_conflict(&service_worker.script_url());
+                        return None;
+                    }
+                    let _ = request_service_worker_claim(&service_worker).await;
+                    if service_worker_forwarder_ready().await {
+                        return controlled_service_worker();
+                    }
                     return Some(service_worker);
                 }
             }
 
             if let Ok(ready) = service0.ready() {
-                if let Ok(registration) = JsFuture::from(ready).await {
+                if let Ok(Ok(registration)) =
+                    async_std::future::timeout(Duration::from_secs(10), JsFuture::from(ready)).await
+                {
                     if let Ok(registration) = registration.dyn_into::<ServiceWorkerRegistration>() {
                         if let Some(service_worker) = registration.active() {
+                            if service_worker.script_url() != expected_worker_url {
+                                warn_about_worker_conflict(&service_worker.script_url());
+                                return None;
+                            }
+                            let _ = request_service_worker_claim(&service_worker).await;
+                            if service_worker_forwarder_ready().await {
+                                return controlled_service_worker();
+                            }
                             return Some(service_worker);
                         }
                     }
                 }
             }
         }
-        Err(err) => {
+        Ok(Err(err)) => {
             web_sys::console::warn_1(&err);
         }
+        Err(_) => web_sys::console::warn_1(&JsValue::from_str(
+            "timed out while registering the weeb-3 Service Worker",
+        )),
     }
 
-    active_service_worker(&service0).await
+    let active = active_service_worker(&service0).await?;
+    if active.script_url() != expected_worker_url {
+        warn_about_worker_conflict(&active.script_url());
+        return None;
+    }
+    let _ = request_service_worker_claim(&active).await;
+    controlled_service_worker().or(Some(active))
 }
 
-fn service_worker_has_controller() -> bool {
+fn controlled_service_worker() -> Option<web_sys::ServiceWorker> {
     let Some(service0) = service_worker_container() else {
-        return false;
+        return None;
     };
     js_sys::Reflect::get(service0.as_ref(), &JsValue::from_str("controller"))
-        .map(|controller| !controller.is_null() && !controller.is_undefined())
+        .ok()?
+        .dyn_into::<web_sys::ServiceWorker>()
+        .ok()
+}
+
+async fn service_worker_forwarder_ready() -> bool {
+    for _ in 0..3 {
+        if service_worker_forwarder_ready_with_timeout(500).await {
+            return true;
+        }
+    }
+    false
+}
+
+async fn service_worker_forwarder_ready_with_timeout(timeout_ms: u64) -> bool {
+    let Some(controller) = controlled_service_worker() else {
+        return false;
+    };
+    service_worker_protocol_request(&controller, "WEEB3_PING", "WEEB3_PONG", timeout_ms).await
+}
+
+async fn request_service_worker_claim(worker: &web_sys::ServiceWorker) -> bool {
+    service_worker_protocol_request(worker, "WEEB3_CLAIM", "WEEB3_CLAIMED", 1_500).await
+}
+
+struct ServiceWorkerProtocolPort {
+    port: MessagePort,
+    _callback: Closure<dyn FnMut(MessageEvent)>,
+}
+
+impl Drop for ServiceWorkerProtocolPort {
+    fn drop(&mut self) {
+        self.port.set_onmessage(None);
+        self.port.close();
+    }
+}
+
+async fn service_worker_protocol_request(
+    worker: &web_sys::ServiceWorker,
+    request_type: &str,
+    response_type: &str,
+    timeout_ms: u64,
+) -> bool {
+    let Ok(channel) = MessageChannel::new() else {
+        return false;
+    };
+    let (sender, receiver) = async_std::channel::bounded::<bool>(1);
+    let expected_scope = streaming_service_worker_scope();
+    let expected_response_type = response_type.to_string();
+    let callback = Closure::<dyn FnMut(MessageEvent)>::new(move |event: MessageEvent| {
+        let data = event.data();
+        let matches = Reflect::get(&data, &JsValue::from_str("type"))
+            .ok()
+            .and_then(|value| value.as_string())
+            .is_some_and(|value| value == expected_response_type)
+            && Reflect::get(&data, &JsValue::from_str("protocol"))
+                .ok()
+                .and_then(|value| value.as_f64())
+                == Some(SERVICE_WORKER_PROTOCOL)
+            && Reflect::get(&data, &JsValue::from_str("scope"))
+                .ok()
+                .and_then(|value| value.as_string())
+                .is_some_and(|scope| scope == expected_scope);
+        let _ = sender.try_send(matches);
+    });
+    let protocol_port = ServiceWorkerProtocolPort {
+        port: channel.port1(),
+        _callback: callback,
+    };
+    protocol_port
+        .port
+        .set_onmessage(Some(protocol_port._callback.as_ref().unchecked_ref()));
+    protocol_port.port.start();
+
+    let ping = Object::new();
+    let _ = Reflect::set(
+        &ping,
+        &JsValue::from_str("type"),
+        &JsValue::from_str(request_type),
+    );
+    let transfer = Array::new();
+    transfer.push(&channel.port2());
+    if worker
+        .post_message_with_transferable(&ping, &transfer)
+        .is_err()
+    {
+        return false;
+    }
+
+    async_std::future::timeout(Duration::from_millis(timeout_ms), receiver.recv())
+        .await
+        .ok()
+        .and_then(Result::ok)
         .unwrap_or(false)
+}
+
+pub(crate) fn service_worker_scope_protocol_error(purpose: &str) -> String {
+    format!(
+        "Service Worker protocol {} did not become ready for {}: configured worker {} did not \
+         claim scope {} and answer WEEB3_PING within {} ms ({} follow-up probes maximum).",
+        SERVICE_WORKER_PROTOCOL as u8,
+        purpose,
+        streaming_service_worker_url(),
+        streaming_service_worker_scope(),
+        SERVICE_WORKER_CONTROL_TOTAL_TIMEOUT_MS,
+        SERVICE_WORKER_CONTROL_MAX_FOLLOWUP_PROBES,
+    )
+}
+
+async fn wait_for_service_worker_control(
+    weeb3: &Arc<Weeb3>,
+    purpose: &str,
+    still_needed: &impl Fn() -> bool,
+) -> bool {
+    if service_worker_forwarder_ready().await {
+        return true;
+    }
+    if service_worker_container().is_none() {
+        weeb3.interface_log(format!("service worker unavailable for {}", purpose));
+        return false;
+    }
+
+    weeb3.interface_log(format!("service worker activating for {}", purpose));
+    let mut unavailable_rounds = 0u8;
+    let mut protocol_probes = 0u8;
+    loop {
+        if !still_needed() || protocol_probes >= SERVICE_WORKER_CONTROL_MAX_FOLLOWUP_PROBES {
+            return false;
+        }
+
+        let worker_available = get_service_worker().await.is_some();
+        unavailable_rounds = if worker_available {
+            0
+        } else {
+            unavailable_rounds.saturating_add(1)
+        };
+
+        // A newly activated worker may exist before clients.claim() has made
+        // it this document's controller. Waiting for that transition is not a
+        // failed protocol handshake and must not consume the bounded PING
+        // probe allowance; the caller's 30-second timeout remains the hard
+        // bound for the whole activation sequence.
+        if controlled_service_worker().is_none() {
+            if unavailable_rounds >= SERVICE_WORKER_CONTROL_MAX_UNAVAILABLE_ROUNDS {
+                return false;
+            }
+            weeb3.interface_log(format!(
+                "service worker still activating for {}; retrying without a reload",
+                purpose
+            ));
+            async_std::task::sleep(Duration::from_millis(100)).await;
+            continue;
+        }
+
+        // Registration, activation, controllerchange and the scoped protocol
+        // handshake are control-plane operations. They are safe to retry; no
+        // Swarm request or accounting-sensitive operation has been dispatched.
+        let remaining_probes =
+            SERVICE_WORKER_CONTROL_MAX_FOLLOWUP_PROBES.saturating_sub(protocol_probes);
+        let probes = if worker_available {
+            remaining_probes
+        } else {
+            remaining_probes.min(4)
+        };
+        for _ in 0..probes {
+            if !still_needed() {
+                return false;
+            }
+            if controlled_service_worker().is_none() {
+                break;
+            }
+            protocol_probes = protocol_probes.saturating_add(1);
+            if service_worker_forwarder_ready_with_timeout(1_500).await {
+                weeb3.interface_log(format!("service worker controls {}", purpose));
+                return true;
+            }
+            async_std::task::sleep(Duration::from_millis(100)).await;
+        }
+
+        if unavailable_rounds >= SERVICE_WORKER_CONTROL_MAX_UNAVAILABLE_ROUNDS {
+            return false;
+        }
+        weeb3.interface_log(format!(
+            "service worker still activating for {}; retrying without a reload",
+            purpose
+        ));
+    }
 }
 
 pub(crate) async fn service_worker_controls_bzz_requests(
     weeb3: &Arc<Weeb3>,
     purpose: &str,
+    still_needed: impl Fn() -> bool,
 ) -> bool {
-    if service_worker_has_controller() {
-        return true;
-    }
-
-    weeb3.interface_log(format!("service worker activating for {}", purpose));
-    if get_service_worker().await.is_none() {
-        weeb3.interface_log(format!("service worker unavailable for {}", purpose));
+    if !still_needed() {
         return false;
     }
 
-    for _ in 0..120 {
-        if service_worker_has_controller() {
-            weeb3.interface_log(format!("service worker controls {}", purpose));
-            return true;
-        }
-        async_std::task::sleep(Duration::from_millis(100)).await;
+    let ready = async_std::future::timeout(
+        Duration::from_millis(SERVICE_WORKER_CONTROL_TOTAL_TIMEOUT_MS),
+        wait_for_service_worker_control(weeb3, purpose, &still_needed),
+    )
+    .await
+    .unwrap_or(false);
+    if ready || !still_needed() {
+        return ready;
+    }
+    if service_worker_container().is_none() {
+        return false;
     }
 
-    weeb3.interface_log(format!(
-        "service worker active but does not control {}",
-        purpose
-    ));
+    weeb3.interface_log(service_worker_scope_protocol_error(purpose));
     false
 }

@@ -1,20 +1,24 @@
-const CACHE_NAME = "default10";
 const SCOPE = new URL(self.registration.scope);
 const SCOPE_PATH = SCOPE.pathname.endsWith("/") ? SCOPE.pathname : `${SCOPE.pathname}/`;
 const APP_ROOT = SCOPE_PATH;
 const APP_INDEX = `${SCOPE_PATH}index.html`;
 const NETWORK_ROUTE_PREFIXES = ["", "mainnet/", "testnet/"];
 const RAW_ROUTE_KINDS = [
+  ["hls/bytes", "hls-bytes"],
   ["bytes", "bytes"],
   ["chunks", "chunk"],
   ["chunk", "chunk"]
 ];
 const FETCH_TIMEOUT_MS = 240000;
-const SERVICE_WORKER_MARKER = "forwarder-default10";
+const SERVICE_WORKER_MARKER = "forwarder-default20";
+const SERVICE_WORKER_PROTOCOL = 5;
 const DEBUG_SERVICE_WORKER = false;
 const MIB_BYTES = 1024 * 1024;
 const STREAM_STORAGE_WINDOW_BYTES = MIB_BYTES / 2;
 const STREAM_LOOKAHEAD_CHUNKS = 8;
+const HLS_REQUEST_FLIGHTS = new Map();
+const CLIENT_RUNTIME_PROBES = new Map();
+const CLIENT_RUNTIME_PROBE_TIMEOUT_MS = 1_500;
 
 console.log(`weeb-3 service worker start ${SERVICE_WORKER_MARKER}`);
 
@@ -24,25 +28,8 @@ function debugLog(...args) {
   }
 }
 
-function bytesToHex(bytes) {
-  return Array.from(bytes)
-    .map((byte) => byte.toString(16).padStart(2, "0"))
-    .join("");
-}
-
-async function serviceWorkerVersion() {
-  try {
-    const response = await fetch(self.location.href, { cache: "no-store" });
-    const body = await response.arrayBuffer();
-    const digest = await crypto.subtle.digest("SHA-256", body);
-    return `${SERVICE_WORKER_MARKER}-${bytesToHex(new Uint8Array(digest)).slice(0, 16)}`;
-  } catch (_) {
-    return SERVICE_WORKER_MARKER;
-  }
-}
-
-async function logServiceWorkerVersion(reason) {
-  console.log(`weeb-3 service worker ${reason} ${await serviceWorkerVersion()}`);
+function logServiceWorkerVersion(reason) {
+  console.log(`weeb-3 service worker ${reason} ${SERVICE_WORKER_MARKER}`);
 }
 
 function isSwarmReference(reference) {
@@ -59,10 +46,65 @@ function rawRouteMarkers() {
   );
 }
 
+function feedMarkers() {
+  return NETWORK_ROUTE_PREFIXES.map((prefix) => `${SCOPE_PATH}${prefix}feeds/`);
+}
+
+function canonicalRouteNetworkId(pathname) {
+  if (!pathname.startsWith(SCOPE_PATH)) {
+    return null;
+  }
+
+  const relative = pathname.substring(SCOPE_PATH.length);
+  const first = relative.split("/", 1)[0];
+  return first === "testnet" ? 10 : 1;
+}
+
 function isNetworkShellPath(pathname) {
   return ["mainnet", "testnet"].some((mode) =>
     pathname === `${SCOPE_PATH}${mode}` || pathname === `${SCOPE_PATH}${mode}/`
   );
+}
+
+function isCanonicalStreamTopic(value) {
+  try {
+    const topic = decodeURIComponent(value || "");
+    return Boolean(topic) &&
+      topic !== "." &&
+      topic !== ".." &&
+      new TextEncoder().encode(topic).byteLength <= 256 &&
+      !/[\u0000-\u001F\u007F-\u009F]/.test(topic);
+  } catch (_) {
+    return false;
+  }
+}
+
+function isCanonicalStreamIndex(value) {
+  if (value === undefined) {
+    return true;
+  }
+  return /^[0-9]+$/.test(value) && BigInt(value) <= 18446744073709551615n;
+}
+
+function isDirectShareShellPath(pathname) {
+  if (!pathname.startsWith(SCOPE_PATH)) {
+    return false;
+  }
+
+  const parts = pathname.substring(SCOPE_PATH.length).split("/");
+  if (parts[0] === "testnet") {
+    parts.shift();
+  }
+
+  const kind = parts.shift();
+  if (kind !== "stream") {
+    return false;
+  }
+
+  return (parts.length === 2 || parts.length === 3) &&
+    /^(?:0[xX])?[a-fA-F0-9]{40}$/.test(parts[0] || "") &&
+    isCanonicalStreamTopic(parts[1]) &&
+    isCanonicalStreamIndex(parts[2]);
 }
 
 function isBzzUploadPath(pathname) {
@@ -71,12 +113,11 @@ function isBzzUploadPath(pathname) {
 
 function canonicalBzzResource(url) {
   for (const marker of bzzMarkers()) {
-    const idx = url.pathname.indexOf(marker);
-    if (idx < 0) {
+    if (!url.pathname.startsWith(marker)) {
       continue;
     }
 
-    const resource = url.pathname.substring(idx + marker.length);
+    const resource = url.pathname.substring(marker.length);
     if (!resource) {
       return null;
     }
@@ -98,12 +139,11 @@ function canonicalBzzResource(url) {
 
 function canonicalRawResource(url) {
   for (const [marker] of rawRouteMarkers()) {
-    const idx = url.pathname.indexOf(marker);
-    if (idx < 0) {
+    if (!url.pathname.startsWith(marker)) {
       continue;
     }
 
-    const resource = url.pathname.substring(idx + marker.length);
+    const resource = url.pathname.substring(marker.length);
     if (!resource) {
       return null;
     }
@@ -113,6 +153,28 @@ function canonicalRawResource(url) {
     } catch (_) {
       return resource;
     }
+  }
+
+  return null;
+}
+
+function canonicalFeedResource(url) {
+  for (const marker of feedMarkers()) {
+    if (!url.pathname.startsWith(marker)) {
+      continue;
+    }
+
+    const resource = url.pathname.substring(marker.length);
+    const parts = resource.split("/");
+    if (
+      parts.length !== 2 ||
+      !/^[a-fA-F0-9]{40}$/.test(parts[0]) ||
+      !/^[a-fA-F0-9]{64}$/.test(parts[1])
+    ) {
+      return null;
+    }
+
+    return `${parts[0]}/${parts[1]}`;
   }
 
   return null;
@@ -129,39 +191,18 @@ function isCanonicalRequest(request) {
 
 function isAppShellNavigation(request) {
   const headerDestination = request.headers.get("Sec-Fetch-Dest") || "";
-  return request.mode === "navigate" &&
+  return request.method === "GET" &&
+    request.mode === "navigate" &&
     request.destination !== "iframe" &&
     request.destination !== "frame" &&
     headerDestination !== "iframe" &&
     headerDestination !== "frame";
 }
 
-async function cacheAppShellResponse(cache, request, response) {
-  if (!response.ok || isCanonicalRequest(request)) {
-    return;
-  }
-
-  await cache.put(request, response.clone());
-
-  const url = new URL(request.url);
-  if (url.pathname === APP_ROOT || url.pathname === APP_INDEX) {
-    await cache.put(new URL(APP_ROOT, self.registration.scope).toString(), response.clone());
-    await cache.put(new URL(APP_INDEX, self.registration.scope).toString(), response.clone());
-  }
-}
-
-async function networkFirst(request) {
-  const cache = await caches.open(CACHE_NAME);
-
+async function fetchOrError(request) {
   try {
-    const fetched = await fetch(request);
-    await cacheAppShellResponse(cache, request, fetched);
-    return fetched;
+    return await fetch(request);
   } catch (_) {
-    const cached = await cache.match(request);
-    if (cached) {
-      return cached;
-    }
     return new Response("network fetch failed", { status: 502 });
   }
 }
@@ -174,26 +215,41 @@ function appShellRequest(sourceRequest) {
 }
 
 self.addEventListener("install", (event) => {
-  event.waitUntil((async () => {
-    await logServiceWorkerVersion("install");
-    const cache = await caches.open(CACHE_NAME);
-    await cache.addAll([APP_ROOT, APP_INDEX]);
-    await self.skipWaiting();
-  })());
+  logServiceWorkerVersion("install");
+  event.waitUntil(self.skipWaiting());
 });
 
 self.addEventListener("activate", (event) => {
-  event.waitUntil((async () => {
-    await logServiceWorkerVersion("activate");
-    const cacheNames = await caches.keys();
-    await Promise.all(cacheNames.map((name) => {
-      if (name !== CACHE_NAME) {
-        return caches.delete(name);
-      }
-      return Promise.resolve(false);
-    }));
-    await self.clients.claim();
-  })());
+  logServiceWorkerVersion("activate");
+  event.waitUntil(self.clients.claim());
+});
+
+self.addEventListener("message", (event) => {
+  if (event.data?.type === "WEEB3_CLAIM") {
+    const port = event.ports?.[0];
+    event.waitUntil((async () => {
+      await self.clients.claim();
+      port?.postMessage({
+        type: "WEEB3_CLAIMED",
+        protocol: SERVICE_WORKER_PROTOCOL,
+        scope: SCOPE_PATH
+      });
+    })());
+    return;
+  }
+
+  if (event.data?.type !== "WEEB3_PING") {
+    return;
+  }
+  const port = event.ports?.[0];
+  if (!port) {
+    return;
+  }
+  port.postMessage({
+    type: "WEEB3_PONG",
+    protocol: SERVICE_WORKER_PROTOCOL,
+    scope: SCOPE_PATH
+  });
 });
 
 self.addEventListener("fetch", (event) => {
@@ -206,19 +262,21 @@ self.addEventListener("fetch", (event) => {
   }
 
   if (url.origin !== SCOPE.origin) {
-    event.respondWith(fetch(request));
     return;
   }
 
-  if (isAppShellNavigation(request) && isNetworkShellPath(url.pathname)) {
-    event.respondWith(networkFirst(appShellRequest(request)));
+  if (
+    isAppShellNavigation(request) &&
+    (isNetworkShellPath(url.pathname) || isDirectShareShellPath(url.pathname))
+  ) {
+    event.respondWith(fetchOrError(appShellRequest(request)));
     return;
   }
 
   const bzzResource = canonicalBzzResource(url);
   if (bzzResource && (request.method === "GET" || request.method === "HEAD")) {
     if (isAppShellNavigation(request)) {
-      event.respondWith(networkFirst(appShellRequest(request)));
+      event.respondWith(fetchOrError(appShellRequest(request)));
     } else {
       event.respondWith(forwardRequestToRust(request, event));
     }
@@ -231,7 +289,15 @@ self.addEventListener("fetch", (event) => {
     return;
   }
 
-  event.respondWith(networkFirst(request));
+  const feedResource = canonicalFeedResource(url);
+  if (feedResource && (request.method === "GET" || request.method === "HEAD")) {
+    event.respondWith(forwardRequestToRust(request, event));
+    return;
+  }
+
+  // This worker is safe to mount in an npm application: requests outside the
+  // explicit weeb-3 routes remain entirely under the host app/browser's
+  // normal fetch and caching policy.
 });
 
 function clientInScope(client) {
@@ -266,7 +332,7 @@ function isAppShellClient(client) {
       return true;
     }
 
-    if (isNetworkShellPath(url.pathname)) {
+    if (isNetworkShellPath(url.pathname) || isDirectShareShellPath(url.pathname)) {
       return true;
     }
 
@@ -285,20 +351,96 @@ function pushUniqueClient(list, seen, client) {
   list.push(client);
 }
 
-async function requestClients(event, requestUrl) {
+async function clientWeeb3NetworkId(client) {
+  const existing = CLIENT_RUNTIME_PROBES.get(client.id);
+  if (existing) {
+    return existing;
+  }
+
+  let tracked;
+  tracked = messageClient(
+    client,
+    { type: "WEEB3_CLIENT_PING" },
+    CLIENT_RUNTIME_PROBE_TIMEOUT_MS
+  )
+    .then((response) => {
+      const ready = response?.ok === true && response?.type === "WEEB3_CLIENT_PONG";
+      const networkId = Number(response?.networkId);
+      return ready && Number.isSafeInteger(networkId) ? networkId : null;
+    })
+    .finally(() => {
+      if (CLIENT_RUNTIME_PROBES.get(client.id) === tracked) {
+        CLIENT_RUNTIME_PROBES.delete(client.id);
+      }
+    });
+  CLIENT_RUNTIME_PROBES.set(client.id, tracked);
+  return tracked;
+}
+
+async function firstReadyClient(candidates, requiredNetworkId) {
+  if (!candidates.length) {
+    return [];
+  }
+
+  // Start the cheap liveness/network probes together so stale tabs add at
+  // most one probe timeout. Preserve the originating client's fast path and
+  // candidate priority; the accounting-sensitive operation itself is still
+  // sent exactly once by messageFirstClient.
+  const probes = candidates.map((candidate) => clientWeeb3NetworkId(candidate));
+  if (await probes[0] === requiredNetworkId) {
+    return [candidates[0]];
+  }
+
+  const remainingNetworkIds = await Promise.all(probes.slice(1));
+  const match = remainingNetworkIds.findIndex(
+    (networkId) => networkId === requiredNetworkId
+  );
+  if (match >= 0) {
+    return [candidates[match + 1]];
+  }
+
+  return [];
+}
+
+async function requestClients(event, requestUrl, requiredNetworkId) {
+  const eventClientId = event.clientId || "";
+  const eventClient = eventClientId ? await self.clients.get(eventClientId) : null;
+  const requestUrlObject = requestUrl ? new URL(requestUrl) : null;
+  const directHlsRequest = requestUrlObject !== null && (
+    canonicalFeedResource(requestUrlObject) !== null ||
+    rawRouteMarkers().some(([marker, rawType]) =>
+      rawType === "hls-bytes" && requestUrlObject.pathname.startsWith(marker)
+    )
+  );
+
+  // HLS fetches originate in the top-level page that attached the shared Rust
+  // player, whether that page is the bundled shell or an arbitrary npm host.
+  // Dispatch those directly: the Rust bridge validates networkId before
+  // retrieval, while a redundant liveness round-trip here can false-timeout
+  // when a large WASM retrieval wave briefly occupies the browser thread.
+  // Nested clients retain the probed fallback below.
+  if (
+    directHlsRequest &&
+    eventClient &&
+    isTopLevelClient(eventClient) &&
+    clientInScope(eventClient)
+  ) {
+    return [eventClient];
+  }
+
   const allClients = await self.clients.matchAll({
     includeUncontrolled: true,
     type: "window"
   });
-  const clients = [];
+  const candidates = [];
   const seen = new Set();
+  const requestReference = requestUrlObject ? bzzReferenceFromUrl(requestUrlObject) : "";
 
-  const eventClientId = event.clientId || event.resultingClientId || "";
-  const eventClient = eventClientId ? await self.clients.get(eventClientId) : null;
-  const requestReference = requestUrl ? bzzReferenceFromUrl(new URL(requestUrl)) : "";
-
+  // Prefer the top-level context that originated the request. A nested BZZ
+  // site frame does not host the Rust runtime and must fall through to its
+  // active app-shell tab below.
   if (eventClient && isTopLevelClient(eventClient) && clientInScope(eventClient)) {
-    pushUniqueClient(clients, seen, eventClient);
+    pushUniqueClient(candidates, seen, eventClient);
   }
 
   if (requestReference) {
@@ -308,40 +450,24 @@ async function requestClients(event, requestUrl) {
         clientInScope(client) &&
         bzzReferenceFromUrl(new URL(client.url)) === requestReference
       ) {
-        pushUniqueClient(clients, seen, client);
+        pushUniqueClient(candidates, seen, client);
       }
     }
   }
 
   for (const client of allClients) {
     if (isTopLevelClient(client) && isAppShellClient(client)) {
-      pushUniqueClient(clients, seen, client);
+      pushUniqueClient(candidates, seen, client);
     }
   }
 
   for (const client of allClients) {
     if (isTopLevelClient(client) && clientInScope(client)) {
-      pushUniqueClient(clients, seen, client);
+      pushUniqueClient(candidates, seen, client);
     }
   }
 
-  if (eventClient && eventClient.frameType !== "nested") {
-    pushUniqueClient(clients, seen, eventClient);
-  }
-
-  for (const client of allClients) {
-    if (isTopLevelClient(client) && clientInScope(client)) {
-      pushUniqueClient(clients, seen, client);
-    }
-  }
-
-  for (const client of allClients) {
-    if (isTopLevelClient(client)) {
-      pushUniqueClient(clients, seen, client);
-    }
-  }
-
-  return clients;
+  return firstReadyClient(candidates, requiredNetworkId);
 }
 
 function closeMessagePort(port) {
@@ -394,48 +520,109 @@ function messageClient(client, message, timeoutMs = FETCH_TIMEOUT_MS) {
   });
 }
 
-function messageClients(clients, message, timeoutMs = FETCH_TIMEOUT_MS) {
+function messageFirstClient(clients, message, timeoutMs = FETCH_TIMEOUT_MS) {
   if (!clients.length) {
-    return Promise.resolve({ ok: false, status: 502, error: "weeb-3 client is not available" });
+    const networkId = Number(message?.networkId);
+    return Promise.resolve({
+      ok: false,
+      status: 503,
+      error: Number.isSafeInteger(networkId)
+        ? `weeb-3 runtime for Swarm network ${networkId} is not available`
+        : "weeb-3 runtime is not available"
+    });
   }
 
-  return new Promise((resolve) => {
-    let settled = false;
-    let finished = 0;
-    let firstResponse = null;
-    let bestError = null;
+  // Uploads and canonical retrievals can enter postage/accounting state. Send
+  // each request exactly once. A timeout merely detaches this response port;
+  // already-dispatched work is deliberately left to drain and is never replayed
+  // through another tab.
+  return messageClient(clients[0], message, timeoutMs);
+}
 
-    const finish = (response) => {
-      if (settled) {
-        return;
-      }
-      settled = true;
-      resolve(response);
-    };
+function hlsRequestFlightKey(
+  clients,
+  requestUrl,
+  method,
+  range,
+  ifNoneMatch,
+  ifRange
+) {
+  if (!clients.length || !clients[0] || !clients[0].id) {
+    return null;
+  }
 
-    for (const client of clients) {
-      messageClient(client, message, timeoutMs).then((response) => {
-        finished += 1;
-        if (!firstResponse) {
-          firstResponse = response;
-        }
-        if (response && response.ok) {
-          finish(response);
-          return;
-        }
-        if (response && response.status !== 502 && response.status !== 504 && !bestError) {
-          bestError = response;
-        }
-        if (finished === clients.length) {
-          finish(bestError || firstResponse || response || {
-            ok: false,
-            status: 502,
-            error: "weeb-3 request failed"
-          });
-        }
-      });
+  const url = new URL(requestUrl);
+  const hlsRoute = rawRouteMarkers().some(([marker, rawType]) =>
+    rawType === "hls-bytes" && url.pathname.startsWith(marker)
+  );
+  const hlsAsset = hlsRoute && canonicalRawResource(url) !== null;
+  const feedManifest = canonicalFeedResource(url) !== null;
+  if (!hlsAsset && !feedManifest) {
+    return null;
+  }
+
+  return [
+    clients[0].id,
+    method.toUpperCase(),
+    url.pathname.toLowerCase(),
+    url.search,
+    range.trim().toLowerCase(),
+    ifNoneMatch.trim(),
+    ifRange.trim()
+  ].join("|");
+}
+
+function requestRustFetch(
+  clients,
+  requestUrl,
+  method,
+  range,
+  networkId,
+  ifNoneMatch = "",
+  ifRange = ""
+) {
+  const key = hlsRequestFlightKey(
+    clients,
+    requestUrl,
+    method,
+    range,
+    ifNoneMatch,
+    ifRange
+  );
+  if (!key) {
+    return messageFirstClient(clients, {
+      type: "WEEB3_FETCH_REQUEST",
+      url: requestUrl,
+      method,
+      range,
+      networkId,
+      ifNoneMatch,
+      ifRange
+    });
+  }
+
+  const existing = HLS_REQUEST_FLIGHTS.get(key);
+  if (existing) {
+    return existing;
+  }
+
+  const pending = messageFirstClient(clients, {
+    type: "WEEB3_FETCH_REQUEST",
+    url: requestUrl,
+    method,
+    range,
+    networkId,
+    ifNoneMatch,
+    ifRange
+  });
+  let tracked;
+  tracked = pending.finally(() => {
+    if (HLS_REQUEST_FLIGHTS.get(key) === tracked) {
+      HLS_REQUEST_FLIGHTS.delete(key);
     }
   });
+  HLS_REQUEST_FLIGHTS.set(key, tracked);
+  return tracked;
 }
 
 function toUint8Array(body) {
@@ -451,6 +638,16 @@ function toUint8Array(body) {
   return new Uint8Array();
 }
 
+function oneChunkResponseBody(body) {
+  const bytes = toUint8Array(body);
+  return new ReadableStream({
+    start(controller) {
+      controller.enqueue(bytes);
+      controller.close();
+    }
+  });
+}
+
 function responseHeaders(headerRows) {
   const headers = new Headers();
   for (const row of headerRows || []) {
@@ -461,12 +658,13 @@ function responseHeaders(headerRows) {
   return headers;
 }
 
-function requestRustRange(clients, url, start, end) {
-  return messageClients(clients, {
+function requestRustRange(clients, url, start, end, networkId) {
+  return messageFirstClient(clients, {
     type: "WEEB3_FETCH_REQUEST",
     url,
     method: "GET",
-    range: `bytes=${start}-${end}`
+    range: `bytes=${start}-${end}`,
+    networkId
   }).then((response) => {
     if (!response || !response.ok) {
       return response || { ok: false, status: 503, error: "empty weeb-3 range response" };
@@ -486,7 +684,7 @@ function requestRustRange(clients, url, start, end) {
   });
 }
 
-function createRustRangeStream(clients, url, size) {
+function createRustRangeStream(clients, url, size, networkId) {
   let position = 0;
   let schedulePosition = 0;
   const scheduled = new Map();
@@ -495,7 +693,7 @@ function createRustRangeStream(clients, url, size) {
     while (schedulePosition < size && scheduled.size < STREAM_LOOKAHEAD_CHUNKS) {
       const start = schedulePosition;
       const end = Math.min(start + STREAM_STORAGE_WINDOW_BYTES - 1, size - 1);
-      scheduled.set(start, requestRustRange(clients, url, start, end));
+      scheduled.set(start, requestRustRange(clients, url, start, end, networkId));
       schedulePosition = end + 1;
     }
   };
@@ -539,13 +737,21 @@ function createRustRangeStream(clients, url, size) {
 
 async function forwardRequestToRust(request, event) {
   try {
-    const clients = await requestClients(event, request.url);
-    const response = await messageClients(clients, {
-      type: "WEEB3_FETCH_REQUEST",
-      url: request.url,
-      method: request.method,
-      range: request.headers.get("Range") || ""
-    });
+    const url = new URL(request.url);
+    const networkId = canonicalRouteNetworkId(url.pathname);
+    if (networkId === null) {
+      return new Response("weeb-3 route is outside the configured scope", { status: 400 });
+    }
+    const clients = await requestClients(event, request.url, networkId);
+    const response = await requestRustFetch(
+      clients,
+      request.url,
+      request.method,
+      request.headers.get("Range") || "",
+      networkId,
+      request.headers.get("If-None-Match") || "",
+      request.headers.get("If-Range") || ""
+    );
 
     const status = Number(response.status || (response.ok ? 200 : 404));
     const headers = responseHeaders(response.headers);
@@ -559,16 +765,21 @@ async function forwardRequestToRust(request, event) {
 
     if (response.stream && request.method !== "HEAD") {
       const size = Number(headers.get("Content-Length") || "0");
-      return new Response(createRustRangeStream(clients, request.url, size), {
+      return new Response(createRustRangeStream(clients, request.url, size, networkId), {
         status,
         headers
       });
     }
 
-    return new Response(request.method === "HEAD" ? null : toUint8Array(response.body), {
-      status,
-      headers
-    });
+    return new Response(
+      request.method === "HEAD" || status === 304
+        ? null
+        : oneChunkResponseBody(response.body),
+      {
+        status,
+        headers
+      }
+    );
   } catch (error) {
     return new Response(error && error.message ? error.message : "weeb-3 forwarder error", {
       status: 502
@@ -576,9 +787,28 @@ async function forwardRequestToRust(request, event) {
   }
 }
 
+function parseUploadRedundancyHeader(value) {
+  // Bee marks this header `omitempty`, so a present empty value has the same
+  // Medium default as an omitted header.
+  if (value === null || value === "") {
+    return 1;
+  }
+  // Bee parses an unsigned base-10 header, so reject Number()-only forms such as hex or exponents.
+  if (!/^[0-9]+$/.test(value)) {
+    return null;
+  }
+
+  const level = Number(value);
+  return Number.isSafeInteger(level) && level <= 4 ? level : null;
+}
+
 async function forwardUploadToRust(request, event) {
   try {
     const url = new URL(request.url);
+    const networkId = canonicalRouteNetworkId(url.pathname);
+    if (networkId === null) {
+      return new Response("weeb-3 route is outside the configured scope", { status: 400 });
+    }
     const formData = await request.formData();
     const file = formData.get("file");
 
@@ -586,11 +816,20 @@ async function forwardUploadToRust(request, event) {
       return new Response("No file in form data", { status: 400 });
     }
 
-    const clients = await requestClients(event, request.url);
-    const response = await messageClients(clients, {
+    const parsedRedundancy = parseUploadRedundancyHeader(
+      request.headers.get("swarm-redundancy-level")
+    );
+    if (parsedRedundancy === null) {
+      return new Response("Swarm-Redundancy-Level must be an integer from 0 to 4", { status: 400 });
+    }
+
+    const clients = await requestClients(event, request.url, networkId);
+    const response = await messageFirstClient(clients, {
       type: "UPLOAD_REQUEST",
       file,
+      networkId,
       encryption: request.headers.get("swarm-encrypt") === "true",
+      redundancyLevel: parsedRedundancy,
       indexString: request.headers.get("swarm-index-document") || "",
       addToFeed: request.headers.get("swarm-collection") === "true",
       feedTopic: url.searchParams.get("feedTopic") || ""

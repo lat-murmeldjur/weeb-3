@@ -12,7 +12,7 @@ use web3::{
 };
 
 use async_std::sync::Arc;
-use js_sys::{Array, Uint8Array};
+use js_sys::{Array, Object, Reflect, Uint8Array};
 use tar::{Builder, Header};
 use wasm_bindgen::{JsCast, JsError, JsValue, prelude::*};
 use wasm_bindgen_futures::{JsFuture, spawn_local};
@@ -27,7 +27,10 @@ use web_sys::{
     HtmlInputElement,
     HtmlSelectElement,
     HtmlSpanElement,
+    MessageChannel,
     MessageEvent,
+    MessagePort,
+    RegistrationOptions,
     // Response,
     ServiceWorkerRegistration,
 };
@@ -39,7 +42,7 @@ use crate::{
     interface_conventions::{install_interface_conventions, set_bracket_button_label},
     join_all,
     nav::{
-        ResourceRoute, clear_path, parse_resource_route, read_routes,
+        ResourceRoute, clear_path, parse_networked_resource_route, read_routes,
         route_network_mode_from_location,
     },
     network_profile::{
@@ -59,6 +62,8 @@ use crate::{
         secure_open_vault_from_user_action, secure_preload_vault_module,
         secure_prepare_batch_purchase,
     },
+    stream_conventions::{streaming_service_worker_scope, streaming_service_worker_url},
+    upload_conventions::{upload_redundancy_from_number, upload_redundancy_from_select},
 };
 use alloy::signers::local::PrivateKeySigner;
 
@@ -66,7 +71,7 @@ use alloy::signers::local::PrivateKeySigner;
 mod interface_runtime_conventions;
 use interface_runtime_conventions::*;
 pub(crate) use interface_runtime_conventions::{
-    get_service_worker, service_worker_controls_bzz_requests,
+    get_service_worker, service_worker_controls_bzz_requests, service_worker_scope_protocol_error,
 };
 
 const BOOTNODE_INPUT_IDS: [&str; 8] = [
@@ -85,12 +90,352 @@ const INTERFACE_BUILD_VERSION: &str = env!("WEEB3_BUILD_VERSION");
 
 thread_local! {
     static NETWORK_APPLY_GENERATION: Cell<u64> = Cell::new(0);
+    static INTERFACE_MOUNT_GENERATION: Cell<u64> = Cell::new(0);
+    static SERVICE_WORKER_BRIDGE_CLIENT: RefCell<Option<Arc<Weeb3>>> =
+        const { RefCell::new(None) };
+    static SERVICE_WORKER_BRIDGE_LISTENER: RefCell<Option<Closure<dyn FnMut(MessageEvent)>>> =
+        const { RefCell::new(None) };
 }
 
 fn interface_debug(value: &JsValue) {
     if DEBUG_INTERFACE_LOGS {
         web_sys::console::log_1(value);
     }
+}
+
+pub(crate) fn begin_interface_mount() -> u64 {
+    INTERFACE_MOUNT_GENERATION.with(|generation| {
+        let next = generation.get().wrapping_add(1);
+        let next = if next == 0 { 1 } else { next };
+        generation.set(next);
+        next
+    })
+}
+
+fn interface_mount_is_current(expected: u64) -> bool {
+    INTERFACE_MOUNT_GENERATION.with(|generation| generation.get() == expected)
+}
+
+fn interface_mount_can_poll(expected: u64) -> bool {
+    if !interface_mount_is_current(expected) {
+        return false;
+    }
+
+    web_sys::window()
+        .and_then(|window| window.document())
+        .is_some_and(|document| {
+            ["logsField", "ongoing", "connections"]
+                .into_iter()
+                .all(|id| document.get_element_by_id(id).is_some())
+        })
+}
+
+fn is_weeb3_service_worker_request_type(request_type: &str) -> bool {
+    matches!(
+        request_type,
+        "WEEB3_CLIENT_PING"
+            | "WEEB3_FETCH_REQUEST"
+            | "RESOLVE_BZZ_REQUEST"
+            | "RETRIEVE_RANGE_REQUEST"
+            | "PREPARE_BZZ_STREAM_REQUEST"
+            | "RETRIEVE_REQUEST"
+            | "RETRIEVE_BYTES_REQUEST"
+            | "RETRIEVE_CHUNK_REQUEST"
+            | "UPLOAD_REQUEST"
+    )
+}
+
+fn service_worker_required_network_id(obj: &Object) -> Option<u64> {
+    let value = Reflect::get(obj, &JsValue::from_str("networkId"))
+        .ok()?
+        .as_f64()?;
+    if !value.is_finite() || value.fract() != 0.0 {
+        return None;
+    }
+    let network_id = value as u64;
+    matches!(network_id, 1 | 10).then_some(network_id)
+}
+
+fn post_service_worker_bridge_error(
+    event: &MessageEvent,
+    status: u16,
+    error: &str,
+    network_mismatch: bool,
+) {
+    let Some(port) = event.ports().get(0).dyn_into::<MessagePort>().ok() else {
+        return;
+    };
+    let response = Object::new();
+    let _ = Reflect::set(&response, &"ok".into(), &JsValue::FALSE);
+    let _ = Reflect::set(
+        &response,
+        &"status".into(),
+        &JsValue::from_f64(f64::from(status)),
+    );
+    let _ = Reflect::set(&response, &"error".into(), &JsValue::from_str(error));
+    let _ = Reflect::set(
+        &response,
+        &"networkMismatch".into(),
+        &JsValue::from_bool(network_mismatch),
+    );
+    let _ = port.post_message(&response);
+}
+
+fn handle_service_worker_bridge_event(event: MessageEvent) {
+    let Ok(obj) = event.data().dyn_into::<Object>() else {
+        return;
+    };
+    interface_debug(&JsValue::from(format!(
+        "Attempting to load reference received from service worker {:#?}",
+        obj
+    )));
+
+    let request_type = Reflect::get(&obj, &JsValue::from_str("type"))
+        .ok()
+        .and_then(|value| value.as_string());
+    let Some(request_type) = request_type else {
+        return;
+    };
+    if !is_weeb3_service_worker_request_type(&request_type) {
+        return;
+    }
+
+    // Claim every recognized request before starting asynchronous work. This
+    // prevents stale or host-installed listeners from dispatching the same
+    // accounting-sensitive retrieval or upload a second time.
+    event.stop_immediate_propagation();
+
+    let bridge_client =
+        SERVICE_WORKER_BRIDGE_CLIENT.with(|client| client.borrow().as_ref().cloned());
+
+    if request_type == "WEEB3_CLIENT_PING" {
+        let Some(weeb3) = bridge_client else {
+            post_service_worker_bridge_error(&event, 503, "weeb-3 runtime is not mounted", false);
+            return;
+        };
+        let response = Object::new();
+        let _ = Reflect::set(&response, &"ok".into(), &JsValue::TRUE);
+        let _ = Reflect::set(&response, &"type".into(), &"WEEB3_CLIENT_PONG".into());
+        let _ = Reflect::set(
+            &response,
+            &"networkId".into(),
+            &JsValue::from_f64(weeb3.service_worker_network_id() as f64),
+        );
+        if let Some(port) = event.ports().get(0).dyn_into::<MessagePort>().ok() {
+            let _ = port.post_message(&response);
+        }
+        return;
+    }
+
+    let Some(weeb3) = bridge_client else {
+        post_service_worker_bridge_error(&event, 503, "weeb-3 runtime is not mounted", false);
+        return;
+    };
+
+    let Some(required_network_id) = service_worker_required_network_id(&obj) else {
+        post_service_worker_bridge_error(
+            &event,
+            400,
+            "weeb-3 request is missing a supported networkId",
+            false,
+        );
+        return;
+    };
+    let active_network_id = weeb3.service_worker_network_id();
+    if active_network_id != required_network_id {
+        post_service_worker_bridge_error(
+            &event,
+            409,
+            &format!(
+                "weeb-3 runtime network mismatch: required {}, active {}",
+                required_network_id, active_network_id
+            ),
+            true,
+        );
+        return;
+    }
+
+    if crate::stream::handle_service_worker_message(&obj, &event, weeb3.clone()) {
+        return;
+    }
+
+    match request_type.as_str() {
+        "RETRIEVE_REQUEST" => {
+            let reference = Reflect::get(&obj, &JsValue::from_str("url"))
+                .unwrap_or(JsValue::NULL)
+                .as_string()
+                .unwrap_or_default();
+            let ports: Array = event.ports().into();
+            let port = ports.get(0).dyn_into::<web_sys::MessagePort>().ok();
+
+            spawn_local(async move {
+                interface_debug(&JsValue::from(format!(
+                    "Loading /bzz/ reference from service worker {:#?}",
+                    reference
+                )));
+                let result = weeb3.acquire(reference).await;
+                let (data, indx) = decode_resources(result);
+                let head_resource = data
+                    .iter()
+                    .find(|(_, _, path)| *path == indx)
+                    .or_else(|| data.first());
+
+                let resp = Object::new();
+                Reflect::set(&resp, &"ok".into(), &head_resource.is_some().into()).unwrap();
+                Reflect::set(&resp, &"type".into(), &"RETRIEVE_RESPONSE".into()).unwrap();
+                Reflect::set(&resp, &"indx".into(), &indx.clone().into()).unwrap();
+
+                if let Some((bytes, mime, path)) = head_resource {
+                    interface_debug(&JsValue::from(format!(
+                        "service message resource len {}",
+                        bytes.len()
+                    )));
+
+                    let u8arr = Uint8Array::new_with_length(bytes.len() as u32);
+                    u8arr.copy_from(bytes);
+                    Reflect::set(&resp, &"body".into(), &u8arr).unwrap();
+                    Reflect::set(&resp, &"mime".into(), &mime.clone().into()).unwrap();
+                    Reflect::set(&resp, &"path".into(), &path.clone().into()).unwrap();
+                }
+
+                if let Some(port) = port {
+                    let _ = port.post_message(&resp);
+                }
+            });
+        }
+        "RETRIEVE_BYTES_REQUEST" | "RETRIEVE_CHUNK_REQUEST" => {
+            let reference = Reflect::get(&obj, &JsValue::from_str("url"))
+                .unwrap_or(JsValue::NULL)
+                .as_string()
+                .unwrap_or_default();
+            let retrieve_chunk = request_type == "RETRIEVE_CHUNK_REQUEST";
+            let ports: Array = event.ports().into();
+            let port = ports.get(0).dyn_into::<web_sys::MessagePort>().ok();
+
+            spawn_local(async move {
+                let bytes = if retrieve_chunk {
+                    weeb3.retrieve_chunk_bytes(reference.clone()).await
+                } else {
+                    weeb3.retrieve_bytes(reference.clone()).await
+                };
+
+                let resp = Object::new();
+                Reflect::set(&resp, &"ok".into(), &(!bytes.is_empty()).into()).unwrap();
+                Reflect::set(
+                    &resp,
+                    &"type".into(),
+                    &if retrieve_chunk {
+                        "RETRIEVE_CHUNK_RESPONSE"
+                    } else {
+                        "RETRIEVE_BYTES_RESPONSE"
+                    }
+                    .into(),
+                )
+                .unwrap();
+                Reflect::set(&resp, &"path".into(), &reference.clone().into()).unwrap();
+                Reflect::set(&resp, &"mime".into(), &"application/octet-stream".into()).unwrap();
+
+                let u8arr = Uint8Array::new_with_length(bytes.len() as u32);
+                u8arr.copy_from(&bytes);
+                Reflect::set(&resp, &"body".into(), &u8arr).unwrap();
+
+                if let Some(port) = port {
+                    let _ = port.post_message(&resp);
+                }
+            });
+        }
+        "UPLOAD_REQUEST" => {
+            let file: web_sys::File = Reflect::get(&obj, &"file".into())
+                .unwrap()
+                .dyn_into()
+                .unwrap();
+            let encryption = Reflect::get(&obj, &"encryption".into())
+                .unwrap_or(JsValue::FALSE)
+                .as_bool()
+                .unwrap_or(false);
+            let redundancy_level = upload_redundancy_from_number(
+                Reflect::get(&obj, &"redundancyLevel".into())
+                    .ok()
+                    .and_then(|value| value.as_f64()),
+            )
+            .as_u8();
+            let index_string = Reflect::get(&obj, &"indexString".into())
+                .unwrap_or(JsValue::NULL)
+                .as_string()
+                .unwrap_or_default();
+            let add_to_feed = Reflect::get(&obj, &"addToFeed".into())
+                .unwrap_or(JsValue::FALSE)
+                .as_bool()
+                .unwrap_or(false);
+            let feed_topic = Reflect::get(&obj, &"feedTopic".into())
+                .unwrap_or(JsValue::NULL)
+                .as_string()
+                .unwrap_or_default();
+            let port = event.ports().get(0).dyn_into::<web_sys::MessagePort>().ok();
+
+            spawn_local(async move {
+                let result = weeb3
+                    .post_upload_with_redundancy(
+                        file,
+                        encryption,
+                        f64::from(redundancy_level),
+                        index_string,
+                        add_to_feed,
+                        feed_topic,
+                    )
+                    .await;
+                let (data, indx) = decode_resources(result);
+                let upload_ok = !indx.is_empty();
+                let upload_error = data
+                    .first()
+                    .and_then(|(bytes, _, _)| String::from_utf8(bytes.clone()).ok())
+                    .filter(|message| !message.trim().is_empty())
+                    .unwrap_or_else(|| "Upload failed before returning a reference".into());
+
+                let resp = Object::new();
+                Reflect::set(&resp, &"ok".into(), &upload_ok.into()).unwrap();
+                if upload_ok {
+                    Reflect::set(&resp, &"reference".into(), &indx.clone().into()).unwrap();
+                } else {
+                    Reflect::set(&resp, &"status".into(), &500.into()).unwrap();
+                    Reflect::set(&resp, &"error".into(), &upload_error.into()).unwrap();
+                }
+
+                if let Some(port) = port {
+                    let _ = port.post_message(&resp);
+                }
+
+                render_result(data, indx).await;
+            });
+        }
+        _ => {}
+    }
+}
+
+pub(crate) fn install_service_worker_message_bridge(weeb3: Arc<Weeb3>) {
+    SERVICE_WORKER_BRIDGE_CLIENT.with(|client| {
+        *client.borrow_mut() = Some(weeb3);
+    });
+
+    SERVICE_WORKER_BRIDGE_LISTENER.with(|listener| {
+        if listener.borrow().is_some() {
+            return;
+        }
+
+        let closure = Closure::<dyn FnMut(MessageEvent)>::new(handle_service_worker_bridge_event);
+        let service_worker = web_sys::window().unwrap().navigator().service_worker();
+        if let Err(error) = service_worker
+            .add_event_listener_with_callback("message", closure.as_ref().unchecked_ref())
+        {
+            interface_debug(&JsValue::from(format!(
+                "Service listener error {:#?}",
+                error
+            )));
+            return;
+        }
+
+        *listener.borrow_mut() = Some(closure);
+    });
 }
 
 #[wasm_bindgen]
@@ -118,6 +463,31 @@ pub(crate) async fn mount_interface(
     start_runtime: bool,
     read_initial_routes: bool,
 ) -> Result<(), JsError> {
+    let mount_generation = begin_interface_mount();
+    install_service_worker_message_bridge(weeb3.clone());
+    mount_interface_after_service_worker_bridge_install(
+        weeb3,
+        start_runtime,
+        read_initial_routes,
+        None,
+        true,
+        mount_generation,
+    )
+    .await
+}
+
+pub(crate) async fn mount_interface_after_service_worker_bridge_install(
+    weeb3: Arc<Weeb3>,
+    start_runtime: bool,
+    read_initial_routes: bool,
+    initial_result_generation: Option<u64>,
+    schedule_initial_connections: bool,
+    mount_generation: u64,
+) -> Result<(), JsError> {
+    if !interface_mount_is_current(mount_generation) {
+        return Ok(());
+    }
+
     if start_runtime {
         let weeb30 = weeb3.clone();
         weeb3.interface_log("Node runtime starting".to_string());
@@ -128,11 +498,20 @@ pub(crate) async fn mount_interface(
     }
 
     async_std::task::yield_now().await;
+    if !interface_mount_is_current(mount_generation) {
+        return Ok(());
+    }
 
     secure_preload_vault_module();
     install_interface_conventions();
     if let Some(profile) = profile_for_swarm_network_id(weeb3.get_network_id().await) {
+        if !interface_mount_is_current(mount_generation) {
+            return Ok(());
+        }
         set_network_profile_inputs(profile.mode);
+    }
+    if !interface_mount_is_current(mount_generation) {
+        return Ok(());
     }
     weeb3.interface_log(format!(
         "Interface mounted, version {}",
@@ -145,16 +524,16 @@ pub(crate) async fn mount_interface(
     let weeb34 = weeb3.clone();
     let weeb35 = weeb3.clone();
     let weeb36 = weeb3.clone();
-    let weeb37 = weeb3.clone();
-    let weeb38 = weeb3.clone();
     let weeb39 = weeb3.clone();
     let weeb40 = weeb3.clone();
     let weeb41 = weeb3.clone();
 
-    let initial_network_apply_generation = next_network_apply_generation();
-    spawn_local(async move {
-        connect_all_bootnode_settings(weeb39, initial_network_apply_generation).await;
-    });
+    if schedule_initial_connections {
+        let initial_network_apply_generation = next_network_apply_generation();
+        spawn_local(async move {
+            connect_all_bootnode_settings(weeb39, initial_network_apply_generation).await;
+        });
+    }
 
     spawn_local(async {
         let _ = get_service_worker().await;
@@ -189,6 +568,8 @@ pub(crate) async fn mount_interface(
 
         let chequebook_state_deploy = chequebook_state.clone();
         let chequebook_state_deposit = chequebook_state.clone();
+        let mut retained_message_callbacks =
+            Vec::<Closure<dyn FnMut(web_sys::MessageEvent)>>::new();
 
         // let document = web_sys::window().unwrap().document().unwrap();
 
@@ -452,7 +833,7 @@ pub(crate) async fn mount_interface(
                 });
 
             button.set_onclick(Some(callback_prereq.as_ref().unchecked_ref()));
-            callback_prereq.forget();
+            retained_message_callbacks.push(callback_prereq);
         }
 
         let callback3 =
@@ -534,12 +915,20 @@ pub(crate) async fn mount_interface(
                         Err(_) => "".to_string(),
                     };
 
+                    let redundancy_value = document
+                        .get_element_by_id("uploadRedundancyLevel")
+                        .and_then(|element| element.dyn_into::<HtmlSelectElement>().ok())
+                        .map(|select| select.value());
+                    let redundancy_level =
+                        upload_redundancy_from_select(redundancy_value.as_deref()).as_u8();
+
                     interface_debug(&JsValue::from(format!("IF Upload Marker 0")));
 
                     let result = weeb300
-                        .post_upload(
+                        .post_upload_with_redundancy(
                             file,
                             file_enc.checked() && !upload_to_feed.checked(),
+                            f64::from(redundancy_level),
                             index_string,
                             upload_to_feed.checked(),
                             feed_topic,
@@ -876,194 +1265,22 @@ pub(crate) async fn mount_interface(
             .expect("#depositCash should be a HtmlButtonElement")
             .set_onclick(Some(callback7.as_ref().unchecked_ref()));
 
-        let service_closure = Closure::wrap(Box::new(move |event: MessageEvent| {
-            if let Ok(obj) = event.data().dyn_into::<js_sys::Object>() {
-                interface_debug(&JsValue::from(format!(
-                    "Attempting to load reference received from service worker {:#?}",
-                    obj
-                )));
-                let ty =
-                    js_sys::Reflect::get(&obj, &JsValue::from_str("type")).unwrap_or(JsValue::NULL);
-
-                if crate::streaming_player::handle_service_worker_message(
-                    &obj,
-                    &event,
-                    weeb37.clone(),
-                ) {
-                    return;
-                }
-
-                if ty == JsValue::from_str("RETRIEVE_REQUEST") {
-                    let url = js_sys::Reflect::get(&obj, &JsValue::from_str("url"))
-                        .unwrap_or(JsValue::NULL);
-                    let reference = url.as_string().unwrap_or_default();
-                    let weeb300 = weeb37.clone();
-
-                    let ports: Array = event.ports().into();
-                    let port = ports.get(0).dyn_into::<web_sys::MessagePort>().ok();
-
-                    wasm_bindgen_futures::spawn_local(async move {
-                        interface_debug(&JsValue::from(format!(
-                            "Loading /bzz/ reference from service worker {:#?}",
-                            reference
-                        )));
-                        let result = weeb300.acquire(reference).await;
-                        let (data, indx) = decode_resources(result);
-                        let head_resource = data
-                            .iter()
-                            .find(|(_, _, path)| *path == indx)
-                            .or_else(|| data.get(0));
-
-                        let resp = js_sys::Object::new();
-                        js_sys::Reflect::set(&resp, &"ok".into(), &head_resource.is_some().into())
-                            .unwrap();
-                        js_sys::Reflect::set(&resp, &"type".into(), &"RETRIEVE_RESPONSE".into())
-                            .unwrap();
-                        js_sys::Reflect::set(&resp, &"indx".into(), &indx.clone().into()).unwrap();
-
-                        if let Some((bytes, mime, path)) = head_resource {
-                            interface_debug(&JsValue::from(format!(
-                                "service message resource len {}",
-                                bytes.len()
-                            )));
-
-                            let u8arr = js_sys::Uint8Array::new_with_length(bytes.len() as u32);
-                            u8arr.copy_from(&bytes);
-                            js_sys::Reflect::set(&resp, &"body".into(), &u8arr).unwrap();
-
-                            js_sys::Reflect::set(&resp, &"mime".into(), &mime.clone().into())
-                                .unwrap();
-                            js_sys::Reflect::set(&resp, &"path".into(), &path.clone().into())
-                                .unwrap();
-                        }
-
-                        if let Some(port) = port {
-                            port.post_message(&resp).unwrap();
-                        }
-                    });
-                }
-                if ty == JsValue::from_str("RETRIEVE_BYTES_REQUEST")
-                    || ty == JsValue::from_str("RETRIEVE_CHUNK_REQUEST")
-                {
-                    let url = js_sys::Reflect::get(&obj, &JsValue::from_str("url"))
-                        .unwrap_or(JsValue::NULL);
-                    let reference = url.as_string().unwrap_or_default();
-                    let retrieve_chunk = ty == JsValue::from_str("RETRIEVE_CHUNK_REQUEST");
-                    let weeb300 = weeb37.clone();
-
-                    let ports: Array = event.ports().into();
-                    let port = ports.get(0).dyn_into::<web_sys::MessagePort>().ok();
-
-                    wasm_bindgen_futures::spawn_local(async move {
-                        let bytes = if retrieve_chunk {
-                            weeb300.retrieve_chunk_bytes(reference.clone()).await
-                        } else {
-                            weeb300.retrieve_bytes(reference.clone()).await
-                        };
-
-                        let resp = js_sys::Object::new();
-                        js_sys::Reflect::set(&resp, &"ok".into(), &(!bytes.is_empty()).into())
-                            .unwrap();
-                        js_sys::Reflect::set(
-                            &resp,
-                            &"type".into(),
-                            &if retrieve_chunk {
-                                "RETRIEVE_CHUNK_RESPONSE"
-                            } else {
-                                "RETRIEVE_BYTES_RESPONSE"
-                            }
-                            .into(),
-                        )
-                        .unwrap();
-                        js_sys::Reflect::set(&resp, &"path".into(), &reference.clone().into())
-                            .unwrap();
-                        js_sys::Reflect::set(
-                            &resp,
-                            &"mime".into(),
-                            &"application/octet-stream".into(),
-                        )
-                        .unwrap();
-
-                        let u8arr = js_sys::Uint8Array::new_with_length(bytes.len() as u32);
-                        u8arr.copy_from(&bytes);
-                        js_sys::Reflect::set(&resp, &"body".into(), &u8arr).unwrap();
-
-                        if let Some(port) = port {
-                            port.post_message(&resp).unwrap();
-                        }
-                    });
-                }
-                if ty == JsValue::from_str("UPLOAD_REQUEST") {
-                    let file: web_sys::File = js_sys::Reflect::get(&obj, &"file".into())
-                        .unwrap()
-                        .dyn_into()
-                        .unwrap();
-
-                    let encryption = js_sys::Reflect::get(&obj, &"encryption".into())
-                        .unwrap_or(JsValue::FALSE)
-                        .as_bool()
-                        .unwrap_or(false);
-
-                    let index_string = js_sys::Reflect::get(&obj, &"indexString".into())
-                        .unwrap_or(JsValue::NULL)
-                        .as_string()
-                        .unwrap_or_default();
-
-                    let add_to_feed = js_sys::Reflect::get(&obj, &"addToFeed".into())
-                        .unwrap_or(JsValue::FALSE)
-                        .as_bool()
-                        .unwrap_or(false);
-
-                    let feed_topic = js_sys::Reflect::get(&obj, &"feedTopic".into())
-                        .unwrap_or(JsValue::NULL)
-                        .as_string()
-                        .unwrap_or_default();
-
-                    let weeb300 = weeb38.clone();
-                    let port = event.ports().get(0).dyn_into::<web_sys::MessagePort>().ok();
-
-                    wasm_bindgen_futures::spawn_local(async move {
-                        let result = weeb300
-                            .post_upload(file, encryption, index_string, add_to_feed, feed_topic)
-                            .await;
-
-                        let (data, indx) = decode_resources(result);
-
-                        // send back reference/hash
-                        let resp = js_sys::Object::new();
-                        js_sys::Reflect::set(&resp, &"ok".into(), &true.into()).unwrap();
-                        js_sys::Reflect::set(&resp, &"reference".into(), &indx.clone().into())
-                            .unwrap();
-
-                        if let Some(port) = port {
-                            port.post_message(&resp).unwrap();
-                        }
-
-                        render_result(data, indx).await;
-                    });
-                }
-            }
-        }) as Box<dyn FnMut(_)>);
-
-        let _service_listener = match web_sys::window()
-            .unwrap()
-            .navigator()
-            .service_worker()
-            .add_event_listener_with_callback("message", service_closure.as_ref().unchecked_ref())
-        {
-            Ok(aok) => aok,
-            Err(err) => {
-                interface_debug(&JsValue::from(format!("Service listener error {:#?}", err)));
-            }
-        };
-
         if read_initial_routes {
             spawn_local(async move {
-                let _ = get_service_worker().await;
+                if initial_result_generation.is_some_and(|generation| {
+                    !crate::stream::result_view_request_is_current(generation)
+                }) {
+                    return;
+                }
                 let routes = read_routes().await;
                 let mut handles = vec![];
                 for route in routes {
                     let handle = async {
+                        if initial_result_generation.is_some_and(|generation| {
+                            !crate::stream::result_view_request_is_current(generation)
+                        }) {
+                            return;
+                        }
                         let weeb300 = weeb36.clone();
                         interface_debug(&JsValue::from(format!(
                             "Loading weeb-3 route from path {:#?}",
@@ -1081,45 +1298,60 @@ pub(crate) async fn mount_interface(
         let mut last_ongoing = None::<u64>;
         let mut last_connections = None::<u64>;
         loop {
+            // Keep optional button callbacks alive for exactly this mount.
+            let _retained_callback_count = retained_message_callbacks.len();
+            if !interface_mount_can_poll(mount_generation) {
+                break;
+            }
+
             #[allow(irrefutable_let_patterns)]
             let logs_current = weeb35.get_current_logs().await;
+            if !interface_mount_can_poll(mount_generation) {
+                break;
+            }
             for log_message in logs_current.iter() {
                 render_log_message(&log_message);
             }
 
             let ongoing = weeb35.get_ongoing_connections().await;
+            if !interface_mount_can_poll(mount_generation) {
+                break;
+            }
 
             if last_ongoing != Some(ongoing) {
-                web_sys::window()
-                    .unwrap()
-                    .document()
-                    .unwrap()
-                    .get_element_by_id("ongoing")
-                    .expect("#ongoing should exist")
-                    .dyn_ref::<HtmlSpanElement>()
-                    .unwrap()
-                    .set_text_content(Some(&ongoing.to_string()));
+                let Some(ongoing_element) = web_sys::window()
+                    .and_then(|window| window.document())
+                    .and_then(|document| document.get_element_by_id("ongoing"))
+                    .and_then(|element| element.dyn_into::<HtmlSpanElement>().ok())
+                else {
+                    break;
+                };
+                ongoing_element.set_text_content(Some(&ongoing.to_string()));
                 last_ongoing = Some(ongoing);
             }
 
             let connections = weeb35.get_connections().await;
+            if !interface_mount_can_poll(mount_generation) {
+                break;
+            }
 
             if last_connections != Some(connections) {
-                web_sys::window()
-                    .unwrap()
-                    .document()
-                    .unwrap()
-                    .get_element_by_id("connections")
-                    .expect("#connections should exist")
-                    .dyn_ref::<HtmlSpanElement>()
-                    .unwrap()
-                    .set_text_content(Some(&connections.to_string()));
+                let Some(connections_element) = web_sys::window()
+                    .and_then(|window| window.document())
+                    .and_then(|document| document.get_element_by_id("connections"))
+                    .and_then(|element| element.dyn_into::<HtmlSpanElement>().ok())
+                else {
+                    break;
+                };
+                connections_element.set_text_content(Some(&connections.to_string()));
                 last_connections = Some(connections);
             }
 
-            if let Some((revision, progress_rows)) =
-                weeb35.get_progress_snapshot(last_progress_revision).await
-            {
+            let progress_snapshot = weeb35.get_progress_snapshot(last_progress_revision).await;
+            if !interface_mount_can_poll(mount_generation) {
+                break;
+            }
+            if let Some((revision, progress_rows)) = progress_snapshot {
                 render_progress_rows(progress_rows);
                 last_progress_revision = revision;
             }

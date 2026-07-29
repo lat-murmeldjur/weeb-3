@@ -10,11 +10,12 @@ use crate::mpsc;
 use std::collections::HashMap;
 use std::io::Cursor;
 
-use crate::stream;
+use crate::connection_conventions::{OpenStreamError, StreamControl};
 use libp2p::{
-    PeerId, Stream,
+    PeerId, Stream, StreamProtocol,
     futures::{AsyncReadExt, AsyncWriteExt},
     identity::ecdsa,
+    swarm::ConnectionId,
 };
 
 use wasm_bindgen::JsValue;
@@ -46,8 +47,10 @@ use crate::PSEUDOSETTLE_PROTOCOL;
 use crate::PUSHSYNC_PROTOCOL;
 use crate::RETRIEVAL_PROTOCOL;
 use crate::SWAP_PROTOCOL;
+use crate::{OutboundProtocolSession, TransportConnectionSession};
 
 const DEBUG_HANDLER_LOGS: bool = false;
+const CONTROL_PROTOCOL_MAX_FRAME_BYTES: u64 = 64 * 1024;
 
 macro_rules! handler_log {
     ($($arg:tt)*) => {
@@ -66,6 +69,28 @@ struct OutgoingChequeState {
     effective_deduction: EthU256,
     cheque_delta: EthU256,
     cumulative_payout: EthU256,
+}
+
+async fn read_control_protocol_frame(stream: &mut Stream) -> Option<Vec<u8>> {
+    let mut frame_len = 0_u64;
+    for shift in (0_u32..64).step_by(7) {
+        let mut byte = [0_u8; 1];
+        stream.read_exact(&mut byte).await.ok()?;
+        let value = u64::from(byte[0] & 0x7f);
+        if value > (u64::MAX >> shift) {
+            return None;
+        }
+        frame_len |= value << shift;
+        if frame_len > CONTROL_PROTOCOL_MAX_FRAME_BYTES {
+            return None;
+        }
+        if byte[0] & 0x80 == 0 {
+            let mut frame = vec![0_u8; usize::try_from(frame_len).ok()?];
+            stream.read_exact(&mut frame).await.ok()?;
+            return Some(frame);
+        }
+    }
+    None
 }
 
 fn outgoing_cheque_trace(peer: &PeerId, state: &OutgoingChequeState) -> String {
@@ -138,6 +163,8 @@ async fn prepare_outgoing_cheque_state(
 
 pub async fn ceive(
     peer: PeerId,
+    connection_attempt_id: usize,
+    connection_id: ConnectionId,
     network_id: u64,
     self_ephemeral: libp2p::core::Multiaddr,
     mut stream: Stream,
@@ -164,28 +191,19 @@ pub async fn ceive(
             return false;
         }
     };
-    let _ = stream.flush().await;
+    if stream.flush().await.is_err() {
+        return false;
+    }
 
     handler_log!("Handshake stage 1 1");
 
-    let mut buf_nondiscard_0 = Vec::new();
-    let mut buf_discard_0: [u8; 255] = [0; 255];
-    loop {
-        let n = match stream.read(&mut buf_discard_0).await {
-            Ok(a) => a,
-            Err(_) => {
-                return false;
-            }
-        };
-        buf_nondiscard_0.extend_from_slice(&buf_discard_0[..n]);
-        if n < 255 {
-            break;
-        }
-    }
+    let Some(handshake_frame) = read_control_protocol_frame(&mut stream).await else {
+        return false;
+    };
 
     handler_log!("Handshake stage 1 2");
 
-    let rec_0_u = etiquette_1::SynAck::decode_length_delimited(&mut Cursor::new(buf_nondiscard_0));
+    let rec_0_u = etiquette_1::SynAck::decode(&mut Cursor::new(handshake_frame));
 
     let rec_0 = match rec_0_u {
         Ok(x) => x,
@@ -200,23 +218,29 @@ pub async fn ceive(
 
     handler_log!("Handshake stage 1 3 3");
 
-    let peer_overlay = rec_0.ack.clone().unwrap().address.unwrap().overlay;
+    let Some(ack) = rec_0.ack.as_ref() else {
+        return false;
+    };
+    let Some(peer_address) = ack.address.as_ref() else {
+        return false;
+    };
+    if peer_address.overlay.len() != 32 {
+        return false;
+    }
 
+    let peer_overlay = peer_address.overlay.clone();
     let beneficiary = parse_address(
-        &rec_0.ack.clone().unwrap().address.unwrap().underlay,
-        &rec_0.ack.clone().unwrap().address.unwrap().overlay,
-        &rec_0.ack.clone().unwrap().address.unwrap().signature,
-        &rec_0.ack.clone().unwrap().address.unwrap().nonce,
-        rec_0.ack.clone().unwrap().address.unwrap().timestamp,
+        &peer_address.underlay,
+        &peer_address.overlay,
+        &peer_address.signature,
+        &peer_address.nonce,
+        peer_address.timestamp,
         network_id,
-        &rec_0
-            .ack
-            .clone()
-            .unwrap()
-            .address
-            .unwrap()
-            .chequebook_address,
+        &peer_address.chequebook_address,
     );
+    if beneficiary == web3::types::Address::zero() {
+        return false;
+    }
 
     handler_log!("Handshake stage 1 3");
 
@@ -280,7 +304,9 @@ pub async fn ceive(
             return false;
         }
     };
-    let _ = stream.flush().await;
+    if stream.flush().await.is_err() {
+        return false;
+    }
 
     handler_log!("Handshake stage 1 5");
 
@@ -295,6 +321,8 @@ pub async fn ceive(
             peer_id: peer,
             overlay: peer_overlay.clone(),
             beneficiary: beneficiary,
+            connection_attempt_id,
+            connection_id,
         })
         .is_err()
     {
@@ -305,22 +333,16 @@ pub async fn ceive(
     return true;
 }
 
-pub async fn pricing_handler(peer: PeerId, mut stream: Stream, chan: &mpsc::Sender<(PeerId, u64)>) {
+pub async fn pricing_handler(
+    peer: PeerId,
+    mut stream: Stream,
+    session: TransportConnectionSession,
+    chan: &mpsc::Sender<(PeerId, u64, TransportConnectionSession)>,
+) {
     handler_log!("Opened pricing handle for peer {}!", peer);
 
-    let mut buf_nondiscard_0 = Vec::new();
-    let mut buf_discard_0: [u8; 255] = [0; 255];
-    loop {
-        let n = match stream.read(&mut buf_discard_0).await {
-            Ok(a) => a,
-            Err(_) => {
-                return;
-            }
-        };
-        buf_nondiscard_0.extend_from_slice(&buf_discard_0[..n]);
-        if n < 255 {
-            break;
-        }
+    if read_control_protocol_frame(&mut stream).await.is_none() {
+        return;
     }
 
     let empty = etiquette_0::Headers::default();
@@ -340,24 +362,10 @@ pub async fn pricing_handler(peer: PeerId, mut stream: Stream, chan: &mpsc::Send
     let _ = stream.flush().await;
     let _ = stream.close().await;
 
-    let mut buf_nondiscard_0 = Vec::new();
-    let mut buf_discard_0: [u8; 255] = [0; 255];
-    loop {
-        let n = match stream.read(&mut buf_discard_0).await {
-            Ok(a) => a,
-            Err(_) => {
-                return;
-            }
-        };
-        buf_nondiscard_0.extend_from_slice(&buf_discard_0[..n]);
-        if n < 255 {
-            break;
-        }
-    }
-
-    let rec_0_u = etiquette_4::AnnouncePaymentThreshold::decode_length_delimited(&mut Cursor::new(
-        buf_nondiscard_0,
-    ));
+    let Some(announce_frame) = read_control_protocol_frame(&mut stream).await else {
+        return;
+    };
+    let rec_0_u = etiquette_4::AnnouncePaymentThreshold::decode(&mut Cursor::new(announce_frame));
 
     let rec_0 = match rec_0_u {
         Ok(x) => x,
@@ -369,11 +377,19 @@ pub async fn pricing_handler(peer: PeerId, mut stream: Stream, chan: &mpsc::Send
 
     handler_log!("Got AnnouncePaymentThreshold {:#?}!", rec_0);
 
-    let pt = BigUint::from_bytes_be(&rec_0.payment_threshold)
-        .to_u64()
-        .unwrap();
+    let Some(pt) = BigUint::from_bytes_be(&rec_0.payment_threshold).to_u64() else {
+        return;
+    };
 
-    let _ = chan.try_send((peer, pt));
+    if !session.is_current() {
+        handler_log!(
+            "Discarded pricing result from stale transport session peer={}",
+            peer
+        );
+        return;
+    }
+
+    let _ = chan.try_send((peer, pt, session));
 }
 
 pub async fn gossip_handler(
@@ -448,12 +464,14 @@ pub async fn gossip_handler(
     }
 }
 
-pub async fn fresh(
-    peer: PeerId,
-    amount: u64,
-    mut stream: Stream,
-    chan: &mpsc::Sender<(PeerId, u64)>,
-) {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RefreshmentOutcome {
+    NotDispatched,
+    Acknowledged(u64),
+    AmbiguousAfterPayment,
+}
+
+pub async fn fresh(amount: u64, mut stream: Stream) -> RefreshmentOutcome {
     let empty = etiquette_0::Headers::default();
 
     let mut buf_empty = Vec::new();
@@ -464,27 +482,14 @@ pub async fn fresh(
 
     match stream.write_all(&buf_empty).await {
         Ok(_) => {}
-        Err(_) => {
-            let _ = chan.try_send((peer, 0));
-            return;
-        }
+        Err(_) => return RefreshmentOutcome::NotDispatched,
     };
-    let _ = stream.flush().await;
+    if stream.flush().await.is_err() {
+        return RefreshmentOutcome::NotDispatched;
+    }
 
-    let mut buf_nondiscard_0 = Vec::new();
-    let mut buf_discard_0: [u8; 255] = [0; 255];
-    loop {
-        let n = match stream.read(&mut buf_discard_0).await {
-            Ok(a) => a,
-            Err(_) => {
-                let _ = chan.try_send((peer, 0));
-                return;
-            }
-        };
-        buf_nondiscard_0.extend_from_slice(&buf_discard_0[..n]);
-        if n < 255 {
-            break;
-        }
+    if read_control_protocol_frame(&mut stream).await.is_none() {
+        return RefreshmentOutcome::NotDispatched;
     }
 
     let mut step_1 = etiquette_5::Payment::default();
@@ -499,49 +504,33 @@ pub async fn fresh(
     step_1.encode_length_delimited(&mut bufw_1).unwrap();
     match stream.write_all(&bufw_1).await {
         Ok(_) => {}
-        Err(_) => {
-            let _ = chan.try_send((peer, 0));
-            return;
-        }
+        Err(_) => return RefreshmentOutcome::AmbiguousAfterPayment,
     };
-    let _ = stream.flush().await;
-    let _ = stream.close().await;
-
-    let mut buf_nondiscard_0 = Vec::new();
-    let mut buf_discard_0: [u8; 255] = [0; 255];
-    loop {
-        let n = match stream.read(&mut buf_discard_0).await {
-            Ok(a) => a,
-            Err(_) => {
-                let _ = chan.try_send((peer, 0));
-                return;
-            }
-        };
-        buf_nondiscard_0.extend_from_slice(&buf_discard_0[..n]);
-        if n < 255 {
-            break;
-        }
+    if stream.flush().await.is_err() || stream.close().await.is_err() {
+        return RefreshmentOutcome::AmbiguousAfterPayment;
     }
 
-    let rec_0_u =
-        etiquette_5::PaymentAck::decode_length_delimited(&mut Cursor::new(buf_nondiscard_0));
+    let Some(ack_frame) = read_control_protocol_frame(&mut stream).await else {
+        return RefreshmentOutcome::AmbiguousAfterPayment;
+    };
+    let rec_0_u = etiquette_5::PaymentAck::decode(&mut Cursor::new(ack_frame));
 
     let rec_0 = match rec_0_u {
         Ok(x) => x,
         Err(x) => {
-            let _ = chan.try_send((peer, 0));
             handler_log!("Error in protocol {:#?}!", x);
-            return;
+            return RefreshmentOutcome::AmbiguousAfterPayment;
         }
     };
 
-    let refr_am = BigUint::from_bytes_be(&rec_0.amount).to_u64().unwrap();
+    let Some(refr_am) = BigUint::from_bytes_be(&rec_0.amount).to_u64() else {
+        return RefreshmentOutcome::AmbiguousAfterPayment;
+    };
 
-    if amount > 0 {
-        let _ = chan.try_send((peer, refr_am));
-    } else {
-        let _ = chan.try_send((peer, 0));
+    if refr_am > amount {
+        return RefreshmentOutcome::AmbiguousAfterPayment;
     }
+    RefreshmentOutcome::Acknowledged(refr_am)
 }
 
 #[allow(dead_code)]
@@ -745,19 +734,8 @@ pub async fn trieve(
     };
     let _ = stream.flush().await;
 
-    let mut buf_nondiscard_0 = Vec::new();
-    let mut buf_discard_0: [u8; 255] = [0; 255];
-    loop {
-        let n = match stream.read(&mut buf_discard_0).await {
-            Ok(a) => a,
-            Err(_) => {
-                return;
-            }
-        };
-        buf_nondiscard_0.extend_from_slice(&buf_discard_0[..n]);
-        if n < 255 {
-            break;
-        }
+    if read_control_protocol_frame(&mut stream).await.is_none() {
+        return;
     }
 
     let mut step_1 = etiquette_6::Request::default();
@@ -779,23 +757,10 @@ pub async fn trieve(
     let _ = stream.flush().await;
     let _ = stream.close().await;
 
-    let mut buf_nondiscard_0 = Vec::new();
-    let mut buf_discard_0: [u8; 255] = [0; 255];
-    loop {
-        let n = match stream.read(&mut buf_discard_0).await {
-            Ok(a) => a,
-            Err(_) => {
-                return;
-            }
-        };
-        buf_nondiscard_0.extend_from_slice(&buf_discard_0[..n]);
-        if n < 255 {
-            break;
-        }
-    }
-
-    let rec_0_u =
-        etiquette_6::Delivery::decode_length_delimited(&mut Cursor::new(buf_nondiscard_0));
+    let Some(delivery_frame) = read_control_protocol_frame(&mut stream).await else {
+        return;
+    };
+    let rec_0_u = etiquette_6::Delivery::decode(&mut Cursor::new(delivery_frame));
 
     let rec_0 = match rec_0_u {
         Ok(x) => x,
@@ -814,18 +779,23 @@ pub async fn trieve(
 
 pub async fn connection_handler(
     peer: PeerId,
+    connection_attempt_id: usize,
+    session: TransportConnectionSession,
     network_id: u64,
     self_ephemeral: libp2p::core::Multiaddr,
-    mut control: stream::Control,
+    mut control: StreamControl,
     a: &libp2p::core::Multiaddr,
     pk: &Arc<Mutex<ecdsa::SecretKey>>,
     chan: &mpsc::Sender<PeerFile>,
 ) -> bool {
     handler_log!("Handshake stage 0");
 
+    if !session.is_current() {
+        return false;
+    }
     let stream = match control.open_stream(peer, HANDSHAKE_PROTOCOL).await {
         Ok(stream) => stream,
-        Err(error @ stream::OpenStreamError::UnsupportedProtocol(_)) => {
+        Err(error @ OpenStreamError::UnsupportedProtocol(_)) => {
             handler_log!("{} {}", peer, error);
             return false;
         }
@@ -834,11 +804,17 @@ pub async fn connection_handler(
             return false;
         }
     };
+    if !session.is_current() {
+        drop(stream);
+        return false;
+    }
 
     handler_log!("Handshake stage 1");
 
     if !ceive(
         peer,
+        connection_attempt_id,
+        session.connection_id(),
         network_id,
         self_ephemeral,
         stream,
@@ -861,55 +837,63 @@ pub async fn connection_handler(
     return true;
 }
 
-pub async fn refresh_handler(
+async fn open_current_outbound_stream(
     peer: PeerId,
-    amount: u64,
-    control: stream::Control,
-    chan: &mpsc::Sender<(PeerId, u64)>,
-) {
-    let stream = match control
-        .clone()
-        .open_stream(peer, PSEUDOSETTLE_PROTOCOL)
-        .await
-    {
+    mut control: StreamControl,
+    protocol: StreamProtocol,
+    session: &OutboundProtocolSession,
+) -> Option<Stream> {
+    if !session.is_current() {
+        return None;
+    }
+    let stream = match control.open_stream(peer, protocol).await {
         Ok(stream) => stream,
-        Err(error @ stream::OpenStreamError::UnsupportedProtocol(_)) => {
+        Err(error @ OpenStreamError::UnsupportedProtocol(_)) => {
             handler_log!("{} {}", peer, error);
-            let _ = chan.try_send((peer, 0));
-            return;
+            return None;
         }
         Err(error) => {
             handler_log!("{} {}", peer, error);
-            let _ = chan.try_send((peer, 0));
-            return;
+            return None;
         }
     };
+    if !session.is_current() {
+        drop(stream);
+        return None;
+    }
+    Some(stream)
+}
 
-    fresh(peer, amount, stream, chan).await;
+pub async fn refresh_handler(
+    peer: PeerId,
+    amount: u64,
+    control: StreamControl,
+    session: OutboundProtocolSession,
+) -> RefreshmentOutcome {
+    let Some(stream) =
+        open_current_outbound_stream(peer, control, PSEUDOSETTLE_PROTOCOL, &session).await
+    else {
+        return RefreshmentOutcome::NotDispatched;
+    };
+
+    fresh(amount, stream).await
 }
 
 #[allow(dead_code)]
 pub async fn issue_handler(
     peer: PeerId,
     amount: u64,
-    control: stream::Control,
+    control: StreamControl,
+    session: OutboundProtocolSession,
     chan: &mpsc::Sender<(PeerId, bool)>,
     beneficiaries: Arc<Mutex<HashMap<PeerId, (web3::types::Address, bool)>>>,
     price: U256,
     deduction: U256,
 ) {
-    let stream = match control.clone().open_stream(peer, SWAP_PROTOCOL).await {
-        Ok(stream) => stream,
-        Err(error @ stream::OpenStreamError::UnsupportedProtocol(_)) => {
-            handler_log!("{} {}", peer, error);
-            let _ = chan.try_send((peer, false));
-            return;
-        }
-        Err(error) => {
-            handler_log!("{} {}", peer, error);
-            let _ = chan.try_send((peer, false));
-            return;
-        }
+    let Some(stream) = open_current_outbound_stream(peer, control, SWAP_PROTOCOL, &session).await
+    else {
+        let _ = chan.try_send((peer, false));
+        return;
     };
 
     issue(peer, amount, stream, chan, beneficiaries, price, deduction).await;
@@ -918,19 +902,14 @@ pub async fn issue_handler(
 pub async fn retrieve_handler(
     peer: PeerId,
     chunk_address: Vec<u8>,
-    control: stream::Control,
+    control: StreamControl,
+    session: OutboundProtocolSession,
     chan: &mpsc::Sender<Vec<u8>>,
 ) {
-    let stream = match control.clone().open_stream(peer, RETRIEVAL_PROTOCOL).await {
-        Ok(stream) => stream,
-        Err(error @ stream::OpenStreamError::UnsupportedProtocol(_)) => {
-            handler_log!("{} {}", peer, error);
-            return;
-        }
-        Err(error) => {
-            handler_log!("{} {}", peer, error);
-            return;
-        }
+    let Some(stream) =
+        open_current_outbound_stream(peer, control, RETRIEVAL_PROTOCOL, &session).await
+    else {
+        return;
     };
 
     trieve(peer, chunk_address, stream, chan).await;
@@ -941,19 +920,14 @@ pub async fn pushsync_handler(
     chunk_address: &Vec<u8>,
     chunk_content: &Vec<u8>,
     chunk_stamp: &Vec<u8>,
-    control: stream::Control,
+    control: StreamControl,
+    session: OutboundProtocolSession,
     chan: &mpsc::Sender<bool>,
 ) {
-    let stream = match control.clone().open_stream(peer, PUSHSYNC_PROTOCOL).await {
-        Ok(stream) => stream,
-        Err(error @ stream::OpenStreamError::UnsupportedProtocol(_)) => {
-            handler_log!("{} {}", peer, error);
-            return;
-        }
-        Err(error) => {
-            handler_log!("{} {}", peer, error);
-            return;
-        }
+    let Some(stream) =
+        open_current_outbound_stream(peer, control, PUSHSYNC_PROTOCOL, &session).await
+    else {
+        return;
     };
 
     sync(
@@ -991,20 +965,9 @@ pub async fn sync(
     };
     let _ = stream.flush().await;
 
-    let mut buf_nondiscard_0 = Vec::new();
-    let mut buf_discard_0: [u8; 255] = [0; 255];
-    loop {
-        let n = match stream.read(&mut buf_discard_0).await {
-            Ok(a) => a,
-            Err(_) => {
-                let _ = chan.try_send(false);
-                return;
-            }
-        };
-        buf_nondiscard_0.extend_from_slice(&buf_discard_0[..n]);
-        if n < 255 {
-            break;
-        }
+    if read_control_protocol_frame(&mut stream).await.is_none() {
+        let _ = chan.try_send(false);
+        return;
     }
 
     let mut step_1 = etiquette_7::Delivery::default();
@@ -1014,46 +977,18 @@ pub async fn sync(
     step_1.stamp = chunk_stamp.to_vec();
 
     let bufw_1 = step_1.encode_length_delimited_to_vec();
-
-    let mut i = 0;
-    loop {
-        let mut j = i + 255;
-        if j > bufw_1.len() {
-            j = bufw_1.len();
-        };
-        match stream.write(&bufw_1[i..j].to_vec()).await {
-            Ok(_) => {}
-            Err(_) => {
-                let _ = chan.try_send(false);
-                return;
-            }
-        };
-        let _ = stream.flush().await;
-        i = i + 255;
-        if j == bufw_1.len() {
-            break;
-        };
+    if stream.write_all(&bufw_1).await.is_err() || stream.flush().await.is_err() {
+        let _ = chan.try_send(false);
+        return;
     }
 
     let _ = stream.close().await;
 
-    let mut buf_nondiscard_0 = Vec::new();
-    let mut buf_discard_0: [u8; 255] = [0; 255];
-    loop {
-        let n = match stream.read(&mut buf_discard_0).await {
-            Ok(a) => a,
-            Err(_) => {
-                let _ = chan.try_send(false);
-                return;
-            }
-        };
-        buf_nondiscard_0.extend_from_slice(&buf_discard_0[..n]);
-        if n < 255 {
-            break;
-        }
-    }
-
-    let rec_0_u = etiquette_7::Receipt::decode_length_delimited(&mut Cursor::new(buf_nondiscard_0));
+    let Some(receipt_frame) = read_control_protocol_frame(&mut stream).await else {
+        let _ = chan.try_send(false);
+        return;
+    };
+    let rec_0_u = etiquette_7::Receipt::decode(&mut Cursor::new(receipt_frame));
 
     let rec_0 = match rec_0_u {
         Ok(x) => x,

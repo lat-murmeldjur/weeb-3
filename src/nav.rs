@@ -1,13 +1,35 @@
+#[cfg(target_arch = "wasm32")]
 use wasm_bindgen::JsValue;
+#[cfg(target_arch = "wasm32")]
 use web_sys::window;
 
-use crate::network_profile::NetworkMode;
+use crate::{
+    network_profile::NetworkMode,
+    stream_conventions::streaming_route_base,
+    stream_hls::{StreamShareNetwork, parse_stream_share_link},
+};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ResourceRoute {
     Bzz(String),
     Bytes(String),
     Chunks(String),
+    Feed {
+        owner: String,
+        topic: String,
+    },
+    Hls {
+        media_type: String,
+        owner: String,
+        topic: String,
+        index: Option<u64>,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct NetworkedResourceRoute {
+    pub network: NetworkMode,
+    pub resource: ResourceRoute,
 }
 
 fn strip_query(input: &str) -> &str {
@@ -33,10 +55,22 @@ fn trim_route_prefix(input: &str) -> String {
         }
     }
 
-    for prefix in ["/weeb-3/#/", "/weeb-3/", "weeb-3/#/", "weeb-3/"] {
-        if let Some(rest) = route.strip_prefix(prefix) {
-            route = rest.to_string();
-            break;
+    let route_base = streaming_route_base();
+    if !route_base.is_empty() {
+        let relative_base = route_base.trim_start_matches('/');
+        for prefix in [
+            format!("{route_base}/"),
+            format!("{relative_base}/"),
+            format!("{route_base}/#/"),
+            format!("{relative_base}/#/"),
+        ] {
+            if let Some(rest) = route.strip_prefix(&prefix) {
+                route = rest.to_string();
+                break;
+            }
+        }
+        if route == route_base || route == relative_base {
+            route.clear();
         }
     }
 
@@ -51,25 +85,42 @@ fn network_mode_segment(segment: &str) -> Option<NetworkMode> {
     }
 }
 
-fn trim_network_mode_prefix(route: &str) -> &str {
+fn split_transport_network(route: &str) -> (NetworkMode, &str) {
     let route = route.trim_start_matches('/');
     let mut parts = route.splitn(2, '/');
     let head = parts.next().unwrap_or_default();
     let tail = parts.next().unwrap_or_default();
 
-    if network_mode_segment(head).is_some() {
-        tail.trim_start_matches('/')
-    } else {
-        route
+    match head {
+        "mainnet" => (NetworkMode::Mainnet, tail.trim_start_matches('/')),
+        "testnet" => (NetworkMode::Testnet, tail.trim_start_matches('/')),
+        _ => (NetworkMode::Mainnet, route),
     }
 }
 
 pub(crate) fn route_network_mode_from_path(pathname: &str) -> Option<NetworkMode> {
+    if let Some(route) = parse_networked_resource_route(pathname) {
+        return Some(route.network);
+    }
+
     let route = trim_route_prefix(pathname);
-    let head = route.split('/').find(|part| !part.is_empty())?;
-    network_mode_segment(head)
+    if route == "bzz" {
+        return Some(NetworkMode::Mainnet);
+    }
+    if !route.contains('/') {
+        return network_mode_segment(&route);
+    }
+
+    let (network, route) = split_transport_network(&route);
+    let route = route.strip_prefix("read/").unwrap_or(route);
+    if route == "bzz" || is_hls_bytes_route(route) {
+        Some(network)
+    } else {
+        None
+    }
 }
 
+#[cfg(target_arch = "wasm32")]
 pub(crate) fn route_network_mode_from_location() -> Option<NetworkMode> {
     let window = window()?;
     let location = window.location();
@@ -82,9 +133,33 @@ fn is_reference_hex(reference: &str) -> bool {
         && reference.as_bytes().iter().all(|b| b.is_ascii_hexdigit())
 }
 
-pub(crate) fn parse_resource_route(input: &str) -> Option<ResourceRoute> {
-    let route = trim_route_prefix(input);
-    let route = trim_network_mode_prefix(&route).to_string();
+fn is_feed_owner(owner: &str) -> bool {
+    let owner = owner
+        .strip_prefix("0x")
+        .or_else(|| owner.strip_prefix("0X"))
+        .unwrap_or(owner);
+    owner.len() == 40 && owner.as_bytes().iter().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn feed_identity(tail: &str) -> Option<(String, String)> {
+    let mut parts = tail.trim_matches('/').split('/');
+    let owner = parts.next()?.trim();
+    let topic = parts.next()?.trim();
+    if parts.next().is_some() || !is_feed_owner(owner) || topic.is_empty() || topic.len() > 256 {
+        return None;
+    }
+    Some((owner.to_string(), topic.to_string()))
+}
+
+fn is_hls_bytes_route(route: &str) -> bool {
+    let Some(reference) = route.strip_prefix("hls/bytes/") else {
+        return false;
+    };
+    is_reference_hex(reference.trim_matches('/'))
+}
+
+fn parse_resource_route_body(route: &str) -> Option<ResourceRoute> {
+    let route = route.strip_prefix("read/").unwrap_or(route);
     let mut parts = route.splitn(2, '/');
     let head = parts.next().unwrap_or_default();
     let tail = parts.next().unwrap_or_default();
@@ -119,9 +194,40 @@ pub(crate) fn parse_resource_route(input: &str) -> Option<ResourceRoute> {
                 None
             }
         }
-        reference if is_reference_hex(reference) => Some(ResourceRoute::Bzz(route)),
+        "feed" | "feeds" => {
+            let (owner, topic) = feed_identity(tail)?;
+            Some(ResourceRoute::Feed { owner, topic })
+        }
+        reference if is_reference_hex(reference) => Some(ResourceRoute::Bzz(route.to_string())),
         _ => None,
     }
+}
+
+pub(crate) fn parse_networked_resource_route(input: &str) -> Option<NetworkedResourceRoute> {
+    if let Ok(route) = parse_stream_share_link(input, &streaming_route_base()) {
+        let network = match route.network {
+            StreamShareNetwork::Mainnet => NetworkMode::Mainnet,
+            StreamShareNetwork::Testnet => NetworkMode::Testnet,
+        };
+        return Some(NetworkedResourceRoute {
+            network,
+            resource: ResourceRoute::Hls {
+                media_type: "video".to_string(),
+                owner: route.owner,
+                topic: route.topic,
+                index: route.index,
+            },
+        });
+    }
+
+    let route = trim_route_prefix(input);
+    let (network, route) = split_transport_network(&route);
+    let resource = parse_resource_route_body(route)?;
+    Some(NetworkedResourceRoute { network, resource })
+}
+
+pub(crate) fn parse_resource_route(input: &str) -> Option<ResourceRoute> {
+    parse_networked_resource_route(input).map(|route| route.resource)
 }
 
 fn parse_routes_from_path(pathname: &str) -> Vec<ResourceRoute> {
@@ -132,7 +238,10 @@ fn parse_routes_from_path(pathname: &str) -> Vec<ResourceRoute> {
 
     while index < segments.len() {
         let segment = segments[index];
-        if matches!(segment, "bzz" | "bytes" | "chunk" | "chunks") {
+        if matches!(
+            segment,
+            "bzz" | "bytes" | "chunk" | "chunks" | "feed" | "feeds"
+        ) {
             if let Some(reference) = segments.get(index + 1) {
                 let path_tail = if index + 2 < segments.len() {
                     format!("{}/{}", reference, segments[index + 2..].join("/"))
@@ -154,6 +263,7 @@ fn parse_routes_from_path(pathname: &str) -> Vec<ResourceRoute> {
     routes
 }
 
+#[cfg(target_arch = "wasm32")]
 pub async fn clear_path() {
     let window = window().unwrap();
     let location = window.location();
@@ -254,6 +364,7 @@ pub async fn clear_path() {
     }
 }
 
+#[cfg(target_arch = "wasm32")]
 pub async fn read_routes() -> Vec<ResourceRoute> {
     let window = match window() {
         Some(w) => w,
@@ -264,6 +375,13 @@ pub async fn read_routes() -> Vec<ResourceRoute> {
         Ok(p) => p,
         Err(_) => return vec![],
     };
+
+    // Canonical stream share routes must retain their configured mount and
+    // explicit network until the strict codec has decoded the topic. The
+    // scanner below is intentionally only a legacy/fallback path search.
+    if let Some(route) = parse_resource_route(&pathname) {
+        return vec![route];
+    }
 
     let parsed_routes = parse_routes_from_path(&pathname);
     if !parsed_routes.is_empty() {

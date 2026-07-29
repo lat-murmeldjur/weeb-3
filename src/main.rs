@@ -8,9 +8,10 @@ use std::time::Duration;
 
 use tower_http::cors::{Any, CorsLayer};
 
-use axum::http::StatusCode;
-use axum::http::header::CONTENT_TYPE;
-use axum::response::{Html, IntoResponse};
+use axum::extract::Path;
+use axum::http::header::{ACCEPT, CONTENT_TYPE};
+use axum::http::{HeaderMap, StatusCode, Uri};
+use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::{Router, http::Method, routing::get};
 use axum_server::tls_rustls::RustlsConfig;
 
@@ -23,6 +24,10 @@ use libp2p::{
     swarm::SwarmEvent,
 };
 use libp2p_webrtc as webrtc;
+
+#[allow(dead_code)]
+mod stream_conventions;
+use stream_conventions::{is_direct_share_route, is_document_navigation};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -104,7 +109,13 @@ pub(crate) async fn serve(libp2p_transport: Multiaddr) {
         .route("/weeb-3/mainnet/", get(get_index))
         .route("/weeb-3/testnet", get(get_index))
         .route("/weeb-3/testnet/", get(get_index))
-        .route("/example.html", get(get_example))
+        .route("/example.html", get(redirect_example))
+        .route("/weeb-3/example.html", get(get_example))
+        .route("/hls-stream-example.html", get(redirect_hls_stream_example))
+        .route(
+            "/weeb-3/hls-stream-example.html",
+            get(get_hls_stream_example),
+        )
         .route("/weeb-3/weeb_3.js", get(get_static_file_weeb_3_js))
         .route(
             "/weeb-3/weeb_3_bg.wasm",
@@ -112,11 +123,8 @@ pub(crate) async fn serve(libp2p_transport: Multiaddr) {
         )
         .route("/weeb-3/worker.js", get(get_static_file_worker_js))
         .route("/weeb-3/service.js", get(get_static_file_service_js))
-        .route(
-            "/weeb-3/snippets/web3-0742d85b024bb6f5/inline0.js",
-            get(get_static_file_web3_export_js),
-        )
-        .route("/{*wildcard}", get(get_404))
+        .route("/weeb-3/snippets/{*path}", get(get_static_snippet))
+        .route("/{*wildcard}", get(get_fallback))
         .layer(
             CorsLayer::new()
                 .allow_origin(Any)
@@ -153,6 +161,26 @@ async fn get_example() -> Result<Html<String>, StatusCode> {
         .to_string();
 
     Ok(Html(html))
+}
+
+async fn get_hls_stream_example() -> Result<Html<String>, StatusCode> {
+    let content = StaticFiles::get("hls-stream-example.html")
+        .ok_or(StatusCode::NOT_FOUND)?
+        .data;
+
+    let html = std::str::from_utf8(&content)
+        .expect("hls-stream-example.html to be valid utf8")
+        .to_string();
+
+    Ok(Html(html))
+}
+
+async fn redirect_example() -> Redirect {
+    Redirect::temporary("/weeb-3/example.html")
+}
+
+async fn redirect_hls_stream_example() -> Redirect {
+    Redirect::temporary("/weeb-3/hls-stream-example.html")
 }
 
 async fn get_static_file_weeb_3_js() -> Result<impl IntoResponse, StatusCode> {
@@ -199,18 +227,45 @@ async fn get_static_file_service_js() -> Result<impl IntoResponse, StatusCode> {
     Ok(([(CONTENT_TYPE, content_type)], content))
 }
 
-async fn get_static_file_web3_export_js() -> Result<impl IntoResponse, StatusCode> {
-    let content = StaticFiles::get("snippets/web3-0742d85b024bb6f5/inline0.js")
+async fn get_static_snippet(Path(path): Path<String>) -> Result<impl IntoResponse, StatusCode> {
+    if !path.ends_with(".js")
+        || path
+            .split('/')
+            .any(|part| part.is_empty() || part == "." || part == ".." || part.contains('\\'))
+    {
+        return Err(StatusCode::NOT_FOUND);
+    }
+
+    let embedded_path = format!("snippets/{}", path);
+    let content = StaticFiles::get(&embedded_path)
         .ok_or(StatusCode::NOT_FOUND)?
         .data;
-    let content_type = mime_guess::from_path("snippets/web3-0742d85b024bb6f5/inline0.js")
+    let content_type = mime_guess::from_path(&embedded_path)
         .first_or_octet_stream()
         .to_string();
 
     Ok(([(CONTENT_TYPE, content_type)], content))
 }
 
-async fn get_404() -> Result<Html<String>, StatusCode> {
+async fn get_fallback(uri: Uri, headers: HeaderMap) -> Result<Response, StatusCode> {
+    let fetch_mode = headers
+        .get("sec-fetch-mode")
+        .and_then(|value| value.to_str().ok());
+    let fetch_destination = headers
+        .get("sec-fetch-dest")
+        .and_then(|value| value.to_str().ok());
+    let accept = headers.get(ACCEPT).and_then(|value| value.to_str().ok());
+
+    if is_direct_share_route(uri.path())
+        && is_document_navigation("GET", fetch_mode, fetch_destination, accept)
+    {
+        Ok(get_index().await?.into_response())
+    } else {
+        get_404().await
+    }
+}
+
+async fn get_404() -> Result<Response, StatusCode> {
     let content = StaticFiles::get("404.html")
         .ok_or(StatusCode::NOT_FOUND)?
         .data;
@@ -219,5 +274,5 @@ async fn get_404() -> Result<Html<String>, StatusCode> {
         .expect("404.html to be valid utf8")
         .to_string();
 
-    Ok(Html(html))
+    Ok((StatusCode::NOT_FOUND, Html(html)).into_response())
 }

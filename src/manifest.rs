@@ -1,4 +1,4 @@
-use crate::{ChunkRetrieveSender, mpsc};
+use crate::{ChunkRetrieveSender, bzz_stream::retrieve_embedded_data, mpsc};
 
 use crate::{
     //
@@ -32,7 +32,7 @@ pub struct Fork {
 
 struct ManifestFork {
     fork_type: u8,
-    prefix: String,
+    prefix: Vec<u8>,
     reference: Vec<u8>,
     metadata: Option<Value>,
 }
@@ -43,15 +43,19 @@ struct ManifestForkResult {
     explicit_index: Option<String>,
 }
 
-fn child_path(path_prefix_heritance: &str, fork_prefix: &str) -> String {
-    let mut bequeath: String = String::new();
-    bequeath.push_str(path_prefix_heritance);
-    bequeath.push_str(fork_prefix);
+fn child_path(path_prefix_heritance: &[u8], fork_prefix: &[u8]) -> Vec<u8> {
+    let mut bequeath = Vec::with_capacity(path_prefix_heritance.len() + fork_prefix.len());
+    bequeath.extend_from_slice(path_prefix_heritance);
+    bequeath.extend_from_slice(fork_prefix);
     bequeath
 }
 
+fn display_path(path: &[u8]) -> String {
+    String::from_utf8_lossy(path).into_owned()
+}
+
 async fn load_manifest_fork(
-    path_prefix_heritance: String,
+    path_prefix_heritance: Vec<u8>,
     manifest_encrypted: bool,
     ref_size: u8,
     fork: ManifestFork,
@@ -65,6 +69,7 @@ async fn load_manifest_fork(
     };
 
     let ref_data = get_data(fork.reference, data_retrieve_chan).await;
+    let has_edge = fork.fork_type & 4 == 4;
 
     if fork.fork_type & 16 == 16 {
         manifest_debug!("fork_type: metadata",);
@@ -87,48 +92,25 @@ async fn load_manifest_fork(
             let feed_data_soc = seek_latest_feed_update(owner, topic, chunk_retrieve_chan, 8).await;
 
             if feed_data_soc.len() >= 8 {
-                let mut feed_data_content = vec![];
+                if let Some(feed_data_content) =
+                    retrieve_embedded_data(&feed_data_soc, ref_size == 64, chunk_retrieve_chan)
+                        .await
+                {
+                    manifest_debug!(
+                        "dispatch interpret manifest for wrapped content in feed head soc",
+                    );
 
-                let soc_wrapped_span =
-                    u64::from_le_bytes(feed_data_soc[0..8].try_into().unwrap_or([0; 8]));
+                    let (mut appendix_0, nondiscard) = Box::pin(interpret_manifest_bytes(
+                        vec![],
+                        &feed_data_content,
+                        data_retrieve_chan,
+                        chunk_retrieve_chan,
+                    ))
+                    .await;
 
-                if soc_wrapped_span <= 4096 {
-                    feed_data_content = feed_data_soc.to_vec();
-                } else {
-                    let lens = (feed_data_soc.len() - 8) / ref_size as usize;
-
-                    feed_data_content.append(&mut feed_data_soc[0..8].to_vec());
-
-                    let mut feed_leaf_refs = Vec::with_capacity(lens);
-                    for i in 0..lens {
-                        let ref_start = 8 + i * ref_size as usize;
-                        let ref_end = 8 + (i + 1) * ref_size as usize;
-
-                        feed_leaf_refs.push(feed_data_soc[ref_start..ref_end].to_vec());
-                    }
-
-                    let feed_leaf_loads = feed_leaf_refs.into_iter().map(|addr| {
-                        let data_retrieve_chan = data_retrieve_chan.clone();
-                        async move { get_data(addr, &data_retrieve_chan).await }
-                    });
-
-                    for leaf in join_all(feed_leaf_loads).await {
-                        feed_data_content.extend_from_slice(&leaf[8..]);
-                    }
+                    result.feed_index = Some(nondiscard);
+                    result.parts.append(&mut appendix_0);
                 }
-
-                manifest_debug!("dispatch interpret manifest for wrapped content in feed head soc",);
-
-                let (mut appendix_0, nondiscard) = Box::pin(interpret_manifest(
-                    "".to_string(),
-                    &feed_data_content,
-                    data_retrieve_chan,
-                    chunk_retrieve_chan,
-                ))
-                .await;
-
-                result.feed_index = Some(nondiscard);
-                result.parts.append(&mut appendix_0);
             }
         }
 
@@ -148,7 +130,7 @@ async fn load_manifest_fork(
                     "dispatch interpret manifest for with metadata fork reference with no content type",
                 );
 
-                let (mut appendix_0, _discard) = Box::pin(interpret_manifest(
+                let (mut appendix_0, _discard) = Box::pin(interpret_manifest_bytes(
                     bequeath,
                     &ref_data,
                     data_retrieve_chan,
@@ -213,9 +195,21 @@ async fn load_manifest_fork(
                     data: actual_data.to_vec(),
                     mime: mime_0,
                     // filename: filename_0,
-                    path: child_path(&path_prefix_heritance, &fork.prefix),
+                    path: display_path(&child_path(&path_prefix_heritance, &fork.prefix)),
                 });
             }
+        }
+
+        if has_edge {
+            let bequeath = child_path(&path_prefix_heritance, &fork.prefix);
+            let (mut descendants, _discard) = Box::pin(interpret_manifest_bytes(
+                bequeath,
+                &ref_data,
+                data_retrieve_chan,
+                chunk_retrieve_chan,
+            ))
+            .await;
+            result.parts.append(&mut descendants);
         }
     }
 
@@ -224,7 +218,7 @@ async fn load_manifest_fork(
 
         let bequeath = child_path(&path_prefix_heritance, &fork.prefix);
         manifest_debug!("dispatch interpret manifest for fork with no metadata",);
-        let (mut appendix_0, _discard) = Box::pin(interpret_manifest(
+        let (mut appendix_0, _discard) = Box::pin(interpret_manifest_bytes(
             bequeath,
             &ref_data,
             data_retrieve_chan,
@@ -239,6 +233,21 @@ async fn load_manifest_fork(
 
 pub async fn interpret_manifest(
     path_prefix_heritance: String,
+    cd0: &Vec<u8>,
+    data_retrieve_chan: &mpsc::Sender<(Vec<u8>, mpsc::Sender<Vec<u8>>)>,
+    chunk_retrieve_chan: &ChunkRetrieveSender,
+) -> (Vec<Fork>, String) {
+    interpret_manifest_bytes(
+        path_prefix_heritance.into_bytes(),
+        cd0,
+        data_retrieve_chan,
+        chunk_retrieve_chan,
+    )
+    .await
+}
+
+async fn interpret_manifest_bytes(
+    path_prefix_heritance: Vec<u8>,
     cd0: &Vec<u8>,
     data_retrieve_chan: &mpsc::Sender<(Vec<u8>, mpsc::Sender<Vec<u8>>)>,
     chunk_retrieve_chan: &ChunkRetrieveSender,
@@ -351,8 +360,7 @@ pub async fn interpret_manifest(
         manifest_debug!("fork_prefix_length: {}", hex::encode(&[fork_prefix_length]));
 
         let fork_prefix = &cd[fork_start + 2..fork_start + 2 + (fork_prefix_length as usize)];
-        let string_fork_prefix = String::from_utf8(fork_prefix.to_vec()).unwrap_or("".to_string());
-        manifest_debug!("string_fork_prefix: {}", string_fork_prefix);
+        manifest_debug!("fork_prefix: {}", hex::encode(fork_prefix));
 
         let fork_prefix_delimiter = fork_start + 32;
         let fork_reference_delimiter = fork_prefix_delimiter + (ref_size as usize);
@@ -384,7 +392,7 @@ pub async fn interpret_manifest(
 
         forks.push(ManifestFork {
             fork_type,
-            prefix: string_fork_prefix,
+            prefix: fork_prefix.to_vec(),
             reference: fork_reference.to_vec(),
             metadata,
         });

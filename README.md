@@ -28,12 +28,14 @@ Ensure you have [wasm-pack](https://rustwasm.github.io/wasm-pack/), [protoc](htt
 
 ## Using the npm package
 
-The `wasm-pack` build prepares the generated `static/package.json` for publishing to npm together with the wrapper assets required by the browser package:
+The `wasm-pack` build generates the browser package files, and the publishing workflow finalizes `static/package.json` so every wrapper asset is included:
 
-- `static/snippets/web3-0742d85b024bb6f5/inline0.js`
+- `static/snippets/**`
+- `static/service.js`
 - `static/weeb_3.js`
 - `static/weeb_3_bg.wasm`
 - `static/weeb_3.d.ts`
+- `static/weeb_3_bg.wasm.d.ts`
 
 After publishing, the package can be used with the same API shape as the examples in `static/example.html` and `static/issue-1-json-sync-example.html`:
 
@@ -74,6 +76,14 @@ const ready = await weeb3node.ready(1, 20_000);
 The wrapper exposes the browser node as `Weeb3No103`. It can start the runtime, connect to network profiles, switch between mainnet and testnet with `switchMainnet()` / `switchTestnet()` or `switchNetwork(mode)`, render the bundled interface into a container, report network and progress state, retrieve BZZ resources, retrieve raw bytes or chunks, upload `File` objects or byte arrays, publish and read feed updates, and expose feed identity helpers.
 
 The publishing workflow defaults to the GitHub repository owner scope. If a different npm scope is needed, set the `NPM_SCOPE` repository variable in GitHub Actions before pushing to `main`.
+
+### Bee-compatible erasure coding and optional HLS support
+
+Uploads default to Bee's Medium erasure-coding level. The interface exposes levels `0` through `4` (None, Medium, Strong, Insane, and Paranoid), and npm callers can select the same values with `uploadWithRedundancy`, `postUploadWithRedundancy`, or `postUploadBytesWithRedundancy`. Retrieval reads the level stored in the Swarm tree and uses parity only when data shards are unavailable.
+
+Sequence-feed indexes use Bee's fixed-width eight-byte big-endian encoding. HLS playback is a separate dapp integration rather than a Bee/Swarm standard. Its manifest feeds can be opened with canonical `/stream/{owner}/{topic}[/{index}]` links; mainnet is the default, while testnet links insert `/testnet` before `/stream`.
+
+The npm wrapper provides `renderInterface(container)`, `openStreamFeed(owner, topic)`, `playHlsStream(owner, topic, mediaType, index?)`, `attachHlsStream(media, owner, topic, options)` for application-owned media elements, and `detachHlsStream()` to release an attachment.
 
 ## [Notes]
 
@@ -156,7 +166,7 @@ The `new` function constructs the browser node. In the current implementation it
 - Uses authenticated Noise and Yamux multiplexing for libp2p connections.
 - Enables the stream behavior used by the Swarm protocol handlers.
 - Creates the peer registry, connection registry, progress store, transfer control flag, and runtime channels.
-- Initializes the default Swarm network id to `10`.
+- Initializes the default Swarm network id to `1` (mainnet).
 
 The `run` function is the long-running runtime loop. It builds a channel-based asynchronous task graph for the browser runtime and coordinates the major subsystems:
 
@@ -185,7 +195,9 @@ The main runtime depends on several focused modules:
 - `src/manifest.rs` interprets Swarm manifests.
 - `src/manifest_upload.rs` creates manifests for uploads and collections.
 - `src/bzz_stream.rs` parses canonical BZZ resources, resolves manifests and paths, prepares range trees, and retrieves byte ranges for BZZ resources.
-- `src/streaming_player.rs` integrates range retrieval with browser fetch requests and streaming media playback.
+- `src/stream.rs` integrates generic BZZ range retrieval with browser fetch requests and regular media playback.
+- `src/stream_hls.rs` contains the optional, nonstandard HLS dapp integration: feed discovery, manifest handling, prefetching, and browser playback.
+- `src/stream_conventions.rs` contains the small route, HTTP range, cache identity, and shared media-budget helpers used at the browser boundary.
 - `src/nav.rs` normalizes browser paths and extracts BZZ route references from the location bar.
 - `src/ens.rs` resolves ENS content hashes to Swarm references.
 - `src/events.rs` stores progress rows and progress revisions for the UI and package wrapper.
@@ -224,9 +236,9 @@ The Service Worker solves this by providing deterministic application-scoped rou
 - Testnet can be selected from routes with `/testnet`, for example `/weeb-3/testnet` to boot the interface in testnet mode or `/weeb-3/testnet/bzz/<reference>/<path>` for a testnet BZZ link.
 - Raw byte and chunk routes below `/bytes/`, `/chunks/`, and `/chunk/` are forwarded to the Rust runtime.
 - `POST` requests to the scoped `/bzz` endpoint are forwarded as upload requests, including upload headers such as encryption, collection, and index-document hints.
-- Fetch requests are forwarded to the active controlled client through `postMessage` and `MessageChannel`.
+- Fetch requests are forwarded through `postMessage` and `MessageChannel` only after a fresh, network-aware probe confirms that the selected top-level client hosts a matching weeb-3 runtime. Concurrent probes for the same client are coalesced.
 - BZZ resources can be answered as full responses, byte-range responses, or streaming responses depending on MIME type, request headers, and resource size.
-- The app shell is cached with a network-first strategy so that the interface can continue to load when a cached shell is available.
+- Requests outside the explicit weeb-3 route set remain under the host application's normal fetch and cache policy; the packaged worker does not precache or delete host assets.
 
 This design means that rendered Swarm websites can request their own relative assets through ordinary browser fetch/navigation behavior, while the active Rust runtime resolves and retrieves the underlying Swarm data.
 

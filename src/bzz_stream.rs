@@ -1,83 +1,28 @@
 use crate::{
-    ChunkRetrieveSender, JsValue, RetrieveCancelToken, RetrieveGenerationMap,
-    cancellable_chunk_retrieve_request, chunk_retrieve_request, mpsc,
+    ChunkRetrieveSender, RetrieveCancelToken, RetrieveGenerationMap,
+    erasure_coding::{CHUNK_SIZE, decode_span, encoded_reference_payload_len},
+    manifest_conventions::{
+        BzzManifestFork, MAX_PARALLEL_MANIFEST_FORKS, ParsedBzzManifest, ResolutionGuard,
+        is_bzz_manifest_header, manifest_payload_size_allowed, manifest_wrapped_reference,
+        parse_bzz_manifest,
+    },
+    mpsc,
     retrieval::{
-        get_chunk, get_data, retrieve_data, seek_latest_feed_update, split_chunk_references,
+        DecodedJoinChunk, retrieve_data, retrieve_data_range_from_root,
+        retrieve_data_range_from_root_cancellable, retrieve_decoded_data_root,
+        retrieve_decoded_data_root_cancellable, retrieve_feed_update_at_index,
+        retrieve_feed_update_at_index_bounded, seek_latest_feed_update,
+        seek_latest_feed_update_indexed_bounded_from, seek_latest_feed_update_indexed_from,
+        seek_latest_feed_update_indexed_observing_positive,
     },
     retrieve_cancel_token_current,
 };
 
-use libp2p::futures::{StreamExt, future::join_all, stream::FuturesUnordered};
-use serde_json::Value;
-use std::{
-    cell::RefCell,
-    collections::{BTreeMap, HashMap, VecDeque},
-    future::Future,
-    pin::Pin,
-    time::Duration,
-};
+use libp2p::futures::{StreamExt, stream};
+use std::{rc::Rc, time::Duration};
 
-const RANGE_DISPATCH_YIELD_EVERY: usize = 128;
-const RANGE_RETRIEVE_DATA_PIECE_MAX_BYTES: u64 = 4 * 1024 * 1024;
-const RANGE_TREE_CHUNK_CACHE_MAX: usize = 16384;
 const RANGE_RETRIEVE_RETRY_COUNT: usize = 2;
 const RANGE_RETRIEVE_RETRY_WAIT_MS: u64 = 120;
-const DEBUG_BZZ_STREAM_LOGS: bool = false;
-
-macro_rules! bzz_stream_debug {
-    ($($arg:tt)*) => {
-        if DEBUG_BZZ_STREAM_LOGS {
-            web_sys::console::log_1(&JsValue::from(format!($($arg)*)));
-        }
-    };
-}
-
-thread_local! {
-    static RANGE_TREE_CHUNK_CACHE: RefCell<RangeTreeChunkCache> =
-        RefCell::new(RangeTreeChunkCache::new(RANGE_TREE_CHUNK_CACHE_MAX));
-}
-
-struct RangeTreeChunkCache {
-    max_entries: usize,
-    order: VecDeque<Vec<u8>>,
-    chunks: HashMap<Vec<u8>, Vec<u8>>,
-}
-
-impl RangeTreeChunkCache {
-    fn new(max_entries: usize) -> Self {
-        Self {
-            max_entries,
-            order: VecDeque::new(),
-            chunks: HashMap::new(),
-        }
-    }
-
-    fn get(&mut self, addr: &[u8]) -> Option<Vec<u8>> {
-        let chunk = self.chunks.get(addr).cloned()?;
-        self.order
-            .retain(|cached_addr| cached_addr.as_slice() != addr);
-        self.order.push_back(addr.to_vec());
-        Some(chunk)
-    }
-
-    fn put(&mut self, addr: Vec<u8>, chunk: Vec<u8>) {
-        if self.max_entries == 0 {
-            return;
-        }
-
-        self.order
-            .retain(|cached_addr| cached_addr.as_slice() != addr.as_slice());
-        self.order.push_back(addr.clone());
-        self.chunks.insert(addr, chunk);
-
-        while self.chunks.len() > self.max_entries {
-            let Some(oldest) = self.order.pop_front() else {
-                break;
-            };
-            self.chunks.remove(&oldest);
-        }
-    }
-}
 
 #[derive(Clone, Debug)]
 pub struct BzzResource {
@@ -102,50 +47,10 @@ struct BzzTarget {
     path: String,
 }
 
-#[derive(Clone, Debug)]
-struct BzzManifestFork {
-    fork_type: u8,
-    prefix: String,
-    reference: Vec<u8>,
-    metadata: Option<Value>,
-}
-
 struct ManifestTargetResult {
     targets: Vec<BzzTarget>,
     fallback_index: Option<String>,
     explicit_index: Option<String>,
-}
-
-struct ParsedBzzManifest {
-    cd: Vec<u8>,
-    ref_size: usize,
-    forks: Vec<BzzManifestFork>,
-    explicit_index: Option<String>,
-}
-
-type RangeJoiner = FuturesUnordered<Pin<Box<dyn Future<Output = RangeFetch>>>>;
-type TreeJoiner = FuturesUnordered<Pin<Box<dyn Future<Output = (Vec<u8>, Vec<u8>)>>>>;
-
-struct RangeFetch {
-    subtree_start: u64,
-    addr: Vec<u8>,
-    payload: RangeFetchPayload,
-}
-
-enum RangeFetchPayload {
-    Chunk(Vec<u8>),
-    Data(Vec<u8>),
-}
-
-enum RangeChild {
-    Chunk { start: u64, addr: Vec<u8> },
-    Data { start: u64, addr: Vec<u8> },
-}
-
-enum RangeChunkWork {
-    Skip,
-    Leaf(u64, Vec<u8>),
-    Children(Vec<RangeChild>),
 }
 
 fn strip_known_bzz_prefix(resource: &str) -> String {
@@ -238,579 +143,375 @@ fn bzz_paths_match(left: &str, right: &str) -> bool {
     normalize_bzz_path(left) == normalize_bzz_path(right)
 }
 
-fn child_path(path_prefix_heritance: &str, fork_prefix: &str) -> String {
-    let mut bequeath = String::new();
-    bequeath.push_str(path_prefix_heritance);
-    bequeath.push_str(fork_prefix);
+fn child_path(path_prefix_heritance: &[u8], fork_prefix: &[u8]) -> Vec<u8> {
+    let mut bequeath = Vec::with_capacity(path_prefix_heritance.len() + fork_prefix.len());
+    bequeath.extend_from_slice(path_prefix_heritance);
+    bequeath.extend_from_slice(fork_prefix);
     bequeath
 }
 
-fn data_span(chunk: &[u8]) -> Option<u64> {
-    if chunk.len() < 8 {
-        return None;
+fn normalize_bzz_path_bytes(path: &[u8]) -> &[u8] {
+    let mut start = 0;
+    let mut end = path.len();
+    while start < end && (path[start].is_ascii_whitespace() || path[start] == b'/') {
+        start += 1;
     }
-
-    Some(u64::from_le_bytes(chunk[0..8].try_into().ok()?))
+    while end > start && (path[end - 1].is_ascii_whitespace() || path[end - 1] == b'/') {
+        end -= 1;
+    }
+    &path[start..end]
 }
 
-fn manifest_cd(cd0: &Vec<u8>) -> Option<Vec<u8>> {
-    if cd0.len() < 72 {
-        return None;
-    }
+fn display_bzz_path(path: &[u8]) -> String {
+    String::from_utf8_lossy(normalize_bzz_path_bytes(path)).into_owned()
+}
 
-    let obfuscation_key = &cd0[8..40];
-    let encrypted = hex::encode(obfuscation_key)
-        != "0000000000000000000000000000000000000000000000000000000000000000";
+async fn reference_span(
+    reference: &Vec<u8>,
+    chunk_retrieve_chan: &ChunkRetrieveSender,
+) -> Option<u64> {
+    Some(
+        retrieve_decoded_data_root(reference, chunk_retrieve_chan)
+            .await?
+            .span,
+    )
+}
 
-    let cd = if encrypted {
-        let creylen = obfuscation_key.len();
-        let mut cd = (&cd0[..40]).to_vec();
-        let mut i = 0;
-        while 40 + i * creylen < cd0.len() {
-            let mut k = creylen;
-            if k > cd0.len() - (40 + i * creylen) {
-                k = cd0.len() - (40 + i * creylen);
-            }
-
-            for j in (40 + i * creylen)..(40 + i * creylen + k) {
-                cd.push(cd0[j] ^ obfuscation_key[j - 40 - i * creylen]);
-            }
-
-            i += 1;
-        }
-        cd
+fn embedded_join_root(data: &[u8], encrypted: bool) -> Option<DecodedJoinChunk> {
+    let (level, span) = decode_span(data)?;
+    let payload_len = if span <= CHUNK_SIZE as u64 {
+        usize::try_from(span).ok()?
     } else {
-        cd0.to_vec()
+        encoded_reference_payload_len(span, level, encrypted)?
     };
-
-    if cd.len() < 72 {
+    let end = 8usize.checked_add(payload_len)?;
+    if data.len() != end {
         return None;
     }
 
-    let mf_version = hex::encode(&cd[40..71]);
-    if mf_version != "5768b3b6a7db56d21d1abff40d41cebfc83448fed8d7e9b06ec0d3b073f28f"
-        && mf_version != "025184789d63635766d78c41900196b57d7400875ebe4d9b5d1e76bd9652a9"
-    {
-        return None;
-    }
-
-    let ref_size = cd[71] as usize;
-    if ref_size != 0 && ref_size != 32 && ref_size != 64 {
-        return None;
-    }
-
-    let index_delimiter = 72 + ref_size + 32;
-    if cd.len() < index_delimiter {
-        return None;
-    }
-
-    Some(cd)
-}
-
-fn parse_bzz_manifest(cd0: &Vec<u8>) -> Option<ParsedBzzManifest> {
-    let cd = manifest_cd(cd0)?;
-    let ref_size = cd[71] as usize;
-    let index_delimiter = 72 + ref_size + 32;
-    let mut fork_start_current = index_delimiter;
-    let mut forks = vec![];
-    let mut explicit_index = None;
-
-    while cd.len() > fork_start_current {
-        let fork_start = fork_start_current;
-        if cd.len() < fork_start + 32 + ref_size {
-            return None;
-        }
-
-        let fork_type = cd[fork_start];
-        let fork_prefix_length = cd[fork_start + 1] as usize;
-        if fork_prefix_length > 30 || cd.len() < fork_start + 2 + fork_prefix_length {
-            return None;
-        }
-
-        let fork_prefix = &cd[fork_start + 2..fork_start + 2 + fork_prefix_length];
-        let prefix = String::from_utf8(fork_prefix.to_vec()).unwrap_or_default();
-
-        let fork_prefix_delimiter = fork_start + 32;
-        let fork_reference_delimiter = fork_prefix_delimiter + ref_size;
-        let reference = cd[fork_prefix_delimiter..fork_reference_delimiter].to_vec();
-
-        let metadata = if fork_type & 16 == 16 {
-            if cd.len() < fork_reference_delimiter + 2 {
-                return None;
-            }
-
-            let fork_metadata_bytesize: [u8; 2] = cd
-                [fork_reference_delimiter..fork_reference_delimiter + 2]
-                .try_into()
-                .ok()?;
-            let calc_metadata_bytesize = u16::from_be_bytes(fork_metadata_bytesize) as usize;
-            let fork_metadata_delimiter = fork_reference_delimiter + 2 + calc_metadata_bytesize;
-
-            if cd.len() < fork_metadata_delimiter {
-                return None;
-            }
-
-            fork_start_current = fork_metadata_delimiter;
-            let fork_metadata = &cd[fork_reference_delimiter + 2..fork_metadata_delimiter];
-            let parsed: Option<Value> = serde_json::from_slice(fork_metadata).ok();
-
-            if let Some(value) = &parsed {
-                if let Some(index) = value
-                    .get("website-index-document")
-                    .and_then(|str0i| str0i.as_str())
-                {
-                    explicit_index = Some(index.to_string());
-                }
-            }
-
-            parsed
-        } else {
-            fork_start_current = fork_reference_delimiter;
-            None
-        };
-
-        forks.push(BzzManifestFork {
-            fork_type,
-            prefix,
-            reference,
-            metadata,
-        });
-    }
-
-    Some(ParsedBzzManifest {
-        cd,
-        ref_size,
-        forks,
-        explicit_index,
+    Some(DecodedJoinChunk {
+        level,
+        span,
+        payload: Rc::from(&data[8..end]),
     })
 }
 
-fn manifest_wrapped_reference(cd0: &Vec<u8>) -> Option<Vec<u8>> {
-    let parsed = parse_bzz_manifest(cd0)?;
-    if parsed.ref_size != 32 && parsed.ref_size != 64 {
+pub(crate) async fn retrieve_embedded_data(
+    data: &[u8],
+    encrypted: bool,
+    chunk_retrieve_chan: &ChunkRetrieveSender,
+) -> Option<Vec<u8>> {
+    let (span, payload) =
+        retrieve_embedded_payload_with_span(data, encrypted, chunk_retrieve_chan).await?;
+    let capacity = usize::try_from(span.checked_add(8)?).ok()?;
+    let mut joined = Vec::with_capacity(capacity);
+    joined.extend_from_slice(&span.to_le_bytes());
+    joined.extend_from_slice(&payload);
+    (joined.len() == capacity).then_some(joined)
+}
+
+async fn retrieve_embedded_payload_with_span(
+    data: &[u8],
+    encrypted: bool,
+    chunk_retrieve_chan: &ChunkRetrieveSender,
+) -> Option<(u64, Vec<u8>)> {
+    let root = embedded_join_root(data, encrypted)?;
+    let span = root.span;
+    if !manifest_payload_size_allowed(span) {
         return None;
     }
-
-    let reference_start = 72;
-    let reference_end = reference_start + parsed.ref_size;
-    let reference = parsed.cd[reference_start..reference_end].to_vec();
-
-    if reference.iter().all(|b| *b == 0) {
-        return None;
-    }
-
-    Some(reference)
-}
-
-fn subtree_capacity_for_span(span: u64, address_length: usize) -> u64 {
-    let branch_count = (4096 / address_length).max(1) as u64;
-    let mut capacity = 4096_u64;
-
-    while span > capacity {
-        capacity = capacity.saturating_mul(branch_count);
-        if capacity == u64::MAX {
-            break;
-        }
-    }
-
-    capacity
-}
-
-fn should_yield_after_range_dispatch(dispatched: usize) -> bool {
-    dispatched % RANGE_DISPATCH_YIELD_EVERY == 0
-}
-
-fn cached_range_tree_chunk(addr: &[u8]) -> Option<Vec<u8>> {
-    RANGE_TREE_CHUNK_CACHE.with(|cache| cache.borrow_mut().get(addr))
-}
-
-fn remember_range_tree_chunk(addr: Vec<u8>, chunk: &[u8]) {
-    if data_span(chunk).is_none() {
-        return;
-    };
-
-    RANGE_TREE_CHUNK_CACHE.with(|cache| cache.borrow_mut().put(addr, chunk.to_vec()));
-}
-
-async fn get_range_tree_chunk(addr: Vec<u8>, chunk_retrieve_chan: &ChunkRetrieveSender) -> Vec<u8> {
-    if let Some(chunk) = cached_range_tree_chunk(&addr) {
-        return chunk;
-    }
-
-    let chunk = get_chunk(addr.clone(), chunk_retrieve_chan).await;
-    remember_range_tree_chunk(addr, &chunk);
-    chunk
-}
-
-async fn get_range_tree_chunk_cancellable(
-    addr: Vec<u8>,
-    chunk_retrieve_chan: &ChunkRetrieveSender,
-    cancel: Option<RetrieveCancelToken>,
-) -> Vec<u8> {
-    if let Some(chunk) = cached_range_tree_chunk(&addr) {
-        return chunk;
-    }
-
-    let (chan_out, chan_in) = mpsc::unbounded::<Vec<u8>>();
-    let _ = chunk_retrieve_chan.try_send(cancellable_chunk_retrieve_request(
-        addr.clone(),
-        chan_out,
-        cancel,
-    ));
-    let chunk = chan_in.recv().await.unwrap_or_default();
-    remember_range_tree_chunk(addr, &chunk);
-    chunk
-}
-
-fn queue_range_chunk(
-    subtree_start: u64,
-    addr: Vec<u8>,
-    chunk_retrieve_chan: &ChunkRetrieveSender,
-    joiner: &mut RangeJoiner,
-    cancel: Option<RetrieveCancelToken>,
-) {
-    if let Some(chunk) = cached_range_tree_chunk(&addr) {
-        joiner.push(Box::pin(async move {
-            RangeFetch {
-                subtree_start,
-                addr,
-                payload: RangeFetchPayload::Chunk(chunk),
-            }
-        }));
-        return;
-    }
-
-    let (chan_out, chan_in) = mpsc::unbounded::<Vec<u8>>();
-    let _ = chunk_retrieve_chan.try_send(cancellable_chunk_retrieve_request(
-        addr.clone(),
-        chan_out,
-        cancel,
-    ));
-
-    joiner.push(Box::pin(async move {
-        let chunk = chan_in.recv().await.unwrap_or_default();
-        remember_range_tree_chunk(addr.clone(), &chunk);
-        RangeFetch {
-            subtree_start,
-            addr,
-            payload: RangeFetchPayload::Chunk(chunk),
-        }
-    }));
-}
-
-fn queue_range_data(
-    subtree_start: u64,
-    addr: Vec<u8>,
-    chunk_retrieve_chan: &ChunkRetrieveSender,
-    joiner: &mut RangeJoiner,
-    cancel: Option<RetrieveCancelToken>,
-    cancel_generations: Option<RetrieveGenerationMap>,
-) {
-    let chunk_retrieve_chan = chunk_retrieve_chan.clone();
-
-    joiner.push(Box::pin(async move {
-        let data =
-            retrieve_data_piece(&addr, &chunk_retrieve_chan, cancel, cancel_generations).await;
-        RangeFetch {
-            subtree_start,
-            addr,
-            payload: RangeFetchPayload::Data(data),
-        }
-    }));
-}
-
-async fn retrieve_data_piece(
-    data_address: &Vec<u8>,
-    chunk_retrieve_chan: &ChunkRetrieveSender,
-    cancel: Option<RetrieveCancelToken>,
-    cancel_generations: Option<RetrieveGenerationMap>,
-) -> Vec<u8> {
-    let root_chunk = get_range_tree_chunk_cancellable(
-        data_address.to_vec(),
-        chunk_retrieve_chan,
-        cancel.clone(),
-    )
-    .await;
-    let Some(root_span) = data_span(&root_chunk) else {
-        bzz_stream_debug!("chunk not found: {}", hex::encode(data_address),);
-        return vec![];
-    };
-
-    let expected_len = match usize::try_from(root_span.saturating_add(8)) {
-        Ok(expected_len) => expected_len,
-        Err(_) => return vec![],
-    };
-
-    if root_span <= 4096 {
-        if root_chunk.len() == expected_len {
-            return root_chunk;
-        }
-
-        bzz_stream_debug!(
-            "retrieved chunk length ({}) mismatching span ({}) + 8 for chunk {}",
-            root_chunk.len(),
-            root_span,
-            hex::encode(data_address),
-        );
-        return vec![];
-    }
-
-    if root_span > RANGE_RETRIEVE_DATA_PIECE_MAX_BYTES {
-        bzz_stream_debug!(
-            "range data piece too large: {} bytes for chunk {}",
-            root_span,
-            hex::encode(data_address),
-        );
-        return vec![];
-    }
-
-    let mut data = Vec::with_capacity(expected_len);
-    data.extend_from_slice(&root_chunk[0..8]);
-    data.extend_from_slice(
-        &retrieve_payload_range_from_root(
-            data_address,
-            root_chunk,
-            0,
-            root_span - 1,
-            chunk_retrieve_chan,
-            cancel,
-            cancel_generations,
-        )
-        .await,
-    );
-
-    if data.len() == expected_len {
-        data
+    let payload = if span == 0 {
+        Vec::new()
     } else {
-        bzz_stream_debug!(
-            "retrieved data piece length ({}) not matching span ({}) + 8 for chunk {}",
-            data.len(),
-            root_span,
-            hex::encode(data_address),
-        );
-        vec![]
-    }
+        retrieve_data_range_from_root(
+            root,
+            0,
+            span.checked_sub(1)?,
+            encrypted,
+            chunk_retrieve_chan,
+        )
+        .await?
+    };
+
+    (u64::try_from(payload.len()).ok()? == span).then_some((span, payload))
 }
 
-fn queue_tree_chunk(
-    addr: Vec<u8>,
+pub(crate) async fn retrieve_embedded_payload(
+    data: &[u8],
+    encrypted: bool,
     chunk_retrieve_chan: &ChunkRetrieveSender,
-    joiner: &mut TreeJoiner,
-) {
-    if let Some(chunk) = cached_range_tree_chunk(&addr) {
-        joiner.push(Box::pin(async move { (addr, chunk) }));
-        return;
-    }
-
-    let (chan_out, chan_in) = mpsc::unbounded::<Vec<u8>>();
-    let _ = chunk_retrieve_chan.try_send(chunk_retrieve_request(addr.clone(), chan_out));
-
-    joiner.push(Box::pin(async move {
-        let chunk = chan_in.recv().await.unwrap_or_default();
-        remember_range_tree_chunk(addr.clone(), &chunk);
-        (addr, chunk)
-    }));
+) -> Option<Vec<u8>> {
+    retrieve_embedded_payload_with_span(data, encrypted, chunk_retrieve_chan)
+        .await
+        .map(|(_, payload)| payload)
 }
 
-fn tree_prepare_children(address_length: usize, chunk: &[u8]) -> Option<Vec<Vec<u8>>> {
-    let span = data_span(chunk)?;
-    if span <= 4096 {
-        return Some(vec![]);
-    }
+#[derive(Clone, Debug)]
+pub(crate) struct RawFeedPayload {
+    pub index: u64,
+    pub bytes: Vec<u8>,
+}
 
-    if chunk.len() < 8 + address_length || (chunk.len() - 8) % address_length != 0 {
+async fn raw_feed_payload_from_update(
+    update: &[u8],
+    chunk_retrieve_chan: &ChunkRetrieveSender,
+) -> Option<Vec<u8>> {
+    // uploadPayload creates an ordinary, unencrypted CAC. Trying the encrypted
+    // layout as a fallback also lets this reader handle encrypted feed roots
+    // without changing the common one-chunk fast path.
+    for encrypted in [false, true] {
+        let Some(payload) = retrieve_embedded_payload(update, encrypted, chunk_retrieve_chan).await
+        else {
+            continue;
+        };
+        return Some(payload);
+    }
+    None
+}
+
+pub(crate) async fn acquire_raw_feed_payload_at_index(
+    owner: String,
+    topic: String,
+    index: u64,
+    chunk_retrieve_chan: &ChunkRetrieveSender,
+) -> Option<RawFeedPayload> {
+    let update = retrieve_feed_update_at_index(owner, topic, index, chunk_retrieve_chan).await?;
+    let bytes = raw_feed_payload_from_update(&update, chunk_retrieve_chan).await?;
+    Some(RawFeedPayload { index, bytes })
+}
+
+pub(crate) async fn acquire_raw_feed_payload_at_index_bounded(
+    owner: String,
+    topic: String,
+    index: u64,
+    chunk_retrieve_chan: &ChunkRetrieveSender,
+) -> Option<RawFeedPayload> {
+    let update =
+        retrieve_feed_update_at_index_bounded(owner, topic, index, chunk_retrieve_chan).await?;
+    // Only the SOC listener is deadline-bound. Once the update is
+    // authenticated, finish its manifest tree so a slow but valid archive is
+    // not discarded halfway through decoding.
+    let bytes = raw_feed_payload_from_update(&update, chunk_retrieve_chan).await?;
+    Some(RawFeedPayload { index, bytes })
+}
+
+pub(crate) async fn acquire_latest_raw_feed_payload_observing_positive(
+    owner: String,
+    topic: String,
+    chunk_retrieve_chan: &ChunkRetrieveSender,
+    early_payloads: Option<mpsc::Sender<RawFeedPayload>>,
+) -> Option<RawFeedPayload> {
+    let early_updates = early_payloads.map(|early_payloads| {
+        let (early_update_out, early_update_in) = mpsc::bounded::<(u64, Vec<u8>)>(16);
+        let chunk_retrieve_chan = chunk_retrieve_chan.clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            while let Ok((index, update)) = early_update_in.recv().await {
+                if early_payloads.is_closed() {
+                    return;
+                }
+                let Some(bytes) = raw_feed_payload_from_update(&update, &chunk_retrieve_chan).await
+                else {
+                    continue;
+                };
+                let _ = early_payloads.try_send(RawFeedPayload { index, bytes });
+            }
+        });
+        early_update_out
+    });
+    let (index, update) = seek_latest_feed_update_indexed_observing_positive(
+        owner,
+        topic,
+        chunk_retrieve_chan,
+        8,
+        early_updates,
+    )
+    .await?;
+    let bytes = raw_feed_payload_from_update(&update, chunk_retrieve_chan).await?;
+    Some(RawFeedPayload { index, bytes })
+}
+
+pub(crate) async fn acquire_latest_raw_feed_payload_bounded_from(
+    owner: String,
+    topic: String,
+    initial: RawFeedPayload,
+    chunk_retrieve_chan: &ChunkRetrieveSender,
+) -> Option<RawFeedPayload> {
+    let (index, update) = seek_latest_feed_update_indexed_bounded_from(
+        owner,
+        topic,
+        initial.index,
+        chunk_retrieve_chan,
+    )
+    .await?;
+    if index == initial.index {
+        return Some(initial);
+    }
+    let bytes = raw_feed_payload_from_update(&update, chunk_retrieve_chan).await?;
+    Some(RawFeedPayload { index, bytes })
+}
+
+pub(crate) async fn acquire_latest_raw_feed_payload_from(
+    owner: String,
+    topic: String,
+    initial: RawFeedPayload,
+    chunk_retrieve_chan: &ChunkRetrieveSender,
+) -> Option<RawFeedPayload> {
+    let (index, update) =
+        seek_latest_feed_update_indexed_from(owner, topic, initial.index, chunk_retrieve_chan)
+            .await?;
+    if index == initial.index {
+        return Some(initial);
+    }
+    if index < initial.index {
         return None;
     }
-
-    let capacity = subtree_capacity_for_span(span, address_length);
-    let branch_count = (4096 / address_length).max(1) as u64;
-    let child_capacity = (capacity / branch_count).max(1);
-    let child_refs = split_chunk_references(&chunk[8..], address_length)?;
-    let subtree_end = span.checked_sub(1)?;
-    let mut children = vec![];
-
-    for (child_index, child_addr) in child_refs.into_iter().enumerate() {
-        let child_start = (child_index as u64).saturating_mul(child_capacity);
-        if child_start > subtree_end {
-            break;
-        }
-
-        let child_span = (subtree_end - child_start + 1).min(child_capacity);
-        if child_span > 4096 {
-            children.push(child_addr);
-        }
-    }
-
-    Some(children)
-}
-
-async fn queue_tree_prepare_children(
-    children: Vec<Vec<u8>>,
-    chunk_retrieve_chan: &ChunkRetrieveSender,
-    joiner: &mut TreeJoiner,
-    dispatched: &mut usize,
-) {
-    for child_addr in children {
-        queue_tree_chunk(child_addr, chunk_retrieve_chan, joiner);
-        *dispatched += 1;
-        if should_yield_after_range_dispatch(*dispatched) {
-            async_std::task::yield_now().await;
-        }
-    }
+    let bytes = raw_feed_payload_from_update(&update, chunk_retrieve_chan).await?;
+    Some(RawFeedPayload { index, bytes })
 }
 
 pub async fn prepare_bzz_stream(
     metadata: BzzMetadata,
     chunk_retrieve_chan: &ChunkRetrieveSender,
 ) -> bool {
-    let address_length = metadata.data_reference.len();
-    if address_length != 32 && address_length != 64 {
+    let encrypted = metadata.data_reference.len() == 64;
+    if !encrypted && metadata.data_reference.len() != 32 {
         return false;
     }
 
-    let root_chunk =
-        get_range_tree_chunk(metadata.data_reference.clone(), chunk_retrieve_chan).await;
-    let Some(children) = tree_prepare_children(address_length, &root_chunk) else {
-        bzz_stream_debug!(
-            "could not prepare bzz stream tree for {}",
-            hex::encode(&metadata.data_reference),
-        );
+    let Some(root) =
+        retrieve_decoded_data_root(&metadata.data_reference, chunk_retrieve_chan).await
+    else {
         return false;
     };
-
-    if children.is_empty() {
+    if root.span == 0 {
         return true;
     }
 
-    let mut joiner = FuturesUnordered::new();
-    let mut dispatched = 0usize;
-    let mut prepared = 0usize;
-    let mut failed = 0usize;
-
-    queue_tree_prepare_children(children, chunk_retrieve_chan, &mut joiner, &mut dispatched).await;
-
-    while let Some((addr, chunk)) = joiner.next().await {
-        if chunk.is_empty() {
-            bzz_stream_debug!(
-                "could not prepare bzz stream tree chunk {}",
-                hex::encode(addr),
-            );
-            failed += 1;
-            continue;
-        }
-
-        let Some(children) = tree_prepare_children(address_length, &chunk) else {
-            bzz_stream_debug!("invalid bzz stream tree chunk {}", hex::encode(addr),);
-            failed += 1;
-            continue;
-        };
-
-        prepared += 1;
-        queue_tree_prepare_children(children, chunk_retrieve_chan, &mut joiner, &mut dispatched)
-            .await;
-    }
-
-    bzz_stream_debug!(
-        "prepared bzz stream tree {} intermediate_chunks={} failed={}",
-        metadata.etag,
-        prepared,
-        failed,
-    );
-    prepared > 0 || failed == 0
+    // Warm the root and first playback path. The decoded-chunk LRU then lets
+    // subsequent ranges reuse intermediate chunks without preloading the whole file.
+    let end = root.span.saturating_sub(1).min(CHUNK_SIZE as u64 - 1);
+    retrieve_data_range_from_root(root, 0, end, encrypted, chunk_retrieve_chan)
+        .await
+        .is_some()
 }
 
 async fn retrieve_data_head(
-    data_address: &Vec<u8>,
-    chunk_retrieve_chan: &ChunkRetrieveSender,
-    payload_bytes: u64,
-) -> Vec<u8> {
-    let root_chunk = get_range_tree_chunk(data_address.to_vec(), chunk_retrieve_chan).await;
-    let Some(root_span) = data_span(&root_chunk) else {
-        return vec![];
-    };
-
-    if root_span <= 4096 {
-        return root_chunk;
-    }
-
-    let inclusive_end = (root_span + 7).min(7 + payload_bytes);
-    retrieve_data_range(data_address, 0, inclusive_end, chunk_retrieve_chan).await
-}
-
-async fn get_manifest_data_if_manifest(
     reference: &Vec<u8>,
     chunk_retrieve_chan: &ChunkRetrieveSender,
 ) -> Option<Vec<u8>> {
-    let head = retrieve_data_head(reference, chunk_retrieve_chan, 4096).await;
-    parse_bzz_manifest(&head)?;
-
-    let Some(span) = data_span(&head) else {
+    let encrypted = reference.len() == 64;
+    if !encrypted && reference.len() != 32 {
         return None;
+    }
+
+    let root = retrieve_decoded_data_root(reference, chunk_retrieve_chan).await?;
+    let span = root.span;
+    let head_len = span.min(CHUNK_SIZE as u64);
+    let payload = if head_len == 0 {
+        Vec::new()
+    } else {
+        retrieve_data_range_from_root(
+            root,
+            0,
+            head_len.checked_sub(1)?,
+            encrypted,
+            chunk_retrieve_chan,
+        )
+        .await?
     };
 
-    if head.len() == (span + 8) as usize {
-        return Some(head);
+    let mut head = Vec::with_capacity(8 + payload.len());
+    head.extend_from_slice(&span.to_le_bytes());
+    head.extend_from_slice(&payload);
+    Some(head)
+}
+
+async fn get_manifest_if_manifest(
+    reference: &Vec<u8>,
+    chunk_retrieve_chan: &ChunkRetrieveSender,
+) -> Option<ParsedBzzManifest> {
+    let head = retrieve_data_head(reference, chunk_retrieve_chan).await?;
+    // The fixed manifest header fits in the first payload chunk. Avoid joining
+    // an arbitrary large file unless that header actually identifies a manifest.
+    if !is_bzz_manifest_header(&head) {
+        return None;
+    }
+    let span = u64::from_le_bytes(head.get(..8)?.try_into().ok()?);
+    if !manifest_payload_size_allowed(span) {
+        return None;
+    }
+    if head.len() == usize::try_from(span.checked_add(8)?).ok()? {
+        return parse_bzz_manifest(head);
     }
 
     let data = retrieve_data(reference, chunk_retrieve_chan).await;
-    parse_bzz_manifest(&data)?;
-    Some(data)
+    parse_bzz_manifest(data)
 }
 
-async fn get_root_manifest_data_if_manifest(
+async fn get_root_manifest_if_manifest(
     reference: &Vec<u8>,
     chunk_retrieve_chan: &ChunkRetrieveSender,
-) -> Option<Vec<u8>> {
-    let root_chunk = get_range_tree_chunk(reference.to_vec(), chunk_retrieve_chan).await;
-    parse_bzz_manifest(&root_chunk)?;
-    Some(root_chunk)
+) -> Option<ParsedBzzManifest> {
+    get_manifest_if_manifest(reference, chunk_retrieve_chan).await
 }
 
 async fn collect_reference_targets(
-    path_prefix_heritance: String,
+    path_prefix_heritance: Vec<u8>,
     reference: Vec<u8>,
     data_retrieve_chan: &mpsc::Sender<(Vec<u8>, mpsc::Sender<Vec<u8>>)>,
     chunk_retrieve_chan: &ChunkRetrieveSender,
+    guard: ResolutionGuard,
 ) -> (Vec<BzzTarget>, String) {
     if reference.len() != 32 && reference.len() != 64 {
         return (vec![], String::new());
     }
+    let Some(guard) = guard.descend_reference(&reference) else {
+        return (vec![], String::new());
+    };
 
-    if let Some(manifest_data) =
-        get_manifest_data_if_manifest(&reference, chunk_retrieve_chan).await
-    {
+    if let Some(manifest) = get_manifest_if_manifest(&reference, chunk_retrieve_chan).await {
         return Box::pin(collect_manifest_targets(
             path_prefix_heritance,
-            manifest_data,
+            manifest,
             data_retrieve_chan,
             chunk_retrieve_chan,
+            guard,
         ))
         .await;
+    }
+
+    if !guard.reserve_target() {
+        return (vec![], String::new());
     }
 
     (
         vec![BzzTarget {
             data_reference: reference,
             mime: "application/octet-stream".to_string(),
-            path: normalize_bzz_path(&path_prefix_heritance),
+            path: display_bzz_path(&path_prefix_heritance),
         }],
         String::new(),
     )
 }
 
 async fn collect_manifest_fork_targets(
-    path_prefix_heritance: String,
+    path_prefix_heritance: Vec<u8>,
     ref_size: usize,
     fork: BzzManifestFork,
     data_retrieve_chan: mpsc::Sender<(Vec<u8>, mpsc::Sender<Vec<u8>>)>,
     chunk_retrieve_chan: ChunkRetrieveSender,
+    guard: ResolutionGuard,
 ) -> ManifestTargetResult {
     let mut result = ManifestTargetResult {
         targets: vec![],
         fallback_index: None,
         explicit_index: None,
     };
+    if !guard.reserve_fork() {
+        return result;
+    }
 
+    let has_edge = fork.fork_type & 4 == 4;
     if fork.fork_type & 16 == 16 {
         let Some(metadata) = fork.metadata else {
             return result;
@@ -826,49 +527,30 @@ async fn collect_manifest_fork_targets(
                 .and_then(|str0f1| str0f1.as_str())
                 .map(|topic| topic.to_string()),
         ) {
-            let feed_data_soc =
-                seek_latest_feed_update(owner, topic, &chunk_retrieve_chan, 8).await;
+            if let Some(feed_guard) = guard.descend_feed(&owner, &topic) {
+                let feed_data_soc =
+                    seek_latest_feed_update(owner, topic, &chunk_retrieve_chan, 8).await;
 
-            if feed_data_soc.len() >= 8 {
-                let mut feed_data_content = vec![];
-                let soc_wrapped_span =
-                    u64::from_le_bytes(feed_data_soc[0..8].try_into().unwrap_or([0; 8]));
-
-                if soc_wrapped_span <= 4096 {
-                    feed_data_content = feed_data_soc.to_vec();
-                } else if ref_size > 0 {
-                    let lens = (feed_data_soc.len() - 8) / ref_size;
-                    feed_data_content.extend_from_slice(&feed_data_soc[0..8]);
-
-                    let feed_leaf_refs = (0..lens)
-                        .map(|i| {
-                            let ref_start = 8 + i * ref_size;
-                            let ref_end = 8 + (i + 1) * ref_size;
-                            feed_data_soc[ref_start..ref_end].to_vec()
-                        })
-                        .collect::<Vec<_>>();
-
-                    let feed_leaf_loads = feed_leaf_refs.into_iter().map(|addr| {
-                        let data_retrieve_chan = data_retrieve_chan.clone();
-                        async move { get_data(addr, &data_retrieve_chan).await }
-                    });
-
-                    for leaf in join_all(feed_leaf_loads).await {
-                        if leaf.len() > 8 {
-                            feed_data_content.extend_from_slice(&leaf[8..]);
+                if feed_data_soc.len() >= 8 {
+                    if let Some(feed_data_content) =
+                        retrieve_embedded_data(&feed_data_soc, ref_size == 64, &chunk_retrieve_chan)
+                            .await
+                    {
+                        if let Some(feed_manifest) = parse_bzz_manifest(feed_data_content) {
+                            let (mut feed_targets, feed_index) =
+                                Box::pin(collect_manifest_targets(
+                                    Vec::new(),
+                                    feed_manifest,
+                                    &data_retrieve_chan,
+                                    &chunk_retrieve_chan,
+                                    feed_guard,
+                                ))
+                                .await;
+                            result.targets.append(&mut feed_targets);
+                            result.fallback_index = Some(feed_index);
                         }
                     }
                 }
-
-                let (mut feed_targets, feed_index) = Box::pin(collect_manifest_targets(
-                    String::new(),
-                    feed_data_content,
-                    &data_retrieve_chan,
-                    &chunk_retrieve_chan,
-                ))
-                .await;
-                result.targets.append(&mut feed_targets);
-                result.fallback_index = Some(feed_index);
             }
         }
 
@@ -890,6 +572,7 @@ async fn collect_manifest_fork_targets(
                 fork.reference,
                 &data_retrieve_chan,
                 &chunk_retrieve_chan,
+                guard,
             ))
             .await;
             result.targets.append(&mut child_targets);
@@ -900,19 +583,36 @@ async fn collect_manifest_fork_targets(
         };
 
         let mut data_reference = fork.reference.clone();
-        if let Some(ref_data) =
-            get_root_manifest_data_if_manifest(&fork.reference, &chunk_retrieve_chan).await
+        if let Some(root_manifest) =
+            get_root_manifest_if_manifest(&fork.reference, &chunk_retrieve_chan).await
         {
-            if let Some(wrapped_reference) = manifest_wrapped_reference(&ref_data) {
+            if let Some(wrapped_reference) = manifest_wrapped_reference(root_manifest) {
                 data_reference = wrapped_reference;
             }
         }
 
-        result.targets.push(BzzTarget {
-            data_reference,
-            mime,
-            path: normalize_bzz_path(&bequeath),
-        });
+        if guard.reserve_target() {
+            result.targets.push(BzzTarget {
+                data_reference,
+                mime,
+                path: display_bzz_path(&bequeath),
+            });
+        }
+
+        if has_edge {
+            let (mut child_targets, child_index) = Box::pin(collect_reference_targets(
+                bequeath,
+                fork.reference,
+                &data_retrieve_chan,
+                &chunk_retrieve_chan,
+                guard,
+            ))
+            .await;
+            result.targets.append(&mut child_targets);
+            if result.fallback_index.is_none() {
+                result.fallback_index = Some(child_index);
+            }
+        }
         return result;
     }
 
@@ -922,6 +622,7 @@ async fn collect_manifest_fork_targets(
         fork.reference,
         &data_retrieve_chan,
         &chunk_retrieve_chan,
+        guard,
     ))
     .await;
     result.targets.append(&mut child_targets);
@@ -930,15 +631,12 @@ async fn collect_manifest_fork_targets(
 }
 
 async fn collect_manifest_targets(
-    path_prefix_heritance: String,
-    cd0: Vec<u8>,
+    path_prefix_heritance: Vec<u8>,
+    parsed: ParsedBzzManifest,
     data_retrieve_chan: &mpsc::Sender<(Vec<u8>, mpsc::Sender<Vec<u8>>)>,
     chunk_retrieve_chan: &ChunkRetrieveSender,
+    guard: ResolutionGuard,
 ) -> (Vec<BzzTarget>, String) {
-    let Some(parsed) = parse_bzz_manifest(&cd0) else {
-        return (vec![], String::new());
-    };
-
     let mut targets = vec![];
     let mut index = parsed.explicit_index.unwrap_or_default();
     let mut fallback_index = None;
@@ -950,10 +648,14 @@ async fn collect_manifest_targets(
             fork,
             data_retrieve_chan.clone(),
             chunk_retrieve_chan.clone(),
+            guard.clone(),
         )
     });
 
-    for mut load in join_all(loads).await {
+    // Keep Bee's serialized fork order for index/fallback selection while
+    // limiting how many network-backed branches run concurrently.
+    let mut loads = stream::iter(loads).buffered(MAX_PARALLEL_MANIFEST_FORKS);
+    while let Some(mut load) = loads.next().await {
         if fallback_index.is_none() {
             fallback_index = load.fallback_index.take().filter(|index| !index.is_empty());
         }
@@ -1008,39 +710,47 @@ fn select_bzz_target(
         .or_else(|| targets.into_iter().next())
 }
 
-fn bzz_path_starts_with(path: &str, prefix: &str) -> bool {
-    let path = normalize_bzz_path(path);
-    let prefix = normalize_bzz_path(prefix);
-    prefix.is_empty() || path.starts_with(&prefix)
+fn bzz_path_bytes_match(left: &[u8], right: &[u8]) -> bool {
+    normalize_bzz_path_bytes(left) == normalize_bzz_path_bytes(right)
+}
+
+fn bzz_path_starts_with(path: &[u8], prefix: &[u8]) -> bool {
+    let path = normalize_bzz_path_bytes(path);
+    let prefix = normalize_bzz_path_bytes(prefix);
+    prefix.is_empty() || path.starts_with(prefix)
 }
 
 async fn lazy_reference_target(
-    path_prefix_heritance: String,
+    path_prefix_heritance: Vec<u8>,
     reference: Vec<u8>,
-    requested_path: &str,
+    requested_path: &[u8],
     chunk_retrieve_chan: &ChunkRetrieveSender,
+    guard: ResolutionGuard,
 ) -> Option<BzzTarget> {
     if reference.len() != 32 && reference.len() != 64 {
         return None;
     }
+    let guard = guard.descend_reference(&reference)?;
 
-    if let Some(manifest_data) =
-        get_manifest_data_if_manifest(&reference, chunk_retrieve_chan).await
-    {
+    if let Some(manifest) = get_manifest_if_manifest(&reference, chunk_retrieve_chan).await {
         return Box::pin(lazy_manifest_target(
             path_prefix_heritance,
-            manifest_data,
+            manifest,
             requested_path,
             chunk_retrieve_chan,
+            guard,
         ))
         .await;
     }
 
-    if requested_path.is_empty() || bzz_paths_match(&path_prefix_heritance, requested_path) {
+    if requested_path.is_empty() || bzz_path_bytes_match(&path_prefix_heritance, requested_path) {
+        if !guard.reserve_target() {
+            return None;
+        }
         return Some(BzzTarget {
             data_reference: reference,
             mime: "application/octet-stream".to_string(),
-            path: normalize_bzz_path(&path_prefix_heritance),
+            path: display_bzz_path(&path_prefix_heritance),
         });
     }
 
@@ -1048,24 +758,24 @@ async fn lazy_reference_target(
 }
 
 async fn lazy_manifest_target(
-    path_prefix_heritance: String,
-    cd0: Vec<u8>,
-    requested_path: &str,
+    path_prefix_heritance: Vec<u8>,
+    parsed: ParsedBzzManifest,
+    requested_path: &[u8],
     chunk_retrieve_chan: &ChunkRetrieveSender,
+    guard: ResolutionGuard,
 ) -> Option<BzzTarget> {
-    let parsed = parse_bzz_manifest(&cd0)?;
-    let mut requested_paths = Vec::new();
+    let mut requested_paths: Vec<Vec<u8>> = Vec::new();
 
     if !requested_path.is_empty() {
-        requested_paths.push(normalize_bzz_path(requested_path));
+        requested_paths.push(normalize_bzz_path_bytes(requested_path).to_vec());
     } else if let Some(index) = parsed.explicit_index.clone() {
         if !index.is_empty() {
-            requested_paths.push(normalize_bzz_path(&index));
+            requested_paths.push(normalize_bzz_path(&index).into_bytes());
         }
     }
 
     if requested_path.is_empty() {
-        requested_paths.push("index.html".to_string());
+        requested_paths.push(b"index.html".to_vec());
     }
 
     requested_paths.dedup();
@@ -1077,6 +787,7 @@ async fn lazy_manifest_target(
             parsed.forks.clone(),
             &desired_path,
             chunk_retrieve_chan,
+            guard.clone(),
         ))
         .await
         {
@@ -1090,6 +801,7 @@ async fn lazy_manifest_target(
             parsed.ref_size,
             parsed.forks,
             chunk_retrieve_chan,
+            guard,
         ))
         .await;
     }
@@ -1098,14 +810,19 @@ async fn lazy_manifest_target(
 }
 
 async fn lazy_manifest_target_for_path(
-    path_prefix_heritance: String,
+    path_prefix_heritance: Vec<u8>,
     ref_size: usize,
     forks: Vec<BzzManifestFork>,
-    requested_path: &str,
+    requested_path: &[u8],
     chunk_retrieve_chan: &ChunkRetrieveSender,
+    guard: ResolutionGuard,
 ) -> Option<BzzTarget> {
     for fork in forks {
+        if !guard.reserve_fork() {
+            return None;
+        }
         let bequeath = child_path(&path_prefix_heritance, &fork.prefix);
+        let has_edge = fork.fork_type & 4 == 4;
 
         if !bzz_path_starts_with(requested_path, &bequeath) {
             continue;
@@ -1127,24 +844,29 @@ async fn lazy_manifest_target_for_path(
                 .and_then(|str0| str0.as_str())
                 .map(|mime| mime.to_string())
             {
-                if !bzz_paths_match(&bequeath, requested_path) {
+                if !bzz_path_bytes_match(&bequeath, requested_path) && !has_edge {
                     continue;
                 }
 
-                let mut data_reference = fork.reference.clone();
-                if let Some(ref_data) =
-                    get_root_manifest_data_if_manifest(&fork.reference, chunk_retrieve_chan).await
-                {
-                    if let Some(wrapped_reference) = manifest_wrapped_reference(&ref_data) {
-                        data_reference = wrapped_reference;
+                if bzz_path_bytes_match(&bequeath, requested_path) {
+                    let mut data_reference = fork.reference.clone();
+                    if let Some(root_manifest) =
+                        get_root_manifest_if_manifest(&fork.reference, chunk_retrieve_chan).await
+                    {
+                        if let Some(wrapped_reference) = manifest_wrapped_reference(root_manifest) {
+                            data_reference = wrapped_reference;
+                        }
                     }
-                }
 
-                return Some(BzzTarget {
-                    data_reference,
-                    mime,
-                    path: normalize_bzz_path(&bequeath),
-                });
+                    if !guard.reserve_target() {
+                        return None;
+                    }
+                    return Some(BzzTarget {
+                        data_reference,
+                        mime,
+                        path: display_bzz_path(&bequeath),
+                    });
+                }
             }
         }
 
@@ -1153,6 +875,7 @@ async fn lazy_manifest_target_for_path(
             fork.reference,
             requested_path,
             chunk_retrieve_chan,
+            guard.clone(),
         ))
         .await
         {
@@ -1168,12 +891,16 @@ async fn lazy_manifest_target_for_path(
 }
 
 async fn lazy_first_manifest_target(
-    path_prefix_heritance: String,
+    path_prefix_heritance: Vec<u8>,
     ref_size: usize,
     forks: Vec<BzzManifestFork>,
     chunk_retrieve_chan: &ChunkRetrieveSender,
+    guard: ResolutionGuard,
 ) -> Option<BzzTarget> {
     for fork in forks {
+        if !guard.reserve_fork() {
+            return None;
+        }
         let bequeath = child_path(&path_prefix_heritance, &fork.prefix);
 
         if fork.fork_type & 16 == 16 {
@@ -1193,18 +920,21 @@ async fn lazy_first_manifest_target(
                 .map(|mime| mime.to_string())
             {
                 let mut data_reference = fork.reference.clone();
-                if let Some(ref_data) =
-                    get_root_manifest_data_if_manifest(&fork.reference, chunk_retrieve_chan).await
+                if let Some(root_manifest) =
+                    get_root_manifest_if_manifest(&fork.reference, chunk_retrieve_chan).await
                 {
-                    if let Some(wrapped_reference) = manifest_wrapped_reference(&ref_data) {
+                    if let Some(wrapped_reference) = manifest_wrapped_reference(root_manifest) {
                         data_reference = wrapped_reference;
                     }
                 }
 
+                if !guard.reserve_target() {
+                    return None;
+                }
                 return Some(BzzTarget {
                     data_reference,
                     mime,
-                    path: normalize_bzz_path(&bequeath),
+                    path: display_bzz_path(&bequeath),
                 });
             }
         }
@@ -1212,8 +942,9 @@ async fn lazy_first_manifest_target(
         if let Some(target) = Box::pin(lazy_reference_target(
             bequeath,
             fork.reference,
-            "",
+            b"",
             chunk_retrieve_chan,
+            guard.clone(),
         ))
         .await
         {
@@ -1234,18 +965,18 @@ pub async fn resolve_bzz(
     chunk_retrieve_chan: &ChunkRetrieveSender,
 ) -> Option<BzzMetadata> {
     let parsed = parse_bzz_resource(resource)?;
+    let requested_path = normalize_bzz_path(&parsed.path).into_bytes();
 
     if let Some(target) = lazy_reference_target(
-        String::new(),
+        Vec::new(),
         parsed.reference.clone(),
-        &parsed.path,
+        &requested_path,
         chunk_retrieve_chan,
+        ResolutionGuard::new(),
     )
     .await
     {
-        let root_chunk =
-            get_range_tree_chunk(target.data_reference.clone(), chunk_retrieve_chan).await;
-        let size = data_span(&root_chunk)?;
+        let size = reference_span(&target.data_reference, chunk_retrieve_chan).await?;
 
         return Some(BzzMetadata {
             etag: format!("\"{}\"", hex::encode(&target.data_reference)),
@@ -1258,16 +989,16 @@ pub async fn resolve_bzz(
     }
 
     let (targets, index) = collect_reference_targets(
-        String::new(),
+        Vec::new(),
         parsed.reference,
         data_retrieve_chan,
         chunk_retrieve_chan,
+        ResolutionGuard::new(),
     )
     .await;
     let target_count = targets.len();
     let target = select_bzz_target(targets, &parsed.path, &index)?;
-    let root_chunk = get_range_tree_chunk(target.data_reference.clone(), chunk_retrieve_chan).await;
-    let size = data_span(&root_chunk)?;
+    let size = reference_span(&target.data_reference, chunk_retrieve_chan).await?;
 
     Some(BzzMetadata {
         etag: format!("\"{}\"", hex::encode(&target.data_reference)),
@@ -1279,45 +1010,30 @@ pub async fn resolve_bzz(
     })
 }
 
-async fn latest_feed_manifest_data(
+async fn latest_feed_manifest(
     owner: String,
     topic: String,
     chunk_retrieve_chan: &ChunkRetrieveSender,
-) -> Option<Vec<u8>> {
+) -> Option<ParsedBzzManifest> {
     let feed_data_soc = seek_latest_feed_update(owner, topic, chunk_retrieve_chan, 8).await;
     if feed_data_soc.len() < 8 {
         return None;
     }
 
-    let wrapped_span = data_span(&feed_data_soc)?;
-    if wrapped_span <= 4096 {
-        return Some(feed_data_soc);
-    }
-
-    let ref_payload = &feed_data_soc[8..];
-    let ref_size = if !ref_payload.is_empty() && ref_payload.len() % 32 == 0 {
-        32
-    } else if !ref_payload.is_empty() && ref_payload.len() % 64 == 0 {
-        64
-    } else {
-        return None;
-    };
-
-    let mut content = feed_data_soc[0..8].to_vec();
-    let references = split_chunk_references(ref_payload, ref_size)?;
-    for reference in references {
-        let leaf = retrieve_data(&reference, chunk_retrieve_chan).await;
-        if leaf.len() <= 8 {
-            return None;
+    // A feed stores the logical (decrypted) root but does not carry an
+    // explicit encryption flag. Try both Bee reference layouts and accept the
+    // one that joins to a valid manifest.
+    for encrypted in [false, true] {
+        if let Some(content) =
+            retrieve_embedded_data(&feed_data_soc, encrypted, chunk_retrieve_chan).await
+        {
+            if let Some(manifest) = parse_bzz_manifest(content) {
+                return Some(manifest);
+            }
         }
-        content.extend_from_slice(&leaf[8..]);
     }
 
-    if content.len() == wrapped_span as usize + 8 {
-        Some(content)
-    } else {
-        None
-    }
+    None
 }
 
 pub async fn acquire_latest_feed(
@@ -1325,16 +1041,17 @@ pub async fn acquire_latest_feed(
     topic: String,
     chunk_retrieve_chan: &ChunkRetrieveSender,
 ) -> Option<(Vec<u8>, BzzMetadata)> {
-    let feed_manifest = latest_feed_manifest_data(owner, topic, chunk_retrieve_chan).await?;
+    let guard = ResolutionGuard::new().descend_feed(&owner, &topic)?;
+    let feed_manifest = latest_feed_manifest(owner, topic, chunk_retrieve_chan).await?;
     let target = Box::pin(lazy_manifest_target(
-        String::new(),
+        Vec::new(),
         feed_manifest,
-        "",
+        b"",
         chunk_retrieve_chan,
+        guard,
     ))
     .await?;
-    let root_chunk = get_range_tree_chunk(target.data_reference.clone(), chunk_retrieve_chan).await;
-    let size = data_span(&root_chunk)?;
+    let size = reference_span(&target.data_reference, chunk_retrieve_chan).await?;
     let metadata = BzzMetadata {
         etag: format!("\"{}\"", hex::encode(&target.data_reference)),
         data_reference: target.data_reference,
@@ -1415,7 +1132,10 @@ pub async fn acquire_resolved_range_cancellable(
     }
 
     let end_inclusive = end_inclusive.min(metadata.size.saturating_sub(1));
-    let expected_len = (end_inclusive - start + 1) as usize;
+    let expected_len = end_inclusive
+        .checked_sub(start)?
+        .checked_add(1)
+        .and_then(|len| usize::try_from(len).ok())?;
 
     for attempt in 0..=RANGE_RETRIEVE_RETRY_COUNT {
         if !range_cancel_token_current(&cancel_generations, &cancel).await {
@@ -1441,15 +1161,6 @@ pub async fn acquire_resolved_range_cancellable(
                 return None;
             }
 
-            bzz_stream_debug!(
-                "retrying bzz range {}-{} for {} after short result {}/{} attempt {}",
-                start,
-                end_inclusive,
-                metadata.etag,
-                data.len(),
-                expected_len,
-                attempt + 1,
-            );
             async_std::task::sleep(Duration::from_millis(
                 RANGE_RETRIEVE_RETRY_WAIT_MS * (attempt as u64 + 1),
             ))
@@ -1471,23 +1182,6 @@ async fn range_cancel_token_current(
     true
 }
 
-pub async fn retrieve_data_range(
-    data_address: &Vec<u8>,
-    start: u64,
-    end_inclusive: u64,
-    chunk_retrieve_chan: &ChunkRetrieveSender,
-) -> Vec<u8> {
-    retrieve_data_range_cancellable(
-        data_address,
-        start,
-        end_inclusive,
-        chunk_retrieve_chan,
-        None,
-        None,
-    )
-    .await
-}
-
 pub async fn retrieve_data_range_cancellable(
     data_address: &Vec<u8>,
     start: u64,
@@ -1500,303 +1194,78 @@ pub async fn retrieve_data_range_cancellable(
         return vec![];
     }
 
-    let root_chunk = get_range_tree_chunk_cancellable(
-        data_address.to_vec(),
+    if !range_cancel_token_current(&cancel_generations, &cancel).await {
+        return vec![];
+    }
+
+    let Some(root) = retrieve_decoded_data_root_cancellable(
+        data_address,
         chunk_retrieve_chan,
+        cancel_generations.clone(),
         cancel.clone(),
     )
-    .await;
-    let Some(root_span) = data_span(&root_chunk) else {
-        bzz_stream_debug!("chunk not found: {}", hex::encode(data_address),);
+    .await
+    else {
         return vec![];
     };
+    if !range_cancel_token_current(&cancel_generations, &cancel).await {
+        return vec![];
+    }
 
-    let total_len = root_span + 8;
+    let Some(total_len) = root.span.checked_add(8) else {
+        return vec![];
+    };
     if start >= total_len {
         return vec![];
     }
 
     let end_inclusive = end_inclusive.min(total_len - 1);
-    let mut output = Vec::with_capacity((end_inclusive - start + 1) as usize);
-
-    if start < 8 {
-        let span_end = end_inclusive.min(7);
-        output.extend_from_slice(&root_chunk[start as usize..=span_end as usize]);
-        if end_inclusive < 8 {
-            return output;
-        }
+    let Some(output_len) = end_inclusive
+        .checked_sub(start)
+        .and_then(|len| len.checked_add(1))
+        .and_then(|len| usize::try_from(len).ok())
+    else {
+        return vec![];
+    };
+    let span = root.span.to_le_bytes();
+    if end_inclusive < 8 {
+        return span[start as usize..=end_inclusive as usize].to_vec();
     }
 
     let payload_start = start.max(8) - 8;
     let payload_end = end_inclusive - 8;
-    output.extend_from_slice(
-        &retrieve_payload_range_from_root(
-            data_address,
-            root_chunk,
-            payload_start,
-            payload_end,
-            chunk_retrieve_chan,
-            cancel,
-            cancel_generations,
-        )
-        .await,
-    );
-
-    output
-}
-
-async fn retrieve_payload_range_from_root(
-    data_address: &Vec<u8>,
-    root_chunk: Vec<u8>,
-    start: u64,
-    end_inclusive: u64,
-    chunk_retrieve_chan: &ChunkRetrieveSender,
-    cancel: Option<RetrieveCancelToken>,
-    cancel_generations: Option<RetrieveGenerationMap>,
-) -> Vec<u8> {
-    if start > end_inclusive {
-        return vec![];
-    }
-
-    let address_length = data_address.len();
-    if address_length != 32 && address_length != 64 {
-        return vec![];
-    }
-
-    let mut leaves: BTreeMap<u64, Vec<u8>> = BTreeMap::new();
-    let mut joiner = FuturesUnordered::new();
-    let mut dispatched = 0usize;
-
-    let Some(work) = range_chunk_work(
-        address_length,
-        0,
-        data_address.clone(),
-        root_chunk,
-        start,
-        end_inclusive,
-    ) else {
+    let encrypted = data_address.len() == 64;
+    let Some(payload) = retrieve_data_range_from_root_cancellable(
+        root,
+        payload_start,
+        payload_end,
+        encrypted,
+        chunk_retrieve_chan,
+        cancel_generations.clone(),
+        cancel.clone(),
+    )
+    .await
+    else {
         return vec![];
     };
 
-    dispatch_range_work(
-        work,
-        chunk_retrieve_chan,
-        &mut joiner,
-        &mut leaves,
-        &mut dispatched,
-        cancel.clone(),
-        cancel_generations.clone(),
-    )
-    .await;
-
-    while let Some(fetch) = joiner.next().await {
-        if let (Some(generations), Some(_)) = (&cancel_generations, &cancel) {
-            if !retrieve_cancel_token_current(generations, &cancel).await {
-                return vec![];
-            }
-        }
-
-        let work = match fetch.payload {
-            RangeFetchPayload::Chunk(chunk) => range_chunk_work(
-                address_length,
-                fetch.subtree_start,
-                fetch.addr,
-                chunk,
-                start,
-                end_inclusive,
-            ),
-            RangeFetchPayload::Data(data) => {
-                data_fetch_work(fetch.subtree_start, fetch.addr, data, start, end_inclusive)
-            }
-        };
-
-        let Some(work) = work else {
-            return vec![];
-        };
-
-        dispatch_range_work(
-            work,
-            chunk_retrieve_chan,
-            &mut joiner,
-            &mut leaves,
-            &mut dispatched,
-            cancel.clone(),
-            cancel_generations.clone(),
-        )
-        .await;
+    if !range_cancel_token_current(&cancel_generations, &cancel).await {
+        return vec![];
     }
 
-    let mut output = Vec::with_capacity((end_inclusive - start + 1) as usize);
-    for (_offset, mut leaf) in leaves {
-        output.append(&mut leaf);
+    // BZZ byte ranges exclude the eight-byte Swarm span, so the common path
+    // can return the joined payload allocation directly without a second copy.
+    if start >= 8 {
+        return (payload.len() == output_len)
+            .then_some(payload)
+            .unwrap_or_default();
     }
 
-    output
-}
+    let mut output = Vec::with_capacity(output_len);
+    output.extend_from_slice(&span[start as usize..]);
+    output.extend_from_slice(&payload);
 
-async fn dispatch_range_work(
-    work: RangeChunkWork,
-    chunk_retrieve_chan: &ChunkRetrieveSender,
-    joiner: &mut RangeJoiner,
-    leaves: &mut BTreeMap<u64, Vec<u8>>,
-    dispatched: &mut usize,
-    cancel: Option<RetrieveCancelToken>,
-    cancel_generations: Option<RetrieveGenerationMap>,
-) {
-    match work {
-        RangeChunkWork::Skip => {}
-        RangeChunkWork::Leaf(offset, bytes) => {
-            leaves.insert(offset, bytes);
-        }
-        RangeChunkWork::Children(children) => {
-            for child in children {
-                if let (Some(generations), Some(_)) = (&cancel_generations, &cancel) {
-                    if !retrieve_cancel_token_current(generations, &cancel).await {
-                        break;
-                    }
-                }
-
-                match child {
-                    RangeChild::Chunk { start, addr } => {
-                        queue_range_chunk(start, addr, chunk_retrieve_chan, joiner, cancel.clone());
-                    }
-                    RangeChild::Data { start, addr } => {
-                        queue_range_data(
-                            start,
-                            addr,
-                            chunk_retrieve_chan,
-                            joiner,
-                            cancel.clone(),
-                            cancel_generations.clone(),
-                        );
-                    }
-                }
-                *dispatched += 1;
-                if should_yield_after_range_dispatch(*dispatched) {
-                    async_std::task::yield_now().await;
-                }
-            }
-        }
-    }
-}
-
-fn should_retrieve_child_with_data(child_span: u64) -> bool {
-    child_span <= RANGE_RETRIEVE_DATA_PIECE_MAX_BYTES
-}
-
-fn data_fetch_work(
-    subtree_start: u64,
-    addr: Vec<u8>,
-    data: Vec<u8>,
-    start: u64,
-    end_inclusive: u64,
-) -> Option<RangeChunkWork> {
-    let span = data_span(&data)?;
-    if span == 0 {
-        return Some(RangeChunkWork::Skip);
-    }
-
-    let span_usize = usize::try_from(span).ok()?;
-    let payload_end = 8usize.checked_add(span_usize)?;
-
-    if data.len() < payload_end {
-        bzz_stream_debug!(
-            "retrieved subtree length ({}) too short for span ({}) for chunk {}",
-            data.len(),
-            span,
-            hex::encode(addr),
-        );
-        return None;
-    }
-
-    let subtree_end = subtree_start.checked_add(span)?.checked_sub(1)?;
-    if subtree_end < start || subtree_start > end_inclusive {
-        return Some(RangeChunkWork::Skip);
-    }
-
-    let overlap_start = start.max(subtree_start);
-    let overlap_end = end_inclusive.min(subtree_end);
-    let local_start = usize::try_from(overlap_start - subtree_start).ok()?;
-    let local_end = usize::try_from(overlap_end - subtree_start).ok()?;
-
-    Some(RangeChunkWork::Leaf(
-        overlap_start,
-        data[8 + local_start..=8 + local_end].to_vec(),
-    ))
-}
-
-fn range_chunk_work(
-    address_length: usize,
-    subtree_start: u64,
-    addr: Vec<u8>,
-    chunk: Vec<u8>,
-    start: u64,
-    end_inclusive: u64,
-) -> Option<RangeChunkWork> {
-    let span = data_span(&chunk)?;
-
-    if span == 0 {
-        return Some(RangeChunkWork::Skip);
-    }
-
-    let subtree_end = subtree_start + span - 1;
-    if subtree_end < start || subtree_start > end_inclusive {
-        return Some(RangeChunkWork::Skip);
-    }
-
-    if span <= 4096 {
-        let overlap_start = start.max(subtree_start);
-        let overlap_end = end_inclusive.min(subtree_end);
-        let local_start = (overlap_start - subtree_start) as usize;
-        let local_end = (overlap_end - subtree_start) as usize;
-        let payload = &chunk[8..];
-
-        if payload.len() < local_end + 1 {
-            return None;
-        }
-
-        return Some(RangeChunkWork::Leaf(
-            overlap_start,
-            payload[local_start..=local_end].to_vec(),
-        ));
-    }
-
-    if chunk.len() < 8 + address_length || (chunk.len() - 8) % address_length != 0 {
-        bzz_stream_debug!("chunk too short: {}", hex::encode(addr));
-        return None;
-    }
-
-    let capacity = subtree_capacity_for_span(span, address_length);
-    let branch_count = (4096 / address_length).max(1) as u64;
-    let child_capacity = (capacity / branch_count).max(1);
-    let child_refs = split_chunk_references(&chunk[8..], address_length)?;
-    let mut children = vec![];
-
-    for (child_index, child_addr) in child_refs.into_iter().enumerate() {
-        let child_start = subtree_start + child_index as u64 * child_capacity;
-        if child_start > subtree_end {
-            break;
-        }
-
-        let child_span = (subtree_end - child_start + 1).min(child_capacity);
-        let child_end = child_start + child_span - 1;
-
-        if child_end < start || child_start > end_inclusive {
-            continue;
-        }
-
-        if should_retrieve_child_with_data(child_span) {
-            children.push(RangeChild::Data {
-                start: child_start,
-                addr: child_addr,
-            });
-        } else {
-            children.push(RangeChild::Chunk {
-                start: child_start,
-                addr: child_addr,
-            });
-        }
-    }
-
-    Some(RangeChunkWork::Children(children))
+    (output.len() == output_len)
+        .then_some(output)
+        .unwrap_or_default()
 }

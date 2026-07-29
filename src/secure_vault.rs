@@ -3,7 +3,11 @@ use std::{cell::RefCell, rc::Rc, time::Duration};
 use wasm_bindgen::{JsCast, JsValue, closure::Closure};
 use wasm_bindgen_futures::{JsFuture, spawn_local};
 
-use crate::network_profile::active_profile;
+use crate::{
+    feed::{exact_js_feed_index, sequence_feed_id},
+    network_profile::active_profile,
+    strip_hex_prefix, valid_soc,
+};
 
 const VAULT_ORIGIN: &str = "https://weeb-3-secure.github.io";
 const VAULT_URL: &str = "https://weeb-3-secure.github.io/vault/";
@@ -279,10 +283,33 @@ pub async fn secure_create_feed_update_soc_with_stamp(
     feed_index: u64,
     wrapped_content: Vec<u8>,
 ) -> Option<SecureFeedUpdate> {
+    let topic_bytes = match hex::decode(strip_hex_prefix(&topic)) {
+        Ok(topic_bytes) if !topic_bytes.is_empty() => topic_bytes,
+        _ => {
+            log_error(
+                "secure feed update rejected invalid topic",
+                &JsValue::from_str("topic must be non-empty hexadecimal bytes"),
+            );
+            return None;
+        }
+    };
+    let expected_id = sequence_feed_id(&topic_bytes, feed_index, |input| {
+        alloy::primitives::keccak256(input).into()
+    });
+    let Some(vault_feed_index) = exact_js_feed_index(feed_index) else {
+        log_error(
+            "secure feed update index cannot cross the JavaScript number bridge exactly",
+            &JsValue::from_str(&feed_index.to_string()),
+        );
+        return None;
+    };
+
     let client = secure_client_or_resume("createFeedUpdateSocWithStamp").await?;
     let options = auth_options_for_network(active_profile().swarm_network_id).ok()?;
     set_prop(&options, "topic", JsValue::from_str(&topic)).ok()?;
-    set_prop(&options, "feedIndex", JsValue::from_f64(feed_index as f64)).ok()?;
+    // Pass the logical index unchanged. The signer is responsible for Bee's
+    // canonical big-endian sequence encoding.
+    set_prop(&options, "feedIndex", JsValue::from_f64(vault_feed_index)).ok()?;
     set_prop(&options, "wrappedContent", bytes_value(&wrapped_content)).ok()?;
 
     let signed = match call_secure_client(&client, "createFeedUpdateSocWithStamp", options).await {
@@ -302,10 +329,27 @@ pub async fn secure_create_feed_update_soc_with_stamp(
         });
     }
 
+    let soc_chunk = hex_prop(&signed, "socChunkHex");
+    let soc_address = hex_prop(&signed, "socAddressHex");
+    if soc_chunk.get(..32) != Some(expected_id.as_slice()) {
+        log_error(
+            "secure vault returned a non-canonical feed identifier",
+            &JsValue::from_str(&format!("index {feed_index}")),
+        );
+        return None;
+    }
+    if soc_address.len() != 32 || !valid_soc(&soc_chunk, &soc_address) {
+        log_error(
+            "secure vault returned an invalid feed SOC",
+            &JsValue::from_str(&format!("index {feed_index}")),
+        );
+        return None;
+    }
+
     Some(SecureFeedUpdate {
         bucket_full: false,
-        soc_chunk: hex_prop(&signed, "socChunkHex"),
-        soc_address: hex_prop(&signed, "socAddressHex"),
+        soc_chunk,
+        soc_address,
         stamp: hex_prop(&signed, "stampHex"),
     })
 }

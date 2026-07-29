@@ -2,11 +2,16 @@
 
 use crate::{
     Weeb3, decode_resources, encrey,
-    interface::mount_interface,
+    erasure_coding::RedundancyLevel,
+    interface::{
+        begin_interface_mount, get_service_worker, install_service_worker_message_bridge,
+        mount_interface_after_service_worker_bridge_install,
+    },
     interface_conventions::render_interface_shell,
+    nav::route_network_mode_from_location,
     network_profile::{
-        NetworkMode, NetworkProfile, active_profile, is_browser_dialable_underlay,
-        profile_for_mode, profile_for_swarm_network_id,
+        NetworkMode, NetworkProfile, activate_profile, active_profile,
+        is_browser_dialable_underlay, profile_for_mode, profile_for_swarm_network_id,
     },
     normalize_feed_topic,
     on_chain::{
@@ -23,22 +28,155 @@ use crate::{
         secure_ensure_feed_owner, secure_open_vault_from_user_action,
         secure_prepare_batch_purchase,
     },
+    stream_conventions::{
+        configure_streaming_routes as set_streaming_routes, route_base_controls_path,
+    },
     strip_hex_prefix,
+    upload_conventions::{
+        DEFAULT_UPLOAD_REDUNDANCY_VALUE, UPLOAD_REDUNDANCY_OPTIONS,
+        validated_upload_redundancy_number,
+    },
 };
 use alloy::signers::local::PrivateKeySigner;
 use async_std::sync::Arc;
 use js_sys::{Array, Function, Object, Promise, Reflect, Uint8Array};
-use libp2p::futures::future::join_all;
 use std::{
+    cell::RefCell,
     str::FromStr,
-    sync::atomic::{AtomicBool, Ordering},
+    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
     time::Duration,
 };
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_futures::{JsFuture, spawn_local};
-use web_sys::{Element, File, FilePropertyBag};
+use web_sys::{Element, File, FilePropertyBag, HtmlMediaElement};
 use web3::types::{Address, U256};
+
+thread_local! {
+    static INTERFACE_MOUNT_CONTAINER: RefCell<Option<Element>> = const { RefCell::new(None) };
+}
+
+fn reserve_interface_mount_container(container: &Element) -> Result<(), &'static str> {
+    INTERFACE_MOUNT_CONTAINER.with(|mounted| {
+        let mut mounted = mounted.borrow_mut();
+        if let Some(existing) = mounted.as_ref() {
+            let same_node = existing.is_same_node(Some(container.unchecked_ref()));
+            if existing.is_connected() && !same_node {
+                return Err(
+                    "weeb-3 supports one connected renderInterface container per page; \
+                     rerender the existing container or remove it before mounting another",
+                );
+            }
+        }
+        *mounted = Some(container.clone());
+        Ok(())
+    })
+}
+
+#[wasm_bindgen(typescript_custom_section)]
+const UPLOAD_REDUNDANCY_TYPES: &'static str = r#"
+/** Bee-compatible erasure-coding level used for uploads. */
+export type UploadRedundancyLevel = 0 | 1 | 2 | 3 | 4;
+
+/** Display metadata for an upload erasure-coding choice. */
+export interface UploadRedundancyOption {
+    readonly value: UploadRedundancyLevel;
+    readonly label: string;
+    readonly description: string;
+    readonly isDefault: boolean;
+}
+"#;
+
+#[wasm_bindgen(typescript_custom_section)]
+const HLS_STREAM_TYPES: &'static str = r#"
+/** Which presentation an unindexed mutable HLS feed should expose first. */
+export type HlsStreamStart = "beginning" | "current-window";
+
+/** Options for attaching the shared weeb-3 HLS pipeline to application-owned media. */
+export interface HlsStreamOptions {
+    readonly start: HlsStreamStart;
+    readonly index?: number | null;
+}
+"#;
+
+/// Ordered metadata for building a custom upload redundancy selector.
+#[wasm_bindgen(
+    js_name = uploadRedundancyOptions,
+    unchecked_return_type = "UploadRedundancyOption[]"
+)]
+pub fn upload_redundancy_options() -> Array {
+    let options = Array::new();
+    for option in UPLOAD_REDUNDANCY_OPTIONS {
+        let value = Object::new();
+        set_js(
+            &value,
+            "value",
+            JsValue::from_f64(f64::from(option.value())),
+        );
+        set_js_str(&value, "label", option.label);
+        set_js_str(&value, "description", option.description);
+        set_js(&value, "isDefault", JsValue::from_bool(option.is_default()));
+        options.push(&value);
+    }
+    options
+}
+
+/// Bee's default upload redundancy level (`Medium`).
+#[wasm_bindgen(
+    js_name = defaultUploadRedundancyLevel,
+    unchecked_return_type = "UploadRedundancyLevel"
+)]
+pub fn default_upload_redundancy_level() -> u8 {
+    DEFAULT_UPLOAD_REDUNDANCY_VALUE
+}
+
+/// Configure the same-origin Service Worker asset and URL prefix used by HLS,
+/// feed, BZZ, and raw-byte browser routes. Call this before `renderInterface`
+/// when the npm package is mounted anywhere other than `/weeb-3`.
+#[wasm_bindgen(js_name = configureStreamingRoutes)]
+pub fn configure_streaming_routes(service_worker_url: String, route_base: String) -> Object {
+    let Some(window) = web_sys::window() else {
+        return error_object("streaming routes require a browser window");
+    };
+    let location = window.location();
+    let pathname = location.pathname().unwrap_or_default();
+    if !route_base_controls_path(&route_base, &pathname) {
+        return error_object(
+            "streaming route base must contain the current document so its Service Worker can control this client",
+        );
+    }
+    let page_url = match location
+        .href()
+        .ok()
+        .and_then(|href| web_sys::Url::new(&href).ok())
+    {
+        Some(url) => url,
+        None => return error_object("could not resolve the current document URL"),
+    };
+    let worker_url = match web_sys::Url::new_with_base(&service_worker_url, &page_url.href()) {
+        Ok(url)
+            if matches!(url.protocol().as_str(), "http:" | "https:")
+                && url.origin() == page_url.origin()
+                && url.hash().is_empty() =>
+        {
+            url.href()
+        }
+        _ => {
+            return error_object(
+                "service worker URL must be a same-origin HTTP(S) URL without a fragment",
+            );
+        }
+    };
+    match set_streaming_routes(&worker_url, &route_base) {
+        Ok(()) => ok_object(),
+        Err(error) => error_object(error),
+    }
+}
+
+#[wasm_bindgen(js_name = configure_streaming_routes)]
+pub fn configure_streaming_routes_alias(service_worker_url: String, route_base: String) -> Object {
+    configure_streaming_routes(service_worker_url, route_base)
+}
 
 #[wasm_bindgen]
 pub struct BootstrapNode {
@@ -128,6 +266,13 @@ fn error_object(error: impl AsRef<str>) -> Object {
     set_js_str(&obj, "status", "error");
     set_js_str(&obj, "error", error);
     obj
+}
+
+fn interface_result_view_is_mounted() -> bool {
+    web_sys::window()
+        .and_then(|window| window.document())
+        .and_then(|document| document.get_element_by_id("resultField"))
+        .is_some()
 }
 
 fn u256_string(value: U256) -> JsValue {
@@ -339,7 +484,7 @@ fn start_options_from_js(options: Option<JsValue>) -> StartOptions {
             .map(|profile| profile.mode)
             .unwrap_or(NetworkMode::Mainnet)
     } else {
-        NetworkMode::Mainnet
+        route_network_mode_from_location().unwrap_or(NetworkMode::Mainnet)
     };
 
     let profile = profile_for_mode(mode);
@@ -372,6 +517,40 @@ fn start_options_from_js(options: Option<JsValue>) -> StartOptions {
         network_id,
         bootstrap_nodes,
     }
+}
+
+struct HlsStreamOptions {
+    index: Option<u64>,
+    intent: crate::stream_hls::HlsOpenIntent,
+}
+
+fn hls_stream_options_from_js(options: &JsValue) -> Result<HlsStreamOptions, &'static str> {
+    let start = js_string_prop(options, &["start"])
+        .ok_or("HLS stream options require start: \"beginning\" or \"current-window\"")?;
+    let intent = match start.trim().to_ascii_lowercase().as_str() {
+        "beginning" => crate::stream_hls::HlsOpenIntent::Beginning,
+        "current-window" => crate::stream_hls::HlsOpenIntent::CurrentWindow,
+        _ => return Err("HLS stream start must be \"beginning\" or \"current-window\""),
+    };
+
+    let raw_index = js_prop(options, "index");
+    let index = if raw_index.is_null() || raw_index.is_undefined() {
+        None
+    } else {
+        match raw_index.as_f64() {
+            Some(index)
+                if index.is_finite()
+                    && index >= 0.0
+                    && index <= 9_007_199_254_740_991.0
+                    && (index as u64) as f64 == index =>
+            {
+                Some(index as u64)
+            }
+            _ => return Err("HLS feed index must be an exact unsigned integer"),
+        }
+    };
+
+    Ok(HlsStreamOptions { index, intent })
 }
 
 async fn call_promise(
@@ -476,17 +655,49 @@ async fn request_wallet_address() -> Result<Address, String> {
 #[wasm_bindgen]
 pub struct Weeb3No103 {
     inner: Arc<Weeb3>,
-    started: Arc<AtomicBool>,
+    startup_configured: Arc<AtomicBool>,
+    startup_pending: Arc<AtomicUsize>,
+    startup_serial: Arc<async_lock::Mutex<()>>,
 }
 
-fn start_weeb3_runtime_once(inner: Arc<Weeb3>, started: Arc<AtomicBool>) {
-    if started.swap(true, Ordering::Relaxed) {
-        return;
-    }
-
+fn start_weeb3_runtime(inner: Arc<Weeb3>) {
     spawn_local(async move {
         inner.run(String::new()).await;
     });
+}
+
+fn schedule_bootnode_dials(
+    inner: Arc<Weeb3>,
+    network_id: String,
+    bootstrap_nodes: Vec<StartBootstrapNode>,
+) {
+    let Ok(expected_network_id) = network_id.parse::<u64>() else {
+        return;
+    };
+    let mut seen = std::collections::HashSet::new();
+
+    for node in bootstrap_nodes {
+        if node.multiaddr.is_empty() || !seen.insert(node.multiaddr.clone()) {
+            continue;
+        }
+        if !is_browser_dialable_underlay(&node.multiaddr) {
+            inner.interface_log(format!(
+                "Skipped non-browser bootnode for network {}: {}",
+                network_id, node.multiaddr
+            ));
+            continue;
+        }
+        let dialer = inner.clone();
+        spawn_local(async move {
+            let _ = dialer
+                .connect_bootnode_for_current_network(
+                    node.multiaddr,
+                    expected_network_id,
+                    node.usable,
+                )
+                .await;
+        });
+    }
 }
 
 #[wasm_bindgen]
@@ -495,62 +706,129 @@ impl Weeb3No103 {
     pub fn new() -> Weeb3No103 {
         Weeb3No103 {
             inner: Arc::new(Weeb3::new("".to_string())),
-            started: Arc::new(AtomicBool::new(false)),
+            startup_configured: Arc::new(AtomicBool::new(false)),
+            startup_pending: Arc::new(AtomicUsize::new(0)),
+            startup_serial: Arc::new(async_lock::Mutex::new(())),
         }
     }
 
-    fn start_runtime_once(&self) {
-        start_weeb3_runtime_once(self.inner.clone(), self.started.clone());
+    fn schedule_start(&self, options: StartOptions) {
+        if let Ok(network_id) = options.network_id.parse::<u64>() {
+            if let Some(profile) = profile_for_swarm_network_id(network_id) {
+                activate_profile(profile);
+            }
+        }
+        install_service_worker_message_bridge(self.inner.clone());
+        spawn_local(async {
+            let _ = get_service_worker().await;
+        });
+        self.startup_configured.store(true, Ordering::Release);
+        self.startup_pending.fetch_add(1, Ordering::AcqRel);
+        let inner = self.inner.clone();
+        let pending = self.startup_pending.clone();
+        let serial = self.startup_serial.clone();
+
+        spawn_local(async move {
+            let _guard = serial.lock().await;
+            let network_id = options.network_id;
+            if inner.set_network_id(network_id.clone()).await {
+                start_weeb3_runtime(inner.clone());
+                schedule_bootnode_dials(inner, network_id, options.bootstrap_nodes);
+            }
+            pending.fetch_sub(1, Ordering::AcqRel);
+        });
     }
 
     async fn boot_runtime(&self) {
-        self.start_runtime_once();
+        install_service_worker_message_bridge(self.inner.clone());
+        if !self.startup_configured.swap(true, Ordering::AcqRel) {
+            self.schedule_start(start_options_from_js(None));
+        }
+        self.await_startup_tasks().await;
+        start_weeb3_runtime(self.inner.clone());
         async_std::task::yield_now().await;
+    }
+
+    async fn await_startup_tasks(&self) {
+        while self.startup_pending.load(Ordering::Acquire) != 0 {
+            async_std::task::sleep(Duration::from_millis(10)).await;
+        }
     }
 
     #[wasm_bindgen(js_name = start)]
     pub fn start(&self, options: Option<JsValue>) {
-        let options = start_options_from_js(options);
-        let s = self.inner.clone();
-        let started = self.started.clone();
-
-        spawn_local(async move {
-            let network_id = options.network_id;
-            let _ = s.set_network_id(network_id.clone()).await;
-            start_weeb3_runtime_once(s.clone(), started);
-
-            let futures = options.bootstrap_nodes.into_iter().map(|node| {
-                let s_clone = s.clone();
-                let nid = network_id.clone();
-
-                async move {
-                    if !node.multiaddr.is_empty() {
-                        if !is_browser_dialable_underlay(&node.multiaddr) {
-                            s_clone.interface_log(format!(
-                                "Skipped non-browser bootnode for network {}: {}",
-                                nid, node.multiaddr
-                            ));
-                            return;
-                        }
-                        let _ = s_clone
-                            .change_bootnode_address(node.multiaddr, nid, node.usable)
-                            .await;
-                    }
-                }
-            });
-
-            join_all(futures).await;
-        });
+        self.schedule_start(start_options_from_js(options));
     }
 
     #[wasm_bindgen(js_name = renderInterface)]
     pub fn render_interface(&self, container: Element) -> Object {
-        self.start_runtime_once();
+        if let Err(error) = reserve_interface_mount_container(&container) {
+            return error_object(error);
+        }
+        let mount_generation = begin_interface_mount();
+        // Reserve the new result view before replacing its shell. Older
+        // asynchronous opens may finish accounting, but cannot commit into
+        // this mount after their retrieval settles.
+        let initial_result_generation = crate::stream::begin_result_view_request();
+        // Re-rendering an npm mount removes its result DOM directly, bypassing
+        // normal result-view replacement. Stop future HLS scheduling first;
+        // already-dispatched Rust/accounting work continues to drain.
+        crate::stream::release_current_stream_view();
+        if let Some(mode) = route_network_mode_from_location() {
+            activate_profile(profile_for_mode(mode));
+        }
+        let startup_already_configured = self.startup_configured.swap(true, Ordering::AcqRel);
+        self.startup_pending.fetch_add(1, Ordering::AcqRel);
+        install_service_worker_message_bridge(self.inner.clone());
         render_interface_shell(&container);
 
         let s = self.inner.clone();
+        let pending = self.startup_pending.clone();
+        let serial = self.startup_serial.clone();
         spawn_local(async move {
-            let _ = mount_interface(s, false, false).await;
+            let guard = serial.lock().await;
+            // A canonical /stream/... or /testnet/stream/... URL is
+            // self-contained. Apply its network before the mounted interface
+            // connects and resolves the initial stream, including for
+            // configurable npm route bases.
+            let network_before_route = s.get_network_id().await;
+            let mut route_changed_network = false;
+            if let Some(mode) = route_network_mode_from_location() {
+                let profile = profile_for_mode(mode);
+                route_changed_network = network_before_route != profile.swarm_network_id;
+                let _ = s.set_network_id(profile.swarm_network_id.to_string()).await;
+            }
+            let network_id = s.get_network_id().await;
+            let bootstrap_nodes = profile_for_swarm_network_id(network_id)
+                .map(|profile| {
+                    profile
+                        .bootnodes
+                        .iter()
+                        .map(|address| StartBootstrapNode {
+                            multiaddr: (*address).to_string(),
+                            usable: true,
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            start_weeb3_runtime(s.clone());
+            // Queue the same profile connection buildup as the bundled mount
+            // before releasing npm operations. Do not wait for every dial:
+            // retrieval should be able to use the first established peer.
+            if !startup_already_configured || route_changed_network {
+                schedule_bootnode_dials(s.clone(), network_id.to_string(), bootstrap_nodes);
+            }
+            pending.fetch_sub(1, Ordering::AcqRel);
+            drop(guard);
+            let _ = mount_interface_after_service_worker_bridge_install(
+                s,
+                false,
+                true,
+                Some(initial_result_generation),
+                false,
+                mount_generation,
+            )
+            .await;
         });
 
         ok_object()
@@ -561,8 +839,134 @@ impl Weeb3No103 {
         self.render_interface(container)
     }
 
+    /// Open either an HLS manifest feed or a stream-catalog feed in the
+    /// interface mounted by `renderInterface`.
+    #[wasm_bindgen(js_name = openStreamFeed)]
+    pub async fn open_stream_feed(&self, owner: String, topic: String) -> Object {
+        if !interface_result_view_is_mounted() {
+            return error_object("call renderInterface(container) before opening a stream feed");
+        }
+        self.boot_runtime().await;
+        crate::stream_hls::open_feed_view(self.inner.clone(), owner, topic).await;
+        ok_object()
+    }
+
+    #[wasm_bindgen(js_name = open_stream_feed)]
+    pub async fn open_stream_feed_alias(&self, owner: String, topic: String) -> Object {
+        self.open_stream_feed(owner, topic).await
+    }
+
+    /// Attach the same Rust-owned HLS pipeline used by the bundled interface to
+    /// an application-owned `<video>` or `<audio>` element. One HLS session is
+    /// active per Wasm module; attaching another element retires only future
+    /// scheduling for the previous session while dispatched accounting work
+    /// continues to drain.
+    #[wasm_bindgen(js_name = attachHlsStream)]
+    pub async fn attach_hls_stream(
+        &self,
+        media: HtmlMediaElement,
+        owner: String,
+        topic: String,
+        #[wasm_bindgen(unchecked_param_type = "HlsStreamOptions")] options: JsValue,
+    ) -> Object {
+        let options = match hls_stream_options_from_js(&options) {
+            Ok(options) => options,
+            Err(error) => return error_object(error),
+        };
+        install_service_worker_message_bridge(self.inner.clone());
+        self.boot_runtime().await;
+        let player: Element = media.unchecked_into();
+        match crate::stream_hls::attach_hls_feed_media(
+            self.inner.clone(),
+            player,
+            owner,
+            topic,
+            options.index,
+            options.intent,
+        )
+        .await
+        {
+            Ok(mode) => {
+                let result = ok_object();
+                set_js_str(&result, "mode", mode);
+                result
+            }
+            Err(error) => error_object(error),
+        }
+    }
+
+    #[wasm_bindgen(js_name = attach_hls_stream)]
+    pub async fn attach_hls_stream_alias(
+        &self,
+        media: HtmlMediaElement,
+        owner: String,
+        topic: String,
+        #[wasm_bindgen(unchecked_param_type = "HlsStreamOptions")] options: JsValue,
+    ) -> Object {
+        self.attach_hls_stream(media, owner, topic, options).await
+    }
+
+    /// Stop future work for the active HLS attachment before the application
+    /// removes or replaces its media element. Requests already dispatched to
+    /// Rust continue through their accounting lifecycle.
+    #[wasm_bindgen(js_name = detachHlsStream)]
+    pub fn detach_hls_stream(&self) -> Object {
+        crate::stream::begin_result_view_request();
+        crate::stream::release_current_stream_view();
+        ok_object()
+    }
+
+    #[wasm_bindgen(js_name = detach_hls_stream)]
+    pub fn detach_hls_stream_alias(&self) -> Object {
+        self.detach_hls_stream()
+    }
+
+    /// Open a known HLS feed directly. Passing the catalog's VOD index avoids
+    /// a latest-feed frontier search and retrieves the final manifest SOC in
+    /// one lookup.
+    #[wasm_bindgen(js_name = playHlsStream)]
+    pub async fn play_hls_stream(
+        &self,
+        owner: String,
+        topic: String,
+        media_type: String,
+        index: Option<f64>,
+    ) -> Object {
+        if !interface_result_view_is_mounted() {
+            return error_object("call renderInterface(container) before playing an HLS stream");
+        }
+        let index = match index {
+            Some(index)
+                if index.is_finite()
+                    && index >= 0.0
+                    && index <= 9_007_199_254_740_991.0
+                    && (index as u64) as f64 == index =>
+            {
+                Some(index as u64)
+            }
+            Some(_) => return error_object("HLS feed index must be an exact unsigned integer"),
+            None => None,
+        };
+        self.boot_runtime().await;
+        crate::stream_hls::open_hls_feed_view(self.inner.clone(), owner, topic, media_type, index)
+            .await;
+        ok_object()
+    }
+
+    #[wasm_bindgen(js_name = play_hls_stream)]
+    pub async fn play_hls_stream_alias(
+        &self,
+        owner: String,
+        topic: String,
+        media_type: String,
+        index: Option<f64>,
+    ) -> Object {
+        self.play_hls_stream(owner, topic, media_type, index).await
+    }
+
     #[wasm_bindgen(js_name = networkState)]
     pub async fn network_state(&self) -> Object {
+        self.await_startup_tasks().await;
         let network_id = self.inner.get_network_id().await;
         let profile = profile_for_swarm_network_id(network_id).unwrap_or_else(active_profile);
         network_profile_object(profile, network_id)
@@ -589,44 +993,37 @@ impl Weeb3No103 {
         let Some(mode) = network_mode_from_input(&mode) else {
             return error_object("unknown network mode");
         };
+        install_service_worker_message_bridge(self.inner.clone());
+        spawn_local(async {
+            let _ = get_service_worker().await;
+        });
+        self.startup_pending.fetch_add(1, Ordering::AcqRel);
+        let _guard = self.startup_serial.lock().await;
+        self.startup_configured.store(true, Ordering::Release);
         let profile = profile_for_mode(mode);
         let network_id = profile.swarm_network_id.to_string();
         if !self.inner.set_network_id(network_id.clone()).await {
+            self.startup_pending.fetch_sub(1, Ordering::AcqRel);
             return error_object("network id switch failed");
         }
-        self.start_runtime_once();
+        start_weeb3_runtime(self.inner.clone());
 
-        let attempts = profile.bootnodes.iter().map(|address| {
-            let inner = self.inner.clone();
-            let network_id = network_id.clone();
-            let address = (*address).to_string();
-
-            async move {
-                if !is_browser_dialable_underlay(&address) {
-                    inner.interface_log(format!(
-                        "Skipped non-browser bootnode for network {}: {}",
-                        network_id, address
-                    ));
-                    return (address, false);
-                }
-
-                let _ = inner
-                    .change_bootnode_address(address.clone(), network_id, true)
-                    .await;
-                (address, true)
-            }
-        });
-
-        let results = join_all(attempts).await;
         let requested_bootnodes = Array::new();
         let skipped_bootnodes = Array::new();
-        for (address, requested) in results {
-            if requested {
+        let mut bootstrap_nodes = Vec::with_capacity(profile.bootnodes.len());
+        for address in profile.bootnodes {
+            if is_browser_dialable_underlay(address) {
                 requested_bootnodes.push(&JsValue::from_str(&address));
+                bootstrap_nodes.push(StartBootstrapNode {
+                    multiaddr: (*address).to_string(),
+                    usable: true,
+                });
             } else {
                 skipped_bootnodes.push(&JsValue::from_str(&address));
             }
         }
+        schedule_bootnode_dials(self.inner.clone(), network_id, bootstrap_nodes);
+        self.startup_pending.fetch_sub(1, Ordering::AcqRel);
 
         let obj = network_profile_object(profile, profile.swarm_network_id);
         set_js(&obj, "requestedBootnodes", requested_bootnodes.into());
@@ -660,6 +1057,7 @@ impl Weeb3No103 {
     }
 
     pub async fn connect(&self) -> Object {
+        self.await_startup_tasks().await;
         let network_id = self.inner.get_network_id().await;
         let profile = profile_for_swarm_network_id(network_id).unwrap_or_else(active_profile);
         self.switch_network(network_mode_label(profile.mode).to_string())
@@ -737,7 +1135,7 @@ impl Weeb3No103 {
 
     #[wasm_bindgen(js_name = ready)]
     pub async fn ready(&self, min_connections: u32, timeout_ms: u32) -> bool {
-        self.start_runtime_once();
+        self.boot_runtime().await;
 
         let min_connections = min_connections.max(1) as u64;
         let started = js_sys::Date::now();
@@ -756,7 +1154,7 @@ impl Weeb3No103 {
 
     #[wasm_bindgen(js_name = readyState)]
     pub async fn ready_state(&self, min_connections: u32, timeout_ms: u32) -> Object {
-        self.start_runtime_once();
+        self.boot_runtime().await;
 
         let min_connections = min_connections.max(1) as u64;
         let started = js_sys::Date::now();
@@ -894,6 +1292,32 @@ impl Weeb3No103 {
         add_to_feed: bool,
         feed_topic: String,
     ) -> Object {
+        self.upload_with_redundancy(
+            file,
+            encryption,
+            f64::from(RedundancyLevel::DEFAULT_UPLOAD.as_u8()),
+            index_string,
+            add_to_feed,
+            feed_topic,
+        )
+        .await
+    }
+
+    #[wasm_bindgen(js_name = uploadWithRedundancy)]
+    pub async fn upload_with_redundancy(
+        &self,
+        file: File,
+        encryption: bool,
+        #[wasm_bindgen(unchecked_param_type = "UploadRedundancyLevel")] redundancy_level: f64,
+        index_string: String,
+        add_to_feed: bool,
+        feed_topic: String,
+    ) -> Object {
+        let Some(redundancy_level) = validated_upload_redundancy_number(redundancy_level) else {
+            return error_object("redundancy level must be an integer between 0 and 4");
+        };
+        let redundancy_level = f64::from(redundancy_level.as_u8());
+
         self.boot_runtime().await;
         let feed_topic = if add_to_feed {
             normalize_feed_topic(&feed_topic)
@@ -902,9 +1326,10 @@ impl Weeb3No103 {
         };
         let raw = self
             .inner
-            .post_upload(
+            .post_upload_with_redundancy(
                 file,
                 encryption,
+                redundancy_level,
                 index_string,
                 add_to_feed,
                 feed_topic.clone(),
@@ -919,6 +1344,7 @@ impl Weeb3No103 {
         };
 
         let _ = Reflect::set(&obj, &"reference".into(), &JsValue::from_str(&indx));
+        set_js(&obj, "redundancyLevel", JsValue::from_f64(redundancy_level));
         if add_to_feed {
             set_js_str(&obj, "feedTopic", &feed_topic);
             set_js_str(&obj, "feedReference", &indx);
@@ -958,6 +1384,48 @@ impl Weeb3No103 {
             .await
     }
 
+    #[wasm_bindgen(js_name = postUploadWithRedundancy)]
+    pub async fn post_upload_with_redundancy(
+        &self,
+        file: File,
+        encryption: bool,
+        #[wasm_bindgen(unchecked_param_type = "UploadRedundancyLevel")] redundancy_level: f64,
+        index_string: String,
+        add_to_feed: bool,
+        feed_topic: String,
+    ) -> Object {
+        self.upload_with_redundancy(
+            file,
+            encryption,
+            redundancy_level,
+            index_string,
+            add_to_feed,
+            feed_topic,
+        )
+        .await
+    }
+
+    #[wasm_bindgen(js_name = post_upload_with_redundancy)]
+    pub async fn post_upload_with_redundancy_alias(
+        &self,
+        file: File,
+        encryption: bool,
+        #[wasm_bindgen(unchecked_param_type = "UploadRedundancyLevel")] redundancy_level: f64,
+        index_string: String,
+        add_to_feed: bool,
+        feed_topic: String,
+    ) -> Object {
+        self.post_upload_with_redundancy(
+            file,
+            encryption,
+            redundancy_level,
+            index_string,
+            add_to_feed,
+            feed_topic,
+        )
+        .await
+    }
+
     #[wasm_bindgen(js_name = postUploadBytes)]
     pub async fn post_upload_bytes(
         &self,
@@ -981,6 +1449,62 @@ impl Weeb3No103 {
         let file = make_js_file(bytes, &mime, &filename);
         self.upload(file, encryption, String::new(), add_to_feed, feed_topic)
             .await
+    }
+
+    #[wasm_bindgen(js_name = postUploadBytesWithRedundancy)]
+    pub async fn post_upload_bytes_with_redundancy(
+        &self,
+        bytes: Vec<u8>,
+        mime: String,
+        filename: String,
+        encryption: bool,
+        #[wasm_bindgen(unchecked_param_type = "UploadRedundancyLevel")] redundancy_level: f64,
+        add_to_feed: bool,
+        feed_topic: String,
+    ) -> Object {
+        let mime = if mime.is_empty() {
+            "application/octet-stream".to_string()
+        } else {
+            mime
+        };
+        let filename = if filename.is_empty() {
+            "bytes".to_string()
+        } else {
+            filename
+        };
+        let file = make_js_file(bytes, &mime, &filename);
+        self.upload_with_redundancy(
+            file,
+            encryption,
+            redundancy_level,
+            String::new(),
+            add_to_feed,
+            feed_topic,
+        )
+        .await
+    }
+
+    #[wasm_bindgen(js_name = post_upload_bytes_with_redundancy)]
+    pub async fn post_upload_bytes_with_redundancy_alias(
+        &self,
+        bytes: Vec<u8>,
+        mime: String,
+        filename: String,
+        encryption: bool,
+        #[wasm_bindgen(unchecked_param_type = "UploadRedundancyLevel")] redundancy_level: f64,
+        add_to_feed: bool,
+        feed_topic: String,
+    ) -> Object {
+        self.post_upload_bytes_with_redundancy(
+            bytes,
+            mime,
+            filename,
+            encryption,
+            redundancy_level,
+            add_to_feed,
+            feed_topic,
+        )
+        .await
     }
 
     #[wasm_bindgen(js_name = post_upload_bytes)]
@@ -1038,6 +1562,7 @@ impl Weeb3No103 {
 
     #[wasm_bindgen(js_name = feedIdentity)]
     pub async fn feed_identity(&self, topic: String) -> Object {
+        self.boot_runtime().await;
         let feed_topic = normalize_feed_topic(&topic);
         let obj = match secure_ensure_feed_owner().await {
             Some(owner) if owner.len() == 20 => {
@@ -1174,6 +1699,7 @@ impl Weeb3No103 {
 
     #[wasm_bindgen(js_name = feedOwner)]
     pub async fn feed_owner(&self) -> Object {
+        self.boot_runtime().await;
         match secure_ensure_feed_owner().await {
             Some(owner) if owner.len() == 20 => {
                 let obj = ok_object();
@@ -1192,6 +1718,7 @@ impl Weeb3No103 {
 
     #[wasm_bindgen(js_name = batchState)]
     pub async fn batch_state(&self, depth: u8, validity_days: u32) -> Object {
+        self.boot_runtime().await;
         let profile = active_profile();
         let payer = match request_wallet_address().await {
             Ok(payer) => payer,
@@ -1329,6 +1856,7 @@ impl Weeb3No103 {
 
     #[wasm_bindgen(js_name = buyBatch)]
     pub async fn buy_batch(&self, depth: u8, validity_days: u32) -> Object {
+        self.boot_runtime().await;
         let profile = active_profile();
         let payer = match request_wallet_address().await {
             Ok(payer) => payer,
@@ -1417,6 +1945,7 @@ impl Weeb3No103 {
 
     #[wasm_bindgen(js_name = deployChequebook)]
     pub async fn deploy_chequebook(&self) -> Object {
+        self.boot_runtime().await;
         let stored_key = get_chequebook_signer_key().await;
         let stored_address = get_chequebook_address().await;
         if !stored_key.is_empty() && stored_address.len() == 20 {
@@ -1468,6 +1997,7 @@ impl Weeb3No103 {
 
     #[wasm_bindgen(js_name = depositChequebook)]
     pub async fn deposit_chequebook(&self, amount: String) -> Object {
+        self.boot_runtime().await;
         let amount = match U256::from_dec_str(amount.trim()) {
             Ok(amount) => amount,
             Err(_) => return error_object("amount must be a base-unit integer string"),
@@ -1511,6 +2041,7 @@ impl Weeb3No103 {
 
     #[wasm_bindgen(js_name = resetStamp)]
     pub async fn reset_stamp(&self) -> Object {
+        self.boot_runtime().await;
         let raw = self.inner.reset_stamp().await;
         let (data, _indx) = decode_resources(raw);
         let obj = Object::new();

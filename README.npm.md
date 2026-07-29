@@ -3,8 +3,7 @@
 `weeb-3` is a browser-side Swarm client built in Rust and compiled to WebAssembly.
 The main `weeb-3` project is the full released browser client, published at [lat-murmeldjur.github.io/weeb-3](https://lat-murmeldjur.github.io/weeb-3), where the client is used together with its own interface.
 
-This npm package is the library edition of that same client.
-It is for projects that want to use the `weeb-3` Swarm client in their own browser application without using the full `weeb-3` site and interface.
+This npm package is the library edition of that same client. Projects can use the API directly or mount the bundled browser interface with `renderInterface(container)`.
 
 Project repository: [github.com/lat-murmeldjur/weeb-3](https://github.com/lat-murmeldjur/weeb-3)
 
@@ -37,8 +36,22 @@ The higher-level `Weeb3No103` interface provides the main methods used by the em
 - `connectProfile(mode)` / `connect_profile(mode)`
 - `retrieve(address)`
 - `upload(file, encryption, index_string, add_to_feed, feed_topic)`
+- `uploadWithRedundancy(file, encryption, redundancy_level, index_string, add_to_feed, feed_topic)`
+- `postUploadBytesWithRedundancy(bytes, mime, filename, encryption, redundancy_level, add_to_feed, feed_topic)`
+- `openStreamFeed(owner, topic)`
+- `playHlsStream(owner, topic, media_type, index?)`
+- `attachHlsStream(media, owner, topic, options)`
+- `detachHlsStream()`
+- `configureStreamingRoutes(service_worker_url, route_base)`
+- `renderInterface(container)`
 - `resetStamp()`
 - `postPushChunk(data, soc, chunk_address, stamp)`
+
+Sequence-feed indexes use Bee's fixed-width eight-byte big-endian encoding.
+
+## HLS streaming
+
+HLS playback is an optional dapp integration, not a Bee/Swarm standard. `playHlsStream(...)` displays a stream in the bundled interface after `renderInterface(container)`. For an application-owned `<video>` or `<audio>` element, call `attachHlsStream(media, owner, topic, { start: "beginning" })`; use `"current-window"` for a rolling/live presentation. Call `detachHlsStream()` before removing or replacing that element. The Service Worker must be copied from the package to a same-origin URL whose scope contains the page, then configured with `configureStreamingRoutes(...)`. Canonical mainnet links use `/stream/{owner}/{topic}[/{index}]`; testnet inserts `/testnet` before `/stream`.
 
 ## Basic usage
 
@@ -96,8 +109,39 @@ const entries = await weeb3node.retrieve(
 );
 ```
 
+## Erasure-coding selector
+
+Legacy upload methods use Bee's Medium level. Explicit upload levels are `0` None, `1` Medium, `2` Strong, `3` Insane, and `4` Paranoid. The generated TypeScript declaration exposes this as `UploadRedundancyLevel = 0 | 1 | 2 | 3 | 4`.
+
+`renderInterface(container)` includes a Medium-default erasure-coding dropdown. A custom interface can populate its own dropdown from the same canonical metadata:
+
+```js
+import init, {
+  Weeb3No103,
+  defaultUploadRedundancyLevel,
+  uploadRedundancyOptions,
+} from "@lat-murmeldjur/weeb_3";
+
+await init();
+const node = new Weeb3No103();
+const choices = uploadRedundancyOptions();
+const level = defaultUploadRedundancyLevel();
+
+const result = await node.uploadWithRedundancy(
+  file,
+  true,
+  level,
+  "",
+  false,
+  "",
+);
+```
+
+Retrieval reads the level encoded in the Swarm tree and uses parity when data shards are unavailable.
+
 ## Notes
 
 - This package is meant for browser applications, not a plain Node.js runtime.
-- It does not include the full `weeb-3` interface. It exposes the client so you can build your own interface around it.
+- Use one active `Weeb3No103` node and HLS session per loaded Wasm module.
+- The package does not publish the standalone site HTML, but `renderInterface(container)` embeds the same interface shell—including its erasure-coding selector—from the Wasm bundle.
 - The full released browser client remains available in the main project repository and on the project site.

@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>weeb-3 npm HLS stream example</title>
+    <script type="importmap">
+      {
+        "imports": {
+          "@lat-murmeldjur/weeb_3": "./weeb_3.js",
+          "hls.js": "https://cdn.jsdelivr.net/npm/hls.js@1.6.2/dist/hls.mjs"
+        }
+      }
+    </script>
+    <style>
+      :root {
+        color-scheme: light dark;
+        font-family: system-ui, sans-serif;
+      }
+      body {
+        box-sizing: border-box;
+        margin: 0 auto;
+        max-width: 72rem;
+        padding: 1rem;
+      }
+      #status {
+        min-height: 1.5rem;
+      }
+      #stream {
+        display: block;
+        width: 100%;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>Swarm HLS stream</h1>
+    <p id="status" role="status">Starting the weeb-3 npm client...</p>
+    <video id="stream" controls autoplay playsinline preload="metadata"></video>
+
+    <script type="module">
+      import init, {
+        configureStreamingRoutes,
+        Weeb3No103,
+      } from "@lat-murmeldjur/weeb_3";
+
+      const owner = "6F2728386F8a47ef5EBe323721188e630Ff0FdE9";
+      const topic = "b347b89b-933c-424f-a3d1-403bdd270b25";
+      const status = document.getElementById("status");
+      const media = document.getElementById("stream");
+      let node = null;
+
+      function requireOk(result) {
+        if (result?.status !== "ok") {
+          throw new Error(result?.error || "weeb-3 operation failed");
+        }
+      }
+
+      try {
+        media.addEventListener("weeb3-hls-manifest-ready", () => {
+          status.textContent = "Manifest ready. Press Play if autoplay is blocked.";
+        });
+        media.addEventListener("playing", () => {
+          status.textContent = "Playing through the weeb-3 Rust retrieval pipeline.";
+        });
+        media.addEventListener("waiting", () => {
+          status.textContent = "Buffering the Swarm stream...";
+        });
+        media.addEventListener("weeb3-hls-autoplay-blocked", () => {
+          status.textContent = "Autoplay was blocked. Press Play to continue.";
+        });
+        media.addEventListener("weeb3-hls-error", (event) => {
+          status.textContent = `Playback failed: ${event.detail?.message || "unknown HLS error"}`;
+        });
+        media.addEventListener("error", () => {
+          status.textContent = `Media failed: ${media.error?.message || "unknown media error"}`;
+        });
+
+        await init();
+
+        const directory = new URL(".", location.href);
+        const routeBase = directory.pathname.replace(/\/$/, "") || "/";
+        requireOk(configureStreamingRoutes(
+          new URL("service.js", directory).href,
+          routeBase,
+        ));
+
+        node = new Weeb3No103();
+        node.start({ mainnet: true });
+
+        status.textContent = "Opening the HLS manifest...";
+        const result = await node.attachHlsStream(media, owner, topic, {
+          start: "beginning",
+        });
+        requireOk(result);
+        status.textContent = `HLS attached with ${result.mode}. Loading from Swarm...`;
+      } catch (error) {
+        status.textContent = `Could not open stream: ${error.message || error}`;
+        console.error(error);
+      }
+
+      window.addEventListener("pagehide", () => {
+        node?.detachHlsStream();
+      }, { once: true });
+    </script>
+  </body>
+</html>

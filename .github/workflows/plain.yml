@@ -29,6 +29,8 @@ jobs:
           registry-url: https://registry.npmjs.org
       - name: Build
         run: cargo build --verbose
+      - name: Test Bee compatibility and transfer contracts
+        run: cargo test --locked --tests -- --skip weeb3_loads_in_browser
       - name: Build npm package
         env:
           NPM_SCOPE: ${{ vars.NPM_SCOPE || github.repository_owner }}
@@ -38,7 +40,8 @@ jobs:
           if [ -n "${NPM_SCOPE:-}" ]; then
             SCOPE_ARGS=(--scope "$NPM_SCOPE")
           fi
-          RUSTFLAGS='--cfg getrandom_backend="wasm_js"' wasm-pack build --target web --out-dir static --out-name weeb_3 "${SCOPE_ARGS[@]}"
+          RUSTFLAGS='--cfg getrandom_backend="wasm_js"' wasm-pack build --locked --target web --out-dir static --out-name weeb_3 "${SCOPE_ARGS[@]}"
+          cp README.npm.md static/README.md
           cd static
           npm pkg delete files || true
           npm pkg delete sideEffects || true
@@ -58,12 +61,13 @@ jobs:
             publishConfig.access="public" \
             publishConfig.registry="https://registry.npmjs.org/"
           npm pkg set \
-            files[0]="snippets/web3-0742d85b024bb6f5/inline0.js" \
+            files[0]="snippets" \
             files[1]="weeb_3.d.ts" \
             files[2]="weeb_3.js" \
             files[3]="weeb_3_bg.wasm" \
             files[4]="weeb_3_bg.wasm.d.ts" \
-            sideEffects[0]="./snippets/*" \
+            files[5]="service.js" \
+            sideEffects[0]="./snippets/**/*" \
             keywords[0]="bee" \
             keywords[1]="browser" \
             keywords[2]="swarm" \
@@ -71,14 +75,84 @@ jobs:
             keywords[4]="webassembly" \
             'exports[.].types=./weeb_3.d.ts' \
             'exports[.].import=./weeb_3.js' \
-            'exports[.].default=./weeb_3.js'
+            'exports[.].default=./weeb_3.js' \
+            'exports[./service.js].default=./service.js' \
+            'dependencies[hls.js]=^1.6.2'
           if [ "${GITHUB_EVENT_NAME}" = "push" ] && [ "${GITHUB_REF}" = "refs/heads/main" ]; then
             BASE_VERSION="$(node -p "require('./package.json').version.split('-')[0]")"
             RELEASE_VERSION="$(node -e "const [major, minor, patch] = process.argv[1].split('.').map(Number); const run = Number(process.argv[2]); const attempt = Number(process.argv[3]); console.log([major, minor, patch + run * 1000 + attempt].join('.'))" "$BASE_VERSION" "$GITHUB_RUN_NUMBER" "$GITHUB_RUN_ATTEMPT")"
             npm version "$RELEASE_VERSION" --no-git-tag-version
           fi
       - name: Check npm pack contents
-        run: npm pack --dry-run ./static
+        run: |
+          npm pack --dry-run --json ./static > npm-pack.json
+          node <<'NODE'
+          const fs = require('node:fs');
+          const reports = JSON.parse(fs.readFileSync('npm-pack.json', 'utf8'));
+          if (!Array.isArray(reports) || reports.length !== 1) {
+            throw new Error('npm pack did not return exactly one package report');
+          }
+
+          const packed = new Set(reports[0].files.map(file => file.path));
+          const packageJson = JSON.parse(fs.readFileSync('static/package.json', 'utf8'));
+          if (packageJson.dependencies?.['hls.js'] !== '^1.6.2') {
+            throw new Error('npm package must declare hls.js ^1.6.2 as a runtime dependency');
+          }
+          const required = new Set([
+            'LICENSE',
+            'README.md',
+            'package.json',
+            'service.js',
+            'weeb_3.d.ts',
+            'weeb_3.js',
+            'weeb_3_bg.wasm',
+            'weeb_3_bg.wasm.d.ts',
+          ]);
+          const wrapper = fs.readFileSync('static/weeb_3.js', 'utf8');
+          if (/from\s+['"]hls\.js['"]/.test(wrapper)) {
+            throw new Error('generated Wasm wrapper must not eagerly import hls.js');
+          }
+          for (const match of wrapper.matchAll(/from\s+['"]\.\/([^'"]+)['"]/g)) {
+            required.add(match[1]);
+          }
+
+          const missing = [...required].filter(path => !packed.has(path));
+          if (missing.length > 0) {
+            throw new Error(`npm package is missing: ${missing.join(', ')}`);
+          }
+
+          const customHlsAdapters = [...packed].filter(path => /(^|\/)hls_player\.js$/.test(path));
+          if (customHlsAdapters.length !== 0) {
+            throw new Error(
+              `npm package must use the Rust HLS player without a custom JS adapter: ${customHlsAdapters.join(', ')}`
+            );
+          }
+          const hlsLoaders = [...packed].filter(path => /(^|\/)hls_loader\.js$/.test(path));
+          if (hlsLoaders.length !== 1) {
+            throw new Error(`npm package must contain one static HLS loader, found ${hlsLoaders.length}`);
+          }
+          const hlsLoader = fs.readFileSync(`static/${hlsLoaders[0]}`, 'utf8');
+          if (!hlsLoader.includes('import("hls.js")')) {
+            throw new Error('static HLS loader must lazy-load hls.js');
+          }
+
+          const declarations = fs.readFileSync('static/weeb_3.d.ts', 'utf8');
+          for (const marker of [
+            'UploadRedundancyLevel = 0 | 1 | 2 | 3 | 4',
+            'uploadRedundancyOptions(): UploadRedundancyOption[]',
+            'defaultUploadRedundancyLevel(): UploadRedundancyLevel',
+            'configureStreamingRoutes(service_worker_url: string, route_base: string): object',
+            'openStreamFeed(owner: string, topic: string): Promise<object>',
+            'playHlsStream(owner: string, topic: string, media_type: string, index?: number | null): Promise<object>',
+            'HlsStreamStart = "beginning" | "current-window"',
+            'attachHlsStream(media: HTMLMediaElement, owner: string, topic: string, options: HlsStreamOptions): Promise<object>',
+            'detachHlsStream(): object',
+          ]) {
+            if (!declarations.includes(marker)) {
+              throw new Error(`generated declarations are missing: ${marker}`);
+            }
+          }
+          NODE
       - name: Upload npm package artifact
         uses: actions/upload-artifact@v4
         with:
@@ -87,7 +161,8 @@ jobs:
             static/LICENSE
             static/README.md
             static/package.json
-            static/snippets/web3-0742d85b024bb6f5/inline0.js
+            static/service.js
+            static/snippets
             static/weeb_3.d.ts
             static/weeb_3.js
             static/weeb_3_bg.wasm

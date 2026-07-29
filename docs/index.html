@@ -2,74 +2,84 @@
     <head>
         <meta content="text/html;charset=utf-8" http-equiv="Content-Type" />
         <meta name="viewport" content="width=device-width, initial-scale=1" />
+        <script type="importmap">
+        {
+            "imports": {
+                "hls.js": "https://cdn.jsdelivr.net/npm/hls.js@1.6.2/dist/hls.mjs"
+            }
+        }
+        </script>
         <link
             rel="icon"
             href="https://docs.libp2p.io/logos/libp2p_color_symbol.svg"
             sizes="any"
         />
-        <style id="weeb3InterfaceStyle">
-            * {
-                box-sizing: border-box;
-                font-weight: normal;
-            }
+        <style id="weeb3PageStyle">
             html, body {
+                margin: 0;
                 max-width: 100%;
                 overflow-x: hidden;
             }
-            body {
-                margin: 0;
+        </style>
+        <style id="weeb3InterfaceStyle">
+            #weeb3InterfaceRoot, #weeb3InterfaceRoot * {
+                box-sizing: border-box;
+                font-weight: normal;
+            }
+            #weeb3InterfaceRoot {
                 --frame: max(4.8vw, 6.2vh);
                 background: #fff;
                 color: #000;
                 color-scheme: light;
             }
-            body.dark {
+            #weeb3InterfaceRoot.dark {
                 background: #000;
                 color: #FFFFFF;
                 color-scheme: dark;
             }
-            body.dark * { color: #FFFFFF; }
-            body.light {
+            #weeb3InterfaceRoot.dark * { color: #FFFFFF; }
+            #weeb3InterfaceRoot.light {
                 background: #fff;
                 color: #000;
             }
             @media (prefers-color-scheme: dark) {
-                body:not(.light) {
+                #weeb3InterfaceRoot:not(.light) {
                     background: #000;
                     color: #FFFFFF;
                     color-scheme: dark;
                 }
-                body:not(.light) * { color: #FFFFFF; }
+                #weeb3InterfaceRoot:not(.light) * { color: #FFFFFF; }
             }
-            body.dark select option { background: #000; color: #FFFFFF; }
+            #weeb3InterfaceRoot.dark select option { background: #000; color: #FFFFFF; }
             @media (prefers-color-scheme: dark) {
-                body:not(.light) select option { background: #000; color: #FFFFFF; }
+                #weeb3InterfaceRoot:not(.light) select option { background: #000; color: #FFFFFF; }
             }
-            #wrapper {
+            #weeb3InterfaceRoot {
                 max-width: 100vw;
+                min-height: 100vh;
                 overflow-x: hidden;
                 padding: var(--frame);
             }
-            #head {
+            #weeb3InterfaceRoot #head {
                 display: flex;
                 align-items: flex-start;
                 gap: 1ch;
                 max-width: 100%;
                 min-width: 0;
             }
-            #headRows { min-width: 0; flex: 1 1 auto; }
-            #headRows h3 { margin: 0; }
-            #headActions {
+            #weeb3InterfaceRoot #headRows { min-width: 0; flex: 1 1 auto; }
+            #weeb3InterfaceRoot #headRows h3 { margin: 0; }
+            #weeb3InterfaceRoot #headActions {
                 flex: 0 0 auto;
                 margin-left: auto;
             }
-            #sectionButtons { display: flex; flex-wrap: wrap; column-gap: 1ch; }
-            #sectionButtons button, #logsToggle, #themeToggle {
+            #weeb3InterfaceRoot #sectionButtons { display: flex; flex-wrap: wrap; column-gap: 1ch; }
+            #weeb3InterfaceRoot #sectionButtons button, #weeb3InterfaceRoot #logsToggle, #weeb3InterfaceRoot #themeToggle {
                 all: unset;
                 cursor: pointer;
             }
-            #themeToggle { white-space: nowrap; }
-            #jpBrand {
+            #weeb3InterfaceRoot #themeToggle { white-space: nowrap; }
+            #weeb3InterfaceRoot #jpBrand {
                 margin: 0;
                 letter-spacing: .1em;
                 padding-top: .1em;
@@ -77,39 +87,66 @@
                 text-orientation: upright;
                 font-family: "Yu Gothic", "Hiragino Kaku Gothic ProN", Meiryo, sans-serif;
             }
-            input, select, textarea, button, iframe, embed {
+            #weeb3InterfaceRoot input, #weeb3InterfaceRoot select, #weeb3InterfaceRoot textarea,
+            #weeb3InterfaceRoot button, #weeb3InterfaceRoot iframe, #weeb3InterfaceRoot embed {
                 max-width: 100%;
             }
-            section, #resultField, #progressField, #progressActions, #logsField {
+            #weeb3InterfaceRoot #uploadRedundancyHelp {
+                display: block;
+                margin: .25em 0 .75em;
+                max-width: 72ch;
+            }
+            #weeb3InterfaceRoot .weeb3-stream-catalog { display: grid; gap: .55em; }
+            #weeb3InterfaceRoot .weeb3-stream-catalog h3,
+            #weeb3InterfaceRoot .weeb3-stream-catalog p { margin: 0; }
+            #weeb3InterfaceRoot .weeb3-stream-entry,
+            #weeb3InterfaceRoot .weeb3-stream-share {
+                align-items: baseline;
+                display: flex;
+                flex-wrap: wrap;
+                gap: .35em .65em;
+            }
+            #weeb3InterfaceRoot .weeb3-stream-entry > button:first-child { flex: 0 1 72ch; }
+            #weeb3InterfaceRoot .weeb3-stream-entry button {
+                cursor: pointer;
+                max-width: min(100%, 72ch);
+                text-align: left;
+            }
+            #weeb3InterfaceRoot .weeb3-stream-share-status:empty { display: none; }
+            #weeb3InterfaceRoot .weeb3-stream-share-fallback { overflow-wrap: anywhere; }
+            #weeb3InterfaceRoot .weeb3-hls-status { margin-top: .5em; }
+            #weeb3InterfaceRoot section, #weeb3InterfaceRoot #resultField, #weeb3InterfaceRoot #progressField,
+            #weeb3InterfaceRoot #progressActions, #weeb3InterfaceRoot #logsField {
                 max-width: 100%;
                 overflow-wrap: anywhere;
             }
-            #logsPanel {
+            #weeb3InterfaceRoot #logsPanel {
                 max-width: 50%;
                 width: 50%;
             }
-            pre, #progressRows {
+            #weeb3InterfaceRoot pre, #weeb3InterfaceRoot #progressRows {
                 margin: 0;
                 max-width: 100%;
                 overflow-wrap: anywhere;
                 white-space: pre-wrap;
             }
-            #progressRows:empty, #progressActions:empty { display: none; }
+            #weeb3InterfaceRoot #progressRows:empty, #weeb3InterfaceRoot #progressActions:empty { display: none; }
             @media (max-width: 720px) {
-                body {
+                #weeb3InterfaceRoot {
                     --frame: max(2.4vw, 3.1vh);
                     font-size: 12.8px;
                 }
-                input, select, textarea, button { font-size: 1em; }
-                #headRows > h3:first-child > span { display: block; }
-                #sectionButtons {
+                #weeb3InterfaceRoot input, #weeb3InterfaceRoot select, #weeb3InterfaceRoot textarea,
+                #weeb3InterfaceRoot button { font-size: 1em; }
+                #weeb3InterfaceRoot #headRows > h3:first-child > span { display: block; }
+                #weeb3InterfaceRoot #sectionButtons {
                     align-items: flex-start;
                     display: flex;
                     flex-direction: column;
                     row-gap: .25em;
                 }
-                #sectionButtons button { display: block; }
-                #logsPanel {
+                #weeb3InterfaceRoot #sectionButtons button { display: block; }
+                #weeb3InterfaceRoot #logsPanel {
                     max-width: 100%;
                     width: 100%;
                 }
@@ -117,7 +154,7 @@
         </style>
     </head>
     <body>
-        <div id="wrapper">
+        <div id="weeb3InterfaceRoot">
             <div id="head">
                 <h3 id="jpBrand" lang="ja">ウィーブ3</h3>
                 <div id="headRows">
@@ -179,7 +216,7 @@
                 </div>
             </section>
             <section id="navigationPanel" hidden aria-hidden="true">
-                <input type="text" id="inputString" placeholder="Enter Swarm Hash or ENS site domain to display" size="64">
+                <input type="text" id="inputString" placeholder="Enter Swarm hash, /feeds/owner/topic, or /stream/owner/topic/index" size="88">
                 <div>
                     <input id="streamFilesWhenAvailable" name="streamFilesWhenAvailable" type="checkbox" checked>
                     <label for="streamFilesWhenAvailable">Stream files when available</label>
@@ -221,6 +258,15 @@
                     <input id="uploadFileSelect" type="file">
                     <input id="uploadFileEncrypt" name="encryption" type="checkbox" checked>
                     <label for="uploadFileEncrypt">Encrypt Upload</label>
+                    <label for="uploadRedundancyLevel">Erasure coding</label>
+                    <select id="uploadRedundancyLevel" name="redundancyLevel" aria-describedby="uploadRedundancyHelp">
+                        <option value="0">None — no parity</option>
+                        <option value="1" selected>Medium — recommended</option>
+                        <option value="2">Strong — extra recovery</option>
+                        <option value="3">Insane — high redundancy</option>
+                        <option value="4">Paranoid — maximum redundancy</option>
+                    </select>
+                    <small id="uploadRedundancyHelp">Medium is Bee's default. Higher levels improve loss recovery but upload and store more parity chunks.</small>
                     <input type="text" id="indexString" placeholder="(Optional) Enter Index     Document path for collection upload     (.tar)" size="64">
                     <button id="uploadFile"> Upload on Swarm </button>
                 </div>

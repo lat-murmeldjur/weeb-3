@@ -1,14 +1,15 @@
 // #![allow(warnings)]
 #![cfg(target_arch = "wasm32")]
-use async_std::sync::Mutex;
+use async_std::sync::{Arc, Mutex};
 
-use libp2p::PeerId;
+use libp2p::{PeerId, swarm::ConnectionId};
 
 use crate::conventions::{PeerAccounting, get_proximity};
 use crate::mpsc;
 
 pub const REFRESH_RATE: u64 = 450000;
 pub const PO_PRICE: u64 = 10000;
+pub(crate) type RefreshmentInstruction = (PeerId, Arc<Mutex<PeerAccounting>>, ConnectionId);
 
 pub async fn set_payment_threshold(a: &Mutex<PeerAccounting>, amount: u64) {
     let mut account = a.lock().await;
@@ -18,28 +19,24 @@ pub async fn set_payment_threshold(a: &Mutex<PeerAccounting>, amount: u64) {
     }
 }
 
-pub async fn reserve(a: &Mutex<PeerAccounting>, amount: u64) -> bool {
+pub async fn reserve(a: &Mutex<PeerAccounting>, amount: u64) -> Option<ConnectionId> {
     let mut account = a.lock().await;
-    let Some(new_reserve) = account.reserve.checked_add(amount) else {
-        return false;
-    };
-
-    let Some(reserved_balance) = account.balance.checked_add(new_reserve) else {
-        return false;
-    };
+    let connection_id = account.connection_id?;
+    let new_reserve = account.reserve.checked_add(amount)?;
+    let reserved_balance = account.balance.checked_add(new_reserve)?;
 
     if reserved_balance > account.threshold {
-        return false;
+        return None;
     }
 
     account.reserve = new_reserve;
-    true
+    Some(connection_id)
 }
 
 pub async fn apply_credit(
-    a: &Mutex<PeerAccounting>,
+    a: &Arc<Mutex<PeerAccounting>>,
     amount: u64,
-    chan: &mpsc::Sender<(PeerId, u64)>,
+    chan: &mpsc::Sender<RefreshmentInstruction>,
 ) {
     let mut account = a.lock().await;
     let mut debt_increase = amount;
@@ -59,8 +56,24 @@ pub async fn apply_credit(
         account.balance = account.balance.saturating_add(debt_increase);
     }
 
-    if account.balance >= REFRESH_RATE {
-        let _ = chan.try_send((account.id.clone(), account.balance));
+    let instruction = if account.balance >= REFRESH_RATE && !account.refresh_scheduled {
+        account.connection_id.map(|connection_id| {
+            account.refresh_scheduled = true;
+            (account.id, a.clone(), connection_id)
+        })
+    } else {
+        None
+    };
+    drop(account);
+
+    if let Some(instruction) = instruction {
+        let accounting = instruction.1.clone();
+        match chan.try_send(instruction) {
+            // Pause only the threshold-crossing completion. The receiver is
+            // woken first, then the browser can service its WebRTC control IO.
+            Ok(()) => async_std::task::sleep(std::time::Duration::ZERO).await,
+            Err(_) => accounting.lock().await.refresh_scheduled = false,
+        }
     }
 }
 
@@ -92,9 +105,9 @@ pub async fn cancel_reserve(a: &Mutex<PeerAccounting>, amount: u64) {
     account.reserve = 0;
 }
 
-pub fn price(peer_overlay: &String, chunk_address: &Vec<u8>) -> u64 {
+pub fn price(peer_overlay: &[u8], chunk_address: &[u8]) -> u64 {
     // return uint64(swarm.MaxPO-swarm.Proximity(peer.Bytes(), chunk.Bytes())+1) * pricer.PO_PRICE
 
-    let po = get_proximity(&hex::decode(peer_overlay).unwrap(), &chunk_address);
+    let po = get_proximity(peer_overlay, chunk_address);
     return ((u64::from(crate::conventions::MAX_PO) - u64::from(po) + 1) * PO_PRICE).into();
 }

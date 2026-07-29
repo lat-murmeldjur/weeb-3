@@ -68,6 +68,9 @@ impl ProgressStore {
         let Some(row) = self.rows.iter_mut().find(|row| row.id == id) else {
             return;
         };
+        if row.done {
+            return;
+        }
 
         if row.phase == phase && row.percent == percent && row.detail == detail {
             return;
@@ -140,5 +143,25 @@ impl ProgressStore {
             completed_seen += 1;
             completed_seen <= COMPLETED_PROGRESS_LIMIT
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ProgressStore;
+
+    #[test]
+    fn late_updates_do_not_reopen_finished_progress() {
+        let mut store = ProgressStore::new();
+        let id = store.start("upload", "file", "read", Some(0), "reading");
+        store.finish(&id, "failed", "slice read failed", false);
+        store.update(&id, "push", Some(50), "late chunk receipt");
+
+        let (_, rows) = store.snapshot_if_changed(0).expect("progress changed");
+        let row = rows.iter().find(|row| row.id == id).expect("row exists");
+        assert!(row.done);
+        assert!(!row.ok);
+        assert_eq!(row.phase, "failed");
+        assert_eq!(row.detail, "slice read failed");
     }
 }

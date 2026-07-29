@@ -21,6 +21,7 @@ prost = { git = "https://github.com/tokio-rs/prost.git" }
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = { git = "https://github.com/serde-rs/json.git" }
 getrandom = { version = "0.3.3", features = ["wasm_js"] }
+event-listener = "5.4.1"
 
 
 [build-dependencies]
@@ -74,8 +75,11 @@ web-sys = { version = "0.3.77", features = [
   'BlobPropertyBag',
   'Cache',
   'CacheStorage',
+  'CustomEvent',
+  'CustomEventInit',
   'Document',
   'Element',
+  'Event',
   'EventTarget',
   'EventListener',
   'File',
@@ -87,11 +91,13 @@ web-sys = { version = "0.3.77", features = [
   'HtmlButtonElement',
   'HtmlElement',
   'HtmlInputElement',
+  'HtmlMediaElement',
   'HtmlSpanElement',
   'HtmlParagraphElement',
   'HtmlSelectElement',
   'Location',
   'MediaQueryList',
+  'MediaError',
   'MessagePort',
   'MessageChannel',
   'Navigator',
@@ -106,10 +112,14 @@ web-sys = { version = "0.3.77", features = [
   'RequestMode',
   'RequestCredentials',
   'RequestInit',
+  'RegistrationOptions',
   'Response',
   'ResponseType',
   'ResponseInit',
+  'Storage',
+  'TimeRanges',
   'Url',
+  'UrlSearchParams',
   'Window',
 ] }
 byteorder = { git = "https://github.com/BurntSushi/byteorder" }
@@ -124,6 +134,9 @@ base64 = "0.22.1"
 async-lock = { git = "https://github.com/smol-rs/async-lock" }
 
 [dev-dependencies]
+async-std = { git = "https://github.com/async-rs/async-std.git" }
+async-lock = { git = "https://github.com/smol-rs/async-lock" }
 headless_chrome = "1.0.21"
 anyhow_crates_io = { package = "anyhow", version = "1" }
 serde_json_crates_io = { package = "serde_json", version = "1" }
+sha3_crates_io = { package = "sha3", version = "0.10.9" }

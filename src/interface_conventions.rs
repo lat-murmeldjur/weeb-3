@@ -1,10 +1,30 @@
 use js_sys::{Function, Reflect};
+use std::cell::RefCell;
 use wasm_bindgen::{JsCast, JsValue, closure::Closure};
 use web_sys::{Document, Element, Event, HtmlButtonElement, HtmlElement};
 
 const INTERFACE_STYLE_ID: &str = "weeb3InterfaceStyle";
 
 const INDEX_HTML: &str = include_str!("../static/index.html");
+
+thread_local! {
+    static INTERFACE_EVENT_CALLBACKS: RefCell<Vec<Closure<dyn FnMut(Event)>>> =
+        RefCell::new(Vec::new());
+    static OS_THEME_LISTENER: RefCell<Option<ThemeListener>> = const { RefCell::new(None) };
+}
+
+struct ThemeListener {
+    target: web_sys::EventTarget,
+    callback: Closure<dyn FnMut(Event)>,
+}
+
+impl Drop for ThemeListener {
+    fn drop(&mut self) {
+        let _ = self
+            .target
+            .remove_event_listener_with_callback("change", self.callback.as_ref().unchecked_ref());
+    }
+}
 
 fn interface_style() -> &'static str {
     let start = r#"<style id="weeb3InterfaceStyle">"#;
@@ -22,7 +42,7 @@ fn interface_style() -> &'static str {
 }
 
 fn interface_shell() -> &'static str {
-    let start = r#"<div id="wrapper">"#;
+    let start = r#"<div id="weeb3InterfaceRoot">"#;
     let Some(start_index) = INDEX_HTML.find(start) else {
         return "";
     };
@@ -90,6 +110,10 @@ const LOG_SECTIONS: &[CollapseSection] = &[CollapseSection {
 }];
 
 pub(crate) fn install_interface_conventions() {
+    INTERFACE_EVENT_CALLBACKS.with(|callbacks| callbacks.borrow_mut().clear());
+    OS_THEME_LISTENER.with(|listener| {
+        listener.borrow_mut().take();
+    });
     install_collapsible_group(PRIMARY_SECTIONS);
     install_collapsible_group(LOG_SECTIONS);
     set_section_state(LOG_SECTIONS[0], true);
@@ -227,7 +251,7 @@ fn install_collapsible_group(sections: &'static [CollapseSection]) {
         });
 
         button.set_onclick(Some(callback.as_ref().unchecked_ref()));
-        callback.forget();
+        INTERFACE_EVENT_CALLBACKS.with(|callbacks| callbacks.borrow_mut().push(callback));
     }
 }
 
@@ -243,24 +267,21 @@ fn install_theme_toggle() {
     install_os_theme_listener();
 
     let callback = Closure::<dyn FnMut(Event)>::new(move |_event| {
-        let Some(document) = document() else {
-            return;
-        };
-        let Some(body) = document.body() else {
+        let Some(wrapper) = element("weeb3InterfaceRoot") else {
             return;
         };
 
         if effective_dark() {
-            let _ = body.set_attribute("class", "light");
+            set_theme_class(&wrapper, "light");
         } else {
-            let _ = body.set_attribute("class", "dark");
+            set_theme_class(&wrapper, "dark");
         }
 
         set_theme_button_text();
     });
 
     button.set_onclick(Some(callback.as_ref().unchecked_ref()));
-    callback.forget();
+    INTERFACE_EVENT_CALLBACKS.with(|callbacks| callbacks.borrow_mut().push(callback));
 }
 
 fn prefers_dark() -> bool {
@@ -276,15 +297,26 @@ fn prefers_dark() -> bool {
 }
 
 fn theme_class(name: &str) -> bool {
-    document()
-        .and_then(|document| document.body())
-        .and_then(|body| body.get_attribute("class"))
+    element("weeb3InterfaceRoot")
+        .and_then(|wrapper| wrapper.get_attribute("class"))
         .map(|class_name| {
             class_name
                 .split_whitespace()
                 .any(|class_item| class_item == name)
         })
         .unwrap_or(false)
+}
+
+fn set_theme_class(wrapper: &Element, theme: &str) {
+    let mut classes = wrapper
+        .get_attribute("class")
+        .unwrap_or_default()
+        .split_whitespace()
+        .filter(|name| *name != "dark" && *name != "light")
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    classes.push(theme.to_string());
+    let _ = wrapper.set_attribute("class", &classes.join(" "));
 }
 
 fn effective_dark() -> bool {
@@ -319,6 +351,15 @@ fn install_os_theme_listener() {
         set_theme_button_text();
     });
 
-    let _ = target.add_event_listener_with_callback("change", callback.as_ref().unchecked_ref());
-    callback.forget();
+    if target
+        .add_event_listener_with_callback("change", callback.as_ref().unchecked_ref())
+        .is_ok()
+    {
+        OS_THEME_LISTENER.with(|listener| {
+            *listener.borrow_mut() = Some(ThemeListener {
+                target: target.clone(),
+                callback,
+            });
+        });
+    }
 }

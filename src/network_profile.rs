@@ -101,6 +101,19 @@ pub(crate) fn profile_for_mode(mode: NetworkMode) -> NetworkProfile {
     }
 }
 
+pub(crate) fn activate_profile(profile: NetworkProfile) {
+    match profile.mode {
+        NetworkMode::Mainnet => {
+            crate::set_mainnet(true);
+            crate::set_testnet_official(false);
+        }
+        NetworkMode::Testnet => {
+            crate::set_testnet_official(true);
+            crate::set_mainnet(false);
+        }
+    }
+}
+
 pub(crate) fn active_profile() -> NetworkProfile {
     if crate::is_mainnet() {
         MAINNET_PROFILE

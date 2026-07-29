@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use anyhow_crates_io::{Context, Result, anyhow};
 use headless_chrome::{Browser, LaunchOptionsBuilder};
 use serde_json_crates_io::{Value, json};
@@ -96,10 +98,10 @@ fn weeb3_loads_in_browser() -> Result<()> {
 
         println!(
             "weeb-3 load run {run}: wall_load_ms={wall_load_ms}, \
-             load_event_ms={load_event_ms:?}, \
-             dom_content_loaded_ms={dom_content_loaded_ms:?}, \
-             wasm_count={wasm_count}, \
-             ready_ms={ready_ms:?}"
+                 load_event_ms={load_event_ms:?}, \
+                 dom_content_loaded_ms={dom_content_loaded_ms:?}, \
+                 wasm_count={wasm_count}, \
+                 ready_ms={ready_ms:?}"
         );
 
         results.push(json!({
@@ -186,8 +188,8 @@ fn launch_browser(timeout: Duration) -> Result<Browser> {
     Browser::new(options).map_err(|err| {
         anyhow!(
             "failed to launch Chrome/Chromium. \
-             Install Chrome/Chromium, set CHROME, or set WEEB3_CHROME=/path/to/chrome. \
-             Error: {err:?}"
+                 Install Chrome/Chromium, set CHROME, or set WEEB3_CHROME=/path/to/chrome. \
+                 Error: {err:?}"
         )
     })
 }
@@ -195,25 +197,25 @@ fn launch_browser(timeout: Duration) -> Result<Browser> {
 fn wait_for_load_event_end(tab: &headless_chrome::Tab, timeout: Duration) -> Result<()> {
     let script = format!(
         r#"
-        new Promise((resolve, reject) => {{
-            const deadline = performance.now() + {};
-            const check = () => {{
-                const nav = performance.getEntriesByType('navigation')[0];
+            new Promise((resolve, reject) => {{
+                const deadline = performance.now() + {};
+                const check = () => {{
+                    const nav = performance.getEntriesByType('navigation')[0];
 
-                if (nav && nav.loadEventEnd > 0) {{
-                    return resolve(true);
-                }}
+                    if (nav && nav.loadEventEnd > 0) {{
+                        return resolve(true);
+                    }}
 
-                if (performance.now() > deadline) {{
-                    return reject(new Error('timed out waiting for loadEventEnd'));
-                }}
+                    if (performance.now() > deadline) {{
+                        return reject(new Error('timed out waiting for loadEventEnd'));
+                    }}
 
-                setTimeout(check, 50);
-            }};
+                    setTimeout(check, 50);
+                }};
 
-            check();
-        }})
-        "#,
+                check();
+            }})
+            "#,
         timeout.as_millis()
     );
 
@@ -227,54 +229,54 @@ fn read_browser_metrics(tab: &headless_chrome::Tab) -> Result<Value> {
     let remote = tab
         .evaluate(
             r#"
-            JSON.stringify((() => {
-                const round = n => Number.isFinite(n) ? Math.round(n) : null;
+                JSON.stringify((() => {
+                    const round = n => Number.isFinite(n) ? Math.round(n) : null;
 
-                const responseStatus = entry => {
-                    if (entry && typeof entry.responseStatus === 'number') {
-                        return entry.responseStatus;
-                    }
+                    const responseStatus = entry => {
+                        if (entry && typeof entry.responseStatus === 'number') {
+                            return entry.responseStatus;
+                        }
 
-                    return null;
-                };
+                        return null;
+                    };
 
-                const nav = performance.getEntriesByType('navigation')[0] || null;
-                const resources = performance.getEntriesByType('resource') || [];
+                    const nav = performance.getEntriesByType('navigation')[0] || null;
+                    const resources = performance.getEntriesByType('resource') || [];
 
-                return {
-                    href: location.href,
-                    title: document.title,
-                    ready_state: document.readyState,
+                    return {
+                        href: location.href,
+                        title: document.title,
+                        ready_state: document.readyState,
 
-                    navigation: nav ? {
-                        response_status: responseStatus(nav),
-                        response_end_ms: round(nav.responseEnd - nav.startTime),
-                        dom_content_loaded_ms: round(
-                            nav.domContentLoadedEventEnd - nav.startTime
-                        ),
-                        load_event_ms: round(nav.loadEventEnd - nav.startTime),
-                        duration_ms: round(nav.duration),
-                        transfer_size: nav.transferSize || 0,
-                        encoded_body_size: nav.encodedBodySize || 0,
-                        decoded_body_size: nav.decodedBodySize || 0
-                    } : null,
+                        navigation: nav ? {
+                            response_status: responseStatus(nav),
+                            response_end_ms: round(nav.responseEnd - nav.startTime),
+                            dom_content_loaded_ms: round(
+                                nav.domContentLoadedEventEnd - nav.startTime
+                            ),
+                            load_event_ms: round(nav.loadEventEnd - nav.startTime),
+                            duration_ms: round(nav.duration),
+                            transfer_size: nav.transferSize || 0,
+                            encoded_body_size: nav.encodedBodySize || 0,
+                            decoded_body_size: nav.decodedBodySize || 0
+                        } : null,
 
-                    resource_count: resources.length,
+                        resource_count: resources.length,
 
-                    wasm_resources: resources
-                        .filter(r => r.name.toLowerCase().includes('.wasm'))
-                        .map(r => ({
-                            name: r.name,
-                            start_ms: round(r.startTime),
-                            duration_ms: round(r.duration),
-                            response_status: responseStatus(r),
-                            transfer_size: r.transferSize || 0,
-                            encoded_body_size: r.encodedBodySize || 0,
-                            decoded_body_size: r.decodedBodySize || 0
-                        }))
-                };
-            })())
-            "#,
+                        wasm_resources: resources
+                            .filter(r => r.name.toLowerCase().includes('.wasm'))
+                            .map(r => ({
+                                name: r.name,
+                                start_ms: round(r.startTime),
+                                duration_ms: round(r.duration),
+                                response_status: responseStatus(r),
+                                transfer_size: r.transferSize || 0,
+                                encoded_body_size: r.encodedBodySize || 0,
+                                decoded_body_size: r.decodedBodySize || 0
+                            }))
+                    };
+                })())
+                "#,
             false,
         )
         .map_err(|err| anyhow!("failed to evaluate browser performance metrics: {err:?}"))?;
