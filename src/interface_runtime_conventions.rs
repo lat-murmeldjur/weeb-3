@@ -525,16 +525,8 @@ pub(super) async fn open_resource(weeb3: Arc<Weeb3>, route: ResourceRoute) {
             let bytes = weeb3.retrieve_chunk_bytes(reference.clone()).await;
             download_raw_bytes(bytes, reference, "chunk").await;
         }
-        ResourceRoute::Feed { owner, topic } => {
-            crate::stream_hls::open_feed_view(weeb3, owner, topic).await;
-        }
-        ResourceRoute::Hls {
-            media_type,
-            owner,
-            topic,
-            index,
-        } => {
-            crate::stream_hls::open_hls_feed_view(weeb3, owner, topic, media_type, index).await;
+        ResourceRoute::Hls { owner, topic } => {
+            crate::stream_hls::open_hls_feed_view(weeb3, owner, topic).await;
         }
     }
 }
@@ -1268,13 +1260,12 @@ pub(super) fn create_element_wmt(tmype: String, blob_url: String) -> Element {
     let i = document.create_element("embed").unwrap();
     let _ = i.set_attribute("src", &blob_url);
     let _ = i.set_attribute("type", &tmype);
-    // let _ = i.set_attribute("allow", "fullscreen");
 
     return i;
 }
 
 pub(crate) fn service_worker_missing() {
-    if !service_worker_install_blocked_by_context() {
+    if service_worker_container().is_some() {
         return;
     }
     if SERVICE_WORKER_MISSING_VISIBLE.with(|visible| visible.replace(true)) {
@@ -1358,19 +1349,10 @@ pub(super) fn render_progress_rows(rows: Vec<crate::events::ProgressRow>) {
 }
 
 pub(super) async fn render_result(data: Vec<(Vec<u8>, String, String)>, indx: String) {
-    interface_debug(&JsValue::from(format!(
-        "data array length {:#?}",
-        data.len()
-    )));
-
     if data.len() == 0 {
         let new_element = create_element_wmt("undefined".to_string(), "".to_string());
         prepend_result_node(&new_element);
     } else if data.len() == 1 {
-        interface_debug(&JsValue::from(format!(
-            "data length {:#?}",
-            data[0].0.len()
-        )));
         let (bytes, mime, path) = data.into_iter().next().unwrap();
         render_single_result_with_download(bytes, mime, path);
     } else {
@@ -1400,11 +1382,8 @@ pub fn parsebootconnect(boot_node_masettings_id: String) -> (String, String) {
             boot_node_masettings_id
         ));
 
-    interface_debug(&"g0 bootnode change triggered".into());
     match bootnode_input.value().parse::<String>() {
         Ok(bootnode_address) => {
-            interface_debug(&"g1 bootnode change triggered".into());
-
             let network_id_input = document
                 .get_element_by_id("networkIDSettings")
                 .expect("#networkIDSettings should exist");
@@ -1446,10 +1425,6 @@ fn service_worker_container() -> Option<web_sys::ServiceWorkerContainer> {
         .ok()
 }
 
-fn service_worker_install_blocked_by_context() -> bool {
-    service_worker_container().is_none()
-}
-
 async fn service_worker_registration(
     service0: &web_sys::ServiceWorkerContainer,
 ) -> Option<ServiceWorkerRegistration> {
@@ -1463,16 +1438,10 @@ async fn service_worker_registration(
     registration.dyn_into::<ServiceWorkerRegistration>().ok()
 }
 
-async fn active_service_worker(
-    service0: &web_sys::ServiceWorkerContainer,
-) -> Option<web_sys::ServiceWorker> {
-    service_worker_registration(service0).await?.active()
-}
-
 fn configured_service_worker_url() -> Option<String> {
     let window = web_sys::window()?;
     let page_url = window.location().href().ok()?;
-    web_sys::Url::new_with_base(&streaming_service_worker_url(), &page_url)
+    web_sys::Url::new_with_base(STREAMING_SERVICE_WORKER_URL, &page_url)
         .ok()
         .map(|url| url.href())
 }
@@ -1492,18 +1461,13 @@ pub async fn get_service_worker() -> Option<web_sys::ServiceWorker> {
     let setup_lock = SERVICE_WORKER_SETUP_LOCK.with(std::rc::Rc::clone);
     let _setup_guard = setup_lock.lock().await;
 
-    // An embedding application may already own this scope. A compatible host
-    // worker advertises the forwarding protocol and must be reused; an
-    // unrelated controller must never be silently replaced by renderInterface.
+    // Never replace an unrelated host application's worker.
     if service_worker_forwarder_ready().await {
         return controlled_service_worker();
     }
     let expected_worker_url = configured_service_worker_url()?;
     if let Some(controller) = controlled_service_worker() {
         if controller.script_url() != expected_worker_url {
-            // A compatible host worker may be busy servicing media on a slow
-            // device. Give it one longer probe before treating its different
-            // script URL as an unrelated scope conflict.
             if service_worker_forwarder_ready_with_timeout(1_500).await {
                 return Some(controller);
             }
@@ -1518,18 +1482,11 @@ pub async fn get_service_worker() -> Option<web_sys::ServiceWorker> {
                 return None;
             }
 
-            // `active` does not imply that this document has a controller. In
-            // particular, a document can appear after the worker's activate
-            // event, so activation-time clients.claim() will not run again.
-            // Ask only our exact configured worker to claim the current scope.
             let _ = request_service_worker_claim(&active).await;
             if service_worker_forwarder_ready().await {
                 return controlled_service_worker();
             }
 
-            // A same-URL active worker can be an older cached forwarder that
-            // predates the claim/PING protocol. Refresh only the registration
-            // owned by weeb-3; never update a different host worker.
             if let Ok(update) = registration.update() {
                 let _ = async_std::future::timeout(Duration::from_secs(10), JsFuture::from(update))
                     .await;
@@ -1538,11 +1495,11 @@ pub async fn get_service_worker() -> Option<web_sys::ServiceWorker> {
     }
 
     let registration_options = RegistrationOptions::new();
-    registration_options.set_scope(&streaming_service_worker_scope());
+    registration_options.set_scope(STREAMING_SERVICE_WORKER_SCOPE);
     match async_std::future::timeout(
         Duration::from_secs(10),
         JsFuture::from(
-            service0.register_with_options(&streaming_service_worker_url(), &registration_options),
+            service0.register_with_options(STREAMING_SERVICE_WORKER_URL, &registration_options),
         ),
     )
     .await
@@ -1590,7 +1547,7 @@ pub async fn get_service_worker() -> Option<web_sys::ServiceWorker> {
         )),
     }
 
-    let active = active_service_worker(&service0).await?;
+    let active = service_worker_registration(&service0).await?.active()?;
     if active.script_url() != expected_worker_url {
         warn_about_worker_conflict(&active.script_url());
         return None;
@@ -1651,7 +1608,7 @@ async fn service_worker_protocol_request(
         return false;
     };
     let (sender, receiver) = async_std::channel::bounded::<bool>(1);
-    let expected_scope = streaming_service_worker_scope();
+    let expected_scope = STREAMING_SERVICE_WORKER_SCOPE;
     let expected_response_type = response_type.to_string();
     let callback = Closure::<dyn FnMut(MessageEvent)>::new(move |event: MessageEvent| {
         let data = event.data();
@@ -1706,8 +1663,8 @@ pub(crate) fn service_worker_scope_protocol_error(purpose: &str) -> String {
          claim scope {} and answer WEEB3_PING within {} ms ({} follow-up probes maximum).",
         SERVICE_WORKER_PROTOCOL as u8,
         purpose,
-        streaming_service_worker_url(),
-        streaming_service_worker_scope(),
+        STREAMING_SERVICE_WORKER_URL,
+        STREAMING_SERVICE_WORKER_SCOPE,
         SERVICE_WORKER_CONTROL_TOTAL_TIMEOUT_MS,
         SERVICE_WORKER_CONTROL_MAX_FOLLOWUP_PROBES,
     )
@@ -1741,11 +1698,6 @@ async fn wait_for_service_worker_control(
             unavailable_rounds.saturating_add(1)
         };
 
-        // A newly activated worker may exist before clients.claim() has made
-        // it this document's controller. Waiting for that transition is not a
-        // failed protocol handshake and must not consume the bounded PING
-        // probe allowance; the caller's 30-second timeout remains the hard
-        // bound for the whole activation sequence.
         if controlled_service_worker().is_none() {
             if unavailable_rounds >= SERVICE_WORKER_CONTROL_MAX_UNAVAILABLE_ROUNDS {
                 return false;
@@ -1758,9 +1710,6 @@ async fn wait_for_service_worker_control(
             continue;
         }
 
-        // Registration, activation, controllerchange and the scoped protocol
-        // handshake are control-plane operations. They are safe to retry; no
-        // Swarm request or accounting-sensitive operation has been dispatched.
         let remaining_probes =
             SERVICE_WORKER_CONTROL_MAX_FOLLOWUP_PROBES.saturating_sub(protocol_probes);
         let probes = if worker_available {

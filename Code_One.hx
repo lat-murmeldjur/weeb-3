@@ -44,7 +44,6 @@ class Code_One {
 			temporas(w3);
 
 			clientele('git', ['checkout', '-b', 'feature-$dome'], count);
-			clientele('git', ['add', '-f', './static/hls-stream-example.html', './static/hls_loader.js'], count);
 			clientele('git', ['add', '.'], count);
 			clientele('git', ['commit', '-am', '"Commit number $mist"'], count);
 			clientele('git', ['push', 'origin', 'feature-$dome'], count);

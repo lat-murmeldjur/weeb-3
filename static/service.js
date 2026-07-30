@@ -6,13 +6,11 @@ const NETWORK_ROUTE_PREFIXES = ["", "mainnet/", "testnet/"];
 const RAW_ROUTE_KINDS = [
   ["hls/bytes", "hls-bytes"],
   ["bytes", "bytes"],
-  ["chunks", "chunk"],
-  ["chunk", "chunk"]
+  ["chunks", "chunk"]
 ];
 const FETCH_TIMEOUT_MS = 240000;
 const SERVICE_WORKER_MARKER = "forwarder-default20";
 const SERVICE_WORKER_PROTOCOL = 5;
-const DEBUG_SERVICE_WORKER = false;
 const MIB_BYTES = 1024 * 1024;
 const STREAM_STORAGE_WINDOW_BYTES = MIB_BYTES / 2;
 const STREAM_LOOKAHEAD_CHUNKS = 8;
@@ -21,12 +19,6 @@ const CLIENT_RUNTIME_PROBES = new Map();
 const CLIENT_RUNTIME_PROBE_TIMEOUT_MS = 1_500;
 
 console.log(`weeb-3 service worker start ${SERVICE_WORKER_MARKER}`);
-
-function debugLog(...args) {
-  if (DEBUG_SERVICE_WORKER) {
-    console.log(...args);
-  }
-}
 
 function logServiceWorkerVersion(reason) {
   console.log(`weeb-3 service worker ${reason} ${SERVICE_WORKER_MARKER}`);
@@ -79,32 +71,16 @@ function isCanonicalStreamTopic(value) {
   }
 }
 
-function isCanonicalStreamIndex(value) {
-  if (value === undefined) {
-    return true;
-  }
-  return /^[0-9]+$/.test(value) && BigInt(value) <= 18446744073709551615n;
-}
-
 function isDirectShareShellPath(pathname) {
   if (!pathname.startsWith(SCOPE_PATH)) {
     return false;
   }
 
   const parts = pathname.substring(SCOPE_PATH.length).split("/");
-  if (parts[0] === "testnet") {
-    parts.shift();
-  }
-
-  const kind = parts.shift();
-  if (kind !== "stream") {
-    return false;
-  }
-
-  return (parts.length === 2 || parts.length === 3) &&
-    /^(?:0[xX])?[a-fA-F0-9]{40}$/.test(parts[0] || "") &&
-    isCanonicalStreamTopic(parts[1]) &&
-    isCanonicalStreamIndex(parts[2]);
+  return parts.length === 3 &&
+    parts[0] === "stream" &&
+    /^[a-fA-F0-9]{40}$/.test(parts[1]) &&
+    isCanonicalStreamTopic(parts[2]);
 }
 
 function isBzzUploadPath(pathname) {
@@ -138,21 +114,26 @@ function canonicalBzzResource(url) {
 }
 
 function canonicalRawResource(url) {
-  for (const [marker] of rawRouteMarkers()) {
+  for (const [marker, rawType] of rawRouteMarkers()) {
     if (!url.pathname.startsWith(marker)) {
       continue;
     }
 
-    const resource = url.pathname.substring(marker.length);
-    if (!resource) {
+    const encodedResource = url.pathname.substring(marker.length);
+    if (!encodedResource) {
       return null;
     }
 
+    let resource;
     try {
-      return decodeURIComponent(resource);
+      resource = decodeURIComponent(encodedResource);
     } catch (_) {
-      return resource;
+      resource = encodedResource;
     }
+    if (rawType === "hls-bytes" && !isSwarmReference(resource)) {
+      return null;
+    }
+    return resource;
   }
 
   return null;
@@ -178,15 +159,6 @@ function canonicalFeedResource(url) {
   }
 
   return null;
-}
-
-function isCanonicalRequest(request) {
-  try {
-    const url = new URL(request.url);
-    return canonicalBzzResource(url) !== null || canonicalRawResource(url) !== null;
-  } catch (_) {
-    return false;
-  }
 }
 
 function isAppShellNavigation(request) {
@@ -295,9 +267,6 @@ self.addEventListener("fetch", (event) => {
     return;
   }
 
-  // This worker is safe to mount in an npm application: requests outside the
-  // explicit weeb-3 routes remain entirely under the host app/browser's
-  // normal fetch and caching policy.
 });
 
 function clientInScope(client) {
@@ -382,10 +351,7 @@ async function firstReadyClient(candidates, requiredNetworkId) {
     return [];
   }
 
-  // Start the cheap liveness/network probes together so stale tabs add at
-  // most one probe timeout. Preserve the originating client's fast path and
-  // candidate priority; the accounting-sensitive operation itself is still
-  // sent exactly once by messageFirstClient.
+  // Probe candidates concurrently without redispatching work.
   const probes = candidates.map((candidate) => clientWeeb3NetworkId(candidate));
   if (await probes[0] === requiredNetworkId) {
     return [candidates[0]];
@@ -413,12 +379,7 @@ async function requestClients(event, requestUrl, requiredNetworkId) {
     )
   );
 
-  // HLS fetches originate in the top-level page that attached the shared Rust
-  // player, whether that page is the bundled shell or an arbitrary npm host.
-  // Dispatch those directly: the Rust bridge validates networkId before
-  // retrieval, while a redundant liveness round-trip here can false-timeout
-  // when a large WASM retrieval wave briefly occupies the browser thread.
-  // Nested clients retain the probed fallback below.
+  // Direct top-level HLS requests skip the redundant liveness probe.
   if (
     directHlsRequest &&
     eventClient &&
@@ -436,9 +397,6 @@ async function requestClients(event, requestUrl, requiredNetworkId) {
   const seen = new Set();
   const requestReference = requestUrlObject ? bzzReferenceFromUrl(requestUrlObject) : "";
 
-  // Prefer the top-level context that originated the request. A nested BZZ
-  // site frame does not host the Rust runtime and must fall through to its
-  // active app-shell tab below.
   if (eventClient && isTopLevelClient(eventClient) && clientInScope(eventClient)) {
     pushUniqueClient(candidates, seen, eventClient);
   }
@@ -532,10 +490,7 @@ function messageFirstClient(clients, message, timeoutMs = FETCH_TIMEOUT_MS) {
     });
   }
 
-  // Uploads and canonical retrievals can enter postage/accounting state. Send
-  // each request exactly once. A timeout merely detaches this response port;
-  // already-dispatched work is deliberately left to drain and is never replayed
-  // through another tab.
+  // Timeouts detach the port; dispatched accounting work is never replayed.
   return messageClient(clients[0], message, timeoutMs);
 }
 
@@ -636,16 +591,6 @@ function toUint8Array(body) {
     return new Uint8Array(body.buffer, body.byteOffset, body.byteLength);
   }
   return new Uint8Array();
-}
-
-function oneChunkResponseBody(body) {
-  const bytes = toUint8Array(body);
-  return new ReadableStream({
-    start(controller) {
-      controller.enqueue(bytes);
-      controller.close();
-    }
-  });
 }
 
 function responseHeaders(headerRows) {
@@ -774,7 +719,7 @@ async function forwardRequestToRust(request, event) {
     return new Response(
       request.method === "HEAD" || status === 304
         ? null
-        : oneChunkResponseBody(response.body),
+        : toUint8Array(response.body),
       {
         status,
         headers
@@ -788,12 +733,9 @@ async function forwardRequestToRust(request, event) {
 }
 
 function parseUploadRedundancyHeader(value) {
-  // Bee marks this header `omitempty`, so a present empty value has the same
-  // Medium default as an omitted header.
   if (value === null || value === "") {
     return 1;
   }
-  // Bee parses an unsigned base-10 header, so reject Number()-only forms such as hex or exponents.
   if (!/^[0-9]+$/.test(value)) {
     return null;
   }

@@ -1,33 +1,15 @@
 use crate::{
-    //
-    JsValue,
-    //
     erasure_coding::RedundancyLevel,
-    //
-    manifest_conventions::{
+    manifest::{
         MANTARAY_PREFIX_MAX_BYTES, common_prefix_bytes, encode_fork,
-        encode_fork_with_separator_path, fork_prefix, ordered_indexed_forks, split_prefix_bytes,
+        encode_fork_with_separator_path, ordered_indexed_forks, split_prefix_bytes,
     },
-    //
-    //
     mpsc,
-    //
     upload::{DataUploadRequest, UploadProgressSender},
-    //
     upload_data,
 };
 
 use serde_json::json;
-
-const DEBUG_MANIFEST_UPLOAD_LOGS: bool = false;
-
-macro_rules! manifest_upload_log {
-    ($($arg:tt)*) => {
-        if DEBUG_MANIFEST_UPLOAD_LOGS {
-            web_sys::console::log_1(&JsValue::from(format!($($arg)*)));
-        }
-    };
-}
 
 #[derive(Clone)]
 pub struct Node {
@@ -124,18 +106,8 @@ async fn create_manifest_bytes(
         }
     }
 
-    manifest_upload_log!(
-        "Manifest length after obfuscation key: {}",
-        manifest_bytes_vec.len()
-    );
-
     manifest_bytes_vec.append(
         &mut hex::decode("5768b3b6a7db56d21d1abff40d41cebfc83448fed8d7e9b06ec0d3b073f28f").unwrap(),
-    );
-
-    manifest_upload_log!(
-        "Manifest length after mf version: {}",
-        manifest_bytes_vec.len()
     );
 
     let mut ref_length: u8 = 32;
@@ -150,10 +122,6 @@ async fn create_manifest_bytes(
         } else if reference.len() == 64 {
             ref_length = 64;
         } else {
-            manifest_upload_log!(
-                "Manifest reference irregular length {:#?}!",
-                hex::encode(&reference)
-            );
             return vec![];
         }
     }
@@ -161,29 +129,17 @@ async fn create_manifest_bytes(
     manifest_bytes_vec.push(ref_length);
     manifest_bytes_vec.append(&mut reference.clone());
 
-    if reference.len() == 0 {
+    if reference.is_empty() {
         for _ in 0..ref_length {
             manifest_bytes_vec.push(0_u8);
         }
     };
-
-    manifest_upload_log!(
-        "Manifest length after reference: {}",
-        manifest_bytes_vec.len()
-    );
-
-    // index bytes ?
 
     let index_bytes_start = manifest_bytes_vec.len();
 
     for _ in 0..32 {
         manifest_bytes_vec.push(0_u8);
     }
-
-    manifest_upload_log!(
-        "Manifest length after index bytes: {}",
-        manifest_bytes_vec.len()
-    );
 
     let mut fork_bases: Vec<Vec<u8>> = vec![];
 
@@ -192,7 +148,6 @@ async fn create_manifest_bytes(
 
         for fork in &forks {
             let Some(&leading_byte) = fork.path.first() else {
-                manifest_upload_log!("Manifest path must not be empty");
                 return vec![];
             };
 
@@ -343,8 +298,7 @@ async fn create_manifest_bytes(
                 let mut descendants = Vec::with_capacity(forkgroup1.len());
                 for mut fork in forkgroup1 {
                     if fork.path.len() == common_prefix.len() {
-                        // Bee's Add semantics replace an existing value at the
-                        // same path, so the last sorted duplicate wins.
+                        // Bee's Add semantics make the last sorted duplicate win.
                         exact_value = Some(fork);
                     } else {
                         fork.path = fork.path[common_prefix.len()..].to_vec();
@@ -456,23 +410,15 @@ async fn create_manifest_bytes(
     let mut serialized_forks = data_forks;
     serialized_forks.append(&mut fork_bases);
     let Some((serialized_forks, index_bytes)) = ordered_indexed_forks(serialized_forks) else {
-        manifest_upload_log!("Manifest contains malformed or colliding fork prefixes");
         return vec![];
     };
 
     manifest_bytes_vec[index_bytes_start..index_bytes_start + index_bytes.len()]
         .copy_from_slice(&index_bytes);
 
-    for (position, mut fork) in serialized_forks.into_iter().enumerate() {
-        manifest_upload_log!(
-            "Sorted prefix: {} {}",
-            position,
-            hex::encode(fork_prefix(&fork))
-        );
+    for mut fork in serialized_forks {
         manifest_bytes_vec.append(&mut fork);
     }
-
-    manifest_upload_log!("Manifest length after forks: {}", manifest_bytes_vec.len());
 
     {
         let obfuscation_key = &manifest_bytes_vec[0..32];
@@ -512,15 +458,7 @@ async fn create_manifest_bytes(
 
 pub async fn create_fork(path: String, reference: Vec<u8>, metadata: Vec<u8>) -> Vec<u8> {
     let has_edge = metadata.is_empty();
-    encode_fork(path.as_bytes(), &reference, &metadata, has_edge).unwrap_or_else(|| {
-        manifest_upload_log!(
-            "Invalid manifest fork prefix/reference/metadata: prefix_bytes={} reference_bytes={} metadata_bytes={}",
-            path.len(),
-            reference.len(),
-            metadata.len(),
-        );
-        vec![]
-    })
+    encode_fork(path.as_bytes(), &reference, &metadata, has_edge).unwrap_or_default()
 }
 
 pub async fn create_stub(stub_ref_size: u8, obfuscated: bool) -> Vec<u8> {

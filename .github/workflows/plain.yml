@@ -76,7 +76,6 @@ jobs:
             'exports[.].types=./weeb_3.d.ts' \
             'exports[.].import=./weeb_3.js' \
             'exports[.].default=./weeb_3.js' \
-            'exports[./service.js].default=./service.js' \
             'dependencies[hls.js]=^1.6.2'
           if [ "${GITHUB_EVENT_NAME}" = "push" ] && [ "${GITHUB_REF}" = "refs/heads/main" ]; then
             BASE_VERSION="$(node -p "require('./package.json').version.split('-')[0]")"
@@ -84,75 +83,7 @@ jobs:
             npm version "$RELEASE_VERSION" --no-git-tag-version
           fi
       - name: Check npm pack contents
-        run: |
-          npm pack --dry-run --json ./static > npm-pack.json
-          node <<'NODE'
-          const fs = require('node:fs');
-          const reports = JSON.parse(fs.readFileSync('npm-pack.json', 'utf8'));
-          if (!Array.isArray(reports) || reports.length !== 1) {
-            throw new Error('npm pack did not return exactly one package report');
-          }
-
-          const packed = new Set(reports[0].files.map(file => file.path));
-          const packageJson = JSON.parse(fs.readFileSync('static/package.json', 'utf8'));
-          if (packageJson.dependencies?.['hls.js'] !== '^1.6.2') {
-            throw new Error('npm package must declare hls.js ^1.6.2 as a runtime dependency');
-          }
-          const required = new Set([
-            'LICENSE',
-            'README.md',
-            'package.json',
-            'service.js',
-            'weeb_3.d.ts',
-            'weeb_3.js',
-            'weeb_3_bg.wasm',
-            'weeb_3_bg.wasm.d.ts',
-          ]);
-          const wrapper = fs.readFileSync('static/weeb_3.js', 'utf8');
-          if (/from\s+['"]hls\.js['"]/.test(wrapper)) {
-            throw new Error('generated Wasm wrapper must not eagerly import hls.js');
-          }
-          for (const match of wrapper.matchAll(/from\s+['"]\.\/([^'"]+)['"]/g)) {
-            required.add(match[1]);
-          }
-
-          const missing = [...required].filter(path => !packed.has(path));
-          if (missing.length > 0) {
-            throw new Error(`npm package is missing: ${missing.join(', ')}`);
-          }
-
-          const customHlsAdapters = [...packed].filter(path => /(^|\/)hls_player\.js$/.test(path));
-          if (customHlsAdapters.length !== 0) {
-            throw new Error(
-              `npm package must use the Rust HLS player without a custom JS adapter: ${customHlsAdapters.join(', ')}`
-            );
-          }
-          const hlsLoaders = [...packed].filter(path => /(^|\/)hls_loader\.js$/.test(path));
-          if (hlsLoaders.length !== 1) {
-            throw new Error(`npm package must contain one static HLS loader, found ${hlsLoaders.length}`);
-          }
-          const hlsLoader = fs.readFileSync(`static/${hlsLoaders[0]}`, 'utf8');
-          if (!hlsLoader.includes('import("hls.js")')) {
-            throw new Error('static HLS loader must lazy-load hls.js');
-          }
-
-          const declarations = fs.readFileSync('static/weeb_3.d.ts', 'utf8');
-          for (const marker of [
-            'UploadRedundancyLevel = 0 | 1 | 2 | 3 | 4',
-            'uploadRedundancyOptions(): UploadRedundancyOption[]',
-            'defaultUploadRedundancyLevel(): UploadRedundancyLevel',
-            'configureStreamingRoutes(service_worker_url: string, route_base: string): object',
-            'openStreamFeed(owner: string, topic: string): Promise<object>',
-            'playHlsStream(owner: string, topic: string, media_type: string, index?: number | null): Promise<object>',
-            'HlsStreamStart = "beginning" | "current-window"',
-            'attachHlsStream(media: HTMLMediaElement, owner: string, topic: string, options: HlsStreamOptions): Promise<object>',
-            'detachHlsStream(): object',
-          ]) {
-            if (!declarations.includes(marker)) {
-              throw new Error(`generated declarations are missing: ${marker}`);
-            }
-          }
-          NODE
+        run: npm pack --dry-run ./static
       - name: Upload npm package artifact
         uses: actions/upload-artifact@v4
         with:

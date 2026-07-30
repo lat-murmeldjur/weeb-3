@@ -1,5 +1,4 @@
-use crate::JsValue;
-use std::sync::Arc;
+#![cfg(target_arch = "wasm32")]
 
 use alloy::primitives::keccak256;
 use ethers::{
@@ -7,100 +6,65 @@ use ethers::{
     providers::{Http, Provider},
     types::Address,
 };
+use std::sync::Arc;
 
-const DEBUG_ENS_LOGS: bool = false;
-
-fn ens_debug(message: String) {
-    if DEBUG_ENS_LOGS {
-        web_sys::console::log_1(&JsValue::from(message));
-    }
-}
+const ENS_REGISTRY_ADDRESS: &str = "0x00000000000C2E074eC69A0dFb2997BA6C7d2e1e";
+const DEFAULT_ETHEREUM_RPC_URL: &str = "https://ethereum-rpc.publicnode.com";
 
 abigen!(
     RegistryContract,
-    r#"[
-        function resolver(bytes32 node) external view returns (address)
-    ]"# // event_derives(serde::Deserialize, serde::Serialize)
+    r#"[function resolver(bytes32 node) external view returns (address)]"#
 );
 abigen!(
     ResolverContract,
-    r#"[
-        function contenthash(bytes32 node) external view returns (bytes)
-    ]"# // event_derives(serde::Deserialize, serde::Serialize)
+    r#"[function contenthash(bytes32 node) external view returns (bytes)]"#
 );
 
-fn namehash(name: &str) -> Vec<u8> {
-    if name.is_empty() {
-        return vec![0u8; 32];
-    }
-    let mut hash = vec![0u8; 32];
+fn namehash(name: &str) -> [u8; 32] {
+    let mut hash = [0u8; 32];
     for label in name.rsplit('.') {
-        hash.append(&mut keccak256(label.as_bytes()).to_vec());
-        hash = keccak256(hash.as_slice()).to_vec();
+        let mut node = Vec::with_capacity(64);
+        node.extend_from_slice(&hash);
+        node.extend_from_slice(keccak256(label.as_bytes()).as_slice());
+        hash = keccak256(node).into();
     }
     hash
 }
 
-pub async fn prt(input_address: String, inherit_rpc_url: String) -> Vec<u8> {
-    let mut rpc_url = "https://ethereum-rpc.publicnode.com";
-    let mut testaddress = "swarm.eth";
-    if input_address.len() > 0 {
-        testaddress = &input_address;
+pub(crate) async fn resolve_ens_reference(name: String, rpc_url: &str) -> Vec<u8> {
+    let provider = match Provider::<Http>::try_from(if rpc_url.is_empty() {
+        DEFAULT_ETHEREUM_RPC_URL
+    } else {
+        rpc_url
+    }) {
+        Ok(provider) => Arc::new(provider),
+        Err(_) => return vec![],
+    };
+    let registry_address: Address = match ENS_REGISTRY_ADDRESS.parse() {
+        Ok(address) => address,
+        Err(_) => return vec![],
+    };
+    let node = namehash(if name.is_empty() { "swarm.eth" } else { &name });
+    let resolver_address = match RegistryContract::new(registry_address, provider.clone())
+        .resolver(node)
+        .call()
+        .await
+    {
+        Ok(address) => address,
+        Err(_) => return vec![],
+    };
+    let content_hash = match ResolverContract::new(resolver_address, provider)
+        .contenthash(node)
+        .call()
+        .await
+    {
+        Ok(content_hash) => content_hash,
+        Err(_) => return vec![],
+    };
+
+    if content_hash.len() > 7 && content_hash[0] == 0xe4 {
+        content_hash[7..].to_vec()
+    } else {
+        vec![]
     }
-
-    if inherit_rpc_url.len() > 0 {
-        rpc_url = &inherit_rpc_url;
-    }
-
-    let namehashed = namehash(testaddress);
-
-    let provider = match Provider::<Http>::try_from(rpc_url) {
-        Ok(aok) => aok,
-        _ => return vec![],
-    };
-
-    let client = Arc::new(provider);
-
-    let reg_address_string = "0x00000000000C2E074eC69A0dFb2997BA6C7d2e1e";
-    let reg_address: Address = match reg_address_string.parse() {
-        Ok(aok) => aok,
-        _ => return vec![],
-    };
-
-    let reg_contract = RegistryContract::new(reg_address, client.clone());
-
-    let namehashed32: [u8; 32] = match namehashed.clone().try_into() {
-        Ok(aok) => aok,
-        _ => return vec![],
-    };
-
-    let res_address = match reg_contract.resolver(namehashed32).call().await {
-        Ok(aok) => aok,
-        _ => return vec![],
-    };
-
-    ens_debug(format!("Resolver Address {:#?}", res_address));
-
-    let res_contract = ResolverContract::new(res_address, client.clone());
-
-    let contenthasd = match res_contract.contenthash(namehashed32).call().await {
-        Ok(aok) => aok,
-        _ => return vec![],
-    };
-
-    if contenthasd.len() > 7 {
-        ens_debug(format!(
-            "Contenthash Found {}",
-            hex::encode(contenthasd[..].to_vec())
-        ));
-        if hex::encode(&[contenthasd[0]]) == "e4" {
-            ens_debug(format!(
-                "Swarm Hash Found {}",
-                hex::encode(contenthasd[7..].to_vec())
-            ));
-            return contenthasd[7..].to_vec();
-        }
-    };
-
-    return vec![];
 }

@@ -18,8 +18,7 @@ use crate::{
     mpsc,
     network_profile::{NetworkMode, active_profile},
     retrieval_conventions::{
-        PendingGenerationRelation, next_nonzero_generation, outer_range_retry_count,
-        pending_generation_relation, pending_load_matches,
+        PendingGenerationRelation, next_nonzero_generation, pending_generation_relation,
     },
     stream_conventions::{
         MEDIA_PREFETCH_BATCH_YIELD_MS, MEDIA_PREFETCH_MAX_PARALLEL, MEDIA_STARTUP_RESPONSE_BYTES,
@@ -216,8 +215,6 @@ impl FetchCache {
         media_state_key: &str,
         generation: u64,
     ) {
-        // Superseded media work still settles, but cannot repopulate a newer
-        // view's completed cache. Stable document reads use generation zero.
         if generation > 0
             && !self
                 .media_states
@@ -303,9 +300,11 @@ impl FetchCache {
         load_id: u64,
         result: Result<Vec<u8>, String>,
     ) {
-        if !self.pending_ranges.get(key).is_some_and(|pending| {
-            pending_load_matches(pending.generation, pending.load_id, generation, load_id)
-        }) {
+        if !self
+            .pending_ranges
+            .get(key)
+            .is_some_and(|pending| pending.generation == generation && pending.load_id == load_id)
+        {
             return;
         }
         if let Some(pending) = self.pending_ranges.remove(key) {
@@ -411,8 +410,6 @@ impl PendingRange {
             .peekable();
         while let Some(waiter) = waiters.next() {
             if waiters.peek().is_none() {
-                // Move the final result instead of cloning a full range only to
-                // discard the original immediately after fan-out.
                 let _ = waiter.try_send(result);
                 return;
             }
@@ -576,21 +573,6 @@ pub fn handle_service_worker_message(
 
     if ty == JsValue::from_str("WEEB3_FETCH_REQUEST") {
         handle_fetch_request_message(obj, event, weeb3);
-        return true;
-    }
-
-    if ty == JsValue::from_str("RESOLVE_BZZ_REQUEST") {
-        handle_resolve_bzz_message(obj, event, weeb3);
-        return true;
-    }
-
-    if ty == JsValue::from_str("RETRIEVE_RANGE_REQUEST") {
-        handle_retrieve_range_message(obj, event, weeb3);
-        return true;
-    }
-
-    if ty == JsValue::from_str("PREPARE_BZZ_STREAM_REQUEST") {
-        handle_prepare_bzz_stream_message(obj, event, weeb3);
         return true;
     }
 
@@ -996,9 +978,6 @@ async fn full_bzz_response(
 }
 
 fn should_inline_non_streamable_response(metadata: &BzzMetadata) -> bool {
-    // MIME metadata is authenticated only indirectly through the manifest and
-    // must not force an arbitrarily large allocation. Large HTML/XHTML bodies
-    // can use the same ordered range stream as every other non-media resource.
     metadata.size <= MEDIA_STORAGE_WINDOW_BYTES
 }
 
@@ -1025,9 +1004,6 @@ pub(crate) fn warm_bzz_fetch_cache(resource: &str, metadata: BzzMetadata, body: 
 }
 
 fn metadata_identity(resource: &str, metadata: &BzzMetadata) -> String {
-    // The Swarm reference is the immutable content identity. ETags received over
-    // the service-worker message boundary are descriptive metadata and must not be
-    // able to alias cached bytes belonging to another reference.
     immutable_metadata_identity(resource, &metadata.data_reference, &metadata.etag)
 }
 
@@ -1103,10 +1079,6 @@ fn begin_media_range(resource: &str, metadata: &BzzMetadata, start: u64) -> Medi
         let previous_high_water = state.effective_high_water_end();
         let previous_request_start = state.last_request_start;
         let is_startup = previous_anchor.is_none();
-        // Compare forward movement with the completed/scheduled response
-        // frontier below, not only with the previous request's start. The
-        // normal continuation after an 8 MiB startup response is itself an
-        // 8 MiB start delta and must not be mistaken for a seek.
         let is_request_jump = previous_anchor.is_some()
             && start.saturating_add(STREAM_SEEK_REQUEST_GAP_BYTES) < previous_request_start;
         let is_seek = previous_anchor.is_some()
@@ -1261,7 +1233,11 @@ async fn read_cached_range_with_retry(
     // Generation-zero reads already retry inside the Bee range retriever. A second
     // outer retry would start after the 210s timeout and outlive the service
     // worker's request budget, while its detached first attempt still drains.
-    let retry_count = outer_range_retry_count(generation, STREAM_RANGE_RETRY_COUNT);
+    let retry_count = if generation == 0 {
+        0
+    } else {
+        STREAM_RANGE_RETRY_COUNT
+    };
 
     for attempt in 0..=retry_count {
         match read_cached_range(
@@ -1751,33 +1727,20 @@ fn canonical_bzz_resource(pathname: &str) -> Option<String> {
 }
 
 fn canonical_raw_resource(pathname: &str) -> Option<(String, String)> {
-    for (marker, raw_type) in raw_route_markers() {
-        if let Some(resource) = pathname.strip_prefix(&marker) {
-            let resource = resource.trim();
-            if resource.is_empty() {
-                return None;
+    for network in ["", "mainnet/", "testnet/"] {
+        for (kind, raw_type) in [("bytes", "bytes"), ("chunks", "chunk")] {
+            let marker = streaming_route_path(&format!("{network}{kind}/"));
+            if let Some(resource) = pathname.strip_prefix(&marker) {
+                let resource = resource.trim();
+                if resource.is_empty() {
+                    return None;
+                }
+                return Some((raw_type.to_string(), decode_component(resource)));
             }
-            return Some((raw_type, decode_component(resource)));
         }
     }
 
     None
-}
-
-fn raw_route_markers() -> Vec<(String, String)> {
-    ["", "mainnet/", "testnet/"]
-        .into_iter()
-        .flat_map(|network| {
-            [("bytes", "bytes"), ("chunks", "chunk"), ("chunk", "chunk")]
-                .into_iter()
-                .map(move |(kind, raw_type)| {
-                    (
-                        streaming_route_path(&format!("{network}{kind}/")),
-                        raw_type.to_string(),
-                    )
-                })
-        })
-        .collect()
 }
 
 fn is_swarm_reference(reference: &str) -> bool {
@@ -1826,161 +1789,6 @@ pub async fn try_render_streaming_player(
     install_play_retries(&player, &src);
     start_streaming_player(&player);
     true
-}
-
-fn handle_resolve_bzz_message(obj: &js_sys::Object, event: &MessageEvent, weeb3: Arc<Weeb3>) {
-    let url = Reflect::get(obj, &JsValue::from_str("url")).unwrap_or(JsValue::NULL);
-    let reference = url.as_string().unwrap_or_default();
-    let port = message_port(event);
-
-    spawn_local(async move {
-        let resp = js_sys::Object::new();
-
-        if let Some(metadata) = weeb3.resolve_bzz(reference).await {
-            set_js(&resp, "ok", JsValue::TRUE);
-            set_js(&resp, "type", JsValue::from_str("RESOLVE_BZZ_RESPONSE"));
-            set_js(
-                &resp,
-                "data_reference",
-                JsValue::from_str(&hex::encode(metadata.data_reference)),
-            );
-            set_js(&resp, "mime", JsValue::from_str(&metadata.mime));
-            set_js(&resp, "size", JsValue::from_f64(metadata.size as f64));
-            set_js(&resp, "etag", JsValue::from_str(&metadata.etag));
-            set_js(&resp, "path", JsValue::from_str(&metadata.path));
-        } else {
-            set_js(&resp, "ok", JsValue::FALSE);
-        }
-
-        if let Some(port) = port {
-            let _ = port.post_message(&resp);
-        }
-    });
-}
-
-fn handle_retrieve_range_message(obj: &js_sys::Object, event: &MessageEvent, weeb3: Arc<Weeb3>) {
-    let url = Reflect::get(obj, &JsValue::from_str("url")).unwrap_or(JsValue::NULL);
-    let reference = url.as_string().unwrap_or_default();
-    let start = Reflect::get(obj, &JsValue::from_str("start"))
-        .unwrap_or(JsValue::from_f64(0.0))
-        .as_f64()
-        .unwrap_or(0.0)
-        .max(0.0) as u64;
-    let end_inclusive = Reflect::get(obj, &JsValue::from_str("end"))
-        .unwrap_or(JsValue::from_f64(0.0))
-        .as_f64()
-        .unwrap_or(0.0)
-        .max(0.0) as u64;
-    let stream_key = js_string_property(obj, "stream_key").unwrap_or_default();
-    let stream_generation = Reflect::get(obj, &JsValue::from_str("stream_generation"))
-        .unwrap_or(JsValue::from_f64(0.0))
-        .as_f64()
-        .unwrap_or(0.0)
-        .max(0.0) as u64;
-    let resolved_metadata = metadata_from_range_message(obj);
-    let port = message_port(event);
-
-    spawn_local(async move {
-        let resp = js_sys::Object::new();
-
-        let range_result = if let Some(metadata) = resolved_metadata {
-            if !stream_key.is_empty() && stream_generation > 0 {
-                weeb3
-                    .acquire_resolved_stream_range(
-                        metadata,
-                        start,
-                        end_inclusive,
-                        stream_key,
-                        stream_generation,
-                    )
-                    .await
-            } else {
-                weeb3
-                    .acquire_resolved_range(metadata, start, end_inclusive)
-                    .await
-            }
-        } else {
-            weeb3.acquire_range(reference, start, end_inclusive).await
-        };
-
-        if let Some((bytes, metadata)) = range_result {
-            set_js(&resp, "ok", JsValue::TRUE);
-            set_js(&resp, "type", JsValue::from_str("RETRIEVE_RANGE_RESPONSE"));
-
-            let u8arr = js_sys::Uint8Array::new_with_length(bytes.len() as u32);
-            u8arr.copy_from(&bytes);
-            set_js(&resp, "body", u8arr.into());
-            set_js(&resp, "mime", JsValue::from_str(&metadata.mime));
-            set_js(&resp, "size", JsValue::from_f64(metadata.size as f64));
-            set_js(&resp, "etag", JsValue::from_str(&metadata.etag));
-            set_js(&resp, "path", JsValue::from_str(&metadata.path));
-        } else {
-            set_js(&resp, "ok", JsValue::FALSE);
-            set_js(
-                &resp,
-                "error",
-                JsValue::from_str(&format!(
-                    "failed to retrieve range {}-{}",
-                    start, end_inclusive
-                )),
-            );
-        }
-
-        if let Some(port) = port {
-            let _ = port.post_message(&resp);
-        }
-    });
-}
-
-fn handle_prepare_bzz_stream_message(
-    obj: &js_sys::Object,
-    event: &MessageEvent,
-    weeb3: Arc<Weeb3>,
-) {
-    let metadata = metadata_from_range_message(obj);
-    let port = message_port(event);
-
-    spawn_local(async move {
-        let resp = js_sys::Object::new();
-        let prepared = if let Some(metadata) = metadata {
-            weeb3.prepare_bzz_stream(metadata).await
-        } else {
-            false
-        };
-
-        set_js(&resp, "ok", JsValue::from_bool(prepared));
-        set_js(
-            &resp,
-            "type",
-            JsValue::from_str("PREPARE_BZZ_STREAM_RESPONSE"),
-        );
-
-        if let Some(port) = port {
-            let _ = port.post_message(&resp);
-        }
-    });
-}
-
-fn metadata_from_range_message(obj: &js_sys::Object) -> Option<BzzMetadata> {
-    let data_reference = js_string_property(obj, "data_reference")
-        .and_then(|reference| hex::decode(reference).ok())?;
-    if data_reference.len() != 32 && data_reference.len() != 64 {
-        return None;
-    }
-
-    let size = Reflect::get(obj, &JsValue::from_str("size"))
-        .ok()
-        .and_then(|size| size.as_f64())
-        .filter(|size| *size >= 0.0)? as u64;
-
-    Some(BzzMetadata {
-        data_reference,
-        mime: js_string_property(obj, "mime").unwrap_or_else(|| "application/octet-stream".into()),
-        size,
-        etag: js_string_property(obj, "etag").unwrap_or_default(),
-        path: js_string_property(obj, "path").unwrap_or_default(),
-        target_count: 1,
-    })
 }
 
 fn js_string_property(obj: &js_sys::Object, name: &str) -> Option<String> {

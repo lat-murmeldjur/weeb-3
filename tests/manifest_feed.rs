@@ -2,14 +2,17 @@
 
 #[path = "../src/feed.rs"]
 mod feed;
-#[path = "../src/manifest_conventions.rs"]
-mod manifest_conventions;
+#[path = "../src/manifest.rs"]
+mod manifest;
 
 mod bzz_manifest {
     #![allow(dead_code)]
-    use crate::manifest_conventions;
+    use crate::manifest;
 
-    use manifest_conventions::{encode_fork_with_separator_path, parse_bzz_manifest};
+    use manifest::{
+        encode_fork, encode_fork_with_separator_path, manifest_wrapped_reference,
+        ordered_indexed_forks, parse_bzz_manifest,
+    };
 
     const VERSION_02: [u8; 31] = [
         0x02, 0x51, 0x84, 0x78, 0x9d, 0x63, 0x63, 0x57, 0x66, 0xd7, 0x8c, 0x41, 0x90, 0x01, 0x96,
@@ -54,6 +57,30 @@ mod bzz_manifest {
             parsed.forks[0].metadata.as_ref().unwrap()["Filename"],
             "prefix"
         );
+    }
+
+    #[test]
+    fn wrapping_manifest_may_exceed_the_first_payload_chunk() {
+        let forks = (0_u8..=u8::MAX)
+            .map(|key| encode_fork(&[key], &[key; 32], &[], true).unwrap())
+            .collect();
+        let (forks, index) = ordered_indexed_forks(forks).unwrap();
+        let wrapped_reference = vec![9; 32];
+
+        let mut data = vec![0; 8 + 32];
+        data.extend_from_slice(&VERSION_02);
+        data.push(32);
+        data.extend_from_slice(&wrapped_reference);
+        data.extend_from_slice(&index);
+        for fork in forks {
+            data.extend_from_slice(&fork);
+        }
+        let span = (data.len() - 8) as u64;
+        data[..8].copy_from_slice(&span.to_le_bytes());
+
+        assert!(span > 4096);
+        let parsed = parse_bzz_manifest(data).unwrap();
+        assert_eq!(manifest_wrapped_reference(parsed), Some(wrapped_reference));
     }
 }
 
@@ -197,7 +224,7 @@ mod feed_frontier {
         seek_sequence_feed_frontier, seek_sequence_feed_frontier_bounded_from_observing_positive,
         seek_sequence_feed_frontier_bounded_observing_positive, seek_sequence_feed_frontier_from,
     };
-    use libp2p::futures::executor::block_on;
+    use futures::executor::block_on;
 
     struct OverlapProbe {
         index: u64,
@@ -475,10 +502,6 @@ mod feed_frontier {
 
     #[test]
     fn bounded_initial_wave_does_not_wait_for_index_three_or_zero_after_a_higher_success() {
-        // Index seven is authenticated and every wider exponential probe is
-        // definitively absent. Index three and the zero anchor never answer.
-        // The bounded finder must therefore resolve the proven frontier without
-        // waiting for either lower result listener.
         assert_lookup_ready(
             seek_sequence_feed_frontier_bounded_observing_positive(
                 |index| DeterministicProbe {
@@ -496,10 +519,6 @@ mod feed_frontier {
 
     #[test]
     fn resumed_bounded_wave_does_not_wait_for_index_three_or_any_lower_probe() {
-        // Resuming from the authenticated zero seed probes one through 255. Index
-        // seven succeeds, every wider level is absent, and both lower levels stay
-        // pending forever. They cannot change the proven interval and must not
-        // delay its result.
         assert_lookup_ready(
             seek_sequence_feed_frontier_bounded_from_observing_positive(
                 (0, 0),
@@ -691,5 +710,156 @@ mod feed_frontier {
             .expect("retrieve attempt should remain inspectable");
         assert!(attempt.contains("settle_retrieve_attempt("));
         assert!(attempt.contains("spawn_local(async move"));
+    }
+}
+mod manifest_format_contracts {
+    use crate::manifest::*;
+
+    #[test]
+    fn groups_and_splits_paths_as_raw_utf8_bytes() {
+        let first = "éclair".as_bytes();
+        let second = "être".as_bytes();
+        assert_eq!(common_prefix_bytes(&[first, second]), Some(vec![0xc3]));
+
+        let path = format!("{}é", "a".repeat(29));
+        let prefixes = split_prefix_bytes(path.as_bytes(), 30).unwrap();
+        assert_eq!(prefixes.iter().map(Vec::len).collect::<Vec<_>>(), [30, 1]);
+        assert_eq!(prefixes.concat(), path.as_bytes());
+    }
+
+    #[test]
+    fn prefix_path_is_encoded_as_a_value_bearing_edge() {
+        let paths = [b"foo".as_slice(), b"foobar".as_slice()];
+        let prefix = common_prefix_bytes(&paths).unwrap();
+        assert_eq!(prefix, b"foo");
+        assert_eq!(&paths[0][prefix.len()..], b"");
+        assert_eq!(&paths[1][prefix.len()..], b"bar");
+
+        let metadata = br#"{"Content-Type":"text/plain"}"#;
+        let fork = encode_fork(&prefix, &[7; 32], metadata, true).unwrap();
+        assert_eq!(fork[0], 2 | 4 | 16);
+
+        let directory_fork =
+            encode_fork_with_separator_path(&prefix, &[7; 32], metadata, true, b"foo/bar").unwrap();
+        assert_eq!(directory_fork[0], 2 | 4 | 8 | 16);
+    }
+
+    #[test]
+    fn metadata_padding_and_limit_match_bee() {
+        // Two size bytes plus 30 metadata bytes is exactly one block and must
+        // not receive the extra block emitted by the old implementation.
+        let metadata = vec![b'x'; 30];
+        let fork = encode_fork(b"a", &[1; 32], &metadata, false).unwrap();
+        assert_eq!(u16::from_be_bytes([fork[64], fork[65]]), 30);
+        assert_eq!(fork.len(), 32 + 32 + 2 + 30);
+
+        assert!(encode_fork(b"a", &[1; 32], &vec![b'x'; u16::MAX as usize], false).is_none());
+    }
+
+    fn test_fork(prefix: &[u8], marker: u8) -> Vec<u8> {
+        encode_fork(prefix, &[marker; 32], &[], true).unwrap()
+    }
+
+    #[test]
+    fn fork_bodies_and_index_share_bees_byte_order() {
+        let (forks, index) = ordered_indexed_forks(vec![
+            test_fork(b"a", 3),
+            test_fork(b"/", 2),
+            test_fork(b".hidden", 1),
+        ])
+        .unwrap();
+
+        assert_eq!(
+            forks
+                .iter()
+                .map(|fork| fork_prefix(fork)[0])
+                .collect::<Vec<_>>(),
+            [b'.', b'/', b'a']
+        );
+        for key in [b'.', b'/', b'a'] {
+            assert_ne!(index[(key / 8) as usize] & (1 << (key % 8)), 0);
+        }
+    }
+
+    #[test]
+    fn colliding_or_malformed_forks_are_rejected() {
+        assert!(
+            ordered_indexed_forks(vec![test_fork(b"/", 1), test_fork(b"/child", 2),]).is_none()
+        );
+        assert!(ordered_indexed_forks(vec![vec![0, 1]]).is_none());
+
+        let mut overlong = vec![0, (MANTARAY_PREFIX_MAX_BYTES + 1) as u8];
+        overlong.resize(2 + MANTARAY_PREFIX_MAX_BYTES + 1, b'x');
+        assert!(ordered_indexed_forks(vec![overlong]).is_none());
+    }
+}
+
+mod manifest_resolution_contracts {
+    use crate::manifest::*;
+
+    #[test]
+    fn cycles_are_path_local_but_budget_is_shared() {
+        let guard = ResolutionGuard::new();
+        let root = guard.descend_reference(&[1; 32]).unwrap();
+        let child = root.descend_reference(&[2; 32]).unwrap();
+        assert!(child.descend_reference(&[1; 32]).is_none());
+
+        // The same child is valid on a separate branch of a DAG.
+        assert!(root.descend_reference(&[2; 32]).is_some());
+    }
+
+    #[test]
+    fn feed_cycles_and_depth_are_bounded() {
+        let guard = ResolutionGuard::new();
+        let feed = guard.descend_feed("owner", "topic").unwrap();
+        assert!(feed.descend_feed("owner", "topic").is_none());
+
+        let mut depth = ResolutionGuard::new();
+        for value in 0..MAX_MANIFEST_DEPTH {
+            depth = depth
+                .descend_reference(&(value as u64).to_le_bytes())
+                .unwrap();
+        }
+        assert!(depth.descend_reference(b"over-depth").is_none());
+    }
+
+    #[test]
+    fn global_visit_and_target_budgets_are_hard_limits() {
+        let guard = ResolutionGuard::new();
+        for value in 0..MAX_MANIFEST_VISITS {
+            assert!(
+                guard
+                    .descend_reference(&(value as u64).to_le_bytes())
+                    .is_some()
+            );
+        }
+        assert!(guard.descend_reference(b"over-budget").is_none());
+
+        for _ in 0..MAX_MANIFEST_FORK_VISITS {
+            assert!(guard.reserve_fork());
+        }
+        assert!(!guard.reserve_fork());
+
+        for _ in 0..MAX_MANIFEST_TARGETS {
+            assert!(guard.reserve_target());
+        }
+        assert!(!guard.reserve_target());
+    }
+
+    #[test]
+    fn manifest_size_and_fork_index_follow_mantaray_bounds() {
+        assert!(manifest_payload_size_allowed(
+            MAX_MANIFEST_PAYLOAD_BYTES as u64
+        ));
+        assert!(!manifest_payload_size_allowed(
+            MAX_MANIFEST_PAYLOAD_BYTES as u64 + 1
+        ));
+
+        let mut index = [0u8; 32];
+        index[0] = 0b1000_0011;
+        index[31] = 0b1000_0000;
+        assert_eq!(manifest_fork_keys(&index, 32).unwrap(), [0, 1, 7, 255]);
+        assert_eq!(manifest_fork_keys(&index, 0).unwrap(), Vec::<u8>::new());
+        assert!(manifest_fork_keys(&index[..31], 32).is_none());
     }
 }

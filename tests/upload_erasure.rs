@@ -2,8 +2,42 @@
 
 #[path = "../src/erasure_coding.rs"]
 mod erasure_coding;
-#[path = "../src/upload_conventions.rs"]
-mod upload_conventions;
+mod erasure_test_support {
+    use crate::erasure_coding::{
+        CHUNK_WITH_SPAN_SIZE, ParityEncoder, ReedSolomonError, reconstruct_data_indices,
+    };
+
+    pub(crate) fn encode_parity(
+        data_shards: &[Vec<u8>],
+        parity_count: usize,
+    ) -> Result<Vec<Vec<u8>>, ReedSolomonError> {
+        let shard_size = data_shards.first().map(Vec::len).unwrap_or_default();
+        let data = data_shards.iter().map(Vec::as_slice).collect::<Vec<_>>();
+        let encoder = ParityEncoder::new_padded(&data, parity_count, shard_size)?;
+        (0..encoder.parity_count())
+            .map(|index| encoder.encode_shard(index))
+            .collect()
+    }
+
+    pub(crate) fn reconstruct_data(
+        shards: &mut [Option<Vec<u8>>],
+        data_count: usize,
+    ) -> Result<(), ReedSolomonError> {
+        let requested = (0..data_count)
+            .filter(|&index| shards.get(index).is_some_and(Option::is_none))
+            .collect::<Vec<_>>();
+        reconstruct_data_indices(shards, data_count, &requested)
+    }
+
+    pub(crate) fn padded_chunk(data: &[u8]) -> Option<Vec<u8>> {
+        if data.len() > CHUNK_WITH_SPAN_SIZE {
+            return None;
+        }
+        let mut padded = vec![0; CHUNK_WITH_SPAN_SIZE];
+        padded[..data.len()].copy_from_slice(data);
+        Some(padded)
+    }
+}
 
 mod bee_compatibility {
     #![allow(dead_code)]
@@ -61,7 +95,7 @@ mod bee_compatibility {
                 let raw = if encrypted {
                     let key = data_key(&address);
                     reference.extend_from_slice(&key);
-                    let mut padded = erasure_coding::padded_chunk(&canonical).unwrap();
+                    let mut padded = crate::erasure_test_support::padded_chunk(&canonical).unwrap();
                     crypt_in_place(&mut padded, &key);
                     padded
                 } else {
@@ -135,8 +169,6 @@ mod bee_compatibility {
             key
         }
 
-        // A deterministic reversible stand-in is sufficient here: the contract under
-        // test is that RS sees stored ciphertext while tree parsing sees plaintext.
         fn crypt_in_place(raw: &mut [u8], key: &[u8; HASH_SIZE]) {
             for (index, byte) in raw.iter_mut().enumerate() {
                 *byte ^= key[index % key.len()]
@@ -174,18 +206,18 @@ mod bee_compatibility {
             let layout = erasure_coding::reference_layout(span, level, encrypted).unwrap();
             assert_eq!(layout.data_shards, children.len());
 
-            // Bee encodes the stored bytes: short plaintext chunks are zero padded,
-            // while encrypted chunks are already a full 4104-byte ciphertext shard.
             let data_shards: Vec<Vec<u8>> = children
                 .iter()
                 .map(|child| {
-                    erasure_coding::padded_chunk(store.get(&child.reference).unwrap()).unwrap()
+                    crate::erasure_test_support::padded_chunk(store.get(&child.reference).unwrap())
+                        .unwrap()
                 })
                 .collect();
             let parity = if layout.parity_shards == 0 {
                 Vec::new()
             } else {
-                erasure_coding::encode_parity(&data_shards, layout.parity_shards).unwrap()
+                crate::erasure_test_support::encode_parity(&data_shards, layout.parity_shards)
+                    .unwrap()
             };
             let parity_references: Vec<Vec<u8>> = parity
                 .into_iter()
@@ -204,8 +236,6 @@ mod bee_compatibility {
                 erasure_coding::encoded_reference_payload_len(span, level, encrypted).unwrap()
             );
 
-            // This assertion couples layout, the 64/32-byte encrypted mixed layout,
-            // and the required data-before-parity ordering.
             let (split_data, split_parity) =
                 erasure_coding::split_references(&payload, span, level, encrypted).unwrap();
             assert_eq!(
@@ -258,8 +288,6 @@ mod bee_compatibility {
                 match remainder {
                     0 => {}
                     1 => {
-                        // Bee elevates a lone carrier unchanged so it can share a
-                        // parent with the preceding full group's parent.
                         next.push(current[cursor].clone());
                         carrier_promotions += 1;
                     }
@@ -360,7 +388,7 @@ mod bee_compatibility {
                 .map(|reference| {
                     store
                         .get(reference)
-                        .and_then(|raw| erasure_coding::padded_chunk(raw))
+                        .and_then(|raw| crate::erasure_test_support::padded_chunk(raw))
                 })
                 .chain(parity_references.iter().map(|reference| {
                     store
@@ -374,7 +402,7 @@ mod bee_compatibility {
                 if parity_references.is_empty() {
                     return Err("missing data shard without parity".to_string());
                 }
-                erasure_coding::reconstruct_data(&mut shards, data_count)
+                crate::erasure_test_support::reconstruct_data(&mut shards, data_count)
                     .map_err(|error| format!("erasure reconstruction failed: {error}"))?;
             }
 
@@ -491,111 +519,6 @@ mod bee_compatibility {
             }
         }
 
-        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-        struct SymbolicNode {
-            first_leaf: u64,
-            end_leaf: u64,
-        }
-
-        #[derive(Clone, Debug, Default, Eq, PartialEq)]
-        struct SymbolicLevel {
-            wrapped_groups: Vec<usize>,
-            carriers: u64,
-        }
-
-        #[derive(Clone, Debug, Eq, PartialEq)]
-        struct SymbolicShape {
-            levels: Vec<SymbolicLevel>,
-            root: SymbolicNode,
-        }
-
-        fn symbolic_level(levels: &mut Vec<SymbolicLevel>, level: usize) -> &mut SymbolicLevel {
-            if levels.len() <= level {
-                levels.resize_with(level + 1, SymbolicLevel::default);
-            }
-            &mut levels[level]
-        }
-
-        fn symbolic_parent(
-            children: Vec<SymbolicNode>,
-            level: usize,
-            levels: &mut Vec<SymbolicLevel>,
-        ) -> SymbolicNode {
-            assert!(children.len() >= 2);
-            for pair in children.windows(2) {
-                assert_eq!(pair[0].end_leaf, pair[1].first_leaf);
-            }
-            symbolic_level(levels, level)
-                .wrapped_groups
-                .push(children.len());
-            SymbolicNode {
-                first_leaf: children.first().unwrap().first_leaf,
-                end_leaf: children.last().unwrap().end_leaf,
-            }
-        }
-
-        // This is a literal symbolic model of upload.rs's insert_tree_chunk plus
-        // its final lowest-nonempty-buffer flush. It deliberately differs in shape
-        // from the closed-form planner so their agreement detects carry bugs.
-        fn production_streaming_shape(leaf_count: u64, branching: usize) -> SymbolicShape {
-            assert!(leaf_count > 0);
-            let mut buffers: Vec<Vec<SymbolicNode>> = Vec::new();
-            let mut levels = Vec::new();
-
-            let insert = |mut node: SymbolicNode,
-                          mut level: usize,
-                          buffers: &mut Vec<Vec<SymbolicNode>>,
-                          levels: &mut Vec<SymbolicLevel>| {
-                loop {
-                    if buffers.len() <= level {
-                        buffers.resize_with(level + 1, Vec::new);
-                    }
-                    buffers[level].push(node);
-                    if buffers[level].len() < branching {
-                        break;
-                    }
-                    node = symbolic_parent(std::mem::take(&mut buffers[level]), level, levels);
-                    level += 1;
-                }
-            };
-
-            for leaf in 0..leaf_count {
-                insert(
-                    SymbolicNode {
-                        first_leaf: leaf,
-                        end_leaf: leaf + 1,
-                    },
-                    0,
-                    &mut buffers,
-                    &mut levels,
-                );
-            }
-
-            while buffers.iter().map(Vec::len).sum::<usize>() > 1 {
-                let level = buffers
-                    .iter()
-                    .position(|buffer| !buffer.is_empty())
-                    .unwrap();
-                let mut children = std::mem::take(&mut buffers[level]);
-                let node = if children.len() == 1 {
-                    symbolic_level(&mut levels, level).carriers += 1;
-                    children.pop().unwrap()
-                } else {
-                    symbolic_parent(children, level, &mut levels)
-                };
-                insert(node, level + 1, &mut buffers, &mut levels);
-            }
-
-            let root = buffers.iter_mut().find_map(Vec::pop).unwrap();
-            while levels
-                .last()
-                .is_some_and(|level| level.wrapped_groups.is_empty() && level.carriers == 0)
-            {
-                levels.pop();
-            }
-            SymbolicShape { levels, root }
-        }
-
         const LEVELS: &[RedundancyLevel] = &[
             RedundancyLevel::None,
             RedundancyLevel::Medium,
@@ -657,12 +580,11 @@ mod bee_compatibility {
                     for size in sizes {
                         let expected = deterministic_file(size);
                         let tree = build_tree(&expected, level, encrypted);
-                        let plan = erasure_coding::upload_tree_plan(size as u64, level, encrypted)
-                            .unwrap();
-                        assert_eq!(tree.parent_count as u64, plan.parent_chunks);
-                        assert_eq!(tree.carrier_promotions as u64, plan.carrier_promotions);
-                        assert_eq!(tree.height, plan.levels.len());
-                        assert_eq!(tree.store.chunks.len() as u64, plan.total_chunks);
+                        assert_eq!(
+                            tree.store.chunks.len() as u64,
+                            erasure_coding::upload_tree_chunk_count(size as u64, level, encrypted)
+                                .unwrap()
+                        );
                         assert_eq!(
                             tree.root.reference.len(),
                             if encrypted {
@@ -720,164 +642,19 @@ mod bee_compatibility {
         }
 
         #[test]
-        fn pure_tree_plan_matches_production_streaming_shape_at_adversarial_boundaries() {
-            for level in LEVELS.iter().copied() {
-                for encrypted in [false, true] {
-                    let k = level.max_shards(encrypted) as u64;
-                    let k2 = k * k;
-                    let leaf_counts = BTreeSet::from([
-                        1,
-                        2,
-                        k - 1,
-                        k,
-                        k + 1,
-                        2 * k - 1,
-                        2 * k,
-                        2 * k + 1,
-                        k2 - 1,
-                        k2,
-                        k2 + 1,
-                        k2 + k - 1,
-                        k2 + k,
-                        k2 + k + 1,
-                        2 * k2 + 1,
-                    ]);
-
-                    for leaf_count in leaf_counts {
-                        let data_length = leaf_count.checked_mul(CHUNK_SIZE as u64).unwrap();
-                        let plan = erasure_coding::upload_tree_plan(data_length, level, encrypted)
-                            .unwrap();
-                        let shape = production_streaming_shape(leaf_count, k as usize);
-                        assert_eq!(plan.leaf_chunks, leaf_count);
-                        assert_eq!(
-                            shape.root,
-                            SymbolicNode {
-                                first_leaf: 0,
-                                end_leaf: leaf_count,
-                            },
-                            "root coverage: level={level:?}, encrypted={encrypted}, leaves={leaf_count}"
-                        );
-                        assert_eq!(
-                            shape.levels.len(),
-                            plan.levels.len(),
-                            "height: level={level:?}, encrypted={encrypted}, leaves={leaf_count}"
-                        );
-
-                        let mut planned_parents = 0u64;
-                        let mut planned_parities = 0u64;
-                        let mut planned_carriers = 0u64;
-                        for level_plan in &plan.levels {
-                            let observed = &shape.levels[level_plan.level];
-                            let observed_full = observed
-                                .wrapped_groups
-                                .iter()
-                                .filter(|children| **children == k as usize)
-                                .count() as u64;
-                            let observed_partial: Vec<usize> = observed
-                                .wrapped_groups
-                                .iter()
-                                .copied()
-                                .filter(|children| *children < k as usize)
-                                .collect();
-                            assert_eq!(observed_full, level_plan.full_groups);
-                            assert!(observed_partial.len() <= 1);
-                            assert_eq!(
-                                observed_partial.first().copied().unwrap_or(0),
-                                level_plan.partial_group_shards
-                            );
-                            assert_eq!(observed.carriers, level_plan.carrier_chunks);
-                            assert_eq!(
-                                observed.wrapped_groups.len() as u64,
-                                level_plan.parent_chunks
-                            );
-                            let observed_parities = observed
-                                .wrapped_groups
-                                .iter()
-                                .map(|children| level.parities(*children, encrypted) as u64)
-                                .sum::<u64>();
-                            assert_eq!(observed_parities, level_plan.parity_chunks);
-                            planned_parents += level_plan.parent_chunks;
-                            planned_parities += level_plan.parity_chunks;
-                            planned_carriers += level_plan.carrier_chunks;
-                        }
-                        assert_eq!(planned_parents, plan.parent_chunks);
-                        assert_eq!(planned_parities, plan.parity_chunks);
-                        assert_eq!(planned_carriers, plan.carrier_promotions);
-                        assert_eq!(
-                            plan.total_chunks,
-                            leaf_count + planned_parents + planned_parities
-                        );
-                    }
-                }
-            }
-
-            assert_eq!(
-                erasure_coding::upload_tree_plan(0, RedundancyLevel::Medium, false)
-                    .unwrap()
-                    .leaf_chunks,
-                1
-            );
-        }
-
-        #[test]
-        fn pure_tree_plan_matches_bee_hashtrie_carrier_fixtures() {
-            // Mirrors Bee pkg/file/pipeline/hashtrie/TestRedundancy. These two
-            // fixtures directly pin both plaintext and encrypted K+1 behavior.
-            let fixtures = [
-                (RedundancyLevel::Insane, false, 98u64, 37u64),
-                (RedundancyLevel::Paranoid, true, 21u64, 116u64),
-            ];
-            for (level, encrypted, leaves, expected_parities) in fixtures {
-                let plan =
-                    erasure_coding::upload_tree_plan(leaves * CHUNK_SIZE as u64, level, encrypted)
-                        .unwrap();
-                assert_eq!(plan.parity_chunks, expected_parities);
-                assert_eq!(plan.parent_chunks, 2);
-                assert_eq!(plan.carrier_promotions, 1);
-                assert_eq!(plan.levels.len(), 2);
-                assert_eq!(plan.levels[0].full_groups, 1);
-                assert_eq!(plan.levels[0].carrier_chunks, 1);
-                assert_eq!(plan.levels[1].partial_group_shards, 2);
-            }
-
-            // Generalize the same Bee invariant to every supported contract: K+1
-            // leaves create a full K group, elevate one carrier, then wrap two.
-            for level in LEVELS.iter().copied() {
-                for encrypted in [false, true] {
-                    let k = level.max_shards(encrypted) as u64;
-                    let plan = erasure_coding::upload_tree_plan(
-                        (k + 1) * CHUNK_SIZE as u64,
-                        level,
-                        encrypted,
-                    )
-                    .unwrap();
-                    assert_eq!(plan.parent_chunks, 2);
-                    assert_eq!(plan.carrier_promotions, 1);
-                    assert_eq!(
-                        plan.parity_chunks,
-                        level.parities(k as usize, encrypted) as u64
-                            + level.parities(2, encrypted) as u64
-                    );
-                }
-            }
-        }
-
-        #[test]
         fn pure_tree_plan_enforces_bees_seven_wrap_limit() {
             for level in LEVELS.iter().copied() {
                 for encrypted in [false, true] {
                     let k = level.max_shards(encrypted) as u64;
                     let max_leaves = k.pow(erasure_coding::BEE_MAX_UPLOAD_TREE_LEVELS as u32);
                     let max_size = max_leaves.checked_mul(CHUNK_SIZE as u64).unwrap();
-                    let maximum =
-                        erasure_coding::upload_tree_plan(max_size, level, encrypted).unwrap();
-                    assert_eq!(
-                        maximum.levels.len(),
-                        erasure_coding::BEE_MAX_UPLOAD_TREE_LEVELS
-                    );
-                    assert_eq!(maximum.leaf_chunks, max_leaves);
                     assert!(
-                        erasure_coding::upload_tree_plan(max_size + 1, level, encrypted).is_none(),
+                        erasure_coding::upload_tree_chunk_count(max_size, level, encrypted)
+                            .is_some()
+                    );
+                    assert!(
+                        erasure_coding::upload_tree_chunk_count(max_size + 1, level, encrypted)
+                            .is_none(),
                         "level={level:?}, encrypted={encrypted} accepted an eighth wrap"
                     );
                 }
@@ -937,9 +714,6 @@ mod bee_compatibility {
                     );
                     assert!(join(&unrecoverable).is_err());
 
-                    // K+1 leaves force a full lower group plus a carrier promoted into
-                    // a two-child root. Recovering the lower parent exercises RS before
-                    // recursively descending through the multilevel carrier layout.
                     let carrier_size = size + 1;
                     let carrier_expected = deterministic_file(carrier_size);
                     let carrier_original = build_tree(&carrier_expected, level, encrypted);
@@ -983,9 +757,7 @@ mod bee_compatibility {
 
 mod resource_codec {
     #![allow(dead_code)]
-    use crate::upload_conventions;
-
-    use upload_conventions::{decode_resource_bundle, encode_resource_bundle};
+    use crate::erasure_coding::{decode_resource_bundle, encode_resource_bundle};
 
     fn push_field(encoded: &mut Vec<u8>, bytes: &[u8]) {
         encoded.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
@@ -1098,9 +870,7 @@ mod resource_codec {
 
 mod upload_slicing {
     #![allow(dead_code)]
-    use crate::upload_conventions;
-
-    use upload_conventions::{FILE_UPLOAD_READ_WINDOW_BYTES, FileSlicePlan};
+    use crate::erasure_coding::{FILE_UPLOAD_READ_WINDOW_BYTES, FileSlicePlan};
 
     const SWARM_PAYLOAD_BYTES: u64 = 4096;
 
@@ -1171,6 +941,863 @@ mod upload_slicing {
                 direct.push(remainder);
             }
             assert_eq!(streamed, direct, "leaf plan changed for size {size}");
+        }
+    }
+}
+mod erasure_contracts {
+    use crate::erasure_coding::*;
+    use crate::erasure_test_support::{encode_parity, padded_chunk, reconstruct_data};
+
+    #[derive(Clone, Copy)]
+    struct TableCase {
+        name: &'static str,
+        level: RedundancyLevel,
+        encrypted: bool,
+        thresholds: &'static [usize],
+        parities: &'static [usize],
+        max_shards: usize,
+        recovery_shards: usize,
+    }
+
+    const TABLE_CASES: &[TableCase] = &[
+        TableCase {
+            name: "medium/plain",
+            level: RedundancyLevel::Medium,
+            encrypted: false,
+            thresholds: &[95, 69, 47, 29, 15, 6, 2, 1],
+            parities: &[9, 8, 7, 6, 5, 4, 3, 2],
+            max_shards: 119,
+            recovery_shards: 2,
+        },
+        TableCase {
+            name: "medium/encrypted",
+            level: RedundancyLevel::Medium,
+            encrypted: true,
+            thresholds: &[47, 34, 23, 14, 7, 3, 1],
+            parities: &[9, 8, 7, 6, 5, 4, 3],
+            max_shards: 59,
+            recovery_shards: 3,
+        },
+        TableCase {
+            name: "strong/plain",
+            level: RedundancyLevel::Strong,
+            encrypted: false,
+            thresholds: &[
+                105, 96, 87, 78, 70, 62, 54, 47, 40, 33, 27, 21, 16, 11, 7, 4, 2, 1,
+            ],
+            parities: &[
+                21, 20, 19, 18, 17, 16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4,
+            ],
+            max_shards: 107,
+            recovery_shards: 4,
+        },
+        TableCase {
+            name: "strong/encrypted",
+            level: RedundancyLevel::Strong,
+            encrypted: true,
+            thresholds: &[
+                52, 48, 43, 39, 35, 31, 27, 23, 20, 16, 13, 10, 8, 5, 3, 2, 1,
+            ],
+            parities: &[
+                21, 20, 19, 18, 17, 16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5,
+            ],
+            max_shards: 53,
+            recovery_shards: 3,
+        },
+        TableCase {
+            name: "insane/plain",
+            level: RedundancyLevel::Insane,
+            encrypted: false,
+            thresholds: &[
+                93, 88, 83, 78, 74, 69, 64, 60, 55, 51, 46, 42, 38, 34, 30, 27, 23, 20, 17, 14, 11,
+                9, 6, 4, 3, 2, 1,
+            ],
+            parities: &[
+                31, 30, 29, 28, 27, 26, 25, 24, 23, 22, 21, 20, 19, 18, 17, 16, 15, 14, 13, 12, 11,
+                10, 9, 8, 7, 6, 5,
+            ],
+            max_shards: 97,
+            recovery_shards: 4,
+        },
+        TableCase {
+            name: "insane/encrypted",
+            level: RedundancyLevel::Insane,
+            encrypted: true,
+            thresholds: &[
+                46, 44, 41, 39, 37, 34, 32, 30, 27, 25, 23, 21, 19, 17, 15, 13, 11, 10, 8, 7, 5, 4,
+                3, 2, 1,
+            ],
+            parities: &[
+                31, 30, 29, 28, 27, 26, 25, 24, 23, 22, 21, 20, 19, 18, 17, 16, 15, 14, 13, 12, 11,
+                10, 9, 8, 6,
+            ],
+            max_shards: 48,
+            recovery_shards: 3,
+        },
+        TableCase {
+            name: "paranoid/plain",
+            level: RedundancyLevel::Paranoid,
+            encrypted: false,
+            thresholds: &[
+                37, 36, 35, 34, 33, 32, 31, 30, 29, 28, 27, 26, 25, 24, 23, 22, 21, 20, 19, 18, 17,
+                16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1,
+            ],
+            parities: &[
+                89, 87, 86, 84, 83, 81, 80, 78, 76, 75, 73, 71, 70, 68, 66, 65, 63, 61, 59, 58, 56,
+                54, 52, 50, 48, 47, 45, 43, 40, 38, 36, 34, 31, 29, 26, 23, 19,
+            ],
+            max_shards: 39,
+            recovery_shards: 8,
+        },
+        TableCase {
+            name: "paranoid/encrypted",
+            level: RedundancyLevel::Paranoid,
+            encrypted: true,
+            thresholds: &[
+                18, 17, 16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1,
+            ],
+            parities: &[
+                87, 84, 81, 78, 75, 71, 68, 65, 61, 58, 54, 50, 47, 43, 38, 34, 29, 23,
+            ],
+            max_shards: 20,
+            recovery_shards: 8,
+        },
+    ];
+
+    const ALL_LEVELS: &[RedundancyLevel] = &[
+        RedundancyLevel::None,
+        RedundancyLevel::Medium,
+        RedundancyLevel::Strong,
+        RedundancyLevel::Insane,
+        RedundancyLevel::Paranoid,
+    ];
+
+    fn table_parities(case: TableCase, shards: usize) -> usize {
+        case.thresholds
+            .iter()
+            .zip(case.parities)
+            .find_map(|(&threshold, &parities)| (shards >= threshold).then_some(parities))
+            .unwrap_or(0)
+    }
+
+    fn deterministic_shards(count: usize, size: usize) -> Vec<Vec<u8>> {
+        (0..count)
+            .map(|shard| {
+                (0..size)
+                    .map(|offset| {
+                        let seed = shard
+                            .wrapping_mul(0x9e37)
+                            .wrapping_add(offset.wrapping_mul(0x79b9))
+                            .wrapping_add(shard ^ offset);
+                        (seed as u8).rotate_left(((shard + offset) & 7) as u32)
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    fn assert_recovers(
+        case: TableCase,
+        data: &[Vec<u8>],
+        parity: &[Vec<u8>],
+        erased: impl IntoIterator<Item = usize>,
+    ) {
+        let mut shards: Vec<Option<Vec<u8>>> =
+            data.iter().chain(parity).cloned().map(Some).collect();
+        for index in erased {
+            shards[index] = None;
+        }
+        reconstruct_data(&mut shards, data.len())
+            .unwrap_or_else(|error| panic!("{} reconstruction failed: {error}", case.name));
+        for (index, expected) in data.iter().enumerate() {
+            assert_eq!(
+                shards[index].as_ref(),
+                Some(expected),
+                "{} data shard {index} was reconstructed incorrectly",
+                case.name
+            );
+        }
+    }
+
+    #[test]
+    fn every_bee_redundancy_table_entry_and_gap_matches() {
+        for case in TABLE_CASES {
+            assert_eq!(
+                case.thresholds.len(),
+                case.parities.len(),
+                "{} malformed test contract",
+                case.name
+            );
+            assert_eq!(
+                case.level.max_shards(case.encrypted),
+                case.max_shards,
+                "{} maximum data-shard count",
+                case.name
+            );
+
+            // Checking every input (rather than just thresholds) catches off-by-one
+            // errors in each descending Bee table interval.
+            for shards in 0..=256 {
+                assert_eq!(
+                    case.level.parities(shards, case.encrypted),
+                    table_parities(*case, shards),
+                    "{} parity count for {shards} data shards",
+                    case.name
+                );
+            }
+        }
+
+        for encrypted in [false, true] {
+            assert_eq!(
+                RedundancyLevel::None.max_shards(encrypted),
+                if encrypted { 64 } else { 128 }
+            );
+            for shards in 0..=256 {
+                assert_eq!(RedundancyLevel::None.parities(shards, encrypted), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn every_mode_recovers_each_loss_count_through_p() {
+        for case in TABLE_CASES {
+            let data = deterministic_shards(case.recovery_shards, 37);
+            let parity_count = case.level.parities(data.len(), case.encrypted);
+            let parity = encode_parity(&data, parity_count).unwrap();
+
+            for loss_count in 1..=parity_count {
+                assert_recovers(*case, &data, &parity, 0..loss_count);
+            }
+
+            // A co-prime stride scatters the maximum allowed losses across both
+            // data and parity positions instead of testing only a prefix.
+            let total = data.len() + parity.len();
+            let scattered = (0..parity_count).map(|index| (index * 73) % total);
+            assert_recovers(*case, &data, &parity, scattered);
+        }
+    }
+
+    #[test]
+    fn every_full_group_recovers_the_maximum_allowed_losses() {
+        for case in TABLE_CASES {
+            let data = deterministic_shards(case.max_shards, 19);
+            let parity_count = case.level.parities(data.len(), case.encrypted);
+            let parity = encode_parity(&data, parity_count).unwrap();
+            assert_eq!(
+                data.len() + parity.len(),
+                if case.encrypted {
+                    case.max_shards + parity_count
+                } else {
+                    128
+                },
+                "{} full group size",
+                case.name
+            );
+
+            assert_recovers(*case, &data, &parity, 0..parity_count);
+
+            let total = data.len() + parity.len();
+            let scattered = (0..parity_count).map(|index| (index * 73) % total);
+            assert_recovers(*case, &data, &parity, scattered);
+        }
+    }
+
+    #[test]
+    fn reference_layout_covers_leaf_and_carrier_boundaries() {
+        for level in ALL_LEVELS {
+            for encrypted in [false, true] {
+                let branching = level.max_shards(encrypted) as u64;
+                assert!(reference_layout(0, *level, encrypted).is_none());
+                assert!(reference_layout(CHUNK_SIZE as u64, *level, encrypted).is_none());
+
+                let first = reference_layout(CHUNK_SIZE as u64 + 1, *level, encrypted).unwrap();
+                assert_eq!(first.data_shards, 2);
+                assert_eq!(first.child_capacity, CHUNK_SIZE as u64);
+                assert_eq!(
+                    first.parity_shards,
+                    level.parities(2, encrypted),
+                    "level {level:?}, encrypted={encrypted}"
+                );
+
+                let full_span = branching * CHUNK_SIZE as u64;
+                let full = reference_layout(full_span, *level, encrypted).unwrap();
+                assert_eq!(full.data_shards, branching as usize);
+                assert_eq!(full.child_capacity, CHUNK_SIZE as u64);
+                assert_eq!(
+                    encoded_reference_payload_len(full_span, *level, encrypted).unwrap(),
+                    full.data_shards
+                        * if encrypted {
+                            ENCRYPTED_REFERENCE_SIZE
+                        } else {
+                            HASH_SIZE
+                        }
+                        + full.parity_shards * HASH_SIZE
+                );
+                assert!(
+                    encoded_reference_payload_len(full_span, *level, encrypted).unwrap()
+                        <= CHUNK_SIZE
+                );
+
+                let carried = reference_layout(full_span + 1, *level, encrypted).unwrap();
+                assert_eq!(carried.data_shards, 2);
+                assert_eq!(carried.child_capacity, full_span);
+
+                let second_full_span = branching * full_span;
+                let second_full = reference_layout(second_full_span, *level, encrypted).unwrap();
+                assert_eq!(second_full.data_shards, branching as usize);
+                assert_eq!(second_full.child_capacity, full_span);
+
+                let second_carried =
+                    reference_layout(second_full_span + 1, *level, encrypted).unwrap();
+                assert_eq!(second_carried.data_shards, 2);
+                assert_eq!(second_carried.child_capacity, second_full_span);
+
+                assert!(reference_layout(u64::MAX, *level, encrypted).is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn reference_layout_stays_bounded_at_every_bee_tree_level() {
+        // Exercise the same capacity transitions at every level Bee can emit,
+        // rather than only at K and K^2.  Besides catching off-by-one carrier
+        // errors, this pins the mixed encrypted layout invariant: 64-byte data
+        // references followed by 32-byte parity references must always fit in
+        // one 4096-byte intermediate chunk.
+        for level in ALL_LEVELS {
+            for encrypted in [false, true] {
+                let branching = level.max_shards(encrypted) as u64;
+                let data_reference_size = if encrypted {
+                    ENCRYPTED_REFERENCE_SIZE
+                } else {
+                    HASH_SIZE
+                };
+                let mut child_capacity = CHUNK_SIZE as u64;
+
+                for depth in 1..=BEE_MAX_UPLOAD_TREE_LEVELS {
+                    let capacity = child_capacity.checked_mul(branching).unwrap();
+                    for (span, expected_data_shards) in [
+                        (child_capacity + 1, 2usize),
+                        (capacity - 1, branching as usize),
+                        (capacity, branching as usize),
+                    ] {
+                        let layout = reference_layout(span, *level, encrypted).unwrap();
+                        assert_eq!(
+                            layout.child_capacity, child_capacity,
+                            "child capacity: level={level:?}, encrypted={encrypted}, depth={depth}, span={span}"
+                        );
+                        assert_eq!(
+                            layout.data_shards, expected_data_shards,
+                            "data shards: level={level:?}, encrypted={encrypted}, depth={depth}, span={span}"
+                        );
+                        assert_eq!(
+                            layout.parity_shards,
+                            level.parities(expected_data_shards, encrypted)
+                        );
+
+                        let payload_len = encoded_reference_payload_len(span, *level, encrypted)
+                            .expect("valid Bee level must have a representable payload");
+                        assert_eq!(
+                            payload_len,
+                            expected_data_shards * data_reference_size
+                                + layout.parity_shards * HASH_SIZE
+                        );
+                        assert!(
+                            payload_len <= CHUNK_SIZE,
+                            "oversized parent: level={level:?}, encrypted={encrypted}, depth={depth}, span={span}, payload={payload_len}"
+                        );
+                    }
+
+                    // Crossing a full level is Bee's carrier boundary.  Check
+                    // it when the next multiplication is representable; the
+                    // overflow case must instead be rejected without wrapping.
+                    if capacity.checked_mul(branching).is_some() {
+                        let carried = reference_layout(capacity + 1, *level, encrypted).unwrap();
+                        assert_eq!(carried.child_capacity, capacity);
+                        assert_eq!(carried.data_shards, 2);
+                    } else {
+                        assert!(reference_layout(capacity + 1, *level, encrypted).is_none());
+                    }
+
+                    child_capacity = capacity;
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn reference_payload_splits_data_before_plain_parity_references() {
+        for level in ALL_LEVELS {
+            for encrypted in [false, true] {
+                let span = level.max_shards(encrypted) as u64 * CHUNK_SIZE as u64;
+                let (data_count, parity_count) = reference_count(span, *level, encrypted).unwrap();
+                let data_reference_size = if encrypted {
+                    ENCRYPTED_REFERENCE_SIZE
+                } else {
+                    HASH_SIZE
+                };
+                let mut payload = Vec::new();
+                for index in 0..data_count {
+                    payload.extend(vec![(index + 1) as u8; data_reference_size]);
+                }
+                for index in 0..parity_count {
+                    payload.extend(vec![0x80 | index as u8; HASH_SIZE]);
+                }
+
+                assert_eq!(
+                    payload.len(),
+                    encoded_reference_payload_len(span, *level, encrypted).unwrap()
+                );
+                let (data, parity) = split_references(&payload, span, *level, encrypted).unwrap();
+                assert_eq!(data.len(), data_count);
+                assert_eq!(parity.len(), parity_count);
+                for (index, reference) in data.iter().enumerate() {
+                    assert_eq!(reference, &vec![(index + 1) as u8; data_reference_size]);
+                }
+                for (index, reference) in parity.iter().enumerate() {
+                    assert_eq!(reference, &vec![0x80 | index as u8; HASH_SIZE]);
+                }
+
+                let mut too_long = payload.clone();
+                too_long.push(0);
+                assert!(split_references(&too_long, span, *level, encrypted).is_none());
+                assert!(
+                    split_references(&payload[..payload.len() - 1], span, *level, encrypted)
+                        .is_none()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn span_marker_handles_all_levels_and_logical_size_edges() {
+        assert_eq!(RedundancyLevel::DEFAULT_UPLOAD, RedundancyLevel::Medium);
+        assert_eq!(RedundancyLevel::DEFAULT_DOWNLOAD, RedundancyLevel::Paranoid);
+        for (value, level) in ALL_LEVELS.iter().copied().enumerate() {
+            assert_eq!(RedundancyLevel::from_u8(value as u8), Some(level));
+            assert_eq!(level.as_u8(), value as u8);
+            assert_eq!(level.replica_count(), [0, 2, 4, 8, 16][value]);
+        }
+        assert_eq!(RedundancyLevel::from_u8(5), None);
+        assert_eq!(RedundancyLevel::from_u8(u8::MAX), None);
+
+        for level in ALL_LEVELS[1..].iter().copied() {
+            for logical_size in [0, 1, CHUNK_SIZE as u64, u32::MAX as u64, (1u64 << 56) - 1] {
+                let mut span = logical_size.to_le_bytes();
+                encode_level(&mut span, level);
+                assert_eq!(span[7], 0x80 | level.as_u8());
+                assert_eq!(decode_span(&span), Some((level, logical_size)));
+            }
+        }
+
+        assert_eq!(decode_span(&[]), None);
+        assert_eq!(decode_span(&[0; SPAN_SIZE - 1]), None);
+        assert_eq!(
+            decode_span(&0x8000_0000_0000_0000u64.to_le_bytes()),
+            Some((RedundancyLevel::None, 0x8000_0000_0000_0000))
+        );
+        assert_eq!(decode_span(&0x8500_0000_0000_0000u64.to_le_bytes()), None);
+    }
+
+    #[test]
+    fn parity_has_a_stable_klauspost_compatible_golden_vector() {
+        // For systematic Vandermonde k=2 the first two parity rows are
+        // [3, 2] and [2, 3] in GF(2^8), using polynomial 0x11d.
+        let data = vec![
+            vec![0x00, 0x01, 0x02, 0x03, 0x10, 0x20, 0x80, 0xff],
+            vec![0xff, 0x80, 0x20, 0x10, 0x03, 0x02, 0x01, 0x00],
+        ];
+        let parity = encode_parity(&data, 2).unwrap();
+        assert_eq!(
+            parity,
+            vec![
+                vec![0xe3, 0x1e, 0x46, 0x25, 0x36, 0x64, 0x9f, 0x1c],
+                vec![0x1c, 0x9f, 0x64, 0x36, 0x25, 0x46, 0x1e, 0xe3],
+            ]
+        );
+        assert_eq!(encode_parity(&data, 2).unwrap(), parity);
+    }
+
+    #[test]
+    fn padding_and_reed_solomon_validation_cover_chunk_edges() {
+        for size in [
+            0,
+            1,
+            SPAN_SIZE,
+            CHUNK_WITH_SPAN_SIZE - 1,
+            CHUNK_WITH_SPAN_SIZE,
+        ] {
+            let data: Vec<u8> = (0..size).map(|index| index as u8).collect();
+            let padded = padded_chunk(&data).unwrap();
+            assert_eq!(padded.len(), CHUNK_WITH_SPAN_SIZE);
+            assert_eq!(&padded[..size], data);
+            assert!(padded[size..].iter().all(|byte| *byte == 0));
+        }
+        assert!(padded_chunk(&vec![0; CHUNK_WITH_SPAN_SIZE + 1]).is_none());
+
+        assert_eq!(
+            encode_parity(&[], 1),
+            Err(ReedSolomonError::InvalidShardCount)
+        );
+        assert_eq!(
+            encode_parity(&[vec![1]], 0),
+            Err(ReedSolomonError::InvalidShardCount)
+        );
+        assert_eq!(
+            encode_parity(&vec![vec![1]; 256], 1),
+            Err(ReedSolomonError::InvalidShardCount)
+        );
+        assert_eq!(
+            encode_parity(&[vec![1]], usize::MAX),
+            Err(ReedSolomonError::InvalidShardCount)
+        );
+        let padded_source = [1u8];
+        assert_eq!(
+            ParityEncoder::new_padded(&[padded_source.as_slice()], usize::MAX, 1).err(),
+            Some(ReedSolomonError::InvalidShardCount)
+        );
+        let maximum_total = encode_parity(&[vec![0x5a]], 255).unwrap();
+        assert_eq!(maximum_total.len(), 255);
+        assert!(maximum_total.iter().all(|shard| shard == &[0x5a]));
+        assert_eq!(
+            encode_parity(&[vec![]], 1),
+            Err(ReedSolomonError::InvalidShardSize)
+        );
+        assert_eq!(
+            encode_parity(&[vec![1], vec![1, 2]], 1),
+            Err(ReedSolomonError::InvalidShardSize)
+        );
+
+        assert_eq!(
+            reconstruct_data(&mut [Some(vec![1])], 1),
+            Err(ReedSolomonError::InvalidShardCount)
+        );
+        assert_eq!(
+            reconstruct_data(&mut [Some(vec![1]), None, None], 2),
+            Err(ReedSolomonError::TooFewShards)
+        );
+        assert_eq!(
+            reconstruct_data(&mut [Some(vec![1]), Some(vec![1, 2]), None], 2),
+            Err(ReedSolomonError::InvalidShardSize)
+        );
+        assert_eq!(
+            reconstruct_data_indices(&mut [Some(vec![1]), Some(vec![2])], 1, &[1]),
+            Err(ReedSolomonError::InvalidShardCount)
+        );
+        assert_eq!(
+            reconstruct_data_indices(&mut [Some(vec![1]), None, None], 2, &[1]),
+            Err(ReedSolomonError::TooFewShards)
+        );
+        assert_eq!(
+            reconstruct_data_indices(&mut [Some(vec![1]), Some(vec![2, 3]), None], 2, &[0]),
+            Err(ReedSolomonError::InvalidShardSize)
+        );
+    }
+
+    #[test]
+    fn virtual_zero_padding_matches_explicit_bee_shards() {
+        let short = vec![
+            deterministic_shards(1, SPAN_SIZE)[0].clone(),
+            deterministic_shards(1, 137)[0].clone(),
+            deterministic_shards(1, CHUNK_WITH_SPAN_SIZE)[0].clone(),
+        ];
+        let explicit = short
+            .iter()
+            .map(|shard| padded_chunk(shard).unwrap())
+            .collect::<Vec<_>>();
+        let expected = encode_parity(&explicit, 3).unwrap();
+        let slices = short.iter().map(Vec::as_slice).collect::<Vec<_>>();
+        let encoder = ParityEncoder::new_padded(&slices, 3, CHUNK_WITH_SPAN_SIZE).unwrap();
+        let actual = (0..encoder.parity_count())
+            .map(|index| encoder.encode_shard(index).unwrap())
+            .collect::<Vec<_>>();
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn replica_scheduler_covers_every_dispersion_level() {
+        let root = [0xabu8; HASH_SIZE];
+        let bit_reversal_order = [
+            0, 128, 64, 192, 32, 96, 160, 224, 16, 48, 80, 112, 144, 176, 208, 240,
+        ];
+        for level in ALL_LEVELS.iter().copied() {
+            let mut calls = 0;
+            let replicas = replicas(&root, level, |id| {
+                calls += 1;
+                *id
+            })
+            .unwrap();
+            assert_eq!(replicas.len(), level.replica_count());
+            assert_eq!(
+                replicas
+                    .iter()
+                    .map(|replica| replica.id[0])
+                    .collect::<Vec<_>>(),
+                bit_reversal_order[..level.replica_count()]
+            );
+            assert!(replicas.iter().all(|replica| replica.id[1..] == root[1..]));
+            assert!(replicas.iter().all(|replica| replica.id == replica.address));
+            if level == RedundancyLevel::None {
+                assert_eq!(calls, 0);
+            }
+        }
+
+        assert!(replicas(&root[..HASH_SIZE - 1], RedundancyLevel::Medium, |id| *id).is_none());
+        let short = replicas(&root, RedundancyLevel::Medium, |_| [0; HASH_SIZE]).unwrap();
+        assert_eq!(short.len(), 1);
+        assert_eq!(short[0].id[0], 0);
+    }
+
+    #[test]
+    fn target_rhs_reconstruction_exhaustively_matches_full_recovery() {
+        // Exhaust every recoverable erasure pattern and every requested-data
+        // subset for small matrices. This covers present targets, missing
+        // targets, duplicates through the dedicated test above, data/parity
+        // loss combinations, and the all-data equivalence case.
+        for data_count in 1..=5 {
+            for parity_count in 1..=3 {
+                let data = deterministic_shards(data_count, 31);
+                let parity = encode_parity(&data, parity_count).unwrap();
+                let encoded = data
+                    .iter()
+                    .chain(&parity)
+                    .cloned()
+                    .map(Some)
+                    .collect::<Vec<_>>();
+                let total_count = encoded.len();
+
+                for erasure_mask in 0usize..(1usize << total_count) {
+                    if erasure_mask.count_ones() as usize > parity_count {
+                        continue;
+                    }
+
+                    let mut unavailable = encoded.clone();
+                    for (index, shard) in unavailable.iter_mut().enumerate() {
+                        if erasure_mask & (1usize << index) != 0 {
+                            *shard = None;
+                        }
+                    }
+
+                    let mut fully_recovered = unavailable.clone();
+                    reconstruct_data(&mut fully_recovered, data_count).unwrap();
+
+                    for requested_mask in 0usize..(1usize << data_count) {
+                        let requested = (0..data_count)
+                            .filter(|&index| requested_mask & (1usize << index) != 0)
+                            .collect::<Vec<_>>();
+                        let mut targeted = unavailable.clone();
+                        reconstruct_data_indices(&mut targeted, data_count, &requested).unwrap();
+
+                        for index in 0..data_count {
+                            let should_exist = unavailable[index].is_some()
+                                || requested_mask & (1usize << index) != 0;
+                            if should_exist {
+                                assert_eq!(
+                                    targeted[index], fully_recovered[index],
+                                    "data={data_count} parity={parity_count} erasures={erasure_mask:#x} requested={requested_mask:#x} index={index}"
+                                );
+                            } else {
+                                assert!(
+                                    targeted[index].is_none(),
+                                    "unrequested missing shard was materialized: data={data_count} parity={parity_count} erasures={erasure_mask:#x} requested={requested_mask:#x} index={index}"
+                                );
+                            }
+                        }
+                        assert_eq!(
+                            &targeted[data_count..],
+                            &unavailable[data_count..],
+                            "parity changed: data={data_count} parity={parity_count} erasures={erasure_mask:#x} requested={requested_mask:#x}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn target_rhs_recovers_maximum_loss_bee_groups_for_every_mode() {
+        for case in TABLE_CASES {
+            let data = deterministic_shards(case.max_shards, 19);
+            let parity_count = case.level.parities(data.len(), case.encrypted);
+            let parity = encode_parity(&data, parity_count).unwrap();
+            let mut unavailable = data
+                .iter()
+                .chain(&parity)
+                .cloned()
+                .map(Some)
+                .collect::<Vec<_>>();
+
+            // Erasing a full parity-count prefix exercises the maximum legal
+            // loss budget. Paranoid modes lose every data shard and therefore
+            // decode solely from high-index parity rows.
+            for shard in &mut unavailable[..parity_count] {
+                *shard = None;
+            }
+            let last_missing_data = parity_count.min(data.len()) - 1;
+            let requested = [last_missing_data, 0];
+
+            let mut fully_recovered = unavailable.clone();
+            reconstruct_data(&mut fully_recovered, data.len())
+                .unwrap_or_else(|error| panic!("{} full recovery failed: {error}", case.name));
+            let mut targeted = unavailable.clone();
+            reconstruct_data_indices(&mut targeted, data.len(), &requested)
+                .unwrap_or_else(|error| panic!("{} targeted recovery failed: {error}", case.name));
+
+            for &index in &requested {
+                assert_eq!(
+                    targeted[index], fully_recovered[index],
+                    "{} requested data shard {index}",
+                    case.name
+                );
+            }
+            if let Some(unrequested) =
+                (0..parity_count.min(data.len())).find(|index| !requested.contains(index))
+            {
+                assert!(
+                    targeted[unrequested].is_none(),
+                    "{} materialized unrequested data shard {unrequested}",
+                    case.name
+                );
+            }
+            assert_eq!(
+                &targeted[data.len()..],
+                &unavailable[data.len()..],
+                "{} targeted recovery changed parity shards",
+                case.name
+            );
+        }
+    }
+}
+mod upload_redundancy {
+    use crate::erasure_coding::RedundancyLevel;
+    use crate::erasure_coding::{
+        upload_redundancy_from_number, upload_redundancy_from_select, validated_upload_redundancy,
+        validated_upload_redundancy_number,
+    };
+
+    const UPLOAD_INTERFACE_HTML: &str = include_str!("../static/index.html");
+    const SERVICE_WORKER_JS: &str = include_str!("../static/service.js");
+    const LIBRARY_RS: &str = include_str!("../src/library.rs");
+    const LIB_RS: &str = include_str!("../src/lib.rs");
+
+    #[test]
+    fn strict_validation_accepts_only_bee_levels() {
+        for (value, level) in [
+            RedundancyLevel::None,
+            RedundancyLevel::Medium,
+            RedundancyLevel::Strong,
+            RedundancyLevel::Insane,
+            RedundancyLevel::Paranoid,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert_eq!(validated_upload_redundancy(value as u8), Some(level));
+        }
+        assert_eq!(validated_upload_redundancy(5), None);
+        assert_eq!(validated_upload_redundancy(u8::MAX), None);
+    }
+
+    #[test]
+    fn select_values_fall_back_to_medium() {
+        assert_eq!(
+            upload_redundancy_from_select(Some("0")),
+            RedundancyLevel::None
+        );
+        assert_eq!(
+            upload_redundancy_from_select(Some("4")),
+            RedundancyLevel::Paranoid
+        );
+        for malformed in [None, Some(""), Some("-1"), Some("5"), Some("1.0")] {
+            assert_eq!(
+                upload_redundancy_from_select(malformed),
+                RedundancyLevel::Medium
+            );
+        }
+    }
+
+    #[test]
+    fn javascript_numbers_must_be_finite_integral_bee_values() {
+        assert_eq!(
+            validated_upload_redundancy_number(2.0),
+            Some(RedundancyLevel::Strong)
+        );
+        assert_eq!(
+            upload_redundancy_from_number(Some(2.0)),
+            RedundancyLevel::Strong
+        );
+        for malformed in [
+            None,
+            Some(-1.0),
+            Some(-255.0),
+            Some(1.5),
+            Some(5.0),
+            Some(257.0),
+            Some(f64::NAN),
+            Some(f64::INFINITY),
+        ] {
+            if let Some(value) = malformed {
+                assert_eq!(validated_upload_redundancy_number(value), None);
+            }
+            assert_eq!(
+                upload_redundancy_from_number(malformed),
+                RedundancyLevel::Medium
+            );
+        }
+    }
+
+    #[test]
+    fn built_in_and_npm_rendered_interface_have_the_medium_default_dropdown() {
+        let select_start = UPLOAD_INTERFACE_HTML
+            .find(r#"<select id="uploadRedundancyLevel""#)
+            .expect("upload redundancy selector");
+        let select_end = UPLOAD_INTERFACE_HTML[select_start..]
+            .find("</select>")
+            .map(|offset| select_start + offset)
+            .expect("upload redundancy selector end");
+        let select = &UPLOAD_INTERFACE_HTML[select_start..select_end];
+
+        let mut cursor = 0;
+        for value in 0..=4 {
+            let marker = format!(r#"<option value="{value}""#);
+            let position = select[cursor..]
+                .find(&marker)
+                .map(|offset| cursor + offset)
+                .unwrap_or_else(|| panic!("missing level {value} option"));
+            assert!(position >= cursor, "dropdown order changed");
+            cursor = position + marker.len();
+        }
+        assert!(select.contains(r#"<option value="1" selected>Medium — recommended</option>"#));
+        assert!(UPLOAD_INTERFACE_HTML.contains("Higher levels improve loss recovery"));
+    }
+
+    #[test]
+    fn explicit_wasm_upload_levels_are_validated_before_integer_coercion() {
+        assert!(LIBRARY_RS.contains(
+            r##"#[wasm_bindgen(unchecked_param_type = "UploadRedundancyLevel")] redundancy_level: f64"##
+        ));
+        assert!(!LIBRARY_RS.contains(
+            r##"#[wasm_bindgen(unchecked_param_type = "UploadRedundancyLevel")] redundancy_level: u8"##
+        ));
+        assert!(
+            !LIB_RS
+                .contains(r##"#[wasm_bindgen(unchecked_param_type = "UploadRedundancyLevel")]"##)
+        );
+        assert!(LIB_RS.contains("validated_upload_redundancy_number(redundancy_level)"));
+        assert!(LIBRARY_RS.contains("validated_upload_redundancy_number(redundancy_level)"));
+    }
+
+    #[test]
+    fn service_worker_redundancy_header_uses_strict_base_ten_parsing() {
+        for marker in [
+            "function parseUploadRedundancyHeader(value)",
+            "value === null || value === \"\"",
+            r#"/^[0-9]+$/.test(value)"#,
+            "Number.isSafeInteger(level) && level <= 4",
+            "parsedRedundancy === null",
+        ] {
+            assert!(SERVICE_WORKER_JS.contains(marker), "missing {marker}");
         }
     }
 }

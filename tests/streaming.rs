@@ -1,5 +1,7 @@
 #![allow(dead_code)]
 
+#[path = "../src/retrieval_conventions.rs"]
+mod retrieval_conventions;
 #[path = "../src/stream_conventions.rs"]
 mod stream_conventions;
 #[path = "../src/stream_hls.rs"]
@@ -28,9 +30,8 @@ mod hls {
         hls_manifest_reload_is_continuous, hls_media_references, hls_media_sequence,
         hls_payload_mime, hls_prefix_admission_window_is_open, hls_prefix_stagger_remaining_ms,
         hls_startup_prefix_is_preferred, hls_timeline_rebase_required, hls_track_ids_to_prune,
-        is_hls_manifest, parse_stream_catalog, probe_hls_manifest, read_forward_cache_entry,
-        rewrite_hls_manifest, rewrite_hls_manifest_for_live_reload,
-        stream_feed_payload_len_is_supported,
+        is_hls_manifest, probe_hls_manifest, read_forward_cache_entry, rewrite_hls_manifest,
+        rewrite_hls_manifest_for_live_reload, stream_feed_payload_len_is_supported,
     };
 
     const REF: &str = "919b5395bf7a59cbb3b365769de09a2b15ac5d897823dda9270259a3c038d574";
@@ -67,62 +68,34 @@ mod hls {
 
     #[test]
     fn archive_that_expands_a_rolling_window_requires_a_timeline_rebase() {
-        assert!(hls_timeline_rebase_required(636, true, 0, false));
+        assert!(hls_timeline_rebase_required(636, true, 0));
         assert!(
-            hls_timeline_rebase_required(636, true, 0, true),
-            "a provisionally exposed archive must rebase before ENDLIST confirmation"
-        );
-        assert!(
-            !hls_timeline_rebase_required(0, true, 0, false),
+            !hls_timeline_rebase_required(0, true, 0),
             "a sequence-zero live playlist can become finite without moving its origin"
         );
         assert!(
-            !hls_timeline_rebase_required(636, true, 637, false),
+            !hls_timeline_rebase_required(636, true, 637),
             "a normal forward terminal update keeps the buffered timeline"
         );
         assert!(
-            !hls_timeline_rebase_required(636, false, 0, false),
+            !hls_timeline_rebase_required(636, false, 0),
             "an already finite representation must not repeatedly rebase"
         );
     }
 
     #[test]
     fn rolling_archive_rebases_once_across_a_clean_session_boundary() {
-        let none = HlsLevelTransition {
-            rebase: false,
-            terminal_ready: false,
-        };
-        let rebase = HlsLevelTransition {
-            rebase: true,
-            terminal_ready: false,
-        };
-        let terminal = HlsLevelTransition {
-            rebase: false,
-            terminal_ready: true,
-        };
+        let none = HlsLevelTransition { rebase: false };
+        let rebase = HlsLevelTransition { rebase: true };
 
-        // First hls.js session: a rolling window expands backwards to the full
-        // provisional archive. A pending network recovery must not consume or
-        // suppress that representation correction.
+        assert_eq!(classify_hls_level_transition(None, false, 501), none);
         assert_eq!(
-            classify_hls_level_transition(None, false, false, 501, true),
-            none
-        );
-        assert_eq!(
-            classify_hls_level_transition(Some((501, true)), false, true, 0, true),
+            classify_hls_level_transition(Some((501, true)), false, 0),
             rebase
         );
-
-        // The clean replacement session carries only the one-shot rebase guard;
-        // rendition snapshots start empty. ENDLIST then announces terminal
-        // readiness without rebuilding the same sequence-zero timeline again.
         assert_eq!(
-            classify_hls_level_transition(None, true, false, 0, true),
+            classify_hls_level_transition(Some((501, true)), true, 0),
             none
-        );
-        assert_eq!(
-            classify_hls_level_transition(Some((0, true)), true, false, 0, false),
-            terminal
         );
     }
 
@@ -203,7 +176,7 @@ mod hls {
     }
 
     #[test]
-    fn authenticated_sequence_zero_startup_prefix_requires_an_unindexed_stream_route_intent() {
+    fn authenticated_sequence_zero_startup_prefix_replaces_a_late_canonical_window() {
         let prefix = format!(
             "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:0\n\
              #EXTINF:2.0,\n{REF}\n#EXTINF:2.0,\n{REF2}\n\
@@ -217,7 +190,6 @@ mod hls {
             rolling_vod.as_bytes(),
             prefix.as_bytes(),
             4,
-            true,
         ));
 
         let rolling_tentative_endlist =
@@ -227,7 +199,6 @@ mod hls {
                 rolling_tentative_endlist.as_bytes(),
                 prefix.as_bytes(),
                 4,
-                true,
             ),
             "an authenticated ENDLIST is useful for startup before mutable-head confirmation"
         );
@@ -239,26 +210,17 @@ mod hls {
         let rolling_live = format!("#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:636\n#EXTINF:2.0,\n{REF3}\n");
         for canonical in [&rolling_event, &rolling_live] {
             assert!(
-                hls_startup_prefix_is_preferred(canonical.as_bytes(), prefix.as_bytes(), 4, true),
+                hls_startup_prefix_is_preferred(canonical.as_bytes(), prefix.as_bytes(), 4),
                 "the direct unindexed /stream route must start from zero even when the producer leaves its rolling snapshot live, EVENT, or untagged"
             );
         }
-        assert!(
-            !hls_startup_prefix_is_preferred(rolling_live.as_bytes(), prefix.as_bytes(), 4, false,),
-            "catalog/feed views without direct /stream intent must retain their rolling window"
-        );
 
         let sequence_zero_vod = format!(
             "#EXTM3U\n#EXT-X-PLAYLIST-TYPE:VOD\n#EXT-X-MEDIA-SEQUENCE:0\n\
              #EXTINF:2.0,\n{REF3}\n"
         );
         assert!(
-            !hls_startup_prefix_is_preferred(
-                sequence_zero_vod.as_bytes(),
-                prefix.as_bytes(),
-                4,
-                true,
-            ),
+            !hls_startup_prefix_is_preferred(sequence_zero_vod.as_bytes(), prefix.as_bytes(), 4,),
             "a canonical sequence-zero view needs no presentation override"
         );
 
@@ -270,17 +232,11 @@ mod hls {
             rolling_vod.as_bytes(),
             short_prefix.as_bytes(),
             4,
-            true,
         ));
 
         let master_prefix = format!("#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1000000\n{REF}.m3u8\n");
         assert!(
-            !hls_startup_prefix_is_preferred(
-                rolling_vod.as_bytes(),
-                master_prefix.as_bytes(),
-                4,
-                true,
-            ),
+            !hls_startup_prefix_is_preferred(rolling_vod.as_bytes(), master_prefix.as_bytes(), 4,),
             "a multivariant manifest is not an authenticated media prefix"
         );
     }
@@ -298,24 +254,20 @@ mod hls {
         assert_eq!((a.reference.as_str(), a.rolling), ("a", false));
         let b = policy.next_admission(true).expect("second active lane");
         assert_eq!((b.reference.as_str(), b.rolling), ("b", false));
-        assert_eq!(policy.active_count(), 2);
         assert_eq!(policy.next_admission(true), None);
 
         policy.complete("a", true);
         let c = policy.next_admission(true).expect("first ordered refill");
         assert_eq!((c.reference.as_str(), c.rolling), ("c", true));
-        assert_eq!(policy.active_count(), 2);
         assert_eq!(policy.next_admission(true), None);
 
         policy.complete("b", true);
         let d = policy.next_admission(true).expect("second ordered refill");
         assert_eq!((d.reference.as_str(), d.rolling), ("d", true));
-        assert_eq!(policy.active_count(), 2);
         policy.complete("c", true);
         policy.complete("d", true);
 
         assert!(policy.target_complete());
-        assert_eq!(policy.active_count(), 0);
         assert_eq!(policy.next_admission(true), None);
     }
 
@@ -401,7 +353,6 @@ mod hls {
         assert_eq!(policy.next_admission(false), None);
         policy.complete("a", true);
         assert_eq!(policy.next_admission(true), None);
-        assert_eq!(policy.active_count(), 0);
     }
 
     #[test]
@@ -497,15 +448,19 @@ mod hls {
     #[test]
     fn live_plan_overlap_migrates_before_the_first_appended_fragment() {
         let mut plans = HlsMediaPlanRegistry::new(64);
-        plans.install(["a", "b", "c"].into_iter().map(str::to_string).collect());
+        plans.install_with_early_overlap_limit(
+            ["a", "b", "c"].into_iter().map(str::to_string).collect(),
+            usize::MAX,
+        );
         let first = plans.cursor("a", &HashMap::new()).unwrap();
         let old_plan = first.cursor.plan_id;
 
-        plans.install(
+        plans.install_with_early_overlap_limit(
             ["b", "c", "d", "e"]
                 .into_iter()
                 .map(str::to_string)
                 .collect(),
+            usize::MAX,
         );
         let preferred = HashMap::from([(old_plan, 0)]);
         let migrated = plans.cursor("b", &preferred).unwrap();
@@ -519,22 +474,24 @@ mod hls {
     #[test]
     fn plan_migration_rejects_an_unrelated_rendition_with_only_one_shared_asset() {
         let mut plans = HlsMediaPlanRegistry::new(64);
-        plans.install(
+        plans.install_with_early_overlap_limit(
             ["a", "shared", "c"]
                 .into_iter()
                 .map(str::to_string)
                 .collect(),
+            usize::MAX,
         );
         let old_plan = plans
             .cursor("shared", &HashMap::new())
             .unwrap()
             .cursor
             .plan_id;
-        plans.install(
+        plans.install_with_early_overlap_limit(
             ["x", "shared", "z"]
                 .into_iter()
                 .map(str::to_string)
                 .collect(),
+            usize::MAX,
         );
 
         let selected = plans
@@ -551,9 +508,9 @@ mod hls {
             .into_iter()
             .map(str::to_string)
             .collect::<Vec<_>>();
-        plans.install(references.clone());
+        plans.install_with_early_overlap_limit(references.clone(), usize::MAX);
         let first = plans.cursor("b", &HashMap::new()).unwrap().cursor.plan_id;
-        plans.install(references);
+        plans.install_with_early_overlap_limit(references, usize::MAX);
         let second = plans.cursor("b", &HashMap::new()).unwrap().cursor.plan_id;
         assert_eq!(first, second);
     }
@@ -931,9 +888,6 @@ mod hls {
             "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:0\n\
              #EXTINF:2.0,\n{REF}\n#EXTINF:2.0,\n{REF2}\n"
         );
-        // RFC 8216 permits ENDLIST anywhere in a Media Playlist. This candidate
-        // places it before the overlap, so suffix-only splicing must relocate it
-        // instead of losing the finite-duration signal.
         let early_endlist = format!(
             "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:1\n#EXT-X-ENDLIST\n\
              #EXTINF:2.0,\n{REF2}\n#EXTINF:2.0,\n{REF3}\n"
@@ -1289,55 +1243,6 @@ mod hls {
         assert_eq!(hls_payload_mime(&[0x47; 16]), "application/octet-stream");
         assert_eq!(hls_payload_mime(&[0x13; 16]), "application/octet-stream");
     }
-
-    #[test]
-    fn parses_current_and_upstream_catalog_shapes_and_sorts_live_first() {
-        let wrapped = br#"{
-          "entries": [
-            {"owner":"6F2728386F8a47ef5EBe323721188e630Ff0FdE9","topic":"vod-topic","title":"Past","state":"vod","mediaType":"video","index":69,"updatedAt":100,"duration":138.033},
-            {"owner":"0X6F2728386F8a47ef5EBe323721188e630Ff0FdE9","topic":"live-topic","title":"Now","state":"live","mediatype":"audio","index":70,"updatedAt":90,"duration":"2.5"}
-          ]
-        }"#;
-        let entries = parse_stream_catalog(wrapped).unwrap();
-        assert_eq!(entries[0].title, "Now");
-        assert_eq!(entries[0].owner, "6F2728386F8a47ef5EBe323721188e630Ff0FdE9");
-        assert_eq!(entries[0].media_type(), "audio");
-        assert_eq!(entries[0].duration, Some(2.5));
-        assert_eq!(entries[1].index, Some(69));
-
-        let array = br#"[{"owner":"6F2728386F8a47ef5EBe323721188e630Ff0FdE9","topic":"one","title":"One","timestamp":1}]"#;
-        let unknown = parse_stream_catalog(array).unwrap();
-        assert_eq!(unknown.len(), 1);
-        assert!(!unknown[0].is_live());
-        assert!(!unknown[0].is_vod());
-    }
-
-    #[test]
-    fn catalog_parser_discards_bad_entries_and_rejects_bad_shapes() {
-        let mixed = br#"[
-          {"owner":"6F2728386F8a47ef5EBe323721188e630Ff0FdE9","topic":"good","duration":1},
-          {"owner":"6F2728386F8a47ef5EBe323721188e630Ff0FdE9","topic":"external","isExternal":true},
-          {"owner":"not-an-owner","topic":"bad"},
-          {"owner":"6F2728386F8a47ef5EBe323721188e630Ff0FdE9","topic":"","duration":1},
-          {"owner":"6F2728386F8a47ef5EBe323721188e630Ff0FdE9","topic":"bad-duration","duration":"forever"},
-          null
-        ]"#;
-        let entries = parse_stream_catalog(mixed).unwrap();
-        assert_eq!(entries.len(), 2);
-        assert_eq!(entries[0].topic, "good");
-        assert_eq!(entries[1].topic, "bad-duration");
-        assert_eq!(entries[1].duration, None);
-
-        assert!(parse_stream_catalog(br#"{"entries":"not-an-array"}"#).is_none());
-        assert!(parse_stream_catalog(br#"{"streams":[]}"#).is_none());
-        assert_eq!(parse_stream_catalog(br#"[]"#), Some(Vec::new()));
-        assert_eq!(
-            parse_stream_catalog(br#"{"entries":[],"lastModified":1782960110305}"#),
-            Some(Vec::new())
-        );
-        assert!(parse_stream_catalog(b"not json").is_none());
-        assert!(parse_stream_catalog(&[0xff]).is_none());
-    }
 }
 
 mod http_range {
@@ -1635,28 +1540,18 @@ mod feed_followup {
         HLS_INITIAL_EXACT_BETWEEN_RECHECKS, HLS_INITIAL_EXACT_CATCHUP_LIMIT,
         HLS_SEQUENCE_ZERO_FOLLOWUP_MAX_PARALLEL, HLS_SEQUENCE_ZERO_PRESENTATION_BATCH_LIMIT,
         HLS_TERMINAL_CONFIRMATION_MIN_PRICED_PEERS, cached_feed_should_refresh_head,
-        exact_feed_batch_should_refresh_head, feed_followup_batch_limit,
-        feed_followup_max_parallel, feed_followup_should_refresh_head,
+        feed_followup_batch_limit, feed_followup_max_parallel, feed_followup_should_refresh_head,
         hls_initial_exact_round_limit, hls_snapshot_is_terminal, hls_terminal_peer_view_is_mature,
     };
 
     #[test]
     fn regular_polling_stays_on_the_exact_next_index() {
         assert!(!cached_feed_should_refresh_head(10_000.0, 24_999.0));
-        assert!(!exact_feed_batch_should_refresh_head(
-            FEED_FOLLOWUP_BATCH_LIMIT - 1
-        ));
     }
 
     #[test]
-    fn dormant_or_saturated_readers_jump_to_the_latest_head() {
+    fn dormant_readers_jump_to_the_latest_head() {
         assert!(cached_feed_should_refresh_head(10_000.0, 25_000.0));
-        assert!(exact_feed_batch_should_refresh_head(
-            FEED_FOLLOWUP_BATCH_LIMIT
-        ));
-        assert!(exact_feed_batch_should_refresh_head(
-            FEED_FOLLOWUP_BATCH_LIMIT + 1
-        ));
     }
 
     #[test]
@@ -1710,9 +1605,6 @@ mod feed_followup {
         assert_eq!(HLS_INITIAL_EXACT_BETWEEN_RECHECKS, 1);
         assert_eq!(HLS_INITIAL_EXACT_CATCHUP_LIMIT, 32);
 
-        // Reproduce the public fixture's important ordering: the first bounded
-        // candidate is 510. Exactly 511 may be read, but 512 must not be admitted
-        // before the second bounded wave gets a chance to jump to 646.
         let mut candidate = 510_u64;
         let first_round = hls_initial_exact_round_limit(1, 0);
         assert_eq!(first_round, 1);
@@ -1723,8 +1615,6 @@ mod feed_followup {
         let candidate_after_second_bounded_wave = 646_u64;
         assert_eq!(candidate_after_second_bounded_wave, 646);
 
-        // If that wave misses on a sparse peer view, the old total sequential
-        // reliability budget remains available rather than being reduced to one.
         assert_eq!(hls_initial_exact_round_limit(2, 1), 31);
         assert_eq!(hls_initial_exact_round_limit(2, 32), 0);
     }
@@ -1754,551 +1644,134 @@ mod feed_followup {
     }
 }
 
-mod index_hints {
-    const HINT_STORE: &str = include_str!("../src/stream_hls.rs");
-    const HLS_SOURCE: &str = include_str!("../src/stream_hls.rs");
-    const CARGO_TOML: &str = include_str!("../Cargo.toml");
-
-    #[test]
-    fn persisted_vod_hints_are_bounded_network_scoped_rust_storage() {
-        for marker in [
-            "const STORAGE_KEY: &str = \"weeb3-hls-vod-index-hints-v2\";",
-            "const MAX_HINTS: usize = 256;",
-            "const MAX_SERIALIZED_BYTES: usize = 64 * 1024;",
-            "network_id: u64",
-            "normalized_topic",
-            "web_sys::window()?.local_storage()",
-            "serde_json::to_string(&hints)",
-        ] {
-            assert!(
-                HINT_STORE.contains(marker),
-                "missing persisted VOD hint safety marker: {marker}"
-            );
-        }
-        assert!(CARGO_TOML.contains("'Storage',"));
-        assert!(
-            !HINT_STORE.contains("\"weeb3-hls-vod-index-hints-v1\""),
-            "tentative v1 ENDLIST hints must not be migrated or reused"
-        );
-        assert!(!HINT_STORE.contains("6f2728386f8a47ef5ebe323721188e630ff0fde9"));
-        assert!(!HINT_STORE.contains("/feeds/352eabdea9cb05e984a8828d2a6df3d3b5023260"));
-    }
-
-    #[test]
-    fn unindexed_hints_are_exactly_authenticated_before_the_frontier_is_bypassed() {
-        let loader = HLS_SOURCE
-            .split("async fn load_feed_snapshot(")
-            .nth(1)
-            .and_then(|source| source.split("fn feed_cache_key").next())
-            .expect("feed loader should remain inspectable");
-
-        let hint_read = loader
-            .find("persisted_vod_index(network_id, &owner, &topic)")
-            .expect("unindexed loader must consult the persisted hint");
-        let exact_read = loader[hint_read..]
-            .find("hls_feed_payload_at_index(owner.clone(), topic.clone(), index)")
-            .map(|offset| hint_read + offset)
-            .expect("hint must use an exact SOC read");
-        let manifest_check = loader[exact_read..]
-            .find("is_hls_manifest(&candidate.bytes)")
-            .map(|offset| exact_read + offset)
-            .expect("hinted payload must be authenticated as HLS");
-        let endlist_check = loader[manifest_check..]
-            .find("hls_is_finalized(&candidate.bytes)")
-            .map(|offset| manifest_check + offset)
-            .expect("hinted payload must be a finalized VOD");
-        let eviction = loader[endlist_check..]
-            .find("forget_vod_index(network_id, &owner, &topic)")
-            .map(|offset| endlist_check + offset)
-            .expect("a failed hint must be evicted");
-        let fallback = loader[eviction..]
-            .find("latest_hls_feed_payload_observing_positive(")
-            .map(|offset| eviction + offset)
-            .expect("a failed hint must fall back to the Bee frontier");
-
-        assert!(hint_read < exact_read);
-        assert!(exact_read < manifest_check);
-        assert!(manifest_check < endlist_check);
-        assert!(endlist_check < eviction);
-        assert!(eviction < fallback);
-    }
-
-    #[test]
-    fn catalog_persistence_accepts_only_vod_entries_with_an_index() {
-        let renderer = HLS_SOURCE
-            .split("fn render_stream_catalog(")
-            .nth(1)
-            .and_then(|source| source.split("fn canonical_hls_feed_url").next())
-            .expect("catalog renderer should remain inspectable");
-        for marker in [
-            "entry.is_vod().then_some(",
-            "entry.index?",
-            "normalize_feed_topic(&entry.topic)",
-            "remember_catalog_vod_indices(active_profile().swarm_network_id, vod_hints)",
-        ] {
-            assert!(
-                renderer.contains(marker),
-                "missing VOD catalog hint marker: {marker}"
-            );
-        }
-    }
-
-    #[test]
-    fn explicit_index_branch_remains_an_exact_immutable_read() {
-        let loader = HLS_SOURCE
-            .split("async fn load_feed_snapshot(")
-            .nth(1)
-            .and_then(|source| source.split("fn feed_cache_key").next())
-            .expect("feed loader should remain inspectable");
-        let explicit = loader
-            .split("Some(index) => {")
-            .nth(1)
-            .and_then(|source| source.split("None => {").next())
-            .expect("explicit index branch should remain inspectable");
-        assert!(
-            explicit.contains(".hls_feed_payload_at_index(owner.clone(), topic.clone(), index)")
-        );
-        assert!(explicit.contains("if loaded.index != index"));
-        assert!(!explicit.contains("persisted_vod_index"));
-        assert!(!explicit.contains("latest_hls_feed_payload"));
-
-        let authenticated_store = loader
-            .split("if loaded.bytes.len() > MAX_STREAM_FEED_PAYLOAD_BYTES")
-            .nth(1)
-            .expect("authenticated payload handling should remain inspectable");
-        assert!(authenticated_store.contains("store_feed_snapshot(&cache_key, snapshot"));
-        assert!(authenticated_store.contains("if index_hint.is_none() && snapshot.finalized"));
-        assert!(authenticated_store.contains(
-            "remember_authenticated_endlist_index(network_id, &owner, &topic, snapshot.index)"
-        ));
-        assert!(
-            authenticated_store
-                .find("if index_hint.is_none() && snapshot.finalized")
-                .is_some_and(|guard| {
-                    authenticated_store[guard..]
-                        .find("remember_authenticated_endlist_index(")
-                        .is_some()
-                })
-        );
-    }
-}
-
 mod share_links {
-    use crate::stream_conventions;
-    use crate::stream_hls;
-
-    use stream_conventions::{configure_streaming_routes, streaming_route_base};
-    use stream_hls::{
-        StreamShareNetwork, StreamShareRoute, parse_stream_share_link, stream_share_path,
-        stream_share_url,
-    };
+    use crate::stream_conventions::{StreamShareRoute, parse_stream_share_link};
 
     const OWNER: &str = "352eabdea9cb05e984a8828d2a6df3d3b5023260";
-    const EXAMPLE_OWNER: &str = "6F2728386F8a47ef5EBe323721188e630Ff0FdE9";
-    const CANONICAL_EXAMPLE_OWNER: &str = "6f2728386f8a47ef5ebe323721188e630ff0fde9";
-    const CURRENT_EXAMPLE_TOPIC: &str = "0d216633-3475-4c26-8dd0-9935ef854bbc";
-    const PINNED_EXAMPLE_TOPIC: &str = "ba5c0dc4-2e20-4c08-a10a-c283d32b1af0";
+    const MIXED_CASE_OWNER: &str = "6F2728386F8a47ef5EBe323721188e630Ff0FdE9";
+    const CANONICAL_OWNER: &str = "6f2728386f8a47ef5ebe323721188e630ff0fde9";
+    const TOPIC: &str = "0d216633-3475-4c26-8dd0-9935ef854bbc";
 
     #[test]
-    fn exact_mainnet_link_defaults_and_canonicalizes_the_current_public_example() {
-        let input = format!("/weeb-3/stream/{EXAMPLE_OWNER}/{CURRENT_EXAMPLE_TOPIC}");
-        let parsed = parse_stream_share_link(&input, "/weeb-3").unwrap();
+    fn parses_the_exact_mainnet_stream_route() {
+        let parsed =
+            parse_stream_share_link(&format!("/weeb-3/stream/{MIXED_CASE_OWNER}/{TOPIC}")).unwrap();
 
-        assert_eq!(parsed.network, StreamShareNetwork::Mainnet);
-        assert_eq!(parsed.owner, CANONICAL_EXAMPLE_OWNER);
-        assert_eq!(parsed.topic, CURRENT_EXAMPLE_TOPIC);
-        assert_eq!(parsed.index, None);
+        assert_eq!(parsed.owner, CANONICAL_OWNER);
+        assert_eq!(parsed.topic, TOPIC);
         assert_eq!(
-            stream_share_path("/weeb-3", &parsed).unwrap(),
-            format!("/weeb-3/stream/{CANONICAL_EXAMPLE_OWNER}/{CURRENT_EXAMPLE_TOPIC}")
-        );
-        assert_eq!(
-            stream_share_url("https://192.168.1.2:8080", "/weeb-3", &parsed).unwrap(),
-            format!(
-                "https://192.168.1.2:8080/weeb-3/stream/{CANONICAL_EXAMPLE_OWNER}/{CURRENT_EXAMPLE_TOPIC}"
-            )
+            parse_stream_share_link(&format!("stream/{OWNER}/topic%2Fpart%20%E6%97%A5")),
+            StreamShareRoute::new(OWNER, "topic/part 日")
         );
     }
 
     #[test]
-    fn exact_pinned_mainnet_example_preserves_index_69() {
-        let input = format!("/weeb-3/stream/{EXAMPLE_OWNER}/{PINNED_EXAMPLE_TOPIC}/69");
-        let parsed = parse_stream_share_link(&input, "/weeb-3").unwrap();
-
-        assert_eq!(parsed.network, StreamShareNetwork::Mainnet);
-        assert_eq!(parsed.owner, CANONICAL_EXAMPLE_OWNER);
-        assert_eq!(parsed.topic, PINNED_EXAMPLE_TOPIC);
-        assert_eq!(parsed.index, Some(69));
+    fn construction_rejects_invalid_owner_and_topic_values() {
         assert_eq!(
-            stream_share_path("/weeb-3", &parsed).unwrap(),
-            format!("/weeb-3/stream/{CANONICAL_EXAMPLE_OWNER}/{PINNED_EXAMPLE_TOPIC}/69")
-        );
-        assert_eq!(
-            stream_share_url("https://192.168.1.2:8080", "/weeb-3", &parsed).unwrap(),
-            format!(
-                "https://192.168.1.2:8080/weeb-3/stream/{CANONICAL_EXAMPLE_OWNER}/{PINNED_EXAMPLE_TOPIC}/69"
-            )
-        );
-    }
-
-    #[test]
-    fn root_relative_round_trip_preserves_stream_identity_and_network() {
-        let route = StreamShareRoute::new(
-            StreamShareNetwork::Testnet,
-            OWNER,
-            "release 7/日本語?preview#one%done",
-            Some(u64::MAX),
-        )
-        .unwrap();
-
-        let path = stream_share_path("/media/", &route).unwrap();
-        assert_eq!(
-            path,
-            concat!(
-                "/media/testnet/stream/",
-                "352eabdea9cb05e984a8828d2a6df3d3b5023260/",
-                "release%207%2F%E6%97%A5%E6%9C%AC%E8%AA%9E%3Fpreview%23one%25done/",
-                "18446744073709551615"
-            )
-        );
-        assert_eq!(parse_stream_share_link(&path, "/media"), Ok(route));
-    }
-
-    #[test]
-    fn absolute_links_and_root_mounts_are_clean_and_round_trip() {
-        let route = StreamShareRoute::new(
-            StreamShareNetwork::Mainnet,
-            format!("0x{OWNER}"),
-            "stream-topic",
-            None,
-        )
-        .unwrap();
-
-        assert_eq!(
-            stream_share_url("HTTPS://streams.example/", "/", &route).unwrap(),
-            format!("https://streams.example/stream/{OWNER}/stream-topic")
-        );
-        assert_eq!(
-            stream_share_url("http://[::1]:8080", "/", &route).unwrap(),
-            format!("http://[::1]:8080/stream/{OWNER}/stream-topic")
-        );
-        assert_eq!(
-            parse_stream_share_link(
-                &format!("https://streams.example/weeb-3/stream/0x{OWNER}/stream-topic"),
-                "/weeb-3/"
-            ),
-            Ok(route)
-        );
-    }
-
-    #[test]
-    fn parser_accepts_only_the_canonical_stream_route() {
-        let parsed = parse_stream_share_link(
-            &format!("/weeb-3/stream/{OWNER}/topic%2fpart/007"),
-            "/weeb-3",
-        )
-        .unwrap();
-
-        assert_eq!(parsed.network, StreamShareNetwork::Mainnet);
-        assert_eq!(parsed.owner, OWNER);
-        assert_eq!(parsed.topic, "topic/part");
-        assert_eq!(parsed.index, Some(7));
-        assert_eq!(
-            stream_share_path("/weeb-3", &parsed).unwrap(),
-            format!("/weeb-3/stream/{OWNER}/topic%2Fpart/7")
-        );
-        assert!(
-            parse_stream_share_link(&format!("/weeb-3/MAINNET/STREAM/{OWNER}/topic"), "/weeb-3")
-                .is_err()
-        );
-        assert!(
-            parse_stream_share_link(&format!("/weeb-3/mainnet/stream/{OWNER}/topic"), "/weeb-3")
-                .is_err()
-        );
-        assert!(
-            parse_stream_share_link(&format!("/weeb-3/watch/{OWNER}/topic"), "/weeb-3").is_err()
-        );
-        assert!(parse_stream_share_link(&format!("/weeb-3/hls/{OWNER}/topic"), "/weeb-3").is_err());
-        assert!(
-            parse_stream_share_link(
-                &format!("/weeb-3/mainnet/watch/video/{OWNER}/topic"),
-                "/weeb-3"
-            )
-            .is_err()
-        );
-        assert!(
-            parse_stream_share_link(
-                &format!("/weeb-3/mainnet/hls/video/{OWNER}/topic"),
-                "/weeb-3"
-            )
-            .is_err()
-        );
-        assert!(
-            parse_stream_share_link(
-                &format!("/weeb-3/testnet/watch/video/{OWNER}/topic"),
-                "/weeb-3"
-            )
-            .is_err()
-        );
-        assert!(
-            parse_stream_share_link(
-                &format!("/weeb-3/testnet/hls/video/{OWNER}/topic"),
-                "/weeb-3"
-            )
-            .is_err()
+            StreamShareRoute::new(MIXED_CASE_OWNER, TOPIC)
+                .unwrap()
+                .owner,
+            CANONICAL_OWNER
         );
 
-        let testnet = parse_stream_share_link(
-            &format!("/weeb-3/testnet/stream/{EXAMPLE_OWNER}/{PINNED_EXAMPLE_TOPIC}/69"),
-            "/weeb-3",
-        )
-        .unwrap();
-        assert_eq!(testnet.network, StreamShareNetwork::Testnet);
-        assert_eq!(testnet.owner, CANONICAL_EXAMPLE_OWNER);
-        assert_eq!(testnet.topic, PINNED_EXAMPLE_TOPIC);
-        assert_eq!(testnet.index, Some(69));
-        assert_eq!(
-            stream_share_path("/weeb-3", &testnet).unwrap(),
-            format!("/weeb-3/testnet/stream/{CANONICAL_EXAMPLE_OWNER}/{PINNED_EXAMPLE_TOPIC}/69")
-        );
-    }
-
-    #[test]
-    fn route_base_matching_uses_a_path_boundary() {
-        let valid = format!("/app/stream/{OWNER}/topic");
-        assert!(parse_stream_share_link(&valid, "/app").is_ok());
-
-        let collision = format!("/application/stream/{OWNER}/topic");
-        assert!(parse_stream_share_link(&collision, "/app").is_err());
-        assert!(parse_stream_share_link(&valid, "/").is_err());
-    }
-
-    #[test]
-    fn configured_npm_share_route_is_decoded_before_the_legacy_nav_scanner() {
-        configure_streaming_routes("/media/weeb3-service.js", "/media").unwrap();
-        let route = StreamShareRoute::new(
-            StreamShareNetwork::Testnet,
-            OWNER,
-            "topic/with reserved %# bytes",
-            Some(42),
-        )
-        .unwrap();
-        let path = stream_share_path(&streaming_route_base(), &route).unwrap();
-        assert_eq!(
-            path,
-            format!("/media/testnet/stream/{OWNER}/topic%2Fwith%20reserved%20%25%23%20bytes/42")
-        );
-
-        let decoded = parse_stream_share_link(&path, &streaming_route_base()).unwrap();
-        assert_eq!(decoded, route);
-        assert_eq!(decoded.network, StreamShareNetwork::Testnet);
-
-        let nav = include_str!("../src/nav.rs");
-        let read_routes = nav
-            .split_once("pub async fn read_routes()")
-            .expect("read_routes must remain available")
-            .1;
-        let strict_parse = read_routes
-            .find("parse_resource_route(&pathname)")
-            .expect("read_routes must parse the complete canonical route");
-        let fallback_scan = read_routes
-            .find("parse_routes_from_path(&pathname)")
-            .expect("read_routes must retain its legacy path fallback");
-        assert!(
-            strict_parse < fallback_scan,
-            "strict configured-route decoding must run before the lossy scanner"
-        );
-
-        let scanner = nav
-            .split_once("fn parse_routes_from_path")
-            .expect("legacy path scanner")
-            .1
-            .split_once("pub async fn clear_path")
-            .expect("legacy path scanner boundary")
-            .0;
-        for removed_player_route in ["\"stream\"", "\"watch\"", "\"hls\""] {
+        for owner in [
+            "",
+            "not-an-owner",
+            "0x352eabdea9cb05e984a8828d2a6df3d3b5023260",
+        ] {
+            assert!(StreamShareRoute::new(owner, TOPIC).is_err());
+        }
+        for topic in ["", ".", "..", "line\nbreak"] {
             assert!(
-                !scanner.contains(removed_player_route),
-                "legacy scanner must not revive strict player route {removed_player_route}"
+                StreamShareRoute::new(OWNER, topic).is_err(),
+                "accepted topic {topic:?}"
             );
         }
+        assert!(StreamShareRoute::new(OWNER, "é".repeat(129)).is_err());
     }
 
     #[test]
-    fn invalid_routes_are_rejected_instead_of_being_partially_interpreted() {
+    fn rejects_aliases_indices_urls_and_malformed_paths() {
         let invalid = [
-            format!("/weeb-3/mainnet/stream/{OWNER}/topic"),
-            format!("/weeb-3/watch/{OWNER}/topic"),
-            format!("/weeb-3/hls/{OWNER}/topic"),
-            format!("/weeb-3/mainnet/watch/video/{OWNER}/topic"),
-            format!("/weeb-3/mainnet/hls/video/{OWNER}/topic"),
-            format!("/weeb-3/testnet/watch/video/{OWNER}/topic"),
-            format!("/weeb-3/testnet/hls/video/{OWNER}/topic"),
-            format!("/weeb-3/stream/not-an-owner/topic"),
-            format!("/weeb-3/stream/{OWNER}/topic/not-a-number"),
-            format!("/weeb-3/stream/{OWNER}/topic/18446744073709551616"),
-            format!("/weeb-3/stream/{OWNER}/topic/1/extra"),
-            format!("/weeb-3/stream/{OWNER}/topic/"),
+            format!("/weeb-3/mainnet/stream/{OWNER}/{TOPIC}"),
+            format!("/weeb-3/testnet/stream/{OWNER}/{TOPIC}"),
+            format!("/weeb-3/stream/{OWNER}/{TOPIC}/69"),
+            format!("/weeb-3/watch/video/{OWNER}/{TOPIC}"),
+            format!("/weeb-3/hls/{OWNER}/{TOPIC}"),
+            format!("/weeb-3/stream/not-an-owner/{TOPIC}"),
+            format!("/weeb-3/stream/{OWNER}"),
+            format!("/weeb-3/stream/{OWNER}/{TOPIC}/"),
             format!("/weeb-3/stream/{OWNER}/bad%escape"),
             format!("/weeb-3/stream/{OWNER}/%FF"),
-            format!("/weeb-3/stream/{OWNER}/topic?index=7"),
-            format!("/weeb-3/stream/{OWNER}/topic#fragment"),
-            format!("//host/weeb-3/stream/{OWNER}/topic"),
-            format!("ftp://host/weeb-3/stream/{OWNER}/topic"),
+            format!("/weeb-3/stream/{OWNER}/{TOPIC}?index=7"),
+            format!("/weeb-3/stream/{OWNER}/{TOPIC}#fragment"),
+            format!("//host/weeb-3/stream/{OWNER}/{TOPIC}"),
+            format!("https://host/weeb-3/stream/{OWNER}/{TOPIC}"),
+            format!("/other/stream/{OWNER}/{TOPIC}"),
         ];
 
         for input in invalid {
             assert!(
-                parse_stream_share_link(&input, "/weeb-3").is_err(),
+                parse_stream_share_link(&input).is_err(),
                 "accepted {input:?}"
             );
         }
     }
-
-    #[test]
-    fn construction_rejects_unsafe_topic_owner_base_and_origin_values() {
-        for topic in ["", ".", "..", "line\nbreak"] {
-            assert!(
-                StreamShareRoute::new(StreamShareNetwork::Mainnet, OWNER, topic, None,).is_err(),
-                "accepted topic {topic:?}"
-            );
-        }
-
-        let too_long = "é".repeat(129);
-        assert!(
-            StreamShareRoute::new(StreamShareNetwork::Mainnet, OWNER, too_long, None,).is_err()
-        );
-
-        let route =
-            StreamShareRoute::new(StreamShareNetwork::Mainnet, OWNER, "topic", None).unwrap();
-        assert!(stream_share_path("/app/../escape", &route).is_err());
-        assert!(stream_share_url("https://user@example.com", "/app", &route).is_err());
-        assert!(stream_share_url("https://example.com/path", "/app", &route).is_err());
-        assert!(stream_share_url("javascript://example.com", "/app", &route).is_err());
-        assert!(stream_share_url("https://example.com:99999", "/app", &route).is_err());
-        assert!(stream_share_url("https://[not-ipv6]", "/app", &route).is_err());
-        assert!(stream_share_url("https://bad-.example", "/app", &route).is_err());
-        assert!(stream_share_url("https://999.999.999.999", "/app", &route).is_err());
-    }
 }
 
 mod routes {
-    use crate::stream_conventions;
-
-    use stream_conventions::{
-        configure_streaming_routes, route_base_controls_path, streaming_route_base,
-        streaming_route_path, streaming_service_worker_scope, streaming_service_worker_url,
+    use crate::stream_conventions::{
+        STREAMING_ROUTE_BASE, STREAMING_SERVICE_WORKER_SCOPE, STREAMING_SERVICE_WORKER_URL,
+        streaming_route_path,
     };
 
     #[test]
-    fn defaults_match_the_standalone_distribution() {
-        assert_eq!(streaming_route_base(), "/weeb-3");
+    fn standalone_routes_are_fixed() {
+        assert_eq!(STREAMING_ROUTE_BASE, "/weeb-3");
         assert_eq!(streaming_route_path("hls/bytes"), "/weeb-3/hls/bytes");
-        assert_eq!(streaming_service_worker_url(), "/weeb-3/service.js");
-        assert_eq!(streaming_service_worker_scope(), "/weeb-3/");
-    }
-
-    #[test]
-    fn npm_mount_can_configure_a_same_origin_worker_and_route_scope() {
-        configure_streaming_routes("/media/weeb3-service.js", "/media/").unwrap();
-        assert_eq!(streaming_route_base(), "/media");
-        assert_eq!(streaming_route_path("/feeds"), "/media/feeds");
-        assert_eq!(streaming_service_worker_url(), "/media/weeb3-service.js");
-        assert_eq!(streaming_service_worker_scope(), "/media/");
-
-        configure_streaming_routes("/weeb3-service.js", "/").unwrap();
-        assert_eq!(streaming_route_path("hls/bytes"), "/hls/bytes");
-        assert_eq!(streaming_service_worker_scope(), "/");
-    }
-
-    #[test]
-    fn rejects_route_bases_that_could_escape_or_mismatch_scope() {
-        for invalid in [
-            "",
-            "relative",
-            "/two//parts",
-            "/two/../parts",
-            "/two/%2e%2e/parts",
-            "/two?query",
-            "/two#fragment",
-            "/two\\parts",
-        ] {
-            assert!(
-                configure_streaming_routes("/service.js", invalid).is_err(),
-                "accepted {invalid:?}"
-            );
-        }
-        assert!(configure_streaming_routes("", "/media").is_err());
-    }
-
-    #[test]
-    fn route_scope_must_contain_the_client_document() {
-        assert!(!route_base_controls_path("/app", "/app"));
-        assert!(route_base_controls_path("/app", "/app/stream/1"));
-        assert!(route_base_controls_path("/app", "/app/stream/owner/topic"));
-        assert!(route_base_controls_path(
-            "/app",
-            "/app/testnet/stream/owner/topic"
-        ));
-        assert!(!route_base_controls_path("/app", "/application"));
-        assert!(!route_base_controls_path("/media", "/app/index.html"));
-        assert!(route_base_controls_path("/", "/anywhere"));
+        assert_eq!(streaming_route_path("/feeds"), "/weeb-3/feeds");
+        assert_eq!(STREAMING_SERVICE_WORKER_URL, "/weeb-3/service.js");
+        assert_eq!(STREAMING_SERVICE_WORKER_SCOPE, "/weeb-3/");
     }
 }
 
 mod network_routes {
-    use crate::nav;
-    use crate::network_profile;
-    use crate::stream_conventions;
-
-    use nav::{
-        ResourceRoute, parse_networked_resource_route, parse_resource_route,
-        route_network_mode_from_path,
+    use crate::{
+        nav::{
+            ResourceRoute, parse_networked_resource_route, parse_resource_route,
+            route_network_mode_from_path,
+        },
+        network_profile::NetworkMode,
     };
-    use network_profile::NetworkMode;
-    use stream_conventions::configure_streaming_routes;
 
     const REFERENCE: &str = "919b5395bf7a59cbb3b365769de09a2b15ac5d897823dda9270259a3c038d574";
     const OWNER: &str = "352eabdea9cb05e984a8828d2a6df3d3b5023260";
     const TOPIC: &str = "cfbbc155d709547b198638d0fb11d733359561538d8bd606a9ab257354d13bcc";
-    #[test]
-    fn recognized_transport_routes_default_to_mainnet_and_preserve_testnet() {
-        configure_streaming_routes("/weeb-3/service.js", "/weeb-3").unwrap();
 
-        let route_tails = [
+    #[test]
+    fn existing_transport_routes_keep_their_network_rules() {
+        for tail in [
             format!("bzz/{REFERENCE}"),
             format!("bzz/{REFERENCE}/index.html"),
             format!("bytes/{REFERENCE}"),
-            format!("chunk/{REFERENCE}"),
             format!("chunks/{REFERENCE}"),
-            format!("feeds/{OWNER}/{TOPIC}"),
-            format!("hls/bytes/{REFERENCE}"),
-        ];
-
-        for tail in route_tails {
+        ] {
             assert_eq!(
                 route_network_mode_from_path(&format!("/weeb-3/{tail}")),
-                Some(NetworkMode::Mainnet),
-                "prefix-free route did not default to mainnet: {tail}"
+                Some(NetworkMode::Mainnet)
             );
             assert_eq!(
                 route_network_mode_from_path(&format!("/weeb-3/mainnet/{tail}")),
-                Some(NetworkMode::Mainnet),
-                "mainnet transport alias was not accepted: {tail}"
+                Some(NetworkMode::Mainnet)
             );
             assert_eq!(
                 route_network_mode_from_path(&format!("/weeb-3/testnet/{tail}")),
-                Some(NetworkMode::Testnet),
-                "testnet route lost its network: {tail}"
+                Some(NetworkMode::Testnet)
             );
         }
 
         assert_eq!(
             route_network_mode_from_path("/weeb-3/bzz"),
-            Some(NetworkMode::Mainnet)
-        );
-        assert_eq!(
-            route_network_mode_from_path("/weeb-3/mainnet/bzz"),
             Some(NetworkMode::Mainnet)
         );
         assert_eq!(
@@ -2308,9 +1781,7 @@ mod network_routes {
     }
 
     #[test]
-    fn parsed_ui_resources_retain_network_identity() {
-        configure_streaming_routes("/weeb-3/service.js", "/weeb-3").unwrap();
-
+    fn existing_resource_routes_retain_network_identity() {
         let mainnet =
             parse_networked_resource_route(&format!("/weeb-3/bytes/{REFERENCE}")).unwrap();
         assert_eq!(mainnet.network, NetworkMode::Mainnet);
@@ -2328,7 +1799,6 @@ mod network_routes {
             parse_networked_resource_route(&format!("/weeb-3/testnet/bytes/{REFERENCE}")).unwrap();
         assert_eq!(testnet.network, NetworkMode::Testnet);
         assert_eq!(testnet.resource, mainnet.resource);
-
         assert_eq!(
             parse_resource_route(&format!("/weeb-3/testnet/bytes/{REFERENCE}")),
             Some(ResourceRoute::Bytes(REFERENCE.to_string()))
@@ -2336,35 +1806,29 @@ mod network_routes {
     }
 
     #[test]
-    fn configured_route_base_has_the_same_network_rules() {
-        configure_streaming_routes("/media/weeb3-service.js", "/media").unwrap();
+    fn exact_stream_route_is_mainnet_hls() {
+        let route =
+            parse_networked_resource_route(&format!("/weeb-3/stream/{OWNER}/{TOPIC}")).unwrap();
+        assert_eq!(route.network, NetworkMode::Mainnet);
+        assert_eq!(
+            route.resource,
+            ResourceRoute::Hls {
+                owner: OWNER.to_string(),
+                topic: TOPIC.to_string(),
+            }
+        );
 
-        assert_eq!(
-            route_network_mode_from_path(&format!("/media/feeds/{OWNER}/{TOPIC}")),
-            Some(NetworkMode::Mainnet)
-        );
-        assert_eq!(
-            route_network_mode_from_path(&format!("/media/testnet/feeds/{OWNER}/{TOPIC}")),
-            Some(NetworkMode::Testnet)
-        );
-        assert_eq!(
-            parse_networked_resource_route(&format!(
-                "https://streams.example/media/mainnet/bzz/{REFERENCE}/index.html"
-            ))
-            .map(|route| route.network),
-            Some(NetworkMode::Mainnet)
-        );
-        assert_eq!(
-            route_network_mode_from_path(&format!("/weeb-3/bytes/{REFERENCE}")),
-            None,
-            "a configured npm mount must not claim the default standalone base"
-        );
+        for alias in [
+            format!("/weeb-3/mainnet/stream/{OWNER}/{TOPIC}"),
+            format!("/weeb-3/testnet/stream/{OWNER}/{TOPIC}"),
+            format!("/weeb-3/stream/{OWNER}/{TOPIC}/69"),
+        ] {
+            assert!(parse_networked_resource_route(&alias).is_none());
+        }
     }
 
     #[test]
-    fn invalid_and_removed_routes_do_not_acquire_a_network() {
-        configure_streaming_routes("/weeb-3/service.js", "/weeb-3").unwrap();
-
+    fn invalid_routes_do_not_acquire_a_network() {
         for path in [
             "/weeb-3/",
             "/weeb-3/testnetish/bzz",
@@ -2381,20 +1845,19 @@ mod network_routes {
         }
     }
 }
-
 mod service_worker {
-    use crate::stream_conventions;
-
     const STATIC_WORKER: &str = include_str!("../static/service.js");
     const INTERFACE: &str = include_str!("../src/interface.rs");
     const INTERFACE_RUNTIME: &str = include_str!("../src/interface_runtime_conventions.rs");
     const HLS_PLAYER: &str = include_str!("../src/stream_hls.rs");
     const LIBRARY: &str = include_str!("../src/library.rs");
     const STATIC_HLS_LOADER: &str = include_str!("../static/hls_loader.js");
-    const STATIC_HLS_EXAMPLE: &str = include_str!("../static/hls-stream-example.html");
+    const STATIC_EXAMPLE: &str = include_str!("../static/example.html");
+    const HLS_STREAM_EXAMPLE: &str = include_str!("../static/hls-stream-example.html");
     const MAIN_SERVER: &str = include_str!("../src/main.rs");
     const HAXE_BUILD: &str = include_str!("../Code_One.hx");
     const NPM_WORKFLOW: &str = include_str!("../.github/workflows/plain.yml");
+    const NPM_README: &str = include_str!("../README.npm.md");
     const RUNTIME: &str = include_str!("../src/lib.rs");
     const UPLOAD: &str = include_str!("../src/upload.rs");
 
@@ -2407,18 +1870,25 @@ mod service_worker {
     }
 
     #[test]
-    fn hls_javascript_boundary_is_one_lazy_static_loader() {
-        let docs_root_loader = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("docs")
-            .join("hls_loader.js");
+    fn hls_javascript_boundary_is_one_lazy_loader() {
         assert!(
-            !docs_root_loader.exists(),
-            "the loader source belongs in static; docs snippets are generated by Haxe"
+            !std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("docs")
+                .join("hls_loader.js")
+                .exists()
         );
-
         assert!(STATIC_HLS_LOADER.contains("export async function loadHls()"));
         assert!(STATIC_HLS_LOADER.contains("import(\"hls.js\")"));
         assert!(HLS_PLAYER.contains("module = \"/static/hls_loader.js\""));
+        let open = source_between(
+            HLS_PLAYER,
+            "async fn open_hls_feed_view_generation(",
+            "fn create_hls_player()",
+        );
+        let loader_start = open.find("JsFuture::from(load_hls())").unwrap();
+        let worker_ready = open.find("prepare_hls_feed_target").unwrap();
+        assert!(loader_start < worker_ready);
+        assert!(open.contains("hls_loader,\n            view_generation"));
 
         for policy in [
             "maxBufferLength",
@@ -2426,144 +1896,61 @@ mod service_worker {
             "recoverMediaError",
             "AbortController",
         ] {
+            assert!(!STATIC_HLS_LOADER.contains(policy));
+        }
+    }
+
+    #[test]
+    fn hls_example_uses_the_retained_shared_interface_api() {
+        assert!(HLS_STREAM_EXAMPLE.contains(r#"import init, { Weeb3No103 } from "./weeb_3.js""#));
+        assert!(HLS_STREAM_EXAMPLE.contains(r#"history.replaceState(null, "", streamPath)"#));
+        assert!(HLS_STREAM_EXAMPLE.contains("node.renderInterface(mount)"));
+        assert!(!HLS_STREAM_EXAMPLE.contains("node.start("));
+        assert!(
+            MAIN_SERVER.contains(r#".route("/weeb-3/hls-stream-example.html", get(get_example))"#)
+        );
+        assert!(HAXE_BUILD.contains("cp', [ './static/hls-stream-example.html', './docs/' ]"));
+        assert!(!HAXE_BUILD.contains("rm', [ '-f', './docs/hls-stream-example.html' ]"));
+        assert!(!HAXE_BUILD.contains("git', ['add', '-f', './static/hls-stream-example.html'"));
+        assert!(!HAXE_BUILD.contains("git', ['add', '-f', './static/hls_loader.js'"));
+        assert!(!STATIC_EXAMPLE.contains("hls.js"));
+        assert!(!NPM_README.contains("one active `Weeb3No103` node and HLS session"));
+
+        for removed in [
+            "openStreamFeed",
+            "open_stream_feed",
+            "playHlsStream",
+            "play_hls_stream",
+            "attachHlsStream",
+            "attach_hls_stream",
+            "detachHlsStream",
+            "detach_hls_stream",
+            "configureStreamingRoutes",
+            "configure_streaming_routes",
+            "uploadRedundancyOptions",
+            "defaultUploadRedundancyLevel",
+        ] {
+            assert!(!LIBRARY.contains(removed), "library exports {removed}");
             assert!(
-                !STATIC_HLS_LOADER.contains(policy),
-                "HLS policy leaked into the JavaScript bridge: {policy}"
+                !HLS_STREAM_EXAMPLE.contains(removed),
+                "HLS example uses removed API {removed}"
+            );
+            assert!(
+                !NPM_WORKFLOW.contains(removed),
+                "npm workflow exports {removed}"
             );
         }
     }
 
     #[test]
-    fn static_hls_example_opens_the_unindexed_test_feed_from_its_own_scope() {
-        assert!(
-            STATIC_HLS_EXAMPLE
-                .contains(r#"const owner = "6F2728386F8a47ef5EBe323721188e630Ff0FdE9";"#)
-        );
-        assert!(
-            STATIC_HLS_EXAMPLE.contains(r#"const topic = "b347b89b-933c-424f-a3d1-403bdd270b25";"#)
-        );
-        assert!(
-            STATIC_HLS_EXAMPLE.contains(r#"<video id="stream" controls autoplay playsinline"#),
-            "the application should visibly own the media element"
-        );
-        assert!(
-            STATIC_HLS_EXAMPLE.contains("node.attachHlsStream(media, owner, topic, {")
-                && STATIC_HLS_EXAMPLE.contains(r#"start: "beginning""#),
-            "the example feed has no pinned index"
-        );
-        assert!(!STATIC_HLS_EXAMPLE.contains("const index ="));
-        assert!(!STATIC_HLS_EXAMPLE.contains("renderInterface"));
-        assert!(!STATIC_HLS_EXAMPLE.contains("playHlsStream"));
-        assert!(STATIC_HLS_EXAMPLE.contains("node.start({ mainnet: true })"));
-        assert!(STATIC_HLS_EXAMPLE.contains(r#"media.addEventListener("waiting""#));
-        assert!(
-            STATIC_HLS_EXAMPLE.contains(r#"media.addEventListener("weeb3-hls-manifest-ready""#)
-        );
-        assert!(STATIC_HLS_EXAMPLE.contains("node?.detachHlsStream()"));
-        assert!(STATIC_HLS_EXAMPLE.contains(r#"new URL("service.js", directory).href"#));
-        assert!(
-            STATIC_HLS_EXAMPLE
-                .contains(r#"const routeBase = directory.pathname.replace(/\/$/, "") || "/";"#)
-        );
-
-        assert!(MAIN_SERVER.contains(r#""/weeb-3/hls-stream-example.html","#));
-        assert!(MAIN_SERVER.contains(r#"StaticFiles::get("hls-stream-example.html")"#));
-        assert!(HAXE_BUILD.contains(
-            r#"clientele('cp', [ './static/hls-stream-example.html', './docs/' ], count);"#
-        ));
-        assert!(HAXE_BUILD.contains(
-            r#"clientele('git', ['add', '-f', './static/hls-stream-example.html', './static/hls_loader.js'], count);"#
-        ));
-        assert!(
-            !NPM_WORKFLOW.contains("hls-stream-example.html"),
-            "the standalone example is served/copied, not published in the npm package"
-        );
-    }
-
-    #[test]
-    fn npm_hls_attachment_is_a_dom_adapter_over_the_shared_rust_pipeline() {
-        let adapter = source_between(
-            LIBRARY,
-            "pub async fn attach_hls_stream(",
-            "#[wasm_bindgen(js_name = attach_hls_stream)]",
-        );
-        assert!(adapter.contains("media: HtmlMediaElement"));
-        assert!(adapter.contains("install_service_worker_message_bridge(self.inner.clone())"));
-        assert!(adapter.contains("self.boot_runtime().await"));
-        assert!(adapter.contains("stream_hls::attach_hls_feed_media("));
-        assert!(!adapter.contains("interface_result_view_is_mounted"));
-        assert!(!adapter.contains("render_interface_shell"));
-        assert!(!adapter.contains("create_element"));
-
-        let detach = source_between(
-            LIBRARY,
-            "pub fn detach_hls_stream(&self)",
-            "#[wasm_bindgen(js_name = detach_hls_stream)]",
-        );
-        assert!(detach.contains("begin_result_view_request()"));
-        assert!(detach.contains("release_current_stream_view()"));
-
-        let preparation = source_between(
-            HLS_PLAYER,
-            "async fn prepare_hls_feed_target(",
-            "async fn attach_hls_feed_player(",
-        );
-        assert!(preparation.contains("service_worker_controls_bzz_requests("));
-        assert!(preparation.contains("canonical_hls_feed_url("));
-
-        let attachment = source_between(
-            HLS_PLAYER,
-            "async fn attach_hls_feed_player(",
-            "pub(crate) async fn attach_hls_feed_media(",
-        );
-        assert!(attachment.contains("install_hls_prefetch_lifecycle("));
-        assert!(attachment.contains("play_hls(player, &target.source)"));
-
-        let bundled_ui = source_between(
-            HLS_PLAYER,
-            "async fn open_hls_feed_view_generation(",
-            "fn render_stream_catalog(",
-        );
-        assert!(bundled_ui.contains("prepare_hls_feed_target("));
-        assert!(bundled_ui.contains("attach_hls_feed_player("));
-    }
-
-    #[test]
-    fn hls_open_intent_is_explicit_and_initial_warmup_gets_one_fresh_window() {
-        assert!(HLS_PLAYER.contains("pub(crate) enum HlsOpenIntent"));
-        assert!(HLS_PLAYER.contains("Beginning,"));
-        assert!(HLS_PLAYER.contains("CurrentWindow,"));
-        assert!(HLS_PLAYER.contains("index_hint.is_none() && self == Self::Beginning"));
-        assert!(!HLS_PLAYER.contains("current_view_requests_hls_sequence_zero_start"));
-
-        let warmup = source_between(
-            HLS_PLAYER,
-            "fn activate_hls_prefetch_warmup()",
-            "fn retire_hls_prefetch_timeline()",
-        );
-        assert!(warmup.contains("session.mode == HlsPrefetchMode::Inactive"));
-        assert!(warmup.contains("initial_warmup || timeline_rebasing"));
-        assert!(
-            warmup
-                .contains("session.startup_deadline_ms = now_ms + HLS_INITIAL_RESPONSE_BUDGET_MS")
-        );
-        assert_eq!(
-            warmup
-                .matches("session.startup_deadline_ms = now_ms + HLS_INITIAL_RESPONSE_BUDGET_MS")
-                .count(),
-            1,
-            "playlist reloads must not keep extending startup speculation"
-        );
-    }
-
-    #[test]
-    fn npm_and_bundled_interface_share_the_core_runtime_and_current_network_dial_path() {
+    fn npm_and_interface_share_the_core_runtime_and_network_dial_path() {
         assert!(RUNTIME.contains("runtime_started: AtomicBool"));
         assert!(RUNTIME.contains("self.runtime_started.swap(true, Ordering::AcqRel)"));
         assert!(LIBRARY.contains("inner: Arc<Weeb3>"));
         assert!(!LIBRARY.contains("Swarm<Behaviour>"));
         assert!(LIBRARY.contains("start_weeb3_runtime(inner.clone())"));
         assert!(LIBRARY.contains("connect_bootnode_for_current_network("));
+
         let npm_start = source_between(
             LIBRARY,
             "fn schedule_start(&self, options: StartOptions)",
@@ -2571,108 +1958,59 @@ mod service_worker {
         );
         assert!(npm_start.contains("install_service_worker_message_bridge(self.inner.clone())"));
         assert!(npm_start.contains("get_service_worker().await"));
+
         let implicit_start = source_between(
             LIBRARY,
             "fn start_options_from_js(options: Option<JsValue>)",
-            "struct HlsStreamOptions",
+            "async fn call_promise(",
         );
         assert!(implicit_start.contains("route_network_mode_from_location()"));
         assert!(INTERFACE_RUNTIME.contains("connect_bootnode_for_current_network("));
         assert!(RUNTIME.contains("pub(crate) async fn connect_bootnode_for_current_network("));
-
-        let network_switch = source_between(
-            RUNTIME,
-            "pub async fn set_network_id(&self, id: String)",
-            "async fn current_connection_generation(&self)",
-        );
-        let profile_sync = network_switch
-            .find("if let Some(profile) = profile_for_swarm_network_id(parsed_id)")
-            .expect("active network profile synchronization");
-        let changed_check = network_switch
-            .find("if *nid != parsed_id")
-            .expect("physical network change check");
-        assert!(
-            profile_sync < changed_check,
-            "the global secure/on-chain profile must synchronize even when a new node already stores that id"
-        );
     }
 
     #[test]
-    fn npm_data_plane_exports_cross_the_shared_runtime_barrier() {
+    fn npm_data_plane_uses_the_shared_startup_barrier() {
         for (start, end) in [
-            (
-                "pub async fn open_stream_feed(&self",
-                "#[wasm_bindgen(js_name = open_stream_feed)]",
-            ),
-            (
-                "pub async fn attach_hls_stream(",
-                "#[wasm_bindgen(js_name = attach_hls_stream)]",
-            ),
-            (
-                "pub async fn play_hls_stream(",
-                "#[wasm_bindgen(js_name = play_hls_stream)]",
-            ),
             (
                 "pub async fn retrieve(&self",
                 "#[wasm_bindgen(js_name = retrieveBytes)]",
             ),
-            (
-                "pub async fn retrieve_bytes(&self",
-                "#[wasm_bindgen(js_name = retrieve_bytes)]",
-            ),
-            (
-                "pub async fn retrieve_chunk(&self",
-                "#[wasm_bindgen(js_name = retrieve_chunk)]",
-            ),
-            (
-                "pub async fn post_push_chunk_js(",
-                "#[wasm_bindgen(js_name = post_push_chunk)]",
-            ),
+            ("pub async fn post_push_chunk_js(", "pub async fn upload("),
             (
                 "pub async fn upload_with_redundancy(",
-                "#[wasm_bindgen(js_name = post_upload)]",
-            ),
-            (
-                "pub async fn acquire_feed(&self",
-                "#[wasm_bindgen(js_name = acquire_feed)]",
+                "#[wasm_bindgen(js_name = postUploadBytes)]",
             ),
             (
                 "pub async fn acquire_feed_bytes(&self",
-                "#[wasm_bindgen(js_name = acquire_feed_bytes)]",
+                "#[wasm_bindgen(js_name = batchState)]",
             ),
         ] {
-            let operation = source_between(LIBRARY, start, end);
             assert!(
-                operation.contains("self.boot_runtime().await"),
-                "{start} bypasses the shared npm startup barrier"
+                source_between(LIBRARY, start, end).contains("self.boot_runtime().await"),
+                "{start} bypasses the shared startup barrier"
             );
         }
     }
 
     #[test]
-    fn npm_render_mount_uses_the_startup_barrier_and_cannot_reopen_a_superseded_route() {
+    fn npm_render_mount_cannot_reopen_a_superseded_route() {
         let render = source_between(
             LIBRARY,
             "pub fn render_interface(&self, container: Element)",
-            "#[wasm_bindgen(js_name = render_interface)]",
+            "#[wasm_bindgen(js_name = networkState)]",
         );
         assert!(render.contains("self.startup_pending.fetch_add(1, Ordering::AcqRel)"));
         assert!(render.contains("let guard = serial.lock().await"));
         assert!(render.contains("route_network_mode_from_location()"));
-        assert!(render.contains("startup_already_configured"));
-        assert!(render.contains("!startup_already_configured || route_changed_network"));
         assert!(render.contains("pending.fetch_sub(1, Ordering::AcqRel)"));
         assert!(render.contains("Some(initial_result_generation)"));
-        let dial_position = render
-            .find("schedule_bootnode_dials(")
-            .expect("render bootnode dial scheduling");
-        let barrier_release_position = render
+
+        let dial = render.find("schedule_bootnode_dials(").unwrap();
+        let release = render
             .find("pending.fetch_sub(1, Ordering::AcqRel)")
-            .expect("render startup barrier release");
-        assert!(
-            dial_position < barrier_release_position,
-            "render must queue connection buildup before npm operations proceed"
-        );
+            .unwrap();
+        assert!(dial < release);
 
         let mount = source_between(
             INTERFACE,
@@ -2706,14 +2044,7 @@ mod service_worker {
     }
 
     #[test]
-    fn uncached_hls_foregrounds_keep_the_stable_startup_head_start() {
-        let retrieval = source_between(
-            HLS_PLAYER,
-            "async fn retrieve_hls_payload_for_playback(",
-            "fn cached_hls_asset_metadata(",
-        );
-        assert!(retrieval.contains("let overlap_head_start_ms = if foreground_cached"));
-        assert!(retrieval.contains("if foreground_cached"));
+    fn hls_prefetch_reserves_foreground_capacity() {
         assert!(
             HLS_PLAYER
                 .contains("const HLS_EXACT_NEXT_HEAD_START: Duration = Duration::from_secs(1);")
@@ -2722,18 +2053,14 @@ mod service_worker {
             HLS_PLAYER
                 .contains("const HLS_NEXT_RESERVE_STAGGER: Duration = Duration::from_secs(1);")
         );
-    }
-
-    #[test]
-    fn hls_steady_state_reserves_foreground_with_three_speculative_bodies() {
         assert!(HLS_PLAYER.contains("const HLS_PREFETCH_BODY_MAX_PARALLEL: usize = 3;"));
+
         let cache = source_between(HLS_PLAYER, "fn load_role(", "fn finish_load(");
         assert!(cache.contains(
             ".filter(|pending| pending.speculative && pending.generation == generation)"
         ));
         assert!(cache.contains("speculative_loads >= HLS_PREFETCH_BODY_MAX_PARALLEL"));
         assert!(cache.contains("pending.speculative = false;"));
-        assert!(!HLS_PLAYER.contains("HLS_ACTIVE_BODY_MAX_PARALLEL"));
 
         let stages = source_between(
             HLS_PLAYER,
@@ -2741,11 +2068,10 @@ mod service_worker {
             "async fn retrieve_hls_payload_for_playback(",
         );
         assert!(stages.contains("loads.len() < HLS_PREFETCH_BODY_MAX_PARALLEL"));
-        assert!(!stages.contains("immediate_successor_ready"));
     }
 
     #[test]
-    fn terminal_hls_failures_retry_quickly_without_a_four_x_dead_end() {
+    fn transient_hls_failures_retry_without_a_four_x_dead_end() {
         let policy = source_between(
             HLS_PLAYER,
             "fn swarm_load_policy() -> Object {",
@@ -2779,19 +2105,24 @@ mod service_worker {
         assert!(
             feed.contains(r#"FetchResponse::error(503, "weeb-3 did not retrieve feed update")"#)
         );
+        assert!(
+            feed.contains(r#"FetchResponse::error(502, "feed update is not an HLS manifest")"#)
+        );
+        assert!(!feed.contains("serde_json"));
+        assert!(!feed.contains("application/octet-stream"));
     }
 
     #[test]
     fn runtime_logging_is_bounded_off_the_network_hot_path() {
         assert!(RUNTIME.contains("mpsc::bounded::<String>(LOG_QUEUE_CAPACITY)"));
         assert!(RUNTIME.contains("for _ in 0..LOG_DRAIN_BATCH"));
-        assert!(RUNTIME.contains("if DEBUG_RUNTIME_LOGS"));
+        assert!(!RUNTIME.contains("DEBUG_RUNTIME_LOGS"));
         assert!(INTERFACE_RUNTIME.contains("logs.child_element_count() > crate::LOG_DOM_RETAINED"));
         assert!(UPLOAD.contains("logs.child_element_count() > crate::LOG_DOM_RETAINED"));
     }
 
     #[test]
-    fn worker_dispatches_accounting_sensitive_work_once_and_tolerates_late_responses() {
+    fn accounting_sensitive_work_is_dispatched_once_and_may_finish_late() {
         let selection = source_between(
             STATIC_WORKER,
             "async function firstReadyClient(candidates, requiredNetworkId)",
@@ -2803,24 +2134,18 @@ mod service_worker {
         let dispatch = source_between(
             STATIC_WORKER,
             "function messageFirstClient(clients, message, timeoutMs = FETCH_TIMEOUT_MS)",
-            "function hlsRequestFlightKey(",
+            "function toUint8Array(body)",
         );
         assert!(dispatch.contains("return messageClient(clients[0], message, timeoutMs)"));
         assert!(!dispatch.contains("Promise.race"));
         assert!(!dispatch.contains("AbortController"));
+        assert!(dispatch.contains("const existing = HLS_REQUEST_FLIGHTS.get(key)"));
+        assert!(dispatch.contains("if (existing)"));
+        assert!(dispatch.contains("return existing"));
 
-        assert!(
-            INTERFACE.contains("event.stop_immediate_propagation()"),
-            "one runtime bridge must claim each worker operation"
-        );
-        assert!(
-            !INTERFACE.contains("port.post_message(&resp).unwrap()"),
-            "a response arriving after its browser port closes must not trap"
-        );
-        assert!(
-            INTERFACE.contains("let _ = port.post_message(&resp);"),
-            "late response delivery must be best-effort after Rust work drains"
-        );
+        assert!(INTERFACE.contains("event.stop_immediate_propagation()"));
+        assert!(!INTERFACE.contains("port.post_message(&resp).unwrap()"));
+        assert!(INTERFACE.contains("let _ = port.post_message(&resp);"));
     }
 
     #[test]
@@ -2835,12 +2160,11 @@ mod service_worker {
         assert!(selection.contains("clientInScope(eventClient)"));
         assert!(selection.contains("return [eventClient]"));
         assert!(selection.contains("return firstReadyClient(candidates, requiredNetworkId)"));
-        assert!(!STATIC_WORKER.contains("APP_HLS_EXAMPLE"));
         assert!(INTERFACE.contains("if active_network_id != required_network_id"));
     }
 
     #[test]
-    fn worker_routes_only_explicit_weeb3_requests_to_the_matching_network() {
+    fn worker_routes_only_explicit_requests_to_the_matching_network() {
         let route_network = source_between(
             STATIC_WORKER,
             "function canonicalRouteNetworkId(pathname)",
@@ -2848,32 +2172,20 @@ mod service_worker {
         );
         assert!(route_network.contains("first === \"testnet\" ? 10 : 1"));
 
-        let client_selection = source_between(
-            STATIC_WORKER,
-            "async function requestClients(event, requestUrl, requiredNetworkId)",
-            "function closeMessagePort(",
-        );
-        assert!(
-            client_selection.contains("return firstReadyClient(candidates, requiredNetworkId)")
-        );
-
-        assert!(INTERFACE.contains("if active_network_id != required_network_id"));
-        assert!(INTERFACE.contains("weeb3.service_worker_network_id()"));
-
         let fetch_handler = source_between(
             STATIC_WORKER,
             "self.addEventListener(\"fetch\", (event) => {",
             "function clientInScope(client)",
         );
-        for explicit_route in [
+        for route in [
             "isBzzUploadPath",
             "canonicalBzzResource",
             "canonicalRawResource",
             "canonicalFeedResource",
         ] {
             assert!(
-                fetch_handler.contains(explicit_route),
-                "missing explicit worker route: {explicit_route}"
+                fetch_handler.contains(route),
+                "missing worker route {route}"
             );
         }
         assert!(fetch_handler.contains("if (url.origin !== SCOPE.origin)"));
@@ -2881,6 +2193,15 @@ mod service_worker {
         assert!(!fetch_handler.contains("respondWith(fetchOrError(request))"));
         assert!(!STATIC_WORKER.contains("cache.addAll("));
         assert!(!STATIC_WORKER.contains("caches.delete("));
+
+        let raw_routes = source_between(
+            STATIC_WORKER,
+            "function canonicalRawResource(url)",
+            "function canonicalFeedResource(url)",
+        );
+        assert!(raw_routes.contains("for (const [marker, rawType] of rawRouteMarkers())"));
+        assert!(raw_routes.contains(r#"rawType === "hls-bytes" && !isSwarmReference(resource)"#));
+        assert!(raw_routes.contains("return resource;"));
     }
 
     #[test]
@@ -2895,164 +2216,48 @@ mod service_worker {
             INTERFACE_RUNTIME
                 .contains("service worker still activating for {}; retrying without a reload")
         );
-        assert!(INTERFACE_RUNTIME.contains("service_worker_protocol_request("));
 
         let setup = source_between(
             INTERFACE_RUNTIME,
             "pub async fn get_service_worker()",
             "fn controlled_service_worker()",
         );
-        assert!(INTERFACE_RUNTIME.contains("static SERVICE_WORKER_SETUP_LOCK:"));
         assert!(setup.contains("SERVICE_WORKER_SETUP_LOCK.with(std::rc::Rc::clone)"));
         assert!(setup.contains("setup_lock.lock().await"));
-        let lock_position = setup
-            .find("setup_lock.lock().await")
-            .expect("setup lock acquisition");
-        let registration_position = setup
-            .find("service_worker_registration(&service0).await")
-            .expect("registration lookup");
-        assert!(lock_position < registration_position);
-
-        let control_wait = source_between(
-            INTERFACE_RUNTIME,
-            "async fn wait_for_service_worker_control(",
-            "pub(crate) async fn service_worker_controls_bzz_requests(",
-        );
-        let no_controller = source_between(
-            control_wait,
-            "if controlled_service_worker().is_none() {",
-            "// Registration, activation, controllerchange",
-        );
-        assert!(no_controller.contains("continue;"));
-        assert!(!no_controller.contains("protocol_probes ="));
-        let probe_loop = control_wait
-            .split_once("for _ in 0..probes {")
-            .map(|(_, body)| body)
-            .expect("follow-up protocol probe loop");
-        let controller_check = probe_loop
-            .find("if controlled_service_worker().is_none()")
-            .expect("controller check inside probe loop");
-        let probe_increment = probe_loop
-            .find("protocol_probes = protocol_probes.saturating_add(1)")
-            .expect("follow-up probe increment");
-        assert!(controller_check < probe_increment);
 
         let readiness = INTERFACE_RUNTIME
             .split_once("pub(crate) async fn service_worker_controls_bzz_requests(")
             .map(|(_, body)| body)
-            .expect("worker readiness function");
+            .unwrap();
         assert!(
             readiness.contains("Duration::from_millis(SERVICE_WORKER_CONTROL_TOTAL_TIMEOUT_MS)")
         );
-        let readiness_lower = readiness.to_ascii_lowercase();
-        assert!(!readiness_lower.contains("please reload"));
-        assert!(!readiness_lower.contains("reload the page"));
+        let readiness = readiness.to_ascii_lowercase();
+        assert!(!readiness.contains("please reload"));
+        assert!(!readiness.contains("reload the page"));
         assert!(!INTERFACE_RUNTIME.contains("location.reload"));
     }
 
     #[test]
-    fn direct_stream_share_routes_are_document_shells_only() {
-        const OWNER: &str = "352eabdea9cb05e984a8828d2a6df3d3b5023260";
-
-        for path in [
-            format!("/weeb-3/stream/{OWNER}/topic"),
-            format!("/weeb-3/stream/0x{OWNER}/topic%2Fpart"),
-            format!("/weeb-3/testnet/stream/{OWNER}/topic/7"),
-            "/weeb-3/stream/6F2728386F8a47ef5EBe323721188e630Ff0FdE9/0d216633-3475-4c26-8dd0-9935ef854bbc".to_string(),
-            "/weeb-3/stream/6F2728386F8a47ef5EBe323721188e630Ff0FdE9/ba5c0dc4-2e20-4c08-a10a-c283d32b1af0/69".to_string(),
-            "/weeb-3/stream/6F2728386F8a47ef5EBe323721188e630Ff0FdE9/b347b89b-933c-424f-a3d1-403bdd270b25".to_string(),
-        ] {
-            assert!(
-                stream_conventions::is_direct_share_route(&path),
-                "share route was not recognized: {path}"
-            );
-        }
-
-        const REFERENCE: &str = "919b5395bf7a59cbb3b365769de09a2b15ac5d897823dda9270259a3c038d574";
-        for path in [
-            "/weeb-3/".to_string(),
-            "/weeb-3/mainnet".to_string(),
-            format!("/weeb-3/mainnet/stream/{OWNER}/topic"),
-            format!("/weeb-3/mainnet/feed/{OWNER}/topic"),
-            format!("/weeb-3/mainnet/feeds/{OWNER}/topic"),
-            format!("/weeb-3/watch/{OWNER}/topic"),
-            format!("/weeb-3/hls/{OWNER}/topic"),
-            format!("/weeb-3/mainnet/hls/video/{OWNER}/topic"),
-            format!("/weeb-3/mainnet/watch/video/{OWNER}/topic"),
-            format!("/weeb-3/testnet/hls/video/{OWNER}/topic"),
-            format!("/weeb-3/testnet/watch/video/{OWNER}/topic"),
-            format!("/weeb-3/MAINNET/STREAM/{OWNER}/topic"),
-            format!("/weeb-3/stream/not-an-owner/topic"),
-            format!("/weeb-3/stream/{OWNER}"),
-            format!("/weeb-3/stream/{OWNER}/topic/"),
-            format!("/weeb-3/stream/{OWNER}/topic/not-a-number"),
-            format!("/weeb-3/stream/{OWNER}/topic/18446744073709551616"),
-            format!("/weeb-3/stream/{OWNER}/topic/1/extra"),
-            format!("/weeb-3/stream/{OWNER}/bad%escape"),
-            format!("/weeb-3/stream/{OWNER}/control%C2%80topic"),
-            format!("/other/stream/{OWNER}/topic"),
-            format!("/weeb-3/hls/bytes/{REFERENCE}"),
-        ] {
-            assert!(
-                !stream_conventions::is_direct_share_route(&path),
-                "non-share route was recognized: {path}"
-            );
-        }
-
-        assert!(stream_conventions::is_document_navigation(
-            "GET",
-            Some("navigate"),
-            Some("document"),
-            Some("text/html,application/xhtml+xml")
-        ));
-        assert!(!stream_conventions::is_document_navigation(
-            "GET",
-            Some("cors"),
-            Some("empty"),
-            Some("text/html")
-        ));
-        assert!(stream_conventions::is_document_navigation(
-            "GET",
-            None,
-            None,
-            Some("text/html")
-        ));
-        assert!(!stream_conventions::is_document_navigation(
-            "POST",
-            Some("navigate"),
-            Some("document"),
-            Some("text/html")
-        ));
-        assert!(!stream_conventions::is_document_navigation(
-            "GET",
-            Some("navigate"),
-            Some("iframe"),
-            Some("text/html")
-        ));
-        assert!(!stream_conventions::is_document_navigation(
-            "GET",
-            Some("cors"),
-            Some("empty"),
-            Some("application/vnd.apple.mpegurl,*/*")
-        ));
-    }
-
-    #[test]
-    fn server_and_worker_expose_only_canonical_stream_shell_routes() {
-        assert!(MAIN_SERVER.contains(".route(\"/{*wildcard}\", get(get_fallback))"));
-        assert!(MAIN_SERVER.contains("is_direct_share_route(uri.path())"));
-        assert!(MAIN_SERVER.contains("is_document_navigation("));
+    fn server_and_worker_expose_only_the_exact_stream_shell_route() {
+        assert!(
+            MAIN_SERVER.contains(r#".route("/weeb-3/stream/{owner}/{topic}", get(get_stream))"#)
+        );
+        assert!(MAIN_SERVER.contains(r#".route("/{*wildcard}", get(get_404))"#));
+        assert!(!MAIN_SERVER.contains("watch/video"));
+        assert!(MAIN_SERVER.contains("/weeb-3/hls-stream-example.html"));
 
         let worker_matcher = source_between(
             STATIC_WORKER,
             "function isDirectShareShellPath(pathname)",
             "function isBzzUploadPath(pathname)",
         );
-        assert!(worker_matcher.contains("kind !== \"stream\""));
-        assert!(worker_matcher.contains("if (parts[0] === \"testnet\")"));
+        assert!(worker_matcher.contains("parts.length === 3"));
+        assert!(worker_matcher.contains("parts[0] === \"stream\""));
+        assert!(worker_matcher.contains("/^[a-fA-F0-9]{40}$/"));
+        assert!(!worker_matcher.contains("testnet"));
         assert!(!worker_matcher.contains("mainnet"));
-        assert!(!worker_matcher.contains("watch"));
-        assert!(!worker_matcher.contains("video"));
+        assert!(!worker_matcher.contains("index"));
 
         let fetch_handler = source_between(
             STATIC_WORKER,
@@ -3061,11 +2266,9 @@ mod service_worker {
         );
         assert!(fetch_handler.contains("isAppShellNavigation(request)"));
         assert!(fetch_handler.contains("isDirectShareShellPath(url.pathname)"));
-        assert!(!MAIN_SERVER.contains("watch/video"));
         assert!(!STATIC_WORKER.contains("watch/video"));
     }
 }
-
 mod hls_payload_cancellation {
     const RETRIEVAL: &str = include_str!("../src/retrieval.rs");
     const HLS_STREAM: &str = include_str!("../src/stream_hls.rs");
@@ -3305,7 +2508,8 @@ mod stream_reader_concurrency {
             "async fn prefetch_hls_media_stages(",
             "async fn retrieve_hls_payload_for_playback(",
         );
-        assert!(hls_prefetch.contains("hls_prefetch_ahead_limit_bytes()"));
+        assert!(hls_prefetch.contains("media_prefetch_ahead_limit_bytes("));
+        assert!(hls_prefetch.contains("hls_payload_cache_capacity_bytes()"));
         assert!(hls_prefetch.contains("if planned_bytes >= ahead_limit_bytes"));
         assert!(hls_prefetch.contains("planned_bytes < ahead_limit_bytes"));
         assert!(hls_prefetch.contains("plan_media_prefetch_batch("));
@@ -3330,6 +2534,7 @@ mod stream_reader_concurrency {
         );
         assert!(begin_hls.contains("clear_completed_bzz_media_ranges()"));
         assert!(begin_hls.contains("pending/dispatched reads keep their transport"));
+        assert!(!begin_hls.contains("sequence_zero_start_requested"));
 
         let window = source_section(
             "async fn read_range_window(",

@@ -14,53 +14,54 @@ path = "src/main.rs"
 [lib]
 crate-type = ["cdylib"]
 
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = ["-O", "--all-features"]
+
 [dependencies]
-anyhow = { git = "https://github.com/dtolnay/anyhow.git" }
 rand = "0.8"
 prost = { git = "https://github.com/tokio-rs/prost.git" }
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = { git = "https://github.com/serde-rs/json.git" }
-getrandom = { version = "0.3.3", features = ["wasm_js"] }
 event-listener = "5.4.1"
+futures = "0.3.33"
 
 
 [build-dependencies]
 prost-build = { git = "https://github.com/tokio-rs/prost.git" }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+anyhow = { git = "https://github.com/dtolnay/anyhow.git" }
 axum = { git = "https://github.com/tokio-rs/axum.git" }
-axum-server = { git = "https://github.com/programatik29/axum-server.git", features = ["tls-rustls"] }
-rustls = { version = "0.23", features = ["ring","logging","tls12"]}
+axum-server = { git = "https://github.com/programatik29/axum-server.git", features = ["tls-rustls-no-provider"] }
+rustls = { version = "0.23", default-features = false, features = ["ring","std","tls12"]}
 rust-embed = { version = "8.7.1", features = ["include-exclude", "interpolate-folder-path"] }
-tokio = { version = "1.38.0", default-features = false, features = ["macros", "net", "rt", "signal", "rt-multi-thread"] }
+tokio = { version = "1.38.0", default-features = false, features = ["macros", "net", "rt"] }
 tower-http = { git = "https://github.com/tower-rs/tower-http.git", features = ["cors"] }
-mime_guess = { git = "https://github.com/abonander/mime_guess.git" }
 # rcgen 0.13.2 does not compile with time 0.3.48 under Rust 1.96.
 time = "=0.3.47"
-libp2p = { git = "https://github.com/libp2p/rust-libp2p.git", rev = "8072a73f62f07adc273e4270a22564f94462b58c", features = [ "ecdsa", "ed25519", "macros", "ping", "tokio"] }
-libp2p-webrtc = { git = "https://github.com/libp2p/rust-libp2p.git", rev = "8072a73f62f07adc273e4270a22564f94462b58c", features = [ "tokio"] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-ethers = { git = "https://github.com/gakonst/ethers-rs.git" }
-alloy = { git = "https://github.com/alloy-rs/alloy.git", features = [
+ethers = { git = "https://github.com/gakonst/ethers-rs.git", default-features = false, features = ["abigen"] }
+alloy = { git = "https://github.com/alloy-rs/alloy.git", default-features = false, features = [
+    "std",
     "k256",
-    "network",
     "signer-local",
-    "wasm-bindgen",
 ] }
 getrandom = { version = "0.3.3", features = ["wasm_js"] }
-alloy-signer-local = { git = "https://github.com/alloy-rs/alloy.git" }
 async-std = { git = "https://github.com/async-rs/async-std.git" }
 console_error_panic_hook = "0.1.7"
 libp2p = { git = "https://github.com/libp2p/rust-libp2p.git", rev = "8072a73f62f07adc273e4270a22564f94462b58c", features = [ 
-"autonat",
-"dcutr",
 "ecdsa",
 "identify", 
 "macros",
 "noise",
 "ping", 
-"secp256k1", 
 "wasm-bindgen", 
 "websocket-websys",
 "yamux",
@@ -73,27 +74,21 @@ web-sys = { version = "0.3.77", features = [
   'console',
   'Blob',
   'BlobPropertyBag',
-  'Cache',
-  'CacheStorage',
   'CustomEvent',
   'CustomEventInit',
   'Document',
   'Element',
   'Event',
   'EventTarget',
-  'EventListener',
   'File',
   'FileList',
   'FilePropertyBag',
-  'FileReader',
-  'Headers',
   'History',
   'HtmlButtonElement',
   'HtmlElement',
   'HtmlInputElement',
   'HtmlMediaElement',
   'HtmlSpanElement',
-  'HtmlParagraphElement',
   'HtmlSelectElement',
   'Location',
   'MediaQueryList',
@@ -105,28 +100,16 @@ web-sys = { version = "0.3.77", features = [
   'ServiceWorker',
   'ServiceWorkerContainer',
   'ServiceWorkerRegistration',
-  'ReadableStream',
-  'Request',
-  'Response',
-  'RequestCache',
-  'RequestMode',
-  'RequestCredentials',
-  'RequestInit',
   'RegistrationOptions',
-  'Response',
-  'ResponseType',
-  'ResponseInit',
   'Storage',
   'TimeRanges',
   'Url',
   'UrlSearchParams',
   'Window',
 ] }
-byteorder = { git = "https://github.com/BurntSushi/byteorder" }
-num = { git = "https://github.com/rust-num/num.git" }
 hex = { git = "https://github.com/KokaKiwi/rust-hex.git" }
 #tracing-wasm = { git = "https://github.com/old-storyai/tracing-wasm.git" }
-web3 = { git = "https://github.com/tomusdrw/rust-web3.git", default-features = false, features = ["http-rustls-tls", "wasm", "eip-1193"] }
+web3 = { git = "https://github.com/tomusdrw/rust-web3.git", default-features = false, features = ["wasm", "eip-1193"] }
 tar = { git = "https://github.com/alexcrichton/tar-rs.git" }
 mime_guess = { git = "https://github.com/abonander/mime_guess.git" }
 indexed_db_futures = { git = "https://github.com/Alorel/rust-indexed-db.git", features = ["serde", "indices", "async-upgrade"] }

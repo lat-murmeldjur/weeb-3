@@ -5,11 +5,11 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use wasm_bindgen_futures::spawn_local;
 
 pub(crate) use async_std::channel as mpsc;
-use rand::rngs::OsRng;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Read;
 use std::num::NonZero;
 use std::ops::Deref;
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use tar::Archive;
@@ -18,31 +18,26 @@ use web3::types::U256;
 
 use js_sys::Date;
 use libp2p::{
-    PeerId, StreamProtocol, Swarm, autonat,
-    core::{self, Multiaddr, Transport},
-    dcutr,
+    PeerId, StreamProtocol, Swarm,
+    core::{self, Endpoint, Multiaddr, Transport, transport::PortUse},
     futures::{StreamExt, future::join_all, join},
     identify, identity,
     identity::{ecdsa, ecdsa::SecretKey},
     noise, ping,
     swarm::{
-        ConnectionId, NetworkBehaviour, SwarmEvent,
+        ConnectionDenied, ConnectionId, DialError, FromSwarm, NetworkBehaviour, SwarmEvent,
+        THandler, THandlerInEvent, THandlerOutEvent, ToSwarm,
+        behaviour::DialFailure,
         dial_opts::{DialOpts, PeerCondition},
     },
     websocket_websys, yamux,
 };
+pub(crate) use libp2p_stream::{Control as StreamControl, OpenStreamError};
 use wasm_bindgen::{JsValue, prelude::*};
 use web_sys::File;
 
-mod accounting;
-use accounting::*;
-
-mod addresses;
-use addresses::{
-    UnderlayFormat, beewss_to_dns_transformed, deserialize_underlays, detect_underlay_format,
-};
-
-mod manifest_conventions;
+mod manifest;
+use manifest::acquire_bzz_collection;
 
 mod bzz_stream;
 use bzz_stream::*;
@@ -50,11 +45,16 @@ use bzz_stream::*;
 mod conventions;
 pub(crate) use conventions::*;
 
-mod connection_conventions;
-use connection_conventions::{
-    CONNECTION_BUILDUP_LIMIT, CONNECTION_DIAL_CONCURRENCY_LIMIT, ConnectionCounterRelease,
-    StreamBehaviour, bee_reconnect_delay_seconds, connection_counter_release,
-    connection_dial_capacity_available, remove_overlay_owner,
+mod accounting;
+use accounting::{
+    REFRESH_RATE, RefreshmentInstruction, apply_credit, apply_refreshment,
+    bee_reconnect_delay_seconds, cancel_reserve, connection_dial_capacity_available, price,
+    reserve, set_payment_threshold,
+};
+
+mod addresses;
+use addresses::{
+    UnderlayFormat, beewss_to_dns_transformed, deserialize_underlays, detect_underlay_format,
 };
 
 mod erasure_coding;
@@ -72,8 +72,6 @@ mod interface_conventions;
 
 mod library;
 
-mod manifest;
-
 mod manifest_upload;
 
 mod stream_conventions;
@@ -89,8 +87,6 @@ use network_profile::{activate_profile, profile_for_swarm_network_id};
 mod persistence;
 use persistence::{get_chequebook_address, get_chequebook_signer_key};
 
-mod upload_conventions;
-
 mod retrieval;
 use retrieval::*;
 
@@ -105,7 +101,7 @@ mod upload;
 use upload::*;
 
 mod ens;
-use ens::*;
+use ens::resolve_ens_reference;
 
 mod events;
 use events::{ProgressRow, ProgressStore};
@@ -113,20 +109,109 @@ use events::{ProgressRow, ProgressStore};
 static MAINNET: AtomicBool = AtomicBool::new(true);
 static TESTNET_OFFICIAL: AtomicBool = AtomicBool::new(false);
 
-pub fn set_mainnet(value: bool) {
+pub(crate) fn set_mainnet(value: bool) {
     MAINNET.store(value, Ordering::Relaxed);
 }
 
-pub fn is_mainnet() -> bool {
+pub(crate) fn is_mainnet() -> bool {
     MAINNET.load(Ordering::Relaxed)
 }
 
-pub fn set_testnet_official(value: bool) {
+pub(crate) fn set_testnet_official(value: bool) {
     TESTNET_OFFICIAL.store(value, Ordering::Relaxed);
 }
 
-pub fn is_testnet_official() -> bool {
+pub(crate) fn is_testnet_official() -> bool {
     TESTNET_OFFICIAL.load(Ordering::Relaxed)
+}
+
+pub(crate) struct StreamBehaviour {
+    inner: libp2p_stream::Behaviour,
+}
+
+impl StreamBehaviour {
+    pub(crate) fn new() -> Self {
+        Self {
+            inner: libp2p_stream::Behaviour::new(),
+        }
+    }
+
+    pub(crate) fn new_control(&self) -> StreamControl {
+        self.inner.new_control()
+    }
+}
+
+impl NetworkBehaviour for StreamBehaviour {
+    type ConnectionHandler = <libp2p_stream::Behaviour as NetworkBehaviour>::ConnectionHandler;
+    type ToSwarm = <libp2p_stream::Behaviour as NetworkBehaviour>::ToSwarm;
+
+    fn handle_established_inbound_connection(
+        &mut self,
+        connection_id: ConnectionId,
+        peer: PeerId,
+        local_addr: &Multiaddr,
+        remote_addr: &Multiaddr,
+    ) -> Result<THandler<Self>, ConnectionDenied> {
+        self.inner.handle_established_inbound_connection(
+            connection_id,
+            peer,
+            local_addr,
+            remote_addr,
+        )
+    }
+
+    fn handle_established_outbound_connection(
+        &mut self,
+        connection_id: ConnectionId,
+        peer: PeerId,
+        addr: &Multiaddr,
+        role_override: Endpoint,
+        port_use: PortUse,
+    ) -> Result<THandler<Self>, ConnectionDenied> {
+        self.inner.handle_established_outbound_connection(
+            connection_id,
+            peer,
+            addr,
+            role_override,
+            port_use,
+        )
+    }
+
+    fn on_swarm_event(&mut self, event: FromSwarm<'_>) {
+        self.inner.on_swarm_event(event);
+    }
+
+    fn on_connection_handler_event(
+        &mut self,
+        peer_id: PeerId,
+        connection_id: ConnectionId,
+        event: THandlerOutEvent<Self>,
+    ) {
+        self.inner
+            .on_connection_handler_event(peer_id, connection_id, event);
+    }
+
+    fn poll(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<ToSwarm<Self::ToSwarm, THandlerInEvent<Self>>> {
+        loop {
+            match self.inner.poll(cx) {
+                Poll::Ready(ToSwarm::Dial { opts }) => {
+                    let peer_id = opts.get_peer_id();
+                    let connection_id = opts.connection_id();
+                    let error = DialError::NoAddresses;
+                    self.inner
+                        .on_swarm_event(FromSwarm::DialFailure(DialFailure {
+                            peer_id,
+                            error: &error,
+                            connection_id,
+                        }));
+                }
+                event => return event,
+            }
+        }
+    }
 }
 
 fn spawn_upload_progress_listener(
@@ -183,9 +268,6 @@ pub mod weeb_3 {
     pub mod etiquette_2 {
         include!(concat!(env!("OUT_DIR"), "/weeb_3.etiquette_2.rs"));
     }
-    pub mod etiquette_3 {
-        include!(concat!(env!("OUT_DIR"), "/weeb_3.etiquette_3.rs"));
-    }
     pub mod etiquette_4 {
         include!(concat!(env!("OUT_DIR"), "/weeb_3.etiquette_4.rs"));
     }
@@ -203,14 +285,7 @@ pub mod weeb_3 {
     }
 }
 
-// use crate::weeb_3::etiquette_0;
-// use crate::weeb_3::etiquette_1;
 use crate::weeb_3::etiquette_2;
-// use crate::weeb_3::etiquette_3;
-// use crate::weeb_3::etiquette_4;
-// use crate::weeb_3::etiquette_5;
-// use crate::weeb_3::etiquette_6;
-// use crate::weeb_3::etiquette_8;
 
 const HANDSHAKE_PROTOCOL: StreamProtocol = StreamProtocol::new("/swarm/handshake/15.0.0/handshake");
 const PRICING_PROTOCOL: StreamProtocol = StreamProtocol::new("/swarm/pricing/1.0.0/pricing");
@@ -220,13 +295,6 @@ const PSEUDOSETTLE_PROTOCOL: StreamProtocol =
 const RETRIEVAL_PROTOCOL: StreamProtocol = StreamProtocol::new("/swarm/retrieval/1.4.0/retrieval");
 const PUSHSYNC_PROTOCOL: StreamProtocol = StreamProtocol::new("/swarm/pushsync/1.3.1/pushsync");
 const SWAP_PROTOCOL: StreamProtocol = StreamProtocol::new("/swarm/swap/1.0.0/swap");
-
-// const PINGPONG_PROTOCOL: StreamProtocol = StreamProtocol::new("/swarm/pingpong/1.0.0/pingpong");
-// const STATUS_PROTOCOL: StreamProtocol = StreamProtocol::new("/swarm/status/1.1.1/status");
-//
-// const PULL_CURSORS_PROTOCOL: StreamProtocol = StreamProtocol:: "/swarm/pullsync/1.4.0/cursors");
-// const PULL_PROTOCOL: StreamProtocol = StreamProtocol::new("/swarm/pullsync/1.4.0/pullsync");
-// const PUSH_PROTOCOL: StreamProtocol = StreamProtocol::new("/swarm/pushsync/1.3.0/pushsync");
 
 const PROTOCOL_ROUND_TIME: f64 = 160.0;
 const STARTUP_QUEUE_POLL_MS: u64 = 25;
@@ -242,25 +310,11 @@ const PUSH_CHUNK_RETRY_DELAY_MS: u64 = 500;
 const PUSH_CHUNK_QUEUE_BACKOFF_MS: u64 = 25;
 const RETRIEVE_QUEUE_HOT_LOOP_GUARD_MS: u64 = 25;
 const RANGE_REQUEST_CONCURRENCY: usize = 16;
-// Four concurrent Medium-EC tree joins can each admit roughly 470 data leaves.
-// Keep all sustained lanes active and leave capacity for parity recovery,
-// feed/root probes, and foreground work without changing chunk semantics.
 const RETRIEVE_CHUNK_CONCURRENCY: usize = 2_048;
 const RANGE_REQUEST_QUEUE_CAPACITY: usize = 256;
 const LOG_QUEUE_CAPACITY: usize = 256;
 const LOG_DRAIN_BATCH: usize = 64;
 pub(crate) const LOG_DOM_RETAINED: u32 = 256;
-const DEBUG_RUNTIME_LOGS: bool = false;
-
-fn runtime_debug(value: &JsValue) {
-    if DEBUG_RUNTIME_LOGS {
-        web_sys::console::log_1(value);
-    }
-}
-
-pub fn timed_log(message: impl AsRef<str>) {
-    runtime_debug(&JsValue::from(message.as_ref()));
-}
 
 async fn decrement_counter(counter: &Arc<Mutex<u64>>) {
     let mut value = counter.lock().await;
@@ -269,67 +323,23 @@ async fn decrement_counter(counter: &Arc<Mutex<u64>>) {
     }
 }
 
-async fn release_connection_counter(
-    release: ConnectionCounterRelease,
-    connections: &Arc<Mutex<u64>>,
-    ongoing_connections: &Arc<Mutex<u64>>,
-) {
-    match release {
-        ConnectionCounterRelease::None => {}
-        ConnectionCounterRelease::Ongoing => decrement_counter(ongoing_connections).await,
-        ConnectionCounterRelease::Connected => decrement_counter(connections).await,
-    }
-}
-
 async fn reserve_connection_capacity(
     connections: &Arc<Mutex<u64>>,
     ongoing_connections: &Arc<Mutex<u64>>,
     connection_generation: &Arc<Mutex<u64>>,
     expected_generation: u64,
-    reason: &str,
 ) -> bool {
-    let mut logged_wait = false;
-
     loop {
         if *connection_generation.lock().await != expected_generation {
-            timed_log(format!(
-                "Connection capacity wait skipped stale generation reason={} generation={}",
-                reason, expected_generation
-            ));
             return false;
         }
 
-        // Hold both guards through the admission decision. Promotion takes
-        // them in the same order and transfers one reservation atomically, so
-        // a dial can never observe a mixed pre/post-promotion snapshot.
         let connected_guard = connections.lock().await;
         let mut ongoing = ongoing_connections.lock().await;
         let connected = *connected_guard;
         if connection_dial_capacity_available(connected, *ongoing) {
             *ongoing = (*ongoing).saturating_add(1);
-            if logged_wait {
-                timed_log(format!(
-                    "Connection dial resumed reason={} connected={} ongoing={} population_limit={} dial_limit={}",
-                    reason,
-                    connected,
-                    *ongoing,
-                    CONNECTION_BUILDUP_LIMIT,
-                    CONNECTION_DIAL_CONCURRENCY_LIMIT
-                ));
-            }
             return true;
-        }
-
-        if !logged_wait {
-            timed_log(format!(
-                "Connection dial paused at capacity reason={} connected={} ongoing={} population_limit={} dial_limit={}",
-                reason,
-                connected,
-                *ongoing,
-                CONNECTION_BUILDUP_LIMIT,
-                CONNECTION_DIAL_CONCURRENCY_LIMIT
-            ));
-            logged_wait = true;
         }
         drop(ongoing);
         drop(connected_guard);
@@ -342,8 +352,6 @@ async fn try_reserve_connection_capacity(
     connections: &Arc<Mutex<u64>>,
     ongoing_connections: &Arc<Mutex<u64>>,
 ) -> bool {
-    // Keep the combined population snapshot stable until the reservation is
-    // recorded. `promote_priced_peer` uses this same lock order.
     let connected_guard = connections.lock().await;
     let mut ongoing = ongoing_connections.lock().await;
     let connected = *connected_guard;
@@ -360,25 +368,16 @@ async fn queue_peer_dial_retry(
     expected_generation: u64,
     connection_generation: Arc<Mutex<u64>>,
     peers_instructions: mpsc::Sender<PeerDialInstruction>,
-    reason: String,
 ) {
     async_std::task::sleep(Duration::from_millis(HANDSHAKE_RETRY_DELAY_MS)).await;
 
     if *connection_generation.lock().await != expected_generation {
-        timed_log(format!(
-            "Peer dial retry skipped stale generation address={} reason={}",
-            address, reason
-        ));
         return;
     }
 
     let mut bzzaddr = etiquette_2::BzzAddress::default();
     bzzaddr.underlay = address.to_vec();
     let _ = peers_instructions.try_send((bzzaddr, expected_generation));
-    timed_log(format!(
-        "Peer dial retry queued address={} reason={}",
-        address, reason
-    ));
 }
 
 async fn queue_bootnode_retry(
@@ -387,32 +386,20 @@ async fn queue_bootnode_retry(
     expected_generation: u64,
     connection_generation: Arc<Mutex<u64>>,
     bootnode_port: mpsc::Sender<(String, mpsc::Sender<String>, bool, u64)>,
-    reason: String,
 ) {
     async_std::task::sleep(Duration::from_millis(HANDSHAKE_RETRY_DELAY_MS)).await;
 
     if *connection_generation.lock().await != expected_generation {
-        timed_log(format!(
-            "Bootnode dial retry skipped stale generation address={} reason={}",
-            address, reason
-        ));
         return;
     }
 
     let (status_out, _status_in) = mpsc::unbounded::<String>();
-    let _ = bootnode_port.try_send((address.clone(), status_out, usable, expected_generation));
-    timed_log(format!(
-        "Bootnode dial retry queued address={} reason={}",
-        address, reason
-    ));
+    let _ = bootnode_port.try_send((address, status_out, usable, expected_generation));
 }
 
 pub(crate) fn interface_log_to(log_port: &mpsc::Sender<String>, log_start_ms: f64, log0: String) {
     let elapsed_ms = (Date::now() - log_start_ms).max(0.0).round() as u64;
     let log = format!("[+{}ms] {}", elapsed_ms, log0);
-    if DEBUG_RUNTIME_LOGS {
-        web_sys::console::log_1(&JsValue::from(log.clone()));
-    }
     let _ = log_port.try_send(log);
 }
 
@@ -439,7 +426,7 @@ async fn cheques_active() -> bool {
 
 static PANIC_HOOK: std::sync::Once = std::sync::Once::new();
 
-pub fn init_panic_hook() {
+fn init_panic_hook() {
     PANIC_HOOK.call_once(console_error_panic_hook::set_once);
 }
 
@@ -448,14 +435,12 @@ pub fn init_wasm_runtime() {
     init_panic_hook();
 }
 
-#[wasm_bindgen]
-pub struct Weeb3 {
+pub(crate) struct Weeb3 {
     swarm: Arc<Mutex<Swarm<Behaviour>>>,
     secret_key: Arc<Mutex<SecretKey>>,
     wings: Mutex<Arc<Wings>>,
     log_port: (mpsc::Sender<String>, mpsc::Receiver<String>),
     log_start_ms: f64,
-    message_port: (ChunkRetrieveSender, ChunkRetrieveReceiver),
     chunk_port: (ChunkRetrieveSender, ChunkRetrieveReceiver),
     resolve_port: (
         mpsc::Sender<BzzResolveRequest>,
@@ -645,7 +630,6 @@ struct ConnectionAttempt {
     id: ConnectionAttemptId,
     dial_connection_id: Option<ConnectionId>,
     physical_connection_id: Option<ConnectionId>,
-    reused_connection: bool,
 }
 
 type PeerDialInstruction = (etiquette_2::BzzAddress, u64);
@@ -662,7 +646,6 @@ fn next_connection_attempt_id() -> ConnectionAttemptId {
 #[derive(Clone)]
 struct QueuedPeerDial {
     peer: PeerId,
-    source_addr: Multiaddr,
     dial_addr: Multiaddr,
     bzzaddr: etiquette_2::BzzAddress,
     generation: u64,
@@ -675,7 +658,7 @@ fn peer_dial_candidate(
 ) -> Option<QueuedPeerDial> {
     let dial_addr = match detect_underlay_format(&source_addr) {
         UnderlayFormat::BeeWss => beewss_to_dns_transformed(&source_addr),
-        UnderlayFormat::DNSTransformedWss => source_addr.clone(),
+        UnderlayFormat::DnsTransformedWss => source_addr.clone(),
         UnderlayFormat::Other => return None,
     };
     let peer = try_from_multiaddr(&source_addr)?;
@@ -684,7 +667,6 @@ fn peer_dial_candidate(
 
     Some(QueuedPeerDial {
         peer,
-        source_addr,
         dial_addr,
         bzzaddr,
         generation,
@@ -811,13 +793,6 @@ async fn wait_transfer_unpaused_for_admission(
 
 type BzzResolveRequest = (String, mpsc::Sender<Option<BzzMetadata>>);
 enum BzzRangeRequest {
-    Resource {
-        resource: String,
-        start: u64,
-        end_inclusive: u64,
-        cancel: Option<RetrieveCancelToken>,
-        chan: mpsc::Sender<Option<(Vec<u8>, BzzMetadata)>>,
-    },
     Resolved {
         metadata: BzzMetadata,
         start: u64,
@@ -825,14 +800,9 @@ enum BzzRangeRequest {
         cancel: Option<RetrieveCancelToken>,
         chan: mpsc::Sender<Option<(Vec<u8>, BzzMetadata)>>,
     },
-    Prepare {
-        metadata: BzzMetadata,
-        chan: mpsc::Sender<bool>,
-    },
 }
 
-#[wasm_bindgen]
-pub struct Wings {
+pub(crate) struct Wings {
     connected_peers: Arc<Mutex<HashMap<PeerId, PeerFile>>>,
     overlay_peers: Arc<Mutex<HashMap<Vec<u8>, PeerId>>>,
     bootnodes: Arc<Mutex<HashSet<String>>>,
@@ -870,9 +840,6 @@ async fn try_mark_connection_attempt(
     wings: &Arc<Wings>,
     peer: &PeerId,
 ) -> Option<ConnectionAttemptId> {
-    // Keep PeerFile publication/cleanup and attempt ownership in one lock
-    // order. Otherwise a close task can finish between these two checks and
-    // an older handshake can erase the replacement attempt.
     let connected_peers = wings.connected_peers.lock().await;
     if connected_peers.contains_key(peer) {
         return None;
@@ -894,7 +861,6 @@ async fn try_mark_connection_attempt(
                 id: attempt_id,
                 dial_connection_id: None,
                 physical_connection_id: None,
-                reused_connection: false,
             },
         );
         Some(attempt_id)
@@ -935,10 +901,9 @@ async fn remove_connection_attempt_for_close(
     connection_id: ConnectionId,
 ) -> bool {
     let mut attempts = wings.connection_attempts.lock().await;
-    let owns_closed_connection = attempts.get(peer).is_some_and(|attempt| {
-        attempt.dial_connection_id == Some(connection_id)
-            || (attempt.reused_connection && attempt.physical_connection_id == Some(connection_id))
-    });
+    let owns_closed_connection = attempts
+        .get(peer)
+        .is_some_and(|attempt| attempt.physical_connection_id == Some(connection_id));
     if !owns_closed_connection {
         return false;
     }
@@ -952,6 +917,54 @@ async fn connection_attempt_is_current(
 ) -> bool {
     let attempts = wings.connection_attempts.lock().await;
     attempts.get(peer).map(|attempt| attempt.id) == Some(expected_attempt_id)
+}
+
+async fn start_owned_connection_attempt(
+    swarm: &Arc<Mutex<Swarm<Behaviour>>>,
+    wings: &Arc<Wings>,
+    peer: &PeerId,
+    dial_addr: &Multiaddr,
+    attempt_id: ConnectionAttemptId,
+) -> Result<Option<bool>, libp2p::swarm::DialError> {
+    let mut swarm = swarm.lock_arc().await;
+    if swarm.is_connected(peer) {
+        let physical_connection_id =
+            exclusive_physical_connection(&wings.physical_connections, peer);
+        let attempt_owned = {
+            let mut attempts = wings.connection_attempts.lock().await;
+            match attempts.get_mut(peer) {
+                Some(attempt) if attempt.id == attempt_id && physical_connection_id.is_some() => {
+                    attempt.physical_connection_id = physical_connection_id;
+                    true
+                }
+                _ => false,
+            }
+        };
+        return Ok(attempt_owned.then_some(true));
+    }
+
+    let options = DialOpts::peer_id(peer.clone())
+        .condition(PeerCondition::DisconnectedAndNotDialing)
+        .addresses(vec![dial_addr.clone()])
+        .build();
+    let connection_id = options.connection_id();
+    let attempt_owned = {
+        let mut attempts = wings.connection_attempts.lock().await;
+        match attempts.get_mut(peer) {
+            Some(attempt) if attempt.id == attempt_id => {
+                attempt.dial_connection_id = Some(connection_id);
+                attempt.physical_connection_id = Some(connection_id);
+                true
+            }
+            _ => false,
+        }
+    };
+    if !attempt_owned {
+        return Ok(None);
+    }
+
+    swarm.dial(options)?;
+    Ok(Some(false))
 }
 
 async fn current_accounting_protocol_session(
@@ -995,9 +1008,6 @@ async fn claim_current_cheque(
     amount: u64,
     generation: u64,
 ) -> bool {
-    // `connected_peers` is also held by terminal cleanup. Validate and
-    // publish the claim under that lifecycle guard so an old refresh task
-    // cannot recreate a cheque after its connection has been removed.
     let connected_peers = wings.connected_peers.lock().await;
     if !connected_peers
         .get(&peer)
@@ -1034,10 +1044,7 @@ async fn quiesce_drain_and_close_accounting_session(
     accounting_peer: &Arc<Mutex<PeerAccounting>>,
     connection_id: ConnectionId,
 ) {
-    // Stop new reservations under the same lifecycle/lock order used by
-    // terminal cleanup and cheque publication. Requests already reserved keep
-    // their exact account Arc and must reach terminal accounting before the
-    // physical stream is closed.
+    // Reserved requests must settle before the accounting connection closes.
     let pending_cheque = {
         let connected_peers = wings.connected_peers.lock().await;
         let owns_connection = connected_peers
@@ -1078,53 +1085,12 @@ async fn quiesce_drain_and_close_accounting_session(
     let _ = swarm.close_connection(connection_id);
 }
 
-#[wasm_bindgen]
 impl Weeb3 {
-    pub async fn change_bootnode_address(
-        &self,
-        address: String,
-        _id: String,
-        usable_in_protocols: bool,
-    ) -> Vec<u8> {
-        let result = if self.set_network_id(_id).await {
-            let generation = self.current_connection_generation().await;
-            self.request_bootnode_dial(address, usable_in_protocols, generation)
-                .await
-        } else {
-            "invalid bootnode network id".to_string()
-        };
-
-        if !usable_in_protocols {
-            return encode_resources(
-                vec![(
-                    format!("Bootnode connect status: {}", result)
-                        .as_bytes()
-                        .to_vec(),
-                    "text/plain".to_string(),
-                    "... result ...".to_string(),
-                )],
-                "... result ...".to_string(),
-            );
-        } else {
-            return encode_resources(
-                vec![(
-                    format!("Bootstrap connect status: {}", result)
-                        .as_bytes()
-                        .to_vec(),
-                    "text/plain".to_string(),
-                    "... result ...".to_string(),
-                )],
-                "... result ...".to_string(),
-            );
-        }
-    }
-
     pub async fn set_network_id(&self, id: String) -> bool {
         let Ok(parsed_id) = id.parse::<u64>() else {
             return false;
         };
 
-        runtime_debug(&JsValue::from(format!("Parsed network id {}", parsed_id)));
         let mut network_changed = false;
         {
             let mut nid = self.network_id.lock().await;
@@ -1159,10 +1125,6 @@ impl Weeb3 {
     async fn bump_connection_generation(&self) -> u64 {
         let mut generation = self.connection_generation.lock().await;
         *generation = generation.saturating_add(1);
-        runtime_debug(&JsValue::from(format!(
-            "Connection generation bumped to {}",
-            *generation
-        )));
         *generation
     }
 
@@ -1204,13 +1166,9 @@ impl Weeb3 {
             let mut connected = self.connections.lock().await;
             *connected = 0;
         }
-
-        runtime_debug(&JsValue::from("All peers disconnected"));
     }
 
     async fn promote_priced_peer(&self, wings: &Arc<Wings>, peer: PeerId) {
-        // Serialize promotion with disconnect cleanup until reservation,
-        // overlay ownership, and the counted-state transfer agree.
         let connected_peers_guard = wings.connected_peers.lock().await;
         let peer_file = match connected_peers_guard.get(&peer) {
             Some(peer_file) => peer_file.clone(),
@@ -1219,10 +1177,6 @@ impl Weeb3 {
         if exclusive_physical_connection(&wings.physical_connections, &peer)
             != Some(peer_file.connection_id)
         {
-            timed_log(format!(
-                "Skipped stale priced-peer promotion peer={} attempt={} connection_id={:?}",
-                peer, peer_file.connection_attempt_id, peer_file.connection_id
-            ));
             return;
         }
         let had_reservation = {
@@ -1236,8 +1190,6 @@ impl Weeb3 {
             }
         };
         if !had_reservation {
-            // Pricing may be repeated. Promotion and both counters are
-            // intentionally idempotent once this peer's reservation is gone.
             return;
         }
 
@@ -1263,8 +1215,6 @@ impl Weeb3 {
         };
 
         {
-            // Transfer the counted peer from ongoing to connected without
-            // exposing a temporary free slot to concurrent dial admission.
             let mut connections = self.connections.lock().await;
             let mut ongoing = self.ongoing_connections.lock().await;
             *ongoing = ongoing.saturating_sub(1);
@@ -1317,50 +1267,24 @@ impl Weeb3 {
                 let mut waiters = wings.self_ephemeral_waiters.lock().await;
                 waiters.remove(&peer);
             }
-            let disconnect_result = {
+            {
                 let mut swarm = self.swarm.lock_arc().await;
-                swarm.disconnect_peer_id(peer.clone())
-            };
-            if let Err(error) = disconnect_result {
-                timed_log(format!(
-                    "Duplicate overlay disconnect failed overlay={} peer={} error={:?}",
-                    overlay_hex, peer, error
-                ));
+                let _ = swarm.disconnect_peer_id(peer.clone());
             }
         }
     }
 
-    pub async fn post_upload(
-        &self,
-        file: File,
-        encryption: bool,
-        index_string: String,
-        add_to_feed: bool,
-        feed_topic: String,
-    ) -> Vec<u8> {
-        self.post_upload_with_redundancy(
-            file,
-            encryption,
-            f64::from(erasure_coding::RedundancyLevel::DEFAULT_UPLOAD.as_u8()),
-            index_string,
-            add_to_feed,
-            feed_topic,
-        )
-        .await
-    }
-
-    #[wasm_bindgen(js_name = postUploadWithRedundancy)]
     pub async fn post_upload_with_redundancy(
         &self,
         file: File,
         encryption: bool,
-        #[wasm_bindgen(unchecked_param_type = "UploadRedundancyLevel")] redundancy_level: f64,
+        redundancy_level: f64,
         index_string: String,
         add_to_feed: bool,
         feed_topic: String,
     ) -> Vec<u8> {
         let Some(redundancy_level) =
-            upload_conventions::validated_upload_redundancy_number(redundancy_level)
+            erasure_coding::validated_upload_redundancy_number(redundancy_level)
         else {
             return upload_result(
                 "upload result: redundancy level must be between 0 and 4",
@@ -1387,8 +1311,6 @@ impl Weeb3 {
         let mut index_document = "".to_string();
 
         if f_type == "application/x-tar" || f_type == "application/tar" {
-            // let tar = GzDecoder::new(file);
-
             index_document = match index_string.len() == 0 {
                 true => "index.html".to_string(),
                 false => index_string,
@@ -1589,41 +1511,35 @@ impl Weeb3 {
 
     pub async fn acquire(&self, address: String) -> Vec<u8> {
         if let Some(resource) = parse_bzz_resource(&address) {
-            if !resource.path.is_empty() {
-                if let Some(metadata) = self.resolve_bzz(address.clone()).await {
-                    if metadata.size == 0 {
-                        return encode_resources(
-                            vec![(vec![], metadata.mime, metadata.path.clone())],
-                            metadata.path,
-                        );
-                    }
+            if resource.path.is_empty() {
+                return acquire_bzz_collection(resource.reference, &self.chunk_port.0).await;
+            }
+            if let Some(metadata) = self.resolve_bzz(address.clone()).await {
+                if metadata.size == 0 {
+                    return encode_resources(
+                        vec![(vec![], metadata.mime, metadata.path.clone())],
+                        metadata.path,
+                    );
+                }
 
-                    if let Some((bytes, metadata)) = self
-                        .acquire_resolved_range(metadata.clone(), 0, metadata.size - 1)
-                        .await
-                    {
-                        return encode_resources(
-                            vec![(bytes, metadata.mime, metadata.path.clone())],
-                            metadata.path,
-                        );
-                    }
+                if let Some((bytes, metadata)) = self
+                    .acquire_resolved_range(metadata.clone(), 0, metadata.size - 1)
+                    .await
+                {
+                    return encode_resources(
+                        vec![(bytes, metadata.mime, metadata.path.clone())],
+                        metadata.path,
+                    );
                 }
             }
         }
 
-        let (chan_out, chan_in) = mpsc::unbounded::<Vec<u8>>();
-        let valaddr_0 = hex::decode(&address);
-        let valaddr = match valaddr_0 {
+        let valaddr = match hex::decode(&address) {
             Ok(hex) => hex,
-            _ => prt(address, "".to_string()).await,
+            _ => resolve_ens_reference(address, "").await,
         };
 
-        let _ = self
-            .message_port
-            .0
-            .try_send(chunk_retrieve_request(valaddr, chan_out));
-
-        return chan_in.recv().await.unwrap_or_default();
+        acquire_bzz_collection(valaddr, &self.chunk_port.0).await
     }
 
     pub async fn retrieve_bytes(&self, address: String) -> Vec<u8> {
@@ -1682,15 +1598,6 @@ impl Weeb3 {
         bytes
     }
 
-    pub async fn acquire_feed(&self, owner: String, topic: String) -> Vec<u8> {
-        let raw = self.acquire_feed_envelope(owner, topic).await;
-        let (data, _index) = decode_resources(raw);
-        data.into_iter()
-            .find(|(_bytes, mime, path)| mime != "not found" && path != "not found")
-            .map(|(bytes, _mime, _path)| bytes)
-            .unwrap_or_default()
-    }
-
     pub async fn reset_stamp(&self) -> Vec<u8> {
         let reset = secure_reset_stamp().await;
         let message = if reset {
@@ -1710,11 +1617,7 @@ impl Weeb3 {
     }
 
     pub fn new(_st: String) -> Weeb3 {
-        // tracing_wasm::set_as_global_default(); // uncomment to turn on tracing
         init_panic_hook();
-
-        // let body = Body::from_current_window()?;
-        // body.append_p(&format!("Attempt to establish connection over websocket"))?;
 
         let secret_key_o = ecdsa::SecretKey::generate();
         let secret_key = secret_key_o.clone();
@@ -1769,7 +1672,6 @@ impl Weeb3 {
         let self_ephemeral_waiters: Arc<Mutex<HashMap<PeerId, Vec<mpsc::Sender<Multiaddr>>>>> =
             Arc::new(Mutex::new(HashMap::new()));
 
-        let (m_out, m_in) = chunk_retrieve_channel();
         let (chunk_out, chunk_in) = chunk_retrieve_channel();
         let (resolve_out, resolve_in) = mpsc::unbounded::<BzzResolveRequest>();
         let (range_out, range_in) = mpsc::bounded::<BzzRangeRequest>(RANGE_REQUEST_QUEUE_CAPACITY);
@@ -1816,7 +1718,6 @@ impl Weeb3 {
             })),
             log_port: (log_port_out, log_port_in),
             log_start_ms: Date::now(),
-            message_port: (m_out, m_in),
             chunk_port: (chunk_out, chunk_in),
             resolve_port: (resolve_out, resolve_in),
             range_port: (range_out, range_in),
@@ -1956,9 +1857,6 @@ impl Weeb3 {
         let (refreshment_instructions_chan_outgoing, refreshment_instructions_chan_incoming) =
             mpsc::unbounded::<RefreshmentInstruction>();
 
-        let (data_retrieve_chan_outgoing, data_retrieve_chan_incoming) =
-            mpsc::unbounded::<(Vec<u8>, mpsc::Sender<Vec<u8>>)>();
-
         let (chunk_retrieve_chan_outgoing, chunk_retrieve_chan_incoming) = chunk_retrieve_channel();
 
         let (data_upload_chan_outgoing, data_upload_chan_incoming) =
@@ -2005,10 +1903,6 @@ impl Weeb3 {
                 let Some(connection_id) =
                     exclusive_physical_connection(&pricing_physical_connections, &peer)
                 else {
-                    timed_log(format!(
-                        "Discarded inbound pricing stream without an exclusive transport peer={}",
-                        peer
-                    ));
                     continue;
                 };
                 let Some(pricing_session) = TransportConnectionSession::capture(
@@ -2049,7 +1943,6 @@ impl Weeb3 {
         let swarm_event_handle_0 = async {
             let mut pending = VecDeque::<QueuedPeerDial>::new();
             let mut queued = HashSet::<PeerId>::new();
-            let mut logged_capacity_wait = false;
 
             loop {
                 if pending.is_empty() {
@@ -2110,24 +2003,10 @@ impl Weeb3 {
                     if queued.insert(candidate.peer.clone()) {
                         pending.push_front(candidate);
                     }
-                    if !logged_capacity_wait {
-                        let connected = self.get_connections().await;
-                        let ongoing = self.get_ongoing_connections().await;
-                        timed_log(format!(
-                            "Peer dial queue paused at capacity connected={} ongoing={} pending={} population_limit={} dial_limit={}",
-                            connected,
-                            ongoing,
-                            pending.len(),
-                            CONNECTION_BUILDUP_LIMIT,
-                            CONNECTION_DIAL_CONCURRENCY_LIMIT
-                        ));
-                        logged_capacity_wait = true;
-                    }
                     async_std::task::sleep(Duration::from_millis(CONNECTION_CAPACITY_WAIT_MS))
                         .await;
                     continue;
                 }
-                logged_capacity_wait = false;
 
                 if *self.connection_generation.lock().await != candidate.generation {
                     decrement_counter(&self.ongoing_connections).await;
@@ -2156,102 +2035,38 @@ impl Weeb3 {
                     generations.insert(candidate.peer.clone(), candidate.generation);
                 }
 
-                let (reused_connection, dial_result, attempt_owned) = {
-                    let mut swarm = self.swarm.lock_arc().await;
-                    if swarm.is_connected(&candidate.peer) {
-                        let physical_connection_id = exclusive_physical_connection(
-                            &wings.physical_connections,
-                            &candidate.peer,
-                        );
-                        let attempt_owned = {
-                            let mut attempts = wings.connection_attempts.lock().await;
-                            match attempts.get_mut(&candidate.peer) {
-                                Some(attempt)
-                                    if attempt.id == attempt_id
-                                        && physical_connection_id.is_some() =>
-                                {
-                                    attempt.reused_connection = true;
-                                    attempt.physical_connection_id = physical_connection_id;
-                                    true
-                                }
-                                _ => false,
-                            }
-                        };
-                        (true, Ok(()), attempt_owned)
-                    } else {
-                        let options = DialOpts::peer_id(candidate.peer.clone())
-                            .condition(PeerCondition::DisconnectedAndNotDialing)
-                            .addresses(vec![candidate.dial_addr.clone()])
-                            .build();
-                        let connection_id = options.connection_id();
-                        let attempt_owned = {
-                            let mut attempts = wings.connection_attempts.lock().await;
-                            match attempts.get_mut(&candidate.peer) {
-                                Some(attempt) if attempt.id == attempt_id => {
-                                    attempt.dial_connection_id = Some(connection_id);
-                                    attempt.physical_connection_id = Some(connection_id);
-                                    true
-                                }
-                                _ => false,
-                            }
-                        };
-                        if attempt_owned {
-                            (false, swarm.dial(options), true)
-                        } else {
-                            (false, Ok(()), false)
+                match start_owned_connection_attempt(
+                    &self.swarm,
+                    &wings,
+                    &candidate.peer,
+                    &candidate.dial_addr,
+                    attempt_id,
+                )
+                .await
+                {
+                    Ok(Some(_)) => {}
+                    Ok(None) => {
+                        if remove_connection_attempt(&wings, &candidate.peer, attempt_id).await {
+                            decrement_counter(&self.ongoing_connections).await;
                         }
+                        continue;
                     }
-                };
-                if !attempt_owned {
-                    if remove_connection_attempt(&wings, &candidate.peer, attempt_id).await {
-                        decrement_counter(&self.ongoing_connections).await;
+                    Err(_) => {
+                        if remove_connection_attempt(&wings, &candidate.peer, attempt_id).await {
+                            decrement_counter(&self.ongoing_connections).await;
+                        }
+                        {
+                            let mut generations = wings.known_peer_generations.lock().await;
+                            generations.remove(&candidate.peer);
+                        }
+                        spawn_local(queue_peer_dial_retry(
+                            candidate.dial_addr.clone(),
+                            candidate.generation,
+                            self.connection_generation.clone(),
+                            peers_instructions_chan_outgoing.clone(),
+                        ));
+                        continue;
                     }
-                    timed_log(format!(
-                        "Skipped stale dial peer={} attempt={}",
-                        candidate.peer, attempt_id
-                    ));
-                    continue;
-                }
-
-                if let Err(error) = dial_result {
-                    timed_log(format!(
-                        "Dial failed immediately peer={} address={} source={} pending={} error={:?}",
-                        candidate.peer,
-                        candidate.dial_addr,
-                        candidate.source_addr,
-                        pending.len(),
-                        error
-                    ));
-                    if remove_connection_attempt(&wings, &candidate.peer, attempt_id).await {
-                        decrement_counter(&self.ongoing_connections).await;
-                    }
-                    {
-                        let mut generations = wings.known_peer_generations.lock().await;
-                        generations.remove(&candidate.peer);
-                    }
-                    // Do not make one immediately rejected address stall the
-                    // only dial feeder for the retry delay. The detached timer
-                    // re-enters this same bounded queue, while the feeder can
-                    // continue admitting useful peers toward the 200-peer
-                    // population target.
-                    spawn_local(queue_peer_dial_retry(
-                        candidate.dial_addr.clone(),
-                        candidate.generation,
-                        self.connection_generation.clone(),
-                        peers_instructions_chan_outgoing.clone(),
-                        format!(
-                            "immediate dial error peer={} error={:?}",
-                            candidate.peer, error
-                        ),
-                    ));
-                    continue;
-                }
-
-                if reused_connection {
-                    timed_log(format!(
-                        "Reusing existing physical connection for handshake peer={} attempt={}",
-                        candidate.peer, attempt_id
-                    ));
                 }
 
                 if connections_instructions_chan_outgoing
@@ -2388,13 +2203,6 @@ impl Weeb3 {
                                     for waiter in waiters {
                                         let _ = waiter.try_send(observed_addr.clone());
                                     }
-
-                                    // Keep the observed-address state, but do not surface every
-                                    // self-address update in UI logs.
-                                    // interface_log(format!(
-                                    //     "Observed address {} for peer {} stored/overwritten",
-                                    //     observed_addr, peer_id
-                                    // ));
                                 }
                             }
                         }
@@ -2433,13 +2241,6 @@ impl Weeb3 {
                             let mut should_retry = false;
 
                             if let Some(peer_id) = peer_to_clear.clone() {
-                                // Release only the dial attempt named by this
-                                // error before consulting broad peer
-                                // connectivity. A concurrent inbound/unowned
-                                // connection can make `is_connected` true
-                                // while this exact outbound attempt has still
-                                // failed; returning first would leak both the
-                                // attempt and its ongoing-capacity slot.
                                 let had_attempt = remove_connection_attempt_for_dial(
                                     &wings,
                                     &peer_id,
@@ -2455,10 +2256,6 @@ impl Weeb3 {
                                     swarm.is_connected(&peer_id)
                                 };
                                 if physically_connected && !had_attempt {
-                                    timed_log(format!(
-                                        "Ignored stale outgoing error for connected peer={}",
-                                        peer_id
-                                    ));
                                     return;
                                 }
 
@@ -2473,13 +2270,6 @@ impl Weeb3 {
 
                                 should_retry =
                                     had_attempt && peer_generation == Some(retry_generation);
-
-                                if had_attempt && peer_generation != Some(retry_generation) {
-                                    timed_log(format!(
-                                        "Skipping outgoing retry for stale peer={} connection_id={:?} peer_generation={:?} current_generation={}",
-                                        peer_id, connection_id, peer_generation, retry_generation
-                                    ));
-                                }
                             }
 
                             if should_retry {
@@ -2495,24 +2285,15 @@ impl Weeb3 {
                                             .try_send((bzzaddr, retry_generation));
                                     }
                                 }
-                            } else if let Some(address) = retry_address {
-                                timed_log(format!(
-                                    "Skipping retry for untracked outgoing dial error address={}",
-                                    address
-                                ));
                             }
                         }
                         SwarmEvent::ConnectionClosed {
                             peer_id,
                             connection_id,
                             endpoint,
-                            num_established,
+                            num_established: _,
                             cause,
                         } => {
-                            // `connected_peers` is the peer-lifecycle guard. Keep
-                            // physical state, attempt ownership, maps, and both
-                            // counters linearizable with PeerFile publication
-                            // and priced-peer promotion.
                             let mut connected_peers = wings.connected_peers.lock().await;
                             let expected_peer_connection = connected_peers
                                 .get(&peer_id)
@@ -2532,15 +2313,6 @@ impl Weeb3 {
                                     expected_attempt_connection == Some(connection_id)
                                 });
                             if !close_owns_lifecycle {
-                                timed_log(format!(
-                                    "Retained peer after unowned close peer={} connection_id={:?} remaining={} expected_peer={:?} expected_attempt={:?} cause={:?}",
-                                    peer_id,
-                                    connection_id,
-                                    num_established,
-                                    expected_peer_connection,
-                                    expected_attempt_connection,
-                                    cause
-                                ));
                                 return;
                             }
 
@@ -2560,7 +2332,12 @@ impl Weeb3 {
                                 tracked_bootnode = was_bootnode;
                                 removed_owned_overlay = {
                                     let mut overlay_peers_map = wings.overlay_peers.lock().await;
-                                    remove_overlay_owner(&mut overlay_peers_map, &ol0, &peer_id)
+                                    if overlay_peers_map.get(ol0) == Some(&peer_id) {
+                                        overlay_peers_map.remove(ol0);
+                                        true
+                                    } else {
+                                        false
+                                    }
                                 };
                             }
 
@@ -2577,22 +2354,7 @@ impl Weeb3 {
                             };
                             if !was_tracked_peer && !had_attempt {
                                 drop(connected_peers);
-                                timed_log(format!(
-                                    "Ignored stale/untracked terminal close peer={} connection_id={:?}",
-                                    peer_id, connection_id
-                                ));
                                 return;
-                            }
-                            let counter_release = connection_counter_release(
-                                had_attempt,
-                                removed_owned_overlay,
-                                tracked_bootnode,
-                            );
-                            if had_attempt && removed_owned_overlay {
-                                timed_log(format!(
-                                    "Connection lifecycle invariant violated peer={} pending_and_promoted=true",
-                                    peer_id
-                                ));
                             }
 
                             let accounting_peer = {
@@ -2610,9 +2372,6 @@ impl Weeb3 {
                                 } else {
                                     (0, 0, 0)
                                 };
-                            // Mainnet Bees advertise a 1.35M light-peer
-                            // threshold by default. Before pricing arrives, use
-                            // that conservative four-refresh-second floor.
                             let reconnect_delay_seconds = bee_reconnect_delay_seconds(
                                 balance,
                                 reserve,
@@ -2642,30 +2401,24 @@ impl Weeb3 {
                                     .await
                                     .insert(peer_id.clone());
                             }
-                            release_connection_counter(
-                                counter_release,
-                                &connections,
-                                &ongoing_connections,
-                            )
-                            .await;
+                            let counter_release = if had_attempt {
+                                decrement_counter(&ongoing_connections).await;
+                                "Ongoing"
+                            } else if removed_owned_overlay || tracked_bootnode {
+                                decrement_counter(&connections).await;
+                                "Connected"
+                            } else {
+                                "None"
+                            };
                             drop(connected_peers);
 
                             let connected_count = *connections.lock().await;
                             let ongoing_count = *ongoing_connections.lock().await;
                             interface_log(format!(
-                                "Disconnected peer={} overlay={} connection_id={:?} endpoint={:?} cause={:?} accounting_balance={} reserve={} threshold={} reconnect_delay_ms={} counter_release={:?} connected={} ongoing={}",
+                                "Disconnected from peer {} endpoint={:?} reason={:?} release={} connected={} ongoing={}",
                                 peer_id,
-                                removed_overlay
-                                    .as_ref()
-                                    .map(hex::encode)
-                                    .unwrap_or_else(|| "unpriced".to_string()),
-                                connection_id,
                                 endpoint,
                                 cause,
-                                balance,
-                                reserve,
-                                announced_threshold,
-                                reconnect_delay_ms,
                                 counter_release,
                                 connected_count,
                                 ongoing_count
@@ -2682,17 +2435,9 @@ impl Weeb3 {
                             };
 
                             if retry_is_current {
-                                // Keep this peer unavailable for the complete
-                                // remote accounting blocklist interval. Gossip
-                                // may reannounce it while this task sleeps.
                                 async_std::task::sleep(Duration::from_millis(reconnect_delay_ms))
                                     .await;
-                                if *connection_generation.lock().await != retry_generation {
-                                    timed_log(format!(
-                                        "Reconnect skipped stale generation peer={}",
-                                        peer_id
-                                    ));
-                                } else {
+                                if *connection_generation.lock().await == retry_generation {
                                     wings.connection_cooldowns.lock().await.remove(&peer_id);
                                     if let Some(address) = retry_address {
                                         let mut bzzaddr = etiquette_2::BzzAddress::default();
@@ -2703,18 +2448,8 @@ impl Weeb3 {
                                             "Queued reconnect for peer {} {} after {}ms backoff",
                                             peer_id, address, reconnect_delay_ms
                                         ));
-                                    } else {
-                                        timed_log(format!(
-                                            "No known reconnect address for closed peer={}",
-                                            peer_id
-                                        ));
                                     }
                                 }
-                            } else {
-                                timed_log(format!(
-                                    "Skipping reconnect for stale peer={} peer_generation={:?} current_generation={}",
-                                    peer_id, peer_generation, retry_generation
-                                ));
                             }
                         }
                         _ => {}
@@ -2758,13 +2493,6 @@ impl Weeb3 {
                             }
                         };
 
-                        // let bn_id: PeerId = match try_from_multiaddr(&addr33.clone()) {
-                        //     Some(aok) => aok,
-                        //     _ => {
-                        //         let _ = chan.try_send("parse peerid for bootnode failed".to_string());
-                        //         break;
-                        //     }
-                        // };
                         let pid: PeerId = match try_from_multiaddr(&addr33.clone()) {
                             Some(aok) => aok,
                             _ => {
@@ -2784,7 +2512,6 @@ impl Weeb3 {
                             &ongoing_connections,
                             &connection_generation,
                             request_generation,
-                            "bootnode dial",
                         )
                         .await
                         {
@@ -2820,92 +2547,41 @@ impl Weeb3 {
                             let mut generations = wings.known_peer_generations.lock().await;
                             generations.insert(pid.clone(), request_generation);
                         }
-                        let (reused_connection, dial_result, attempt_owned) = {
-                            let mut swarm = swarm.lock_arc().await;
-                            runtime_debug(&JsValue::from(format!("dial 2 :: {:#?}", addr33)));
-                            if swarm.is_connected(&pid) {
-                                let physical_connection_id = exclusive_physical_connection(
-                                    &wings.physical_connections,
-                                    &pid,
-                                );
-                                let attempt_owned = {
-                                    let mut attempts = wings.connection_attempts.lock().await;
-                                    match attempts.get_mut(&pid) {
-                                        Some(attempt)
-                                            if attempt.id == attempt_id
-                                                && physical_connection_id.is_some() =>
-                                        {
-                                            attempt.reused_connection = true;
-                                            attempt.physical_connection_id = physical_connection_id;
-                                            true
-                                        }
-                                        _ => false,
-                                    }
-                                };
-                                (true, Ok(()), attempt_owned)
-                            } else {
-                                let options = DialOpts::peer_id(pid.clone())
-                                    .condition(PeerCondition::DisconnectedAndNotDialing)
-                                    .addresses(vec![dial_addr.clone()])
-                                    .build();
-                                let connection_id = options.connection_id();
-                                let attempt_owned = {
-                                    let mut attempts = wings.connection_attempts.lock().await;
-                                    match attempts.get_mut(&pid) {
-                                        Some(attempt) if attempt.id == attempt_id => {
-                                            attempt.dial_connection_id = Some(connection_id);
-                                            attempt.physical_connection_id = Some(connection_id);
-                                            true
-                                        }
-                                        _ => false,
-                                    }
-                                };
-                                if attempt_owned {
-                                    (false, swarm.dial(options), true)
-                                } else {
-                                    (false, Ok(()), false)
+                        let reused_connection = match start_owned_connection_attempt(
+                            &swarm, &wings, &pid, &dial_addr, attempt_id,
+                        )
+                        .await
+                        {
+                            Ok(Some(reused_connection)) => reused_connection,
+                            Ok(None) => {
+                                if remove_connection_attempt(&wings, &pid, attempt_id).await {
+                                    decrement_counter(&ongoing_connections).await;
                                 }
+                                return;
+                            }
+                            Err(error) => {
+                                if remove_connection_attempt(&wings, &pid, attempt_id).await {
+                                    decrement_counter(&ongoing_connections).await;
+                                }
+                                {
+                                    let mut generations = wings.known_peer_generations.lock().await;
+                                    generations.remove(&pid);
+                                }
+                                let _ = chan.try_send(format!(
+                                    "bootnode dial failed: {:?}; retrying",
+                                    error
+                                ));
+                                queue_bootnode_retry(
+                                    baddr.clone(),
+                                    usable,
+                                    request_generation,
+                                    connection_generation.clone(),
+                                    bootnode_port_outgoing.clone(),
+                                )
+                                .await;
+                                return;
                             }
                         };
-                        if !attempt_owned {
-                            if remove_connection_attempt(&wings, &pid, attempt_id).await {
-                                decrement_counter(&ongoing_connections).await;
-                            }
-                            timed_log(format!(
-                                "Skipped stale bootnode dial peer={} attempt={}",
-                                pid, attempt_id
-                            ));
-                            return;
-                        }
-
-                        if let Err(error) = dial_result {
-                            timed_log(format!(
-                                "Bootnode dial failed immediately peer={} address={} error={:?}",
-                                pid, dial_addr, error
-                            ));
-                            if remove_connection_attempt(&wings, &pid, attempt_id).await {
-                                decrement_counter(&ongoing_connections).await;
-                            }
-                            {
-                                let mut generations = wings.known_peer_generations.lock().await;
-                                generations.remove(&pid);
-                            }
-                            let _ = chan
-                                .try_send(format!("bootnode dial failed: {:?}; retrying", error));
-                            queue_bootnode_retry(
-                                baddr.clone(),
-                                usable,
-                                request_generation,
-                                connection_generation.clone(),
-                                bootnode_port_outgoing.clone(),
-                                format!(
-                                    "immediate bootnode dial error peer={} error={:?}",
-                                    pid, error
-                                ),
-                            )
-                            .await;
-                            return;
-                        }
 
                         let _ = chan.try_send(
                             if reused_connection {
@@ -2946,7 +2622,6 @@ impl Weeb3 {
                 };
 
                 loop {
-                    // Accounting connect
                     let peer = peer_file.peer_id.clone();
                     let connection_attempt_id = peer_file.connection_attempt_id;
                     let mut connected_peers = wings.connected_peers.lock().await;
@@ -2965,14 +2640,6 @@ impl Weeb3 {
                             let mut swarm = self.swarm.lock_arc().await;
                             let _ = swarm.disconnect_peer_id(peer.clone());
                         }
-                        timed_log(format!(
-                            "Discarded stale handshake result peer={} attempt={} connection_id={:?} physical_current={} owns_attempt={}",
-                            peer,
-                            connection_attempt_id,
-                            peer_file.connection_id,
-                            physical_session_current,
-                            owns_attempt
-                        ));
                         break;
                     }
 
@@ -2980,10 +2647,6 @@ impl Weeb3 {
                         Some(existing)
                             if existing.connection_attempt_id != connection_attempt_id =>
                         {
-                            timed_log(format!(
-                                "Discarded stale handshake result peer={} attempt={} current_attempt={}",
-                                peer, connection_attempt_id, existing.connection_attempt_id
-                            ));
                             break;
                         }
                         Some(_) => false,
@@ -2994,10 +2657,6 @@ impl Weeb3 {
                                     == Some(connection_attempt_id)
                             };
                             if !owns_reservation {
-                                timed_log(format!(
-                                    "Discarded unowned handshake result peer={} attempt={}",
-                                    peer, connection_attempt_id
-                                ));
                                 break;
                             }
                             true
@@ -3037,9 +2696,6 @@ impl Weeb3 {
                     }
                     drop(connected_peers);
 
-                    // Pricing may have arrived before the connected peer and
-                    // its counted reservation existed. Reconcile only after
-                    // reservation, so an early promotion cannot be lost.
                     let threshold_ready = {
                         let accounting_peer = accounting_peer_lock.lock().await;
                         accounting_peer.threshold > 0
@@ -3063,10 +2719,6 @@ impl Weeb3 {
                             .await;
 
                             if *connection_generation.lock().await != retry_generation {
-                                timed_log(format!(
-                                    "Pricing timeout skipped stale generation peer={}",
-                                    peer_for_timeout
-                                ));
                                 return;
                             }
 
@@ -3118,10 +2770,6 @@ impl Weeb3 {
                                 let _ = swarm.disconnect_peer_id(peer_for_timeout.clone());
                             }
                             drop(connected_peers);
-                            timed_log(format!(
-                                "Disconnected peer={} after pricing timeout; terminal close owns retry",
-                                peer_for_timeout
-                            ));
                         });
                     }
 
@@ -3181,14 +2829,6 @@ impl Weeb3 {
                         self.promote_priced_peer(&wings, peer).await;
                     } else {
                         drop(connected_peers);
-                        timed_log(format!(
-                            "Discarded stale pricing result peer={} amount={} \
-                             pricing_connection={:?} expected_connection={:?}",
-                            peer,
-                            amount,
-                            pricing_session.connection_id(),
-                            expected_connection
-                        ));
                     }
 
                     match pricing_chan_incoming.try_recv() {
@@ -3204,9 +2844,6 @@ impl Weeb3 {
         let cheques_active_cache = Arc::new(Mutex::new(None::<bool>));
         let cheque_generations = Arc::new(Mutex::new(0_u64));
         {
-            // Capability discovery may touch persistence and an RPC endpoint.
-            // It is optional cheque policy and must never hold pseudo-settlement
-            // behind a cold lookup.
             let cheques_active_cache = cheques_active_cache.clone();
             spawn_local(async move {
                 let active = cheques_active().await;
@@ -3261,10 +2898,6 @@ impl Weeb3 {
                             return;
                         }
 
-                        // Monetary settlement and pseudosettlement both reduce
-                        // this account. Count the pending cheque as settlement
-                        // already in flight, but keep pseudo-refresh moving
-                        // whenever at least one refresh-rate unit remains.
                         let pending_cheque_amount = {
                             let cheques = wings0.ongoing_cheques.lock().await;
                             cheques.get(&peer).map(|(amount, _)| *amount).unwrap_or(0)
@@ -3298,18 +2931,14 @@ impl Weeb3 {
                             return;
                         };
 
-                        // Once dispatched, settlement is awaited to terminal;
-                        // no timeout clears ownership underneath accounting.
+                        // Dispatched settlement always runs to completion.
                         let attempted_amount = {
                             let mut account = accounting_peer.lock().await;
                             if account.balance < REFRESH_RATE {
                                 account.refresh_scheduled = false;
                                 return;
                             }
-                            // Reserve admission keeps balance + reserve at or
-                            // below this peer-announced maximum. Attempting the
-                            // whole threshold lets Bee include requests that
-                            // complete after this refresh was dispatched.
+                            // Include in-flight completions in the advertised allowance.
                             account.threshold
                         };
                         if attempted_amount == 0 {
@@ -3324,10 +2953,6 @@ impl Weeb3 {
                         )
                         .await;
 
-                        // Bee measures the one-second allowance from terminal
-                        // completion, not dispatch. Stamping here prevents a
-                        // slow successful attempt from immediately starting a
-                        // second payment in the same Bee wall-clock second.
                         accounting_peer.lock().await.refreshment = Date::now();
 
                         let amount = match outcome {
@@ -3336,12 +2961,6 @@ impl Weeb3 {
                                 continue;
                             }
                             RefreshmentOutcome::Acknowledged(0) => {
-                                // Bee persists accounting credit across
-                                // reconnects while this light client does not.
-                                // A valid zero acknowledgement authoritatively
-                                // says the peer sees no debt now. Preserve
-                                // reserve: requests completing after this lock
-                                // become the next refresh generation.
                                 let mut account = accounting_peer.lock().await;
                                 account.balance = 0;
                                 account.refresh_scheduled = false;
@@ -3351,10 +2970,6 @@ impl Weeb3 {
                             RefreshmentOutcome::Acknowledged(amount) => amount,
                             RefreshmentOutcome::AmbiguousAfterPayment => {
                                 interface_log(format!("Refreshment attempt cleared {}", 0));
-                                timed_log(format!(
-                                    "Quiescing exact accounting session after ambiguous refresh peer={} connection_id={:?}",
-                                    peer, connection_id
-                                ));
                                 quiesce_drain_and_close_accounting_session(
                                     &wings0,
                                     &refreshment_swarm,
@@ -3410,9 +3025,6 @@ impl Weeb3 {
                         }
                     }
                 });
-                // Interleave settlement tasks immediately, but break a burst
-                // of ready instructions often enough for browser WebRTC
-                // events (including PaymentAck) to run.
                 refresh_dispatches += 1;
                 if refresh_dispatches % 8 == 0 {
                     async_std::task::sleep(Duration::ZERO).await;
@@ -3473,9 +3085,6 @@ impl Weeb3 {
                             *current_deduction
                         };
 
-                        // Oracle access may be slow. A terminal close clears
-                        // this exact claim, so check again before opening a
-                        // protocol stream on a replacement connection.
                         let still_current = {
                             let map = ongoing_cheques.lock().await;
                             map.get(&peer).copied() == Some((amount, cheque_generation))
@@ -3502,9 +3111,6 @@ impl Weeb3 {
                             let _ = cheque_chan.try_send((peer, false, cheque_generation));
                             return;
                         };
-                        // Reading the accounting session awaited the peer
-                        // lock. A terminal close may have cleared this claim
-                        // during that gap.
                         let still_current = {
                             let map = ongoing_cheques.lock().await;
                             map.get(&peer).copied() == Some((amount, cheque_generation))
@@ -3573,21 +3179,11 @@ impl Weeb3 {
                             if let Some(accounting_peer) = accounting_peer {
                                 let _ = apply_refreshment(&accounting_peer, amount).await;
                             }
-                        } else if still_current {
-                            timed_log(format!(
-                                "Cheque issue failed peer={} amount={}",
-                                peer, amount
-                            ));
                         }
                         let mut cheques = wings.ongoing_cheques.lock().await;
                         if cheques.get(&peer).copied() == Some((amount, cheque_generation)) {
                             cheques.remove(&peer);
                         }
-                    } else {
-                        timed_log(format!(
-                            "Ignored stale cheque result peer={} generation={}",
-                            peer, cheque_generation
-                        ));
                     }
 
                     match cheque_send_chan_incoming.try_recv() {
@@ -3597,41 +3193,6 @@ impl Weeb3 {
                 }
 
                 async_std::task::yield_now().await;
-            }
-        };
-
-        let retrieve_handle = async {
-            loop {
-                let mut incoming_request = match self.message_port.1.recv().await {
-                    Ok(request) => request,
-                    Err(_) => break,
-                };
-                let mut dispatched = 0usize;
-
-                loop {
-                    let request = incoming_request;
-                    let n = request.address;
-                    let chan = request.chan;
-                    let data_retrieve_chan = data_retrieve_chan_outgoing.clone();
-                    let chunk_retrieve_chan = chunk_retrieve_chan_outgoing.clone();
-
-                    dispatched += 1;
-
-                    spawn_local(async move {
-                        let _ = chan.try_send(
-                            retrieve_resource(&n, &data_retrieve_chan, &chunk_retrieve_chan).await,
-                        );
-                    });
-
-                    match self.message_port.1.try_recv() {
-                        Ok(request) => incoming_request = request,
-                        Err(_) => break,
-                    }
-                }
-
-                if dispatched > 0 {
-                    async_std::task::yield_now().await;
-                }
             }
         };
 
@@ -3675,18 +3236,13 @@ impl Weeb3 {
 
                 loop {
                     let (resource, chan) = incoming_request;
-                    let data_retrieve_chan = data_retrieve_chan_outgoing.clone();
                     let chunk_retrieve_chan = chunk_retrieve_chan_outgoing.clone();
 
                     dispatched += 1;
 
                     spawn_local(async move {
-                        let resolved = bzz_stream::resolve_bzz(
-                            &resource,
-                            &data_retrieve_chan,
-                            &chunk_retrieve_chan,
-                        )
-                        .await;
+                        let resolved =
+                            bzz_stream::resolve_bzz(&resource, &chunk_retrieve_chan).await;
                         let _ = chan.try_send(resolved);
                     });
 
@@ -3713,7 +3269,6 @@ impl Weeb3 {
 
                 loop {
                     let request = incoming_request;
-                    let data_retrieve_chan = data_retrieve_chan_outgoing.clone();
                     let chunk_retrieve_chan = chunk_retrieve_chan_outgoing.clone();
                     let retrieve_cancel_generations = self.retrieve_cancel_generations.clone();
                     let range_permit = range_sem.acquire_arc().await;
@@ -3721,46 +3276,9 @@ impl Weeb3 {
                     dispatched += 1;
 
                     spawn_local(async move {
-                        // Admission is bounded above the chunk retriever. Once a chunk
-                        // request is dispatched it still owns its normal accounting-safe
-                        // drain lifecycle; the permit only suppresses excess new joins.
+                        // Closing admission never cancels dispatched accounting work.
                         let _range_permit = range_permit;
                         match request {
-                            BzzRangeRequest::Resource {
-                                resource,
-                                start,
-                                end_inclusive,
-                                cancel,
-                                chan,
-                            } => {
-                                register_retrieve_cancel_token(
-                                    &retrieve_cancel_generations,
-                                    &cancel,
-                                )
-                                .await;
-                                let data = if cancel.is_some() {
-                                    bzz_stream::acquire_range_cancellable(
-                                        &resource,
-                                        start,
-                                        end_inclusive,
-                                        &data_retrieve_chan,
-                                        &chunk_retrieve_chan,
-                                        cancel,
-                                        retrieve_cancel_generations,
-                                    )
-                                    .await
-                                } else {
-                                    bzz_stream::acquire_range(
-                                        &resource,
-                                        start,
-                                        end_inclusive,
-                                        &data_retrieve_chan,
-                                        &chunk_retrieve_chan,
-                                    )
-                                    .await
-                                };
-                                let _ = chan.try_send(data);
-                            }
                             BzzRangeRequest::Resolved {
                                 metadata,
                                 start,
@@ -3793,12 +3311,6 @@ impl Weeb3 {
                                     .await
                                 };
                                 let _ = chan.try_send(data);
-                            }
-                            BzzRangeRequest::Prepare { metadata, chan } => {
-                                let prepared =
-                                    bzz_stream::prepare_bzz_stream(metadata, &chunk_retrieve_chan)
-                                        .await;
-                                let _ = chan.try_send(prepared);
                             }
                         }
                     });
@@ -3848,10 +3360,6 @@ impl Weeb3 {
                             progress,
                         )
                         .await;
-                        runtime_debug(&JsValue::from(format!(
-                            "Writing response to interface push request"
-                        )));
-
                         let _ = chan.try_send(push_reference);
                     }
 
@@ -3892,38 +3400,6 @@ impl Weeb3 {
                 }
 
                 async_std::task::yield_now().await;
-            }
-        };
-
-        let retrieve_data_handle = async {
-            loop {
-                let mut incoming_request = match data_retrieve_chan_incoming.recv().await {
-                    Ok(request) => request,
-                    Err(_) => break,
-                };
-                let mut dispatched = 0usize;
-
-                loop {
-                    let (n, chan) = incoming_request;
-                    let chunk_retrieve_chan_outgoing = chunk_retrieve_chan_outgoing.clone();
-
-                    dispatched += 1;
-
-                    spawn_local(async move {
-                        let retrieved_data =
-                            retrieve_data(&n, &chunk_retrieve_chan_outgoing.clone()).await;
-                        let _ = chan.try_send(retrieved_data);
-                    });
-
-                    match data_retrieve_chan_incoming.try_recv() {
-                        Ok(request) => incoming_request = request,
-                        Err(_) => break,
-                    }
-                }
-
-                if dispatched > 0 {
-                    async_std::task::yield_now().await;
-                }
             }
         };
 
@@ -4284,8 +3760,6 @@ impl Weeb3 {
                     });
 
                     if retrieve_dispatches_since_browser_yield >= retrieve_dispatch_yield_every {
-                        // Break the WASM microtask chain so WebRTC control
-                        // traffic is serviced during large retrieval waves.
                         retrieve_dispatches_since_browser_yield = 0;
                         async_std::task::sleep(Duration::ZERO).await;
                     }
@@ -4296,8 +3770,6 @@ impl Weeb3 {
                     }
                 }
 
-                // Let the spawned retrievals begin without imposing a browser
-                // timer on every small tree-expansion wave.
                 async_std::task::yield_now().await;
             }
         };
@@ -4313,10 +3785,6 @@ impl Weeb3 {
                     let (bzzaddr0, bootn, instruction_generation, connection_attempt_id) = that;
                     let current_generation = self.current_connection_generation().await;
                     if instruction_generation != current_generation {
-                        timed_log(format!(
-                            "Skipping stale connection instruction generation={} current={}",
-                            instruction_generation, current_generation
-                        ));
                         match connections_instructions_chan_incoming.try_recv() {
                             Ok(instruction) => {
                                 that = instruction;
@@ -4341,27 +3809,15 @@ impl Weeb3 {
                     let wings = wings.clone();
 
                     spawn_local(async move {
-                        let handshake_started = Date::now();
                         let addr3 = match libp2p::core::Multiaddr::try_from(bzzaddr0.underlay) {
                             Ok(addr) => addr,
-                            Err(_) => {
-                                timed_log("Handshake dispatch skipped invalid underlay");
-                                return;
-                            }
+                            Err(_) => return,
                         };
 
                         let id = match try_from_multiaddr(&addr3) {
                             Some(peer_id) => peer_id,
-                            None => {
-                                timed_log("Handshake dispatch skipped invalid peer id");
-                                return;
-                            }
+                            None => return,
                         };
-
-                        timed_log(format!(
-                            "Entering Handshake Joiner peer={} bootnode={}",
-                            id, bootn,
-                        ));
 
                         if bootn {
                             let mut bootnodes_set = wings.bootnodes.lock().await;
@@ -4401,11 +3857,6 @@ impl Weeb3 {
                                         {
                                             Ok(Ok(addr)) => addr,
                                             _ => {
-                                                // This task has not run the Bee handshake yet, so
-                                                // it can only own an ongoing reservation. Check
-                                                // the exact token before touching peer-scoped
-                                                // waiter state; an old timeout must not erase a
-                                                // replacement attempt.
                                                 let connected_peers =
                                                     wings.connected_peers.lock().await;
                                                 if !connection_attempt_is_current(
@@ -4416,10 +3867,6 @@ impl Weeb3 {
                                                 .await
                                                 {
                                                     drop(connected_peers);
-                                                    timed_log(format!(
-                                                        "Ignored stale observed-address timeout peer={} attempt={}",
-                                                        id, connection_attempt_id
-                                                    ));
                                                     return;
                                                 }
                                                 {
@@ -4432,11 +3879,6 @@ impl Weeb3 {
                                                     let _ = swarm.disconnect_peer_id(id.clone());
                                                 }
                                                 drop(connected_peers);
-
-                                                timed_log(format!(
-                                                    "Disconnected stalled pre-handshake peer={} attempt={}; terminal close owns retry",
-                                                    id, connection_attempt_id
-                                                ));
                                                 return;
                                             }
                                         }
@@ -4453,18 +3895,10 @@ impl Weeb3 {
                                 decrement_counter(&ongoing_connections).await;
                             }
                             drop(connected_peers);
-                            timed_log(format!(
-                                "Handshake skipped stale generation peer={} generation={} attempt={} owned={}",
-                                id, instruction_generation, connection_attempt_id, had_attempt
-                            ));
                             return;
                         }
                         if !connection_attempt_is_current(&wings, &id, connection_attempt_id).await
                         {
-                            timed_log(format!(
-                                "Handshake skipped stale attempt peer={} attempt={}",
-                                id, connection_attempt_id
-                            ));
                             return;
                         }
                         let Some(physical_connection_id) = ({
@@ -4475,10 +3909,6 @@ impl Weeb3 {
                                     .flatten()
                             })
                         }) else {
-                            timed_log(format!(
-                                "Handshake skipped peer={} attempt={} without an owned physical connection",
-                                id, connection_attempt_id
-                            ));
                             return;
                         };
                         let Some(transport_session) = TransportConnectionSession::capture(
@@ -4490,10 +3920,6 @@ impl Weeb3 {
                                 let mut swarm = swarm.lock_arc().await;
                                 let _ = swarm.disconnect_peer_id(id.clone());
                             }
-                            timed_log(format!(
-                                "Handshake skipped peer={} attempt={} after physical session changed",
-                                id, connection_attempt_id
-                            ));
                             return;
                         };
 
@@ -4514,35 +3940,15 @@ impl Weeb3 {
                         .await
                         {
                             Ok(success) => success,
-                            Err(_) => {
-                                timed_log(format!(
-                                    "Handshake timed out peer={} attempt={}",
-                                    id, connection_attempt_id
-                                ));
-                                false
-                            }
+                            Err(_) => false,
                         };
 
-                        let elapsed = Date::now() - handshake_started;
-                        timed_log(format!(
-                            "Handshake Joiner finished peer={} success={} elapsed_ms={}",
-                            id, success, elapsed
-                        ));
-
                         if !success {
-                            // `connection_handler` publishes PeerFile only on
-                            // success. A failure therefore releases exactly
-                            // this attempt's ongoing slot and no connected or
-                            // accounting state.
                             let connected_peers = wings.connected_peers.lock().await;
                             if !connection_attempt_is_current(&wings, &id, connection_attempt_id)
                                 .await
                             {
                                 drop(connected_peers);
-                                timed_log(format!(
-                                    "Ignored stale handshake failure peer={} attempt={}",
-                                    id, connection_attempt_id
-                                ));
                                 return;
                             }
                             {
@@ -4550,11 +3956,6 @@ impl Weeb3 {
                                 let _ = swarm.disconnect_peer_id(id.clone());
                             }
                             drop(connected_peers);
-
-                            timed_log(format!(
-                                "Disconnected failed-handshake peer={} attempt={}; terminal close owns retry",
-                                id, connection_attempt_id
-                            ));
                         }
                     });
 
@@ -4574,11 +3975,9 @@ impl Weeb3 {
             refreshment_instruction_handle,
             cheque_instruction_handle,
             cheque_apply_handle,
-            retrieve_handle,
             raw_chunk_handle,
             resolve_bzz_handle,
             acquire_range_handle,
-            retrieve_data_handle,
             retrieve_chunk_handle,
             push_handle,
             push_data_handle,
@@ -4592,8 +3991,6 @@ impl Weeb3 {
             hive_joiner,
         );
 
-        runtime_debug(&JsValue::from(format!("Dropping All handlers")));
-
         ()
     }
 }
@@ -4605,7 +4002,6 @@ impl Weeb3 {
         usable_in_protocols: bool,
         generation: u64,
     ) -> String {
-        runtime_debug(&"bootnode change triggered".into());
         self.interface_log(format!(
             "Dial requested network={} usable={} address={}",
             self.get_network_id().await,
@@ -4750,31 +4146,6 @@ impl Weeb3 {
         chan_in.recv().await.unwrap_or(None)
     }
 
-    pub async fn acquire_range(
-        &self,
-        resource: String,
-        start: u64,
-        end_inclusive: u64,
-    ) -> Option<(Vec<u8>, BzzMetadata)> {
-        let (chan_out, chan_in) = mpsc::unbounded::<Option<(Vec<u8>, BzzMetadata)>>();
-        if self
-            .range_port
-            .0
-            .try_send(BzzRangeRequest::Resource {
-                resource,
-                start,
-                end_inclusive,
-                cancel: None,
-                chan: chan_out,
-            })
-            .is_err()
-        {
-            return None;
-        }
-
-        chan_in.recv().await.unwrap_or(None)
-    }
-
     pub async fn acquire_resolved_range(
         &self,
         metadata: BzzMetadata,
@@ -4810,9 +4181,7 @@ impl Weeb3 {
     ) -> Option<(Vec<u8>, BzzMetadata)> {
         let (chan_out, chan_in) = mpsc::unbounded::<Option<(Vec<u8>, BzzMetadata)>>();
         let cancel = stream_retrieve_cancel_token(stream_key, stream_generation);
-        // Publish a seek generation before bounded range admission. This makes queued
-        // older traversals stop scheduling new chunks while requests they already sent
-        // remain free to drain and settle accounting.
+        // Superseded ranges stop admission without cancelling dispatched work.
         register_retrieve_cancel_token(&self.retrieve_cancel_generations, &cancel).await;
 
         if self
@@ -4832,30 +4201,10 @@ impl Weeb3 {
 
         chan_in.recv().await.unwrap_or(None)
     }
-
-    pub async fn prepare_bzz_stream(&self, metadata: BzzMetadata) -> bool {
-        let (chan_out, chan_in) = mpsc::unbounded::<bool>();
-        if self
-            .range_port
-            .0
-            .try_send(BzzRangeRequest::Prepare {
-                metadata,
-                chan: chan_out,
-            })
-            .is_err()
-        {
-            return false;
-        }
-
-        chan_in.recv().await.unwrap_or(false)
-    }
 }
 
 #[derive(NetworkBehaviour)]
 struct Behaviour {
-    autonat: autonat::v2::client::Behaviour,
-    autonat_s: autonat::v2::server::Behaviour,
-    dcutr: dcutr::Behaviour,
     identify: identify::Behaviour,
     ping: ping::Behaviour,
     stream: StreamBehaviour,
@@ -4864,12 +4213,6 @@ struct Behaviour {
 impl Behaviour {
     fn new(local_public_key: identity::PublicKey) -> Self {
         Self {
-            autonat: autonat::v2::client::Behaviour::new(
-                OsRng,
-                autonat::v2::client::Config::default().with_probe_interval(Duration::from_secs(60)),
-            ),
-            autonat_s: autonat::v2::server::Behaviour::new(OsRng),
-            dcutr: dcutr::Behaviour::new(local_public_key.to_peer_id()),
             identify: identify::Behaviour::new(
                 identify::Config::new("/weeb-3".into(), local_public_key.clone())
                     .with_push_listen_addr_updates(true)

@@ -1,65 +1,92 @@
-// #![allow(warnings)]
-#![cfg(target_arch = "wasm32")]
-use async_std::sync::{Arc, Mutex};
+pub(crate) const CONNECTION_BUILDUP_LIMIT: u64 = 200;
+pub(crate) const CONNECTION_DIAL_CONCURRENCY_LIMIT: u64 = 128;
+pub(crate) const REFRESH_RATE: u64 = 450000;
+const PO_PRICE: u64 = 10000;
 
+pub(crate) fn connection_dial_capacity_available(connected: u64, ongoing: u64) -> bool {
+    connected.saturating_add(ongoing) < CONNECTION_BUILDUP_LIMIT
+        && ongoing < CONNECTION_DIAL_CONCURRENCY_LIMIT
+}
+
+pub(crate) fn bee_reconnect_delay_seconds(
+    balance: u64,
+    reserve: u64,
+    payment_threshold: u64,
+    refresh_rate: u64,
+) -> u64 {
+    if refresh_rate == 0 {
+        return 1;
+    }
+
+    const BEE_LIGHT_ACCOUNTING_FACTOR: u64 = 10;
+    let bee_refresh_rate = refresh_rate.saturating_mul(BEE_LIGHT_ACCOUNTING_FACTOR);
+    let bee_payment_threshold = payment_threshold.saturating_mul(BEE_LIGHT_ACCOUNTING_FACTOR);
+
+    balance
+        .saturating_add(reserve)
+        .max(bee_refresh_rate)
+        .saturating_add(bee_payment_threshold)
+        .checked_div(bee_refresh_rate)
+        .unwrap_or(1)
+        .max(1)
+}
+
+#[cfg(target_arch = "wasm32")]
+use crate::{
+    conventions::{PeerAccounting, get_proximity},
+    mpsc,
+};
+#[cfg(target_arch = "wasm32")]
+use async_std::sync::{Arc, Mutex};
+#[cfg(target_arch = "wasm32")]
 use libp2p::{PeerId, swarm::ConnectionId};
 
-use crate::conventions::{PeerAccounting, get_proximity};
-use crate::mpsc;
-
-pub const REFRESH_RATE: u64 = 450000;
-pub const PO_PRICE: u64 = 10000;
+#[cfg(target_arch = "wasm32")]
 pub(crate) type RefreshmentInstruction = (PeerId, Arc<Mutex<PeerAccounting>>, ConnectionId);
 
-pub async fn set_payment_threshold(a: &Mutex<PeerAccounting>, amount: u64) {
-    let mut account = a.lock().await;
+#[cfg(target_arch = "wasm32")]
+pub(crate) async fn set_payment_threshold(accounting: &Mutex<PeerAccounting>, amount: u64) {
+    let mut account = accounting.lock().await;
     account.threshold = amount;
     if amount > REFRESH_RATE * 2 {
         account.payment_threshold = REFRESH_RATE * 2;
     }
 }
 
-pub async fn reserve(a: &Mutex<PeerAccounting>, amount: u64) -> Option<ConnectionId> {
-    let mut account = a.lock().await;
+#[cfg(target_arch = "wasm32")]
+pub(crate) async fn reserve(
+    accounting: &Mutex<PeerAccounting>,
+    amount: u64,
+) -> Option<ConnectionId> {
+    let mut account = accounting.lock().await;
     let connection_id = account.connection_id?;
     let new_reserve = account.reserve.checked_add(amount)?;
-    let reserved_balance = account.balance.checked_add(new_reserve)?;
-
-    if reserved_balance > account.threshold {
+    if account.balance.checked_add(new_reserve)? > account.threshold {
         return None;
     }
-
     account.reserve = new_reserve;
     Some(connection_id)
 }
 
-pub async fn apply_credit(
-    a: &Arc<Mutex<PeerAccounting>>,
+#[cfg(target_arch = "wasm32")]
+pub(crate) async fn apply_credit(
+    accounting: &Arc<Mutex<PeerAccounting>>,
     amount: u64,
-    chan: &mpsc::Sender<RefreshmentInstruction>,
+    refreshments: &mpsc::Sender<RefreshmentInstruction>,
 ) {
-    let mut account = a.lock().await;
+    let mut account = accounting.lock().await;
     let mut debt_increase = amount;
-    if account.reserve > amount {
-        account.reserve -= amount;
-    } else {
-        account.reserve = 0;
-    }
+    account.reserve = account.reserve.saturating_sub(amount);
 
-    if account.surplus_balance > 0 {
-        let compensated = account.surplus_balance.min(debt_increase);
-        account.surplus_balance -= compensated;
-        debt_increase -= compensated;
-    }
-
-    if debt_increase > 0 {
-        account.balance = account.balance.saturating_add(debt_increase);
-    }
+    let compensated = account.surplus_balance.min(debt_increase);
+    account.surplus_balance -= compensated;
+    debt_increase -= compensated;
+    account.balance = account.balance.saturating_add(debt_increase);
 
     let instruction = if account.balance >= REFRESH_RATE && !account.refresh_scheduled {
         account.connection_id.map(|connection_id| {
             account.refresh_scheduled = true;
-            (account.id, a.clone(), connection_id)
+            (account.id, accounting.clone(), connection_id)
         })
     } else {
         None
@@ -68,20 +95,19 @@ pub async fn apply_credit(
 
     if let Some(instruction) = instruction {
         let accounting = instruction.1.clone();
-        match chan.try_send(instruction) {
-            // Pause only the threshold-crossing completion. The receiver is
-            // woken first, then the browser can service its WebRTC control IO.
+        match refreshments.try_send(instruction) {
             Ok(()) => async_std::task::sleep(std::time::Duration::ZERO).await,
             Err(_) => accounting.lock().await.refresh_scheduled = false,
         }
     }
 }
 
-pub async fn apply_refreshment(
-    a: &Mutex<PeerAccounting>,
+#[cfg(target_arch = "wasm32")]
+pub(crate) async fn apply_refreshment(
+    accounting: &Mutex<PeerAccounting>,
     amount: u64,
 ) -> Option<(PeerId, u64, u64)> {
-    let mut account = a.lock().await;
+    let mut account = accounting.lock().await;
     if amount >= account.balance {
         let surplus_growth = amount - account.balance;
         account.balance = 0;
@@ -92,22 +118,18 @@ pub async fn apply_refreshment(
     } else {
         account.balance -= amount;
     }
-
     None
 }
 
-pub async fn cancel_reserve(a: &Mutex<PeerAccounting>, amount: u64) {
-    let mut account = a.lock().await;
-    if account.reserve > amount {
-        account.reserve -= amount;
-        return;
-    }
-    account.reserve = 0;
+#[cfg(target_arch = "wasm32")]
+pub(crate) async fn cancel_reserve(accounting: &Mutex<PeerAccounting>, amount: u64) {
+    let mut account = accounting.lock().await;
+    account.reserve = account.reserve.saturating_sub(amount);
 }
 
-pub fn price(peer_overlay: &[u8], chunk_address: &[u8]) -> u64 {
-    // return uint64(swarm.MaxPO-swarm.Proximity(peer.Bytes(), chunk.Bytes())+1) * pricer.PO_PRICE
-
-    let po = get_proximity(peer_overlay, chunk_address);
-    return ((u64::from(crate::conventions::MAX_PO) - u64::from(po) + 1) * PO_PRICE).into();
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn price(peer_overlay: &[u8], chunk_address: &[u8]) -> u64 {
+    (u64::from(crate::conventions::MAX_PO) - u64::from(get_proximity(peer_overlay, chunk_address))
+        + 1)
+        * PO_PRICE
 }

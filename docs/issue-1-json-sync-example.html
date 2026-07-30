@@ -188,7 +188,7 @@
 
       async function diagnostics() {
         const network = await node.networkState();
-        const ready = await node.readyState(1, 0);
+        const ready = await node.ready(1, 0);
         return {
           runtime: "node.start() default mainnet",
           network: {
@@ -198,15 +198,9 @@
             baseSymbol: network.baseSymbol,
             bzzSymbol: network.bzzSymbol
           },
-          connections: {
-            ready: ready.ready,
-            connected: ready.connections,
-            connecting: ready.connecting
-          },
+          ready,
           feed: {
-            topic: TOPIC,
-            normalizedTopic: node.feedTopic(TOPIC).feedTopic,
-            identity: await node.feedIdentity(TOPIC)
+            topic: TOPIC
           },
           batchRequest: {
             depth: DEPTH,
@@ -217,7 +211,7 @@
       }
 
       async function checkBatch() {
-        return node.uploadPrerequisites(DEPTH, VALIDITY_DAYS);
+        return node.batchState(DEPTH, VALIDITY_DAYS);
       }
 
       async function buyBatchAndVerify() {

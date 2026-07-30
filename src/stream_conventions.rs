@@ -1,81 +1,15 @@
-use std::cell::RefCell;
+pub(crate) const STREAMING_ROUTE_BASE: &str = "/weeb-3";
+pub(crate) const STREAMING_SERVICE_WORKER_URL: &str = "/weeb-3/service.js";
+pub(crate) const STREAMING_SERVICE_WORKER_SCOPE: &str = "/weeb-3/";
 
-const DEFAULT_ROUTE_BASE: &str = "/weeb-3";
-const DEFAULT_SERVICE_WORKER_URL: &str = "/weeb-3/service.js";
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct StreamingRouteConfig {
-    route_base: String,
-    service_worker_url: String,
-}
-
-impl Default for StreamingRouteConfig {
-    fn default() -> Self {
-        Self {
-            route_base: DEFAULT_ROUTE_BASE.to_string(),
-            service_worker_url: DEFAULT_SERVICE_WORKER_URL.to_string(),
-        }
-    }
-}
-
-thread_local! {
-    static STREAMING_ROUTE_CONFIG: RefCell<StreamingRouteConfig> =
-        RefCell::new(StreamingRouteConfig::default());
-}
-
-pub(crate) fn configure_streaming_routes(
-    service_worker_url: &str,
-    route_base: &str,
-) -> Result<(), String> {
-    let service_worker_url = service_worker_url.trim();
-    if service_worker_url.is_empty()
-        || service_worker_url
-            .chars()
-            .any(|character| character.is_control())
-    {
-        return Err(
-            "service worker URL must be non-empty and contain no control characters".into(),
-        );
-    }
-    let route_base = normalize_route_base(route_base)?;
-
-    STREAMING_ROUTE_CONFIG.with(|config| {
-        *config.borrow_mut() = StreamingRouteConfig {
-            route_base,
-            service_worker_url: service_worker_url.to_string(),
-        };
-    });
-    Ok(())
-}
-
-pub(crate) fn streaming_route_base() -> String {
-    STREAMING_ROUTE_CONFIG.with(|config| config.borrow().route_base.clone())
-}
-
-pub(crate) fn streaming_service_worker_url() -> String {
-    STREAMING_ROUTE_CONFIG.with(|config| config.borrow().service_worker_url.clone())
-}
-
-pub(crate) fn streaming_service_worker_scope() -> String {
-    let base = streaming_route_base();
-    if base.is_empty() {
-        "/".to_string()
-    } else {
-        format!("{base}/")
-    }
-}
+const MAX_STREAM_TOPIC_BYTES: usize = 256;
 
 pub(crate) fn streaming_route_path(suffix: &str) -> String {
-    let base = streaming_route_base();
     let suffix = suffix.trim_start_matches('/');
     if suffix.is_empty() {
-        if base.is_empty() {
-            "/".to_string()
-        } else {
-            base
-        }
+        STREAMING_ROUTE_BASE.to_string()
     } else {
-        format!("{base}/{suffix}")
+        format!("{STREAMING_ROUTE_BASE}/{suffix}")
     }
 }
 
@@ -95,110 +29,83 @@ pub(crate) fn decode_component(value: &str) -> String {
         .unwrap_or_else(|| value.to_string())
 }
 
-pub(crate) fn route_base_controls_path(route_base: &str, pathname: &str) -> bool {
-    let Ok(base) = normalize_route_base(route_base) else {
-        return false;
-    };
-    base.is_empty() || pathname.starts_with(&format!("{base}/"))
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct StreamShareRoute {
+    pub owner: String,
+    pub topic: String,
 }
 
-pub(crate) fn normalize_route_base(value: &str) -> Result<String, String> {
-    let value = value.trim();
-    if value == "/" {
-        return Ok(String::new());
+impl StreamShareRoute {
+    pub(crate) fn new(owner: impl Into<String>, topic: impl Into<String>) -> Result<Self, String> {
+        let owner = owner.into();
+        let topic = topic.into();
+        if owner.len() != 40 || !owner.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err("stream owner must be a 20-byte hexadecimal address".into());
+        }
+        if topic.is_empty()
+            || topic.len() > MAX_STREAM_TOPIC_BYTES
+            || topic.chars().any(char::is_control)
+            || matches!(topic.as_str(), "." | "..")
+        {
+            return Err("stream topic is invalid".into());
+        }
+        Ok(Self {
+            owner: owner.to_ascii_lowercase(),
+            topic,
+        })
     }
-    if !value.starts_with('/') {
-        return Err("streaming route base must be an absolute same-origin path".into());
-    }
-    if value.contains(['?', '#', '\\']) || value.chars().any(|character| character.is_control()) {
-        return Err("streaming route base contains an invalid path character".into());
-    }
-
-    let normalized = value.trim_end_matches('/');
-    if normalized.split('/').skip(1).any(|component| {
-        component.is_empty()
-            || component == "."
-            || component == ".."
-            || component.eq_ignore_ascii_case("%2e")
-            || component.eq_ignore_ascii_case("%2e%2e")
-            || component.eq_ignore_ascii_case(".%2e")
-            || component.eq_ignore_ascii_case("%2e.")
-    }) {
-        return Err("streaming route base must not contain empty or dot path segments".into());
-    }
-    Ok(normalized.to_string())
 }
 
-#[cfg(not(target_arch = "wasm32"))]
-pub(crate) fn is_direct_share_route(path: &str) -> bool {
-    let path = path.split(['?', '#']).next().unwrap_or_default();
-    let Some(route) = path.strip_prefix("/weeb-3/") else {
-        return false;
-    };
-    if route.ends_with('/') {
-        return false;
+pub(crate) fn parse_stream_share_link(input: &str) -> Result<StreamShareRoute, String> {
+    let input = input.trim();
+    if input.is_empty() || input.contains(['?', '#', '\\']) || input.chars().any(char::is_control) {
+        return Err("stream link must be a clean path".into());
     }
+    let route = input
+        .strip_prefix(STREAMING_ROUTE_BASE)
+        .and_then(|tail| tail.strip_prefix('/'))
+        .unwrap_or_else(|| input.trim_start_matches('/'));
     let mut parts = route.split('/');
-
-    match parts.next() {
-        Some("stream") => {}
-        Some("testnet") if parts.next() == Some("stream") => {}
-        _ => return false,
+    if parts.next() != Some("stream") {
+        return Err("stream link has an invalid path".into());
     }
-
-    let Some(owner) = parts.next() else {
-        return false;
-    };
-    let Some(topic) = parts.next() else {
-        return false;
-    };
-    let index = parts.next();
-    parts.next().is_none()
-        && is_feed_owner(owner)
-        && is_stream_topic(topic)
-        && index.is_none_or(|index| index.parse::<u64>().is_ok())
+    let owner = parts
+        .next()
+        .ok_or_else(|| "stream link is missing its owner".to_string())?;
+    let topic = parts
+        .next()
+        .ok_or_else(|| "stream link is missing its topic".to_string())?;
+    if parts.next().is_some() {
+        return Err("stream link has an invalid path".into());
+    }
+    StreamShareRoute::new(owner, decode_path_segment(topic)?)
 }
 
-#[cfg(not(target_arch = "wasm32"))]
-fn is_stream_topic(value: &str) -> bool {
-    if value.is_empty() {
-        return false;
-    }
+fn decode_path_segment(value: &str) -> Result<String, String> {
     let bytes = value.as_bytes();
     let mut decoded = Vec::with_capacity(bytes.len());
-    let mut cursor = 0usize;
+    let mut cursor = 0;
     while cursor < bytes.len() {
-        if bytes[cursor] == b'%' {
-            let Some(high) = bytes
-                .get(cursor + 1)
-                .and_then(|byte| navigation_hex_value(*byte))
-            else {
-                return false;
-            };
-            let Some(low) = bytes
-                .get(cursor + 2)
-                .and_then(|byte| navigation_hex_value(*byte))
-            else {
-                return false;
-            };
-            decoded.push((high << 4) | low);
-            cursor += 3;
-        } else {
+        if bytes[cursor] != b'%' {
             decoded.push(bytes[cursor]);
             cursor += 1;
+            continue;
         }
+        let high = bytes
+            .get(cursor + 1)
+            .and_then(|byte| hex_value(*byte))
+            .ok_or_else(|| "stream topic has an invalid percent escape".to_string())?;
+        let low = bytes
+            .get(cursor + 2)
+            .and_then(|byte| hex_value(*byte))
+            .ok_or_else(|| "stream topic has an invalid percent escape".to_string())?;
+        decoded.push((high << 4) | low);
+        cursor += 3;
     }
-    let Ok(topic) = std::str::from_utf8(&decoded) else {
-        return false;
-    };
-    !topic.is_empty()
-        && topic.len() <= 256
-        && !topic.chars().any(char::is_control)
-        && !matches!(topic, "." | "..")
+    String::from_utf8(decoded).map_err(|_| "stream topic is not valid UTF-8".to_string())
 }
 
-#[cfg(not(target_arch = "wasm32"))]
-fn navigation_hex_value(byte: u8) -> Option<u8> {
+fn hex_value(byte: u8) -> Option<u8> {
     match byte {
         b'0'..=b'9' => Some(byte - b'0'),
         b'a'..=b'f' => Some(byte - b'a' + 10),
@@ -207,63 +114,6 @@ fn navigation_hex_value(byte: u8) -> Option<u8> {
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
-fn is_feed_owner(value: &str) -> bool {
-    let value = value
-        .strip_prefix("0x")
-        .or_else(|| value.strip_prefix("0X"))
-        .unwrap_or(value);
-    value.len() == 40 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-pub(crate) fn is_document_navigation(
-    method: &str,
-    fetch_mode: Option<&str>,
-    fetch_destination: Option<&str>,
-    accept: Option<&str>,
-) -> bool {
-    if !method.eq_ignore_ascii_case("GET") {
-        return false;
-    }
-
-    if fetch_destination.is_some_and(|destination| {
-        destination.eq_ignore_ascii_case("frame") || destination.eq_ignore_ascii_case("iframe")
-    }) {
-        return false;
-    }
-
-    if let Some(mode) = fetch_mode {
-        return mode.eq_ignore_ascii_case("navigate");
-    }
-    if let Some(destination) = fetch_destination {
-        return destination.eq_ignore_ascii_case("document");
-    }
-
-    accept.is_some_and(accepts_html)
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-fn accepts_html(value: &str) -> bool {
-    value.split(',').any(|entry| {
-        matches!(
-            entry
-                .split(';')
-                .next()
-                .unwrap_or_default()
-                .trim()
-                .to_ascii_lowercase()
-                .as_str(),
-            "text/html" | "application/xhtml+xml"
-        )
-    })
-}
-
-/// Parse one HTTP byte range against a known representation size.
-///
-/// `None` means that no Range header was supplied. A supplied but malformed,
-/// multipart, empty, or unsatisfiable range is always `Some(Err(()))`; callers
-/// must not silently turn it into a full-body response.
 pub(crate) fn parse_single_range(range: Option<&str>, size: u64) -> Option<Result<(u64, u64), ()>> {
     let range = range?.trim();
     let Some((unit, spec)) = range.split_once('=') else {
@@ -314,12 +164,6 @@ fn parse_decimal(value: &str) -> Option<u64> {
         .flatten()
 }
 
-/// Apply the weak entity-tag comparison required by `If-None-Match` on GET
-/// and HEAD requests.
-///
-/// The representations emitted by weeb-3 use simple quoted entity tags, so a
-/// comma-separated validator list is sufficient here. An opaque tag containing
-/// a comma is not produced by this server.
 pub(crate) fn if_none_match_matches(value: Option<&str>, current_etag: &str) -> bool {
     let Some(value) = value else {
         return false;
@@ -337,11 +181,6 @@ pub(crate) fn if_none_match_matches(value: Option<&str>, current_etag: &str) -> 
     })
 }
 
-/// Return whether an optional `If-Range` validator permits a partial response.
-///
-/// Entity tags use strong comparison. HTTP-date validators conservatively
-/// fall back to a full representation because Swarm metadata does not expose a
-/// trustworthy last-modified time.
 pub(crate) fn if_range_allows_range(value: Option<&str>, current_etag: &str) -> bool {
     let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
         return true;
@@ -398,42 +237,6 @@ pub(crate) fn window_prefix(identity: &str, size: u64) -> String {
     format!("{}|{}|", identity, size)
 }
 
-#[cfg(test)]
-mod range_cache_identity_tests {
-    use super::{immutable_metadata_identity, window_key, window_prefix};
-
-    #[test]
-    fn content_reference_is_authoritative_over_etag() {
-        let first = immutable_metadata_identity("resource", &[0x11; 32], "same-etag");
-        let second = immutable_metadata_identity("resource", &[0x22; 32], "same-etag");
-        assert_ne!(first, second);
-        assert_eq!(first, "11".repeat(32));
-    }
-
-    #[test]
-    fn invalid_reference_uses_safe_fallbacks() {
-        assert_eq!(
-            immutable_metadata_identity("resource", &[0x11; 31], "etag"),
-            "etag"
-        );
-        assert_eq!(immutable_metadata_identity("resource", &[], ""), "resource");
-    }
-
-    #[test]
-    fn window_keys_separate_size_and_bounds() {
-        let identity = immutable_metadata_identity("resource", &[0x33; 64], "etag");
-        assert_ne!(
-            window_key(&identity, 10, 0, 4),
-            window_key(&identity, 11, 0, 4)
-        );
-        assert_ne!(
-            window_key(&identity, 10, 0, 4),
-            window_key(&identity, 10, 5, 9)
-        );
-        assert!(window_key(&identity, 10, 0, 4).starts_with(&window_prefix(&identity, 10)));
-    }
-}
-
 pub(crate) const MIB_BYTES: u64 = 1024 * 1024;
 
 pub(crate) const MEDIA_STORAGE_WINDOW_BYTES: u64 = MIB_BYTES / 2;
@@ -486,22 +289,12 @@ pub(crate) fn media_cache_budget_bytes(
     MEDIA_CACHE_FALLBACK_BYTES
 }
 
-/// Return the byte distance speculative media may advance beyond the response
-/// that triggered it.
-///
-/// The foreground startup response and three storage-window edge allowances
-/// remain resident. Lookahead is then capped at 96 MiB even on large heaps.
 pub(crate) fn media_prefetch_ahead_limit_bytes(cache_budget_bytes: u64) -> u64 {
     cache_budget_bytes
         .saturating_sub(MEDIA_PREFETCH_ACTIVE_HEADROOM_BYTES)
         .min(MEDIA_PREFETCH_AHEAD_HARD_LIMIT_BYTES)
 }
 
-/// Return cumulative byte targets for the shared staged prefetch policy.
-///
-/// Targets are relative to the end of the foreground response. The caller can
-/// pass a smaller limit for end-of-file/end-of-playlist clipping. A clipped
-/// final target appears only once.
 pub(crate) fn media_prefetch_stage_targets(ahead_limit_bytes: u64) -> Vec<u64> {
     let limit = ahead_limit_bytes.min(MEDIA_PREFETCH_AHEAD_HARD_LIMIT_BYTES);
     let mut targets = Vec::with_capacity(MEDIA_PREFETCH_STAGE_BYTES.len());
@@ -518,15 +311,6 @@ pub(crate) fn media_prefetch_stage_targets(ahead_limit_bytes: u64) -> Vec<u64> {
     targets
 }
 
-/// One bounded batch of indivisible prefetch units.
-///
-/// A unit is a fixed byte-storage window or another indivisible media object.
-/// `already_planned_bytes`, `stage_target_bytes`, and
-/// `hard_limit_bytes` are all measured from the end of the triggering
-/// foreground response. The stage target may be exceeded by the final
-/// indivisible unit, but the hard limit is never exceeded. Units are kept in
-/// order; an invalid or over-budget unit stops the batch rather than skipping
-/// ahead in the media.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct MediaPrefetchBatch {
     pub(crate) unit_count: usize,

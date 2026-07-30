@@ -2,15 +2,13 @@ use alloy::primitives::keccak256;
 use alloy::signers::Signer;
 use alloy::signers::local::PrivateKeySigner;
 
-use byteorder::ByteOrder;
-use num::{BigUint, ToPrimitive};
 use prost::Message;
 
 use crate::mpsc;
 use std::collections::HashMap;
 use std::io::Cursor;
 
-use crate::connection_conventions::{OpenStreamError, StreamControl};
+use crate::{OpenStreamError, StreamControl};
 use libp2p::{
     PeerId, Stream, StreamProtocol,
     futures::{AsyncReadExt, AsyncWriteExt},
@@ -18,7 +16,6 @@ use libp2p::{
     swarm::ConnectionId,
 };
 
-use wasm_bindgen::JsValue;
 use web3::types::U256;
 
 use crate::conventions::*;
@@ -27,7 +24,6 @@ use async_std::sync::{Arc, Mutex};
 use crate::weeb_3::etiquette_0;
 use crate::weeb_3::etiquette_1;
 use crate::weeb_3::etiquette_2;
-// use crate::weeb_3::etiquette_3;
 use crate::weeb_3::etiquette_4;
 use crate::weeb_3::etiquette_5;
 use crate::weeb_3::etiquette_6;
@@ -49,15 +45,27 @@ use crate::RETRIEVAL_PROTOCOL;
 use crate::SWAP_PROTOCOL;
 use crate::{OutboundProtocolSession, TransportConnectionSession};
 
-const DEBUG_HANDLER_LOGS: bool = false;
 const CONTROL_PROTOCOL_MAX_FRAME_BYTES: u64 = 64 * 1024;
 
-macro_rules! handler_log {
-    ($($arg:tt)*) => {
-        if DEBUG_HANDLER_LOGS {
-            web_sys::console::log_1(&JsValue::from(format!($($arg)*)));
-        }
-    };
+fn trimmed_big_endian(bytes: &[u8]) -> Vec<u8> {
+    let first = bytes
+        .iter()
+        .position(|byte| *byte != 0)
+        .unwrap_or(bytes.len());
+    bytes[first..].to_vec()
+}
+
+fn decode_big_endian_u64(bytes: &[u8]) -> Option<u64> {
+    let bytes = &bytes[bytes
+        .iter()
+        .position(|byte| *byte != 0)
+        .unwrap_or(bytes.len())..];
+    if bytes.len() > 8 {
+        return None;
+    }
+    let mut value = [0_u8; 8];
+    value[8 - bytes.len()..].copy_from_slice(bytes);
+    Some(u64::from_be_bytes(value))
 }
 
 struct OutgoingChequeState {
@@ -65,9 +73,7 @@ struct OutgoingChequeState {
     beneficiary: EthAddress,
     chequebook_bytes: Vec<u8>,
     chequebook: EthAddress,
-    stored_cumulative_payout: EthU256,
     effective_deduction: EthU256,
-    cheque_delta: EthU256,
     cumulative_payout: EthU256,
 }
 
@@ -91,19 +97,6 @@ async fn read_control_protocol_frame(stream: &mut Stream) -> Option<Vec<u8>> {
         }
     }
     None
-}
-
-fn outgoing_cheque_trace(peer: &PeerId, state: &OutgoingChequeState) -> String {
-    return format!(
-        "peer={} beneficiary={:#x} chequebook={:#x} stored_cumulative_payout={} effective_deduction={} cheque_delta={} cumulative_payout={}",
-        peer,
-        state.beneficiary,
-        state.chequebook,
-        state.stored_cumulative_payout,
-        state.effective_deduction,
-        state.cheque_delta,
-        state.cumulative_payout
-    );
 }
 
 async fn prepare_outgoing_cheque_state(
@@ -154,9 +147,7 @@ async fn prepare_outgoing_cheque_state(
         beneficiary,
         chequebook_bytes,
         chequebook,
-        stored_cumulative_payout,
         effective_deduction,
-        cheque_delta,
         cumulative_payout,
     });
 }
@@ -172,8 +163,6 @@ pub async fn ceive(
     pk: &Arc<Mutex<ecdsa::SecretKey>>,
     chan: &mpsc::Sender<PeerFile>,
 ) -> bool {
-    handler_log!("Handshake stage 1 0");
-
     let mut step_0 = etiquette_1::Syn::default();
 
     step_0.observed_underlay = a.clone().to_vec();
@@ -195,13 +184,9 @@ pub async fn ceive(
         return false;
     }
 
-    handler_log!("Handshake stage 1 1");
-
     let Some(handshake_frame) = read_control_protocol_frame(&mut stream).await else {
         return false;
     };
-
-    handler_log!("Handshake stage 1 2");
 
     let rec_0_u = etiquette_1::SynAck::decode(&mut Cursor::new(handshake_frame));
 
@@ -212,11 +197,7 @@ pub async fn ceive(
         }
     };
 
-    handler_log!("Handshake stage 1 3 2 \n {:#?}", rec_0);
-
     let underlay = self_ephemeral.to_vec();
-
-    handler_log!("Handshake stage 1 3 3");
 
     let Some(ack) = rec_0.ack.as_ref() else {
         return false;
@@ -242,8 +223,6 @@ pub async fn ceive(
         return false;
     }
 
-    handler_log!("Handshake stage 1 3");
-
     let overlay;
     let signature;
     let nonce: [u8; 32] = [0; 32];
@@ -256,8 +235,7 @@ pub async fn ceive(
         let addrep = signer.address();
         let addre = addrep.to_vec();
 
-        let mut bufidl: [u8; 8] = [0; 8];
-        byteorder::LittleEndian::write_u64(&mut bufidl, network_id);
+        let bufidl = network_id.to_le_bytes();
         let byteslice = [addre.as_slice(), &bufidl].concat();
 
         let byteslice2 = [byteslice, (&nonce).to_vec()].concat();
@@ -290,8 +268,6 @@ pub async fn ceive(
     step_1.full_node = false;
     step_1.welcome_message = "... Ara Ara ...".to_string();
 
-    handler_log!("Handshake stage 1 4");
-
     let mut bufw_1 = Vec::new();
 
     let step_1_len = step_1.encoded_len();
@@ -308,13 +284,7 @@ pub async fn ceive(
         return false;
     }
 
-    handler_log!("Handshake stage 1 5");
-
     let _ = stream.close().await;
-
-    handler_log!("Handshake stage 1 6");
-
-    handler_log!("Connected Peer {:#?} with address {}!", peer, beneficiary);
 
     if chan
         .try_send(PeerFile {
@@ -326,7 +296,6 @@ pub async fn ceive(
         })
         .is_err()
     {
-        handler_log!("Handshake result receiver closed for peer {}", peer);
         return false;
     }
 
@@ -339,8 +308,6 @@ pub async fn pricing_handler(
     session: TransportConnectionSession,
     chan: &mpsc::Sender<(PeerId, u64, TransportConnectionSession)>,
 ) {
-    handler_log!("Opened pricing handle for peer {}!", peer);
-
     if read_control_protocol_frame(&mut stream).await.is_none() {
         return;
     }
@@ -370,22 +337,15 @@ pub async fn pricing_handler(
     let rec_0 = match rec_0_u {
         Ok(x) => x,
         Err(_x) => {
-            handler_log!("Error in protocol {:#?}!", _x);
             return;
         }
     };
 
-    handler_log!("Got AnnouncePaymentThreshold {:#?}!", rec_0);
-
-    let Some(pt) = BigUint::from_bytes_be(&rec_0.payment_threshold).to_u64() else {
+    let Some(pt) = decode_big_endian_u64(&rec_0.payment_threshold) else {
         return;
     };
 
     if !session.is_current() {
-        handler_log!(
-            "Discarded pricing result from stale transport session peer={}",
-            peer
-        );
         return;
     }
 
@@ -393,13 +353,11 @@ pub async fn pricing_handler(
 }
 
 pub async fn gossip_handler(
-    peer: PeerId,
+    _peer: PeerId,
     mut stream: Stream,
     chan: &mpsc::Sender<(etiquette_2::BzzAddress, u64)>,
     generation: u64,
 ) {
-    handler_log!("Opened gossip handle for peer {}!", peer);
-
     let mut buf_nondiscard_0 = Vec::new();
     let mut buf_discard_0: [u8; 255] = [0; 255];
     loop {
@@ -451,8 +409,7 @@ pub async fn gossip_handler(
 
     let rec_0 = match rec_0_u {
         Ok(x) => x,
-        Err(x) => {
-            handler_log!("Error in protocol {:#?}!", x);
+        Err(_) => {
             return;
         }
     };
@@ -494,7 +451,7 @@ pub async fn fresh(amount: u64, mut stream: Stream) -> RefreshmentOutcome {
 
     let mut step_1 = etiquette_5::Payment::default();
 
-    step_1.amount = BigUint::from(amount).to_bytes_be();
+    step_1.amount = trimmed_big_endian(&amount.to_be_bytes());
 
     let mut bufw_1 = Vec::new();
 
@@ -517,13 +474,12 @@ pub async fn fresh(amount: u64, mut stream: Stream) -> RefreshmentOutcome {
 
     let rec_0 = match rec_0_u {
         Ok(x) => x,
-        Err(x) => {
-            handler_log!("Error in protocol {:#?}!", x);
+        Err(_) => {
             return RefreshmentOutcome::AmbiguousAfterPayment;
         }
     };
 
-    let Some(refr_am) = BigUint::from_bytes_be(&rec_0.amount).to_u64() else {
+    let Some(refr_am) = decode_big_endian_u64(&rec_0.amount) else {
         return RefreshmentOutcome::AmbiguousAfterPayment;
     };
 
@@ -533,7 +489,6 @@ pub async fn fresh(amount: u64, mut stream: Stream) -> RefreshmentOutcome {
     RefreshmentOutcome::Acknowledged(refr_am)
 }
 
-#[allow(dead_code)]
 pub async fn issue(
     peer: PeerId,
     amount: u64,
@@ -543,12 +498,9 @@ pub async fn issue(
     price: U256,
     deduction: U256,
 ) {
-    handler_log!("Opened issue handle for peer {}!", peer);
-
     let signer_key = get_chequebook_signer_key().await;
     if signer_key.len() != 32 {
         let _ = chan.try_send((peer, false));
-        handler_log!("Issue fail 1 - no chequebook signer");
         return;
     }
 
@@ -556,7 +508,6 @@ pub async fn issue(
         Ok(w) => w,
         Err(_) => {
             let _ = chan.try_send((peer, false));
-            handler_log!("Issue fail 2");
             return;
         }
     };
@@ -568,15 +519,9 @@ pub async fn issue(
             Some(state) => state,
             None => {
                 let _ = chan.try_send((peer, false));
-                handler_log!("Issue fail 3");
                 return;
             }
         };
-
-    handler_log!(
-        "Issue cheque attempt {}",
-        outgoing_cheque_trace(&peer, &cheque_state)
-    );
 
     let mut non_empty = etiquette_0::Headers::default();
 
@@ -585,14 +530,14 @@ pub async fn issue(
 
     let mut buf = [0u8; 32];
     price.to_big_endian(&mut buf);
-    price_header.value = BigUint::from_bytes_be(&buf).to_bytes_be();
+    price_header.value = trimmed_big_endian(&buf);
 
     let mut deduction_header = etiquette_0::Header::default();
     deduction_header.key = "deduction".to_string();
 
     let mut buf = [0u8; 32];
     cheque_state.effective_deduction.to_big_endian(&mut buf);
-    deduction_header.value = BigUint::from_bytes_be(&buf).to_bytes_be();
+    deduction_header.value = trimmed_big_endian(&buf);
 
     non_empty.headers = vec![price_header, deduction_header];
 
@@ -608,11 +553,6 @@ pub async fn issue(
         Ok(_) => {}
         Err(_) => {
             let _ = chan.try_send((peer, false));
-            handler_log!(
-                "Issue cheque send failed {}",
-                outgoing_cheque_trace(&peer, &cheque_state)
-            );
-            handler_log!("Issue fail -2");
             return;
         }
     };
@@ -625,11 +565,6 @@ pub async fn issue(
             Ok(a) => a,
             Err(_) => {
                 let _ = chan.try_send((peer, false));
-                handler_log!(
-                    "Issue cheque send failed {}",
-                    outgoing_cheque_trace(&peer, &cheque_state)
-                );
-                handler_log!("Issue fail -1");
                 return;
             }
         };
@@ -651,11 +586,6 @@ pub async fn issue(
         Some(cheque_data) => cheque_data,
         None => {
             let _ = chan.try_send((peer, false));
-            handler_log!(
-                "Issue cheque send failed {}",
-                outgoing_cheque_trace(&peer, &cheque_state)
-            );
-            handler_log!("Issue fail 5");
             return;
         }
     };
@@ -670,11 +600,6 @@ pub async fn issue(
 
     if let Err(_) = stream.write_all(&bufw).await {
         let _ = chan.try_send((peer, false));
-        handler_log!(
-            "Issue cheque send failed {}",
-            outgoing_cheque_trace(&peer, &cheque_state)
-        );
-        handler_log!("Issue fail 6");
         return;
     }
 
@@ -694,21 +619,11 @@ pub async fn issue(
     {
         let _ = stream.close().await;
         let _ = chan.try_send((peer, false));
-        handler_log!(
-            "Issue cheque send failed {}",
-            outgoing_cheque_trace(&peer, &cheque_state)
-        );
-        handler_log!("Issue fail 7");
         return;
     }
 
     let _ = stream.close().await;
 
-    handler_log!(
-        "Issue cheque send success {}",
-        outgoing_cheque_trace(&peer, &cheque_state)
-    );
-    handler_log!("Issue complete");
     let _ = chan.try_send((peer, true));
 }
 
@@ -764,17 +679,14 @@ pub async fn trieve(
 
     let rec_0 = match rec_0_u {
         Ok(x) => x,
-        Err(x) => {
-            handler_log!("Error in protocol {:#?}!", x);
+        Err(_) => {
             return;
         }
     };
 
     let rec_1 = rec_0.data;
 
-    if chan.try_send(rec_1).is_err() {
-        handler_log!("Retrieve result receiver closed for peer {}", _peer);
-    }
+    if chan.try_send(rec_1).is_err() {}
 }
 
 pub async fn connection_handler(
@@ -788,19 +700,15 @@ pub async fn connection_handler(
     pk: &Arc<Mutex<ecdsa::SecretKey>>,
     chan: &mpsc::Sender<PeerFile>,
 ) -> bool {
-    handler_log!("Handshake stage 0");
-
     if !session.is_current() {
         return false;
     }
     let stream = match control.open_stream(peer, HANDSHAKE_PROTOCOL).await {
         Ok(stream) => stream,
-        Err(error @ OpenStreamError::UnsupportedProtocol(_)) => {
-            handler_log!("{} {}", peer, error);
+        Err(OpenStreamError::UnsupportedProtocol(_)) => {
             return false;
         }
-        Err(error) => {
-            handler_log!("{} {}", peer, error);
+        Err(_) => {
             return false;
         }
     };
@@ -808,8 +716,6 @@ pub async fn connection_handler(
         drop(stream);
         return false;
     }
-
-    handler_log!("Handshake stage 1");
 
     if !ceive(
         peer,
@@ -824,15 +730,8 @@ pub async fn connection_handler(
     )
     .await
     {
-        handler_log!("Handshake protocol failed");
         return false;
     }
-
-    handler_log!("Handshake stage 2");
-
-    handler_log!("Handshake complete for peer: {}!", peer);
-
-    handler_log!("Handshake stage 3");
 
     return true;
 }
@@ -848,12 +747,10 @@ async fn open_current_outbound_stream(
     }
     let stream = match control.open_stream(peer, protocol).await {
         Ok(stream) => stream,
-        Err(error @ OpenStreamError::UnsupportedProtocol(_)) => {
-            handler_log!("{} {}", peer, error);
+        Err(OpenStreamError::UnsupportedProtocol(_)) => {
             return None;
         }
-        Err(error) => {
-            handler_log!("{} {}", peer, error);
+        Err(_) => {
             return None;
         }
     };
@@ -879,7 +776,6 @@ pub async fn refresh_handler(
     fresh(amount, stream).await
 }
 
-#[allow(dead_code)]
 pub async fn issue_handler(
     peer: PeerId,
     amount: u64,
@@ -992,50 +888,26 @@ pub async fn sync(
 
     let rec_0 = match rec_0_u {
         Ok(x) => x,
-        Err(x) => {
-            handler_log!("Error in protocol {:#?}!", x);
+        Err(_) => {
             let _ = chan.try_send(false);
             return;
         }
     };
 
     if !rec_0.err.is_empty() {
-        handler_log!(
-            "Pushsync rejected chunk {} from peer {}: {}",
-            hex::encode(chunk_address),
-            _peer,
-            rec_0.err,
-        );
         let _ = chan.try_send(false);
         return;
     }
 
     if rec_0.address.as_slice() != chunk_address.as_slice() {
-        handler_log!(
-            "Pushsync receipt address mismatch for peer {}: expected {}, got {}",
-            _peer,
-            hex::encode(chunk_address),
-            hex::encode(&rec_0.address),
-        );
         let _ = chan.try_send(false);
         return;
     }
 
     if rec_0.signature.is_empty() {
-        handler_log!(
-            "Pushsync receipt missing signature for chunk {} from peer {}",
-            hex::encode(chunk_address),
-            _peer,
-        );
         let _ = chan.try_send(false);
         return;
     }
 
-    handler_log!(
-        "Pushsync accepted chunk {} from peer {} storage_radius {}",
-        hex::encode(chunk_address),
-        _peer,
-        rec_0.storage_radius,
-    );
     let _ = chan.try_send(true);
 }

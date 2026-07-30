@@ -1,7 +1,7 @@
 use crate::{
     ChunkRetrieveSender, RetrieveCancelToken, RetrieveGenerationMap,
     erasure_coding::{CHUNK_SIZE, decode_span, encoded_reference_payload_len},
-    manifest_conventions::{
+    manifest::{
         BzzManifestFork, MAX_PARALLEL_MANIFEST_FORKS, ParsedBzzManifest, ResolutionGuard,
         is_bzz_manifest_header, manifest_payload_size_allowed, manifest_wrapped_reference,
         parse_bzz_manifest,
@@ -41,10 +41,11 @@ pub struct BzzMetadata {
 }
 
 #[derive(Clone, Debug)]
-struct BzzTarget {
-    data_reference: Vec<u8>,
-    mime: String,
-    path: String,
+pub(crate) struct BzzTarget {
+    pub(crate) data_reference: Vec<u8>,
+    pub(crate) mime: String,
+    pub(crate) path: String,
+    pub(crate) raw_fallback: bool,
 }
 
 struct ManifestTargetResult {
@@ -163,7 +164,7 @@ fn normalize_bzz_path_bytes(path: &[u8]) -> &[u8] {
 }
 
 fn display_bzz_path(path: &[u8]) -> String {
-    String::from_utf8_lossy(normalize_bzz_path_bytes(path)).into_owned()
+    String::from_utf8_lossy(path).into_owned()
 }
 
 async fn reference_span(
@@ -236,16 +237,6 @@ async fn retrieve_embedded_payload_with_span(
     (u64::try_from(payload.len()).ok()? == span).then_some((span, payload))
 }
 
-pub(crate) async fn retrieve_embedded_payload(
-    data: &[u8],
-    encrypted: bool,
-    chunk_retrieve_chan: &ChunkRetrieveSender,
-) -> Option<Vec<u8>> {
-    retrieve_embedded_payload_with_span(data, encrypted, chunk_retrieve_chan)
-        .await
-        .map(|(_, payload)| payload)
-}
-
 #[derive(Clone, Debug)]
 pub(crate) struct RawFeedPayload {
     pub index: u64,
@@ -256,11 +247,9 @@ async fn raw_feed_payload_from_update(
     update: &[u8],
     chunk_retrieve_chan: &ChunkRetrieveSender,
 ) -> Option<Vec<u8>> {
-    // uploadPayload creates an ordinary, unencrypted CAC. Trying the encrypted
-    // layout as a fallback also lets this reader handle encrypted feed roots
-    // without changing the common one-chunk fast path.
     for encrypted in [false, true] {
-        let Some(payload) = retrieve_embedded_payload(update, encrypted, chunk_retrieve_chan).await
+        let Some((_, payload)) =
+            retrieve_embedded_payload_with_span(update, encrypted, chunk_retrieve_chan).await
         else {
             continue;
         };
@@ -288,9 +277,6 @@ pub(crate) async fn acquire_raw_feed_payload_at_index_bounded(
 ) -> Option<RawFeedPayload> {
     let update =
         retrieve_feed_update_at_index_bounded(owner, topic, index, chunk_retrieve_chan).await?;
-    // Only the SOC listener is deadline-bound. Once the update is
-    // authenticated, finish its manifest tree so a slow but valid archive is
-    // not discarded halfway through decoding.
     let bytes = raw_feed_payload_from_update(&update, chunk_retrieve_chan).await?;
     Some(RawFeedPayload { index, bytes })
 }
@@ -322,7 +308,6 @@ pub(crate) async fn acquire_latest_raw_feed_payload_observing_positive(
         owner,
         topic,
         chunk_retrieve_chan,
-        8,
         early_updates,
     )
     .await?;
@@ -369,32 +354,6 @@ pub(crate) async fn acquire_latest_raw_feed_payload_from(
     Some(RawFeedPayload { index, bytes })
 }
 
-pub async fn prepare_bzz_stream(
-    metadata: BzzMetadata,
-    chunk_retrieve_chan: &ChunkRetrieveSender,
-) -> bool {
-    let encrypted = metadata.data_reference.len() == 64;
-    if !encrypted && metadata.data_reference.len() != 32 {
-        return false;
-    }
-
-    let Some(root) =
-        retrieve_decoded_data_root(&metadata.data_reference, chunk_retrieve_chan).await
-    else {
-        return false;
-    };
-    if root.span == 0 {
-        return true;
-    }
-
-    // Warm the root and first playback path. The decoded-chunk LRU then lets
-    // subsequent ranges reuse intermediate chunks without preloading the whole file.
-    let end = root.span.saturating_sub(1).min(CHUNK_SIZE as u64 - 1);
-    retrieve_data_range_from_root(root, 0, end, encrypted, chunk_retrieve_chan)
-        .await
-        .is_some()
-}
-
 async fn retrieve_data_head(
     reference: &Vec<u8>,
     chunk_retrieve_chan: &ChunkRetrieveSender,
@@ -431,8 +390,6 @@ async fn get_manifest_if_manifest(
     chunk_retrieve_chan: &ChunkRetrieveSender,
 ) -> Option<ParsedBzzManifest> {
     let head = retrieve_data_head(reference, chunk_retrieve_chan).await?;
-    // The fixed manifest header fits in the first payload chunk. Avoid joining
-    // an arbitrary large file unless that header actually identifies a manifest.
     if !is_bzz_manifest_header(&head) {
         return None;
     }
@@ -455,10 +412,9 @@ async fn get_root_manifest_if_manifest(
     get_manifest_if_manifest(reference, chunk_retrieve_chan).await
 }
 
-async fn collect_reference_targets(
+pub(crate) async fn collect_reference_targets(
     path_prefix_heritance: Vec<u8>,
     reference: Vec<u8>,
-    data_retrieve_chan: &mpsc::Sender<(Vec<u8>, mpsc::Sender<Vec<u8>>)>,
     chunk_retrieve_chan: &ChunkRetrieveSender,
     guard: ResolutionGuard,
 ) -> (Vec<BzzTarget>, String) {
@@ -473,7 +429,6 @@ async fn collect_reference_targets(
         return Box::pin(collect_manifest_targets(
             path_prefix_heritance,
             manifest,
-            data_retrieve_chan,
             chunk_retrieve_chan,
             guard,
         ))
@@ -489,6 +444,7 @@ async fn collect_reference_targets(
             data_reference: reference,
             mime: "application/octet-stream".to_string(),
             path: display_bzz_path(&path_prefix_heritance),
+            raw_fallback: true,
         }],
         String::new(),
     )
@@ -498,7 +454,6 @@ async fn collect_manifest_fork_targets(
     path_prefix_heritance: Vec<u8>,
     ref_size: usize,
     fork: BzzManifestFork,
-    data_retrieve_chan: mpsc::Sender<(Vec<u8>, mpsc::Sender<Vec<u8>>)>,
     chunk_retrieve_chan: ChunkRetrieveSender,
     guard: ResolutionGuard,
 ) -> ManifestTargetResult {
@@ -541,7 +496,6 @@ async fn collect_manifest_fork_targets(
                                 Box::pin(collect_manifest_targets(
                                     Vec::new(),
                                     feed_manifest,
-                                    &data_retrieve_chan,
                                     &chunk_retrieve_chan,
                                     feed_guard,
                                 ))
@@ -570,7 +524,6 @@ async fn collect_manifest_fork_targets(
             let (mut child_targets, child_index) = Box::pin(collect_reference_targets(
                 bequeath,
                 fork.reference,
-                &data_retrieve_chan,
                 &chunk_retrieve_chan,
                 guard,
             ))
@@ -596,6 +549,7 @@ async fn collect_manifest_fork_targets(
                 data_reference,
                 mime,
                 path: display_bzz_path(&bequeath),
+                raw_fallback: false,
             });
         }
 
@@ -603,7 +557,6 @@ async fn collect_manifest_fork_targets(
             let (mut child_targets, child_index) = Box::pin(collect_reference_targets(
                 bequeath,
                 fork.reference,
-                &data_retrieve_chan,
                 &chunk_retrieve_chan,
                 guard,
             ))
@@ -620,7 +573,6 @@ async fn collect_manifest_fork_targets(
     let (mut child_targets, child_index) = Box::pin(collect_reference_targets(
         bequeath,
         fork.reference,
-        &data_retrieve_chan,
         &chunk_retrieve_chan,
         guard,
     ))
@@ -633,7 +585,6 @@ async fn collect_manifest_fork_targets(
 async fn collect_manifest_targets(
     path_prefix_heritance: Vec<u8>,
     parsed: ParsedBzzManifest,
-    data_retrieve_chan: &mpsc::Sender<(Vec<u8>, mpsc::Sender<Vec<u8>>)>,
     chunk_retrieve_chan: &ChunkRetrieveSender,
     guard: ResolutionGuard,
 ) -> (Vec<BzzTarget>, String) {
@@ -646,14 +597,11 @@ async fn collect_manifest_targets(
             path_prefix_heritance.clone(),
             parsed.ref_size,
             fork,
-            data_retrieve_chan.clone(),
             chunk_retrieve_chan.clone(),
             guard.clone(),
         )
     });
 
-    // Keep Bee's serialized fork order for index/fallback selection while
-    // limiting how many network-backed branches run concurrently.
     let mut loads = stream::iter(loads).buffered(MAX_PARALLEL_MANIFEST_FORKS);
     while let Some(mut load) = loads.next().await {
         if fallback_index.is_none() {
@@ -751,6 +699,7 @@ async fn lazy_reference_target(
             data_reference: reference,
             mime: "application/octet-stream".to_string(),
             path: display_bzz_path(&path_prefix_heritance),
+            raw_fallback: true,
         });
     }
 
@@ -865,6 +814,7 @@ async fn lazy_manifest_target_for_path(
                         data_reference,
                         mime,
                         path: display_bzz_path(&bequeath),
+                        raw_fallback: false,
                     });
                 }
             }
@@ -935,6 +885,7 @@ async fn lazy_first_manifest_target(
                     data_reference,
                     mime,
                     path: display_bzz_path(&bequeath),
+                    raw_fallback: false,
                 });
             }
         }
@@ -961,7 +912,6 @@ async fn lazy_first_manifest_target(
 
 pub async fn resolve_bzz(
     resource: &str,
-    data_retrieve_chan: &mpsc::Sender<(Vec<u8>, mpsc::Sender<Vec<u8>>)>,
     chunk_retrieve_chan: &ChunkRetrieveSender,
 ) -> Option<BzzMetadata> {
     let parsed = parse_bzz_resource(resource)?;
@@ -991,7 +941,6 @@ pub async fn resolve_bzz(
     let (targets, index) = collect_reference_targets(
         Vec::new(),
         parsed.reference,
-        data_retrieve_chan,
         chunk_retrieve_chan,
         ResolutionGuard::new(),
     )
@@ -1020,9 +969,6 @@ async fn latest_feed_manifest(
         return None;
     }
 
-    // A feed stores the logical (decrypted) root but does not carry an
-    // explicit encryption flag. Try both Bee reference layouts and accept the
-    // one that joins to a valid manifest.
     for encrypted in [false, true] {
         if let Some(content) =
             retrieve_embedded_data(&feed_data_soc, encrypted, chunk_retrieve_chan).await
@@ -1066,40 +1012,6 @@ pub async fn acquire_latest_feed(
     }
 
     acquire_resolved_range(metadata, 0, size - 1, chunk_retrieve_chan).await
-}
-
-pub async fn acquire_range(
-    resource: &str,
-    start: u64,
-    end_inclusive: u64,
-    data_retrieve_chan: &mpsc::Sender<(Vec<u8>, mpsc::Sender<Vec<u8>>)>,
-    chunk_retrieve_chan: &ChunkRetrieveSender,
-) -> Option<(Vec<u8>, BzzMetadata)> {
-    let metadata = resolve_bzz(resource, data_retrieve_chan, chunk_retrieve_chan).await?;
-
-    acquire_resolved_range(metadata, start, end_inclusive, chunk_retrieve_chan).await
-}
-
-pub async fn acquire_range_cancellable(
-    resource: &str,
-    start: u64,
-    end_inclusive: u64,
-    data_retrieve_chan: &mpsc::Sender<(Vec<u8>, mpsc::Sender<Vec<u8>>)>,
-    chunk_retrieve_chan: &ChunkRetrieveSender,
-    cancel: Option<RetrieveCancelToken>,
-    cancel_generations: RetrieveGenerationMap,
-) -> Option<(Vec<u8>, BzzMetadata)> {
-    let metadata = resolve_bzz(resource, data_retrieve_chan, chunk_retrieve_chan).await?;
-
-    acquire_resolved_range_cancellable(
-        metadata,
-        start,
-        end_inclusive,
-        chunk_retrieve_chan,
-        cancel,
-        Some(cancel_generations),
-    )
-    .await
 }
 
 pub async fn acquire_resolved_range(
@@ -1253,8 +1165,6 @@ pub async fn retrieve_data_range_cancellable(
         return vec![];
     }
 
-    // BZZ byte ranges exclude the eight-byte Swarm span, so the common path
-    // can return the joined payload allocation directly without a second copy.
     if start >= 8 {
         return (payload.len() == output_len)
             .then_some(payload)

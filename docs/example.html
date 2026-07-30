@@ -3,9 +3,6 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <script type="importmap">
-      { "imports": { "hls.js": "https://cdn.jsdelivr.net/npm/hls.js@1.6.2/dist/hls.mjs" } }
-    </script>
     <title>weeb-3 npm capability example</title>
     <style>
       :root {
@@ -58,10 +55,6 @@
   </head>
   <body>
     <h1>weeb-3 npm capability example</h1>
-    <p>
-      <a href="./issue-1-json-sync-example.html">Open the focused issue #1 JSON sync example</a>
-    </p>
-
     <section>
       <h2>Embedded Interface</h2>
       <p>
@@ -77,7 +70,7 @@
         <button id="networkState">Network State</button>
         <button id="testnet">Switch Testnet</button>
         <button id="mainnet">Switch Mainnet</button>
-        <button id="ready">Ready State</button>
+        <button id="ready">Ready</button>
         <button id="progressSnapshot">Progress Snapshot</button>
         <button id="logs">logs()</button>
       </div>
@@ -154,7 +147,6 @@
           <input id="batchDays" class="small" type="number" value="365" min="1" />
         </label>
         <button id="batchState">batchState()</button>
-        <button id="uploadPrerequisites">uploadPrerequisites()</button>
         <button id="buyBatch">buyBatch()</button>
       </div>
       <div class="row">
@@ -164,7 +156,6 @@
           <input id="depositAmount" type="text" value="1000000000000000" />
         </label>
         <button id="depositChequebook">depositChequebook()</button>
-        <button id="feedOwnerButton">feedOwner()</button>
         <button id="resetStamp">resetStamp()</button>
       </div>
       <pre id="chainOut"></pre>
@@ -202,7 +193,6 @@
         </label>
       </div>
       <div class="row">
-        <button id="feedIdentity">feedIdentity()</button>
         <button id="ensureBatch">Check Or Buy Batch</button>
         <button id="exportLinks">Export JSON To Swarm Feed</button>
       </div>
@@ -348,9 +338,9 @@
       }
 
       $("networkState").onclick = async () => show("networkOut", await node.networkState());
-      $("testnet").onclick = async () => show("networkOut", await node.switchTestnet());
-      $("mainnet").onclick = async () => show("networkOut", await node.switchMainnet());
-      $("ready").onclick = async () => show("networkOut", await node.readyState(1, 10000));
+      $("testnet").onclick = async () => show("networkOut", await node.switchNetwork("testnet"));
+      $("mainnet").onclick = async () => show("networkOut", await node.switchNetwork("mainnet"));
+      $("ready").onclick = async () => show("networkOut", await node.ready(1, 10000));
       $("progressSnapshot").onclick = async () => {
         const snapshot = await node.progressSnapshot(progressRevision);
         if (snapshot.changed) progressRevision = snapshot.revision;
@@ -435,9 +425,6 @@
       $("batchState").onclick = async () => {
         show("chainOut", await node.batchState(selectedDepth(), selectedDays()));
       };
-      $("uploadPrerequisites").onclick = async () => {
-        show("chainOut", await node.uploadPrerequisites(selectedDepth(), selectedDays()));
-      };
       $("buyBatch").onclick = async () => {
         show("chainOut", await node.buyBatch(selectedDepth(), selectedDays()));
       };
@@ -446,9 +433,6 @@
       };
       $("depositChequebook").onclick = async () => {
         show("chainOut", await node.depositChequebook($("depositAmount").value.trim()));
-      };
-      $("feedOwnerButton").onclick = async () => {
-        show("chainOut", await node.feedOwner());
       };
       $("resetStamp").onclick = async () => {
         show("chainOut", await node.resetStamp());
@@ -489,12 +473,6 @@
         if (!file) return;
         $("linksJson").value = parseJsonText(await file.text());
         show("linksOut", { importedFile: file.name, bytes: file.size });
-      };
-
-      $("feedIdentity").onclick = async () => {
-        const identity = await node.feedIdentity(linksTopic());
-        if (identity.feedOwner) $("feedOwner").value = identity.feedOwner;
-        show("linksOut", identity);
       };
 
       $("ensureBatch").onclick = async () => {

@@ -3,6 +3,7 @@
 use crate::{
     Weeb3, decode_resources, encrey,
     erasure_coding::RedundancyLevel,
+    erasure_coding::validated_upload_redundancy_number,
     interface::{
         begin_interface_mount, get_service_worker, install_service_worker_message_bridge,
         mount_interface_after_service_worker_bridge_install,
@@ -28,20 +29,12 @@ use crate::{
         secure_ensure_feed_owner, secure_open_vault_from_user_action,
         secure_prepare_batch_purchase,
     },
-    stream_conventions::{
-        configure_streaming_routes as set_streaming_routes, route_base_controls_path,
-    },
     strip_hex_prefix,
-    upload_conventions::{
-        DEFAULT_UPLOAD_REDUNDANCY_VALUE, UPLOAD_REDUNDANCY_OPTIONS,
-        validated_upload_redundancy_number,
-    },
 };
 use alloy::signers::local::PrivateKeySigner;
 use async_std::sync::Arc;
 use js_sys::{Array, Function, Object, Promise, Reflect, Uint8Array};
 use std::{
-    cell::RefCell,
     str::FromStr,
     sync::atomic::{AtomicBool, AtomicUsize, Ordering},
     time::Duration,
@@ -49,158 +42,14 @@ use std::{
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_futures::{JsFuture, spawn_local};
-use web_sys::{Element, File, FilePropertyBag, HtmlMediaElement};
+use web_sys::{Element, File, FilePropertyBag};
 use web3::types::{Address, U256};
-
-thread_local! {
-    static INTERFACE_MOUNT_CONTAINER: RefCell<Option<Element>> = const { RefCell::new(None) };
-}
-
-fn reserve_interface_mount_container(container: &Element) -> Result<(), &'static str> {
-    INTERFACE_MOUNT_CONTAINER.with(|mounted| {
-        let mut mounted = mounted.borrow_mut();
-        if let Some(existing) = mounted.as_ref() {
-            let same_node = existing.is_same_node(Some(container.unchecked_ref()));
-            if existing.is_connected() && !same_node {
-                return Err(
-                    "weeb-3 supports one connected renderInterface container per page; \
-                     rerender the existing container or remove it before mounting another",
-                );
-            }
-        }
-        *mounted = Some(container.clone());
-        Ok(())
-    })
-}
 
 #[wasm_bindgen(typescript_custom_section)]
 const UPLOAD_REDUNDANCY_TYPES: &'static str = r#"
 /** Bee-compatible erasure-coding level used for uploads. */
 export type UploadRedundancyLevel = 0 | 1 | 2 | 3 | 4;
-
-/** Display metadata for an upload erasure-coding choice. */
-export interface UploadRedundancyOption {
-    readonly value: UploadRedundancyLevel;
-    readonly label: string;
-    readonly description: string;
-    readonly isDefault: boolean;
-}
 "#;
-
-#[wasm_bindgen(typescript_custom_section)]
-const HLS_STREAM_TYPES: &'static str = r#"
-/** Which presentation an unindexed mutable HLS feed should expose first. */
-export type HlsStreamStart = "beginning" | "current-window";
-
-/** Options for attaching the shared weeb-3 HLS pipeline to application-owned media. */
-export interface HlsStreamOptions {
-    readonly start: HlsStreamStart;
-    readonly index?: number | null;
-}
-"#;
-
-/// Ordered metadata for building a custom upload redundancy selector.
-#[wasm_bindgen(
-    js_name = uploadRedundancyOptions,
-    unchecked_return_type = "UploadRedundancyOption[]"
-)]
-pub fn upload_redundancy_options() -> Array {
-    let options = Array::new();
-    for option in UPLOAD_REDUNDANCY_OPTIONS {
-        let value = Object::new();
-        set_js(
-            &value,
-            "value",
-            JsValue::from_f64(f64::from(option.value())),
-        );
-        set_js_str(&value, "label", option.label);
-        set_js_str(&value, "description", option.description);
-        set_js(&value, "isDefault", JsValue::from_bool(option.is_default()));
-        options.push(&value);
-    }
-    options
-}
-
-/// Bee's default upload redundancy level (`Medium`).
-#[wasm_bindgen(
-    js_name = defaultUploadRedundancyLevel,
-    unchecked_return_type = "UploadRedundancyLevel"
-)]
-pub fn default_upload_redundancy_level() -> u8 {
-    DEFAULT_UPLOAD_REDUNDANCY_VALUE
-}
-
-/// Configure the same-origin Service Worker asset and URL prefix used by HLS,
-/// feed, BZZ, and raw-byte browser routes. Call this before `renderInterface`
-/// when the npm package is mounted anywhere other than `/weeb-3`.
-#[wasm_bindgen(js_name = configureStreamingRoutes)]
-pub fn configure_streaming_routes(service_worker_url: String, route_base: String) -> Object {
-    let Some(window) = web_sys::window() else {
-        return error_object("streaming routes require a browser window");
-    };
-    let location = window.location();
-    let pathname = location.pathname().unwrap_or_default();
-    if !route_base_controls_path(&route_base, &pathname) {
-        return error_object(
-            "streaming route base must contain the current document so its Service Worker can control this client",
-        );
-    }
-    let page_url = match location
-        .href()
-        .ok()
-        .and_then(|href| web_sys::Url::new(&href).ok())
-    {
-        Some(url) => url,
-        None => return error_object("could not resolve the current document URL"),
-    };
-    let worker_url = match web_sys::Url::new_with_base(&service_worker_url, &page_url.href()) {
-        Ok(url)
-            if matches!(url.protocol().as_str(), "http:" | "https:")
-                && url.origin() == page_url.origin()
-                && url.hash().is_empty() =>
-        {
-            url.href()
-        }
-        _ => {
-            return error_object(
-                "service worker URL must be a same-origin HTTP(S) URL without a fragment",
-            );
-        }
-    };
-    match set_streaming_routes(&worker_url, &route_base) {
-        Ok(()) => ok_object(),
-        Err(error) => error_object(error),
-    }
-}
-
-#[wasm_bindgen(js_name = configure_streaming_routes)]
-pub fn configure_streaming_routes_alias(service_worker_url: String, route_base: String) -> Object {
-    configure_streaming_routes(service_worker_url, route_base)
-}
-
-#[wasm_bindgen]
-pub struct BootstrapNode {
-    multiaddr: String,
-    usable: bool,
-}
-
-#[wasm_bindgen]
-impl BootstrapNode {
-    #[wasm_bindgen(constructor)]
-    pub fn new(multiaddr: String, usable: bool) -> BootstrapNode {
-        BootstrapNode { multiaddr, usable }
-    }
-
-    #[wasm_bindgen(getter)]
-    pub fn multiaddr(&self) -> String {
-        self.multiaddr.clone()
-    }
-
-    #[wasm_bindgen(getter)]
-    pub fn usable(&self) -> bool {
-        self.usable
-    }
-}
 
 fn resource_to_js(bytes: Vec<u8>, mime: String, path: String) -> Object {
     let obj = Object::new();
@@ -266,13 +115,6 @@ fn error_object(error: impl AsRef<str>) -> Object {
     set_js_str(&obj, "status", "error");
     set_js_str(&obj, "error", error);
     obj
-}
-
-fn interface_result_view_is_mounted() -> bool {
-    web_sys::window()
-        .and_then(|window| window.document())
-        .and_then(|document| document.get_element_by_id("resultField"))
-        .is_some()
 }
 
 fn u256_string(value: U256) -> JsValue {
@@ -344,8 +186,8 @@ fn active_wallet_chain_id() -> u64 {
 
 fn network_mode_from_input(mode: &str) -> Option<NetworkMode> {
     match mode.trim().to_ascii_lowercase().as_str() {
-        "mainnet" | "gnosis" | "gnosischain" | "1" => Some(NetworkMode::Mainnet),
-        "testnet" | "sepolia" | "10" => Some(NetworkMode::Testnet),
+        "mainnet" => Some(NetworkMode::Mainnet),
+        "testnet" => Some(NetworkMode::Testnet),
         _ => None,
     }
 }
@@ -446,8 +288,8 @@ fn js_string_prop(value: &JsValue, names: &[&str]) -> Option<String> {
 }
 
 fn parse_start_bootstrap_node(value: JsValue) -> Option<StartBootstrapNode> {
-    let multiaddr = js_string_prop(&value, &["multiaddr", "address", "underlay"])?;
-    let usable = js_bool_prop(&value, &["usable", "usableInProtocols"]).unwrap_or(true);
+    let multiaddr = js_string_prop(&value, &["multiaddr"])?;
+    let usable = js_bool_prop(&value, &["usable"]).unwrap_or(true);
     Some(StartBootstrapNode { multiaddr, usable })
 }
 
@@ -469,7 +311,7 @@ fn start_options_from_js(options: Option<JsValue>) -> StartOptions {
     let explicit_network_id = if bare_bootnodes {
         None
     } else {
-        js_string_prop(&options, &["networkId", "network_id", "swarmNetworkId"])
+        js_string_prop(&options, &["networkId"])
     };
 
     let mode = if js_bool_prop(&options, &["testnet"]).unwrap_or(false) {
@@ -492,12 +334,7 @@ fn start_options_from_js(options: Option<JsValue>) -> StartOptions {
     let configured_nodes = if bare_bootnodes {
         parse_start_bootstrap_nodes(options)
     } else {
-        let nodes = js_prop(&options, "bootstrapNodes");
-        if nodes.is_null() || nodes.is_undefined() {
-            parse_start_bootstrap_nodes(js_prop(&options, "bootstrap_nodes"))
-        } else {
-            parse_start_bootstrap_nodes(nodes)
-        }
+        parse_start_bootstrap_nodes(js_prop(&options, "bootstrapNodes"))
     };
 
     let bootstrap_nodes = if configured_nodes.is_empty() {
@@ -517,40 +354,6 @@ fn start_options_from_js(options: Option<JsValue>) -> StartOptions {
         network_id,
         bootstrap_nodes,
     }
-}
-
-struct HlsStreamOptions {
-    index: Option<u64>,
-    intent: crate::stream_hls::HlsOpenIntent,
-}
-
-fn hls_stream_options_from_js(options: &JsValue) -> Result<HlsStreamOptions, &'static str> {
-    let start = js_string_prop(options, &["start"])
-        .ok_or("HLS stream options require start: \"beginning\" or \"current-window\"")?;
-    let intent = match start.trim().to_ascii_lowercase().as_str() {
-        "beginning" => crate::stream_hls::HlsOpenIntent::Beginning,
-        "current-window" => crate::stream_hls::HlsOpenIntent::CurrentWindow,
-        _ => return Err("HLS stream start must be \"beginning\" or \"current-window\""),
-    };
-
-    let raw_index = js_prop(options, "index");
-    let index = if raw_index.is_null() || raw_index.is_undefined() {
-        None
-    } else {
-        match raw_index.as_f64() {
-            Some(index)
-                if index.is_finite()
-                    && index >= 0.0
-                    && index <= 9_007_199_254_740_991.0
-                    && (index as u64) as f64 == index =>
-            {
-                Some(index as u64)
-            }
-            _ => return Err("HLS feed index must be an exact unsigned integer"),
-        }
-    };
-
-    Ok(HlsStreamOptions { index, intent })
 }
 
 async fn call_promise(
@@ -762,17 +565,8 @@ impl Weeb3No103 {
 
     #[wasm_bindgen(js_name = renderInterface)]
     pub fn render_interface(&self, container: Element) -> Object {
-        if let Err(error) = reserve_interface_mount_container(&container) {
-            return error_object(error);
-        }
         let mount_generation = begin_interface_mount();
-        // Reserve the new result view before replacing its shell. Older
-        // asynchronous opens may finish accounting, but cannot commit into
-        // this mount after their retrieval settles.
         let initial_result_generation = crate::stream::begin_result_view_request();
-        // Re-rendering an npm mount removes its result DOM directly, bypassing
-        // normal result-view replacement. Stop future HLS scheduling first;
-        // already-dispatched Rust/accounting work continues to drain.
         crate::stream::release_current_stream_view();
         if let Some(mode) = route_network_mode_from_location() {
             activate_profile(profile_for_mode(mode));
@@ -787,10 +581,6 @@ impl Weeb3No103 {
         let serial = self.startup_serial.clone();
         spawn_local(async move {
             let guard = serial.lock().await;
-            // A canonical /stream/... or /testnet/stream/... URL is
-            // self-contained. Apply its network before the mounted interface
-            // connects and resolves the initial stream, including for
-            // configurable npm route bases.
             let network_before_route = s.get_network_id().await;
             let mut route_changed_network = false;
             if let Some(mode) = route_network_mode_from_location() {
@@ -812,9 +602,6 @@ impl Weeb3No103 {
                 })
                 .unwrap_or_default();
             start_weeb3_runtime(s.clone());
-            // Queue the same profile connection buildup as the bundled mount
-            // before releasing npm operations. Do not wait for every dial:
-            // retrieval should be able to use the first established peer.
             if !startup_already_configured || route_changed_network {
                 schedule_bootnode_dials(s.clone(), network_id.to_string(), bootstrap_nodes);
             }
@@ -834,136 +621,6 @@ impl Weeb3No103 {
         ok_object()
     }
 
-    #[wasm_bindgen(js_name = render_interface)]
-    pub fn render_interface_alias(&self, container: Element) -> Object {
-        self.render_interface(container)
-    }
-
-    /// Open either an HLS manifest feed or a stream-catalog feed in the
-    /// interface mounted by `renderInterface`.
-    #[wasm_bindgen(js_name = openStreamFeed)]
-    pub async fn open_stream_feed(&self, owner: String, topic: String) -> Object {
-        if !interface_result_view_is_mounted() {
-            return error_object("call renderInterface(container) before opening a stream feed");
-        }
-        self.boot_runtime().await;
-        crate::stream_hls::open_feed_view(self.inner.clone(), owner, topic).await;
-        ok_object()
-    }
-
-    #[wasm_bindgen(js_name = open_stream_feed)]
-    pub async fn open_stream_feed_alias(&self, owner: String, topic: String) -> Object {
-        self.open_stream_feed(owner, topic).await
-    }
-
-    /// Attach the same Rust-owned HLS pipeline used by the bundled interface to
-    /// an application-owned `<video>` or `<audio>` element. One HLS session is
-    /// active per Wasm module; attaching another element retires only future
-    /// scheduling for the previous session while dispatched accounting work
-    /// continues to drain.
-    #[wasm_bindgen(js_name = attachHlsStream)]
-    pub async fn attach_hls_stream(
-        &self,
-        media: HtmlMediaElement,
-        owner: String,
-        topic: String,
-        #[wasm_bindgen(unchecked_param_type = "HlsStreamOptions")] options: JsValue,
-    ) -> Object {
-        let options = match hls_stream_options_from_js(&options) {
-            Ok(options) => options,
-            Err(error) => return error_object(error),
-        };
-        install_service_worker_message_bridge(self.inner.clone());
-        self.boot_runtime().await;
-        let player: Element = media.unchecked_into();
-        match crate::stream_hls::attach_hls_feed_media(
-            self.inner.clone(),
-            player,
-            owner,
-            topic,
-            options.index,
-            options.intent,
-        )
-        .await
-        {
-            Ok(mode) => {
-                let result = ok_object();
-                set_js_str(&result, "mode", mode);
-                result
-            }
-            Err(error) => error_object(error),
-        }
-    }
-
-    #[wasm_bindgen(js_name = attach_hls_stream)]
-    pub async fn attach_hls_stream_alias(
-        &self,
-        media: HtmlMediaElement,
-        owner: String,
-        topic: String,
-        #[wasm_bindgen(unchecked_param_type = "HlsStreamOptions")] options: JsValue,
-    ) -> Object {
-        self.attach_hls_stream(media, owner, topic, options).await
-    }
-
-    /// Stop future work for the active HLS attachment before the application
-    /// removes or replaces its media element. Requests already dispatched to
-    /// Rust continue through their accounting lifecycle.
-    #[wasm_bindgen(js_name = detachHlsStream)]
-    pub fn detach_hls_stream(&self) -> Object {
-        crate::stream::begin_result_view_request();
-        crate::stream::release_current_stream_view();
-        ok_object()
-    }
-
-    #[wasm_bindgen(js_name = detach_hls_stream)]
-    pub fn detach_hls_stream_alias(&self) -> Object {
-        self.detach_hls_stream()
-    }
-
-    /// Open a known HLS feed directly. Passing the catalog's VOD index avoids
-    /// a latest-feed frontier search and retrieves the final manifest SOC in
-    /// one lookup.
-    #[wasm_bindgen(js_name = playHlsStream)]
-    pub async fn play_hls_stream(
-        &self,
-        owner: String,
-        topic: String,
-        media_type: String,
-        index: Option<f64>,
-    ) -> Object {
-        if !interface_result_view_is_mounted() {
-            return error_object("call renderInterface(container) before playing an HLS stream");
-        }
-        let index = match index {
-            Some(index)
-                if index.is_finite()
-                    && index >= 0.0
-                    && index <= 9_007_199_254_740_991.0
-                    && (index as u64) as f64 == index =>
-            {
-                Some(index as u64)
-            }
-            Some(_) => return error_object("HLS feed index must be an exact unsigned integer"),
-            None => None,
-        };
-        self.boot_runtime().await;
-        crate::stream_hls::open_hls_feed_view(self.inner.clone(), owner, topic, media_type, index)
-            .await;
-        ok_object()
-    }
-
-    #[wasm_bindgen(js_name = play_hls_stream)]
-    pub async fn play_hls_stream_alias(
-        &self,
-        owner: String,
-        topic: String,
-        media_type: String,
-        index: Option<f64>,
-    ) -> Object {
-        self.play_hls_stream(owner, topic, media_type, index).await
-    }
-
     #[wasm_bindgen(js_name = networkState)]
     pub async fn network_state(&self) -> Object {
         self.await_startup_tasks().await;
@@ -972,20 +629,10 @@ impl Weeb3No103 {
         network_profile_object(profile, network_id)
     }
 
-    #[wasm_bindgen(js_name = network_state)]
-    pub async fn network_state_alias(&self) -> Object {
-        self.network_state().await
-    }
-
     #[wasm_bindgen(js_name = openSecureVault)]
     pub fn open_secure_vault(&self) -> Object {
         secure_open_vault_from_user_action();
         ok_object()
-    }
-
-    #[wasm_bindgen(js_name = open_secure_vault)]
-    pub fn open_secure_vault_alias(&self) -> Object {
-        self.open_secure_vault()
     }
 
     #[wasm_bindgen(js_name = switchNetwork)]
@@ -1031,49 +678,6 @@ impl Weeb3No103 {
         obj
     }
 
-    #[wasm_bindgen(js_name = switch_network)]
-    pub async fn switch_network_alias(&self, mode: String) -> Object {
-        self.switch_network(mode).await
-    }
-
-    #[wasm_bindgen(js_name = switchMainnet)]
-    pub async fn switch_mainnet(&self) -> Object {
-        self.switch_network("mainnet".to_string()).await
-    }
-
-    #[wasm_bindgen(js_name = switch_mainnet)]
-    pub async fn switch_mainnet_alias(&self) -> Object {
-        self.switch_mainnet().await
-    }
-
-    #[wasm_bindgen(js_name = switchTestnet)]
-    pub async fn switch_testnet(&self) -> Object {
-        self.switch_network("testnet".to_string()).await
-    }
-
-    #[wasm_bindgen(js_name = switch_testnet)]
-    pub async fn switch_testnet_alias(&self) -> Object {
-        self.switch_testnet().await
-    }
-
-    pub async fn connect(&self) -> Object {
-        self.await_startup_tasks().await;
-        let network_id = self.inner.get_network_id().await;
-        let profile = profile_for_swarm_network_id(network_id).unwrap_or_else(active_profile);
-        self.switch_network(network_mode_label(profile.mode).to_string())
-            .await
-    }
-
-    #[wasm_bindgen(js_name = connectProfile)]
-    pub async fn connect_profile(&self, mode: String) -> Object {
-        self.switch_network(mode).await
-    }
-
-    #[wasm_bindgen(js_name = connect_profile)]
-    pub async fn connect_profile_alias(&self, mode: String) -> Object {
-        self.connect_profile(mode).await
-    }
-
     #[wasm_bindgen(js_name = retrieve)]
     pub async fn retrieve(&self, address: String) -> Array {
         self.boot_runtime().await;
@@ -1114,11 +718,6 @@ impl Weeb3No103 {
         out
     }
 
-    #[wasm_bindgen(js_name = retrieve_bytes)]
-    pub async fn retrieve_bytes_alias(&self, address: String) -> Uint8Array {
-        self.retrieve_bytes(address).await
-    }
-
     #[wasm_bindgen(js_name = retrieveChunk)]
     pub async fn retrieve_chunk(&self, address: String) -> Uint8Array {
         self.boot_runtime().await;
@@ -1126,11 +725,6 @@ impl Weeb3No103 {
         let out = Uint8Array::new_with_length(bytes.len() as u32);
         out.copy_from(&bytes);
         out
-    }
-
-    #[wasm_bindgen(js_name = retrieve_chunk)]
-    pub async fn retrieve_chunk_alias(&self, address: String) -> Uint8Array {
-        self.retrieve_chunk(address).await
     }
 
     #[wasm_bindgen(js_name = ready)]
@@ -1150,67 +744,6 @@ impl Weeb3No103 {
 
             async_std::task::sleep(Duration::from_millis(160)).await;
         }
-    }
-
-    #[wasm_bindgen(js_name = readyState)]
-    pub async fn ready_state(&self, min_connections: u32, timeout_ms: u32) -> Object {
-        self.boot_runtime().await;
-
-        let min_connections = min_connections.max(1) as u64;
-        let started = js_sys::Date::now();
-        let mut connections;
-        loop {
-            connections = self.inner.get_connections().await;
-            if connections >= min_connections {
-                break;
-            }
-
-            if timeout_ms == 0 || js_sys::Date::now() - started >= timeout_ms as f64 {
-                break;
-            }
-
-            async_std::task::sleep(Duration::from_millis(160)).await;
-        }
-
-        let connecting = self.inner.get_ongoing_connections().await;
-        let network_id = self.inner.get_network_id().await;
-        let profile = profile_for_swarm_network_id(network_id).unwrap_or_else(active_profile);
-        let ready = connections >= min_connections;
-        let obj = ok_object();
-
-        set_js(&obj, "ready", JsValue::from_bool(ready));
-        set_js(&obj, "connections", JsValue::from_f64(connections as f64));
-        set_js(&obj, "connecting", JsValue::from_f64(connecting as f64));
-        set_js(
-            &obj,
-            "minConnections",
-            JsValue::from_f64(min_connections as f64),
-        );
-        set_js(&obj, "networkId", JsValue::from_f64(network_id as f64));
-        set_js_str(&obj, "network", network_mode_label(profile.mode));
-        set_js_str(&obj, "mode", network_mode_label(profile.mode));
-        set_js(
-            &obj,
-            "walletChainId",
-            JsValue::from_f64(profile.wallet_chain_id as f64),
-        );
-        set_js_str(
-            &obj,
-            "reason",
-            if ready {
-                "ready"
-            } else if connecting > 0 {
-                "connecting"
-            } else {
-                "insufficient_connections"
-            },
-        );
-        obj
-    }
-
-    #[wasm_bindgen(js_name = ready_state)]
-    pub async fn ready_state_alias(&self, min_connections: u32, timeout_ms: u32) -> Object {
-        self.ready_state(min_connections, timeout_ms).await
     }
 
     pub async fn logs(&self) -> Array {
@@ -1244,11 +777,6 @@ impl Weeb3No103 {
         obj
     }
 
-    #[wasm_bindgen(js_name = progress_snapshot)]
-    pub async fn progress_snapshot_alias(&self, seen_revision: u32) -> Object {
-        self.progress_snapshot(seen_revision).await
-    }
-
     #[wasm_bindgen(js_name = postPushChunk)]
     pub async fn post_push_chunk_js(
         &self,
@@ -1263,25 +791,13 @@ impl Weeb3No103 {
             .post_push_chunk(data, soc, chunk_address, stamp)
             .await;
 
-        let (resources, indx) = decode_resources(raw);
+        let (resources, _) = decode_resources(raw);
 
-        if let Some((bytes, _mime, _path)) = resources.into_iter().find(|(_, _, p)| *p == indx) {
+        if let Some((bytes, _, _)) = resources.into_iter().next() {
             String::from_utf8(bytes).unwrap_or_else(|_| "Invalid UTF-8 result".to_string())
         } else {
             "No upload result returned".to_string()
         }
-    }
-
-    #[wasm_bindgen(js_name = post_push_chunk)]
-    pub async fn post_push_chunk_alias(
-        &self,
-        data: Vec<u8>,
-        soc: bool,
-        chunk_address: Vec<u8>,
-        stamp: Vec<u8>,
-    ) -> String {
-        self.post_push_chunk_js(data, soc, chunk_address, stamp)
-            .await
     }
 
     pub async fn upload(
@@ -1371,61 +887,6 @@ impl Weeb3No103 {
         obj
     }
 
-    #[wasm_bindgen(js_name = post_upload)]
-    pub async fn post_upload_alias(
-        &self,
-        file: File,
-        encryption: bool,
-        index_string: String,
-        add_to_feed: bool,
-        feed_topic: String,
-    ) -> Object {
-        self.upload(file, encryption, index_string, add_to_feed, feed_topic)
-            .await
-    }
-
-    #[wasm_bindgen(js_name = postUploadWithRedundancy)]
-    pub async fn post_upload_with_redundancy(
-        &self,
-        file: File,
-        encryption: bool,
-        #[wasm_bindgen(unchecked_param_type = "UploadRedundancyLevel")] redundancy_level: f64,
-        index_string: String,
-        add_to_feed: bool,
-        feed_topic: String,
-    ) -> Object {
-        self.upload_with_redundancy(
-            file,
-            encryption,
-            redundancy_level,
-            index_string,
-            add_to_feed,
-            feed_topic,
-        )
-        .await
-    }
-
-    #[wasm_bindgen(js_name = post_upload_with_redundancy)]
-    pub async fn post_upload_with_redundancy_alias(
-        &self,
-        file: File,
-        encryption: bool,
-        #[wasm_bindgen(unchecked_param_type = "UploadRedundancyLevel")] redundancy_level: f64,
-        index_string: String,
-        add_to_feed: bool,
-        feed_topic: String,
-    ) -> Object {
-        self.post_upload_with_redundancy(
-            file,
-            encryption,
-            redundancy_level,
-            index_string,
-            add_to_feed,
-            feed_topic,
-        )
-        .await
-    }
-
     #[wasm_bindgen(js_name = postUploadBytes)]
     pub async fn post_upload_bytes(
         &self,
@@ -1484,43 +945,6 @@ impl Weeb3No103 {
         .await
     }
 
-    #[wasm_bindgen(js_name = post_upload_bytes_with_redundancy)]
-    pub async fn post_upload_bytes_with_redundancy_alias(
-        &self,
-        bytes: Vec<u8>,
-        mime: String,
-        filename: String,
-        encryption: bool,
-        #[wasm_bindgen(unchecked_param_type = "UploadRedundancyLevel")] redundancy_level: f64,
-        add_to_feed: bool,
-        feed_topic: String,
-    ) -> Object {
-        self.post_upload_bytes_with_redundancy(
-            bytes,
-            mime,
-            filename,
-            encryption,
-            redundancy_level,
-            add_to_feed,
-            feed_topic,
-        )
-        .await
-    }
-
-    #[wasm_bindgen(js_name = post_upload_bytes)]
-    pub async fn post_upload_bytes_alias(
-        &self,
-        bytes: Vec<u8>,
-        mime: String,
-        filename: String,
-        encryption: bool,
-        add_to_feed: bool,
-        feed_topic: String,
-    ) -> Object {
-        self.post_upload_bytes(bytes, mime, filename, encryption, add_to_feed, feed_topic)
-            .await
-    }
-
     #[wasm_bindgen(js_name = postFeedBytes)]
     pub async fn post_feed_bytes(
         &self,
@@ -1532,110 +956,6 @@ impl Weeb3No103 {
     ) -> Object {
         self.post_upload_bytes(bytes, mime, filename, encryption, true, topic)
             .await
-    }
-
-    #[wasm_bindgen(js_name = post_feed_bytes)]
-    pub async fn post_feed_bytes_alias(
-        &self,
-        topic: String,
-        bytes: Vec<u8>,
-        mime: String,
-        filename: String,
-        encryption: bool,
-    ) -> Object {
-        self.post_feed_bytes(topic, bytes, mime, filename, encryption)
-            .await
-    }
-
-    #[wasm_bindgen(js_name = feedTopic)]
-    pub fn feed_topic(&self, topic: String) -> Object {
-        let obj = ok_object();
-        set_js_str(&obj, "topic", &topic);
-        set_js_str(&obj, "feedTopic", normalize_feed_topic(&topic));
-        obj
-    }
-
-    #[wasm_bindgen(js_name = feed_topic)]
-    pub fn feed_topic_alias(&self, topic: String) -> Object {
-        self.feed_topic(topic)
-    }
-
-    #[wasm_bindgen(js_name = feedIdentity)]
-    pub async fn feed_identity(&self, topic: String) -> Object {
-        self.boot_runtime().await;
-        let feed_topic = normalize_feed_topic(&topic);
-        let obj = match secure_ensure_feed_owner().await {
-            Some(owner) if owner.len() == 20 => {
-                let obj = ok_object();
-                let owner = format!("0x{}", hex::encode(owner));
-                set_js_str(&obj, "owner", &owner);
-                set_js_str(&obj, "feedOwner", owner);
-                obj
-            }
-            Some(owner) => error_object(format!("feed owner had invalid length {}", owner.len())),
-            None => error_object("feed owner unavailable"),
-        };
-
-        set_js_str(&obj, "topic", &topic);
-        set_js_str(&obj, "feedTopic", feed_topic);
-        obj
-    }
-
-    #[wasm_bindgen(js_name = feed_identity)]
-    pub async fn feed_identity_alias(&self, topic: String) -> Object {
-        self.feed_identity(topic).await
-    }
-
-    #[wasm_bindgen(js_name = acquireFeed)]
-    pub async fn acquire_feed(&self, owner: String, topic: String) -> Object {
-        self.boot_runtime().await;
-        let feed_topic = normalize_feed_topic(&topic);
-        let feed_owner = match feed_owner_for_request(&owner).await {
-            Ok(feed_owner) => feed_owner,
-            Err(reason) => {
-                let obj = Object::new();
-                set_js_str(&obj, "status", "error");
-                set_js_str(&obj, "reason", reason);
-                set_js_str(&obj, "owner", &owner);
-                set_js_str(&obj, "topic", &topic);
-                set_js_str(&obj, "feedTopic", &feed_topic);
-                set_js(&obj, "resources", Array::new().into());
-                return obj;
-            }
-        };
-        let owner_for_read = feed_owner.clone().unwrap_or_else(|| owner.clone());
-        let raw = self
-            .inner
-            .acquire_feed_envelope(owner_for_read, topic.clone())
-            .await;
-        let (data, indx) = decode_resources(raw);
-        let obj = Object::new();
-        let resources = Array::new();
-
-        if let Some((status, reason)) = feed_status(&data, self.inner.get_connections().await) {
-            set_js_str(&obj, "status", status);
-            set_js_str(&obj, "reason", reason);
-        } else {
-            set_js_str(&obj, "status", "ok");
-            for (bytes, mime, path) in data {
-                resources.push(&resource_to_js(bytes, mime, path));
-            }
-        }
-
-        let _ = Reflect::set(&obj, &"owner".into(), &JsValue::from_str(&owner));
-        let _ = Reflect::set(&obj, &"topic".into(), &JsValue::from_str(&topic));
-        set_js_str(&obj, "feedTopic", &feed_topic);
-        if let Some(owner) = feed_owner {
-            set_js_str(&obj, "feedOwner", owner);
-        }
-        let _ = Reflect::set(&obj, &"index".into(), &JsValue::from_str(&indx));
-        let _ = Reflect::set(&obj, &"resources".into(), &resources);
-        obj
-    }
-
-    #[wasm_bindgen(js_name = acquire_feed)]
-    pub async fn acquire_feed_alias(&self, owner: String, topic: String) -> Object {
-        self.acquire_feed(owner, topic).await
     }
 
     #[wasm_bindgen(js_name = acquireFeedBytes)]
@@ -1690,30 +1010,6 @@ impl Weeb3No103 {
         }
 
         obj
-    }
-
-    #[wasm_bindgen(js_name = acquire_feed_bytes)]
-    pub async fn acquire_feed_bytes_alias(&self, owner: String, topic: String) -> Object {
-        self.acquire_feed_bytes(owner, topic).await
-    }
-
-    #[wasm_bindgen(js_name = feedOwner)]
-    pub async fn feed_owner(&self) -> Object {
-        self.boot_runtime().await;
-        match secure_ensure_feed_owner().await {
-            Some(owner) if owner.len() == 20 => {
-                let obj = ok_object();
-                set_js_str(&obj, "owner", format!("0x{}", hex::encode(owner)));
-                obj
-            }
-            Some(owner) => error_object(format!("feed owner had invalid length {}", owner.len())),
-            None => error_object("feed owner unavailable"),
-        }
-    }
-
-    #[wasm_bindgen(js_name = feed_owner)]
-    pub async fn feed_owner_alias(&self) -> Object {
-        self.feed_owner().await
     }
 
     #[wasm_bindgen(js_name = batchState)]
@@ -1839,21 +1135,6 @@ impl Weeb3No103 {
         obj
     }
 
-    #[wasm_bindgen(js_name = batch_state)]
-    pub async fn batch_state_alias(&self, depth: u8, validity_days: u32) -> Object {
-        self.batch_state(depth, validity_days).await
-    }
-
-    #[wasm_bindgen(js_name = uploadPrerequisites)]
-    pub async fn upload_prerequisites(&self, depth: u8, validity_days: u32) -> Object {
-        self.batch_state(depth, validity_days).await
-    }
-
-    #[wasm_bindgen(js_name = upload_prerequisites)]
-    pub async fn upload_prerequisites_alias(&self, depth: u8, validity_days: u32) -> Object {
-        self.upload_prerequisites(depth, validity_days).await
-    }
-
     #[wasm_bindgen(js_name = buyBatch)]
     pub async fn buy_batch(&self, depth: u8, validity_days: u32) -> Object {
         self.boot_runtime().await;
@@ -1938,11 +1219,6 @@ impl Weeb3No103 {
         obj
     }
 
-    #[wasm_bindgen(js_name = buy_batch)]
-    pub async fn buy_batch_alias(&self, depth: u8, validity_days: u32) -> Object {
-        self.buy_batch(depth, validity_days).await
-    }
-
     #[wasm_bindgen(js_name = deployChequebook)]
     pub async fn deploy_chequebook(&self) -> Object {
         self.boot_runtime().await;
@@ -1990,11 +1266,6 @@ impl Weeb3No103 {
         obj
     }
 
-    #[wasm_bindgen(js_name = deploy_chequebook)]
-    pub async fn deploy_chequebook_alias(&self) -> Object {
-        self.deploy_chequebook().await
-    }
-
     #[wasm_bindgen(js_name = depositChequebook)]
     pub async fn deposit_chequebook(&self, amount: String) -> Object {
         self.boot_runtime().await;
@@ -2034,11 +1305,6 @@ impl Weeb3No103 {
         obj
     }
 
-    #[wasm_bindgen(js_name = deposit_chequebook)]
-    pub async fn deposit_chequebook_alias(&self, amount: String) -> Object {
-        self.deposit_chequebook(amount).await
-    }
-
     #[wasm_bindgen(js_name = resetStamp)]
     pub async fn reset_stamp(&self) -> Object {
         self.boot_runtime().await;
@@ -2055,10 +1321,5 @@ impl Weeb3No103 {
             let _ = Reflect::set(&obj, &"path".into(), &JsValue::from_str(path));
         }
         obj
-    }
-
-    #[wasm_bindgen(js_name = reset_stamp)]
-    pub async fn reset_stamp_alias(&self) -> Object {
-        self.reset_stamp().await
     }
 }

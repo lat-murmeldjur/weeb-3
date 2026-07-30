@@ -1,10 +1,8 @@
 use crate::{
     ChunkRetrieveSender, Date, Duration, HashMap, HashSet, Mutex, OutboundProtocolSession,
     PeerAccounting, PeerId, PhysicalConnectionMap, RETRIEVE_CHECK_CONFIRMATION_PEERS,
-    RefreshmentInstruction, RetrieveCancelToken, RetrieveGenerationMap, apply_credit,
-    cancel_reserve,
-    connection_conventions::{StreamControl, retrieval_dispatch_available},
-    encode_resources,
+    RefreshmentInstruction, RetrieveCancelToken, RetrieveGenerationMap, StreamControl,
+    apply_credit, cancel_reserve,
     erasure_coding::{
         self, BEE_MAX_UPLOAD_TREE_LEVELS, CHUNK_SIZE, CHUNK_WITH_SPAN_SIZE, HASH_SIZE,
         RedundancyLevel, encoded_reference_payload_len, reconstruct_data_indices, reference_layout,
@@ -15,20 +13,14 @@ use crate::{
         seek_sequence_feed_frontier_bounded_from_observing_positive,
         seek_sequence_feed_frontier_bounded_observing_positive, seek_sequence_feed_frontier_from,
     },
-    get_feed_address, get_proximity,
-    manifest::interpret_manifest,
-    mpsc, price, reserve,
+    get_feed_address, get_proximity, mpsc, price, reserve,
     retrieval_conventions::SingleflightRegistry,
-    retrieval_conventions::{
-        RetrieveAdmission, RetrieveAdmissionState, RetrievePostReserveAction,
-        retrieve_admission_current, retrieve_admission_state, retrieve_post_reserve_action,
-    },
+    retrieval_conventions::{RetrieveAdmission, retrieve_admission_current},
     retrieve_cancel_token_current, retrieve_handler, transfer_pause_enabled, valid_cac, valid_soc,
 };
 
 use alloy::primitives::keccak256;
 use async_std::sync::Arc;
-use byteorder::ByteOrder;
 use std::{
     cell::RefCell, collections::VecDeque, future::Future, pin::Pin, rc::Rc,
     sync::atomic::AtomicBool,
@@ -44,9 +36,6 @@ const RETRIEVE_HOT_LOOP_GUARD_MS: u64 = 25;
 const RETRIEVE_CHECK_RETRY_WAIT_MS: u64 = 160;
 const RETRIEVE_CHUNK_MAX_ATTEMPT_ERRORS: usize = 20;
 const RETRIEVE_DATA_GROUP_CONCURRENCY: usize = 4;
-// A cached entry can retain both the authenticated raw shard and its decoded
-// view. 2048 entries cover 8 MiB of leaf data while bounding that pair near
-// 16 MiB before map/reference overhead.
 const RETRIEVE_DECODED_CHUNK_CACHE_ENTRIES: usize = 2048;
 
 struct RetrieveAttemptResult {
@@ -54,8 +43,7 @@ struct RetrieveAttemptResult {
     chunk: Vec<u8>,
     valid: bool,
     soc: bool,
-    /// False only for the ten-second scheduler observation; true after the
-    /// dispatched transport has applied or cancelled its accounting reserve.
+    /// True only after the dispatched transport settles its accounting reserve.
     terminal: bool,
 }
 
@@ -73,46 +61,6 @@ use libp2p::futures::{
     stream::FuturesUnordered,
 };
 
-pub async fn retrieve_resource(
-    chunk_address: &Vec<u8>,
-    data_retrieve_chan: &mpsc::Sender<(Vec<u8>, mpsc::Sender<Vec<u8>>)>,
-    chunk_retrieve_chan: &ChunkRetrieveSender,
-) -> Vec<u8> {
-    let cd = get_data(chunk_address.to_vec(), &data_retrieve_chan).await;
-
-    let mut data_vector_e: Vec<(Vec<u8>, String, String)> = vec![];
-
-    #[allow(unused_assignments)]
-    let mut index: String = "".to_string();
-
-    {
-        let (data_vector, index0) = interpret_manifest(
-            "".to_string(),
-            &cd,
-            &data_retrieve_chan,
-            &chunk_retrieve_chan,
-        )
-        .await;
-
-        index = index0;
-
-        for f in &data_vector {
-            if f.data.len() > 8 {
-                data_vector_e.push((f.data[8..].to_vec(), f.mime.clone(), f.path.clone()));
-            };
-        }
-    }
-
-    if data_vector_e.len() == 0 {
-        return encode_resources(
-            vec![(vec![], "not found".to_string(), "not found".to_string())],
-            index,
-        );
-    }
-
-    return encode_resources(data_vector_e, index);
-}
-
 async fn select_retrieve_peer(
     caddr: &Vec<u8>,
     peers: &Arc<Mutex<HashMap<Vec<u8>, PeerId>>>,
@@ -124,7 +72,7 @@ async fn select_retrieve_peer(
     loop {
         let selected = {
             let peers_map = peers.lock().await;
-            if !retrieval_dispatch_available(peers_map.len()) {
+            if peers_map.is_empty() {
                 return None;
             }
 
@@ -274,10 +222,7 @@ async fn retrieve_attempt(
         Err(_) => {
             let _ = result_chan.try_send(failed_retrieve_attempt(&peer, false));
 
-            // The caller is free to hedge now, but the already-dispatched
-            // request must drain to a terminal result before its reservation
-            // is applied or cancelled. This avoids accounting ghosting when a
-            // slow peer responds after the scheduler timeout.
+            // A timed-out dispatched request must still settle its accounting reserve.
             wasm_bindgen_futures::spawn_local(async move {
                 let terminal_result = settle_retrieve_attempt(
                     peer,
@@ -576,11 +521,7 @@ fn remove_raw_fetch_waiter(key: &RawFetchKey, flight_id: u64, waiter_id: u64) {
             .remove_waiter(key, flight_id, waiter_id)
     });
     if let Some(admission) = admission {
-        // Closing the shared gate suppresses queued/pre-dispatch work. Any peer
-        // exchange that already crossed dispatch continues its accounting
-        // drain. The zero-waiter producer flight stays registered until
-        // `complete_raw_fetch`, so a same-generation tree retry cannot open a
-        // duplicate flight while that accounting-sensitive work is draining.
+        // Keep the flight registered while dispatched accounting work drains.
         admission.close();
     }
 }
@@ -627,8 +568,6 @@ fn queue_drained_raw_chunk(
     admission: &RetrieveAdmission,
     cancel: &Option<RetrieveCancelToken>,
 ) {
-    // Close the race between a caller's cache probe and another flight completing.
-    // Only canonical chunks enter this cache, so no additional CAC work is needed.
     if let Some(reference) = cache_reference.as_ref() {
         if let Some(chunk) = cached_raw_chunk(reference) {
             let _ = result_chan.try_send(RawFetchResult {
@@ -681,18 +620,11 @@ fn queue_drained_raw_chunk(
     });
     let completion_key = registration.key;
 
-    // This task deliberately outlives the group join. Closing its admission gate
-    // discards queued work and prevents new peer attempts. Any attempt that already
-    // crossed the dispatch boundary continues settling (including after a soft timeout),
-    // so reaching another shard's quorum never abandons an accounting exchange.
+    // The detached producer lets dispatched exchanges settle after callers leave.
     wasm_bindgen_futures::spawn_local(async move {
         let chunk = chan_in.recv().await.unwrap_or_default();
         complete_raw_fetch(&completion_key, flight_id, chunk);
     });
-}
-
-pub(crate) fn decode_join_span(data: &[u8]) -> Option<(RedundancyLevel, u64)> {
-    erasure_coding::decode_span(data)
 }
 
 #[inline]
@@ -730,7 +662,7 @@ fn decrypt_join_chunk(raw: &[u8], key: &[u8]) -> Option<Vec<u8>> {
 }
 
 fn canonical_plain_chunk(plain: &[u8], encrypted: bool) -> Option<DecodedJoinChunk> {
-    let (level, span) = decode_join_span(plain)?;
+    let (level, span) = erasure_coding::decode_span(plain)?;
     let payload_len = if span <= CHUNK_SIZE as u64 {
         usize::try_from(span).ok()?
     } else {
@@ -1198,11 +1130,6 @@ async fn fetch_data_group_indices_streaming(
                         return None;
                     }
                     if requested_count == data_count {
-                        // Bee's full-group RACE strategy uses every available
-                        // parity after the hedge. This turns a long-tail
-                        // 119-of-121 wait into 119-of-128 for Medium EC while
-                        // leaving groups that need only a subset of children
-                        // on the progressive recovery path.
                         dispatched += dispatch_group_parity(
                             data_count,
                             &parity_references,
@@ -1260,9 +1187,6 @@ async fn fetch_data_group_indices_streaming(
             authenticated_shards[result_index] = result.canonical_cac;
             successes += 1;
 
-            // Publish a requested data child as soon as it has passed the same
-            // CAC/decryption checks used by the terminal collector. The raw Rc
-            // remains in the recovery buffer in case another sibling needs RS.
             if result_index < data_count
                 && requested_mask[result_index]
                 && cached_chunks[result_index].is_none()
@@ -1764,8 +1688,6 @@ async fn retrieve_data_joined_cancellable(
 }
 
 /// Retrieve Bee's historical joined representation (`span || payload`).
-///
-/// Keep this public behavior unchanged for existing `retrieveBytes` callers.
 pub async fn retrieve_data(
     data_address: &Vec<u8>,
     chunk_retrieve_chan: &ChunkRetrieveSender,
@@ -1773,10 +1695,7 @@ pub async fn retrieve_data(
     retrieve_data_joined(data_address, chunk_retrieve_chan, true).await
 }
 
-/// Retrieve only the logical payload represented by a Bee bytes reference.
-///
-/// Bee's HTTP `/bytes` response omits the internal span. Joining without that
-/// prefix avoids a second allocation or move for wire-format consumers.
+/// Retrieve a Bee bytes payload without its internal span.
 pub(crate) async fn retrieve_data_payload(
     data_address: &Vec<u8>,
     chunk_retrieve_chan: &ChunkRetrieveSender,
@@ -1784,11 +1703,6 @@ pub(crate) async fn retrieve_data_payload(
     retrieve_data_joined(data_address, chunk_retrieve_chan, false).await
 }
 
-/// Retrieve Bee's logical `/bytes` payload under a stream-generation token.
-///
-/// Superseding the token only closes admission for traversal work that has not
-/// crossed the transport/accounting boundary. Chunk requests already
-/// dispatched by the join retain their normal drain-and-settle lifecycle.
 pub(crate) async fn retrieve_data_payload_cancellable(
     data_address: &Vec<u8>,
     chunk_retrieve_chan: &ChunkRetrieveSender,
@@ -1829,16 +1743,6 @@ pub async fn retrieve_chunk(
     #[allow(unused_assignments)]
     let mut cd = vec![];
 
-    // cd = retrieve_cached_chunk(&caddr).await;
-    // if cd.len() > 0 {
-    //     (chunk_valid, soc) = verify_chunk(&caddr, &cd);
-    //     if chunk_valid {
-    //         error_count = RETRIEVE_CHUNK_MAX_ATTEMPT_ERRORS;
-    //     } else {
-    //         cd = vec![];
-    //     };
-    // };
-
     let (attempt_out, attempt_in) = mpsc::unbounded::<RetrieveAttemptResult>();
     let mut in_flight = 0_usize;
     let mut last_attempt_started = 0.0;
@@ -1869,14 +1773,12 @@ pub async fn retrieve_chunk(
             .as_ref()
             .map(transfer_pause_enabled)
             .unwrap_or(false);
-        let admission_state = retrieve_admission_state(
-            chunk_retrieve_admission_current(&cancel_generations, &cancel, &admission).await,
-            in_flight,
-        );
-        if admission_state == RetrieveAdmissionState::Closed {
+        let admission_current =
+            chunk_retrieve_admission_current(&cancel_generations, &cancel, &admission).await;
+        if !admission_current && in_flight == 0 {
             break;
         }
-        let cancelled = admission_state == RetrieveAdmissionState::Draining;
+        let cancelled = !admission_current;
 
         if paused && in_flight == 0 {
             async_std::task::sleep(Duration::from_millis(100)).await;
@@ -1901,12 +1803,8 @@ pub async fn retrieve_chunk(
             )
             .await
             {
-                let post_reserve_action = retrieve_post_reserve_action(
-                    chunk_retrieve_admission_current(&cancel_generations, &cancel, &admission)
-                        .await,
-                );
-
-                if post_reserve_action == RetrievePostReserveAction::CancelReservation {
+                if !chunk_retrieve_admission_current(&cancel_generations, &cancel, &admission).await
+                {
                     cancel_reserve(&selected.accounting, selected.price).await;
                     skiplist.remove(&selected.peer);
                     if in_flight == 0 {
@@ -2013,10 +1911,7 @@ pub async fn retrieve_check_chunk(
 
     while error_count < max_error && success_peers.len() < RETRIEVE_CHECK_CONFIRMATION_PEERS {
         while let Ok(result) = attempt_in.try_recv() {
-            // Confirmation checks preserve their historical ten-second
-            // observer deadline. A late terminal response still settles
-            // accounting, but it must not count after this peer's soft
-            // timeout was already reported as the check result.
+            // Late terminal replies settle accounting but not confirmation quorum.
             if !reported_peers.insert(result.peer.clone()) {
                 continue;
             }
@@ -2110,8 +2005,7 @@ pub fn decrypt(cd: &Vec<u8>, encrey: Vec<u8>) -> Vec<u8> {
     let creylen = encrey.len();
 
     let mut spanbytes: Vec<u8> = vec![];
-    let mut spansegmentkey0: [u8; 4] = [0; 4];
-    byteorder::LittleEndian::write_u32(&mut spansegmentkey0, (4096 / creylen) as u32);
+    let spansegmentkey0 = ((4096 / creylen) as u32).to_le_bytes();
     let spansegmentkey1 =
         keccak256(keccak256([encrey.clone(), spansegmentkey0.to_vec()].concat()).to_vec()).to_vec();
 
@@ -2128,8 +2022,7 @@ pub fn decrypt(cd: &Vec<u8>, encrey: Vec<u8>) -> Vec<u8> {
             k = concred.len() - (i * creylen);
         };
 
-        let mut contentsegmentkey0: [u8; 4] = [0; 4];
-        byteorder::LittleEndian::write_u32(&mut contentsegmentkey0, i as u32);
+        let contentsegmentkey0 = (i as u32).to_le_bytes();
         let contentsegmentkey1 = keccak256(keccak256(
             [encrey.clone(), contentsegmentkey0.to_vec()].concat(),
         ))
@@ -2170,16 +2063,6 @@ pub fn decrypt(cd: &Vec<u8>, encrey: Vec<u8>) -> Vec<u8> {
     return [spanbytes, content[..span_decrypted as usize].to_vec()].concat();
 }
 
-pub async fn get_data(
-    data_address: Vec<u8>,
-    data_retrieve_chan: &mpsc::Sender<(Vec<u8>, mpsc::Sender<Vec<u8>>)>,
-) -> Vec<u8> {
-    let (chan_out, chan_in) = mpsc::unbounded::<Vec<u8>>();
-    let _ = data_retrieve_chan.try_send((data_address, chan_out));
-
-    return chan_in.recv().await.unwrap_or_default();
-}
-
 async fn get_feed_probe_chunk(
     data_address: Vec<u8>,
     chunk_retrieve_chan: &ChunkRetrieveSender,
@@ -2194,9 +2077,7 @@ async fn get_feed_probe_chunk(
         admission: Some(admission),
     });
 
-    // A frontier lookahead deadline may drop this receiver. The admission
-    // guard then stops queued work and future hedges, while any attempt already
-    // dispatched remains detached and drains its accounting settlement.
+    // Dropping the listener stops admission, not dispatched accounting settlement.
     chan_in.recv().await.unwrap_or_default()
 }
 
@@ -2220,7 +2101,6 @@ async fn probe_feed_update(
     if found { Some(payload) } else { None }
 }
 
-/// Retrieve one exact Bee sequence-feed update without rescanning its frontier.
 pub(crate) async fn retrieve_feed_update_at_index(
     owner: String,
     topic: String,
@@ -2230,13 +2110,7 @@ pub(crate) async fn retrieve_feed_update_at_index(
     probe_feed_update(&owner, &topic, index, chunk_retrieve_chan).await
 }
 
-/// Retrieve one exact update with Bee's startup result-listener deadline.
-///
-/// The deadline covers only the SOC probe. Once an owner-authenticated update
-/// is found, its referenced manifest body is decoded by the caller without a
-/// deadline. Dropping the probe listener closes queued work and future hedges,
-/// while any transport already dispatched keeps its detached accounting
-/// lifecycle in `retrieve_chunk`.
+/// Bound only the SOC probe; dispatched transport still settles accounting.
 pub(crate) async fn retrieve_feed_update_at_index_bounded(
     owner: String,
     topic: String,
@@ -2283,9 +2157,6 @@ async fn seek_feed_frontier_bounded_from(
     start_index: u64,
     chunk_retrieve_chan: &ChunkRetrieveSender,
 ) -> (Option<(u64, Vec<u8>)>, u64) {
-    // The caller already owns and authenticated the decoded payload at
-    // `start_index`. The empty seed is only a marker; if no newer SOC exists,
-    // the higher layer reuses its existing payload without another exact read.
     seek_sequence_feed_frontier_bounded_from_observing_positive(
         (start_index, Vec::new()),
         |index| probe_feed_update(&owner, &topic, index, chunk_retrieve_chan),
@@ -2300,9 +2171,6 @@ async fn seek_feed_frontier_from(
     start_index: u64,
     chunk_retrieve_chan: &ChunkRetrieveSender,
 ) -> (Option<(u64, Vec<u8>)>, u64) {
-    // The caller already owns and authenticated the decoded payload at
-    // `start_index`. As in the bounded variant, the empty seed is only a
-    // marker that lets the higher layer reuse its existing decoded payload.
     seek_sequence_feed_frontier_from((start_index, Vec::new()), |index| {
         probe_feed_update(&owner, &topic, index, chunk_retrieve_chan)
     })
@@ -2315,7 +2183,7 @@ pub async fn seek_latest_feed_update(
     chunk_retrieve_chan: &ChunkRetrieveSender,
     _redundancy: u8,
 ) -> Vec<u8> {
-    seek_latest_feed_update_indexed(owner, topic, chunk_retrieve_chan, _redundancy)
+    seek_latest_feed_update_indexed(owner, topic, chunk_retrieve_chan)
         .await
         .map(|(_, payload)| payload)
         .unwrap_or_default()
@@ -2325,23 +2193,15 @@ pub(crate) async fn seek_latest_feed_update_indexed(
     owner: String,
     topic: String,
     chunk_retrieve_chan: &ChunkRetrieveSender,
-    _redundancy: u8,
 ) -> Option<(u64, Vec<u8>)> {
-    seek_latest_feed_update_indexed_observing_positive(
-        owner,
-        topic,
-        chunk_retrieve_chan,
-        _redundancy,
-        None,
-    )
-    .await
+    seek_latest_feed_update_indexed_observing_positive(owner, topic, chunk_retrieve_chan, None)
+        .await
 }
 
 pub(crate) async fn seek_latest_feed_update_indexed_observing_positive(
     owner: String,
     topic: String,
     chunk_retrieve_chan: &ChunkRetrieveSender,
-    _redundancy: u8,
     early_updates: Option<mpsc::Sender<(u64, Vec<u8>)>>,
 ) -> Option<(u64, Vec<u8>)> {
     match seek_feed_frontier(owner, topic, chunk_retrieve_chan, early_updates).await {
@@ -2381,7 +2241,3 @@ pub async fn seek_next_feed_update_index(
     let (_latest, next_index) = seek_feed_frontier(owner, topic, chunk_retrieve_chan, None).await;
     next_index
 }
-
-//
-// 166875e18d6754e468f231c8545322eaff22a0e3ec939fc25b296c4ce31dd654
-//

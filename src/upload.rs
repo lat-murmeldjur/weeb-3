@@ -1,71 +1,21 @@
 use crate::{
-    //                                                                        //
-    ChunkRetrieveSender,
-    //                                                                        //
-    Date,
-    //                                                                        //
-    Duration,
-    //                                                                        //
-    HashMap,
-    //                                                                        //
-    HashSet,
-    //                                                                        //
-    JsValue,
-    //                                                                        //
-    Mutex,
-    //                                                                        //
-    OutboundProtocolSession,
-    //                                                                        //
-    PROTOCOL_ROUND_TIME,
-    //                                                                        //
-    PUSH_CHUNK_CONFIRMATION_PEERS,
-    //                                                                        //
-    PeerAccounting,
-    //                                                                        //
-    PeerId,
-    //                                                                        //
-    PhysicalConnectionMap,
-    //                                                                        //
-    RefreshmentInstruction,
-    //                                                                        //
-    apply_credit,
-    //                                                                        //
-    cancel_reserve,
-    //                                                                        //
-    connection_conventions::StreamControl,
-    //                                                                        //
+    ChunkRetrieveSender, Date, Duration, HashMap, HashSet, Mutex, OutboundProtocolSession,
+    PROTOCOL_ROUND_TIME, PUSH_CHUNK_CONFIRMATION_PEERS, PeerAccounting, PeerId,
+    PhysicalConnectionMap, RefreshmentInstruction, StreamControl, apply_credit, cancel_reserve,
     content_address,
-    //                                                                        //
     erasure_coding::{
-        CHUNK_SIZE, CHUNK_WITH_SPAN_SIZE, ParityEncoder, RedundancyLevel, encode_level,
-        encoded_reference_payload_len, reference_layout, replicas, upload_tree_plan,
+        CHUNK_SIZE, CHUNK_WITH_SPAN_SIZE, FileSlicePlan, ParityEncoder, RedundancyLevel,
+        encode_level, encoded_reference_payload_len, reference_layout, replicas,
+        upload_tree_chunk_count,
     },
-    //                                                                        //
     get_proximity,
-    //                                                                        //
     manifest_upload::{Node, create_fork, create_manifest, create_stub},
-    //                                                                        //
-    mpsc,
-    //                                                                        //
-    price,
-    //                                                                        //
-    pushsync_handler,
-    //                                                                        //
-    reserve,
-    //                                                                        //
+    mpsc, price, pushsync_handler, reserve,
     secure_vault::{
         secure_create_feed_update_soc_with_stamp, secure_ensure_feed_owner, secure_stamp_chunk,
     },
-    //                                                                        //
-    seek_next_feed_update_index,
-    //                                                                        //
-    transfer_pause_enabled,
-    //                                                                        //
-    upload_conventions::FileSlicePlan,
-    //                                                                        //
+    seek_next_feed_update_index, transfer_pause_enabled,
 };
-
-use byteorder::ByteOrder;
 
 use async_std::sync::Arc;
 
@@ -86,15 +36,6 @@ const PUSH_CHUNK_ATTEMPT_SOFT_TIMEOUT_MS: u64 = 15000;
 const PUSH_CHUNK_QUEUE_WINDOW: usize = 256;
 const PUSH_CHUNK_RECEIPT_WINDOW: usize = PUSH_CHUNK_QUEUE_WINDOW * 2;
 const PARITY_ENCODE_YIELD_ROWS: usize = 2;
-const DEBUG_UPLOAD_LOGS: bool = false;
-
-macro_rules! upload_log {
-    ($($arg:tt)*) => {
-        if DEBUG_UPLOAD_LOGS {
-            web_sys::console::log_1(&JsValue::from(format!($($arg)*)));
-        }
-    };
-}
 
 pub(crate) type ChunkUploadRequest = (
     Vec<u8>,
@@ -291,7 +232,7 @@ fn count_push_data_chunks(
     encryption: bool,
     redundancy_level: RedundancyLevel,
 ) -> Option<u64> {
-    upload_tree_plan(data_length, redundancy_level, encryption).map(|plan| plan.total_chunks)
+    upload_tree_chunk_count(data_length, redundancy_level, encryption)
 }
 
 async fn wait_for_chunk_pushes(receipts: &mut ChunkPushReceipts) -> bool {
@@ -354,10 +295,7 @@ async fn enqueue_stamped_chunk(
         async_std::task::yield_now().await;
     }
 
-    // Push slot feedback only bounds requests through the initial push. Final
-    // retrieve-check/retry receipts may lag behind it, so keep a second bounded
-    // window and drain one completed result before accepting more tree chunks.
-    // Awaiting the receiver never cancels the separately spawned push/accounting task.
+    // Receipt waiting never cancels the separately spawned push/accounting task.
     if chunk_receipts.len() >= PUSH_CHUNK_RECEIPT_WINDOW
         && !wait_for_next_chunk_push(chunk_receipts).await
     {
@@ -425,8 +363,7 @@ async fn pushsync_attempt(
     } = selected;
     let (chunk_out, chunk_in) = mpsc::unbounded::<bool>();
 
-    // This task owns the protocol exchange and accounting even if push_chunk
-    // starts trying another peer while this one is still waiting for a receipt.
+    // This task retains protocol and accounting ownership through its receipt.
     pushsync_handler(
         peer.clone(),
         &caddr,
@@ -480,13 +417,9 @@ pub async fn upload_resource(
     chunk_retrieve_chan: &ChunkRetrieveSender,
     progress: Option<UploadProgressSender>,
 ) -> Vec<u8> {
-    //
     let mut node0: Vec<Node> = vec![];
 
     for mut r0 in resource0 {
-        upload_log!("Attempt uploading resource");
-
-        // upload core file
         let input = match r0.data {
             ResourceData::Parts(parts) => DataUploadInput::from_parts(parts),
             ResourceData::BrowserFile(file) => DataUploadInput::from_browser_file(file),
@@ -522,11 +455,6 @@ pub async fn upload_resource(
         if index.len() == 0 {
             index = r0.path0.clone();
         };
-
-        upload_log!(
-            "Upload resource returning {:#?}!",
-            hex::encode(&core_reference)
-        );
 
         r0.data_address = core_reference;
 
@@ -661,9 +589,7 @@ pub async fn upload_resource(
     )
     .await;
 
-    // A feed update wraps the exact logical root chunk. With erasure coding its
-    // span carries the level marker and its payload contains mixed-width data
-    // and parity references, so rebuilding it from the source length is invalid.
+    // Feed updates must wrap the exact erasure-coded root chunk.
     let soc_wrapped_content = manifest_upload.root_data;
 
     let feed_update = match secure_create_feed_update_soc_with_stamp(
@@ -789,14 +715,7 @@ async fn upload_input_with_root(
     }
 
     match chan_in.recv().await {
-        Ok(result) => {
-            upload_log!(
-                "Upload data returning {:#?}!",
-                hex::encode(&result.reference)
-            );
-
-            result
-        }
+        Ok(result) => result,
         Err(_) => DataUploadResult::failed(),
     }
 }
@@ -853,9 +772,7 @@ async fn stamp_push_chunk(
             data = raw_data.clone();
             address = content_address(&raw_data);
         } else {
-            // Bee file trees contain CAC references. The legacy arbitrary-SOC
-            // bucket-overflow fallback creates a reference Bee's joiner cannot
-            // interpret, so fail this file upload cleanly instead.
+            // Bee file trees contain CAC references, so arbitrary-SOC fallback is invalid.
             return None;
         }
     }
@@ -871,9 +788,7 @@ async fn stamp_push_chunk(
     })
 }
 
-// Parity bytes are already a complete CAC (including its RS-generated span).
-// They must remain CACs: wrapping one in a SOC would make its parent reference
-// incompatible with Bee's erasure decoder.
+// Parity chunks must remain CACs for Bee's erasure decoder.
 async fn stamp_parity_chunk(
     raw_data: Vec<u8>,
     batch_owner: Vec<u8>,
@@ -1651,12 +1566,6 @@ pub async fn push_chunk(
         return caddr;
     }
 
-    upload_log!(
-        "unable to push chunk {} through {} separate peers",
-        hex::encode(&caddr),
-        PUSH_CHUNK_CONFIRMATION_PEERS
-    );
-
     vec![]
 }
 
@@ -1677,8 +1586,7 @@ fn encrypt_with_span(span: &[u8; 8], cd: &[u8], encrey: &[u8]) -> Vec<u8> {
     let creylen = encrey.len();
 
     let mut spanbytes: Vec<u8> = vec![];
-    let mut spansegmentkey0: [u8; 4] = [0; 4];
-    byteorder::LittleEndian::write_u32(&mut spansegmentkey0, (4096 / creylen) as u32);
+    let spansegmentkey0 = ((4096 / creylen) as u32).to_le_bytes();
     let spansegmentkey1 =
         keccak256(keccak256([encrey.to_vec(), spansegmentkey0.to_vec()].concat()).to_vec())
             .to_vec();
@@ -1696,8 +1604,7 @@ fn encrypt_with_span(span: &[u8; 8], cd: &[u8], encrey: &[u8]) -> Vec<u8> {
             k = concred.len() - (i * creylen);
         };
 
-        let mut contentsegmentkey0: [u8; 4] = [0; 4];
-        byteorder::LittleEndian::write_u32(&mut contentsegmentkey0, i as u32);
+        let contentsegmentkey0 = (i as u32).to_le_bytes();
         let contentsegmentkey1 = keccak256(keccak256(
             [encrey.to_vec(), contentsegmentkey0.to_vec()].concat(),
         ))
@@ -1735,7 +1642,6 @@ pub async fn make_soc(
     let soc_signer: PrivateKeySigner = match PrivateKeySigner::from_slice(&owner) {
         Ok(aok) => aok,
         _ => {
-            upload_log!("owner key length not 32 but {}", owner.len());
             return (vec![], vec![]);
         }
     };
@@ -1759,7 +1665,6 @@ pub async fn make_soc(
         .to_vec();
 
     if signature.len() != 65 {
-        upload_log!("soc signature length not 64 but {}", signature.len());
         return (vec![], vec![]);
     }
 

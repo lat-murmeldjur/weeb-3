@@ -1,21 +1,16 @@
 #![allow(dead_code)]
 
-#[path = "../src/connection_conventions.rs"]
-mod connection_conventions;
+#[path = "../src/accounting.rs"]
+mod accounting;
 #[path = "../src/events.rs"]
 mod events;
 #[path = "../src/retrieval_conventions.rs"]
 mod retrieval_conventions;
 
 mod connection {
-    use crate::connection_conventions;
-
-    use std::collections::HashMap;
-
-    use connection_conventions::{
-        CONNECTION_BUILDUP_LIMIT, CONNECTION_DIAL_CONCURRENCY_LIMIT, ConnectionCounterRelease,
-        bee_reconnect_delay_seconds, connection_counter_release,
-        connection_dial_capacity_available, remove_overlay_owner, retrieval_dispatch_available,
+    use crate::accounting::{
+        CONNECTION_BUILDUP_LIMIT, CONNECTION_DIAL_CONCURRENCY_LIMIT, bee_reconnect_delay_seconds,
+        connection_dial_capacity_available,
     };
 
     #[test]
@@ -31,20 +26,13 @@ mod connection {
 
     #[test]
     fn retrieval_dispatches_at_the_first_priced_peer() {
-        assert!(!retrieval_dispatch_available(0));
-        assert!(retrieval_dispatch_available(1));
         assert!(!connection_dial_capacity_available(
             1,
             CONNECTION_DIAL_CONCURRENCY_LIMIT
         ));
-        assert!(retrieval_dispatch_available(1));
         assert!(!connection_dial_capacity_available(
             CONNECTION_BUILDUP_LIMIT,
             0
-        ));
-        assert!(retrieval_dispatch_available(1));
-        assert!(retrieval_dispatch_available(
-            CONNECTION_BUILDUP_LIMIT as usize
         ));
 
         let retrieval = include_str!("../src/retrieval.rs");
@@ -60,7 +48,7 @@ mod connection {
             include_str!("../src/lib.rs")
                 .contains("overlay_peers: Arc<Mutex<HashMap<Vec<u8>, PeerId>>>")
         );
-        assert!(selection.contains("retrieval_dispatch_available(peers_map.len())"));
+        assert!(selection.contains("if peers_map.is_empty()"));
         assert!(selection.contains("for (overlay, id) in peers_map.iter()"));
         assert!(selection.contains("current_po >= current_max_po || closest_peer_id.is_none()"));
         assert!(!selection.contains("peer_candidates"));
@@ -101,13 +89,20 @@ mod connection {
             dial_feeder.contains("spawn_local(queue_peer_dial_retry("),
             "an immediate dial error must schedule its retry without sleeping the only dial feeder"
         );
-        assert!(dial_feeder.contains("PeerCondition::DisconnectedAndNotDialing"));
+        assert!(dial_feeder.contains("start_owned_connection_attempt("));
         assert!(dial_feeder.contains("try_mark_connection_attempt(&wings, &candidate.peer)"));
         assert!(
             dial_feeder.contains(
                 ".try_send((candidate.bzzaddr, false, candidate.generation, attempt_id))"
             )
         );
+
+        let dial_attempt = runtime
+            .split_once("async fn start_owned_connection_attempt(")
+            .expect("owned connection attempt helper")
+            .1;
+        assert!(dial_attempt.contains("PeerCondition::DisconnectedAndNotDialing"));
+        assert!(dial_attempt.contains("swarm.dial(options)?;"));
 
         let reserve = runtime
             .split("async fn try_reserve_connection_capacity(")
@@ -131,45 +126,25 @@ mod connection {
         let promotion = runtime
             .split("async fn promote_priced_peer(")
             .nth(1)
-            .and_then(|source| source.split("pub async fn post_upload(").next())
+            .and_then(|source| {
+                source
+                    .split("pub async fn post_upload_with_redundancy(")
+                    .next()
+            })
             .expect("priced-peer promotion");
-        let transfer = promotion
-            .split("Transfer the counted peer from ongoing to connected")
-            .nth(1)
-            .expect("atomic promotion transfer");
-        assert!(transfer.contains("let mut connections = self.connections.lock().await;"));
-        assert!(transfer.contains("let mut ongoing = self.ongoing_connections.lock().await;"));
-        assert!(transfer.contains("*ongoing = ongoing.saturating_sub(1);"));
-        assert!(transfer.contains("*connections = connections.saturating_add(1);"));
-    }
-
-    #[test]
-    fn only_the_peer_that_owns_an_overlay_can_remove_it() {
-        let mut overlays = HashMap::from([("overlay", "original-peer")]);
-        assert!(!remove_overlay_owner(
-            &mut overlays,
-            &"overlay",
-            &"foreign-peer"
-        ));
-        assert_eq!(overlays.get("overlay"), Some(&"original-peer"));
-        assert!(remove_overlay_owner(
-            &mut overlays,
-            &"overlay",
-            &"original-peer"
-        ));
-        assert!(!overlays.contains_key("overlay"));
-    }
-
-    #[test]
-    fn peer_lifecycle_releases_exactly_one_counter() {
-        use ConnectionCounterRelease::{Connected, None, Ongoing};
-
-        assert_eq!(connection_counter_release(true, false, false), Ongoing);
-        assert_eq!(connection_counter_release(true, true, false), Ongoing);
-        assert_eq!(connection_counter_release(true, false, true), Ongoing);
-        assert_eq!(connection_counter_release(false, true, false), Connected);
-        assert_eq!(connection_counter_release(false, false, true), Connected);
-        assert_eq!(connection_counter_release(false, false, false), None);
+        let connections = promotion
+            .find("let mut connections = self.connections.lock().await;")
+            .expect("connected counter lock");
+        let ongoing = promotion
+            .find("let mut ongoing = self.ongoing_connections.lock().await;")
+            .expect("ongoing counter lock");
+        let release = promotion
+            .find("*ongoing = ongoing.saturating_sub(1);")
+            .expect("ongoing reservation release");
+        let promote = promotion
+            .find("*connections = connections.saturating_add(1);")
+            .expect("connected counter promotion");
+        assert!(connections < ongoing && ongoing < release && release < promote);
     }
 
     #[test]
@@ -224,7 +199,11 @@ mod connection {
         let promotion = runtime
             .split("async fn promote_priced_peer(")
             .nth(1)
-            .and_then(|source| source.split("pub async fn post_upload(").next())
+            .and_then(|source| {
+                source
+                    .split("pub async fn post_upload_with_redundancy(")
+                    .next()
+            })
             .expect("priced-peer promotion should remain inspectable");
         let connected_guard = promotion
             .find("let connected_peers_guard = wings.connected_peers.lock().await;")
@@ -306,8 +285,8 @@ mod connection {
     fn only_the_connection_that_owns_the_session_tears_down_peer_state() {
         let runtime = include_str!("../src/lib.rs");
         let close = runtime
-            .split("// `connected_peers` is the peer-lifecycle guard.")
-            .nth(1)
+            .split("SwarmEvent::ConnectionClosed {")
+            .find(|source| source.contains("let close_owns_lifecycle ="))
             .and_then(|source| source.split("let accounting_peer =").next())
             .expect("connection-close lifecycle");
         let expected = close
@@ -368,8 +347,8 @@ mod connection {
 
         let runtime = include_str!("../src/lib.rs");
         let close = runtime
-            .split("// `connected_peers` is the peer-lifecycle guard.")
-            .nth(1)
+            .split("SwarmEvent::ConnectionClosed {")
+            .find(|source| source.contains("let close_owns_lifecycle ="))
             .and_then(|source| source.split("_ => {}").next())
             .expect("connection-close lifecycle");
         let snapshot = close
@@ -389,7 +368,7 @@ mod connection {
             .find("Duration::from_millis(reconnect_delay_ms)")
             .expect("backoff sleep");
         let generation_check = close[sleep..]
-            .find("*connection_generation.lock().await != retry_generation")
+            .find("*connection_generation.lock().await == retry_generation")
             .expect("post-backoff generation check");
         let cooldown_release = close[sleep..]
             .find(".remove(&peer_id)")
@@ -462,7 +441,7 @@ mod connection {
         let ambiguous_close = runtime
             .split("async fn quiesce_drain_and_close_accounting_session(")
             .nth(1)
-            .and_then(|source| source.split("#[wasm_bindgen]").next())
+            .and_then(|source| source.split("impl Weeb3 {").next())
             .expect("draining exact-session close");
         let quiesce = ambiguous_close
             .find("account.connection_id = None;")
@@ -485,7 +464,7 @@ mod connection {
             .map(|offset| coalescing + offset)
             .expect("refresh instruction claim");
         let enqueue = accounting[claim..]
-            .find("chan.try_send(instruction)")
+            .find("refreshments.try_send(instruction)")
             .map(|offset| claim + offset)
             .expect("claimed refresh enqueue");
         assert!(coalescing < claim && claim < enqueue);
@@ -557,8 +536,7 @@ mod connection {
     #[test]
     fn handshake_and_cheque_lifecycles_are_session_bound() {
         let runtime = include_str!("../src/lib.rs");
-        assert!(runtime.contains("HANDSHAKE_PROTOCOL_TIMEOUT_MS"));
-        assert!(runtime.contains("Handshake timed out peer="));
+        assert!(runtime.contains("Duration::from_millis(HANDSHAKE_PROTOCOL_TIMEOUT_MS)"));
 
         let handlers = include_str!("../src/handlers.rs");
         assert!(handlers.contains("let Some(ack) = rec_0.ack.as_ref()"));
@@ -582,7 +560,7 @@ mod connection {
         let refresh = handlers
             .split("pub async fn fresh(")
             .nth(1)
-            .and_then(|source| source.split("#[allow(dead_code)]").next())
+            .and_then(|source| source.split("pub async fn issue(").next())
             .expect("refresh handler");
         assert_eq!(
             refresh
@@ -597,7 +575,6 @@ mod connection {
         assert!(runtime.contains("(cheque_amt, cheque_generation)"));
         assert!(runtime.contains("map.get(&peer).copied() == Some((amount, cheque_generation))"));
         assert!(runtime.contains("generation == cheque_generation"));
-        assert!(runtime.contains("Ignored stale cheque result"));
 
         let cheque_claim = runtime
             .split("async fn claim_current_cheque(")
@@ -688,10 +665,10 @@ mod connection {
 
     #[test]
     fn accounting_protocol_streams_cannot_implicitly_redial_or_cross_sessions() {
-        let connection_conventions = include_str!("../src/connection_conventions.rs");
-        assert!(connection_conventions.contains("Poll::Ready(ToSwarm::Dial { opts })"));
-        assert!(connection_conventions.contains("FromSwarm::DialFailure(DialFailure"));
-        assert!(connection_conventions.contains("let error = DialError::NoAddresses;"));
+        let runtime = include_str!("../src/lib.rs");
+        assert!(runtime.contains("Poll::Ready(ToSwarm::Dial { opts })"));
+        assert!(runtime.contains("FromSwarm::DialFailure(DialFailure"));
+        assert!(runtime.contains("let error = DialError::NoAddresses;"));
 
         let handlers = include_str!("../src/handlers.rs");
         let open_current = handlers
@@ -827,5 +804,302 @@ mod retrieve_group_stream {
             RETRIEVAL_SOURCE
                 .contains("const RETRIEVE_RS_HEDGE_AFTER_MS: u64 = RETRIEVE_HEDGE_AFTER_MS * 2;")
         );
+    }
+}
+mod progress_events {
+    use crate::events::ProgressStore;
+
+    #[test]
+    fn late_updates_do_not_reopen_finished_progress() {
+        let mut store = ProgressStore::new();
+        let id = store.start("upload", "file", "read", Some(0), "reading");
+        store.finish(&id, "failed", "slice read failed", false);
+        store.update(&id, "push", Some(50), "late chunk receipt");
+
+        let (_, rows) = store.snapshot_if_changed(0).expect("progress changed");
+        let row = rows.iter().find(|row| row.id == id).expect("row exists");
+        assert!(row.done);
+        assert!(!row.ok);
+        assert_eq!(row.phase, "failed");
+        assert_eq!(row.detail, "slice read failed");
+    }
+}
+
+mod retrieve_generations {
+    use crate::retrieval_conventions::{
+        PendingGenerationRelation, cancel_generation_is_current, generation_is_newer,
+        latest_registered_generation, next_nonzero_generation, pending_generation_relation,
+    };
+
+    #[test]
+    fn advances_across_create_seek_evict_and_recreate() {
+        let created = next_nonzero_generation(0);
+        let sought = next_nonzero_generation(created);
+        let recreated = next_nonzero_generation(sought);
+
+        assert_eq!(created, 1);
+        assert!(sought > created);
+        assert!(recreated > sought);
+        assert!(!cancel_generation_is_current(Some(sought), created));
+        assert!(cancel_generation_is_current(Some(sought), recreated));
+    }
+
+    #[test]
+    fn wrapping_never_emits_the_reserved_zero_generation() {
+        assert_eq!(next_nonzero_generation(u64::MAX), 1);
+        assert!(generation_is_newer(1, u64::MAX));
+        assert!(!generation_is_newer(u64::MAX, 1));
+        assert!(cancel_generation_is_current(Some(u64::MAX), 1));
+        assert!(!cancel_generation_is_current(Some(1), u64::MAX));
+        assert_eq!(latest_registered_generation(u64::MAX, 1), 1);
+        assert_eq!(latest_registered_generation(1, u64::MAX), 1);
+    }
+
+    #[test]
+    fn pending_generation_order_is_wrap_safe() {
+        assert_eq!(latest_registered_generation(0, 1), 1);
+        assert_eq!(latest_registered_generation(7, 8), 8);
+        assert_eq!(latest_registered_generation(8, 7), 8);
+        assert_eq!(
+            pending_generation_relation(u64::MAX, 1),
+            PendingGenerationRelation::Replace
+        );
+        assert_eq!(
+            pending_generation_relation(1, u64::MAX),
+            PendingGenerationRelation::RejectStale
+        );
+        assert_eq!(
+            pending_generation_relation(7, 7),
+            PendingGenerationRelation::Join
+        );
+        assert_eq!(
+            pending_generation_relation(0, 7),
+            PendingGenerationRelation::Join
+        );
+    }
+}
+
+mod retrieve_admission {
+    use crate::retrieval_conventions::{
+        RetrieveAdmission, acquire_retrieve_permit, retrieve_admission_current,
+    };
+    use async_lock::Semaphore;
+    use std::{
+        future::Future,
+        pin::pin,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+        task::{Context, Poll, Wake, Waker},
+    };
+
+    #[derive(Debug)]
+    struct CountingWake(AtomicUsize);
+
+    impl Wake for CountingWake {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn close_is_monotonic_and_visible_to_every_clone() {
+        let admission = RetrieveAdmission::new();
+        let queued = admission.clone();
+
+        assert!(admission.is_open());
+        assert!(queued.is_open());
+        admission.close();
+        admission.close();
+
+        assert!(!admission.is_open());
+        assert!(!queued.is_open());
+    }
+
+    #[test]
+    fn drop_guard_closes_early_return_paths() {
+        let admission = RetrieveAdmission::new();
+        {
+            let _guard = admission.close_on_drop();
+            assert!(admission.is_open());
+        }
+
+        assert!(!admission.is_open());
+    }
+
+    #[test]
+    fn local_and_stream_cancellation_are_both_required_for_admission() {
+        let admission = RetrieveAdmission::new();
+
+        assert!(retrieve_admission_current(true, &None));
+        assert!(!retrieve_admission_current(false, &None));
+        assert!(retrieve_admission_current(true, &Some(admission.clone())));
+        assert!(!retrieve_admission_current(false, &Some(admission.clone())));
+
+        admission.close();
+        assert!(!retrieve_admission_current(true, &Some(admission)));
+    }
+
+    #[test]
+    fn close_wakes_pending_waiters() {
+        let admission = RetrieveAdmission::new();
+        let closer = admission.clone();
+        let wake = Arc::new(CountingWake(AtomicUsize::new(0)));
+        let waker = Waker::from(wake.clone());
+        let mut context = Context::from_waker(&waker);
+        let mut waiting = pin!(admission.wait_closed());
+
+        assert_eq!(waiting.as_mut().poll(&mut context), Poll::Pending);
+        closer.close();
+        assert!(wake.0.load(Ordering::SeqCst) > 0);
+        assert_eq!(waiting.as_mut().poll(&mut context), Poll::Ready(()));
+    }
+
+    #[test]
+    fn waiting_after_close_is_immediately_ready() {
+        let admission = RetrieveAdmission::new();
+        admission.close();
+        admission.close();
+
+        let wake = Arc::new(CountingWake(AtomicUsize::new(0)));
+        let waker = Waker::from(wake);
+        let mut context = Context::from_waker(&waker);
+        let mut waiting = pin!(admission.wait_closed());
+
+        assert_eq!(waiting.as_mut().poll(&mut context), Poll::Ready(()));
+    }
+
+    #[test]
+    fn closing_drops_a_waiter_before_retrieve_capacity_is_reserved() {
+        async_std::task::block_on(async {
+            let semaphore = Arc::new(Semaphore::new(0));
+            let admission = RetrieveAdmission::new();
+            let closer = admission.clone();
+            let waiting = async_std::task::spawn({
+                let semaphore = semaphore.clone();
+                async move { acquire_retrieve_permit(&semaphore, Some(&admission)).await }
+            });
+
+            async_std::task::yield_now().await;
+            closer.close();
+            assert!(waiting.await.is_none());
+        });
+    }
+}
+
+mod retrieve_singleflight {
+    use crate::retrieval_conventions::SingleflightRegistry;
+    use std::{cell::Cell, rc::Rc};
+
+    #[test]
+    fn identical_keys_share_one_leader_and_one_resource() {
+        let created = Rc::new(Cell::new(0));
+        let mut flights = SingleflightRegistry::<String, usize, Rc<Cell<bool>>>::default();
+
+        let first_created = Rc::clone(&created);
+        let first = flights.register("chunk".to_string(), 3, move || {
+            first_created.set(first_created.get() + 1);
+            Rc::new(Cell::new(true))
+        });
+        let second_created = Rc::clone(&created);
+        let second = flights.register("chunk".to_string(), 5, move || {
+            second_created.set(second_created.get() + 1);
+            Rc::new(Cell::new(true))
+        });
+
+        assert!(first.leader);
+        assert!(!second.leader);
+        assert_eq!(first.flight_id, second.flight_id);
+        assert!(Rc::ptr_eq(&first.shared, &second.shared));
+        assert_eq!(created.get(), 1);
+    }
+
+    #[test]
+    fn last_waiter_closes_but_does_not_remove_the_producer_flight() {
+        let mut flights = SingleflightRegistry::<u8, (), Rc<Cell<bool>>>::default();
+        let first = flights.register(7, (), || Rc::new(Cell::new(true)));
+        let second = flights.register(7, (), || Rc::new(Cell::new(true)));
+
+        assert!(
+            flights
+                .remove_waiter(&7, first.flight_id, first.waiter_id)
+                .is_none()
+        );
+        assert!(second.shared.get());
+        let shared = flights
+            .remove_waiter(&7, second.flight_id, second.waiter_id)
+            .expect("last waiter returns the shared admission");
+        shared.set(false);
+        assert!(!first.shared.get());
+
+        let follower = flights.register(7, (), || Rc::new(Cell::new(true)));
+        assert!(!follower.leader);
+        assert_eq!(follower.flight_id, first.flight_id);
+        assert!(!follower.shared.get());
+
+        let completed = flights
+            .take(&7, first.flight_id)
+            .expect("only the producer removes the flight");
+        assert_eq!(completed.waiters.len(), 1);
+
+        let successor = flights.register(7, (), || Rc::new(Cell::new(true)));
+        assert!(successor.leader);
+        assert_ne!(successor.flight_id, first.flight_id);
+    }
+
+    #[test]
+    fn completion_detaches_every_waiter_atomically() {
+        let mut flights = SingleflightRegistry::<u8, usize, ()>::default();
+        let first = flights.register(9, 4, || ());
+        flights.register(9, 2, || ());
+
+        let mut waiters = flights
+            .take(&9, first.flight_id)
+            .expect("active flight")
+            .waiters;
+        waiters.sort_unstable();
+        assert_eq!(waiters, vec![2, 4]);
+    }
+
+    #[test]
+    fn distinct_scopes_never_share() {
+        let mut flights = SingleflightRegistry::<(&str, u64), (), ()>::default();
+        assert!(flights.register(("video", 1), (), || ()).leader);
+        assert!(flights.register(("video", 2), (), || ()).leader);
+        assert!(flights.register(("audio", 1), (), || ()).leader);
+    }
+
+    #[test]
+    fn stale_producer_cannot_take_a_successor_with_the_same_key() {
+        let mut flights = SingleflightRegistry::<u8, &'static str, Rc<Cell<bool>>>::default();
+        let old = flights.register(3, "old", || Rc::new(Cell::new(true)));
+        let old_shared = flights
+            .remove_waiter(&3, old.flight_id, old.waiter_id)
+            .expect("old flight admission is returned");
+        old_shared.set(false);
+        let old_flight = flights
+            .take(&3, old.flight_id)
+            .expect("old producer completes its own flight");
+        assert_eq!(old_flight.waiters, Vec::<&'static str>::new());
+
+        let successor = flights.register(3, "new", || Rc::new(Cell::new(true)));
+        assert!(successor.leader);
+        assert_ne!(old.flight_id, successor.flight_id);
+        assert!(flights.take(&3, old.flight_id).is_none());
+        assert!(
+            flights
+                .remove_waiter(&3, old.flight_id, old.waiter_id)
+                .is_none()
+        );
+
+        let flight = flights
+            .take(&3, successor.flight_id)
+            .expect("successor remains registered");
+        assert_eq!(flight.waiters, vec!["new"]);
     }
 }

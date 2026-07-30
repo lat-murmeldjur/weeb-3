@@ -96,24 +96,6 @@
                 margin: .25em 0 .75em;
                 max-width: 72ch;
             }
-            #weeb3InterfaceRoot .weeb3-stream-catalog { display: grid; gap: .55em; }
-            #weeb3InterfaceRoot .weeb3-stream-catalog h3,
-            #weeb3InterfaceRoot .weeb3-stream-catalog p { margin: 0; }
-            #weeb3InterfaceRoot .weeb3-stream-entry,
-            #weeb3InterfaceRoot .weeb3-stream-share {
-                align-items: baseline;
-                display: flex;
-                flex-wrap: wrap;
-                gap: .35em .65em;
-            }
-            #weeb3InterfaceRoot .weeb3-stream-entry > button:first-child { flex: 0 1 72ch; }
-            #weeb3InterfaceRoot .weeb3-stream-entry button {
-                cursor: pointer;
-                max-width: min(100%, 72ch);
-                text-align: left;
-            }
-            #weeb3InterfaceRoot .weeb3-stream-share-status:empty { display: none; }
-            #weeb3InterfaceRoot .weeb3-stream-share-fallback { overflow-wrap: anywhere; }
             #weeb3InterfaceRoot .weeb3-hls-status { margin-top: .5em; }
             #weeb3InterfaceRoot section, #weeb3InterfaceRoot #resultField, #weeb3InterfaceRoot #progressField,
             #weeb3InterfaceRoot #progressActions, #weeb3InterfaceRoot #logsField {
@@ -216,7 +198,7 @@
                 </div>
             </section>
             <section id="navigationPanel" hidden aria-hidden="true">
-                <input type="text" id="inputString" placeholder="Enter Swarm hash, /feeds/owner/topic, or /stream/owner/topic/index" size="88">
+                <input type="text" id="inputString" placeholder="Enter Swarm hash or /stream/owner/topic" size="88">
                 <div>
                     <input id="streamFilesWhenAvailable" name="streamFilesWhenAvailable" type="checkbox" checked>
                     <label for="streamFilesWhenAvailable">Stream files when available</label>

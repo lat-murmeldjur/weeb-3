@@ -24,7 +24,9 @@ Ensure you have [wasm-pack](https://rustwasm.github.io/wasm-pack/), [protoc](htt
 
     For a trusted deployment, one option is to serve the static build from GitHub Pages or another HTTPS host with a browser-trusted certificate. A simple workflow is to fork the repository, enable GitHub Pages for the `docs` folder, and copy the latest files from `static` to `docs` after building.
 
-3. Open the application URL, for example [`https://localhost:8080/weeb-3`](https://localhost:8080/weeb-3), or the GitHub Pages hosted version at [`https://lat-murmeldjur.github.io/weeb-3`](https://lat-murmeldjur.github.io/weeb-3).
+    `Code_One.hx` automates that synchronization after successful Wasm and native builds. Files in `static` are authoritative; the script copies the HTML examples, including `hls-stream-example.html`, and generated runtime assets into `docs`.
+
+3. Open the application URL, for example [`https://localhost:8080/weeb-3/`](https://localhost:8080/weeb-3/), or the GitHub Pages hosted version at [`https://lat-murmeldjur.github.io/weeb-3`](https://lat-murmeldjur.github.io/weeb-3).
 
 ## Using the npm package
 
@@ -37,10 +39,10 @@ The `wasm-pack` build generates the browser package files, and the publishing wo
 - `static/weeb_3.d.ts`
 - `static/weeb_3_bg.wasm.d.ts`
 
-After publishing, the package can be used with the same API shape as the examples in `static/example.html` and `static/issue-1-json-sync-example.html`:
+After publishing, the package can be used with the same API shape as the examples in `static/example.html`, `static/issue-1-json-sync-example.html`, and `static/hls-stream-example.html`:
 
 ```js
-import init, { Weeb3No103, BootstrapNode } from "@lat-murmeldjur/weeb_3";
+import init, { Weeb3No103 } from "@lat-murmeldjur/weeb_3";
 
 await init();
 
@@ -51,11 +53,6 @@ weeb3node.start();
 console.log(await weeb3node.networkState());
 
 // Switch explicitly between the built-in profiles.
-await weeb3node.switchTestnet();
-await weeb3node.switchMainnet();
-
-// The generic form accepts "mainnet", "gnosis", or "1", and
-// "testnet", "sepolia", or "10".
 await weeb3node.switchNetwork("testnet");
 await weeb3node.switchNetwork("mainnet");
 
@@ -63,7 +60,7 @@ await weeb3node.switchNetwork("mainnet");
 weeb3node.start({
   networkId: "1",
   bootstrapNodes: [
-    new BootstrapNode("/ip4/example/tcp/443/wss/p2p/examplePeerId", true),
+    { multiaddr: "/ip4/example/tcp/443/wss/p2p/examplePeerId", usable: true },
   ],
 });
 
@@ -73,17 +70,11 @@ weeb3node.start({ testnet: true });
 const ready = await weeb3node.ready(1, 20_000);
 ```
 
-The wrapper exposes the browser node as `Weeb3No103`. It can start the runtime, connect to network profiles, switch between mainnet and testnet with `switchMainnet()` / `switchTestnet()` or `switchNetwork(mode)`, render the bundled interface into a container, report network and progress state, retrieve BZZ resources, retrieve raw bytes or chunks, upload `File` objects or byte arrays, publish and read feed updates, and expose feed identity helpers.
+The wrapper exposes the browser node as `Weeb3No103`. It can start the runtime, switch between mainnet and testnet with `switchNetwork(mode)`, render the bundled interface into a container, report network and progress state, retrieve BZZ resources, retrieve raw bytes or chunks, upload `File` objects or byte arrays, and publish or read feed updates.
+
+The HLS example selects the canonical `/weeb-3/stream/{owner}/{topic}` location and passes an explicit DOM element to `renderInterface(container)`. That call mounts the player and the rest of the Rust interface inside the chosen element and performs the same runtime boot, connection buildup, Service Worker setup, retrieval, and stream startup used by the standalone application. It does not add a separate JavaScript HLS transport API.
 
 The publishing workflow defaults to the GitHub repository owner scope. If a different npm scope is needed, set the `NPM_SCOPE` repository variable in GitHub Actions before pushing to `main`.
-
-### Bee-compatible erasure coding and optional HLS support
-
-Uploads default to Bee's Medium erasure-coding level. The interface exposes levels `0` through `4` (None, Medium, Strong, Insane, and Paranoid), and npm callers can select the same values with `uploadWithRedundancy`, `postUploadWithRedundancy`, or `postUploadBytesWithRedundancy`. Retrieval reads the level stored in the Swarm tree and uses parity only when data shards are unavailable.
-
-Sequence-feed indexes use Bee's fixed-width eight-byte big-endian encoding. HLS playback is a separate dapp integration rather than a Bee/Swarm standard. Its manifest feeds can be opened with canonical `/stream/{owner}/{topic}[/{index}]` links; mainnet is the default, while testnet links insert `/testnet` before `/stream`.
-
-The npm wrapper provides `renderInterface(container)`, `openStreamFeed(owner, topic)`, `playHlsStream(owner, topic, mediaType, index?)`, `attachHlsStream(media, owner, topic, options)` for application-owned media elements, and `detachHlsStream()` to release an attachment.
 
 ## [Notes]
 
@@ -102,9 +93,11 @@ Testing and improving support for other browsers is planned.
 
 The weeb-3 client consists of several logical components:
 
+- The native development server in `src/main.rs`, which serves the embedded browser distribution over local TLS and provides application-shell routes.
 - The browser interface, implemented primarily by `static/index.html`, `src/interface.rs`, `src/interface_conventions.rs`, and `src/interface_runtime_conventions.rs`.
 - The libp2p / Swarm node, whose main entry point is `src/lib.rs`.
-- The Swarm protocol handlers and data pipelines for handshake, peer discovery, pricing, accounting, retrieval, pushsync, pseudosettle, swap, manifests, feeds, streaming, and uploads.
+- The Swarm protocol handlers and data pipelines for handshake, peer discovery, pricing, accounting, retrieval, pushsync, pseudosettle, swap, manifests, feeds, erasure-coded uploads and recovery, and generic resource streaming.
+- The separate HLS dapp integration in `src/stream_hls.rs`, which follows Swarm feeds and presents their manifests and segments to browser media playback. HLS itself is not part of the Bee / Swarm protocol.
 - The Service Worker in `static/service.js`, which provides deterministic browser routes for Swarm content and forwards canonical requests into the Rust runtime.
 - The npm / library facade in `src/library.rs`, which wraps the same runtime for embedding in other browser applications.
 - Browser persistence, secure local state, network profiles, and on-chain integration implemented by `src/persistence.rs`, `src/secure_vault.rs`, `src/network_profile.rs`, and `src/on_chain.rs`.
@@ -115,7 +108,7 @@ Below is a piece-by-piece overview of the current component logic.
 
 The default browser application is instantiated by `static/index.html`, which loads the generated Wasm module and calls `interweeb` from `src/interface.rs`.
 
-`interweeb` creates a `Weeb3` node, clears legacy hash-based paths through `src/nav.rs`, and delegates the rest of the UI setup to `mount_interface`. `mount_interface` can either start the runtime itself or attach the interface to a runtime that has already been started by the package wrapper.
+`interweeb` creates a `Weeb3` node, selects the network from the exact current route, and delegates the rest of the UI setup to `mount_interface`. `mount_interface` can either start the runtime itself or attach the interface to a runtime that has already been started by the package wrapper.
 
 The interface layer currently has the following roles:
 
@@ -124,8 +117,8 @@ The interface layer currently has the following roles:
 - Preloading the secure vault module before sensitive upload, feed, stamp, or cheque operations are requested.
 - Registering the Service Worker and routing Service Worker messages back to the Rust runtime.
 - Reading the configured network profile, network id, and browser-dialable bootnodes, then passing bootnode connection requests to the `Weeb3` node.
-- Wiring the navigation input so BZZ references, raw byte routes, and chunk routes can be opened from the UI.
-- Wiring upload controls for single files, tar-based collections, optional encryption, index document selection, optional feed publishing, and postage-stamp reuse or reset.
+- Wiring the navigation input so BZZ references, raw byte routes, chunk routes, and exact `/stream/{owner}/{topic}` HLS share routes can be opened from the UI.
+- Wiring upload controls for single files, tar-based collections, optional encryption, Bee redundancy levels, index document selection, optional feed publishing, and postage-stamp reuse or reset.
 - Wiring on-chain controls for upload prerequisites, postage batch acquisition, chequebook deployment, cheque signer persistence, and chequebook deposits through the browser wallet.
 - Providing runtime controls such as pausing and resuming transfers.
 - Rendering retrieved resources, website iframes, streaming media, raw downloads, logs, connection status, network state, and progress rows.
@@ -138,22 +131,22 @@ The main Swarm client is implemented in `src/lib.rs`. It is compiled only for th
 
 At a high level, `src/lib.rs` does the following:
 
-- Imports the generated protobuf protocol modules from `etiquette_0` through `etiquette_8`.
+- Imports the generated protobuf modules for the Swarm protocols the client implements.
 - Defines the Swarm protocol names used by the client, including handshake, pricing, hive peer discovery, pseudosettle, retrieval, pushsync, and swap.
 - Defines network mode helpers for testnet and mainnet. The built-in profiles currently map Swarm network id `10` to the Sepolia-based testnet profile and Swarm network id `1` to the Gnosis / xDAI mainnet profile.
 - Defines the `Weeb3` client, which owns the libp2p `Swarm`, runtime channels, connection state, network id, progress store, transfer pause flag, and peer registry.
 - Defines `Wings`, the in-memory peer and accounting registry used to track connected peers, overlay addresses, bootnodes, accounting peers, settlement state, known underlays, and self-observed ephemeral addresses.
 - Exposes the runtime functions used by the interface and library wrapper.
 
-The most important public `Weeb3` operations are:
+The internal `Weeb3` operations used by the interface and npm facade are:
 
-1. Changing the network id and bootnode address.
+1. Changing the network id and connecting browser-dialable bootnodes.
 2. Disconnecting and clearing peer state when the active network profile changes.
-3. Uploading a `File` or tar collection, optionally encrypted, optionally with an index document, and optionally as a feed update.
+3. Uploading a `File` or tar collection, optionally encrypted, with a selected Bee redundancy level, optionally with an index document, and optionally as a feed update.
 4. Pushing a raw chunk through pushsync.
 5. Resolving and acquiring BZZ resources.
 6. Retrieving raw bytes or individual chunks.
-7. Reading feed envelopes and feed content.
+7. Reading feed envelopes and feed content with Bee-compatible big-endian sequence indexes.
 8. Resetting the active postage stamp state.
 9. Reporting logs, connection counts, active network id, and progress snapshots.
 10. Pausing or resuming transfers.
@@ -174,7 +167,7 @@ The `run` function is the long-running runtime loop. It builds a channel-based a
 - Incoming and outgoing libp2p stream handling.
 - Handshake, identify, pricing, and peer promotion.
 - Accounting, pseudosettle refreshes, cheque sending, and swap-related settlement messages.
-- High-level BZZ resolution, range preparation, and BZZ range retrieval.
+- High-level BZZ resolution and resolved BZZ range retrieval.
 - Data-level retrieval and upload requests.
 - Chunk-level retrieval and pushsync with bounded concurrency.
 - Upload progress reporting.
@@ -183,34 +176,69 @@ The `run` function is the long-running runtime loop. It builds a channel-based a
 
 The runtime is heavily asynchronous, but it is still running inside the browser's Wasm execution environment. It uses `spawn_local`, async channels, short queue polling, and protocol-specific retry delays rather than OS threads.
 
-#### The Swarm Client Subcomponents
+#### Source file map
 
-The main runtime depends on several focused modules:
+Every Rust source file belongs to one of the runtime areas below. None of the `.rs` files are generated. `build.rs` compiles the active protocol schemas in `src/etiquette_0.proto` through `src/etiquette_8.proto`, except for the retained but unused `src/etiquette_3.proto`, and `src/lib.rs` includes the resulting active modules.
 
-- `src/handlers.rs` implements the libp2p stream handlers for Swarm protocol traffic such as handshake, hive, pricing, pseudosettle, retrieval, pushsync, and swap.
-- `src/accounting.rs` implements local accounting, price calculations, reservations, peer credit / debit tracking, refresh triggers, and settlement coordination.
-- `src/addresses.rs` normalizes and validates browser-dialable underlays, including WebSocket and secure WebSocket multiaddresses.
-- `src/retrieval.rs` implements chunk retrieval, peer selection, validation, decryption, data joining, and request coordination.
-- `src/upload.rs` implements file splitting, optional encryption, chunk creation, postage stamp use, pushsync, manifest creation, SOC creation, and feed upload support.
-- `src/manifest.rs` interprets Swarm manifests.
-- `src/manifest_upload.rs` creates manifests for uploads and collections.
-- `src/bzz_stream.rs` parses canonical BZZ resources, resolves manifests and paths, prepares range trees, and retrieves byte ranges for BZZ resources.
-- `src/stream.rs` integrates generic BZZ range retrieval with browser fetch requests and regular media playback.
-- `src/stream_hls.rs` contains the optional, nonstandard HLS dapp integration: feed discovery, manifest handling, prefetching, and browser playback.
-- `src/stream_conventions.rs` contains the small route, HTTP range, cache identity, and shared media-budget helpers used at the browser boundary.
-- `src/nav.rs` normalizes browser paths and extracts BZZ route references from the location bar.
-- `src/ens.rs` resolves ENS content hashes to Swarm references.
-- `src/events.rs` stores progress rows and progress revisions for the UI and package wrapper.
-- `src/persistence.rs` stores browser-side data in IndexedDB.
-- `src/secure_vault.rs` manages sensitive local state such as upload identities, postage-stamp state, feed ownership, and cheque signer material.
-- `src/network_profile.rs` defines the built-in testnet and mainnet profiles, wallet chain ids, token symbols, and bootnodes.
-- `src/on_chain.rs` implements browser wallet and contract interactions for postage batches, price oracle access, chequebook operations, swap token operations, and related state.
-- Batch state held by `weeb-3-secure` is requested with the active Swarm network id, so testnet and mainnet use separate batch owners, batch ids, bucket counters, and temp-auth authorization.
-- `src/interface_conventions.rs` and `src/interface_runtime_conventions.rs` contain DOM helpers, UI rendering, route parsing, network controls, and Service Worker runtime integration.
-- `src/library.rs` exposes the Wasm runtime to JavaScript as `Weeb3No103` and `BootstrapNode`.
-- `src/conventions.rs` and `src/interface_conventions.rs` collect common encoding, decoding, hashing, resource, UI, and protocol helper logic.
+##### Entrypoints and browser integration
 
-The ABI files in `src/*.json` are consumed by the on-chain module and cover contracts such as the postage stamp contract, price oracle, factory, sBZZ token, and simple swap contract.
+- `src/main.rs` is the native development executable. It binds the HTTPS server on all local interfaces, embeds the browser runtime assets and repository HTML examples, serves the HLS npm example at `/weeb-3/hls-stream-example.html`, and returns the application shell for the exact mainnet `/weeb-3/stream/{owner}/{topic}` share route.
+- `src/lib.rs` is the Wasm crate root and low-level node runtime. It defines protocol names and generated protobuf modules, owns `Weeb3`, `Wings`, libp2p state, physical connection sessions, channels and workers, and runs the asynchronous protocol event loop. Its stream behavior rejects implicit dialing so protocol streams remain attached to explicitly tracked connections.
+- `src/library.rs` is the wasm-bindgen / npm facade over the same `Weeb3` runtime used by the built-in interface. It exposes lifecycle, network, retrieval, upload, feed, progress, postage, and wallet methods as `Weeb3No103` and converts Rust results into JavaScript values.
+- `src/interface.rs` mounts and orchestrates the built-in browser interface. It starts or attaches to the shared runtime, installs the Service Worker message bridge, wires resource, upload, feed, network, wallet and pause controls, and renders results, logs, connection state, and progress.
+- `src/interface_conventions.rs` embeds the static interface shell and contains its DOM construction, styles, labels, collapsible sections, and theme behavior.
+- `src/interface_runtime_conventions.rs` contains the operational UI-to-runtime bridge: bootnode and network application, wallet and upload prerequisites, resource views and downloads, progress rendering, and Service Worker registration, control negotiation, and request dispatch.
+- `src/events.rs` implements the bounded, revisioned progress store. Upload and retrieval tasks write progress rows there, while both the built-in interface and npm facade read consistent snapshots.
+- `src/nav.rs` parses exact locations and user input into network-aware BZZ, bytes, chunk, or HLS share routes. Unqualified routes default to mainnet; non-Bee aliases and legacy hash rewriting are not retained.
+
+##### Connections and Swarm protocols
+
+- `src/accounting.rs` contains connection-scoped debt, reserve, credit and refreshment accounting, proximity pricing, the 200-peer buildup and dial-concurrency limits, and Bee-compatible reconnect delay calculations.
+- `src/addresses.rs` decodes Bee underlay lists, validates their WSS address forms, and converts Bee IP/SNI addresses into browser-dialable DNS WebSocket multiaddresses.
+- `src/handlers.rs` implements framing and stream exchanges for handshake, pricing, hive gossip, pseudosettle refreshment, SWAP cheques, retrieval, and pushsync. It binds protocol work to physical connection sessions and reports completion to accounting and the data pipelines.
+- `src/conventions.rs` contains shared Swarm protocol primitives, including peer and accounting records, proximity order, BMT / CAC addressing, CAC and SOC validation, cryptographic signing and recovery, handshake helpers, and common reference and resource encodings.
+
+##### Retrieval, manifests, and feeds
+
+- `src/retrieval.rs` is the central download engine. It performs priced peer selection, accounting-safe individual chunk retrieval, validation and decryption, replica fallback, decoded caching, concurrent Bee tree and range joins, erasure-shard acquisition and Reed-Solomon recovery, complete-resource retrieval, and feed-update acquisition.
+- `src/retrieval_conventions.rs` provides wrap-safe request-generation ordering, bounded retrieval admission, cancellation of work that has not been sent, and keyed singleflight coordination. Once a network request has been dispatched, observers may detach but the request and its accounting completion are allowed to drain instead of being replayed or abandoned.
+- `src/bzz_stream.rs` parses canonical BZZ resources and resolves Mantaray paths, embedded values, and feed indirection into metadata and byte-range targets. It provides lazy range resolution for `src/stream.rs` using the same erasure-capable retrieval join used for complete resources.
+- `src/manifest.rs` contains the shared Mantaray wire-format and collection-reading logic: headers and forks, prefix ordering, metadata sizing, encrypted or obfuscated header handling, bounded visit and ancestry guards, and ordered resource joining.
+- `src/manifest_upload.rs` constructs and uploads Bee-compatible Mantaray nodes, forks, stubs, collection entries, index and error documents, and encrypted or obfuscated manifests. It delegates protected chunk-tree creation to `src/upload.rs`.
+- `src/feed.rs` encodes Bee sequence indexes as fixed-width eight-byte big-endian values, derives feed IDs and update addresses, converts JavaScript indexes without loss, and performs bounded concurrent probing for the latest sequence frontier. Feed reads share retrieval's rule that observer timeouts do not cancel already dispatched accounting work.
+- `src/ens.rs` resolves ENS names through the registry and resolver contracts and converts supported content hashes into Swarm references.
+
+##### Upload path
+
+- `src/upload.rs` reads browser files in bounded slices, splits and optionally encrypts resources, builds Bee chunk trees, generates erasure parity and root replicas, stamps chunks, and pushes them with bounded concurrency and accounting. It also handles raw resources, manifests, SOCs, feed updates, receipts, and progress without changing the individual chunk push protocol.
+- `src/erasure_coding.rs` implements Bee's redundancy levels and span flags, per-level shard and parity schedules, protected reference layouts and counts, root replicas, cached GF(256) coding matrices, parity generation, and selective Reed-Solomon reconstruction. It also keeps the small upload-level validation, resource-bundle encoding, and bounded file-slice helpers beside the upload coding implementation. Upload writes Bee-compatible layouts and retrieval reads their encoded level, using parity when data shards are unavailable.
+
+##### Streaming and HTTP integration
+
+- `src/stream.rs` is the generic browser resource layer. It translates Service Worker messages into BZZ and raw responses, implements HTTP Range, ETag, metadata, response and singleflight caches, and drives ordinary audio or video range retrieval, seek handling, staged prefetch, retries, and result-view lifetime.
+- `src/stream_conventions.rs` contains exact share-route validation, HTTP range and validator helpers, immutable cache identities, device-aware cache limits, and staged regular-media lookahead budgets shared at the browser boundary.
+- `src/stream_hls.rs` contains the separate, nonstandard HLS dapp integration rather than generic Bee retrieval logic. It recognizes and rewrites playlists, discovers and follows feed heads, stabilizes archive and live timelines, maintains segment caches and singleflight requests, plans startup and sustained lookahead, serves internal feed and segment responses, and owns the Rust player lifecycle and recovery logic. It begins the single hls.js module load while Service Worker control is being established so these independent cold-start operations do not run serially. Only the minimal dynamic import hook remains in `static/hls_loader.js`; stream control and prefetching stay in Rust.
+
+##### Persistence, identity, networks, and contracts
+
+- `src/persistence.rs` provides the IndexedDB primitives used for the chequebook signer and address and last issued payouts.
+- `src/secure_vault.rs` communicates with the separately hosted secure vault and authorization popup for network-scoped postage state, chunk stamping, feed ownership and signed updates, and cheque signer material. It also handles vault reconnect and resume behavior without exposing sensitive state to ordinary UI code.
+- `src/network_profile.rs` defines the built-in mainnet and testnet Swarm IDs, wallet chains, base currencies, token symbols, bootnodes, active-profile switching, and browser-dialable underlay checks.
+- `src/on_chain.rs` implements injected-wallet and contract operations for postage batches, token approval, price-oracle reads, chequebook deployment and deposits, swap-token balances, and EIP-712 cheque signing. It embeds the ABI definitions in `src/*.json`.
+
+The protobuf schema files map directly to Bee stream protocols:
+
+- `src/etiquette_0.proto` defines the common protocol header envelope.
+- `src/etiquette_1.proto` defines handshake messages and signed BZZ addresses.
+- `src/etiquette_2.proto` defines Hive peer-gossip messages.
+- `src/etiquette_3.proto` retains the original Ping/Pong schema for reference but is not compiled or wired into the runtime.
+- `src/etiquette_4.proto` defines pricing threshold announcements.
+- `src/etiquette_5.proto` defines pseudosettle payments and acknowledgements.
+- `src/etiquette_6.proto` defines retrieval requests and deliveries.
+- `src/etiquette_7.proto` defines pushsync deliveries and receipts.
+- `src/etiquette_8.proto` defines SWAP handshakes and cheque messages.
+
+Batch state held by `weeb-3-secure` is requested with the active Swarm network id, so testnet and mainnet use separate batch owners, batch ids, bucket counters, and temporary authorization.
 
 #### Persistence and identity
 
@@ -218,7 +246,7 @@ The browser runtime maintains a mix of ephemeral and persistent state.
 
 The libp2p identity used by a `Weeb3` runtime is generated when the node is created. That makes the live peer identity tab-local and runtime-local. Peer maps, connection attempts, active streams, and accounting state are kept in memory by the `Weeb3` and `Wings` structures.
 
-Browser persistence is used for state that should survive page reloads or browser sessions, such as retrieved chunks, chequebook data, signer material, postage-stamp state, and other runtime settings. Sensitive state is routed through the secure vault module instead of being handled directly by ordinary UI code.
+`src/persistence.rs` stores the chequebook signer and address and last issued payouts across browser sessions. Network-scoped postage state, upload and feed identities, and other sensitive state are routed through the secure vault module instead of being handled directly by ordinary UI code.
 
 Wallet access is requested only for on-chain operations. The browser wallet is used for chain switching, account access, postage purchase flows, chequebook deployment, and deposits. Upload/feed identities and cheque signer keys are managed separately from the wallet account so that Swarm protocol operations do not require signing every action with the injected wallet.
 
@@ -232,11 +260,14 @@ Single files can still be displayed without a Service Worker by creating `Blob` 
 
 The Service Worker solves this by providing deterministic application-scoped routes:
 
+- Top-level navigation to `/weeb-3/stream/{owner}/{topic}` loads the application shell and selects the mainnet HLS feed view. The two path values are a 20-byte feed owner and a URL-encoded feed topic; this is the only public HLS share-route shape.
 - `GET` and `HEAD` requests below `/bzz/<reference>/<path>` are interpreted as canonical mainnet BZZ resource requests.
 - Testnet can be selected from routes with `/testnet`, for example `/weeb-3/testnet` to boot the interface in testnet mode or `/weeb-3/testnet/bzz/<reference>/<path>` for a testnet BZZ link.
-- Raw byte and chunk routes below `/bytes/`, `/chunks/`, and `/chunk/` are forwarded to the Rust runtime.
+- Raw byte and chunk routes below `/bytes/` and `/chunks/` are forwarded to the Rust runtime.
+- HLS playback uses `/feeds/<owner>/<topic-hash>` and `/hls/bytes/<reference>` internally for rewritten playlists and segment fetches. These are transport paths between the media loader, Service Worker, and Rust runtime, not additional share-link APIs.
 - `POST` requests to the scoped `/bzz` endpoint are forwarded as upload requests, including upload headers such as encryption, collection, and index-document hints.
-- Fetch requests are forwarded through `postMessage` and `MessageChannel` only after a fresh, network-aware probe confirms that the selected top-level client hosts a matching weeb-3 runtime. Concurrent probes for the same client are coalesced.
+- Ordinary fetch forwarding selects a top-level client through a fresh, network-aware runtime probe, with concurrent probes for the same client coalesced. Direct HLS feed and segment requests from an in-scope top-level client use that client immediately to avoid repeating the probe on the playback path.
+- HLS feed and segment requests are singleflighted by client, method, path, and range. A Service Worker response timeout detaches its `MessagePort` without replaying the request; while the page runtime remains alive, already dispatched Rust work can continue and settle its peer response and accounting once.
 - BZZ resources can be answered as full responses, byte-range responses, or streaming responses depending on MIME type, request headers, and resource size.
 - Requests outside the explicit weeb-3 route set remain under the host application's normal fetch and cache policy; the packaged worker does not precache or delete host assets.
 
@@ -248,15 +279,15 @@ The Service Worker is security-sensitive. Browsers only enable it for secure ori
 
 The weeb-3 project uses the following main Rust crates and browser bindings:
 
-- `libp2p` and `libp2p-stream` for peer identity, transport, multiplexing, stream protocols, identify, ping, autonat / dcutr support, and browser WebSocket transport.
+- `libp2p` and `libp2p-stream` for peer identity, transport, multiplexing, stream protocols, identify, ping, and browser WebSocket transport.
 - `async-std` and `async-lock` for async runtime primitives that work in the browser Wasm target.
 - `wasm-bindgen`, `wasm-bindgen-futures`, `js-sys`, and `web-sys` for JavaScript, DOM, Service Worker, browser API, and Promise integration.
-- `web3`, `alloy`, `alloy-signer-local`, and `ethers` for wallet, signing, ABI, and on-chain contract interaction.
+- `web3`, `alloy`, and `ethers` for wallet, signing, ABI, ENS, and on-chain contract interaction.
 - `indexed_db_futures` for browser IndexedDB persistence.
 - `tar` and `mime_guess` for collection upload handling and MIME inference.
 - `getrandom` with the `wasm_js` backend for browser-compatible randomness.
-- `base64`, `hex`, `byteorder`, and numeric / cryptographic helper crates for protocol encoding and Swarm data structures.
-- `tokio` and `tower-http` for the local development server used outside the Wasm target.
+- `base64`, `hex`, and cryptographic helper crates for protocol encoding and Swarm data structures.
+- `axum`, `axum-server`, `tokio`, and `tower-http` for the local development server used outside the Wasm target.
 
 ### Concurrency and memory limitations
 

@@ -18,31 +18,20 @@ use wasm_bindgen::{JsCast, JsError, JsValue, prelude::*};
 use wasm_bindgen_futures::{JsFuture, spawn_local};
 
 use web_sys::{
-    Blob,
-    BlobPropertyBag,
-    Element,
-    Event,
-    HtmlButtonElement,
-    HtmlElement,
-    HtmlInputElement,
-    HtmlSelectElement,
-    HtmlSpanElement,
-    MessageChannel,
-    MessageEvent,
-    MessagePort,
-    RegistrationOptions,
-    // Response,
-    ServiceWorkerRegistration,
+    Blob, BlobPropertyBag, Element, Event, HtmlButtonElement, HtmlElement, HtmlInputElement,
+    HtmlSelectElement, HtmlSpanElement, MessageChannel, MessageEvent, MessagePort,
+    RegistrationOptions, ServiceWorkerRegistration,
 };
 
 use crate::{
     Weeb3,
     bzz_stream::{BzzMetadata, bzz_reference_hex, normalize_bzz_path},
     decode_resources, encrey,
+    erasure_coding::{upload_redundancy_from_number, upload_redundancy_from_select},
     interface_conventions::{install_interface_conventions, set_bracket_button_label},
     join_all,
     nav::{
-        ResourceRoute, clear_path, parse_networked_resource_route, read_routes,
+        ResourceRoute, parse_networked_resource_route, read_routes,
         route_network_mode_from_location,
     },
     network_profile::{
@@ -62,8 +51,7 @@ use crate::{
         secure_open_vault_from_user_action, secure_preload_vault_module,
         secure_prepare_batch_purchase,
     },
-    stream_conventions::{streaming_service_worker_scope, streaming_service_worker_url},
-    upload_conventions::{upload_redundancy_from_number, upload_redundancy_from_select},
+    stream_conventions::{STREAMING_SERVICE_WORKER_SCOPE, STREAMING_SERVICE_WORKER_URL},
 };
 use alloy::signers::local::PrivateKeySigner;
 
@@ -85,7 +73,6 @@ const BOOTNODE_INPUT_IDS: [&str; 8] = [
     "bootNodeMASettings6",
 ];
 
-const DEBUG_INTERFACE_LOGS: bool = false;
 const INTERFACE_BUILD_VERSION: &str = env!("WEEB3_BUILD_VERSION");
 
 thread_local! {
@@ -95,12 +82,6 @@ thread_local! {
         const { RefCell::new(None) };
     static SERVICE_WORKER_BRIDGE_LISTENER: RefCell<Option<Closure<dyn FnMut(MessageEvent)>>> =
         const { RefCell::new(None) };
-}
-
-fn interface_debug(value: &JsValue) {
-    if DEBUG_INTERFACE_LOGS {
-        web_sys::console::log_1(value);
-    }
 }
 
 pub(crate) fn begin_interface_mount() -> u64 {
@@ -133,15 +114,7 @@ fn interface_mount_can_poll(expected: u64) -> bool {
 fn is_weeb3_service_worker_request_type(request_type: &str) -> bool {
     matches!(
         request_type,
-        "WEEB3_CLIENT_PING"
-            | "WEEB3_FETCH_REQUEST"
-            | "RESOLVE_BZZ_REQUEST"
-            | "RETRIEVE_RANGE_REQUEST"
-            | "PREPARE_BZZ_STREAM_REQUEST"
-            | "RETRIEVE_REQUEST"
-            | "RETRIEVE_BYTES_REQUEST"
-            | "RETRIEVE_CHUNK_REQUEST"
-            | "UPLOAD_REQUEST"
+        "WEEB3_CLIENT_PING" | "WEEB3_FETCH_REQUEST" | "UPLOAD_REQUEST"
     )
 }
 
@@ -185,11 +158,6 @@ fn handle_service_worker_bridge_event(event: MessageEvent) {
     let Ok(obj) = event.data().dyn_into::<Object>() else {
         return;
     };
-    interface_debug(&JsValue::from(format!(
-        "Attempting to load reference received from service worker {:#?}",
-        obj
-    )));
-
     let request_type = Reflect::get(&obj, &JsValue::from_str("type"))
         .ok()
         .and_then(|value| value.as_string());
@@ -200,9 +168,7 @@ fn handle_service_worker_bridge_event(event: MessageEvent) {
         return;
     }
 
-    // Claim every recognized request before starting asynchronous work. This
-    // prevents stale or host-installed listeners from dispatching the same
-    // accounting-sensitive retrieval or upload a second time.
+    // Prevent another listener from redispatching accounting-sensitive work.
     event.stop_immediate_propagation();
 
     let bridge_client =
@@ -260,90 +226,6 @@ fn handle_service_worker_bridge_event(event: MessageEvent) {
     }
 
     match request_type.as_str() {
-        "RETRIEVE_REQUEST" => {
-            let reference = Reflect::get(&obj, &JsValue::from_str("url"))
-                .unwrap_or(JsValue::NULL)
-                .as_string()
-                .unwrap_or_default();
-            let ports: Array = event.ports().into();
-            let port = ports.get(0).dyn_into::<web_sys::MessagePort>().ok();
-
-            spawn_local(async move {
-                interface_debug(&JsValue::from(format!(
-                    "Loading /bzz/ reference from service worker {:#?}",
-                    reference
-                )));
-                let result = weeb3.acquire(reference).await;
-                let (data, indx) = decode_resources(result);
-                let head_resource = data
-                    .iter()
-                    .find(|(_, _, path)| *path == indx)
-                    .or_else(|| data.first());
-
-                let resp = Object::new();
-                Reflect::set(&resp, &"ok".into(), &head_resource.is_some().into()).unwrap();
-                Reflect::set(&resp, &"type".into(), &"RETRIEVE_RESPONSE".into()).unwrap();
-                Reflect::set(&resp, &"indx".into(), &indx.clone().into()).unwrap();
-
-                if let Some((bytes, mime, path)) = head_resource {
-                    interface_debug(&JsValue::from(format!(
-                        "service message resource len {}",
-                        bytes.len()
-                    )));
-
-                    let u8arr = Uint8Array::new_with_length(bytes.len() as u32);
-                    u8arr.copy_from(bytes);
-                    Reflect::set(&resp, &"body".into(), &u8arr).unwrap();
-                    Reflect::set(&resp, &"mime".into(), &mime.clone().into()).unwrap();
-                    Reflect::set(&resp, &"path".into(), &path.clone().into()).unwrap();
-                }
-
-                if let Some(port) = port {
-                    let _ = port.post_message(&resp);
-                }
-            });
-        }
-        "RETRIEVE_BYTES_REQUEST" | "RETRIEVE_CHUNK_REQUEST" => {
-            let reference = Reflect::get(&obj, &JsValue::from_str("url"))
-                .unwrap_or(JsValue::NULL)
-                .as_string()
-                .unwrap_or_default();
-            let retrieve_chunk = request_type == "RETRIEVE_CHUNK_REQUEST";
-            let ports: Array = event.ports().into();
-            let port = ports.get(0).dyn_into::<web_sys::MessagePort>().ok();
-
-            spawn_local(async move {
-                let bytes = if retrieve_chunk {
-                    weeb3.retrieve_chunk_bytes(reference.clone()).await
-                } else {
-                    weeb3.retrieve_bytes(reference.clone()).await
-                };
-
-                let resp = Object::new();
-                Reflect::set(&resp, &"ok".into(), &(!bytes.is_empty()).into()).unwrap();
-                Reflect::set(
-                    &resp,
-                    &"type".into(),
-                    &if retrieve_chunk {
-                        "RETRIEVE_CHUNK_RESPONSE"
-                    } else {
-                        "RETRIEVE_BYTES_RESPONSE"
-                    }
-                    .into(),
-                )
-                .unwrap();
-                Reflect::set(&resp, &"path".into(), &reference.clone().into()).unwrap();
-                Reflect::set(&resp, &"mime".into(), &"application/octet-stream".into()).unwrap();
-
-                let u8arr = Uint8Array::new_with_length(bytes.len() as u32);
-                u8arr.copy_from(&bytes);
-                Reflect::set(&resp, &"body".into(), &u8arr).unwrap();
-
-                if let Some(port) = port {
-                    let _ = port.post_message(&resp);
-                }
-            });
-        }
         "UPLOAD_REQUEST" => {
             let file: web_sys::File = Reflect::get(&obj, &"file".into())
                 .unwrap()
@@ -424,13 +306,10 @@ pub(crate) fn install_service_worker_message_bridge(weeb3: Arc<Weeb3>) {
 
         let closure = Closure::<dyn FnMut(MessageEvent)>::new(handle_service_worker_bridge_event);
         let service_worker = web_sys::window().unwrap().navigator().service_worker();
-        if let Err(error) = service_worker
+        if service_worker
             .add_event_listener_with_callback("message", closure.as_ref().unchecked_ref())
+            .is_err()
         {
-            interface_debug(&JsValue::from(format!(
-                "Service listener error {:#?}",
-                error
-            )));
             return;
         }
 
@@ -440,9 +319,6 @@ pub(crate) fn install_service_worker_message_bridge(weeb3: Arc<Weeb3>) {
 
 #[wasm_bindgen]
 pub async fn interweeb(_st: String) -> Result<(), JsError> {
-    //    init_panic_hook();
-
-    clear_path().await;
     let initial_mode = route_network_mode_from_location().unwrap_or(NetworkMode::Mainnet);
     let initial_profile = profile_for_mode(initial_mode);
     set_network_profile_inputs(initial_mode);
@@ -553,29 +429,14 @@ pub(crate) async fn mount_interface_after_service_worker_bridge_install(
         }
     });
 
-    let window = web_sys::window().unwrap();
-
-    let host2 = window
-        .document()
-        .unwrap()
-        .location()
-        .unwrap()
-        .origin()
-        .unwrap();
-
     let interface_async = async move {
-        interface_debug(&JsValue::from(format!("host2 {:#?}", host2)));
-
         let chequebook_state_deploy = chequebook_state.clone();
         let chequebook_state_deposit = chequebook_state.clone();
         let mut retained_message_callbacks =
             Vec::<Closure<dyn FnMut(web_sys::MessageEvent)>>::new();
 
-        // let document = web_sys::window().unwrap().document().unwrap();
-
         let callback =
             wasm_bindgen::closure::Closure::<dyn FnMut(web_sys::MessageEvent)>::new(move |_msg| {
-                interface_debug(&"oninput callback triggered".into());
                 let weeb300 = weeb31.clone();
                 let document = web_sys::window().unwrap().document().unwrap();
 
@@ -588,8 +449,6 @@ pub(crate) async fn mount_interface_after_service_worker_bridge_install(
 
                 match input_field.value().parse::<String>() {
                     Ok(text) => spawn_local(async move {
-                        interface_debug(&"oninput callback string".into());
-
                         open_resource_input(weeb300, text).await;
                     }),
                     Err(_) => {
@@ -617,7 +476,6 @@ pub(crate) async fn mount_interface_after_service_worker_bridge_install(
 
         let callback_pause =
             wasm_bindgen::closure::Closure::<dyn FnMut(web_sys::MessageEvent)>::new(move |_msg| {
-                interface_debug(&"transferPauseToggle callback triggered".into());
                 let weeb300 = weeb40.clone();
 
                 spawn_local(async move {
@@ -638,8 +496,6 @@ pub(crate) async fn mount_interface_after_service_worker_bridge_install(
 
         let callback2 = wasm_bindgen::closure::Closure::<dyn FnMut(web_sys::MessageEvent)>::new(
             move |_msg| {
-                interface_debug(&"uploadGetBatch callback triggered".into());
-
                 let document = web_sys::window().unwrap().document().unwrap();
 
                 let validity_el = document
@@ -673,11 +529,6 @@ pub(crate) async fn mount_interface_after_service_worker_bridge_install(
                         return;
                     }
                 };
-
-                interface_debug(&JsValue::from(format!(
-                    "Selected batch depth: {}",
-                    batch_depth
-                )));
 
                 spawn_local(async move {
                     let payer = match connect_wallet_address().await {
@@ -743,12 +594,6 @@ pub(crate) async fn mount_interface_after_service_worker_bridge_install(
                     };
                     let owner = Address::from_slice(&prepared.owner);
 
-                    interface_debug(&JsValue::from(format!(
-                        "Secure batch owner 0x{} | payer 0x{}",
-                        hex::encode(&prepared.owner),
-                        hex::encode(payer.as_bytes())
-                    )));
-
                     let purchase = match buy_postage_batch_with_payer(
                         prepared.validity_days,
                         prepared.depth,
@@ -782,16 +627,6 @@ pub(crate) async fn mount_interface_after_service_worker_bridge_install(
                             .alert_with_message("Failed to save or verify batch in weeb-3-secure");
                         return;
                     }
-
-                    interface_debug(&JsValue::from(format!(
-                        "Approve tx 0x{}, Create tx 0x{}, Batch id 0x{}, depth {}, validity {}d, lastPrice {}",
-                        hex::encode(purchase.approve_tx.as_bytes()),
-                        hex::encode(purchase.create_tx.as_bytes()),
-                        hex::encode(&purchase.batch_id),
-                        prepared.depth,
-                        prepared.validity_days,
-                        purchase.last_price,
-                    )));
 
                     let wnd = web_sys::window().unwrap();
                     let _ = wnd.alert_with_message(&format!(
@@ -838,8 +673,6 @@ pub(crate) async fn mount_interface_after_service_worker_bridge_install(
 
         let callback3 =
             wasm_bindgen::closure::Closure::<dyn FnMut(web_sys::MessageEvent)>::new(move |_msg| {
-                interface_debug(&"oninput file callback".into());
-
                 let weeb300 = weeb32.clone();
 
                 let document = web_sys::window().unwrap().document().unwrap();
@@ -897,11 +730,6 @@ pub(crate) async fn mount_interface_after_service_worker_bridge_install(
                         }
                     }
 
-                    interface_debug(&JsValue::from(format!(
-                        "selected file length {:#?}",
-                        file.size()
-                    )));
-
                     let index_input = document
                         .get_element_by_id("indexString")
                         .expect("#indexString should exist");
@@ -922,8 +750,6 @@ pub(crate) async fn mount_interface_after_service_worker_bridge_install(
                     let redundancy_level =
                         upload_redundancy_from_select(redundancy_value.as_deref()).as_u8();
 
-                    interface_debug(&JsValue::from(format!("IF Upload Marker 0")));
-
                     let result = weeb300
                         .post_upload_with_redundancy(
                             file,
@@ -935,13 +761,9 @@ pub(crate) async fn mount_interface_after_service_worker_bridge_install(
                         )
                         .await;
 
-                    interface_debug(&JsValue::from(format!("IF Upload Marker 1")));
-
                     let (data, indx) = decode_resources(result);
 
                     render_result(data, indx).await;
-
-                    interface_debug(&"oninput file callback happened".into());
                 })
             });
 
@@ -960,15 +782,11 @@ pub(crate) async fn mount_interface_after_service_worker_bridge_install(
             wasm_bindgen::closure::Closure::<dyn FnMut(web_sys::MessageEvent)>::new(move |_msg| {
                 let weeb300 = weeb33.clone();
 
-                interface_debug(&"oninput bootnode callback".into());
-
                 let apply_generation = next_network_apply_generation();
                 let network_id = current_network_id_input();
                 spawn_local(async move {
                     apply_network_settings_and_connect(weeb300, apply_generation, network_id).await;
                 });
-
-                interface_debug(&"oninput network settings callback happened".into());
             });
 
         web_sys::window()
@@ -986,8 +804,6 @@ pub(crate) async fn mount_interface_after_service_worker_bridge_install(
         let callback5 =
             wasm_bindgen::closure::Closure::<dyn FnMut(web_sys::MessageEvent)>::new(move |_msg| {
                 let weeb300 = weeb34.clone();
-
-                interface_debug(&"oninput reset stamp callback".into());
 
                 let window = web_sys::window().unwrap();
 
@@ -1282,10 +1098,6 @@ pub(crate) async fn mount_interface_after_service_worker_bridge_install(
                             return;
                         }
                         let weeb300 = weeb36.clone();
-                        interface_debug(&JsValue::from(format!(
-                            "Loading weeb-3 route from path {:#?}",
-                            route
-                        )));
                         open_resource(weeb300, route).await;
                     };
                     handles.push(handle);
@@ -1298,7 +1110,6 @@ pub(crate) async fn mount_interface_after_service_worker_bridge_install(
         let mut last_ongoing = None::<u64>;
         let mut last_connections = None::<u64>;
         loop {
-            // Keep optional button callbacks alive for exactly this mount.
             let _retained_callback_count = retained_message_callbacks.len();
             if !interface_mount_can_poll(mount_generation) {
                 break;
@@ -1360,143 +1171,7 @@ pub(crate) async fn mount_interface_after_service_worker_bridge_install(
         }
     };
 
-    let _fetch_test = async move {
-        async_std::task::sleep(Duration::from_millis(6400)).await;
-
-        let host3 = web_sys::window()
-            .unwrap()
-            .document()
-            .unwrap()
-            .location()
-            .unwrap()
-            .origin()
-            .unwrap();
-
-        let url = format!("{}/weeb-3/bzz", host3);
-
-        let ascii_art = r#"@@@@%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%@@@
-%@%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%@
-%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%@@@%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%@@@@@@@@@@@@@@%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%@@@@@@@@@@@@@@@@@@@@@%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%@@@@@@@@@@@@@@@@@@@@@@@@@%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%@@@@@@@@@@@@@@@@@@@@@@@@@@@@%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%@@@@@@@@@@@@@@@@@@@@@@@@@@@@@%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%@@@@@%%@%%@@@@@@@@@@@@@@@@@@@%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%@@@@%%##+#+#*#%@%@@@@@@@@@@@@@@@%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%@%%#==+==+=+*+*#%%%@@@@@@@@@@@%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%@@%%#==---------==++**#@@@@@@@@@%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%@@@@@@%+==---------===++*#@@@@@@@@@%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%@@@@*=-=----------==+*#%@@@@@@@@@%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%@@@@+==----:::::::-=++*#%@@@@@@@@@%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%#@@%=-=====+++=---==+*#%@@@@@@@@@%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%+*@%#---==++*****++++*%@@@@@@@@@@@%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%#++#*---+##%@@%%*=-=*@@@@@@@@@@@@@%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%++=+------=+#%#+::-%@@@#%@@@@@@@%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%*====----::----:::=%@@@%%%@@@@@@%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%=====--------::::=%@@@%%%%@@@@%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%**===--------:::=+@@@%%%%@@@@%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%#====------:+#=*#@@@@@@@@@%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%=====---::::-++#@@@@@@@@@%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%*=====----:-=++#%@@@@@@@%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%#+======**#*#%@@@@@@@@%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%@@@#+========**#@@@@@@%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%@@+%%*=+==-==+#%@@@@@@%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%@@%**##@@%+---=+*%@@@%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%@%@%#+%@%@@@@@%#*%@@@@%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%###*%%@%@@#@@@@@@@@@@@#@@@%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-%%%%%%%%%%%%%%%%%%%%%%%%%%##*###%####+*%@@*@*@@@@@@@@%@@@@%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-%%%%%%%%%%%%%%%%%%%%%%%%%%%@%%%%%%#%####%%%@@@@@@@@@@@@@@@%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-%%%%%%%%%%%%%%%%%%%%%%@%%%%@@@@@%%@%%%%%%%%%%%@@@@@@@@@%@%%#%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-%%%%%%%%%%%%%%%%%#*######%@@@@@@@@%%%@@%%@@@@@@@@@@@@@@@%#%%#%%##%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-%%%%%%%%%%%%%%%%##**###%%%%@@@@@@@@@%@%%%@@%@@@@@@@@@%@@%%###%%##%##%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-%%%%%%%%%%%%%%%@##**##%%@@@@@@@@@@@@@%%%@@@@@@@@@@@@@%@%@@%#########%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-%%%%%%%%%%%%%%%%#%%%#%%%@@@@@@@@@@@%%%%%%%@@%@@@@@@@@@%%%@@@%%###%%##%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-%%%%%%%%%%%%#*%%*+*%%%@@@@@@@@@@@@@@%%#%%%%%%%%@@@@@@@@%%%%@@%%#####%#%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-%%%%%%%%%%%%%%#%%+++%@@@@@@@@@@@@@@@@%##@%%%@@@%%%%@%%%@%%%@@@@%#####%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-%%%%%%%%%%%@###@%#*#%#@@@@@@@@@@@@@@@%+*%%#%%@%%%%@@%@%@@@%%@@@@@@%%###%%#%%%%%%%%%%%%%%%%%%%%%%%%%%
-%%%%%%%%%%%###++%@@#%%@@@@@@@@@@@@@@@@**%%##%%%@@%%%@@@@@@@%%@@@@@@@%%#%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-%%%%%%%%%%%##*+++#@@%@@@@@@@@@@@@@@@@@*##%%###%#%#%%%@@@@@@@@@@@@@@@@###%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-%%%%%%%%%%%%**++++#%@@@@@@@@@@@@@@@@@%**#%%#####%%#%%%@@@@@@@@%@@@@@@@%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-%%%%%%%%%%%##++=+*#%%%@@@@@@@@@@@@@@%%***#%####%####%%%@@@@@@@@@@@@@@@@@%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-%%%%%%%%%%%%#*+++*#%%%@@@@@@@@@@@@@@%#*+***#**%#####*#%%@@@@@@@@@@@@@@@@@%%%%%%%%%%%%%%%%%%%%%%%%%%%
-%%%%%%%%%%%%*+++++*%@@%@@@@@@@@@@@@%##*+****+********##%@@@@@@@@@@@@@@@@@@@%%%%%%%%%%%%%%%%%%%%%%%%%
-%%%%%%%%%%%#*++++*#%@@@@@@@@@@@@@@@%#****##*+********##%%@@@@@@@@@@@@@@@@@@@%%%%%%%%%%%%%%%%%%%%%%%%
-%%%%%%%%%%%#*+++***#@@@@@@@@@@@@@@@%#*%*************##%%%@@@@@@@@@@@@@@@@@@@@%%%%%%%%%%%%%%%%%%%%%%%
-%%%%%%%%%%%#*+++++*%@@@@@@@@@@@@@@@%######*++*******###%%@@@@@@@@@@@@@@@@@@@@@%%%%%%%%%%%%%%%%%%%%%%
-%%%%%%%%%%%#*++=+**#@@@@@@@@@@@@@@@####%##*#########%%%%@@@@@@@@@@@@@@@@@@@@@@%%%%%%%%%%%%%%%%%%%%%%
-%%%%%%%%%%%#*++++**#%@@@@@@@@@@@@@%##*##******######%%%@@@@@@@@@@@@@@@@@@@@@@@%%%%%%%%%%%%%%%%%%%%%%
-%%%%%%%%%%%%*++++*##%%@@@@@@@@@@@@%#*#######%%%%%%%%@@@@@@@@@@@@@@@@@@@@@@@@@%%%%%%%%%%%%%%%%%%%%%%%
-%%%%%%%%%%%#*++=+*%%%%@@@@@@@@@@@@%##%%#%**####%%%%%@@@@@@@@@@@@@@@@@@@@@@@@%%%%%%%%%%%%%%%%%%%%%%%%
-%%%%%%%%%%%#*+++*#%@@@@@@@@@@@@@@@%###***##%%%%@%@@@@@@@@@@@@@@@@@@@@@@@@@@%%%%%%%%%%%%%%%%%%%%%%%%%
-%%%%%%%%%%%%*+++*#%%@@@%@@@@@@@@@@###########%%%@@@@@@@@@@@@@@@@@@@@@@@@@@%%%%%%%%%%%%%%%%%%%%%%%%%%
-%%%%%%%%%%%%#++==*#@@@@@@@@@@@@@@@#*######%%%%@@@@@@@@@@@@@@@@@@@@@@@@@@%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-%%%%%%%%%%%##*+=+#%@@@@@@@@@@@@@@@%########%%%%@@@@@@@@@@@@@@@@@@@@@@@@@@%%%%%%%%%%%%%%%%%%%%%%%%%%%
-%%%%%%%%%%%%#*++#%%#%%@@@@@@@@@@@@@%#%#%###%@%%@@@@@@@@@@@@@@@@@@@@@@@@@@@%%%%%%%%%%%%%%%%%%%%%%%%%%
-%%%%%%%%%%%%#**+**#%@@@@@@@@@@@@@@@@%%%%%%%%%%%%@@@@@@@@@@@@@@@@@@@@@@@@@@@%%%%%%%%%%%%%%%%%%%%%%%%%
-%%%%%%%%%%%#***+*@@@@@@@@@@@@@@@@@@@%%%%#%%%%%@@@@@@@@@@@@@@@@@@%@@@@@@@@@@%%%%%%%%%%%%%%%%%%%%%%%%%
-%%%%%%%%%%%****#%*#@@@@@@@@@@@@@@@@@@%%%%%%%%@@@@@@@@@@@@@@@@@@@%@@@@@@@@@@@%%%%%%%%%%%%%%%%%%%%%%%%
-%%%%%%%%%%%**#**#***%@@@@@@%@@@@@@@@@%%%%%%%%#%%@@@@@@@@@@@@@@@@%@@@@@@@@@@@@%%%%%%%%%%%%%%%%%%%%%%%
-%%%%%%%%%%%##*#*###%%@@@@@@%%@@@@@@@@%%#%%%%%%%%%@@@@@@@@@@@@@@@@@@%%@@@@@@@@%%%%%%%%%%%%%%%%%%%%%%%
-%%%%%%%%%%%*#*#*%%@@@@@@@@@%%%@@@@@@@@@@%%##%%%%%@@@@@@@@@@@@@@%%@@@@@@@@@@@@@@%%%%%%%%%%%%%%%%%%%%%
-%%%%%%%%%%%#***##%%%@@@@@@@%%%%@@@@@@@@@%%%%#%%%@@@@@@@@@@@@@@@%%@@@@@@@@@@@@@@@%%%%%%%%%%%%%%%%%%%%
-%%%%%%%%%%%#*****#%#@@@@@@%%%%%@@@@@@@@@%@@@@@@@@@@@@@@@@@@@@@@@%@@@@@@@@@@@@@@@@%%%%%%%%%%%%%%%%%%%
-%%%%%%%%%%%####**%%@@@@@@@%%%%%@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@%%%%%%%%%%%%%%%%%%
-%%%%%%%%%%#%#*#**#%%%@@@@@%%%%%%@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@%%%%%%%%%%%%
-%%%%%%%%%%%#%#####%%%@@@@@%%%%%%@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@%%@@@@@@@@@@%@@@@@%##%#%@@@%%%%%%%%%
-%%%%%%%%%%%%#*###*#%%@@@@@@%%%%%@@@@@@@@+-+%@@@%%@@@@@@@@@@@@@@@@@@@@@@@@@@%@@%%%#%#%%%@@@@%%%%%%%%%
-%%%%%%%%%%%######*#%%@@@@@@%%%%%@@@@@@@%*#%%%%%%@@@@@@@@@@@@@@@@@@@@@@@@@#@+#%######%@@@@@@@%%%%%%%%
-%%%%%%%%%%%%*#*##**#%@@@@@@@%%%%%@@@@@@@%%%%%%#**#%%%@@@@@@@@@@@@@@@@@@@@#%#+%#+#%##%@@@@@@@%%%%%%%%
-%%%%%%%%%%%%%%#**+*#%%@@@@@@%%%%@@@@@@@@@%%%%%%%%%%%%@@@@@@@@@@@@@@@@@@@%@@%%@@@%%%=*@@##@#@@%%%%%%%
-%%%%%%%%%%%%%%#*#**#*%@@@@@@@%%@@@@@@@@@@%%%%###%%%%%@%@@@@@@@@@@@@@@@@@@@@@@@%@@%*#%@@@@@##@@%%%%%%
-%%%%%%%%%%%%%%###***##%%@@@@@%@@@@@@@@@@@%%%%%%%%%%%@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@*=#@%%%@+%@@%%%%%
-%%%%%%%%%%%%%%%#***+*#%@@@@@@@@@@@@@@@@%@@%%#%%%%%%%%@@@@@@@@@@@@@@@@@@@@#%@@@%*@@@@%+=@@%@@@@@%%%%%
-%%%%%%%%%%%%%%%#****##@@@@@@@@@@@@@@@@%#****#%%%#%%%%@@@@@@@@@@@@@@@@@@@%%@@@@@@%@@@@@++#@%%@@@@%%%%
-%%%%%%%%%%%%%%%####***#%%%@@@@@@@@@@@@%#*******##%%%%@@@@@@@@@@@@@@@@@@@@%%@@@@@@@@@@@@#*@@@*%@@%%%%
-%%%%%%%%%%%%%%%%%##***###%%@@@@@@@@@@@%###**###*###%@@@@@@@@@@@@@@@@@@@@%@%@@@@@%%%%%%%@%#@@@@@@%%%%
-%%%%%%%%%%%%%%%%%####**#%%@@@@@@@@@@@@%#%#########%@%@@@@@@@@@@@@@@@@@@@###%@%@@%%%%%%%%%%@@@%@@@%%%
-%%%%%%%%%%%%%%%%%####***%%%@@@@@@@@@@@@%%%##%###%%%%%@@@@@@@@@@@@@@@@@@@%#@@%@@@%%%%%%%%%@@@@@@@@@%%
-%%%%%%%%%%%%%%%%%%###**####@@@@@@@@@@@@@%%%%%%%%%%%@@@@@@@@@@@@@@@@@@@@@**%%@@@@%%%%%%%%%%%#@@@@@@@%
-@@@@@@@@%%%%%%%%%%%%%%##**#@@@@@@@@@@@@@@@%%%%%%%@@@@@@@@@@@@@@@@@@@@@@%#%@@%@@@%%%%%%%%%%@@@@@@@%%@
-@@@@@@@@@@@@@%%%%%%#####**%@@@@@@@@@@@@@@@@%%%%%@@@@@@@@@@@@@@@@@@@@@@@@#%%@@@@%%%%%%%%%%%@@@@@@#+@@
-@@@@@@@@@@@@@@@@@@@%#####%%@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@%%@@@@@@@%%%%%%%%%#%@@@@@%@@
-@@@@@@@@@@@@@@@@@@@%%%%####@%@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@%%@@@@@@@%%%%%%%%%*#%@@@@@@@"#;
-
-        let u8arr = js_sys::Uint8Array::from(ascii_art.as_bytes());
-
-        let blob_parts = js_sys::Array::new();
-        blob_parts.push(&u8arr);
-        let props = web_sys::BlobPropertyBag::new();
-        props.set_type("text/plain");
-        let blob =
-            web_sys::Blob::new_with_u8_array_sequence_and_options(&blob_parts, &props).unwrap();
-
-        let form = web_sys::FormData::new().unwrap();
-        form.append_with_blob_and_filename("file", &blob, "sel.txt")
-            .unwrap();
-
-        let opts = web_sys::RequestInit::new();
-        opts.set_method("POST");
-
-        let headers = web_sys::Headers::new().unwrap();
-        headers.set("swarm-encrypt", "true").unwrap();
-        opts.set_headers(&headers);
-        opts.set_body(&wasm_bindgen::JsValue::from(form)); // <-- important: JsValue
-
-        let request = web_sys::Request::new_with_str_and_init(&url, &opts).unwrap();
-        let window = web_sys::window().unwrap();
-        let resp_value = JsFuture::from(window.fetch_with_request(&request)).await;
-        web_sys::console::log_1(&JsValue::from(format!("Upload response: {:?}", resp_value)));
-
-        let window = web_sys::window().unwrap();
-        let resp_value = JsFuture::from(window.fetch_with_request(&request)).await;
-
-        web_sys::console::log_1(&JsValue::from(format!("Upload response: {:?}", resp_value)));
-    };
-
     interface_async.await;
 
-    #[allow(unreachable_code)]
     Ok(())
 }

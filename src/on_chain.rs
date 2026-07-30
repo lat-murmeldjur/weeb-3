@@ -13,7 +13,6 @@ use ethers::signers::LocalWallet;
 use ethers::types::{Address as EthAddress, H256 as EthH256, Signature, U256 as EthU256};
 use ethers::utils::keccak256;
 use hex;
-// use prost::Message;
 
 use crate::{is_mainnet, is_testnet_official, network_profile::active_profile};
 
@@ -23,12 +22,6 @@ pub struct Cheque {
     pub beneficiary: EthAddress,
     pub cumulative_payout: EthU256,
 }
-
-// #[derive(Clone, Debug)]
-// pub struct SignedCheque {
-//     pub cheque: Cheque,
-//     pub signature: Vec<u8>,
-// }
 
 struct SignedChequeJson {
     chequebook: String,
@@ -62,12 +55,6 @@ impl SignedChequeJson {
         .into_bytes()
     }
 }
-
-// #[derive(Clone, PartialEq, Message)]
-// pub struct EmitCheque {
-//     #[prost(bytes = "vec", tag = "1")]
-//     pub cheque: Vec<u8>,
-// }
 
 pub struct ChequeSigner {
     wallet: LocalWallet,
@@ -240,21 +227,6 @@ pub fn web3() -> Result<Web3Inst, JsError> {
     Ok(web3::Web3::new(Eip1193::new(prov)))
 }
 
-#[allow(dead_code)]
-pub async fn connected_accounts(w3: &Web3Inst) -> Result<Vec<Address>, JsError> {
-    let accs = w3
-        .eth()
-        .accounts()
-        .await
-        .map_err(|e| JsError::new(&format!("eth_accounts failed: {e:?}")))?;
-    if accs.is_empty() {
-        return Err(JsError::new(
-            "No wallet account available. Connect the wallet first.",
-        ));
-    }
-    Ok(accs)
-}
-
 pub async fn postage_contract(w3: &Web3Inst) -> Result<PostageContract, JsError> {
     let addr_str = select_postage_contract_addr()?;
     let addr = ensure_addr(addr_str)?;
@@ -328,78 +300,6 @@ pub async fn get_batch_validity(batch_id: Vec<u8>) -> U256 {
         Ok(val) => val,
         Err(_) => U256::from(0),
     }
-}
-
-#[allow(dead_code)]
-pub async fn expire_limited_if_needed(
-    postage: &PostageContract,
-    from: Address,
-) -> Result<(), JsError> {
-    loop {
-        if !expired_batches_exist(postage).await? {
-            break;
-        }
-
-        let _tx_hash = postage
-            .call(
-                "expireLimited",
-                (U256::from(5u64),),
-                from,
-                Options::default(),
-            )
-            .await
-            .map_err(|e| JsError::new(&format!("expireLimited() failed: {e}")))?;
-    }
-    Ok(())
-}
-
-#[allow(dead_code)]
-pub async fn approve_token_spend(
-    token: &TokenContract,
-    spender: Address,
-    from: Address,
-    amount: U256,
-) -> Result<TransactionReceipt, JsError> {
-    token
-        .call_with_confirmations(
-            "approve",
-            (spender, amount),
-            from,
-            Options::default(),
-            1usize,
-        )
-        .await
-        .map_err(|e| JsError::new(&format!("approve() failed: {e}")))
-}
-
-#[allow(dead_code)]
-pub async fn create_postage_batch(
-    postage: &PostageContract,
-    from: Address,
-    owner: Address,
-    initial_balance: U256,
-    depth: u8,
-    bucket_depth: u8,
-    nonce: [u8; 32],
-    immutable_flag: bool,
-) -> Result<TransactionReceipt, JsError> {
-    postage
-        .call_with_confirmations(
-            "createBatch",
-            (
-                owner,
-                initial_balance,
-                depth,
-                bucket_depth,
-                nonce,
-                immutable_flag,
-            ),
-            from,
-            Options::default(),
-            1usize,
-        )
-        .await
-        .map_err(|e| JsError::new(&format!("createBatch() failed: {e}")))
 }
 
 pub fn parse_batch_id_from_receipt(receipt: &TransactionReceipt) -> Option<Vec<u8>> {
@@ -567,8 +467,6 @@ pub async fn buy_postage_batch_with_payer(
         create_tx: create_receipt.transaction_hash,
         batch_id,
         last_price: lp,
-        initial_balance_per_chunk: initial_per_chunk,
-        approve_amount: approve_amt,
         bucket_limit: buckets_for_depth(depth),
     })
 }
@@ -579,10 +477,6 @@ pub struct BatchPurchaseResult {
     pub create_tx: H256,
     pub batch_id: Vec<u8>,
     pub last_price: U256,
-    #[allow(dead_code)]
-    pub initial_balance_per_chunk: U256,
-    #[allow(dead_code)]
-    pub approve_amount: U256,
     pub bucket_limit: u32,
 }
 

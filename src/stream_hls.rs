@@ -1,12 +1,11 @@
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Serialize};
 use std::{
     borrow::Cow,
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
-    net::{Ipv4Addr, Ipv6Addr},
     sync::Arc,
 };
 
-use crate::stream_conventions::normalize_route_base;
+use crate::retrieval_conventions::next_nonzero_generation;
 
 const HLS_HEADER: &str = "#EXTM3U";
 const HLS_ENDLIST: &str = "#EXT-X-ENDLIST";
@@ -179,11 +178,6 @@ impl HlsEarlyPrefixPolicy {
             self.closed = true;
         }
     }
-
-    #[cfg(test)]
-    pub(crate) fn active_count(&self) -> usize {
-        self.active.len()
-    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -200,12 +194,6 @@ pub(crate) struct HlsMediaSelection {
     pub(crate) superseded_plan_ids: Vec<u64>,
 }
 
-/// Bounded registry of ordered media-fragment plans.
-///
-/// Live HLS playlist reloads commonly overlap the previous window. Selection
-/// migrates an active cursor to the newest plan only when the two sequences
-/// have an adjacent overlap (or the old tail is the new head), which avoids
-/// confusing unrelated renditions that happen to share one immutable asset.
 pub(crate) struct HlsMediaPlanRegistry {
     max_references: usize,
     next_plan_id: u64,
@@ -223,11 +211,6 @@ impl HlsMediaPlanRegistry {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn install(&mut self, references: Vec<String>) {
-        self.install_with_early_overlap_limit(references, usize::MAX);
-    }
-
     pub(crate) fn install_with_early_overlap_limit(
         &mut self,
         mut references: Vec<String>,
@@ -238,8 +221,6 @@ impl HlsMediaPlanRegistry {
             return;
         }
 
-        // A live manifest may be polled several times before its feed advances.
-        // Reusing the identical plan avoids artificial plan/track churn.
         if self.cursors.get(&references[0]).is_some_and(|candidates| {
             candidates.iter().any(|cursor| {
                 cursor.position == 0
@@ -255,7 +236,7 @@ impl HlsMediaPlanRegistry {
             self.cursor_count = 0;
         }
 
-        self.next_plan_id = next_nonzero_plan_id(self.next_plan_id);
+        self.next_plan_id = next_nonzero_generation(self.next_plan_id);
         let plan_id = self.next_plan_id;
         let references: Arc<[String]> = references.into();
         for (position, reference) in references.iter().enumerate() {
@@ -329,11 +310,6 @@ impl HlsMediaPlanRegistry {
     }
 }
 
-fn next_nonzero_plan_id(current: u64) -> u64 {
-    let next = current.wrapping_add(1);
-    if next == 0 { 1 } else { next }
-}
-
 fn hls_media_cursors_compatible(left: &HlsMediaCursor, right: &HlsMediaCursor) -> bool {
     if left.references.get(left.position) != right.references.get(right.position) {
         return false;
@@ -363,12 +339,7 @@ pub(crate) struct HlsTrackRetention {
     pub(crate) running: bool,
 }
 
-/// Choose obsolete/inactive HLS prefetch tracks to remove.
-///
-/// Superseded live-plan tracks are retired even while their observer is still
-/// running: the underlying retrieval leader is detached and continues to
-/// settle, while removing the ticket only stops future admission and retries.
-/// The selected plan and unrelated running rendition tracks remain protected.
+/// Pruning stops future admission while detached retrieval and accounting settle.
 pub(crate) fn hls_track_ids_to_prune(
     tracks: &[HlsTrackRetention],
     selected_plan_id: u64,
@@ -409,10 +380,6 @@ pub(crate) fn hls_track_ids_to_prune(
     prune
 }
 
-/// Read a forward-playback cache entry while demoting already consumed media
-/// to the eviction end. Duplicate/retry/back-seek reads remain local until the
-/// next insertion needs space, at which point past media is evicted before
-/// completed future lookahead.
 pub(crate) fn read_forward_cache_entry<T: Clone>(
     order: &mut VecDeque<String>,
     entries: &HashMap<String, T>,
@@ -424,11 +391,6 @@ pub(crate) fn read_forward_cache_entry<T: Clone>(
     Some(value)
 }
 
-/// Classify an ordered HLS request without letting a cached validator,
-/// duplicate, or back-read rewind the forward playback cursor.
-///
-/// A non-adjacent forward request is still a seek even when it was prefetched.
-/// An uncached backward request is also a real seek and pivots lookahead.
 pub(crate) fn hls_foreground_cursor_transition(
     last_position: usize,
     requested_position: usize,
@@ -498,116 +460,7 @@ impl HlsOrderedProbeWindow {
     }
 }
 
-/// A stream feed should only contain a catalog or an HLS playlist. Capping it
-/// before parsing and before copying the joined CAC payload prevents a bogus
-/// feed from causing an unbounded allocation while still leaving ample room
-/// for very long VOD playlists.
 pub(crate) const MAX_STREAM_FEED_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
-
-#[derive(Clone, Debug, Deserialize, PartialEq)]
-pub(crate) struct StreamCatalogEntry {
-    pub owner: String,
-    pub topic: String,
-    #[serde(default)]
-    pub title: String,
-    #[serde(default)]
-    pub description: String,
-    #[serde(default)]
-    pub state: String,
-    #[serde(default, alias = "isExternal")]
-    pub is_external: bool,
-    #[serde(default, alias = "mediaType", alias = "mediatype")]
-    pub media_type: String,
-    #[serde(default, deserialize_with = "deserialize_optional_f64")]
-    pub duration: Option<f64>,
-    #[serde(default)]
-    pub index: Option<u64>,
-    #[serde(default)]
-    pub timestamp: Option<u64>,
-    #[serde(default, alias = "createdAt")]
-    pub created_at: Option<u64>,
-    #[serde(default, alias = "updatedAt")]
-    pub updated_at: Option<u64>,
-}
-
-impl StreamCatalogEntry {
-    pub(crate) fn is_live(&self) -> bool {
-        self.state.eq_ignore_ascii_case("live")
-    }
-
-    pub(crate) fn is_vod(&self) -> bool {
-        self.state.eq_ignore_ascii_case("vod")
-    }
-
-    pub(crate) fn media_type(&self) -> &'static str {
-        if self.media_type.eq_ignore_ascii_case("audio") {
-            "audio"
-        } else {
-            "video"
-        }
-    }
-
-    fn sort_timestamp(&self) -> u64 {
-        self.timestamp
-            .or(self.updated_at)
-            .or(self.created_at)
-            .unwrap_or_default()
-    }
-}
-
-pub(crate) fn parse_stream_catalog(bytes: &[u8]) -> Option<Vec<StreamCatalogEntry>> {
-    if !stream_feed_payload_len_is_supported(bytes.len()) {
-        return None;
-    }
-
-    let value: serde_json::Value = serde_json::from_slice(bytes).ok()?;
-    let entries = match value {
-        serde_json::Value::Array(entries) => entries,
-        serde_json::Value::Object(mut object) => match object.remove("entries")? {
-            serde_json::Value::Array(entries) => entries,
-            _ => return None,
-        },
-        _ => return None,
-    };
-
-    let mut entries: Vec<StreamCatalogEntry> = entries
-        .into_iter()
-        .filter_map(|entry| {
-            let mut entry: StreamCatalogEntry = serde_json::from_value(entry).ok()?;
-            if entry.is_external {
-                return None;
-            }
-            let owner = entry
-                .owner
-                .strip_prefix("0x")
-                .or_else(|| entry.owner.strip_prefix("0X"))
-                .unwrap_or(&entry.owner);
-            if !is_hex_len(owner, 40) || entry.topic.trim().is_empty() || entry.topic.len() > 256 {
-                return None;
-            }
-            // Bee's owner path takes the unprefixed 20-byte address.
-            if owner.len() != entry.owner.len() {
-                entry.owner = owner.to_owned();
-            }
-            Some(entry)
-        })
-        .collect();
-
-    entries.sort_by(|left, right| {
-        right
-            .is_live()
-            .cmp(&left.is_live())
-            .then_with(|| right.sort_timestamp().cmp(&left.sort_timestamp()))
-            .then_with(|| {
-                right
-                    .index
-                    .unwrap_or_default()
-                    .cmp(&left.index.unwrap_or_default())
-            })
-    });
-
-    Some(entries)
-}
 
 pub(crate) fn is_hls_manifest(bytes: &[u8]) -> bool {
     std::str::from_utf8(bytes)
@@ -623,12 +476,7 @@ pub(crate) fn is_hls_manifest(bytes: &[u8]) -> bool {
         .unwrap_or(false)
 }
 
-/// Classify a prefix without mistaking a truncated first line for a binary
-/// asset. Range and HEAD requests can therefore sniff ordinary media cheaply
-/// while retaining exact semantics for unusually padded or split HLS headers.
 pub(crate) fn probe_hls_manifest(prefix: &[u8], total_len: u64) -> HlsManifestProbe {
-    // Unsupported oversized manifests must not turn an ambiguous prefix into
-    // an unbounded full-tree join during an HLS HEAD or Range request.
     if total_len > MAX_STREAM_FEED_PAYLOAD_BYTES as u64 {
         return HlsManifestProbe::NotManifest;
     }
@@ -674,23 +522,12 @@ pub(crate) fn hls_is_finalized(bytes: &[u8]) -> bool {
         .unwrap_or(false)
 }
 
-/// Prefer an authenticated sequence-zero prefix over a late archived window.
-///
-/// Some stream producers publish rolling VOD snapshots before the final
-/// sequence-zero archive. Playing that late window first gives it timestamp
-/// zero, so discovering the archive later requires rebuilding MediaSource and
-/// visibly skips the beginning. The caller supplies the route intent: direct
-/// unindexed `/stream` links start from the beginning, while feed/catalog live
-/// views keep their selected rolling semantics. A short prefix is not useful
-/// enough to replace the selected frontier candidate.
 pub(crate) fn hls_startup_prefix_is_preferred(
     canonical: &[u8],
     prefix: &[u8],
     minimum_prefix_segments: usize,
-    sequence_zero_start_requested: bool,
 ) -> bool {
-    if !sequence_zero_start_requested
-        || !is_hls_manifest(canonical)
+    if !is_hls_manifest(canonical)
         || !is_hls_manifest(prefix)
         || !hls_media_sequence(canonical).is_some_and(|sequence| sequence > 0)
         || hls_media_sequence(prefix) != Some(0)
@@ -701,14 +538,6 @@ pub(crate) fn hls_startup_prefix_is_preferred(
     hls_media_references(prefix).len() >= minimum_prefix_segments
 }
 
-/// Decide whether a newer media-playlist snapshot can replace the one already
-/// exposed to an active player without moving its timeline.
-///
-/// Feed frontier probes may jump across more updates than the producer's live
-/// window retains. Such a non-overlapping snapshot is authenticated, but
-/// publishing it would make hls.js seek to a different window. A rolling
-/// successor overlaps by media sequence, while the terminal full archive
-/// contains the current rolling window at the same sequence numbers.
 pub(crate) fn hls_manifest_reload_is_continuous(current: &[u8], candidate: &[u8]) -> bool {
     let Some(current_sequence) = hls_media_sequence(current) else {
         return false;
@@ -758,15 +587,6 @@ pub(crate) fn hls_manifest_reload_is_continuous(current: &[u8], candidate: &[u8]
     })
 }
 
-/// Extend a start-at-zero archive with a simple overlapping rolling window.
-///
-/// The direct archived-stream route is exposed as an EVENT playlist until its
-/// authenticated final update is confirmed. EVENT history is append-only, so
-/// replacing it with a sliding window would make hls.js discard the playhead
-/// and seek to that window's first fragment. For classic segment playlists we
-/// can instead retain the sequence-zero prefix and append only the candidate's
-/// new, identity-checked suffix. Manifests with stateful segment tags are held
-/// for the final sequence-zero archive rather than synthesized unsafely.
 pub(crate) fn extend_hls_sequence_zero_archive(
     current: &[u8],
     candidate: &[u8],
@@ -828,11 +648,6 @@ pub(crate) fn extend_hls_sequence_zero_archive(
         merged.push(b'\n');
     }
     merged.extend_from_slice(candidate_suffix);
-    // EXT-X-ENDLIST may legally occur anywhere in a Media Playlist. The
-    // rolling candidate's copy can therefore sit before the overlapping URI
-    // where the synthetic suffix starts. Preserve its terminal meaning in a
-    // canonical trailing position instead of silently returning a finalized
-    // cache entry whose visible body still looks live.
     if hls_is_finalized(candidate) && !hls_is_finalized(&merged) {
         if !merged.ends_with(b"\n") {
             merged.push(b'\n');
@@ -905,7 +720,6 @@ fn hls_segment_uri_line_ends(bytes: &[u8]) -> Option<Vec<usize>> {
             }
             expects_media_uri = true;
         } else if line.starts_with('#') || line.is_empty() {
-            // Segment-scoped tags may occur between EXTINF and its URI.
         } else if expects_media_uri {
             swarm_bytes_reference(line)?;
             uri_ends.push(offset.checked_add(raw_line.len())?);
@@ -930,21 +744,10 @@ pub(crate) fn hls_media_sequence(bytes: &[u8]) -> Option<u64> {
     }
 }
 
-/// An HLS client cannot merge an archive that grows backward from an
-/// already-buffered rolling window without moving the presentation origin.
-///
-/// hls.js aligns overlapping sequence numbers to their existing media
-/// timestamps. When a rolling `636..645` playlist is replaced by a complete
-/// `0..645` archive, that would put the newly discovered prefix at negative
-/// time and leave the MediaSource duration near the old rolling-window length.
-/// The unindexed route may expose the archive provisionally before its ENDLIST
-/// is head-confirmed, so the player must rebuild on the backwards expansion
-/// itself rather than waiting for the later live-to-finite transition.
 pub(crate) fn hls_timeline_rebase_required(
     previous_start_sequence: u64,
     previous_live: bool,
     candidate_start_sequence: u64,
-    _candidate_live: bool,
 ) -> bool {
     previous_live && candidate_start_sequence < previous_start_sequence
 }
@@ -952,22 +755,12 @@ pub(crate) fn hls_timeline_rebase_required(
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct HlsLevelTransition {
     pub(crate) rebase: bool,
-    pub(crate) terminal_ready: bool,
 }
 
-/// Classify one rendition-local hls.js level update.
-///
-/// A backwards archive expansion supersedes an already scheduled recovery:
-/// rebuilding the player creates a new session id, so the old recovery timer
-/// cannot act on the replacement session. Suppressing the rebase here would
-/// consume the sequence-zero snapshot and leave no later transition capable
-/// of correcting the MediaSource origin.
 pub(crate) fn classify_hls_level_transition(
     previous: Option<(u64, bool)>,
     rebase_attempted: bool,
-    _recovery_pending: bool,
     candidate_start_sequence: u64,
-    candidate_live: bool,
 ) -> HlsLevelTransition {
     HlsLevelTransition {
         rebase: !rebase_attempted
@@ -976,10 +769,8 @@ pub(crate) fn classify_hls_level_transition(
                     previous_start,
                     previous_live,
                     candidate_start_sequence,
-                    candidate_live,
                 )
             }),
-        terminal_ready: !candidate_live,
     }
 }
 
@@ -987,12 +778,7 @@ pub(crate) fn classify_hls_level_transition(
 struct HlsSegmentIdentity {
     reference: String,
     duration_bits: u64,
-    /// Effective `(offset, length)`, not merely the source spelling. This
-    /// distinguishes implicit offsets and makes equal identities independent
-    /// of whitespace or decimal formatting.
     byte_range: Option<(u64, u64)>,
-    /// Effective discontinuity counter, matching the `cc` value hls.js uses
-    /// when it merges overlapping media sequence numbers.
     discontinuity_counter: u64,
 }
 
@@ -1040,7 +826,6 @@ fn hls_segment_identities(bytes: &[u8]) -> Option<Vec<HlsSegmentIdentity>> {
             }
             byte_range = Some(parse_hls_byte_range(value.trim())?);
         } else if line.starts_with('#') || line.is_empty() {
-            // Tags such as DISCONTINUITY may sit between EXTINF and its URI.
         } else if expects_media_uri {
             let reference = swarm_bytes_reference(line)?.to_ascii_lowercase();
             let effective_range = match byte_range.take() {
@@ -1066,8 +851,6 @@ fn hls_segment_identities(bytes: &[u8]) -> Option<Vec<HlsSegmentIdentity>> {
             });
             expects_media_uri = false;
         } else {
-            // A multivariant URI or malformed mixed playlist cannot establish
-            // media-sequence continuity for an active rendition.
             return None;
         }
     }
@@ -1092,13 +875,6 @@ fn parse_hls_byte_range(value: &str) -> Option<(u64, Option<u64>)> {
     Some((length, offset))
 }
 
-/// Return the ordered immutable Swarm references that carry media fragments.
-///
-/// Variant playlists, alternate renditions, keys, and initialization maps are
-/// deliberately excluded. The caller uses this sequence for a small rolling
-/// playback lookahead, so following a master-playlist URI or a repeated key
-/// would prefetch the wrong part of the presentation. Low-latency media parts
-/// are included because they are fragment payloads in their own right.
 pub(crate) fn hls_media_references(bytes: &[u8]) -> Vec<String> {
     if !stream_feed_payload_len_is_supported(bytes.len()) || !is_hls_manifest(bytes) {
         return Vec::new();
@@ -1130,8 +906,6 @@ pub(crate) fn hls_media_references(bytes: &[u8]) -> Vec<String> {
         }
 
         if line.starts_with('#') {
-            // Tags such as EXT-X-BYTERANGE and EXT-X-DISCONTINUITY may occur
-            // between EXTINF and its media URI, so retain the pending marker.
             continue;
         }
 
@@ -1153,11 +927,6 @@ fn push_distinct_reference(references: &mut Vec<String>, reference: &str) {
     }
 }
 
-/// Best-effort media type for assets referenced by an HLS playlist.
-///
-/// The same Bee `/bytes` route may carry transport streams, fragmented MP4,
-/// audio, subtitles, initialization maps, or encryption keys. Keep unknown
-/// data as octet-stream while recognizing common native-player formats.
 pub(crate) fn hls_payload_mime(bytes: &[u8]) -> &'static str {
     if bytes.first() == Some(&0x47) && bytes.get(188) == Some(&0x47) {
         "video/mp2t"
@@ -1181,18 +950,6 @@ pub(crate) fn rewrite_hls_manifest(bytes: &[u8], local_bytes_base: &str) -> Opti
     rewrite_hls_manifest_inner(bytes, local_bytes_base, false, false)
 }
 
-/// Rewrite an unindexed feed snapshot for a player that must keep polling.
-///
-/// Some archived stream producers emitted `PLAYLIST-TYPE:VOD` before the
-/// owner-authenticated ENDLIST update was published. Serving that intermediate
-/// declaration unchanged can make an HLS client treat a provisional snapshot
-/// as immutable. A historical snapshot may also contain ENDLIST even though a
-/// newer feed update exists, so only expose ENDLIST after the route has
-/// confirmed that snapshot as the feed head. Keep the unindexed representation
-/// EVENT when the producer declared VOD so its playlist type never changes
-/// across reloads. Provisional snapshots explicitly start at the first segment
-/// they contain, including sliding windows, while the feed frontier is still
-/// being discovered.
 pub(crate) fn rewrite_hls_manifest_for_live_reload(
     bytes: &[u8],
     local_bytes_base: &str,
@@ -1313,14 +1070,6 @@ fn hls_event_playlist_type_line(line: &str) -> String {
     rewritten
 }
 
-/// Remove delivery capabilities that the Swarm feed bridge cannot honor.
-///
-/// In particular, advertising blocking reload or delta-update support causes
-/// LL-HLS clients to send `_HLS_msn`, `_HLS_part`, and `_HLS_skip` requests.
-/// The bridge currently serves whole feed snapshots, so keep latency-related
-/// attributes such as HOLD-BACK while suppressing those unsupported promises.
-/// If no attributes remain, omit the tag instead of emitting an invalid empty
-/// attribute list.
 fn strip_unsupported_server_control_claims(line: &str) -> Option<Cow<'_, str>> {
     let attribute_start = server_control_attribute_start(line)?;
     let ranges = attribute_ranges(line, attribute_start);
@@ -1508,9 +1257,6 @@ fn http_route_path(uri: &str) -> Option<&str> {
     }
 }
 
-/// Locate quoted values of attributes named exactly `URI`. Parsing the
-/// comma-separated attribute list (instead of searching for `URI="`) avoids
-/// rewriting `X-URI`, `NOTURI`, or text embedded inside another quoted value.
 fn uri_attribute_value_ranges(line: &str) -> Vec<(usize, usize)> {
     let Some(colon) = line.find(':') else {
         return Vec::new();
@@ -1545,8 +1291,6 @@ fn uri_value_range(line: &str, start: usize, end: usize) -> Option<(usize, usize
 }
 
 fn swarm_bytes_reference(uri: &str) -> Option<&str> {
-    // Whitespace inside a quoted URI attribute is part of its value. Do not
-    // silently normalize it into a different, locally routed resource.
     if uri != uri.trim() {
         return None;
     }
@@ -1563,9 +1307,6 @@ fn swarm_bytes_reference(uri: &str) -> Option<&str> {
 
     let route_path = http_route_path(normalized)?;
 
-    // Only Bee's plural `/bytes/<reference>` path is safe to reinterpret.
-    // In particular, do not turn an arbitrary URL that merely ends in a hash,
-    // a `/bzz` route, or a backslash-obfuscated path into a local request.
     let (prefix, reference) = route_path.rsplit_once('/')?;
     let (_, route) = prefix.rsplit_once('/').unwrap_or(("", prefix));
     if route.eq_ignore_ascii_case("bytes") && is_hex_reference(reference) {
@@ -1593,376 +1334,12 @@ pub(crate) fn stream_feed_payload_len_is_supported(length: usize) -> bool {
     length <= MAX_STREAM_FEED_PAYLOAD_BYTES
 }
 
-fn deserialize_optional_f64<'de, D>(deserializer: D) -> Result<Option<f64>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
-    let parsed = match value {
-        None | Some(serde_json::Value::Null) => None,
-        Some(serde_json::Value::Number(number)) => number.as_f64(),
-        Some(serde_json::Value::String(value)) => value.trim().parse::<f64>().ok(),
-        Some(_) => None,
-    }
-    .filter(|value| value.is_finite() && *value >= 0.0);
-
-    Ok(parsed)
-}
-
-const MAX_TOPIC_BYTES: usize = 256;
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum StreamShareNetwork {
-    Mainnet,
-    Testnet,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct StreamShareRoute {
-    pub network: StreamShareNetwork,
-    pub owner: String,
-    pub topic: String,
-    pub index: Option<u64>,
-}
-
-impl StreamShareRoute {
-    pub(crate) fn new(
-        network: StreamShareNetwork,
-        owner: impl Into<String>,
-        topic: impl Into<String>,
-        index: Option<u64>,
-    ) -> Result<Self, String> {
-        let mut route = Self {
-            network,
-            owner: owner.into(),
-            topic: topic.into(),
-            index,
-        };
-        validate_route(&route)?;
-        route.owner = route
-            .owner
-            .strip_prefix("0x")
-            .or_else(|| route.owner.strip_prefix("0X"))
-            .unwrap_or(&route.owner)
-            .to_ascii_lowercase();
-        Ok(route)
-    }
-}
-
-pub(crate) fn stream_share_path(
-    route_base: &str,
-    route: &StreamShareRoute,
-) -> Result<String, String> {
-    let route_base = normalize_route_base(route_base)?;
-    validate_route(route)?;
-
-    let topic = encode_path_segment(&route.topic);
-    let mut path = match route.network {
-        StreamShareNetwork::Mainnet => {
-            format!("{route_base}/stream/{}/{topic}", route.owner)
-        }
-        StreamShareNetwork::Testnet => {
-            format!("{route_base}/testnet/stream/{}/{topic}", route.owner)
-        }
-    };
-    if let Some(index) = route.index {
-        path.push('/');
-        path.push_str(&index.to_string());
-    }
-    Ok(path)
-}
-
-pub(crate) fn stream_share_url(
-    origin: &str,
-    route_base: &str,
-    route: &StreamShareRoute,
-) -> Result<String, String> {
-    let origin = normalize_http_origin(origin)?;
-    Ok(format!("{origin}{}", stream_share_path(route_base, route)?))
-}
-
-pub(crate) fn parse_stream_share_link(
-    input: &str,
-    route_base: &str,
-) -> Result<StreamShareRoute, String> {
-    let route_base = normalize_route_base(route_base)?;
-    let path = share_path_from_input(input)?;
-    let route_path = if route_base.is_empty() {
-        path
-    } else {
-        path.strip_prefix(&route_base)
-            .and_then(|tail| tail.strip_prefix('/'))
-            .ok_or_else(|| "stream share route is outside the configured route base".to_string())?
-    };
-    let route_path = route_path.trim_start_matches('/');
-    let parts: Vec<&str> = route_path.split('/').collect();
-    if parts.iter().any(|part| part.is_empty()) {
-        return Err("stream share route has an invalid path shape".into());
-    }
-
-    let (network, owner_offset) = match parts.as_slice() {
-        [kind, ..] if *kind == "stream" && matches!(parts.len(), 3 | 4) => {
-            (StreamShareNetwork::Mainnet, 1)
-        }
-        [network, kind, ..]
-            if *network == "testnet" && *kind == "stream" && matches!(parts.len(), 4 | 5) =>
-        {
-            (StreamShareNetwork::Testnet, 2)
-        }
-        _ => return Err("stream share route has an invalid path shape".into()),
-    };
-    let owner = parts[owner_offset].to_string();
-    let topic = decode_path_segment(parts[owner_offset + 1])?;
-    let index = if let Some(index) = parts.get(owner_offset + 2) {
-        if !index.bytes().all(|byte| byte.is_ascii_digit()) {
-            return Err("stream share index must be an unsigned decimal integer".into());
-        }
-        Some(
-            index
-                .parse::<u64>()
-                .map_err(|_| "stream share index is out of range".to_string())?,
-        )
-    } else {
-        None
-    };
-
-    StreamShareRoute::new(network, owner, topic, index)
-}
-
-fn validate_route(route: &StreamShareRoute) -> Result<(), String> {
-    if route.owner.trim() != route.owner {
-        return Err("stream share owner must not contain surrounding whitespace".into());
-    }
-    let owner_hex = route
-        .owner
-        .strip_prefix("0x")
-        .or_else(|| route.owner.strip_prefix("0X"))
-        .unwrap_or(&route.owner);
-    if owner_hex.len() != 40 || !owner_hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        return Err("stream share owner must be a 20-byte hexadecimal address".into());
-    }
-
-    if route.topic.is_empty() || route.topic.len() > MAX_TOPIC_BYTES {
-        return Err(format!(
-            "stream share topic must contain 1 to {MAX_TOPIC_BYTES} UTF-8 bytes"
-        ));
-    }
-    if route.topic.chars().any(char::is_control) {
-        return Err("stream share topic must not contain control characters".into());
-    }
-    // URL implementations normalize literal and percent-encoded dot segments.
-    // There is no portable path-segment representation for these two values.
-    if matches!(route.topic.as_str(), "." | "..") {
-        return Err("stream share topic cannot be a URL dot segment".into());
-    }
-    Ok(())
-}
-
-fn encode_path_segment(value: &str) -> String {
-    const HEX: &[u8; 16] = b"0123456789ABCDEF";
-
-    let mut encoded = String::with_capacity(value.len());
-    for &byte in value.as_bytes() {
-        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
-            encoded.push(char::from(byte));
-        } else {
-            encoded.push('%');
-            encoded.push(char::from(HEX[usize::from(byte >> 4)]));
-            encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
-        }
-    }
-    encoded
-}
-
-fn decode_path_segment(value: &str) -> Result<String, String> {
-    let bytes = value.as_bytes();
-    let mut decoded = Vec::with_capacity(bytes.len());
-    let mut cursor = 0usize;
-
-    while cursor < bytes.len() {
-        if bytes[cursor] == b'%' {
-            let high = bytes
-                .get(cursor + 1)
-                .and_then(|byte| hex_value(*byte))
-                .ok_or_else(|| "stream share topic has an invalid percent escape".to_string())?;
-            let low = bytes
-                .get(cursor + 2)
-                .and_then(|byte| hex_value(*byte))
-                .ok_or_else(|| "stream share topic has an invalid percent escape".to_string())?;
-            decoded.push((high << 4) | low);
-            cursor += 3;
-        } else {
-            decoded.push(bytes[cursor]);
-            cursor += 1;
-        }
-    }
-
-    String::from_utf8(decoded)
-        .map_err(|_| "stream share topic percent escapes are not valid UTF-8".to_string())
-}
-
-fn hex_value(byte: u8) -> Option<u8> {
-    match byte {
-        b'0'..=b'9' => Some(byte - b'0'),
-        b'a'..=b'f' => Some(byte - b'a' + 10),
-        b'A'..=b'F' => Some(byte - b'A' + 10),
-        _ => None,
-    }
-}
-
-fn share_path_from_input(input: &str) -> Result<&str, String> {
-    let input = input.trim();
-    if input.is_empty() || input.chars().any(char::is_control) {
-        return Err("stream share link must be non-empty and contain no control characters".into());
-    }
-    if input.contains(['?', '#', '\\']) {
-        return Err("stream share link must be a clean path without query or fragment".into());
-    }
-
-    if input.starts_with('/') {
-        if input.starts_with("//") {
-            return Err("scheme-relative stream share links are not supported".into());
-        }
-        return Ok(input);
-    }
-
-    let scheme_end = input
-        .find("://")
-        .ok_or_else(|| "stream share link must be absolute or root-relative".to_string())?;
-    let scheme = &input[..scheme_end];
-    if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
-        return Err("stream share link must use HTTP or HTTPS".into());
-    }
-    let remainder = &input[scheme_end + 3..];
-    let path_start = remainder.find('/').unwrap_or(remainder.len());
-    validate_authority(&remainder[..path_start])?;
-    if path_start == remainder.len() {
-        Ok("/")
-    } else {
-        Ok(&remainder[path_start..])
-    }
-}
-
-fn normalize_http_origin(origin: &str) -> Result<String, String> {
-    let origin = origin.trim();
-    if origin.is_empty()
-        || origin.chars().any(char::is_control)
-        || origin.contains(['?', '#', '\\'])
-    {
-        return Err("stream share origin must be a clean HTTP(S) origin".into());
-    }
-
-    let scheme_end = origin
-        .find("://")
-        .ok_or_else(|| "stream share origin must use HTTP or HTTPS".to_string())?;
-    let scheme = &origin[..scheme_end];
-    if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
-        return Err("stream share origin must use HTTP or HTTPS".into());
-    }
-
-    let remainder = &origin[scheme_end + 3..];
-    let authority = remainder.strip_suffix('/').unwrap_or(remainder);
-    if authority.contains('/') {
-        return Err("stream share origin must not contain a path".into());
-    }
-    validate_authority(authority)?;
-    Ok(format!("{}://{authority}", scheme.to_ascii_lowercase()))
-}
-
-fn validate_authority(authority: &str) -> Result<(), String> {
-    if authority.is_empty() || authority.contains('@') || authority.chars().any(char::is_whitespace)
-    {
-        return Err("stream share URL has an invalid authority".into());
-    }
-
-    if let Some(ipv6) = authority.strip_prefix('[') {
-        let close = ipv6
-            .find(']')
-            .ok_or_else(|| "stream share URL has an invalid IPv6 authority".to_string())?;
-        if close == 0 || ipv6[..close].parse::<Ipv6Addr>().is_err() {
-            return Err("stream share URL has an invalid IPv6 authority".into());
-        }
-        let suffix = &ipv6[close + 1..];
-        if !suffix.is_empty() {
-            validate_port(
-                suffix
-                    .strip_prefix(':')
-                    .ok_or_else(|| "stream share URL has an invalid authority".to_string())?,
-            )?;
-        }
-        return Ok(());
-    }
-
-    if authority.matches(':').count() > 1 {
-        return Err("IPv6 stream share origins must use brackets".into());
-    }
-    let (host, port) = authority
-        .rsplit_once(':')
-        .map_or((authority, None), |(host, port)| (host, Some(port)));
-    validate_host(host)?;
-    if let Some(port) = port {
-        validate_port(port)?;
-    }
-    Ok(())
-}
-
-fn validate_host(host: &str) -> Result<(), String> {
-    if host.is_empty() || !host.is_ascii() || host.len() > 253 || host.contains(['[', ']']) {
-        return Err("stream share URL has an invalid host".into());
-    }
-    if host.parse::<Ipv4Addr>().is_ok() {
-        return Ok(());
-    }
-    if host
-        .bytes()
-        .all(|byte| byte.is_ascii_digit() || byte == b'.')
-    {
-        return Err("stream share URL has an invalid IPv4 address".into());
-    }
-
-    let host = host.strip_suffix('.').unwrap_or(host);
-    if host.is_empty()
-        || host.split('.').any(|label| {
-            label.is_empty()
-                || label.len() > 63
-                || !label
-                    .bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
-                || !label
-                    .as_bytes()
-                    .first()
-                    .is_some_and(u8::is_ascii_alphanumeric)
-                || !label
-                    .as_bytes()
-                    .last()
-                    .is_some_and(u8::is_ascii_alphanumeric)
-        })
-    {
-        return Err("stream share URL has an invalid host".into());
-    }
-    Ok(())
-}
-
-fn validate_port(port: &str) -> Result<(), String> {
-    if port.is_empty()
-        || !port.bytes().all(|byte| byte.is_ascii_digit())
-        || port.parse::<u16>().is_err()
-    {
-        return Err("stream share URL has an invalid port".into());
-    }
-    Ok(())
-}
-
 pub(crate) const FEED_FOLLOWUP_BATCH_LIMIT: usize = 4;
 pub(crate) const HLS_INITIAL_EXACT_CATCHUP_LIMIT: usize = 32;
 pub(crate) const HLS_INITIAL_EXACT_BETWEEN_RECHECKS: usize = 1;
 pub(crate) const HLS_INITIAL_BOUNDED_RECHECK_LIMIT: usize = 2;
 pub(crate) const HLS_SEQUENCE_ZERO_PRESENTATION_BATCH_LIMIT: usize = 64;
 pub(crate) const HLS_SEQUENCE_ZERO_FOLLOWUP_MAX_PARALLEL: usize = 4;
-/// One peer is enough to begin retrieval, but not enough to treat a negative
-/// lookup as proof that a sequence feed has no higher update. Eight priced
-/// peers match Bee's sequence-finder probe width without waiting for the
-/// separate 200-connection population target.
 pub(crate) const HLS_TERMINAL_CONFIRMATION_MIN_PRICED_PEERS: u64 = 8;
 const FEED_DORMANT_REFRESH_MS: f64 = 15_000.0;
 
@@ -1972,11 +1349,6 @@ pub(crate) enum FeedFollowupMode {
     SequenceZeroPresentation,
 }
 
-/// Decide whether an HLS snapshot may be represented as terminal.
-///
-/// ENDLIST is authoritative for an explicitly pinned immutable playlist. On
-/// the mutable unindexed route it is terminal only after the reliable sequence
-/// finder confirms that the same update is the current feed head.
 pub(crate) fn hls_snapshot_is_terminal(
     has_endlist: bool,
     explicit_index: bool,
@@ -1994,10 +1366,6 @@ pub(crate) fn cached_feed_should_refresh_head(last_touch_ms: f64, now_ms: f64) -
         && now_ms.is_finite()
         && now_ms >= last_touch_ms
         && now_ms - last_touch_ms >= FEED_DORMANT_REFRESH_MS
-}
-
-pub(crate) fn exact_feed_batch_should_refresh_head(successes: usize) -> bool {
-    successes >= FEED_FOLLOWUP_BATCH_LIMIT
 }
 
 pub(crate) fn feed_followup_batch_limit(mode: FeedFollowupMode) -> usize {
@@ -2020,16 +1388,9 @@ pub(crate) fn feed_followup_should_refresh_head(
     saw_tentative_endlist: bool,
 ) -> bool {
     saw_tentative_endlist
-        || (mode == FeedFollowupMode::Canonical && exact_feed_batch_should_refresh_head(successes))
+        || (mode == FeedFollowupMode::Canonical && successes >= FEED_FOLLOWUP_BATCH_LIMIT)
 }
 
-/// Bound contiguous exact reads before the next initial head recheck.
-///
-/// The first authenticated startup candidate can be far behind even though it
-/// is immediately useful for playback. One exact adjacency read validates
-/// continuity, then a second bounded Bee frontier wave can jump near the head.
-/// Once both bounded waves have run, retain the existing 32-update sequential
-/// fallback for sparse or temporarily inconsistent peer views.
 pub(crate) fn hls_initial_exact_round_limit(
     bounded_rechecks: usize,
     exact_updates: usize,
@@ -2188,40 +1549,6 @@ fn now_ms() -> u64 {
     js_sys::Date::now().max(0.0) as u64
 }
 
-/// Remember exact indices advertised by authenticated stream-catalog feeds.
-///
-/// The catalog assertion is only a hint. The unindexed read path validates
-/// the owner-signed exact SOC and confirms the current feed head before
-/// treating an ENDLIST as terminal.
-#[cfg(target_arch = "wasm32")]
-pub(crate) fn remember_catalog_vod_indices(
-    network_id: u64,
-    entries: impl IntoIterator<Item = (String, String, u64)>,
-) {
-    let touched_ms = now_ms();
-    let mut hints = read_storage();
-    for (owner, normalized_topic, index) in entries.into_iter().take(MAX_HINTS) {
-        upsert(
-            &mut hints,
-            network_id,
-            &owner,
-            &normalized_topic,
-            index,
-            touched_ms,
-        );
-    }
-    write_storage(hints);
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-pub(crate) fn remember_catalog_vod_indices(
-    _network_id: u64,
-    _entries: impl IntoIterator<Item = (String, String, u64)>,
-) {
-}
-
-/// Remember an exact feed index only after its owner-authenticated payload was
-/// confirmed to be the current feed head and a finalized HLS manifest.
 #[cfg(target_arch = "wasm32")]
 pub(crate) fn remember_authenticated_endlist_index(
     network_id: u64,
@@ -2241,15 +1568,6 @@ pub(crate) fn remember_authenticated_endlist_index(
     write_storage(hints);
 }
 
-#[cfg(not(target_arch = "wasm32"))]
-pub(crate) fn remember_authenticated_endlist_index(
-    _network_id: u64,
-    _owner: &str,
-    _normalized_topic: &str,
-    _index: u64,
-) {
-}
-
 #[cfg(target_arch = "wasm32")]
 pub(crate) fn persisted_vod_index(
     network_id: u64,
@@ -2261,15 +1579,6 @@ pub(crate) fn persisted_vod_index(
         .into_iter()
         .find(|hint| hint.network_id == network_id && hint.owner == owner && hint.topic == topic)
         .map(|hint| hint.index)
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-pub(crate) fn persisted_vod_index(
-    _network_id: u64,
-    _owner: &str,
-    _normalized_topic: &str,
-) -> Option<u64> {
-    None
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -2284,75 +1593,9 @@ pub(crate) fn forget_vod_index(network_id: u64, owner: &str, normalized_topic: &
     write_storage(hints);
 }
 
-#[cfg(not(target_arch = "wasm32"))]
-pub(crate) fn forget_vod_index(_network_id: u64, _owner: &str, _normalized_topic: &str) {}
-
-#[cfg(test)]
-mod stream_index_hint_tests {
-    use super::*;
-
-    const OWNER: &str = "6F2728386F8a47ef5EBe323721188e630Ff0FdE9";
-    const TOPIC: &str = "e440540de2dc0ce0112f27889b168994deba607a21e25ca57b7ea37c430472cf";
-
-    #[test]
-    fn identities_are_network_scoped_and_canonical() {
-        assert_eq!(
-            canonical_identity(1, OWNER, TOPIC),
-            Some((1, OWNER.to_ascii_lowercase(), TOPIC.to_string()))
-        );
-        assert!(canonical_identity(1, "not-an-owner", TOPIC).is_none());
-        assert!(canonical_identity(1, OWNER, "uuid-is-not-normalized").is_none());
-    }
-
-    #[test]
-    fn newer_catalog_snapshots_cannot_downgrade_a_vod_hint() {
-        let mut hints = Vec::new();
-        upsert(&mut hints, 1, OWNER, TOPIC, 646, 10);
-        upsert(&mut hints, 1, OWNER, TOPIC, 69, 20);
-        assert_eq!(hints.len(), 1);
-        assert_eq!(hints[0].index, 646);
-        assert_eq!(hints[0].touched_ms, 20);
-    }
-
-    #[test]
-    fn sanitizing_deduplicates_and_bounds_persisted_catalog_data() {
-        let hints = (0..(MAX_HINTS + 20))
-            .map(|index| VodIndexHint {
-                network_id: 1,
-                owner: OWNER.to_string(),
-                topic: format!("{index:064x}"),
-                index: index as u64,
-                touched_ms: index as u64,
-            })
-            .collect();
-        let sanitized = sanitize(hints);
-        assert_eq!(sanitized.len(), MAX_HINTS);
-        assert_eq!(sanitized[0].index, (MAX_HINTS + 19) as u64);
-    }
-
-    #[test]
-    fn serialized_hint_store_has_a_hard_byte_limit() {
-        let hints = (0..MAX_HINTS)
-            .map(|index| VodIndexHint {
-                network_id: 1,
-                owner: OWNER.to_ascii_lowercase(),
-                topic: format!("{index:064x}"),
-                index: index as u64,
-                touched_ms: index as u64,
-            })
-            .collect();
-        let serialized = compact_for_storage(hints).unwrap();
-        assert!(serialized.len() <= MAX_SERIALIZED_BYTES);
-    }
-}
-
 #[cfg(target_arch = "wasm32")]
 mod player {
-    //! Rust-owned HLS browser lifecycle.
-    //!
-    //! `hls.js` remains the playback engine on MSE browsers, but all application
-    //! policy and session ownership live here. A tiny static loader supplies the
-    //! one browser primitive Wasm cannot call directly: dynamic `import()`.
+    //! Rust owns HLS policy; `hls.js` supplies MSE playback through dynamic import.
 
     use std::{
         cell::{Cell, RefCell},
@@ -2388,7 +1631,7 @@ mod player {
     #[wasm_bindgen(module = "/static/hls_loader.js")]
     extern "C" {
         #[wasm_bindgen(js_name = loadHls)]
-        fn load_hls() -> Promise;
+        pub(crate) fn load_hls() -> Promise;
     }
 
     #[wasm_bindgen]
@@ -2479,14 +1722,11 @@ mod player {
 
             match &self.mode {
                 PlayerMode::Hls(hls) => {
-                    // hls.js also drops its own event subscriptions and detaches MSE.
-                    // This does not abort any request already handed to the
-                    // Service Worker/Rust accounting path.
+                    // Player destruction cannot cancel requests already dispatched to Rust.
                     destroy_hls_and_quarantine_callbacks(hls, &mut self.hls_callbacks);
                 }
                 PlayerMode::Native => {
-                    // Prevent only future native playlist requests. Requests that
-                    // already crossed the worker bridge continue settling in Rust.
+                    // Clearing src stops future native requests, not dispatched Rust work.
                     let _ = self.media.pause();
                     self.media.remove_attribute("src").ok();
                     self.media.load();
@@ -2554,7 +1794,11 @@ mod player {
         dispose_current_session();
     }
 
-    pub(crate) async fn play_hls(player: &Element, source: &str) -> Result<&'static str, JsValue> {
+    pub(crate) async fn play_hls(
+        player: &Element,
+        source: &str,
+        hls_loader: JsFuture,
+    ) -> Result<&'static str, JsValue> {
         let media = player
             .clone()
             .dyn_into::<HtmlMediaElement>()
@@ -2565,12 +1809,13 @@ mod player {
                 "HLS playback requires a non-empty source",
             ));
         }
-        start_hls_request(media, source.to_string(), 0, false, false).await
+        start_hls_request(media, source.to_string(), Some(hls_loader), 0, false, false).await
     }
 
     async fn start_hls_request(
         media: HtmlMediaElement,
         source: String,
+        hls_loader: Option<JsFuture>,
         hard_restart_attempts: u8,
         timeline_rebase_attempted: bool,
         resume_authorized_playback: bool,
@@ -2584,7 +1829,10 @@ mod player {
             .ok();
 
         let native_supported = supports_native_hls(&media);
-        let hls_class = match JsFuture::from(load_hls()).await {
+        let hls_class = match match hls_loader {
+            Some(loader) => loader.await,
+            None => JsFuture::from(load_hls()).await,
+        } {
             Ok(hls_class) => Some(hls_class),
             Err(error) => {
                 if !player_request_is_current(session_id) {
@@ -2712,7 +1960,7 @@ mod player {
         timeline_rebase_attempted: bool,
     ) -> Result<(), JsValue> {
         media.set_attribute("data-weeb3-hls-mode", "native")?;
-        let mut dom_callbacks = Vec::with_capacity(2);
+        let mut dom_callbacks = Vec::with_capacity(1);
         let callback = Closure::<dyn FnMut(Event)>::new(move |_| {
             let Some((media, message)) = with_session_mut(session_id, |session| {
                 let message = session
@@ -2728,14 +1976,6 @@ mod player {
             report_playback_error(&media, &message, &JsValue::from_str(&message));
         });
         register_dom_callback(&media, "error", callback, &mut dom_callbacks)?;
-
-        let manifest_ready = Closure::<dyn FnMut(Event)>::new(move |_| {
-            let Some(media) = with_session_mut(session_id, |session| session.media.clone()) else {
-                return;
-            };
-            dispatch_custom_event(&media, "weeb3-hls-manifest-ready", &JsValue::UNDEFINED);
-        });
-        register_dom_callback(&media, "loadedmetadata", manifest_ready, &mut dom_callbacks)?;
 
         CURRENT_SESSION.with(|current| {
             *current.borrow_mut() = Some(HlsSession {
@@ -2838,7 +2078,6 @@ mod player {
                     "HLS manifest ready through weeb-3. Press Play if autoplay is blocked.",
                     "manifest-ready",
                 );
-                dispatch_custom_event(&media, "weeb3-hls-manifest-ready", &JsValue::UNDEFINED);
                 if let Some((hls, resume_authorized)) = startup_hls {
                     dispatch_custom_event(&media, HLS_WARMUP_START_EVENT, &JsValue::UNDEFINED);
                     if !session_is_current(session_id) {
@@ -2880,53 +2119,32 @@ mod player {
         };
 
         let outcome = with_session_mut(session_id, |session| {
-            // Media sequence numbers are local to a rendition. Comparing snapshots
-            // from different ABR levels could mistake an ordinary quality switch
-            // for an archive expansion.
             let previous = session
                 .level_snapshots
                 .insert(level, (start_sequence, live));
             let transition = classify_hls_level_transition(
                 previous,
                 session.timeline_rebase_attempted,
-                session.recovery_pending,
                 start_sequence,
-                live,
             );
-            let terminal_media = transition.terminal_ready.then(|| session.media.clone());
 
             if !transition.rebase {
-                return (None, terminal_media);
+                return None;
             }
 
-            // This is an expected representation transition, not a playback
-            // failure. Keep its one-shot guard separate from the outer error
-            // restart budget and remember whether a prior user gesture authorized
-            // playback so the rebuilt MediaSource can resume. It also supersedes
-            // any recovery already scheduled for this old session; that timer is
-            // session-id guarded and cannot affect the replacement.
             session.timeline_rebase_attempted = true;
             session.recovery_pending = true;
-            (
-                Some((
-                    session.media.clone(),
-                    session.source.clone(),
-                    session.hard_restart_attempts,
-                    session.playback_authorized,
-                    session.hls().cloned(),
-                )),
-                terminal_media,
-            )
+            Some((
+                session.media.clone(),
+                session.source.clone(),
+                session.hard_restart_attempts,
+                session.playback_authorized,
+                session.hls().cloned(),
+            ))
         });
-        let Some((restart, terminal_media)) = outcome else {
+        let Some(restart) = outcome else {
             return;
         };
-        if let Some(media) = terminal_media {
-            // MANIFEST_PARSED normally fires once. A later ENDLIST transition is
-            // also a manifest-ready state change: notify the Rust route owner so
-            // it can pin the authenticated final feed index in the share URL.
-            dispatch_custom_event(&media, "weeb3-hls-manifest-ready", &JsValue::UNDEFINED);
-        }
         let Some((media, source, hard_restart_attempts, resume_authorized, retiring_hls)) = restart
         else {
             return;
@@ -2940,23 +2158,13 @@ mod player {
             "Complete HLS archive found; rebuilding its timeline from the beginning.",
             "rebasing-timeline",
         );
-        // The Rust prefetch scheduler keeps the immutable-content generation so a
-        // sequence-zero body already in flight remains joinable. It only retires
-        // future admissions owned by the superseded rolling-window plans.
         dispatch_custom_event(&media, HLS_TIMELINE_REBASE_EVENT, &JsValue::UNDEFINED);
-        // Stop the retiring loader synchronously inside LEVEL_LOADED so it cannot
-        // dispatch a new same-URL Service Worker flight in the callback-to-destroy
-        // gap. A request already bridged into Rust is owned by its detached leader
-        // and still drains through retrieval and accounting; stop_load only closes
-        // future browser-side admission.
+        // Stop admission before the retiring LEVEL_LOADED callback can dispatch again.
         if let Some(hls) = retiring_hls {
             let _ = hls.stop_load();
         }
 
-        // Let the hls.js LEVEL_LOADED callback stack unwind before dropping the
-        // instance that owns it. Destroying that instance prevents only future
-        // loader admission; Service Worker requests already dispatched into Rust
-        // continue through accounting and settle normally.
+        // Defer destruction until its callback returns; dispatched Rust work still settles.
         spawn_local(async move {
             let _ = JsFuture::from(Promise::resolve(&JsValue::UNDEFINED)).await;
             if !session_is_current(session_id) {
@@ -2965,6 +2173,7 @@ mod player {
             if let Err(error) = start_hls_request(
                 media.clone(),
                 source,
+                None,
                 hard_restart_attempts,
                 true,
                 resume_authorized,
@@ -3016,9 +2225,7 @@ mod player {
         }
         let destroyed = hls.destroy().is_ok();
         if !callbacks_detached && !destroyed {
-            // A broken JS instance may still retain these callbacks. Quarantine
-            // them instead of leaving JS with wrappers whose Rust Closure state
-            // has been dropped.
+            // JS may still retain these wasm closures after a failed destroy.
             std::mem::forget(std::mem::take(retained));
         } else {
             retained.clear();
@@ -3058,8 +2265,7 @@ mod player {
             }
         }
         if !quarantined.is_empty() {
-            // A DOM target that refused to detach a listener may still call it.
-            // Keep only those live wasm-bindgen closures quarantined.
+            // Preserve closures for listeners the DOM refused to remove.
             std::mem::forget(quarantined);
         }
     }
@@ -3115,10 +2321,7 @@ mod player {
 
         let pause = Closure::<dyn FnMut(Event)>::new(move |_| {
             let action = with_session_mut(session_id, |session| {
-                // Chrome may emit `play`/`pause` while rejecting an autoplay
-                // promise. Until playback has actually been authorized, that pair
-                // is not an explicit user pause and must not stop warm-up or
-                // advance the Rust retrieval generation.
+                // Chrome may emit play/pause before rejecting autoplay.
                 if !session.playback_authorized {
                     return None;
                 }
@@ -3155,7 +2358,6 @@ mod player {
                 &JsValue::from_str("weeb-3 HLS non-fatal event"),
                 diagnostic.as_ref(),
             );
-            dispatch_custom_event(&media, "weeb3-hls-warning", diagnostic.as_ref());
             return;
         }
 
@@ -3274,6 +2476,7 @@ mod player {
                     if let Err(error) = start_hls_request(
                         media.clone(),
                         source,
+                        None,
                         attempt,
                         timeline_rebase_attempted,
                         resume_authorized,
@@ -3306,8 +2509,7 @@ mod player {
         };
         report_playback_error(&media, message, &detail);
 
-        // The event callback that requested teardown is retained by this session.
-        // Let that callback return before dropping its Closure.
+        // Drop the retained callback only after it returns.
         spawn_local(async move {
             let _ = JsFuture::from(Promise::resolve(&JsValue::UNDEFINED)).await;
             if session_is_current(session_id) {
@@ -3330,9 +2532,6 @@ mod player {
                 && !session.playback_authorized
                 && !session.autoplay_pending)
                 .then(|| {
-                    // Reuse the pending-play guard for an authorized timeline
-                    // resume. It prevents Chrome's provisional play/pause pair
-                    // from being mistaken for an explicit user pause.
                     session.autoplay_pending = true;
                     session.media.clone()
                 })
@@ -3396,7 +2595,7 @@ mod player {
         Some(media)
     }
 
-    fn report_autoplay_blocked(media: &HtmlMediaElement, error: &JsValue) {
+    fn report_autoplay_blocked(media: &HtmlMediaElement, _error: &JsValue) {
         media
             .set_attribute("data-weeb3-hls-state", "autoplay-blocked")
             .ok();
@@ -3405,7 +2604,6 @@ mod player {
             "HLS startup media is warming. Autoplay was blocked; press Play to start playback.",
             "autoplay-blocked",
         );
-        dispatch_custom_event(media, "weeb3-hls-autoplay-blocked", error);
     }
 
     fn report_playback_error(media: &HtmlMediaElement, message: &str, detail: &JsValue) {
@@ -3414,7 +2612,6 @@ mod player {
         let error: JsValue = error.into();
         web_sys::console::error_2(&JsValue::from_str("weeb-3 HLS playback error"), &error);
         set_playback_status(media, &format!("HLS playback failed: {message}"), "error");
-        dispatch_custom_event(media, "weeb3-hls-error", &error);
     }
 
     fn set_playback_status(media: &HtmlMediaElement, message: &str, state: &str) {
@@ -3511,17 +2708,7 @@ mod player {
             "liveSyncDurationCount",
             JsValue::from_f64(HLS_LIVE_SYNC_DURATION_COUNT as f64),
         );
-        // A feed-backed archive is indistinguishable from a live playlist until
-        // its owner-authenticated ENDLIST update is found. Do not expose the
-        // producer's ten-fragment rolling window as a false finite duration.
-        // hls.js restores the finite MediaSource duration when ENDLIST arrives.
         set_property(&config, "liveDurationInfinity", JsValue::TRUE);
-        // Keep hls.js' infinite maximum-live-latency default. A provisional
-        // archived VOD is represented as a reloadable EVENT playlist until its
-        // authenticated ENDLIST arrives; a finite maximum would seek that archive
-        // from its forced zero start toward the provisional tail. Keep the default
-        // 1.0 live-sync playback rate for the same reason: an archive must retain
-        // normal timeline speed while its final feed update is found.
 
         let low_memory = device_memory_gib()
             .filter(|memory| memory.is_finite())
@@ -3536,8 +2723,6 @@ mod player {
                 JsValue::from_f64(32.0 * 1024.0 * 1024.0),
             );
         } else {
-            // Unknown memory is common in privacy-oriented browsers and is not
-            // evidence of a low-memory device.
             set_property(&config, "maxBufferLength", JsValue::from_f64(90.0));
             set_property(&config, "maxMaxBufferLength", JsValue::from_f64(120.0));
             set_property(
@@ -3618,15 +2803,12 @@ mod player {
 pub(crate) use player::{
     HLS_AUTOPLAY_AUTHORIZED_EVENT, HLS_AUTOPLAY_PENDING_ATTRIBUTE, HLS_EXPLICIT_PAUSE_EVENT,
     HLS_PLAYBACK_AUTHORIZED_ATTRIBUTE, HLS_TIMELINE_REBASE_EVENT, HLS_WARMUP_START_EVENT,
-    destroy_current_hls, play_hls,
+    destroy_current_hls, load_hls, play_hls,
 };
 
 #[cfg(target_arch = "wasm32")]
 mod runtime {
     use super::*;
-    use super::{
-        stream_share_path as build_stream_share_path, stream_share_url as build_stream_share_url,
-    };
     use std::{
         cell::RefCell,
         collections::{HashMap, HashSet, VecDeque},
@@ -3636,7 +2818,7 @@ mod runtime {
     };
 
     use async_std::sync::Arc;
-    use js_sys::{Function, Promise, Reflect};
+    use js_sys::{Function, Reflect};
     use libp2p::futures::future::{Either, select};
     use libp2p::futures::stream::{self, FuturesUnordered, StreamExt};
     use wasm_bindgen::{JsCast, JsValue, closure::Closure};
@@ -3653,27 +2835,25 @@ mod runtime {
         },
         interface::{service_worker_controls_bzz_requests, service_worker_scope_protocol_error},
         mpsc,
-        network_profile::{NetworkMode, active_profile},
+        network_profile::active_profile,
         normalize_feed_topic, register_retrieve_cancel_token,
         retrieval::{
             retrieve_data_payload, retrieve_data_payload_cancellable, retrieve_data_range_join,
             retrieve_decoded_data_root,
         },
-        retrieval_conventions::{
-            PendingGenerationRelation, next_nonzero_generation, pending_generation_relation,
-        },
+        retrieval_conventions::{PendingGenerationRelation, pending_generation_relation},
         stream::{
             FetchResponse, begin_result_view_request, clear_completed_bzz_media_ranges,
             media_cache_max_bytes, next_media_generation, range_cache_body_bytes,
-            release_current_stream_view, replace_stream_result_view,
-            result_view_request_is_current, retain_media_element_callback,
+            replace_stream_result_view, result_view_request_is_current,
+            retain_media_element_callback,
         },
         stream_conventions::{
             MEDIA_PREFETCH_BATCH_YIELD_MS, MEDIA_PREFETCH_MAX_PARALLEL,
-            MEDIA_STARTUP_RESPONSE_BYTES, MEDIA_STORAGE_WINDOW_BYTES, decode_component,
-            if_none_match_matches, if_range_allows_range, media_prefetch_ahead_limit_bytes,
-            parse_single_range, plan_media_prefetch_batch, route_markers, streaming_route_base,
-            streaming_route_path,
+            MEDIA_STARTUP_RESPONSE_BYTES, MEDIA_STORAGE_WINDOW_BYTES, STREAMING_ROUTE_BASE,
+            decode_component, if_none_match_matches, if_range_allows_range,
+            media_prefetch_ahead_limit_bytes, parse_single_range, plan_media_prefetch_batch,
+            route_markers, streaming_route_path,
         },
         stream_retrieve_cancel_token,
     };
@@ -3802,16 +2982,6 @@ mod runtime {
             bytes
         }
 
-        async fn latest_hls_feed_payload_bounded_from(
-            &self,
-            owner: String,
-            topic: String,
-            initial: RawFeedPayload,
-        ) -> Option<RawFeedPayload> {
-            acquire_latest_raw_feed_payload_bounded_from(owner, topic, initial, &self.chunk_port.0)
-                .await
-        }
-
         async fn latest_hls_feed_payload_from(
             &self,
             owner: String,
@@ -3882,15 +3052,6 @@ mod runtime {
         ) -> Option<RawFeedPayload> {
             acquire_raw_feed_payload_at_index(owner, topic, index, &self.chunk_port.0).await
         }
-
-        async fn hls_feed_payload_at_index_bounded(
-            &self,
-            owner: String,
-            topic: String,
-            index: u64,
-        ) -> Option<RawFeedPayload> {
-            acquire_raw_feed_payload_at_index_bounded(owner, topic, index, &self.chunk_port.0).await
-        }
     }
 
     thread_local! {
@@ -3908,8 +3069,6 @@ mod runtime {
             RefCell::new(HashMap::new());
         static HLS_PAYLOAD_CACHE: RefCell<HlsPayloadCache> =
             RefCell::new(HlsPayloadCache::new());
-        static STREAM_CATALOG_CALLBACKS: RefCell<Vec<StreamCatalogCallback>> =
-            RefCell::new(Vec::new());
     }
 
     const FEED_ROUTE_CACHE_MAX_ENTRIES: usize = 64;
@@ -3924,7 +3083,6 @@ mod runtime {
     const HLS_PREFETCH_TRACK_MAX_ENTRIES: usize = 16;
     const HLS_STREAM_KEY: &str = "weeb3:hls-playback";
     const HLS_PAYLOAD_SINGLEFLIGHT_MAX_WAITERS: usize = 64;
-    // One foreground plus three speculative bodies fits the four-tree budget.
     const HLS_STARTUP_BODY_MAX_PARALLEL: usize = 3;
     const HLS_ROLLING_EARLY_OVERLAP_SEGMENTS: usize = 1;
     const HLS_PREFETCH_BODY_MAX_PARALLEL: usize = 3;
@@ -3945,66 +3103,19 @@ mod runtime {
     const HLS_PAYLOAD_RETRY_DELAY_MS: u64 = 75;
     const HLS_STARTUP_LOOKAHEAD_BYTES: u64 = 3 * MEDIA_STARTUP_RESPONSE_BYTES;
 
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    pub(crate) enum HlsOpenIntent {
-        Beginning,
-        CurrentWindow,
-    }
-
-    impl HlsOpenIntent {
-        fn requests_sequence_zero(self, index_hint: Option<u64>) -> bool {
-            index_hint.is_none() && self == Self::Beginning
-        }
-    }
-
     #[derive(Clone)]
     struct FeedRouteSnapshot {
         index: u64,
         body: Arc<[u8]>,
-        /// True only when this representation may expose ENDLIST as terminal.
-        ///
-        /// An explicit-index route is immutable by definition. For the unindexed
-        /// route, an ENDLIST-bearing payload remains provisional until the
-        /// reliable sequence-feed finder confirms that payload is the current
-        /// head.
         finalized: bool,
     }
 
     struct FeedRouteState {
         snapshot: FeedRouteSnapshot,
-        /// Exact decoded bytes authenticated by `snapshot.index`.
-        ///
-        /// A sequence-zero EVENT presentation may accumulate identity-checked
-        /// suffixes from rolling feed updates in `snapshot.body`. Reliable frontier
-        /// searches must still resume from the exact owner-authenticated payload.
         source_body: Arc<[u8]>,
-        /// Whether `snapshot.body` incorporates the authenticated update at
-        /// `snapshot.index`.
-        ///
-        /// Stateful rolling manifests cannot be spliced into the sequence-zero
-        /// EVENT view safely. Discovery may still advance through a continuous
-        /// authenticated source chain while retaining the older visible body, but
-        /// that held view must never become terminal.
         body_tracks_source: bool,
-        /// A terminal source update has passed the mature-peer head check.
-        ///
-        /// This is separate from visible finality: an unsupported stateful
-        /// ENDLIST may be confirmed as the source head while its sequence-zero
-        /// presentation remains provisional and keeps probing for a complete
-        /// archive.
         source_endlist_confirmed: bool,
-        /// A presentation-scoped canonical candidate has already started its
-        /// independent reliable stabilization pass.
-        ///
-        /// This is deliberately separate from `checking_token`: the sequence-zero
-        /// exact follower keeps extending startup runway while one far-ahead
-        /// canonical seed catches up to ENDLIST. The seed must not be dropped just
-        /// because that exact follower currently owns the cache check token.
         canonical_stabilization_started: bool,
-        /// Protect the presentation cache entry while the independent canonical
-        /// pass is in flight. `canonical_stabilization_started` remains set after
-        /// completion so one presentation can never start a second expensive
-        /// frontier traversal.
         canonical_stabilization_running: bool,
         checking_token: u64,
         last_touch: f64,
@@ -4055,7 +3166,6 @@ mod runtime {
         mode: HlsPrefetchMode,
         client: Option<Arc<Weeb3>>,
         feed_identity: Option<(String, String)>,
-        sequence_zero_start_requested: bool,
         sequence_zero_runway_admitted: bool,
         sequence_zero_extension_claimed: bool,
         sequence_zero_runway_closed: bool,
@@ -4083,7 +3193,6 @@ mod runtime {
                 mode: HlsPrefetchMode::Inactive,
                 client: None,
                 feed_identity: None,
-                sequence_zero_start_requested: false,
                 sequence_zero_runway_admitted: false,
                 sequence_zero_extension_claimed: false,
                 sequence_zero_runway_closed: false,
@@ -4147,7 +3256,7 @@ mod runtime {
             let cached = if prefetch {
                 self.body(reference)
             } else {
-                self.foreground_body(reference)
+                read_forward_cache_entry(&mut self.order, &self.bodies, reference)
             };
             if let Some(body) = cached {
                 return HlsPayloadLoadRole::Cached(body);
@@ -4163,8 +3272,6 @@ mod runtime {
                             );
                         }
                         if !prefetch {
-                            // The player joined this detached leader. It is now the
-                            // foreground tree, so release its speculative lane.
                             pending.speculative = false;
                         }
                         let (sender, receiver) = mpsc::bounded(1);
@@ -4188,13 +3295,9 @@ mod runtime {
             let speculative_loads = self
                 .pending
                 .values()
-                // A pause or seek deliberately leaves old peer requests draining
-                // for accounting. Those detached generations must not consume
-                // admission capacity in the current playback generation.
+                // Old generations drain accounting without consuming current capacity.
                 .filter(|pending| pending.speculative && pending.generation == generation)
                 .count();
-            // Foreground loads and seeks always bypass speculative capacity. The
-            // HLS-only body cap applies only to lookahead admissions.
             if prefetch && speculative_loads >= HLS_PREFETCH_BODY_MAX_PARALLEL {
                 return HlsPayloadLoadRole::AtCapacity;
             }
@@ -4229,8 +3332,6 @@ mod runtime {
                 pending.generation == generation && pending.load_id == load_id
             });
 
-            // Immutable data completed by a superseded generation is still useful,
-            // but insert it cold so it cannot evict the current seek target.
             if self.retain_completed
                 && let Ok(body) = &result
             {
@@ -4251,18 +3352,10 @@ mod runtime {
             Some(body)
         }
 
-        fn foreground_body(&mut self, reference: &str) -> Option<Arc<[u8]>> {
-            read_forward_cache_entry(&mut self.order, &self.bodies, reference)
-        }
-
         fn body_size(&self, reference: &str) -> Option<u64> {
             self.bodies
                 .get(reference)
                 .and_then(|body| u64::try_from(body.len()).ok())
-        }
-
-        fn contains_body(&self, reference: &str) -> bool {
-            self.bodies.contains_key(reference)
         }
 
         fn contains_body_or_pending(&self, reference: &str, generation: u64) -> bool {
@@ -4372,62 +3465,12 @@ mod runtime {
         Reject(String),
     }
 
-    struct StreamCatalogCallback {
-        target: Element,
-        event_name: &'static str,
-        callback: Option<Closure<dyn FnMut()>>,
-    }
-
-    impl StreamCatalogCallback {
-        fn attach(
-            target: &Element,
-            event_name: &'static str,
-            callback: Closure<dyn FnMut()>,
-        ) -> Option<Self> {
-            if target
-                .add_event_listener_with_callback(event_name, callback.as_ref().unchecked_ref())
-                .is_err()
-            {
-                return None;
-            }
-            Some(Self {
-                target: target.clone(),
-                event_name,
-                callback: Some(callback),
-            })
-        }
-    }
-
-    impl Drop for StreamCatalogCallback {
-        fn drop(&mut self) {
-            let Some(callback) = self.callback.take() else {
-                return;
-            };
-            if self
-                .target
-                .remove_event_listener_with_callback(
-                    self.event_name,
-                    callback.as_ref().unchecked_ref(),
-                )
-                .is_err()
-            {
-                // An attached wasm-bindgen Closure must remain alive if the browser
-                // refuses to detach it, otherwise a later event would trap.
-                std::mem::forget(callback);
-            }
-        }
-    }
-
     pub(crate) fn hls_payload_cache_body_bytes() -> u64 {
         HLS_PAYLOAD_CACHE.with(|cache| cache.borrow().body_bytes)
     }
 
     fn hls_payload_cache_capacity_bytes() -> u64 {
         media_cache_max_bytes().saturating_sub(range_cache_body_bytes())
-    }
-
-    fn hls_prefetch_ahead_limit_bytes() -> u64 {
-        media_prefetch_ahead_limit_bytes(hls_payload_cache_capacity_bytes())
     }
 
     async fn fetch_hls_bytes_response(
@@ -4444,8 +3487,6 @@ mod runtime {
             return FetchResponse::ok(304, hls_validator_headers(&reference), None);
         }
         if range.is_some() && !if_range_allows_range(if_range.as_deref(), &etag) {
-            // RFC range semantics require a complete 200 response when the
-            // validator no longer names this immutable representation.
             range = None;
         }
         if method != "HEAD" && range.is_none() {
@@ -4459,9 +3500,6 @@ mod runtime {
                 Ok(size) => size,
                 Err(_) => return FetchResponse::error(502, "HLS resource is too large"),
             };
-            // Rewriting is intentionally bounded. Do not cache an oversized HLS-
-            // looking payload as a manifest, otherwise a later HEAD/Range request
-            // would full-join it again before the rewrite limit rejects it.
             let looks_like_manifest = is_hls_manifest(&bytes);
             if looks_like_manifest && bytes.len() > MAX_STREAM_FEED_PAYLOAD_BYTES {
                 return FetchResponse::error(413, "HLS manifest exceeds the supported size limit");
@@ -4491,9 +3529,6 @@ mod runtime {
         }
 
         if method != "HEAD" {
-            // EXT-X-BYTERANGE may race a whole-fragment lookahead. Join that exact
-            // immutable singleflight and slice its completed Arc instead of
-            // dispatching a duplicate selective traversal.
             let _ = wait_for_pending_hls_payload(&reference).await;
         }
         let Some(resolved) = resolve_hls_asset(weeb3.clone(), reference.clone()).await else {
@@ -4712,10 +3747,7 @@ mod runtime {
             return receiver;
         }
 
-        // The root-size request owns a detached task. A scheduler select may drop
-        // only its result receiver; once dispatched, the probe continues through
-        // retrieval/accounting settlement and publishes its immutable result to
-        // every live waiter (or just the cache when all waiters have gone away).
+        // Dropping a probe waiter does not cancel its detached accounting owner.
         spawn_local(async move {
             let size = weeb3
                 .hls_payload_size(reference.clone())
@@ -4746,13 +3778,9 @@ mod runtime {
         client: Arc<Weeb3>,
         normalized_owner: String,
         normalized_topic: String,
-        sequence_zero_start_requested: bool,
         presentation_id: u64,
     ) {
-        // The outgoing regular-media view has already advanced its generation in
-        // `release_current_stream_view`. Reclaim only completed range bodies here;
-        // pending/dispatched reads keep their transport and accounting lifecycle,
-        // and stale generations are prevented from repopulating this cache.
+        // Reclaim completed ranges; pending/dispatched reads keep their transport.
         clear_completed_bzz_media_ranges();
         HLS_PAYLOAD_CACHE.with(|cache| cache.borrow_mut().resume_completed_retention());
         let generation = HLS_PREFETCH_SESSION.with(|session| {
@@ -4762,7 +3790,6 @@ mod runtime {
                 normalized_owner.to_ascii_lowercase(),
                 normalized_topic.to_ascii_lowercase(),
             ));
-            session.sequence_zero_start_requested = sequence_zero_start_requested;
             session.sequence_zero_runway_admitted = false;
             session.sequence_zero_extension_claimed = false;
             session.sequence_zero_runway_closed = false;
@@ -4822,13 +3849,6 @@ mod runtime {
                 && is_hls_manifest(&payload.bytes)
                 && let Some(cache_key) = startup_cache_key.as_deref()
             {
-                // The response path is the sole creator of this overlay. Once its
-                // sequence-zero prefix is visible, publish later
-                // owner-authenticated observations only through the normal
-                // monotonic/continuous cache gate. Cache existence is checked
-                // before this observation so a ready-channel backlog cannot chain
-                // prefix -> rolling window before the selector publishes the
-                // initial response.
                 let _ = store_feed_snapshot(
                     cache_key,
                     FeedRouteSnapshot {
@@ -4841,13 +3861,8 @@ mod runtime {
                 );
             }
             if accepted_prefix {
-                // Presentation observes complete decoded, owner-authenticated
-                // manifest bytes. A full channel means an equal/older prefix is
-                // already ready; feed discovery must never wait on this hint.
                 let _ = prefix_ready.try_send(payload.clone());
             }
-            // Prefix-body prefetch is opportunistic. Never let its bounded
-            // consumer delay feed-frontier discovery or presentation selection.
             let _ = prefetch_payloads.try_send(payload);
         }
     }
@@ -4903,9 +3918,6 @@ mod runtime {
                         expected_generation,
                     ) {
                         HlsPayloadLoadRole::AtCapacity => {
-                            // Capacity did not dispatch or account a request. Keep
-                            // this exact ordered admission and retry it after the
-                            // shared bounded body window makes room.
                             async_std::task::sleep(Duration::from_millis(
                                 MEDIA_PREFETCH_BATCH_YIELD_MS,
                             ))
@@ -4921,8 +3933,7 @@ mod runtime {
                 if matches!(&role, HlsPayloadLoadRole::Lead(_, _)) {
                     last_leader_admission_ms = hls_monotonic_now_ms();
                 }
-                // Retain only completion observers. Detached leaders continue to
-                // own transport, cache insertion, and accounting settlement.
+                // Dropping observers leaves detached transport and accounting owners running.
                 loads.push(async move {
                     let result = wait_hls_payload_load(role).await;
                     (reference, result)
@@ -4933,10 +3944,6 @@ mod runtime {
                 return;
             }
 
-            // Authenticated prefix observations and body completions can arrive in
-            // either order. Prefer a ready completion so the serial a->b->c->d
-            // refill chain advances immediately, while still accepting a manifest
-            // that grows from fewer than four references during the first load.
             let (payload, completion, payloads_closed) =
                 match (early_payloads_open, loads.is_empty()) {
                     (true, false) => {
@@ -4963,7 +3970,7 @@ mod runtime {
             if let Some(payload) = payload {
                 if payload.bytes.len() <= MAX_STREAM_FEED_PAYLOAD_BYTES
                     && is_hls_manifest(&payload.bytes)
-                    && hls_manifest_starts_at_sequence_zero(&payload.bytes)
+                    && hls_media_sequence(&payload.bytes) == Some(0)
                 {
                     let ordered_prefix = hls_media_references(&payload.bytes)
                         .into_iter()
@@ -4972,9 +3979,6 @@ mod runtime {
                     if !ordered_prefix.is_empty() {
                         let _ = policy.observe(&ordered_prefix);
                     }
-                    // A shorter observation may arrive out of order. An
-                    // incompatible sequence-zero prefix is ignored so it cannot
-                    // be mixed with bodies from the canonical authenticated view.
                 }
             }
 
@@ -4982,9 +3986,7 @@ mod runtime {
                 let succeeded = result.is_ok();
                 policy.complete(&reference, succeeded);
                 if !succeeded {
-                    // A contiguous prefix with a failed body is not useful. Stop
-                    // only future admissions; detached leaders already dispatched
-                    // elsewhere continue retrieval and accounting settlement.
+                    // Failed-prefix retirement cannot cancel dispatched leaders.
                     return;
                 }
             }
@@ -5019,7 +4021,6 @@ mod runtime {
             let session = session.borrow();
             (session.generation != 0
                 && session.presentation_id != 0
-                && session.sequence_zero_start_requested
                 && session
                     .client
                     .as_ref()
@@ -5064,7 +4065,6 @@ mod runtime {
             let session_matches = session.generation != 0
                 && session.timeline_epoch != 0
                 && session.presentation_id != 0
-                && session.sequence_zero_start_requested
                 && !session.sequence_zero_runway_closed
                 && (!session.sequence_zero_runway_admitted
                     || !session.sequence_zero_extension_claimed)
@@ -5100,7 +4100,6 @@ mod runtime {
             let ticket_current = session.generation == ticket.generation
                 && session.timeline_epoch == ticket.timeline_epoch
                 && session.presentation_id == ticket.presentation_id
-                && session.sequence_zero_start_requested
                 && !session.sequence_zero_runway_closed
                 && !session.timeline_rebasing
                 && session
@@ -5130,7 +4129,6 @@ mod runtime {
             let claim_current = session.generation == ticket.generation
                 && session.timeline_epoch == ticket.timeline_epoch
                 && session.presentation_id == ticket.presentation_id
-                && session.sequence_zero_start_requested
                 && !session.sequence_zero_runway_closed
                 && session.sequence_zero_runway_admitted
                 && !session.sequence_zero_extension_claimed
@@ -5165,7 +4163,6 @@ mod runtime {
             let ticket_current = session.generation == ticket.generation
                 && session.timeline_epoch == ticket.timeline_epoch
                 && session.presentation_id == ticket.presentation_id
-                && session.sequence_zero_start_requested
                 && !session.sequence_zero_runway_closed
                 && session.sequence_zero_runway_admitted
                 && session.sequence_zero_extension_claimed
@@ -5240,7 +4237,6 @@ mod runtime {
                     if session.generation == ticket.generation
                         && session.timeline_epoch == ticket.timeline_epoch
                         && session.presentation_id == ticket.presentation_id
-                        && session.sequence_zero_start_requested
                         && !session.timeline_rebasing
                     {
                         session.sequence_zero_runway_admitted = true;
@@ -5304,9 +4300,7 @@ mod runtime {
                     | HlsPayloadLoadRole::Lead(_, _) => {}
                 }
 
-                // A leader owns transport, cache insertion, and accounting after
-                // this observer is dropped. Later pause/navigation only prevents
-                // future admission and never terminates the dispatched request.
+                // Dropping this observer cannot cancel the detached accounting owner.
                 drop(role);
                 return;
             }
@@ -5335,18 +4329,10 @@ mod runtime {
         })
     }
 
-    fn hls_manifest_starts_at_sequence_zero(bytes: &[u8]) -> bool {
-        hls_media_sequence(bytes) == Some(0)
-    }
-
     fn set_hls_prefetch_mode(mode: HlsPrefetchMode, advance_generation: bool) {
         let publish = HLS_PREFETCH_SESSION.with(|session| {
             let mut session = session.borrow_mut();
             if mode == HlsPrefetchMode::Inactive && advance_generation {
-                // An explicit pause closes future direct-start runway work for
-                // this presentation. A later resume may promote ordinary
-                // playback lookahead, but it must not resurrect the delayed sixth
-                // body captured before the pause.
                 session.sequence_zero_runway_closed = true;
             }
             session.mode = mode;
@@ -5372,11 +4358,7 @@ mod runtime {
             let timeline_rebasing = session.timeline_rebasing;
             let initial_warmup = !timeline_rebasing && session.mode == HlsPrefetchMode::Inactive;
             if timeline_rebasing {
-                // Close the short interval in which the retiring hls.js instance
-                // can still issue foreground requests from its LEVEL_LOADED
-                // callback. Those foreground leaders keep running, but neither
-                // their tracks nor their speculative tasks can become current
-                // again after the replacement manifest opens this new epoch.
+                // Retire the old timeline before its LEVEL_LOADED callback can schedule work.
                 session.advance_timeline();
                 session.tracks.clear();
                 session.startup_overlap_plans.clear();
@@ -5385,15 +4367,8 @@ mod runtime {
             if (initial_warmup || timeline_rebasing)
                 && let Some(now_ms) = now_ms
             {
-                // Feed discovery can legitimately spend the original bounded
-                // prefix window. Give the first parsed media manifest one fresh,
-                // one-shot runway; repeated playlist reloads see StartupOnly and
-                // cannot extend speculative retrieval indefinitely.
                 session.startup_deadline_ms = now_ms + HLS_INITIAL_RESPONSE_BUDGET_MS;
             }
-            // A user-authorized rebase must remain sustained. Downgrading it to
-            // StartupOnly makes the replacement wait for media.play() to resolve
-            // before its own successors may be admitted, creating a buffer stall.
             if session.mode != HlsPrefetchMode::Sustained {
                 session.mode = HlsPrefetchMode::StartupOnly;
             }
@@ -5403,11 +4378,7 @@ mod runtime {
     fn retire_hls_prefetch_timeline() {
         HLS_PREFETCH_SESSION.with(|session| {
             let mut session = session.borrow_mut();
-            // A backwards archive expansion replaces every media plan owned by the
-            // old hls.js instance. Stop only their future lookahead admissions and
-            // retries. Keep the immutable-content generation unchanged so an
-            // already dispatched sequence-zero prefix remains singleflight-
-            // joinable and all old leaders continue through accounting settlement.
+            // Keep immutable work joinable while replacing the archive timeline.
             session.timeline_rebasing = true;
             session.advance_timeline();
             session.tracks.clear();
@@ -5448,7 +4419,6 @@ mod runtime {
             if clear_client {
                 session.client = None;
                 session.feed_identity = None;
-                session.sequence_zero_start_requested = false;
                 session.sequence_zero_runway_admitted = false;
                 session.sequence_zero_extension_claimed = false;
                 session.sequence_zero_runway_closed = false;
@@ -5823,8 +4793,6 @@ mod runtime {
             return None;
         }
 
-        // A size probe retrieves only the immutable root in a detached
-        // singleflight. Dropping this waiter never drops the dispatched request.
         let size = start_hls_payload_size_probe(weeb3, reference.clone())
             .recv()
             .await
@@ -5933,8 +4901,7 @@ mod runtime {
             && attempts < HLS_PREFETCH_MAX_ATTEMPTS
             && hls_prefetch_ticket_current(plan_id, generation, timeline_epoch, schedule_id)
         {
-            // The previous attempt has reached a terminal result, so a bounded
-            // retry cannot ghost or duplicate an unsettled accounting request.
+            // Retry only terminal failures so accounting cannot be duplicated.
             async_std::task::sleep(Duration::from_millis(
                 HLS_PAYLOAD_RETRY_DELAY_MS.saturating_mul(attempts as u64),
             ))
@@ -5944,9 +4911,6 @@ mod runtime {
             }
             let retry = start_hls_payload_load(weeb3.clone(), reference.clone(), true, generation);
             if matches!(&retry, HlsPayloadLoadRole::AtCapacity) {
-                // Capacity is a transient scheduler condition, not a failed media
-                // reference. Preserve this ordered retry without consuming one of
-                // the post-terminal retrieval attempts.
                 continue;
             }
             result = wait_hls_payload_load(retry).await;
@@ -5963,7 +4927,8 @@ mod runtime {
         schedule_id: u64,
         foreground_ready: mpsc::Receiver<bool>,
     ) {
-        let ahead_limit_bytes = hls_prefetch_ahead_limit_bytes();
+        let ahead_limit_bytes =
+            media_prefetch_ahead_limit_bytes(hls_payload_cache_capacity_bytes());
         let startup_target_bytes = HLS_STARTUP_LOOKAHEAD_BYTES.min(ahead_limit_bytes);
         let startup_body_limit = HLS_STARTUP_BODY_MAX_PARALLEL.min(cursor.early_overlap_limit);
         let mut planned_bytes = 0_u64;
@@ -5973,7 +4938,7 @@ mod runtime {
         let mut loads = FuturesUnordered::new();
         let mut budget_blocked = false;
 
-        // Root/body leaders are detached; dropping this scheduler drops observers.
+        // Detached leaders outlive scheduler observers and settle accounting.
         let foreground_succeeded = loop {
             if !hls_prefetch_ticket_current(cursor.plan_id, generation, timeline_epoch, schedule_id)
             {
@@ -6059,18 +5024,12 @@ mod runtime {
                 }
                 HlsStartupProgress::Work(HlsPrefetchProgress::Body((_position, result))) => {
                     if result.is_err() {
-                        // No later position can close this ordered gap. Stop new
-                        // admission immediately; detached leaders still cache and
-                        // settle without keeping this scheduler generation alive.
                         return;
                     }
                 }
             }
         };
 
-        // A false foreground signal or a stale playback ticket closes only future
-        // admissions. The detached leaders above retain ownership until their
-        // terminal retrieval/accounting result and may still populate the cache.
         if !foreground_succeeded
             || !hls_prefetch_ticket_current(cursor.plan_id, generation, timeline_epoch, schedule_id)
         {
@@ -6092,16 +5051,11 @@ mod runtime {
                 timeline_epoch,
                 schedule_id,
             ) {
-                // Dropping waiters stops future admission and retries only. Every
-                // root/body already dispatched is owned by its detached load task
-                // and continues through retrieval and accounting settlement.
                 return;
             }
             let mut capacity_blocked = false;
 
             if planned_bytes >= ahead_limit_bytes {
-                // The horizon is fully admitted. Observe the terminal results so a
-                // transient attempt can use its bounded post-terminal retry.
                 while let Some(result) = loads.next().await {
                     if !hls_sustained_prefetch_ticket_current(
                         cursor.plan_id,
@@ -6178,10 +5132,6 @@ mod runtime {
             }
 
             if capacity_blocked {
-                // An unrelated discovery body or another ordered track may own the
-                // last speculative slot. Do not commit or skip this position, and
-                // do not turn local admission pressure into a retrieval retry.
-                // Already-dispatched leaders keep draining through accounting.
                 async_std::task::sleep(Duration::from_millis(MEDIA_PREFETCH_BATCH_YIELD_MS)).await;
                 continue;
             }
@@ -6207,9 +5157,6 @@ mod runtime {
                 return;
             }
 
-            // Body and root-probe completions race in one work-conserving loop.
-            // Probe results are admitted strictly by manifest position; a slow
-            // later body cannot keep a free slot idle when the next size is ready.
             match next_hls_prefetch_progress(&mut size_probes, &mut loads).await {
                 Some(HlsPrefetchProgress::Probe((position, size))) => {
                     probe_window.complete(position, size);
@@ -6230,10 +5177,8 @@ mod runtime {
     ) -> Option<Arc<[u8]>> {
         let reference = reference.to_ascii_lowercase();
         let foreground_cached =
-            HLS_PAYLOAD_CACHE.with(|cache| cache.borrow().contains_body(&reference));
+            HLS_PAYLOAD_CACHE.with(|cache| cache.borrow().bodies.contains_key(&reference));
         let context = hls_foreground_context(&reference, foreground_cached);
-        // Register the foreground before the exact-next overlap. Foreground never
-        // competes for speculative admission and promotes an exact pending load.
         let foreground =
             start_hls_payload_load(weeb3.clone(), reference.clone(), false, context.generation);
         if let Some(overlap_schedule_id) = context.schedule_id
@@ -6318,12 +5263,6 @@ mod runtime {
                             overlap_generation,
                         ) {
                             HlsPayloadLoadRole::AtCapacity => {
-                                // Capacity did not dispatch or account this exact
-                                // successor. Retain its ordered position until an
-                                // old plan drains a shared slot or the foreground
-                                // promotes a pending body. The ticket check above
-                                // retires this loop on pause, seek, rebase, or a
-                                // terminal foreground failure.
                                 if capacity_retries >= capacity_retry_limit {
                                     return;
                                 }
@@ -6335,9 +5274,7 @@ mod runtime {
                             }
                             HlsPayloadLoadRole::Reject(_) => return,
                             role => {
-                                // The detached leader retains transport, cache, and
-                                // accounting ownership. A waiter can be dropped
-                                // because the foreground will join the same hash.
+                                // Foreground retrieval will join this detached leader by hash.
                                 drop(role);
                                 break;
                             }
@@ -6349,11 +5286,6 @@ mod runtime {
 
         let (foreground_ready_out, foreground_ready_in) = mpsc::bounded(1);
         if let (Some(schedule_id), Some(cursor)) = (context.schedule_id, context.cursor.clone()) {
-            // Register the staged runway while the visible body is still in
-            // flight. An uncached foreground keeps the same head start as ordered
-            // exact-successor startup. Completed cache hits have no transport to
-            // protect and may roll lookahead immediately. The result below controls
-            // whether bounded warm-up may continue into sustained lookahead.
             if foreground_cached {
                 spawn_hls_prefetch_stages(
                     weeb3.clone(),
@@ -6387,11 +5319,7 @@ mod runtime {
             && attempts < HLS_FOREGROUND_MAX_ATTEMPTS
             && hls_foreground_retry_is_current(context.generation, context.timeline_epoch)
         {
-            // A foreground request may have promoted a speculative leader that
-            // subsequently failed. Retry only after each shared result is terminal
-            // so no dispatched/accounting-sensitive request is abandoned. Several
-            // whole-fragment attempts are worthwhile because one missing leaf out
-            // of hundreds otherwise creates a visible two-second timeline hole.
+            // Retry only after the shared accounting-sensitive result is terminal.
             async_std::task::sleep(Duration::from_millis(
                 HLS_PAYLOAD_RETRY_DELAY_MS.saturating_mul(attempts as u64),
             ))
@@ -6420,10 +5348,6 @@ mod runtime {
         if foreground_succeeded
             && let (Some(schedule_id), Some(cursor)) = (context.schedule_id, context.cursor.clone())
         {
-            // Close the race where the previous runner relinquished this track
-            // before the in-flight foreground entered the immutable-body cache.
-            // If either the old runner or the delayed starter still owns it, the
-            // normal running-generation gate makes this a no-op.
             let (completed_out, completed_in) = mpsc::bounded(1);
             let _ = completed_out.try_send(true);
             spawn_hls_prefetch_stages(
@@ -6435,10 +5359,7 @@ mod runtime {
                 completed_in,
             );
         }
-        // The foreground body is the player's only path to append media and build
-        // its own buffer. Return it as soon as retrieval completes; exact overlap,
-        // prefix leaders, and staged lookahead remain detached and continue
-        // through their normal accounting lifecycle.
+        // Return foreground bytes immediately while detached lookahead continues.
         body.ok()
     }
 
@@ -6524,8 +5445,6 @@ mod runtime {
         let mut prefetched_body = None;
         let is_manifest =
             if payload_size > MAX_STREAM_FEED_PAYLOAD_BYTES as u64 && is_hls_manifest(&probe) {
-                // Preserve the classification so the caller can reject it without
-                // joining the entire oversized tree for a HEAD or Range probe.
                 true
             } else {
                 match probe_hls_manifest(&probe, payload_size) {
@@ -6567,66 +5486,38 @@ mod runtime {
         method: String,
         local_bytes_base: String,
     ) -> FetchResponse {
-        // Capture the active direct, unindexed view generation before the feed
-        // lookup. Indexed/archive reads must never spend its startup runway. A
-        // pause, navigation, or timeline replacement while that lookup is in
-        // flight invalidates the optional fifth/sixth-fragment admissions.
         let runway_ticket = (method != "HEAD" && index_hint.is_none())
             .then(|| hls_sequence_zero_runway_ticket(&weeb3, &owner, &topic))
             .flatten();
-        let snapshot = match load_feed_snapshot(
-            weeb3.clone(),
-            owner.clone(),
-            topic.clone(),
-            index_hint,
-            false,
-        )
-        .await
-        {
-            Some(snapshot) => snapshot,
-            // A valid owner/topic route can fail because the current routing view
-            // did not retrieve its update. That is not authoritative absence:
-            // expose a retryable status so hls.js does not turn a transient Swarm
-            // miss into a permanent playlist failure.
-            None => return FetchResponse::error(503, "weeb-3 did not retrieve feed update"),
-        };
-
-        let is_hls = is_hls_manifest(&snapshot.body);
-        let body = if is_hls {
-            let rewritten = if index_hint.is_none() {
-                rewrite_hls_manifest_for_live_reload(
-                    &snapshot.body,
-                    &local_bytes_base,
-                    snapshot.finalized,
-                )
-            } else {
-                rewrite_hls_manifest(&snapshot.body, &local_bytes_base)
+        let snapshot =
+            match load_feed_snapshot(weeb3.clone(), owner.clone(), topic.clone(), index_hint).await
+            {
+                Some(snapshot) => snapshot,
+                None => return FetchResponse::error(503, "weeb-3 did not retrieve feed update"),
             };
-            match rewritten {
-                Some(body) => body,
-                None => return FetchResponse::error(502, "invalid HLS manifest"),
-            }
-        } else {
-            snapshot.body.to_vec()
-        };
-        if is_hls {
-            // Install the immutable order before admitting the one direct-start
-            // runway body. General lookahead still waits for hls.js's first real
-            // fragment request.
-            remember_hls_media_plan(&body);
-            prefetch_hls_sequence_zero_runway_segment(&weeb3, &owner, &topic, &body, runway_ticket);
+
+        if !is_hls_manifest(&snapshot.body) {
+            return FetchResponse::error(502, "feed update is not an HLS manifest");
         }
+        let rewritten = if index_hint.is_none() {
+            rewrite_hls_manifest_for_live_reload(
+                &snapshot.body,
+                &local_bytes_base,
+                snapshot.finalized,
+            )
+        } else {
+            rewrite_hls_manifest(&snapshot.body, &local_bytes_base)
+        };
+        let Some(body) = rewritten else {
+            return FetchResponse::error(502, "invalid HLS manifest");
+        };
+        remember_hls_media_plan(&body);
+        prefetch_hls_sequence_zero_runway_segment(&weeb3, &owner, &topic, &body, runway_ticket);
 
         let headers = vec![
             (
                 "Content-Type".to_string(),
-                if is_hls {
-                    "application/vnd.apple.mpegurl".to_string()
-                } else if serde_json::from_slice::<serde_json::Value>(&body).is_ok() {
-                    "application/json; charset=utf-8".to_string()
-                } else {
-                    "application/octet-stream".to_string()
-                },
+                "application/vnd.apple.mpegurl".to_string(),
             ),
             ("Cache-Control".to_string(), "no-store".to_string()),
             (
@@ -6649,9 +5540,6 @@ mod runtime {
             return FetchResponse::ok(200, headers, None);
         }
 
-        // Manifests and catalog payloads are deliberately no-store. Segment
-        // references inside manifests point at immutable /bytes routes and retain
-        // their existing retrieval/cache behavior.
         FetchResponse::ok(200, headers, Some(body))
     }
 
@@ -6660,14 +5548,14 @@ mod runtime {
         owner: String,
         topic: String,
         index_hint: Option<u64>,
-        fresh_live: bool,
     ) -> Option<FeedRouteSnapshot> {
         let owner = owner
             .trim_start_matches("0x")
             .trim_start_matches("0X")
             .to_string();
         let topic = normalize_feed_topic(&topic);
-        let sequence_zero_presentation_id = (index_hint.is_none() && !fresh_live)
+        let sequence_zero_presentation_id = index_hint
+            .is_none()
             .then(|| hls_sequence_zero_start_presentation_for_feed(&weeb3, &owner, &topic))
             .flatten();
         let sequence_zero_start_requested = sequence_zero_presentation_id.is_some();
@@ -6693,8 +5581,8 @@ mod runtime {
             };
             let state = cache.get_mut(&selected_key)?;
             let now = js_sys::Date::now();
-            let refresh_head = index_hint.is_none()
-                && (fresh_live || cached_feed_should_refresh_head(state.last_touch, now));
+            let refresh_head =
+                index_hint.is_none() && cached_feed_should_refresh_head(state.last_touch, now);
             state.last_touch = now;
             Some((state.snapshot.clone(), refresh_head, selected_key))
         });
@@ -6705,7 +5593,7 @@ mod runtime {
             let cached_late_window = sequence_zero_start_requested
                 && !cached_is_sequence_zero_presentation
                 && hls_media_sequence(&snapshot.body).is_some_and(|sequence| sequence > 0);
-            if index_hint.is_none() && !fresh_live && !cached_late_window {
+            if index_hint.is_none() && !cached_late_window {
                 let followup_mode = if cached_is_sequence_zero_presentation {
                     FeedFollowupMode::SequenceZeroPresentation
                 } else {
@@ -6721,18 +5609,9 @@ mod runtime {
                 );
                 return Some(snapshot);
             }
-            if !fresh_live {
-                return Some(snapshot);
-            }
-            // A direct UI/catalog open has no automatic polling consumer. Await a
-            // latest-head read so reopening it cannot render an arbitrarily stale
-            // cached catalog. The monotonic store below still wins any race.
+            return Some(snapshot);
         }
 
-        // An index supplied by a past-stream catalog is an immutable snapshot,
-        // not a lower bound. Never substitute the current feed head if that exact
-        // update is unavailable, and keep it isolated from the advancing live
-        // cache entry for the same owner/topic.
         let network_id = active_profile().swarm_network_id;
         let mut authenticated_startup_prefix = None;
         let loaded = match index_hint {
@@ -6762,20 +5641,12 @@ mod runtime {
                                 if sequence_zero_start_requested
                                     && hls_media_sequence(&candidate.bytes) != Some(0)
                                 {
-                                    // A reliably confirmed rolling ENDLIST remains
-                                    // a useful canonical/catalog hint, but cannot
-                                    // be the presentation shortcut for a new
-                                    // start-at-zero share session.
                                     None
                                 } else {
                                     Some(candidate)
                                 }
                             }
                             _ => {
-                                // A catalog index is only a performance hint. An
-                                // unavailable, malformed, live, or stale exact SOC
-                                // must never change the unindexed route's fallback
-                                // semantics.
                                 forget_vod_index(network_id, &owner, &topic);
                                 None
                             }
@@ -6806,13 +5677,7 @@ mod runtime {
                             let reliable_prefix_owner = owner.clone();
                             let reliable_prefix_topic = topic.clone();
                             spawn_local(async move {
-                                // The bounded frontier already dispatches index
-                                // three, but its Bee-compatible one-second result
-                                // listener can expire before a sparse cold peer
-                                // view answers. Retain one detached reliable
-                                // observer for a direct start-at-zero route.
-                                // Closing its notification never cancels dispatched
-                                // retrieval/accounting work.
+                                // Keep one detached index-three observer past the frontier timeout.
                                 if let Some(payload) = reliable_prefix_client
                                     .hls_feed_payload_at_index(
                                         reliable_prefix_owner,
@@ -6837,10 +5702,7 @@ mod runtime {
                             .await;
                         });
 
-                        // Own the canonical finder in a detached task. Selecting
-                        // the decoded prefix below drops only a result listener;
-                        // the full frontier algorithm and every dispatched,
-                        // accounted lookup continue to completion.
+                        // Dropping this listener cannot cancel the detached canonical frontier.
                         let (canonical_out, canonical_in) =
                             mpsc::bounded::<Option<crate::bzz_stream::RawFeedPayload>>(1);
                         let canonical_client = weeb3.clone();
@@ -6885,7 +5747,6 @@ mod runtime {
                                                     &canonical.bytes,
                                                     &prefix.bytes,
                                                     HLS_EARLY_FEED_PREFIX_TARGET_SEGMENTS,
-                                                    true,
                                                 )
                                         });
                                     if preferred.is_none()
@@ -6901,7 +5762,6 @@ mod runtime {
                                             &canonical.bytes,
                                             &prefix.bytes,
                                             HLS_EARLY_FEED_PREFIX_TARGET_SEGMENTS,
-                                            true,
                                         )
                                     {
                                         preferred = Some(prefix);
@@ -6948,19 +5808,10 @@ mod runtime {
                         &canonical_loaded.bytes,
                         &prefix.bytes,
                         HLS_EARLY_FEED_PREFIX_TARGET_SEGMENTS,
-                        sequence_zero_start_requested,
                     )
             })
             .unwrap_or_else(|| canonical_loaded.clone());
-        // A cold unindexed service fetch may expose any owner-authenticated,
-        // decoded HLS candidate immediately. This includes an ENDLIST-bearing
-        // historical update: ENDLIST proves that immutable playlist ended, but not
-        // that the mutable sequence feed has no higher update. Exact/reliable head
-        // verification continues behind the cache so segment retrieval overlaps
-        // it instead of waiting serially. Direct UI feed opens retain their
-        // fresh-head behavior, while explicit-index routes remain immutable.
         let provisional_hls = index_hint.is_none()
-            && !fresh_live
             && canonical_loaded.bytes.len() <= MAX_STREAM_FEED_PAYLOAD_BYTES
             && is_hls_manifest(&canonical_loaded.bytes);
         let (loaded, head_confirmed) = if index_hint.is_none() && !provisional_hls {
@@ -6991,11 +5842,6 @@ mod runtime {
             } else {
                 FeedFollowupMode::Canonical
             };
-        // Never seed a fresh start-at-zero presentation with a late rolling
-        // window: its high feed index would reject the lower authenticated prefix.
-        // Keep that rare initial fallback in the canonical live namespace. Once a
-        // session has published sequence zero, its session-scoped overlay may
-        // safely advance through continuous rolling windows for active playback.
         let cache_key = if sequence_zero_start_requested
             && hls_media_sequence(&loaded.bytes).is_some_and(|sequence| sequence > 0)
         {
@@ -7011,9 +5857,6 @@ mod runtime {
         let snapshot =
             store_feed_snapshot(&cache_key, snapshot, index_hint.is_none(), followup_mode);
         if index_hint.is_none() && snapshot.finalized {
-            // Persist only the monotonic, reliably head-confirmed unindexed cache
-            // winner. Opening an arbitrary exact historical ENDLIST must never
-            // poison later latest-feed resolution.
             remember_authenticated_endlist_index(network_id, &owner, &topic, snapshot.index);
         }
         if let Some(initial) = stabilization_seed {
@@ -7036,9 +5879,6 @@ mod runtime {
         weeb3: &Weeb3,
         expected_network_id: u64,
     ) -> bool {
-        // Playback and provisional manifest polling already proceed from the first
-        // priced peer. Only the irreversible ENDLIST decision waits for a wider
-        // peer view and a reliable head search.
         async_std::task::sleep(HLS_TERMINAL_CONFIRMATION_MIN_DELAY).await;
         for poll in 0..=HLS_TERMINAL_CONFIRMATION_MAX_POLLS {
             if weeb3.get_network_id().await != expected_network_id {
@@ -7080,9 +5920,6 @@ mod runtime {
         else {
             return (candidate, false);
         };
-        // The reliable lookup may itself wait on several peer exchanges. Do not
-        // carry its terminal verdict across a network change or a peer-view
-        // collapse that happened while it was in flight.
         if weeb3.get_network_id().await != expected_network_id {
             return (candidate, false);
         }
@@ -7132,10 +5969,6 @@ mod runtime {
         let mut head_confirmed = false;
 
         'stabilize: loop {
-            // ENDLIST is not trusted as terminal here. It is, however, a useful
-            // seed for the mature reliable finder below, which can still discover
-            // any newer update. Avoid stacking bounded and exact negative scans
-            // for a candidate whose only remaining question is whether it is head.
             if hls_is_finalized(&loaded.bytes) {
                 break 'stabilize;
             }
@@ -7151,13 +5984,13 @@ mod runtime {
                         ),
                     )
                     .await;
-                if let Some(recheck) = weeb3
-                    .latest_hls_feed_payload_bounded_from(
-                        owner.to_string(),
-                        topic.to_string(),
-                        loaded.clone(),
-                    )
-                    .await
+                if let Some(recheck) = acquire_latest_raw_feed_payload_bounded_from(
+                    owner.to_string(),
+                    topic.to_string(),
+                    loaded.clone(),
+                    &weeb3.chunk_port.0,
+                )
+                .await
                     && recheck.index > loaded.index
                     && recheck.bytes.len() <= MAX_STREAM_FEED_PAYLOAD_BYTES
                     && is_hls_manifest(&recheck.bytes)
@@ -7181,20 +6014,15 @@ mod runtime {
                     break 'stabilize;
                 };
                 let next = if bounded_rechecks < HLS_INITIAL_BOUNDED_RECHECK_LIMIT {
-                    // This is only a result-listener deadline around the exact SOC
-                    // probe. A request that crossed accounting remains detached
-                    // and drains, and an authenticated manifest body is still
-                    // decoded without a deadline.
-                    weeb3
-                        .hls_feed_payload_at_index_bounded(
-                            owner.to_string(),
-                            topic.to_string(),
-                            next_index,
-                        )
-                        .await
+                    // The deadline covers only the listener; dispatched accounting still drains.
+                    acquire_raw_feed_payload_at_index_bounded(
+                        owner.to_string(),
+                        topic.to_string(),
+                        next_index,
+                        &weeb3.chunk_port.0,
+                    )
+                    .await
                 } else {
-                    // Preserve the existing 32-update reliable fallback once both
-                    // bounded frontier rechecks have had their chance.
                     weeb3
                         .hls_feed_payload_at_index(owner.to_string(), topic.to_string(), next_index)
                         .await
@@ -7203,10 +6031,6 @@ mod runtime {
                     if bounded_rechecks < HLS_INITIAL_BOUNDED_RECHECK_LIMIT {
                         continue 'stabilize;
                     }
-                    // A failed exact read is never proof of the head: on a sparse
-                    // priced-peer view an existing SOC can be temporarily absent.
-                    // Leave detail empty so the reliable seeded finder confirms
-                    // both archived and genuinely live feeds below.
                     break 'stabilize;
                 };
                 if next.index != next_index {
@@ -7246,12 +6070,6 @@ mod runtime {
                     ),
                 )
                 .await;
-            // A bounded/exact phase that already reached ENDLIST does not need an
-            // unbounded absent-head traversal before terminal confirmation. The
-            // confirmation below first waits for the mature eight-peer view and
-            // then performs the reliable, network-sandwiched lookup once. Live
-            // candidates still need this preliminary finder to discover a newer
-            // snapshot.
             let reliable = if hls_is_finalized(&loaded.bytes) {
                 Some(loaded.clone())
             } else {
@@ -7270,10 +6088,6 @@ mod runtime {
                         && is_hls_manifest(&reliable.bytes) =>
                 {
                     loaded = reliable;
-                    // A first-peer negative result is not proof that no higher SOC
-                    // exists. Publish the authenticated candidate provisionally,
-                    // then require a wider peer view and a repeated head search
-                    // before allowing ENDLIST to become terminal.
                     observe_candidate(&loaded, false);
                     let confirmation =
                         confirm_terminal_feed_head(weeb3.clone(), owner, topic, loaded, network_id)
@@ -7281,9 +6095,6 @@ mod runtime {
                     loaded = confirmation.0;
                     head_confirmed = confirmation.1;
                     if head_confirmed {
-                        // Equality is meaningful only after the mature-peer
-                        // confirmation: promote a byte-identical cached ENDLIST
-                        // without requiring a nonexistent higher update.
                         observe_candidate(&loaded, true);
                     }
                     if hls_is_finalized(&loaded.bytes) && head_confirmed {
@@ -7396,11 +6207,7 @@ mod runtime {
         initial: crate::bzz_stream::RawFeedPayload,
         followup_mode: FeedFollowupMode,
     ) {
-        // This task deliberately outlives the manifest response. The feed probes
-        // it dispatches retain their accounting drain even if the view changes
-        // while head verification is still running. Each continuous authenticated
-        // advance is published immediately so hls.js reloads do not remain pinned
-        // to the first presentation snapshot.
+        // Head verification outlives the response and publishes continuous advances.
         let (_, head_confirmed) = stabilize_initial_unindexed_hls_payload(
             weeb3.clone(),
             &owner,
@@ -7423,19 +6230,11 @@ mod runtime {
             release_feed_route_check(&cache_key, checking_token)
         {
             if cache_finalized {
-                // Use the exact token-guarded cache entry. Recomputing a key from
-                // the global active profile here could cross networks if the user
-                // switched modes while this detached task drained.
                 remember_authenticated_endlist_index(network_id, &owner, &topic, cache_index);
             } else {
-                // Any v2 catalog hint remains a useful seed, but a reliable
-                // live-head result disproves its terminality. Do not let that stale
-                // exact update shortcut a future unindexed open.
                 if head_confirmed {
                     forget_vod_index(network_id, &owner, &topic);
                 }
-                // A transient exact miss is not terminal. Keep the lightweight
-                // exact-next poller available after reliable stabilization.
                 schedule_feed_followup(weeb3, cache_key, owner, topic, false, followup_mode);
             }
         }
@@ -7475,11 +6274,7 @@ mod runtime {
         network_id: u64,
         initial: crate::bzz_stream::RawFeedPayload,
     ) {
-        // The exact prefix follower may already own `checking_token`. Do not cancel
-        // it or steal its token: its current accounted request continues to drain
-        // and it may keep growing useful startup runway. This single independent
-        // pass starts from the far-ahead canonical seed and publishes only its
-        // stabilized result through the same monotonic continuity gate.
+        // Preserve the exact follower's token while stabilizing the canonical seed.
         let (candidate, head_confirmed) = stabilize_initial_unindexed_hls_payload(
             weeb3.clone(),
             &owner,
@@ -7580,10 +6375,6 @@ mod runtime {
             true,
             FeedFollowupMode::SequenceZeroPresentation,
         );
-        // Start exact contiguous growth immediately. This claim performs useful
-        // index-4+ work instead of reserving the route while the independent
-        // canonical finder is still pending. Fan-out observations may still
-        // advance the cache through the same monotonic/continuity gate.
         schedule_feed_followup(
             weeb3.clone(),
             cache_key.clone(),
@@ -7602,20 +6393,12 @@ mod runtime {
                 InitialCanonicalFeedResolution::Unavailable => None,
             };
             if let Some(initial) = initial {
-                // The bounded canonical finder can stop on a far-ahead rolling
-                // update while the exact prefix follower owns `checking_token`.
-                // Keep one independent presentation-scoped stabilization pass so
-                // that seed can reach the full sequence-zero ENDLIST instead of
-                // being discarded by a one-shot cache-claim race.
                 schedule_sequence_zero_canonical_stabilization(
                     weeb3, cache_key, owner, topic, network_id, initial,
                 );
                 return;
             }
 
-            // The canonical resolver completed without a decoded payload. Its
-            // already-dispatched lookups have still drained normally. The exact
-            // follower above remains the useful retry path.
             if weeb3.get_network_id().await == network_id {
                 schedule_feed_followup(
                     weeb3,
@@ -7648,37 +6431,6 @@ mod runtime {
             "{}:sequence-zero:{presentation_id:016x}",
             feed_cache_key(owner, topic, None)
         )
-    }
-
-    fn cached_finalized_feed_index(
-        owner: &str,
-        topic: &str,
-        sequence_zero_presentation_id: Option<u64>,
-    ) -> Option<u64> {
-        let owner = owner.trim_start_matches("0x").trim_start_matches("0X");
-        let topic = normalize_feed_topic(topic);
-        let mut cache_keys = Vec::with_capacity(2);
-        let require_sequence_zero = sequence_zero_presentation_id.is_some();
-        if let Some(presentation_id) = sequence_zero_presentation_id {
-            cache_keys.push(sequence_zero_feed_cache_key(owner, &topic, presentation_id));
-        }
-        cache_keys.push(feed_cache_key(owner, &topic, None));
-        FEED_ROUTE_CACHE.with(|cache| {
-            let mut cache = cache.borrow_mut();
-            for cache_key in cache_keys {
-                let Some(state) = cache.get_mut(&cache_key) else {
-                    continue;
-                };
-                if state.snapshot.finalized
-                    && (!require_sequence_zero
-                        || hls_media_sequence(&state.snapshot.body) == Some(0))
-                {
-                    state.last_touch = js_sys::Date::now();
-                    return Some(state.snapshot.index);
-                }
-            }
-            None
-        })
     }
 
     enum FeedRouteBodyUpdate {
@@ -7725,12 +6477,6 @@ mod runtime {
         FEED_ROUTE_CACHE.with(|cache| {
             let mut cache = cache.borrow_mut();
             if let Some(existing) = cache.get_mut(cache_key) {
-                // Two cold live lookups may complete out of order. Content-addressed
-                // pinned entries share an exact index, while a live entry must never
-                // move backwards to a slower, older frontier result. A reliably
-                // confirmed terminal head cannot move again. At an equal immutable
-                // index, only promote a byte-identical provisional snapshot to
-                // confirmed finality.
                 if existing.snapshot.finalized || existing.snapshot.index > snapshot.index {
                     existing.last_touch = js_sys::Date::now();
                     return existing.snapshot.clone();
@@ -7870,9 +6616,6 @@ mod runtime {
                 state.checking_token = 0;
                 (state.snapshot.finalized, state.snapshot.index)
             };
-            // Entries protected while an authenticated lookup was draining may
-            // have temporarily kept the cache over budget. Re-run eviction as soon
-            // as that protection is released.
             trim_feed_route_cache(&mut cache, cache_key);
             Some(released)
         })
@@ -8070,8 +6813,6 @@ mod runtime {
                         )
                     }
                 })
-                // `buffered` overlaps retrieval but yields in input order, so no
-                // later feed update can publish across a missing exact index.
                 .buffered(feed_followup_max_parallel(followup_mode));
             while let Some((next_index, next)) = exact_followups.next().await {
                 let Some(next) = next else {
@@ -8116,9 +6857,6 @@ mod runtime {
                     state.snapshot = FeedRouteSnapshot {
                         index: next.index,
                         body,
-                        // Exact adjacency proves sequence continuity, not that
-                        // this is the feed head. Reliable head confirmation below
-                        // is the only path that may expose ENDLIST.
                         finalized: false,
                     };
                     state.last_touch = js_sys::Date::now();
@@ -8135,9 +6873,7 @@ mod runtime {
                     break;
                 }
             }
-            // Dropping buffered tail observers closes only their queued admission
-            // and future hedges. Any peer request already dispatched keeps its
-            // detached terminal accounting lifecycle.
+            // Dropping tail observers cannot cancel dispatched accounting work.
             drop(exact_followups);
 
             if feed_followup_should_refresh_head(
@@ -8258,7 +6994,7 @@ mod runtime {
     }
 
     fn local_hls_bytes_base(pathname: &str) -> String {
-        let base = streaming_route_base();
+        let base = STREAMING_ROUTE_BASE;
         if pathname.starts_with(&format!("{base}/testnet/")) {
             streaming_route_path("testnet/hls/bytes")
         } else if pathname.starts_with(&format!("{base}/mainnet/")) {
@@ -8268,90 +7004,9 @@ mod runtime {
         }
     }
 
-    pub(crate) async fn open_feed_view(weeb3: Arc<Weeb3>, owner: String, topic: String) {
+    pub(crate) async fn open_hls_feed_view(weeb3: Arc<Weeb3>, owner: String, topic: String) {
         let view_generation = begin_result_view_request();
-        render_stream_status_for_generation("Resolving Swarm stream feed...", view_generation);
-        let owner = owner
-            .trim()
-            .trim_start_matches("0x")
-            .trim_start_matches("0X")
-            .to_string();
-        let topic = normalize_feed_topic(&topic);
-        let Some(snapshot) =
-            load_feed_snapshot(weeb3.clone(), owner.clone(), topic.clone(), None, true).await
-        else {
-            render_stream_status_for_generation(
-                "Could not retrieve the Swarm feed.",
-                view_generation,
-            );
-            return;
-        };
-        if !result_view_request_is_current(view_generation) {
-            return;
-        }
-
-        if is_hls_manifest(&snapshot.body) {
-            open_hls_feed_view_generation(
-                weeb3,
-                owner,
-                topic,
-                "video".to_string(),
-                None,
-                HlsOpenIntent::CurrentWindow,
-                view_generation,
-            )
-            .await;
-            return;
-        }
-
-        let Some(entries) = parse_stream_catalog(&snapshot.body) else {
-            render_stream_status_for_generation(
-                "The feed is neither an HLS manifest nor a supported stream catalog.",
-                view_generation,
-            );
-            return;
-        };
-        render_stream_catalog(weeb3, entries, view_generation);
-    }
-
-    pub(crate) async fn open_hls_feed_view(
-        weeb3: Arc<Weeb3>,
-        owner: String,
-        topic: String,
-        media_type: String,
-        index_hint: Option<u64>,
-    ) {
-        let view_generation = begin_result_view_request();
-        open_hls_feed_view_generation(
-            weeb3,
-            owner,
-            topic,
-            media_type,
-            index_hint,
-            HlsOpenIntent::Beginning,
-            view_generation,
-        )
-        .await;
-    }
-
-    async fn open_hls_feed_view_current_window(
-        weeb3: Arc<Weeb3>,
-        owner: String,
-        topic: String,
-        media_type: String,
-        index_hint: Option<u64>,
-    ) {
-        let view_generation = begin_result_view_request();
-        open_hls_feed_view_generation(
-            weeb3,
-            owner,
-            topic,
-            media_type,
-            index_hint,
-            HlsOpenIntent::CurrentWindow,
-            view_generation,
-        )
-        .await;
+        open_hls_feed_view_generation(weeb3, owner, topic, view_generation).await;
     }
 
     #[derive(Clone)]
@@ -8359,16 +7014,12 @@ mod runtime {
         owner: String,
         topic: String,
         source: String,
-        index_hint: Option<u64>,
-        sequence_zero_start_requested: bool,
     }
 
     async fn prepare_hls_feed_target(
         weeb3: &Arc<Weeb3>,
         owner: String,
         topic: String,
-        index_hint: Option<u64>,
-        intent: HlsOpenIntent,
         view_generation: u64,
     ) -> Result<HlsFeedTarget, String> {
         if !service_worker_controls_bzz_requests(weeb3, "HLS feed and segment requests", || {
@@ -8395,11 +7046,9 @@ mod runtime {
         }
 
         Ok(HlsFeedTarget {
-            source: canonical_hls_feed_url(&owner, &topic, index_hint),
+            source: format!("{}/{}/{}", streaming_route_path("feeds"), owner, topic),
             owner,
             topic,
-            index_hint,
-            sequence_zero_start_requested: intent.requests_sequence_zero(index_hint),
         })
     }
 
@@ -8407,6 +7056,7 @@ mod runtime {
         weeb3: Arc<Weeb3>,
         player: &Element,
         target: &HlsFeedTarget,
+        hls_loader: JsFuture,
         view_generation: u64,
     ) -> Result<&'static str, String> {
         if !result_view_request_is_current(view_generation) {
@@ -8417,29 +7067,14 @@ mod runtime {
             weeb3.clone(),
             target.owner.clone(),
             target.topic.clone(),
-            target.sequence_zero_start_requested,
             view_generation,
         );
-        install_hls_route_canonicalization(
-            player,
-            &target.owner,
-            &target.topic,
-            target.index_hint,
-            target.sequence_zero_start_requested,
-            view_generation,
-        );
-
         weeb3.interface_log(format!(
-            "HLS open owner={} topic={}{}",
-            target.owner,
-            target.topic,
-            target
-                .index_hint
-                .map(|index| format!(" index={}", index))
-                .unwrap_or_default()
+            "HLS open owner={} topic={}",
+            target.owner, target.topic
         ));
 
-        let mode = play_hls(player, &target.source)
+        let mode = play_hls(player, &target.source, hls_loader)
             .await
             .map_err(|error| format!("Could not initialize HLS: {}", js_error_message(&error)))?;
         if !result_view_request_is_current(view_generation) {
@@ -8448,50 +7083,18 @@ mod runtime {
         Ok(mode)
     }
 
-    pub(crate) async fn attach_hls_feed_media(
-        weeb3: Arc<Weeb3>,
-        player: Element,
-        owner: String,
-        topic: String,
-        index_hint: Option<u64>,
-        intent: HlsOpenIntent,
-    ) -> Result<&'static str, String> {
-        if !player.is_connected() {
-            return Err(
-                "attach the HLS media element to the document before opening the stream".into(),
-            );
-        }
-        let view_generation = begin_result_view_request();
-        release_current_stream_view();
-        let target =
-            prepare_hls_feed_target(&weeb3, owner, topic, index_hint, intent, view_generation)
-                .await?;
-        attach_hls_feed_player(weeb3, &player, &target, view_generation).await
-    }
-
     async fn open_hls_feed_view_generation(
         weeb3: Arc<Weeb3>,
         owner: String,
         topic: String,
-        media_type: String,
-        index_hint: Option<u64>,
-        intent: HlsOpenIntent,
         view_generation: u64,
     ) {
+        let hls_loader = JsFuture::from(load_hls());
         render_stream_status_for_generation(
             "Preparing reload-free Service Worker routing for HLS...",
             view_generation,
         );
-        let target = match prepare_hls_feed_target(
-            &weeb3,
-            owner,
-            topic,
-            index_hint,
-            intent,
-            view_generation,
-        )
-        .await
-        {
+        let target = match prepare_hls_feed_target(&weeb3, owner, topic, view_generation).await {
             Ok(target) => target,
             Err(error) => {
                 if result_view_request_is_current(view_generation) {
@@ -8502,16 +7105,8 @@ mod runtime {
         };
         let document = web_sys::window().unwrap().document().unwrap();
         let wrapper = document.create_element("section").unwrap();
-        let player = create_hls_player(&media_type);
+        let player = create_hls_player();
         let status = document.create_element("div").unwrap();
-        let (share_control, share_callback) = create_stream_share_control(
-            &target.owner,
-            &target.topic,
-            target.index_hint,
-            "this stream",
-            &format!("player-{view_generation}"),
-            view_generation,
-        );
         status.set_class_name("weeb3-hls-status");
         let status_id = format!("weeb3-hls-status-{view_generation}");
         status.set_id(&status_id);
@@ -8522,15 +7117,19 @@ mod runtime {
         let _ = player.set_attribute("aria-describedby", &status_id);
         let _ = wrapper.append_child(&player);
         let _ = wrapper.append_child(&status);
-        let _ = wrapper.append_child(&share_control);
         if !replace_stream_result_view(&wrapper, view_generation) {
             return;
         }
-        STREAM_CATALOG_CALLBACKS.with(|stored| {
-            *stored.borrow_mut() = share_callback.into_iter().collect();
-        });
 
-        let mode = match attach_hls_feed_player(weeb3, &player, &target, view_generation).await {
+        let mode = match attach_hls_feed_player(
+            weeb3,
+            &player,
+            &target,
+            hls_loader,
+            view_generation,
+        )
+        .await
+        {
             Ok(mode) => mode,
             Err(error) => {
                 status.set_text_content(Some(&error));
@@ -8544,315 +7143,13 @@ mod runtime {
             "HLS player attached with {mode}; loading through weeb-3. Press play if autoplay is blocked.",
         )));
     }
-
-    fn render_stream_catalog(
-        weeb3: Arc<Weeb3>,
-        entries: Vec<StreamCatalogEntry>,
-        view_generation: u64,
-    ) {
-        if !result_view_request_is_current(view_generation) {
-            return;
-        }
-        let vod_hints = entries
-            .iter()
-            .filter_map(|entry| {
-                entry.is_vod().then_some((
-                    entry.owner.clone(),
-                    normalize_feed_topic(&entry.topic),
-                    entry.index?,
-                ))
-            })
-            .collect::<Vec<_>>();
-        if !vod_hints.is_empty() {
-            remember_catalog_vod_indices(active_profile().swarm_network_id, vod_hints);
-        }
+    fn create_hls_player() -> Element {
         let document = web_sys::window().unwrap().document().unwrap();
-        let catalog = document.create_element("section").unwrap();
-        catalog.set_class_name("weeb3-stream-catalog");
-        let heading = document.create_element("h3").unwrap();
-        heading.set_text_content(Some("Streams on Swarm"));
-        let explanation = document.create_element("p").unwrap();
-        explanation.set_text_content(Some(
-            "Choose a stream. Archived manifests use their exact feed index for a fast, deterministic lookup.",
-        ));
-        let _ = catalog.append_child(&heading);
-        let _ = catalog.append_child(&explanation);
-
-        if entries.is_empty() {
-            let empty = document.create_element("p").unwrap();
-            empty.set_text_content(Some(
-                "This stream catalog does not contain any entries yet.",
-            ));
-            let _ = catalog.append_child(&empty);
-            let _ = replace_stream_result_view(&catalog, view_generation);
-            return;
-        }
-
-        let mut callbacks = Vec::with_capacity(entries.len().min(100).saturating_mul(2));
-        for (row_index, entry) in entries.into_iter().take(100).enumerate() {
-            let row = document.create_element("div").unwrap();
-            row.set_class_name("weeb3-stream-entry");
-            let button = document.create_element("button").unwrap();
-            let title = if entry.title.trim().is_empty() {
-                format!("Stream {}", short_identity(&entry.topic))
-            } else {
-                entry.title.trim().to_string()
-            };
-            let state = if entry.is_live() {
-                "LIVE"
-            } else if entry.is_vod() {
-                "VOD"
-            } else {
-                "STREAM"
-            };
-            let duration = entry
-                .duration
-                .filter(|duration| duration.is_finite() && *duration > 0.0)
-                .map(format_stream_duration)
-                .unwrap_or_default();
-            let label = if duration.is_empty() {
-                format!("[ {} ] {}", state, title)
-            } else {
-                format!("[ {} ] {} - {}", state, title, duration)
-            };
-            button.set_text_content(Some(&label));
-            let _ = button.set_attribute("type", "button");
-            let _ = button.set_attribute("aria-label", &format!("Play {title}"));
-            let _ = row.set_attribute("role", "group");
-            let _ = row.set_attribute("aria-label", &format!("{state} stream: {title}"));
-            if !entry.description.trim().is_empty() {
-                let _ = button.set_attribute("title", entry.description.trim());
-            }
-
-            let weeb3 = weeb3.clone();
-            let owner = entry.owner.clone();
-            let topic = entry.topic.clone();
-            let media_type = entry.media_type().to_string();
-            // Catalog producers sometimes include their current index on live
-            // entries. Treat it as informational; only archived VOD is immutable.
-            let index = entry.is_vod().then_some(entry.index).flatten();
-            let (share_control, share_callback) = create_stream_share_control(
-                &owner,
-                &topic,
-                index,
-                &title,
-                &format!("catalog-{view_generation}-{row_index}"),
-                view_generation,
-            );
-            let playback_callback = Closure::<dyn FnMut()>::new(move || {
-                let weeb3 = weeb3.clone();
-                let owner = owner.clone();
-                let topic = topic.clone();
-                let media_type = media_type.clone();
-                spawn_local(async move {
-                    open_hls_feed_view_current_window(weeb3, owner, topic, media_type, index).await;
-                });
-            });
-            if let Some(playback_callback) =
-                StreamCatalogCallback::attach(&button, "click", playback_callback)
-            {
-                callbacks.push(playback_callback);
-            }
-            if let Some(share_callback) = share_callback {
-                callbacks.push(share_callback);
-            }
-            let _ = row.append_child(&button);
-            let _ = row.append_child(&share_control);
-            let _ = catalog.append_child(&row);
-        }
-
-        if replace_stream_result_view(&catalog, view_generation) {
-            STREAM_CATALOG_CALLBACKS.with(|stored| {
-                *stored.borrow_mut() = callbacks;
-            });
-        }
-    }
-
-    fn canonical_hls_feed_url(owner: &str, topic: &str, index_hint: Option<u64>) -> String {
-        let prefix = match active_profile().mode {
-            NetworkMode::Mainnet => streaming_route_path("feeds"),
-            NetworkMode::Testnet => streaming_route_path("testnet/feeds"),
-        };
-        let mut source = format!("{}/{}/{}", prefix, owner, topic);
-        if let Some(index) = index_hint {
-            source.push_str(&format!("?index={}", index));
-        }
-        source
-    }
-
-    fn stream_share_url(
-        owner: &str,
-        topic: &str,
-        index_hint: Option<u64>,
-    ) -> Result<String, String> {
-        let network = match active_profile().mode {
-            NetworkMode::Mainnet => StreamShareNetwork::Mainnet,
-            NetworkMode::Testnet => StreamShareNetwork::Testnet,
-        };
-        let route = StreamShareRoute::new(
-            network,
-            owner.trim(),
-            normalize_feed_topic(topic),
-            index_hint,
-        )?;
-        let route_base = streaming_route_base();
-        match web_sys::window().and_then(|window| window.location().origin().ok()) {
-            Some(origin) => build_stream_share_url(&origin, &route_base, &route)
-                .or_else(|_| build_stream_share_path(&route_base, &route)),
-            None => build_stream_share_path(&route_base, &route),
-        }
-    }
-
-    fn clipboard_write_text(value: &str) -> Option<Promise> {
-        let window = web_sys::window()?;
-        let navigator = window.navigator();
-        let clipboard = Reflect::get(navigator.as_ref(), &JsValue::from_str("clipboard")).ok()?;
-        if clipboard.is_null() || clipboard.is_undefined() {
-            return None;
-        }
-        let write_text = Reflect::get(&clipboard, &JsValue::from_str("writeText"))
-            .ok()?
-            .dyn_into::<Function>()
-            .ok()?;
-        write_text
-            .call1(&clipboard, &JsValue::from_str(value))
-            .ok()?
-            .dyn_into::<Promise>()
-            .ok()
-    }
-
-    fn show_stream_share_fallback(
-        status: &Element,
-        fallback: &Element,
-        share_url: &str,
-        view_generation: u64,
-    ) {
-        if !result_view_request_is_current(view_generation) {
-            return;
-        }
-        status.set_text_content(Some(&format!(
-            "Automatic copy was unavailable. Copy this stream link: {share_url}"
-        )));
-        let _ = fallback.remove_attribute("hidden");
-    }
-
-    fn create_stream_share_control(
-        owner: &str,
-        topic: &str,
-        index_hint: Option<u64>,
-        stream_label: &str,
-        id_suffix: &str,
-        view_generation: u64,
-    ) -> (Element, Option<StreamCatalogCallback>) {
-        let document = web_sys::window().unwrap().document().unwrap();
-        let container = document.create_element("div").unwrap();
-        container.set_class_name("weeb3-stream-share");
-
-        let button = document.create_element("button").unwrap();
-        button.set_class_name("weeb3-stream-share-copy");
-        button.set_text_content(Some("Copy stream link"));
-        let _ = button.set_attribute("type", "button");
-        let _ = button.set_attribute("aria-label", &format!("Copy link for {stream_label}"));
-
-        let status = document.create_element("span").unwrap();
-        status.set_class_name("weeb3-stream-share-status");
-        let status_id = format!("weeb3-stream-share-status-{id_suffix}");
-        status.set_id(&status_id);
-        let _ = status.set_attribute("role", "status");
-        let _ = status.set_attribute("aria-live", "polite");
-        let _ = status.set_attribute("aria-atomic", "true");
-        let _ = button.set_attribute("aria-describedby", &status_id);
-
-        let share_url = stream_share_url(owner, topic, index_hint).ok();
-        let fallback = document.create_element("a").unwrap();
-        fallback.set_class_name("weeb3-stream-share-fallback");
-        let fallback_id = format!("weeb3-stream-share-fallback-{id_suffix}");
-        fallback.set_id(&fallback_id);
-        fallback.set_text_content(Some("Open stream link"));
-        let _ = fallback.set_attribute("target", "_blank");
-        let _ = fallback.set_attribute("rel", "noopener");
-        let _ = fallback.set_attribute("hidden", "");
-        let _ = button.set_attribute("aria-controls", &fallback_id);
-        if let Some(share_url) = &share_url {
-            let _ = fallback.set_attribute("href", share_url);
-            let _ = button.set_attribute("data-stream-share-url", share_url);
-        } else {
-            let _ = button.set_attribute("disabled", "");
-            status.set_text_content(Some("A share link could not be created for this stream."));
-        }
-
-        let click_button = button.clone();
-        let click_status = status.clone();
-        let click_fallback = fallback.clone();
-        let click_owner = owner.to_string();
-        let click_topic = topic.to_string();
-        let callback = Closure::<dyn FnMut()>::new(move || {
-            if !result_view_request_is_current(view_generation) {
-                return;
-            }
-            let effective_index = index_hint
-                .or_else(|| cached_finalized_feed_index(&click_owner, &click_topic, None));
-            let Ok(click_share_url) = stream_share_url(&click_owner, &click_topic, effective_index)
-            else {
-                click_status
-                    .set_text_content(Some("A share link could not be created for this stream."));
-                return;
-            };
-            let _ = click_button.set_attribute("data-stream-share-url", &click_share_url);
-            let _ = click_fallback.set_attribute("href", &click_share_url);
-            click_status.set_text_content(Some("Copying stream link..."));
-            let _ = click_fallback.set_attribute("hidden", "");
-
-            let Some(copy_promise) = clipboard_write_text(&click_share_url) else {
-                show_stream_share_fallback(
-                    &click_status,
-                    &click_fallback,
-                    &click_share_url,
-                    view_generation,
-                );
-                return;
-            };
-
-            let status = click_status.clone();
-            let fallback = click_fallback.clone();
-            let share_url = click_share_url;
-            spawn_local(async move {
-                match JsFuture::from(copy_promise).await {
-                    Ok(_) if result_view_request_is_current(view_generation) => {
-                        status.set_text_content(Some("Stream link copied."));
-                        let _ = fallback.set_attribute("hidden", "");
-                    }
-                    Err(_) => {
-                        show_stream_share_fallback(&status, &fallback, &share_url, view_generation);
-                    }
-                    Ok(_) => {}
-                }
-            });
-        });
-        let callback = StreamCatalogCallback::attach(&button, "click", callback);
-
-        let _ = container.append_child(&button);
-        let _ = container.append_child(&status);
-        let _ = container.append_child(&fallback);
-        (container, callback)
-    }
-
-    fn create_hls_player(media_type: &str) -> Element {
-        let document = web_sys::window().unwrap().document().unwrap();
-        let is_audio = media_type.eq_ignore_ascii_case("audio");
-        let tag = if is_audio { "audio" } else { "video" };
-        let player = document.create_element(tag).unwrap();
+        let player = document.create_element("video").unwrap();
         let _ = player.set_attribute("controls", "");
         let _ = player.set_attribute("autoplay", "");
         let _ = player.set_attribute("preload", "metadata");
-        let _ = player.set_attribute(
-            "aria-label",
-            if is_audio {
-                "Swarm HLS audio stream"
-            } else {
-                "Swarm HLS video stream"
-            },
-        );
+        let _ = player.set_attribute("aria-label", "Swarm HLS video stream");
         let _ = player.set_attribute("playsinline", "");
         let _ = player.set_attribute("style", "width:90%;max-height:75vh;");
         player
@@ -8863,22 +7160,6 @@ mod runtime {
         let status = document.create_element("p").unwrap();
         status.set_text_content(Some(message));
         let _ = replace_stream_result_view(&status, view_generation);
-    }
-
-    fn format_stream_duration(seconds: f64) -> String {
-        let total = seconds.round().max(0.0) as u64;
-        let hours = total / 3600;
-        let minutes = (total % 3600) / 60;
-        let seconds = total % 60;
-        if hours > 0 {
-            format!("{}:{:02}:{:02}", hours, minutes, seconds)
-        } else {
-            format!("{}:{:02}", minutes, seconds)
-        }
-    }
-
-    fn short_identity(value: &str) -> String {
-        value.chars().take(12).collect()
     }
 
     fn js_error_message(error: &JsValue) -> String {
@@ -8894,16 +7175,9 @@ mod runtime {
         weeb3: Arc<Weeb3>,
         normalized_owner: String,
         normalized_topic: String,
-        sequence_zero_start_requested: bool,
         presentation_id: u64,
     ) {
-        begin_hls_prefetch_session(
-            weeb3,
-            normalized_owner,
-            normalized_topic,
-            sequence_zero_start_requested,
-            presentation_id,
-        );
+        begin_hls_prefetch_session(weeb3, normalized_owner, normalized_topic, presentation_id);
 
         let warmup_callback = Closure::<dyn FnMut()>::new(move || {
             activate_hls_prefetch_warmup();
@@ -8932,8 +7206,6 @@ mod runtime {
         let play_player = player.clone();
         let play_callback = Closure::<dyn FnMut()>::new(move || {
             if play_player.get_attribute("data-weeb3-hls-mode").as_deref() == Some("hls.js") {
-                // Rust's HLS callback classifies provisional autoplay separately
-                // and emits HLS_AUTOPLAY_AUTHORIZED_EVENT only for real playback.
                 return;
             }
             if play_player
@@ -8941,9 +7213,7 @@ mod runtime {
                 .as_deref()
                 == Some("1")
             {
-                // Await the autoplay promise. Chrome can emit `play` before
-                // rejecting it, and that provisional event must not promote the
-                // bounded warm-up to sustained retrieval.
+                // Chrome can emit play before its autoplay promise rejects.
                 return;
             }
             play_player
@@ -8956,9 +7226,7 @@ mod runtime {
         let pause_player = player.clone();
         let pause_callback = Closure::<dyn FnMut()>::new(move || {
             if pause_player.get_attribute("data-weeb3-hls-mode").as_deref() == Some("hls.js") {
-                // The HLS player emits HLS_EXPLICIT_PAUSE_EVENT only after playback
-                // authorization, so a rejected autoplay pause cannot invalidate
-                // the bounded warm-up generation.
+                // hls.js reports authorized pauses through HLS_EXPLICIT_PAUSE_EVENT.
                 return;
             }
             if pause_player
@@ -8970,99 +7238,24 @@ mod runtime {
                     .as_deref()
                     != Some("1")
             {
-                // A rejected autoplay can emit `pause` either before or after its
-                // promise settles. In neither ordering was playback authorized, so
-                // retain StartupOnly and its generation.
                 return;
             }
             pause_player
                 .remove_attribute(HLS_PLAYBACK_AUTHORIZED_ATTRIBUTE)
                 .ok();
-            // Close only future admission. A fragment/root request that was
-            // already dispatched remains detached and drains through accounting.
+            // Pause closes admission without cancelling dispatched accounting.
             set_hls_prefetch_mode(HlsPrefetchMode::Inactive, true);
         });
         retain_media_element_callback(player, "pause", pause_callback);
 
-        // Do not advance on the media element's generic `seeking` event. hls.js
-        // emits it for its normal 0.1-second startup alignment and while stepping
-        // across a temporary buffer gap; treating either as a user seek cancels
-        // the exact fragment that is filling that gap. A real seek is detected
-        // from the ordered manifest cursor in `hls_foreground_context` before its
-        // target fragment enters retrieval.
-    }
-
-    fn install_hls_route_canonicalization(
-        player: &Element,
-        owner: &str,
-        topic: &str,
-        index_hint: Option<u64>,
-        sequence_zero_start_requested: bool,
-        view_generation: u64,
-    ) {
-        let owner = owner.to_ascii_lowercase();
-        let topic = normalize_feed_topic(topic);
-        let callback = Closure::<dyn FnMut()>::new(move || {
-            if !result_view_request_is_current(view_generation) {
-                return;
-            }
-            let Some(window) = web_sys::window() else {
-                return;
-            };
-            let route_base = streaming_route_base();
-            let Ok(pathname) = window.location().pathname() else {
-                return;
-            };
-            let Ok(current) = parse_stream_share_link(&pathname, &route_base) else {
-                // Catalog/API opens must not rewrite an unrelated browser route.
-                return;
-            };
-            let network = match active_profile().mode {
-                NetworkMode::Mainnet => StreamShareNetwork::Mainnet,
-                NetworkMode::Testnet => StreamShareNetwork::Testnet,
-            };
-            if current.network != network
-                || current.owner != owner
-                || normalize_feed_topic(&current.topic) != topic
-                || current.index != index_hint
-            {
-                return;
-            }
-
-            // ENDLIST snapshots are immutable, so a proven feed index turns the
-            // expensive unindexed UUID route into an exact one for refreshes and
-            // address-bar sharing. Live routes retain no index.
-            let effective_index = index_hint.or_else(|| {
-                cached_finalized_feed_index(
-                    &owner,
-                    &topic,
-                    sequence_zero_start_requested.then_some(view_generation),
-                )
-            });
-            let Ok(canonical_route) =
-                StreamShareRoute::new(network, &owner, &topic, effective_index)
-            else {
-                return;
-            };
-            let Ok(canonical_path) = build_stream_share_path(&route_base, &canonical_route) else {
-                return;
-            };
-            if canonical_path == pathname {
-                return;
-            }
-            if let Ok(history) = window.history() {
-                let _ = history.replace_state_with_url(&JsValue::NULL, "", Some(&canonical_path));
-            }
-        });
-        retain_media_element_callback(player, "weeb3-hls-manifest-ready", callback);
+        // Ignore generic seeking; cursor discontinuity distinguishes real seeks
+        // from hls.js startup alignment and gap traversal.
     }
 
     pub(crate) fn release_hls_view() {
-        // Closing a view stops only future HLS admissions. Detached retrieval
-        // leaders still own every dispatched request through accounting.
+        // View closure cannot cancel dispatched accounting work.
         invalidate_hls_prefetch_session(true);
         destroy_current_hls();
-        STREAM_CATALOG_CALLBACKS.with(|callbacks| callbacks.borrow_mut().clear());
     }
 
     pub(crate) fn release_hls_for_bzz_view() {
@@ -9073,6 +7266,6 @@ mod runtime {
 
 #[cfg(target_arch = "wasm32")]
 pub(crate) use runtime::{
-    HlsOpenIntent, attach_hls_feed_media, hls_payload_cache_body_bytes, open_feed_view,
-    open_hls_feed_view, release_hls_for_bzz_view, release_hls_view, try_fetch_response,
+    hls_payload_cache_body_bytes, open_hls_feed_view, release_hls_for_bzz_view, release_hls_view,
+    try_fetch_response,
 };

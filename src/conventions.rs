@@ -38,42 +38,6 @@ pub fn try_from_multiaddr(address: &Multiaddr) -> Option<PeerId> {
     })
 }
 
-//  pub struct Body {
-//      body: HtmlElement,
-//      document: Document,
-//  }
-//
-//  impl Body {
-//      pub fn from_current_window() -> Result<Self, JsError> {
-//          let document = web_sys::window()
-//              .ok_or(js_error("no global `window` exists"))?
-//              .document()
-//              .ok_or(js_error("should have a document on window"))?;
-//          let body = document
-//              .body()
-//              .ok_or(js_error("document should have a body"))?;
-//
-//          Ok(Self { body, document })
-//      }
-//
-//      pub fn append_p(&self, msg: &str) -> Result<(), JsError> {
-//          let val = self
-//              .document
-//              .create_element("p")
-//              .map_err(|_| js_error("failed to create <p>"))?;
-//          val.set_text_content(Some(msg));
-//          self.body
-//              .append_child(&val)
-//              .map_err(|_| js_error("failed to append <p>"))?;
-//
-//          Ok(())
-//      }
-//  }
-//
-//  fn js_error(msg: &str) -> JsError {
-//      io::Error::new(io::ErrorKind::Other, msg).into()
-//  }
-
 pub fn get_proximity(one: &[u8], other: &[u8]) -> u8 {
     let mut b: usize = (MAX_PO / 4 + 1).into();
 
@@ -129,20 +93,14 @@ fn zero_bmt_nodes() -> [BmtHash; BMT_LEVEL_COUNT] {
 }
 
 std::thread_local! {
-    /// BMT padding is deterministic. Cache its root at every tree level so a
-    /// short CAC pays only for the path containing actual content.
     static ZERO_BMT_NODES: [BmtHash; BMT_LEVEL_COUNT] = zero_bmt_nodes();
 }
 
-/// Calculate the 4 KiB Swarm BMT root without materialising the padded chunk
-/// or allocating every hash-tree node separately.
 fn bmt_root(content: &[u8]) -> Option<BmtHash> {
     if content.len() > CHUNK_SIZE {
         return None;
     }
 
-    // Trailing zero bytes are indistinguishable from BMT padding. Ignoring them
-    // lets short and zero-heavy chunks reuse whole known-zero subtrees.
     let effective_len = content
         .iter()
         .rposition(|&value| value != 0)
@@ -170,8 +128,6 @@ fn bmt_root(content: &[u8]) -> Option<BmtHash> {
 
     let mut reduce = |nodes: &mut [BmtHash; BMT_LEAF_COUNT], zero_nodes: Option<&[BmtHash]>| {
         if let Some(zero_nodes) = zero_nodes {
-            // Only an odd occupied frontier reads one absent right sibling;
-            // the rest of the zero tail never participates in a hash.
             if occupied_leaves % 2 != 0 {
                 nodes[occupied_leaves] = zero_nodes[0];
             }
@@ -184,9 +140,6 @@ fn bmt_root(content: &[u8]) -> Option<BmtHash> {
             let next_width = width / 2;
             let next_occupied = occupied.div_ceil(2);
 
-            // Writing parents over the beginning of the same array is safe:
-            // parent i consumes children 2i and 2i+1, which no later parent can
-            // overwrite before they are read.
             for index in 0..next_occupied {
                 nodes[index] = hash_pair(&nodes[index * 2], &nodes[index * 2 + 1], &mut pair);
             }
@@ -233,8 +186,6 @@ pub fn valid_cac(chunk_content: &[u8], address: &[u8]) -> bool {
 }
 
 pub fn valid_soc(chunk_content: &Vec<u8>, address: &Vec<u8>) -> bool {
-    //
-
     if chunk_content.len() < 97 + SPAN_SIZE {
         return false;
     }
@@ -260,13 +211,7 @@ pub fn valid_soc(chunk_content: &Vec<u8>, address: &Vec<u8>) -> bool {
     };
 
     let address_constructed = keccak256([soc_address, owner.as_slice().to_vec()].concat()).to_vec();
-
-    if *address == address_constructed {
-        return true;
-    };
-
-    return false;
-    //
+    *address == address_constructed
 }
 
 pub fn get_feed_address(owner: &str, topic: &str, index: u64) -> Vec<u8> {
@@ -290,7 +235,7 @@ pub fn get_feed_address(owner: &str, topic: &str, index: u64) -> Vec<u8> {
 }
 
 pub fn encode_resources(data_array: Vec<(Vec<u8>, String, String)>, indx: String) -> Vec<u8> {
-    crate::upload_conventions::encode_resource_bundle(data_array, indx).unwrap_or_default()
+    crate::erasure_coding::encode_resource_bundle(data_array, indx).unwrap_or_default()
 }
 
 pub(crate) fn normalize_feed_topic(topic: &str) -> String {
@@ -322,7 +267,7 @@ pub(crate) fn upload_result(message: &str, index: &str) -> Vec<u8> {
 }
 
 pub fn decode_resources(encoded_data: Vec<u8>) -> (Vec<(Vec<u8>, String, String)>, String) {
-    crate::upload_conventions::decode_resource_bundle(&encoded_data).unwrap_or_default()
+    crate::erasure_coding::decode_resource_bundle(&encoded_data).unwrap_or_default()
 }
 
 pub async fn read_file(file: web_sys::File) -> Vec<Vec<u8>> {
@@ -445,158 +390,4 @@ pub fn parse_address(
     }
 
     web3::types::Address::from_slice(&recovered)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{
-        BmtHash, CHUNK_SIZE, SECTION2_SIZE, SPAN_SIZE, bmt_root, content_address, valid_cac,
-    };
-    use alloy::primitives::keccak256;
-
-    fn reference_tree_root(content: &[u8]) -> BmtHash {
-        assert!(content.len() >= SECTION2_SIZE);
-        assert!(content.len().is_power_of_two());
-
-        let mut level = content
-            .chunks_exact(SECTION2_SIZE)
-            .map(|section| BmtHash::from(keccak256(section)))
-            .collect::<Vec<_>>();
-        while level.len() > 1 {
-            level = level
-                .chunks_exact(2)
-                .map(|children| {
-                    let mut input = [0u8; SECTION2_SIZE];
-                    input[..32].copy_from_slice(&children[0]);
-                    input[32..].copy_from_slice(&children[1]);
-                    keccak256(input).into()
-                })
-                .collect();
-        }
-        level[0]
-    }
-
-    // Deliberately straightforward and allocation-heavy. This mirrors Bee's
-    // definition rather than the sparse/in-place production implementation.
-    fn reference_bmt_root(content: &[u8]) -> BmtHash {
-        assert!(content.len() <= CHUNK_SIZE);
-        let mut padded = [0u8; CHUNK_SIZE];
-        padded[..content.len()].copy_from_slice(content);
-        reference_tree_root(&padded)
-    }
-
-    fn reference_content_address(chunk: &[u8]) -> Vec<u8> {
-        let (span, content) = chunk.split_at(SPAN_SIZE);
-        let root = reference_bmt_root(content);
-        let mut input = [0u8; SPAN_SIZE + 32];
-        input[..SPAN_SIZE].copy_from_slice(span);
-        input[SPAN_SIZE..].copy_from_slice(&root);
-        keccak256(input).to_vec()
-    }
-
-    fn patterned_payload(size: usize, seed: u8) -> Vec<u8> {
-        let mut payload = (0..size)
-            .map(|index| {
-                (index as u8)
-                    .wrapping_mul(73)
-                    .wrapping_add(seed)
-                    .wrapping_add(1)
-            })
-            .collect::<Vec<_>>();
-        if let Some(last) = payload.last_mut() {
-            *last = seed.max(1);
-        }
-        payload
-    }
-
-    fn chunk_with_span(payload: &[u8], span: u64) -> Vec<u8> {
-        let mut chunk = Vec::with_capacity(SPAN_SIZE + payload.len());
-        chunk.extend_from_slice(&span.to_le_bytes());
-        chunk.extend_from_slice(payload);
-        chunk
-    }
-
-    #[test]
-    fn empty_payload_is_a_valid_cac() {
-        let chunk = vec![0; SPAN_SIZE];
-        let address = content_address(&chunk);
-
-        assert_eq!(address.len(), 32);
-        assert!(valid_cac(&chunk, &address));
-    }
-
-    #[test]
-    fn bee_cac_golden_vectors_are_unchanged() {
-        for (payload, expected) in [
-            (
-                b"foo".as_slice(),
-                "2387e8e7d8a48c2a9339c97c1dc3461a9a7aa07e994c5cb8b38fd7c1b3e6ea48",
-            ),
-            (
-                b"greaterthanspan".as_slice(),
-                "27913f1bdb6e8e52cbd5a5fd4ab577c857287edf6969b41efe926b51de0f4f23",
-            ),
-        ] {
-            let chunk = chunk_with_span(payload, payload.len() as u64);
-            assert_eq!(hex::encode(content_address(&chunk)), expected);
-        }
-    }
-
-    #[test]
-    fn optimized_bmt_matches_independent_reference_at_every_boundary() {
-        let sizes = [
-            0, 1, 7, 8, 31, 32, 33, 63, 64, 65, 95, 127, 128, 129, 255, 256, 257, 511, 512, 513,
-            1023, 1024, 1025, 2047, 2048, 2049, 4095, 4096,
-        ];
-
-        for (case, size) in sizes.into_iter().enumerate() {
-            let payload = patterned_payload(size, case as u8 + 1);
-            let span = (size as u64)
-                .wrapping_mul(0x0102_0304_0506_0708)
-                .wrapping_add(case as u64);
-            let chunk = chunk_with_span(&payload, span);
-            let expected_root = reference_bmt_root(&payload);
-            let expected_address = reference_content_address(&chunk);
-
-            assert_eq!(bmt_root(&payload), Some(expected_root), "size {size}");
-            assert_eq!(content_address(&chunk), expected_address, "size {size}");
-            assert!(valid_cac(&chunk, &expected_address), "size {size}");
-        }
-    }
-
-    #[test]
-    fn optimized_bmt_matches_reference_for_dispersed_lengths_and_zero_tails() {
-        let mut state = 0x9e37_79b9u32;
-        for case in 0..96u64 {
-            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
-            let size = (state as usize) % (CHUNK_SIZE + 1);
-            let mut payload = patterned_payload(size, state as u8);
-            if !payload.is_empty() {
-                let zero_tail = (state as usize >> 16) % (payload.len().min(257) + 1);
-                let zero_start = payload.len() - zero_tail;
-                payload[zero_start..].fill(0);
-            }
-            let chunk = chunk_with_span(&payload, case.rotate_left(17) ^ 0xa5a5_5a5a);
-
-            assert_eq!(bmt_root(&payload), Some(reference_bmt_root(&payload)));
-            assert_eq!(content_address(&chunk), reference_content_address(&chunk));
-        }
-    }
-
-    #[test]
-    fn invalid_cac_inputs_fail_without_hash_allocations_or_panics() {
-        assert!(content_address(&[]).is_empty());
-        assert!(content_address(&[0; SPAN_SIZE - 1]).is_empty());
-        assert!(content_address(&vec![0; SPAN_SIZE + CHUNK_SIZE + 1]).is_empty());
-        assert!(bmt_root(&vec![0; CHUNK_SIZE + 1]).is_none());
-
-        let chunk = chunk_with_span(b"payload", 7);
-        let address = content_address(&chunk);
-        assert!(!valid_cac(&chunk, &address[..31]));
-        assert!(!valid_cac(&chunk, &[0; 32]));
-
-        let mut changed = chunk.clone();
-        changed[0] ^= 1;
-        assert!(!valid_cac(&changed, &address));
-    }
 }

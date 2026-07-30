@@ -16,15 +16,6 @@ const CLIENT_NAME: &str = "official-weeb-3-shell";
 const POPUP_NAME: &str = "weeb3-secure-vault";
 const SECURE_CALL_ATTEMPTS: usize = 3;
 const RESUME_NOTICE_ID: &str = "secureVaultResumeNotice";
-const DEBUG_SECURE_VAULT_LOGS: bool = false;
-
-macro_rules! secure_vault_log {
-    ($($arg:tt)*) => {
-        if DEBUG_SECURE_VAULT_LOGS {
-            web_sys::console::log_1(&JsValue::from(format!($($arg)*)));
-        }
-    };
-}
 
 thread_local! {
     static SECURE_MODULE: RefCell<Option<JsValue>> = RefCell::new(None);
@@ -103,14 +94,6 @@ async fn check_batch_state(client: Rc<JsValue>, network_id: u64) -> Option<Secur
         batch_validity_status: string_prop(&state, "batchValidityStatus")
             .unwrap_or_else(|| "unknown".to_string()),
     };
-
-    secure_vault_log!(
-        "secure batch state: hasBatch={}, batchIdLen={}, bucketLimit={}, validity={}",
-        state.has_batch,
-        state.batch_id.len(),
-        state.batch_bucket_limit,
-        state.batch_validity_status
-    );
 
     Some(state)
 }
@@ -200,22 +183,12 @@ pub async fn secure_commit_batch_purchase_and_verify(
     }
 
     let Some(state) = secure_batch_state_for_wallet(wallet, network_id).await else {
-        secure_vault_log!("secure commit verification failed: batch state unavailable");
         return false;
     };
 
-    let saved = state.has_batch
+    state.has_batch
         && state.batch_id.as_slice() == batch_id
-        && state.batch_bucket_limit == batch_bucket_limit;
-    if !saved {
-        secure_vault_log!(
-            "secure commit verification failed: hasBatch={}, savedBatchIdLen={}, savedBucketLimit={}",
-            state.has_batch,
-            state.batch_id.len(),
-            state.batch_bucket_limit
-        );
-    }
-    saved
+        && state.batch_bucket_limit == batch_bucket_limit
 }
 
 pub async fn secure_stamp_chunk(chunk_address: Vec<u8>) -> (Vec<u8>, bool) {
@@ -307,8 +280,7 @@ pub async fn secure_create_feed_update_soc_with_stamp(
     let client = secure_client_or_resume("createFeedUpdateSocWithStamp").await?;
     let options = auth_options_for_network(active_profile().swarm_network_id).ok()?;
     set_prop(&options, "topic", JsValue::from_str(&topic)).ok()?;
-    // Pass the logical index unchanged. The signer is responsible for Bee's
-    // canonical big-endian sequence encoding.
+    // The signer applies Bee's big-endian index encoding.
     set_prop(&options, "feedIndex", JsValue::from_f64(vault_feed_index)).ok()?;
     set_prop(&options, "wrappedContent", bytes_value(&wrapped_content)).ok()?;
 

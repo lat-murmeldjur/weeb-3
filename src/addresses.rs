@@ -1,154 +1,137 @@
+#![cfg(target_arch = "wasm32")]
+
 use libp2p::{Multiaddr, multiaddr::Protocol};
-use std::convert::TryFrom;
-use std::str::FromStr;
+use std::{convert::TryFrom, str::FromStr};
 
-pub const UNDERLAY_LIST_PREFIX: u8 = 0x99;
+const UNDERLAY_LIST_PREFIX: u8 = 0x99;
 
-pub fn deserialize_underlays(data: &[u8]) -> Vec<Multiaddr> {
+pub(crate) fn deserialize_underlays(data: &[u8]) -> Vec<Multiaddr> {
     if data.is_empty() {
         return Vec::new();
     }
-
     if data[0] == UNDERLAY_LIST_PREFIX {
-        return deserialize_list(&data[1..]);
+        return deserialize_underlay_list(&data[1..]);
     }
-
-    match Multiaddr::try_from(data.to_vec()) {
-        Ok(addr) => vec![addr],
-        Err(_) => Vec::new(),
-    }
+    Multiaddr::try_from(data.to_vec()).map_or_else(|_| Vec::new(), |address| vec![address])
 }
 
-fn deserialize_list(data: &[u8]) -> Vec<Multiaddr> {
-    let mut addrs = Vec::new();
-    let mut i = 0usize;
+fn deserialize_underlay_list(data: &[u8]) -> Vec<Multiaddr> {
+    let mut addresses = Vec::new();
+    let mut offset = 0usize;
 
-    while i < data.len() {
-        let (addr_len_u64, varint_len) = read_uvarint(&data[i..]);
-
-        if varint_len == 0 {
+    while offset < data.len() {
+        let (address_len, varint_len) = read_underlay_uvarint(&data[offset..]);
+        if varint_len == 0 || address_len > usize::MAX as u64 {
             break;
         }
-
-        i += varint_len;
-
-        if addr_len_u64 > usize::MAX as u64 {
+        offset += varint_len;
+        let address_len = address_len as usize;
+        if data.len().saturating_sub(offset) < address_len {
             break;
         }
-        let addr_len = addr_len_u64 as usize;
-
-        let remaining = data.len().saturating_sub(i);
-        if remaining < addr_len {
-            break;
-        }
-
-        let end = i + addr_len;
-        let addr_bytes = &data[i..end];
-
-        match Multiaddr::try_from(addr_bytes.to_vec()) {
-            Ok(addr) => addrs.push(addr),
+        let end = offset + address_len;
+        match Multiaddr::try_from(data[offset..end].to_vec()) {
+            Ok(address) => addresses.push(address),
             Err(_) => break,
         }
-
-        i = end;
+        offset = end;
     }
 
-    addrs
+    addresses
 }
 
-fn read_uvarint(src: &[u8]) -> (u64, usize) {
-    let mut value: u64 = 0;
-    let mut shift: u32 = 0;
-
-    for (i, &byte) in src.iter().enumerate() {
-        let bits = (byte & 0x7f) as u64;
-        value |= bits << shift;
-
+fn read_underlay_uvarint(src: &[u8]) -> (u64, usize) {
+    let mut value = 0u64;
+    let mut shift = 0u32;
+    for (index, &byte) in src.iter().enumerate() {
+        value |= u64::from(byte & 0x7f) << shift;
         if byte & 0x80 == 0 {
-            return (value, i + 1);
+            return (value, index + 1);
         }
-
         shift += 7;
         if shift > 63 {
             return (0, 0);
         }
     }
-
     (0, 0)
 }
 
 #[derive(Debug, PartialEq, Eq)]
-pub enum UnderlayFormat {
+pub(crate) enum UnderlayFormat {
     BeeWss,
-    DNSTransformedWss,
+    DnsTransformedWss,
     Other,
 }
 
-pub fn detect_underlay_format(addr: &Multiaddr) -> UnderlayFormat {
-    let mut iter = addr.iter();
-
-    match iter.next() {
+pub(crate) fn detect_underlay_format(address: &Multiaddr) -> UnderlayFormat {
+    let mut protocols = address.iter();
+    match protocols.next() {
         Some(Protocol::Ip4(_)) => {
-            match (
-                iter.next(),
-                iter.next(),
-                iter.next(),
-                iter.next(),
-                iter.next(),
-            ) {
+            if matches!(
+                (
+                    protocols.next(),
+                    protocols.next(),
+                    protocols.next(),
+                    protocols.next(),
+                    protocols.next(),
+                    protocols.next(),
+                ),
                 (
                     Some(Protocol::Tcp(_)),
                     Some(Protocol::Tls),
                     Some(Protocol::Sni(_)),
                     Some(Protocol::Ws(_)),
                     Some(Protocol::P2p(_)),
-                ) => {
-                    if iter.next().is_none() {
-                        return UnderlayFormat::BeeWss;
-                    }
-                }
-                _ => {}
+                    None,
+                )
+            ) {
+                return UnderlayFormat::BeeWss;
             }
         }
-        Some(Protocol::Dns4(_)) => match (iter.next(), iter.next(), iter.next(), iter.next()) {
-            (
-                Some(Protocol::Tcp(_)),
-                Some(Protocol::Tls),
-                Some(Protocol::Ws(_)),
-                Some(Protocol::P2p(_)),
-            ) => {
-                if iter.next().is_none() {
-                    return UnderlayFormat::DNSTransformedWss;
-                }
+        Some(Protocol::Dns4(_)) => {
+            if matches!(
+                (
+                    protocols.next(),
+                    protocols.next(),
+                    protocols.next(),
+                    protocols.next(),
+                    protocols.next(),
+                ),
+                (
+                    Some(Protocol::Tcp(_)),
+                    Some(Protocol::Tls),
+                    Some(Protocol::Ws(_)),
+                    Some(Protocol::P2p(_)),
+                    None,
+                )
+            ) {
+                return UnderlayFormat::DnsTransformedWss;
             }
-            _ => {}
-        },
+        }
         _ => {}
     }
-
     UnderlayFormat::Other
 }
 
-pub fn beewss_to_dns_transformed(addr: &Multiaddr) -> Multiaddr {
+pub(crate) fn beewss_to_dns_transformed(address: &Multiaddr) -> Multiaddr {
     let mut hostname = None;
     let mut tcp_port = None;
     let mut peer_id = None;
 
-    for proto in addr.iter() {
-        match proto {
-            Protocol::Sni(h) => hostname = Some(h.to_string()),
-            Protocol::Tcp(p) => tcp_port = Some(p),
-            Protocol::P2p(id) => peer_id = Some(id.to_string()),
+    for protocol in address.iter() {
+        match protocol {
+            Protocol::Sni(value) => hostname = Some(value.to_string()),
+            Protocol::Tcp(value) => tcp_port = Some(value),
+            Protocol::P2p(value) => peer_id = Some(value.to_string()),
             _ => {}
         }
     }
 
-    let addr_str = format!(
+    Multiaddr::from_str(&format!(
         "/dns4/{}/tcp/{}/tls/ws/p2p/{}",
         hostname.expect("BeeWss requires SNI"),
         tcp_port.expect("BeeWss requires TCP port"),
         peer_id.expect("BeeWss requires PeerId"),
-    );
-
-    Multiaddr::from_str(&addr_str).expect("constructed DNS-transformed WSS multiaddr must be valid")
+    ))
+    .expect("constructed DNS-transformed WSS multiaddr must be valid")
 }

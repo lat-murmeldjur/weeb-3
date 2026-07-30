@@ -7,7 +7,6 @@
     <script type="importmap">
       {
         "imports": {
-          "@lat-murmeldjur/weeb_3": "./weeb_3.js",
           "hls.js": "https://cdn.jsdelivr.net/npm/hls.js@1.6.2/dist/hls.mjs"
         }
       }
@@ -19,88 +18,53 @@
       }
       body {
         box-sizing: border-box;
-        margin: 0 auto;
-        max-width: 72rem;
+        margin: 0;
+      }
+      header {
         padding: 1rem;
       }
-      #status {
-        min-height: 1.5rem;
-      }
-      #stream {
-        display: block;
-        width: 100%;
+      header p {
+        max-width: 72ch;
       }
     </style>
   </head>
   <body>
-    <h1>Swarm HLS stream</h1>
-    <p id="status" role="status">Starting the weeb-3 npm client...</p>
-    <video id="stream" controls autoplay playsinline preload="metadata"></video>
+    <header>
+      <h1>Swarm HLS stream</h1>
+      <p>
+        The JavaScript below selects the canonical stream route, then mounts the
+        bundled Rust interface into the <code>weeb3</code> element. The mounted
+        interface owns the player while the surrounding page remains under the
+        application's control.
+      </p>
+      <p id="status" role="status">Loading the weeb-3 npm client...</p>
+    </header>
+    <main id="weeb3"></main>
 
     <script type="module">
-      import init, {
-        configureStreamingRoutes,
-        Weeb3No103,
-      } from "@lat-murmeldjur/weeb_3";
+      import init, { Weeb3No103 } from "./weeb_3.js";
 
       const owner = "6F2728386F8a47ef5EBe323721188e630Ff0FdE9";
       const topic = "b347b89b-933c-424f-a3d1-403bdd270b25";
+      const streamPath = `/weeb-3/stream/${owner}/${encodeURIComponent(topic)}`;
       const status = document.getElementById("status");
-      const media = document.getElementById("stream");
-      let node = null;
-
-      function requireOk(result) {
-        if (result?.status !== "ok") {
-          throw new Error(result?.error || "weeb-3 operation failed");
-        }
-      }
 
       try {
-        media.addEventListener("weeb3-hls-manifest-ready", () => {
-          status.textContent = "Manifest ready. Press Play if autoplay is blocked.";
-        });
-        media.addEventListener("playing", () => {
-          status.textContent = "Playing through the weeb-3 Rust retrieval pipeline.";
-        });
-        media.addEventListener("waiting", () => {
-          status.textContent = "Buffering the Swarm stream...";
-        });
-        media.addEventListener("weeb3-hls-autoplay-blocked", () => {
-          status.textContent = "Autoplay was blocked. Press Play to continue.";
-        });
-        media.addEventListener("weeb3-hls-error", (event) => {
-          status.textContent = `Playback failed: ${event.detail?.message || "unknown HLS error"}`;
-        });
-        media.addEventListener("error", () => {
-          status.textContent = `Media failed: ${media.error?.message || "unknown media error"}`;
-        });
-
+        history.replaceState(null, "", streamPath);
         await init();
 
-        const directory = new URL(".", location.href);
-        const routeBase = directory.pathname.replace(/\/$/, "") || "/";
-        requireOk(configureStreamingRoutes(
-          new URL("service.js", directory).href,
-          routeBase,
-        ));
+        const node = new Weeb3No103();
+        const mount = document.getElementById("weeb3");
+        const result = node.renderInterface(mount);
 
-        node = new Weeb3No103();
-        node.start({ mainnet: true });
-
-        status.textContent = "Opening the HLS manifest...";
-        const result = await node.attachHlsStream(media, owner, topic, {
-          start: "beginning",
-        });
-        requireOk(result);
-        status.textContent = `HLS attached with ${result.mode}. Loading from Swarm...`;
+        if (result?.status !== "ok") {
+          throw new Error(result?.error || "Could not mount the weeb-3 interface");
+        }
+        status.textContent = `Mounted the stream at ${streamPath}`;
       } catch (error) {
-        status.textContent = `Could not open stream: ${error.message || error}`;
+        status.textContent = `Could not open the stream: ${error.message || error}`;
         console.error(error);
       }
-
-      window.addEventListener("pagehide", () => {
-        node?.detachHlsStream();
-      }, { once: true });
     </script>
   </body>
 </html>
