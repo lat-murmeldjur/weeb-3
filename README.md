@@ -70,9 +70,9 @@ weeb3node.start({ testnet: true });
 const ready = await weeb3node.ready(1, 20_000);
 ```
 
-The wrapper exposes the browser node as `Weeb3No103`. It can start the runtime, switch between mainnet and testnet with `switchNetwork(mode)`, render the bundled interface into a container, report network and progress state, retrieve BZZ resources, retrieve raw bytes or chunks, upload `File` objects or byte arrays, and publish or read feed updates.
+The wrapper exposes the browser node as `Weeb3No103`. It can start the runtime, switch between mainnet and testnet with `switchNetwork(mode)`, render the bundled interface into a container, attach a Swarm HLS stream to an application-owned media element, report network and progress state, retrieve BZZ resources, retrieve raw bytes or chunks, upload `File` objects or byte arrays, and publish or read feed updates.
 
-The HLS example selects the canonical `/weeb-3/stream/{owner}/{topic}` location and passes an explicit DOM element to `renderInterface(container)`. That call mounts the player and the rest of the Rust interface inside the chosen element and performs the same runtime boot, connection buildup, Service Worker setup, retrieval, and stream startup used by the standalone application. It does not add a separate JavaScript HLS transport API.
+The HLS example creates its own `<video>` and passes it to `attachStream(media, owner, topic, start)`, where `start` is `"beginning"` or `"live"`. The method uses the same runtime boot, connection buildup, Service Worker setup, retrieval, prefetch, player and accounting paths as the standalone application without mounting the rest of its interface.
 
 The publishing workflow defaults to the GitHub repository owner scope. If a different npm scope is needed, set the `NPM_SCOPE` repository variable in GitHub Actions before pushing to `main`.
 
@@ -108,7 +108,7 @@ Below is a piece-by-piece overview of the current component logic.
 
 The default browser application is instantiated by `static/index.html`, which loads the generated Wasm module and calls `interweeb` from `src/interface.rs`.
 
-`interweeb` creates a `Weeb3` node, selects the network from the exact current route, and delegates the rest of the UI setup to `mount_interface`. `mount_interface` can either start the runtime itself or attach the interface to a runtime that has already been started by the package wrapper.
+`interweeb` first converts the GitHub Pages `404.html` `#/` handoff into its canonical path, then creates a `Weeb3` node, selects the network from that route, and delegates the rest of the UI setup to `mount_interface`. `mount_interface` can either start the runtime itself or attach the interface to a runtime that has already been started by the package wrapper.
 
 The interface layer currently has the following roles:
 
@@ -117,7 +117,7 @@ The interface layer currently has the following roles:
 - Preloading the secure vault module before sensitive upload, feed, stamp, or cheque operations are requested.
 - Registering the Service Worker and routing Service Worker messages back to the Rust runtime.
 - Reading the configured network profile, network id, and browser-dialable bootnodes, then passing bootnode connection requests to the `Weeb3` node.
-- Wiring the navigation input so BZZ references, raw byte routes, chunk routes, and exact `/stream/{owner}/{topic}` HLS share routes can be opened from the UI.
+- Wiring the navigation input so BZZ references, raw byte routes, chunk routes, and exact `/stream/{owner}/{topic}` or `/live/stream/{owner}/{topic}` HLS share routes can be opened from the UI.
 - Wiring upload controls for single files, tar-based collections, optional encryption, Bee redundancy levels, index document selection, optional feed publishing, and postage-stamp reuse or reset.
 - Wiring on-chain controls for upload prerequisites, postage batch acquisition, chequebook deployment, cheque signer persistence, and chequebook deposits through the browser wallet.
 - Providing runtime controls such as pausing and resuming transfers.
@@ -182,14 +182,14 @@ Every Rust source file belongs to one of the runtime areas below. None of the `.
 
 ##### Entrypoints and browser integration
 
-- `src/main.rs` is the native development executable. It binds the HTTPS server on all local interfaces, embeds the browser runtime assets and repository HTML examples, serves the HLS npm example at `/weeb-3/hls-stream-example.html`, and returns the application shell for the exact mainnet `/weeb-3/stream/{owner}/{topic}` share route.
+- `src/main.rs` is the native development executable. It binds the HTTPS server on all local interfaces, embeds the browser runtime assets and repository HTML examples, serves the HLS npm example at `/weeb-3/hls-stream-example.html`, and returns the application shell for the exact mainnet beginning and live stream share routes.
 - `src/lib.rs` is the Wasm crate root and low-level node runtime. It defines protocol names and generated protobuf modules, owns `Weeb3`, `Wings`, libp2p state, physical connection sessions, channels and workers, and runs the asynchronous protocol event loop. Its stream behavior rejects implicit dialing so protocol streams remain attached to explicitly tracked connections.
-- `src/library.rs` is the wasm-bindgen / npm facade over the same `Weeb3` runtime used by the built-in interface. It exposes lifecycle, network, retrieval, upload, feed, progress, postage, and wallet methods as `Weeb3No103` and converts Rust results into JavaScript values.
+- `src/library.rs` is the wasm-bindgen / npm facade over the same `Weeb3` runtime used by the built-in interface. It exposes lifecycle, network, retrieval, upload, feed, HLS media attachment, progress, postage, and wallet methods as `Weeb3No103` and converts Rust results into JavaScript values.
 - `src/interface.rs` mounts and orchestrates the built-in browser interface. It starts or attaches to the shared runtime, installs the Service Worker message bridge, wires resource, upload, feed, network, wallet and pause controls, and renders results, logs, connection state, and progress.
 - `src/interface_conventions.rs` embeds the static interface shell and contains its DOM construction, styles, labels, collapsible sections, and theme behavior.
 - `src/interface_runtime_conventions.rs` contains the operational UI-to-runtime bridge: bootnode and network application, wallet and upload prerequisites, resource views and downloads, progress rendering, and Service Worker registration, control negotiation, and request dispatch.
 - `src/events.rs` implements the bounded, revisioned progress store. Upload and retrieval tasks write progress rows there, while both the built-in interface and npm facade read consistent snapshots.
-- `src/nav.rs` parses exact locations and user input into network-aware BZZ, bytes, chunk, or HLS share routes. Unqualified routes default to mainnet; non-Bee aliases and legacy hash rewriting are not retained.
+- `src/nav.rs` restores the GitHub Pages `#/` handoff to a canonical `/weeb-3/` path and parses exact locations and user input into network-aware BZZ, bytes, chunk, beginning-HLS, or live-HLS share routes. Unqualified routes default to mainnet, and non-Bee aliases are not retained.
 
 ##### Connections and Swarm protocols
 
@@ -216,8 +216,8 @@ Every Rust source file belongs to one of the runtime areas below. None of the `.
 ##### Streaming and HTTP integration
 
 - `src/stream.rs` is the generic browser resource layer. It translates Service Worker messages into BZZ and raw responses, implements HTTP Range, ETag, metadata, response and singleflight caches, and drives ordinary audio or video range retrieval, seek handling, staged prefetch, retries, and result-view lifetime.
-- `src/stream_conventions.rs` contains exact share-route validation, HTTP range and validator helpers, immutable cache identities, device-aware cache limits, and staged regular-media lookahead budgets shared at the browser boundary.
-- `src/stream_hls.rs` contains the separate, nonstandard HLS dapp integration rather than generic Bee retrieval logic. It recognizes and rewrites playlists, discovers and follows feed heads, stabilizes archive and live timelines, maintains segment caches and singleflight requests, plans startup and sustained lookahead, serves internal feed and segment responses, and owns the Rust player lifecycle and recovery logic. It begins the single hls.js module load while Service Worker control is being established so these independent cold-start operations do not run serially. Only the minimal dynamic import hook remains in `static/hls_loader.js`; stream control and prefetching stay in Rust.
+- `src/stream_conventions.rs` contains exact beginning and live share-route validation, their HLS start value, HTTP range and validator helpers, immutable cache identities, device-aware cache limits, and staged regular-media lookahead budgets shared at the browser boundary.
+- `src/stream_hls.rs` contains the separate, nonstandard HLS dapp integration rather than generic Bee retrieval logic. It recognizes and rewrites playlists, reconstructs sequence-zero playback for beginning mode, goes directly to the current authenticated feed head for live mode, stabilizes archive and live timelines, maintains segment caches and singleflight requests, plans startup and sustained lookahead, serves internal feed and segment responses, and owns the Rust player lifecycle and recovery logic. It begins the single hls.js module load while Service Worker control is being established so these independent cold-start operations do not run serially. Only the minimal dynamic import hook remains in `static/hls_loader.js`; stream control and prefetching stay in Rust.
 
 ##### Persistence, identity, networks, and contracts
 
@@ -260,7 +260,7 @@ Single files can still be displayed without a Service Worker by creating `Blob` 
 
 The Service Worker solves this by providing deterministic application-scoped routes:
 
-- Top-level navigation to `/weeb-3/stream/{owner}/{topic}` loads the application shell and selects the mainnet HLS feed view. The two path values are a 20-byte feed owner and a URL-encoded feed topic; this is the only public HLS share-route shape.
+- Top-level navigation to `/weeb-3/stream/{owner}/{topic}` loads the mainnet HLS feed from its earliest available update. `/weeb-3/live/stream/{owner}/{topic}` loads its current authenticated feed head and lets the player select the safe live-sync point. The path values are a 20-byte feed owner and a URL-encoded feed topic.
 - `GET` and `HEAD` requests below `/bzz/<reference>/<path>` are interpreted as canonical mainnet BZZ resource requests.
 - Testnet can be selected from routes with `/testnet`, for example `/weeb-3/testnet` to boot the interface in testnet mode or `/weeb-3/testnet/bzz/<reference>/<path>` for a testnet BZZ link.
 - Raw byte and chunk routes below `/bytes/` and `/chunks/` are forwarded to the Rust runtime.

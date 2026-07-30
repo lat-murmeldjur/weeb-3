@@ -31,7 +31,7 @@ use crate::{
     interface_conventions::{install_interface_conventions, set_bracket_button_label},
     join_all,
     nav::{
-        ResourceRoute, parse_networked_resource_route, read_routes,
+        ResourceRoute, clear_hash_route, parse_networked_resource_route, read_routes,
         route_network_mode_from_location,
     },
     network_profile::{
@@ -319,6 +319,7 @@ pub(crate) fn install_service_worker_message_bridge(weeb3: Arc<Weeb3>) {
 
 #[wasm_bindgen]
 pub async fn interweeb(_st: String) -> Result<(), JsError> {
+    clear_hash_route();
     let initial_mode = route_network_mode_from_location().unwrap_or(NetworkMode::Mainnet);
     let initial_profile = profile_for_mode(initial_mode);
     set_network_profile_inputs(initial_mode);

@@ -51,6 +51,7 @@ pub(crate) async fn serve(listen_addr: Ipv4Addr) {
         .route("/example.html", get(get_example))
         .route("/weeb-3/hls-stream-example.html", get(get_example))
         .route("/weeb-3/stream/{owner}/{topic}", get(get_stream))
+        .route("/weeb-3/live/stream/{owner}/{topic}", get(get_stream))
         .route("/weeb-3/weeb_3.js", get(get_static_file))
         .route("/weeb-3/weeb_3_bg.wasm", get(get_static_file))
         .route("/weeb-3/service.js", get(get_static_file))

@@ -525,8 +525,12 @@ pub(super) async fn open_resource(weeb3: Arc<Weeb3>, route: ResourceRoute) {
             let bytes = weeb3.retrieve_chunk_bytes(reference.clone()).await;
             download_raw_bytes(bytes, reference, "chunk").await;
         }
-        ResourceRoute::Hls { owner, topic } => {
-            crate::stream_hls::open_hls_feed_view(weeb3, owner, topic).await;
+        ResourceRoute::Hls {
+            owner,
+            topic,
+            start,
+        } => {
+            crate::stream_hls::open_hls_feed_view(weeb3, owner, topic, start).await;
         }
     }
 }

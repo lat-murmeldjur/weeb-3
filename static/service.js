@@ -77,10 +77,11 @@ function isDirectShareShellPath(pathname) {
   }
 
   const parts = pathname.substring(SCOPE_PATH.length).split("/");
-  return parts.length === 3 &&
-    parts[0] === "stream" &&
-    /^[a-fA-F0-9]{40}$/.test(parts[1]) &&
-    isCanonicalStreamTopic(parts[2]);
+  const streamOffset = parts[0] === "live" ? 1 : 0;
+  return parts.length === streamOffset + 3 &&
+    parts[streamOffset] === "stream" &&
+    /^[a-fA-F0-9]{40}$/.test(parts[streamOffset + 1]) &&
+    isCanonicalStreamTopic(parts[streamOffset + 2]);
 }
 
 function isBzzUploadPath(pathname) {

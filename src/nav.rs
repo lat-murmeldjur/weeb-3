@@ -3,7 +3,7 @@ use web_sys::window;
 
 use crate::{
     network_profile::NetworkMode,
-    stream_conventions::{STREAMING_ROUTE_BASE, parse_stream_share_link},
+    stream_conventions::{HlsStart, STREAMING_ROUTE_BASE, parse_stream_share_link},
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -11,7 +11,11 @@ pub(crate) enum ResourceRoute {
     Bzz(String),
     Bytes(String),
     Chunks(String),
-    Hls { owner: String, topic: String },
+    Hls {
+        owner: String,
+        topic: String,
+        start: HlsStart,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -113,6 +117,24 @@ pub(crate) fn route_network_mode_from_location() -> Option<NetworkMode> {
     route_network_mode_from_path(&pathname)
 }
 
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn clear_hash_route() {
+    let Some(window) = window() else {
+        return;
+    };
+    let location = window.location();
+    let Ok(hash) = location.hash() else {
+        return;
+    };
+    let Some(route) = hash.strip_prefix("#/") else {
+        return;
+    };
+    let path = format!("{STREAMING_ROUTE_BASE}/{route}");
+    if let Ok(history) = window.history() {
+        let _ = history.replace_state_with_url(&wasm_bindgen::JsValue::NULL, "", Some(&path));
+    }
+}
+
 fn is_reference_hex(reference: &str) -> bool {
     (reference.len() == 64 || reference.len() == 128)
         && reference.as_bytes().iter().all(|b| b.is_ascii_hexdigit())
@@ -173,6 +195,7 @@ pub(crate) fn parse_networked_resource_route(input: &str) -> Option<NetworkedRes
             resource: ResourceRoute::Hls {
                 owner: route.owner,
                 topic: route.topic,
+                start: route.start,
             },
         });
     }

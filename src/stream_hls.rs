@@ -5,7 +5,7 @@ use std::{
     sync::Arc,
 };
 
-use crate::retrieval_conventions::next_nonzero_generation;
+use crate::{retrieval_conventions::next_nonzero_generation, stream_conventions::HlsStart};
 
 const HLS_HEADER: &str = "#EXTM3U";
 const HLS_ENDLIST: &str = "#EXT-X-ENDLIST";
@@ -947,15 +947,16 @@ pub(crate) fn hls_payload_mime(bytes: &[u8]) -> &'static str {
 }
 
 pub(crate) fn rewrite_hls_manifest(bytes: &[u8], local_bytes_base: &str) -> Option<Vec<u8>> {
-    rewrite_hls_manifest_inner(bytes, local_bytes_base, false, false)
+    rewrite_hls_manifest_inner(bytes, local_bytes_base, false, false, HlsStart::Beginning)
 }
 
 pub(crate) fn rewrite_hls_manifest_for_live_reload(
     bytes: &[u8],
     local_bytes_base: &str,
     head_finalized: bool,
+    start: HlsStart,
 ) -> Option<Vec<u8>> {
-    rewrite_hls_manifest_inner(bytes, local_bytes_base, true, head_finalized)
+    rewrite_hls_manifest_inner(bytes, local_bytes_base, true, head_finalized, start)
 }
 
 fn rewrite_hls_manifest_inner(
@@ -963,6 +964,7 @@ fn rewrite_hls_manifest_inner(
     local_bytes_base: &str,
     normalize_unindexed_feed: bool,
     head_finalized: bool,
+    start: HlsStart,
 ) -> Option<Vec<u8>> {
     if !stream_feed_payload_len_is_supported(bytes.len()) {
         return None;
@@ -978,8 +980,28 @@ fn rewrite_hls_manifest_inner(
             .map(|line| line.trim_end_matches('\r'))
             .any(hls_vod_playlist_type_line);
     let provisional_unindexed_feed = normalize_unindexed_feed && !head_finalized;
-    let force_archived_start = rewrite_vod_as_event || provisional_unindexed_feed;
-    let has_start_tag = force_archived_start
+    let force_archived_start =
+        start == HlsStart::Beginning && (rewrite_vod_as_event || provisional_unindexed_feed);
+    let strip_start = normalize_unindexed_feed && start == HlsStart::Live;
+    let live_final_offset = if strip_start && head_finalized {
+        hls_segment_identities(bytes).and_then(|segments| {
+            let offset = segments
+                .iter()
+                .rev()
+                .take(HLS_LIVE_SYNC_DURATION_COUNT)
+                .map(|segment| f64::from_bits(segment.duration_bits))
+                .sum::<f64>();
+            (offset.is_finite() && offset > 0.0).then_some(offset)
+        })
+    } else {
+        None
+    };
+    let forced_start_tag = if force_archived_start {
+        Some("#EXT-X-START:TIME-OFFSET=0,PRECISE=YES".to_string())
+    } else {
+        live_final_offset.map(|offset| format!("#EXT-X-START:TIME-OFFSET=-{offset},PRECISE=NO"))
+    };
+    let has_start_tag = forced_start_tag.is_some()
         && text
             .lines()
             .map(|line| line.trim_end_matches('\r'))
@@ -996,12 +1018,14 @@ fn rewrite_hls_manifest_inner(
             Some(Cow::Owned(hls_event_playlist_type_line(line)))
         } else if provisional_unindexed_feed && line.trim() == HLS_ENDLIST {
             None
-        } else if force_archived_start && hls_start_tag_line(line) {
+        } else if (forced_start_tag.is_some() || strip_start) && hls_start_tag_line(line) {
             if wrote_forced_start {
                 None
-            } else {
+            } else if let Some(forced_start_tag) = forced_start_tag.as_deref() {
                 wrote_forced_start = true;
-                Some(Cow::Borrowed("#EXT-X-START:TIME-OFFSET=0,PRECISE=YES"))
+                Some(Cow::Borrowed(forced_start_tag))
+            } else {
+                None
             }
         } else if line.trim_start().starts_with('#') {
             if server_control_attribute_start(line).is_some() {
@@ -1035,10 +1059,13 @@ fn rewrite_hls_manifest_inner(
 
         let insert_start_after_line =
             rewrote_playlist_type || (!rewrite_vod_as_event && line.trim() == HLS_HEADER);
-        if force_archived_start && insert_start_after_line && !has_start_tag && !wrote_forced_start
+        if let Some(forced_start_tag) = forced_start_tag.as_deref()
+            && insert_start_after_line
+            && !has_start_tag
+            && !wrote_forced_start
         {
             output.push('\n');
-            output.push_str("#EXT-X-START:TIME-OFFSET=0,PRECISE=YES");
+            output.push_str(forced_start_tag);
             wrote_forced_start = true;
         }
     }
@@ -2155,7 +2182,7 @@ mod player {
             .ok();
         set_playback_status(
             &media,
-            "Complete HLS archive found; rebuilding its timeline from the beginning.",
+            "Complete HLS archive found; rebuilding its finalized timeline.",
             "rebasing-timeline",
         );
         dispatch_custom_event(&media, HLS_TIMELINE_REBASE_EVENT, &JsValue::UNDEFINED);
@@ -5483,18 +5510,25 @@ mod runtime {
         owner: String,
         topic: String,
         index_hint: Option<u64>,
+        start: HlsStart,
         method: String,
         local_bytes_base: String,
     ) -> FetchResponse {
         let runway_ticket = (method != "HEAD" && index_hint.is_none())
             .then(|| hls_sequence_zero_runway_ticket(&weeb3, &owner, &topic))
             .flatten();
-        let snapshot =
-            match load_feed_snapshot(weeb3.clone(), owner.clone(), topic.clone(), index_hint).await
-            {
-                Some(snapshot) => snapshot,
-                None => return FetchResponse::error(503, "weeb-3 did not retrieve feed update"),
-            };
+        let snapshot = match load_feed_snapshot(
+            weeb3.clone(),
+            owner.clone(),
+            topic.clone(),
+            index_hint,
+            start,
+        )
+        .await
+        {
+            Some(snapshot) => snapshot,
+            None => return FetchResponse::error(503, "weeb-3 did not retrieve feed update"),
+        };
 
         if !is_hls_manifest(&snapshot.body) {
             return FetchResponse::error(502, "feed update is not an HLS manifest");
@@ -5504,6 +5538,7 @@ mod runtime {
                 &snapshot.body,
                 &local_bytes_base,
                 snapshot.finalized,
+                start,
             )
         } else {
             rewrite_hls_manifest(&snapshot.body, &local_bytes_base)
@@ -5548,16 +5583,19 @@ mod runtime {
         owner: String,
         topic: String,
         index_hint: Option<u64>,
+        start: HlsStart,
     ) -> Option<FeedRouteSnapshot> {
         let owner = owner
             .trim_start_matches("0x")
             .trim_start_matches("0X")
             .to_string();
         let topic = normalize_feed_topic(&topic);
-        let sequence_zero_presentation_id = index_hint
-            .is_none()
-            .then(|| hls_sequence_zero_start_presentation_for_feed(&weeb3, &owner, &topic))
-            .flatten();
+        let sequence_zero_presentation_id = if start == HlsStart::Beginning && index_hint.is_none()
+        {
+            hls_sequence_zero_start_presentation_for_feed(&weeb3, &owner, &topic)
+        } else {
+            None
+        };
         let sequence_zero_start_requested = sequence_zero_presentation_id.is_some();
         let canonical_cache_key = feed_cache_key(&owner, &topic, index_hint);
         let cache_key = if let Some(presentation_id) = sequence_zero_presentation_id {
@@ -5656,6 +5694,15 @@ mod runtime {
                 };
                 match persisted {
                     Some(loaded) => loaded,
+                    None if !sequence_zero_start_requested => {
+                        weeb3
+                            .latest_hls_feed_payload_observing_positive(
+                                owner.clone(),
+                                topic.clone(),
+                                None,
+                            )
+                            .await?
+                    }
                     None => {
                         let (early_payload_out, early_payload_in) =
                             mpsc::bounded::<crate::bzz_stream::RawFeedPayload>(16);
@@ -6926,9 +6973,12 @@ mod runtime {
         }
 
         let (owner, topic) = canonical_feed_resource(pathname)?;
-        let feed_index = web_sys::Url::new(request_url)
-            .ok()
-            .and_then(|url| url.search_params().get("index"));
+        let request_url = match web_sys::Url::new(request_url) {
+            Ok(url) => url,
+            Err(_) => return Some(FetchResponse::error(400, "invalid feed URL")),
+        };
+        let search = request_url.search_params();
+        let feed_index = search.get("index");
         let index_hint = match feed_index {
             Some(index) => match index.parse::<u64>() {
                 Ok(index) => Some(index),
@@ -6936,12 +6986,18 @@ mod runtime {
             },
             None => None,
         };
+        let start = match search.get("start").as_deref() {
+            None => HlsStart::Beginning,
+            Some("live") => HlsStart::Live,
+            Some(_) => return Some(FetchResponse::error(400, "invalid HLS start")),
+        };
         Some(
             fetch_feed_response(
                 weeb3,
                 owner,
                 topic,
                 index_hint,
+                start,
                 method.to_string(),
                 local_hls_bytes_base(pathname),
             )
@@ -7004,25 +7060,26 @@ mod runtime {
         }
     }
 
-    pub(crate) async fn open_hls_feed_view(weeb3: Arc<Weeb3>, owner: String, topic: String) {
+    pub(crate) async fn open_hls_feed_view(
+        weeb3: Arc<Weeb3>,
+        owner: String,
+        topic: String,
+        start: HlsStart,
+    ) {
         let view_generation = begin_result_view_request();
-        open_hls_feed_view_generation(weeb3, owner, topic, view_generation).await;
+        open_hls_feed_view_generation(weeb3, owner, topic, start, view_generation).await;
     }
 
-    #[derive(Clone)]
-    struct HlsFeedTarget {
+    pub(crate) async fn attach_hls_feed_player(
+        weeb3: Arc<Weeb3>,
+        player: &Element,
         owner: String,
         topic: String,
-        source: String,
-    }
-
-    async fn prepare_hls_feed_target(
-        weeb3: &Arc<Weeb3>,
-        owner: String,
-        topic: String,
+        start: HlsStart,
         view_generation: u64,
-    ) -> Result<HlsFeedTarget, String> {
-        if !service_worker_controls_bzz_requests(weeb3, "HLS feed and segment requests", || {
+    ) -> Result<&'static str, String> {
+        let hls_loader = JsFuture::from(load_hls());
+        if !service_worker_controls_bzz_requests(&weeb3, "HLS feed and segment requests", || {
             result_view_request_is_current(view_generation)
         })
         .await
@@ -7044,37 +7101,39 @@ mod runtime {
         if owner.len() != 40 || !owner.bytes().all(|byte| byte.is_ascii_hexdigit()) {
             return Err("The stream feed owner is invalid.".to_string());
         }
-
-        Ok(HlsFeedTarget {
-            source: format!("{}/{}/{}", streaming_route_path("feeds"), owner, topic),
-            owner,
-            topic,
-        })
-    }
-
-    async fn attach_hls_feed_player(
-        weeb3: Arc<Weeb3>,
-        player: &Element,
-        target: &HlsFeedTarget,
-        hls_loader: JsFuture,
-        view_generation: u64,
-    ) -> Result<&'static str, String> {
-        if !result_view_request_is_current(view_generation) {
-            return Err("HLS open was superseded".to_string());
-        }
+        let mut source = format!("{}/{}/{}", streaming_route_path("feeds"), owner, topic);
+        let presentation_id = match start {
+            HlsStart::Beginning => view_generation,
+            HlsStart::Live => {
+                let cache_key = feed_cache_key(&owner, &topic, None);
+                FEED_ROUTE_CACHE.with(|cache| {
+                    let mut cache = cache.borrow_mut();
+                    let remove = cache.get(&cache_key).is_some_and(|state| {
+                        !state.snapshot.finalized
+                            && state.checking_token == 0
+                            && cached_feed_should_refresh_head(
+                                state.last_touch,
+                                js_sys::Date::now(),
+                            )
+                    });
+                    if remove {
+                        cache.remove(&cache_key);
+                    }
+                });
+                source.push_str("?start=live");
+                0
+            }
+        };
         install_hls_prefetch_lifecycle(
             player,
             weeb3.clone(),
-            target.owner.clone(),
-            target.topic.clone(),
-            view_generation,
+            owner.clone(),
+            topic.clone(),
+            presentation_id,
         );
-        weeb3.interface_log(format!(
-            "HLS open owner={} topic={}",
-            target.owner, target.topic
-        ));
+        weeb3.interface_log(format!("HLS open owner={} topic={}", owner, topic));
 
-        let mode = play_hls(player, &target.source, hls_loader)
+        let mode = play_hls(player, &source, hls_loader)
             .await
             .map_err(|error| format!("Could not initialize HLS: {}", js_error_message(&error)))?;
         if !result_view_request_is_current(view_generation) {
@@ -7087,22 +7146,13 @@ mod runtime {
         weeb3: Arc<Weeb3>,
         owner: String,
         topic: String,
+        start: HlsStart,
         view_generation: u64,
     ) {
-        let hls_loader = JsFuture::from(load_hls());
         render_stream_status_for_generation(
             "Preparing reload-free Service Worker routing for HLS...",
             view_generation,
         );
-        let target = match prepare_hls_feed_target(&weeb3, owner, topic, view_generation).await {
-            Ok(target) => target,
-            Err(error) => {
-                if result_view_request_is_current(view_generation) {
-                    render_stream_status_for_generation(&error, view_generation);
-                }
-                return;
-            }
-        };
         let document = web_sys::window().unwrap().document().unwrap();
         let wrapper = document.create_element("section").unwrap();
         let player = create_hls_player();
@@ -7124,8 +7174,9 @@ mod runtime {
         let mode = match attach_hls_feed_player(
             weeb3,
             &player,
-            &target,
-            hls_loader,
+            owner,
+            topic,
+            start,
             view_generation,
         )
         .await
@@ -7266,6 +7317,6 @@ mod runtime {
 
 #[cfg(target_arch = "wasm32")]
 pub(crate) use runtime::{
-    hls_payload_cache_body_bytes, open_hls_feed_view, release_hls_for_bzz_view, release_hls_view,
-    try_fetch_response,
+    attach_hls_feed_player, hls_payload_cache_body_bytes, open_hls_feed_view,
+    release_hls_for_bzz_view, release_hls_view, try_fetch_response,
 };

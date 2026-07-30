@@ -19,6 +19,7 @@ mod network_profile {
 mod nav;
 
 mod hls {
+    use crate::stream_conventions::HlsStart;
     use crate::stream_hls;
 
     use std::collections::{HashMap, VecDeque};
@@ -597,8 +598,13 @@ mod hls {
              #EXT-X-ENDLIST\r\n"
         );
         let rewritten = String::from_utf8(
-            rewrite_hls_manifest_for_live_reload(historical.as_bytes(), "/weeb-3/hls/bytes", false)
-                .unwrap(),
+            rewrite_hls_manifest_for_live_reload(
+                historical.as_bytes(),
+                "/weeb-3/hls/bytes",
+                false,
+                HlsStart::Beginning,
+            )
+            .unwrap(),
         )
         .unwrap();
         assert!(rewritten.contains("#EXT-X-PLAYLIST-TYPE:EVENT  \n"));
@@ -618,8 +624,13 @@ mod hls {
     fn provisional_sliding_window_starts_at_its_first_available_segment() {
         let sliding = format!("#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:7\n#EXTINF:2.0,\n{REF}\n");
         let rewritten = String::from_utf8(
-            rewrite_hls_manifest_for_live_reload(sliding.as_bytes(), "/weeb-3/hls/bytes", false)
-                .unwrap(),
+            rewrite_hls_manifest_for_live_reload(
+                sliding.as_bytes(),
+                "/weeb-3/hls/bytes",
+                false,
+                HlsStart::Beginning,
+            )
+            .unwrap(),
         )
         .unwrap();
         assert!(rewritten.starts_with("#EXTM3U\n#EXT-X-START:TIME-OFFSET=0,PRECISE=YES\n"));
@@ -643,6 +654,7 @@ mod hls {
                 producer_offsets.as_bytes(),
                 "/weeb-3/hls/bytes",
                 false,
+                HlsStart::Beginning,
             )
             .unwrap(),
         )
@@ -659,14 +671,47 @@ mod hls {
     }
 
     #[test]
-    fn confirmed_final_unindexed_manifest_retains_endlist() {
-        let finalized = format!(
-            "#EXTM3U\n#EXT-X-PLAYLIST-TYPE:VOD\n#EXT-X-MEDIA-SEQUENCE:0\n\
+    fn live_reload_uses_the_current_window_without_a_forced_start() {
+        let live = format!(
+            "#EXTM3U\n#EXT-X-PLAYLIST-TYPE:VOD\n#EXT-X-START:TIME-OFFSET=42\n\
+             #EXT-X-MEDIA-SEQUENCE:35\n#EXT-X-START:TIME-OFFSET=-6\n\
              #EXTINF:2.0,\n{REF}\n#EXT-X-ENDLIST\n"
         );
         let rewritten = String::from_utf8(
-            rewrite_hls_manifest_for_live_reload(finalized.as_bytes(), "/weeb-3/hls/bytes", true)
-                .unwrap(),
+            rewrite_hls_manifest_for_live_reload(
+                live.as_bytes(),
+                "/weeb-3/hls/bytes",
+                false,
+                HlsStart::Live,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+        assert!(rewritten.contains("#EXT-X-PLAYLIST-TYPE:EVENT"));
+        assert!(rewritten.contains("#EXT-X-MEDIA-SEQUENCE:35"));
+        assert!(!rewritten.contains("#EXT-X-START:"));
+        assert!(!rewritten.contains("#EXT-X-ENDLIST"));
+        assert!(rewritten.contains(&format!("/weeb-3/hls/bytes/{REF}")));
+    }
+
+    #[test]
+    fn confirmed_final_unindexed_manifest_retains_endlist() {
+        let segments = (0..6)
+            .map(|value| format!("#EXTINF:2.0,\n{value:064x}\n"))
+            .collect::<String>();
+        let finalized = format!(
+            "#EXTM3U\n#EXT-X-PLAYLIST-TYPE:VOD\n#EXT-X-TARGETDURATION:2\n\
+             #EXT-X-MEDIA-SEQUENCE:0\n{segments}#EXT-X-ENDLIST\n"
+        );
+        let rewritten = String::from_utf8(
+            rewrite_hls_manifest_for_live_reload(
+                finalized.as_bytes(),
+                "/weeb-3/hls/bytes",
+                true,
+                HlsStart::Beginning,
+            )
+            .unwrap(),
         )
         .unwrap();
         assert!(rewritten.contains("#EXT-X-PLAYLIST-TYPE:EVENT\n"));
@@ -679,6 +724,36 @@ mod hls {
                 .count(),
             1
         );
+
+        let live = String::from_utf8(
+            rewrite_hls_manifest_for_live_reload(
+                finalized.as_bytes(),
+                "/weeb-3/hls/bytes",
+                true,
+                HlsStart::Live,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(live.contains("#EXT-X-START:TIME-OFFSET=-10,PRECISE=NO"));
+        assert!(!live.contains("TIME-OFFSET=0"));
+        assert!(hls_is_finalized(live.as_bytes()));
+
+        let short = format!(
+            "#EXTM3U\n#EXT-X-PLAYLIST-TYPE:VOD\n#EXT-X-TARGETDURATION:2\n\
+             #EXT-X-MEDIA-SEQUENCE:0\n#EXTINF:2.0,\n{REF}\n#EXT-X-ENDLIST\n"
+        );
+        let short = String::from_utf8(
+            rewrite_hls_manifest_for_live_reload(
+                short.as_bytes(),
+                "/weeb-3/hls/bytes",
+                true,
+                HlsStart::Live,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(short.contains("#EXT-X-START:TIME-OFFSET=-2,PRECISE=NO"));
     }
 
     #[test]
@@ -862,8 +937,13 @@ mod hls {
             1
         );
 
-        let rewritten = rewrite_hls_manifest_for_live_reload(&merged, "/weeb-3/hls/bytes", false)
-            .expect("merged archive remains a valid provisional HLS representation");
+        let rewritten = rewrite_hls_manifest_for_live_reload(
+            &merged,
+            "/weeb-3/hls/bytes",
+            false,
+            HlsStart::Beginning,
+        )
+        .expect("merged archive remains a valid provisional HLS representation");
         let rewritten = std::str::from_utf8(&rewritten).unwrap();
         assert!(rewritten.contains("#EXT-X-PLAYLIST-TYPE:EVENT"));
         assert!(rewritten.contains("#EXT-X-START:TIME-OFFSET=0,PRECISE=YES"));
@@ -1645,7 +1725,7 @@ mod feed_followup {
 }
 
 mod share_links {
-    use crate::stream_conventions::{StreamShareRoute, parse_stream_share_link};
+    use crate::stream_conventions::{HlsStart, StreamShareRoute, parse_stream_share_link};
 
     const OWNER: &str = "352eabdea9cb05e984a8828d2a6df3d3b5023260";
     const MIXED_CASE_OWNER: &str = "6F2728386F8a47ef5EBe323721188e630Ff0FdE9";
@@ -1653,12 +1733,19 @@ mod share_links {
     const TOPIC: &str = "0d216633-3475-4c26-8dd0-9935ef854bbc";
 
     #[test]
-    fn parses_the_exact_mainnet_stream_route() {
+    fn parses_the_exact_mainnet_stream_routes() {
         let parsed =
             parse_stream_share_link(&format!("/weeb-3/stream/{MIXED_CASE_OWNER}/{TOPIC}")).unwrap();
 
         assert_eq!(parsed.owner, CANONICAL_OWNER);
         assert_eq!(parsed.topic, TOPIC);
+        assert_eq!(parsed.start, HlsStart::Beginning);
+        assert_eq!(
+            parse_stream_share_link(&format!("/weeb-3/live/stream/{MIXED_CASE_OWNER}/{TOPIC}"))
+                .unwrap()
+                .start,
+            HlsStart::Live
+        );
         assert_eq!(
             parse_stream_share_link(&format!("stream/{OWNER}/topic%2Fpart%20%E6%97%A5")),
             StreamShareRoute::new(OWNER, "topic/part 日")
@@ -1695,7 +1782,11 @@ mod share_links {
         let invalid = [
             format!("/weeb-3/mainnet/stream/{OWNER}/{TOPIC}"),
             format!("/weeb-3/testnet/stream/{OWNER}/{TOPIC}"),
+            format!("/weeb-3/mainnet/live/stream/{OWNER}/{TOPIC}"),
+            format!("/weeb-3/testnet/live/stream/{OWNER}/{TOPIC}"),
             format!("/weeb-3/stream/{OWNER}/{TOPIC}/69"),
+            format!("/weeb-3/live/{OWNER}/{TOPIC}"),
+            format!("/weeb-3/live/stream/{OWNER}/{TOPIC}/"),
             format!("/weeb-3/watch/video/{OWNER}/{TOPIC}"),
             format!("/weeb-3/hls/{OWNER}/{TOPIC}"),
             format!("/weeb-3/stream/not-an-owner/{TOPIC}"),
@@ -1704,6 +1795,7 @@ mod share_links {
             format!("/weeb-3/stream/{OWNER}/bad%escape"),
             format!("/weeb-3/stream/{OWNER}/%FF"),
             format!("/weeb-3/stream/{OWNER}/{TOPIC}?index=7"),
+            format!("/weeb-3/live/stream/{OWNER}/{TOPIC}?index=7"),
             format!("/weeb-3/stream/{OWNER}/{TOPIC}#fragment"),
             format!("//host/weeb-3/stream/{OWNER}/{TOPIC}"),
             format!("https://host/weeb-3/stream/{OWNER}/{TOPIC}"),
@@ -1742,6 +1834,7 @@ mod network_routes {
             route_network_mode_from_path,
         },
         network_profile::NetworkMode,
+        stream_conventions::HlsStart,
     };
 
     const REFERENCE: &str = "919b5395bf7a59cbb3b365769de09a2b15ac5d897823dda9270259a3c038d574";
@@ -1806,7 +1899,7 @@ mod network_routes {
     }
 
     #[test]
-    fn exact_stream_route_is_mainnet_hls() {
+    fn exact_stream_routes_are_mainnet_hls() {
         let route =
             parse_networked_resource_route(&format!("/weeb-3/stream/{OWNER}/{TOPIC}")).unwrap();
         assert_eq!(route.network, NetworkMode::Mainnet);
@@ -1815,12 +1908,25 @@ mod network_routes {
             ResourceRoute::Hls {
                 owner: OWNER.to_string(),
                 topic: TOPIC.to_string(),
+                start: HlsStart::Beginning,
+            }
+        );
+        let live = parse_networked_resource_route(&format!("/weeb-3/live/stream/{OWNER}/{TOPIC}"))
+            .unwrap();
+        assert_eq!(live.network, NetworkMode::Mainnet);
+        assert_eq!(
+            live.resource,
+            ResourceRoute::Hls {
+                owner: OWNER.to_string(),
+                topic: TOPIC.to_string(),
+                start: HlsStart::Live,
             }
         );
 
         for alias in [
             format!("/weeb-3/mainnet/stream/{OWNER}/{TOPIC}"),
             format!("/weeb-3/testnet/stream/{OWNER}/{TOPIC}"),
+            format!("/weeb-3/mainnet/live/stream/{OWNER}/{TOPIC}"),
             format!("/weeb-3/stream/{OWNER}/{TOPIC}/69"),
         ] {
             assert!(parse_networked_resource_route(&alias).is_none());
@@ -1851,6 +1957,8 @@ mod service_worker {
     const INTERFACE_RUNTIME: &str = include_str!("../src/interface_runtime_conventions.rs");
     const HLS_PLAYER: &str = include_str!("../src/stream_hls.rs");
     const LIBRARY: &str = include_str!("../src/library.rs");
+    const NAV: &str = include_str!("../src/nav.rs");
+    const STATIC_404: &str = include_str!("../static/404.html");
     const STATIC_HLS_LOADER: &str = include_str!("../static/hls_loader.js");
     const STATIC_EXAMPLE: &str = include_str!("../static/example.html");
     const HLS_STREAM_EXAMPLE: &str = include_str!("../static/hls-stream-example.html");
@@ -1880,15 +1988,15 @@ mod service_worker {
         assert!(STATIC_HLS_LOADER.contains("export async function loadHls()"));
         assert!(STATIC_HLS_LOADER.contains("import(\"hls.js\")"));
         assert!(HLS_PLAYER.contains("module = \"/static/hls_loader.js\""));
-        let open = source_between(
+        let attach = source_between(
             HLS_PLAYER,
+            "pub(crate) async fn attach_hls_feed_player(",
             "async fn open_hls_feed_view_generation(",
-            "fn create_hls_player()",
         );
-        let loader_start = open.find("JsFuture::from(load_hls())").unwrap();
-        let worker_ready = open.find("prepare_hls_feed_target").unwrap();
+        let loader_start = attach.find("JsFuture::from(load_hls())").unwrap();
+        let worker_ready = attach.find("service_worker_controls_bzz_requests").unwrap();
         assert!(loader_start < worker_ready);
-        assert!(open.contains("hls_loader,\n            view_generation"));
+        assert!(attach.contains("play_hls(player, &source, hls_loader)"));
 
         for policy in [
             "maxBufferLength",
@@ -1901,11 +2009,17 @@ mod service_worker {
     }
 
     #[test]
-    fn hls_example_uses_the_retained_shared_interface_api() {
+    fn hls_example_embeds_a_caller_owned_video() {
         assert!(HLS_STREAM_EXAMPLE.contains(r#"import init, { Weeb3No103 } from "./weeb_3.js""#));
-        assert!(HLS_STREAM_EXAMPLE.contains(r#"history.replaceState(null, "", streamPath)"#));
-        assert!(HLS_STREAM_EXAMPLE.contains("node.renderInterface(mount)"));
-        assert!(!HLS_STREAM_EXAMPLE.contains("node.start("));
+        assert!(
+            HLS_STREAM_EXAMPLE.contains(r#"<video id="stream" controls autoplay playsinline>"#)
+        );
+        assert!(HLS_STREAM_EXAMPLE.contains("node.start()"));
+        assert!(HLS_STREAM_EXAMPLE.contains("node.attachStream(video, owner, topic, start)"));
+        assert!(HLS_STREAM_EXAMPLE.contains(r#"attach("beginning")"#));
+        assert!(HLS_STREAM_EXAMPLE.contains(r#"attach("live")"#));
+        assert!(!HLS_STREAM_EXAMPLE.contains("renderInterface"));
+        assert!(!HLS_STREAM_EXAMPLE.contains("history.replaceState"));
         assert!(
             MAIN_SERVER.contains(r#".route("/weeb-3/hls-stream-example.html", get(get_example))"#)
         );
@@ -1985,12 +2099,24 @@ mod service_worker {
                 "pub async fn acquire_feed_bytes(&self",
                 "#[wasm_bindgen(js_name = batchState)]",
             ),
+            (
+                "pub async fn attach_stream(",
+                "#[wasm_bindgen(js_name = networkState)]",
+            ),
         ] {
             assert!(
                 source_between(LIBRARY, start, end).contains("self.boot_runtime().await"),
                 "{start} bypasses the shared startup barrier"
             );
         }
+        let attach = source_between(
+            LIBRARY,
+            "pub async fn attach_stream(",
+            "#[wasm_bindgen(js_name = networkState)]",
+        );
+        assert!(attach.contains("attach_hls_feed_player("));
+        assert!(attach.contains("release_current_stream_view()"));
+        assert!(HLS_PLAYER.contains("source.push_str(\"?start=live\")"));
     }
 
     #[test]
@@ -1998,7 +2124,7 @@ mod service_worker {
         let render = source_between(
             LIBRARY,
             "pub fn render_interface(&self, container: Element)",
-            "#[wasm_bindgen(js_name = networkState)]",
+            "#[wasm_bindgen(js_name = attachStream)]",
         );
         assert!(render.contains("self.startup_pending.fetch_add(1, Ordering::AcqRel)"));
         assert!(render.contains("let guard = serial.lock().await"));
@@ -2110,6 +2236,38 @@ mod service_worker {
         );
         assert!(!feed.contains("serde_json"));
         assert!(!feed.contains("application/octet-stream"));
+    }
+
+    #[test]
+    fn live_start_bypasses_sequence_zero_discovery() {
+        let load = source_between(
+            HLS_PLAYER,
+            "async fn load_feed_snapshot(",
+            "async fn await_terminal_feed_confirmation_view(",
+        );
+        assert!(load.contains("None if !sequence_zero_start_requested"));
+        assert!(load.contains("latest_hls_feed_payload_observing_positive("));
+        assert!(load.contains("topic.clone(),\n                                None,"));
+
+        let attach = source_between(
+            HLS_PLAYER,
+            "pub(crate) async fn attach_hls_feed_player(",
+            "async fn open_hls_feed_view_generation(",
+        );
+        assert!(attach.contains("HlsStart::Beginning => view_generation"));
+        assert!(attach.contains("HlsStart::Live =>"));
+        assert!(attach.contains("!state.snapshot.finalized"));
+        assert!(attach.contains("source.push_str(\"?start=live\")"));
+        assert!(attach.contains("\n                0\n"));
+
+        let fetch = source_between(
+            HLS_PLAYER,
+            "pub(crate) async fn try_fetch_response(",
+            "fn canonical_hls_bytes_resource(",
+        );
+        assert!(fetch.contains("None => HlsStart::Beginning"));
+        assert!(fetch.contains(r#"Some("live") => HlsStart::Live"#));
+        assert!(fetch.contains("invalid HLS start"));
     }
 
     #[test]
@@ -2239,9 +2397,13 @@ mod service_worker {
     }
 
     #[test]
-    fn server_and_worker_expose_only_the_exact_stream_shell_route() {
+    fn server_and_worker_expose_only_the_exact_stream_shell_routes() {
         assert!(
             MAIN_SERVER.contains(r#".route("/weeb-3/stream/{owner}/{topic}", get(get_stream))"#)
+        );
+        assert!(
+            MAIN_SERVER
+                .contains(r#".route("/weeb-3/live/stream/{owner}/{topic}", get(get_stream))"#)
         );
         assert!(MAIN_SERVER.contains(r#".route("/{*wildcard}", get(get_404))"#));
         assert!(!MAIN_SERVER.contains("watch/video"));
@@ -2252,8 +2414,9 @@ mod service_worker {
             "function isDirectShareShellPath(pathname)",
             "function isBzzUploadPath(pathname)",
         );
-        assert!(worker_matcher.contains("parts.length === 3"));
-        assert!(worker_matcher.contains("parts[0] === \"stream\""));
+        assert!(worker_matcher.contains(r#"parts[0] === "live""#));
+        assert!(worker_matcher.contains("parts.length === streamOffset + 3"));
+        assert!(worker_matcher.contains(r#"parts[streamOffset] === "stream""#));
         assert!(worker_matcher.contains("/^[a-fA-F0-9]{40}$/"));
         assert!(!worker_matcher.contains("testnet"));
         assert!(!worker_matcher.contains("mainnet"));
@@ -2267,6 +2430,23 @@ mod service_worker {
         assert!(fetch_handler.contains("isAppShellNavigation(request)"));
         assert!(fetch_handler.contains("isDirectShareShellPath(url.pathname)"));
         assert!(!STATIC_WORKER.contains("watch/video"));
+    }
+
+    #[test]
+    fn github_pages_hash_handoff_restores_the_direct_stream_path() {
+        assert!(STATIC_404.contains(r#"window.location.replace("/weeb-3/#" + path"#));
+        assert!(NAV.contains(r##"let Some(route) = hash.strip_prefix("#/")"##));
+        assert!(NAV.contains(r#"format!("{STREAMING_ROUTE_BASE}/{route}")"#));
+        assert!(NAV.contains("history.replace_state_with_url("));
+        let startup = source_between(
+            INTERFACE,
+            "pub async fn interweeb(",
+            "pub(crate) async fn mount_interface(",
+        );
+        assert!(
+            startup.find("clear_hash_route();").unwrap()
+                < startup.find("route_network_mode_from_location()").unwrap()
+        );
     }
 }
 mod hls_payload_cancellation {

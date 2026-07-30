@@ -29,6 +29,7 @@ use crate::{
         secure_ensure_feed_owner, secure_open_vault_from_user_action,
         secure_prepare_batch_purchase,
     },
+    stream_conventions::{HlsStart, StreamShareRoute},
     strip_hex_prefix,
 };
 use alloy::signers::local::PrivateKeySigner;
@@ -42,13 +43,14 @@ use std::{
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_futures::{JsFuture, spawn_local};
-use web_sys::{Element, File, FilePropertyBag};
+use web_sys::{Element, File, FilePropertyBag, HtmlMediaElement};
 use web3::types::{Address, U256};
 
 #[wasm_bindgen(typescript_custom_section)]
 const UPLOAD_REDUNDANCY_TYPES: &'static str = r#"
 /** Bee-compatible erasure-coding level used for uploads. */
 export type UploadRedundancyLevel = 0 | 1 | 2 | 3 | 4;
+export type HlsStart = "beginning" | "live";
 "#;
 
 fn resource_to_js(bytes: Vec<u8>, mime: String, path: String) -> Object {
@@ -619,6 +621,42 @@ impl Weeb3No103 {
         });
 
         ok_object()
+    }
+
+    #[wasm_bindgen(js_name = attachStream)]
+    pub async fn attach_stream(
+        &self,
+        #[wasm_bindgen(unchecked_param_type = "HTMLMediaElement")] media: Element,
+        owner: String,
+        topic: String,
+        #[wasm_bindgen(unchecked_param_type = "HlsStart")] start: String,
+    ) -> Result<(), JsValue> {
+        if media.dyn_ref::<HtmlMediaElement>().is_none() {
+            return Err(JsValue::from_str(
+                "attachStream requires an HTML media element",
+            ));
+        }
+        let start = match start.as_str() {
+            "beginning" => HlsStart::Beginning,
+            "live" => HlsStart::Live,
+            _ => return Err(JsValue::from_str("stream start must be beginning or live")),
+        };
+        let route =
+            StreamShareRoute::new(owner, topic).map_err(|error| JsValue::from_str(&error))?;
+        let view_generation = crate::stream::begin_result_view_request();
+        crate::stream::release_current_stream_view();
+        self.boot_runtime().await;
+        crate::stream_hls::attach_hls_feed_player(
+            self.inner.clone(),
+            &media,
+            route.owner,
+            route.topic,
+            start,
+            view_generation,
+        )
+        .await
+        .map(|_| ())
+        .map_err(|error| JsValue::from_str(&error))
     }
 
     #[wasm_bindgen(js_name = networkState)]

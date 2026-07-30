@@ -4,6 +4,12 @@ pub(crate) const STREAMING_SERVICE_WORKER_SCOPE: &str = "/weeb-3/";
 
 const MAX_STREAM_TOPIC_BYTES: usize = 256;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum HlsStart {
+    Beginning,
+    Live,
+}
+
 pub(crate) fn streaming_route_path(suffix: &str) -> String {
     let suffix = suffix.trim_start_matches('/');
     if suffix.is_empty() {
@@ -33,6 +39,7 @@ pub(crate) fn decode_component(value: &str) -> String {
 pub(crate) struct StreamShareRoute {
     pub owner: String,
     pub topic: String,
+    pub start: HlsStart,
 }
 
 impl StreamShareRoute {
@@ -52,6 +59,7 @@ impl StreamShareRoute {
         Ok(Self {
             owner: owner.to_ascii_lowercase(),
             topic,
+            start: HlsStart::Beginning,
         })
     }
 }
@@ -66,9 +74,11 @@ pub(crate) fn parse_stream_share_link(input: &str) -> Result<StreamShareRoute, S
         .and_then(|tail| tail.strip_prefix('/'))
         .unwrap_or_else(|| input.trim_start_matches('/'));
     let mut parts = route.split('/');
-    if parts.next() != Some("stream") {
-        return Err("stream link has an invalid path".into());
-    }
+    let start = match parts.next() {
+        Some("stream") => HlsStart::Beginning,
+        Some("live") if parts.next() == Some("stream") => HlsStart::Live,
+        _ => return Err("stream link has an invalid path".into()),
+    };
     let owner = parts
         .next()
         .ok_or_else(|| "stream link is missing its owner".to_string())?;
@@ -78,7 +88,10 @@ pub(crate) fn parse_stream_share_link(input: &str) -> Result<StreamShareRoute, S
     if parts.next().is_some() {
         return Err("stream link has an invalid path".into());
     }
-    StreamShareRoute::new(owner, decode_path_segment(topic)?)
+    Ok(StreamShareRoute {
+        start,
+        ..StreamShareRoute::new(owner, decode_path_segment(topic)?)?
+    })
 }
 
 fn decode_path_segment(value: &str) -> Result<String, String> {

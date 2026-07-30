@@ -3,7 +3,7 @@
 `weeb-3` is a browser-side Swarm client built in Rust and compiled to WebAssembly.
 The main `weeb-3` project is the full released browser client, published at [lat-murmeldjur.github.io/weeb-3](https://lat-murmeldjur.github.io/weeb-3), where the client is used together with its own interface.
 
-This npm package is the library edition of that same client. Projects can use the API directly or mount the bundled browser interface with `renderInterface(container)`.
+This npm package is the library edition of that same client. Projects can use the API directly, attach Swarm HLS playback to their own media element, or mount the bundled browser interface with `renderInterface(container)`.
 
 Project repository: [github.com/lat-murmeldjur/weeb-3](https://github.com/lat-murmeldjur/weeb-3)
 
@@ -32,6 +32,7 @@ The higher-level `Weeb3No103` interface provides the main methods used by the em
 - `upload(file, encryption, index_string, add_to_feed, feed_topic)`
 - `uploadWithRedundancy(file, encryption, redundancy_level, index_string, add_to_feed, feed_topic)`
 - `postUploadBytesWithRedundancy(bytes, mime, filename, encryption, redundancy_level, add_to_feed, feed_topic)`
+- `attachStream(media, owner, topic, start)`
 - `renderInterface(container)`
 - `resetStamp()`
 - `postPushChunk(data, soc, chunk_address, stamp)`
@@ -70,6 +71,29 @@ weeb3node.start({
 // Or start with the built-in testnet profile.
 weeb3node.start({ testnet: true });
 ```
+
+## Stream playback
+
+The application creates and owns the media element. `"beginning"` reconstructs the earliest available feed timeline, while `"live"` opens the current authenticated feed head and starts at the player's safe live-sync position. Calling `attachStream` again switches the same element between them.
+
+```js
+import init, { Weeb3No103 } from "@lat-murmeldjur/weeb_3";
+
+await init();
+
+const node = new Weeb3No103();
+const video = document.querySelector("video");
+const owner = "6F2728386F8a47ef5EBe323721188e630Ff0FdE9";
+const topic = "b347b89b-933c-424f-a3d1-403bdd270b25";
+
+node.start();
+await node.attachStream(video, owner, topic, "beginning");
+
+// Later, for example from the application's own Live button:
+await node.attachStream(video, owner, topic, "live");
+```
+
+Public HLS feeds use mainnet. The embedding page must be below the `/weeb-3/` scope and serve the packaged worker at `/weeb-3/service.js`, or already be controlled by a worker implementing the same forwarding protocol.
 
 ## Example corresponding to `example.html`
 
@@ -117,5 +141,6 @@ Retrieval reads the level encoded in the Swarm tree and uses parity when data sh
 ## Notes
 
 - This package is meant for browser applications, not a plain Node.js runtime.
+- `attachStream` uses the same runtime, connection buildup, retrieval, prefetch, accounting, hls.js or native-HLS player, and recovery logic as the built-in interface.
 - The package does not publish the standalone site HTML, but `renderInterface(container)` embeds the same interface shell—including its erasure-coding selector—from the Wasm bundle.
 - The full released browser client remains available in the main project repository and on the project site.

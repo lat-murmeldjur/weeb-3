@@ -26,43 +26,75 @@
       header p {
         max-width: 72ch;
       }
+      main {
+        padding: 0 1rem 1rem;
+      }
+      video {
+        display: block;
+        width: min(100%, 72rem);
+        max-height: 75vh;
+        background: #000;
+      }
+      nav {
+        display: flex;
+        gap: 0.5rem;
+        margin-top: 0.75rem;
+      }
     </style>
   </head>
   <body>
     <header>
       <h1>Swarm HLS stream</h1>
       <p>
-        The JavaScript below selects the canonical stream route, then mounts the
-        bundled Rust interface into the <code>weeb3</code> element. The mounted
-        interface owns the player while the surrounding page remains under the
-        application's control.
+        This page owns its video element and passes it to the npm client. The
+        same Rust runtime, connections, retrieval, prefetch and player used by
+        weeb-3 run underneath it.
       </p>
       <p id="status" role="status">Loading the weeb-3 npm client...</p>
     </header>
-    <main id="weeb3"></main>
+    <main>
+      <video id="stream" controls autoplay playsinline></video>
+      <nav aria-label="Stream position">
+        <button id="beginning" type="button">From beginning</button>
+        <button id="live" type="button">Live</button>
+      </nav>
+    </main>
 
     <script type="module">
       import init, { Weeb3No103 } from "./weeb_3.js";
 
       const owner = "6F2728386F8a47ef5EBe323721188e630Ff0FdE9";
       const topic = "b347b89b-933c-424f-a3d1-403bdd270b25";
-      const streamPath = `/weeb-3/stream/${owner}/${encodeURIComponent(topic)}`;
       const status = document.getElementById("status");
+      const video = document.getElementById("stream");
+      let attachRequest = 0;
 
       try {
-        history.replaceState(null, "", streamPath);
         await init();
-
         const node = new Weeb3No103();
-        const mount = document.getElementById("weeb3");
-        const result = node.renderInterface(mount);
+        node.start();
 
-        if (result?.status !== "ok") {
-          throw new Error(result?.error || "Could not mount the weeb-3 interface");
+        async function attach(start) {
+          const request = ++attachRequest;
+          status.textContent = `Opening the stream from ${start}...`;
+          try {
+            await node.attachStream(video, owner, topic, start);
+            if (request === attachRequest) {
+              status.textContent = `Stream attached from ${start}; loading playback...`;
+            }
+          } catch (error) {
+            if (request === attachRequest) {
+              status.textContent = `Could not open the stream: ${error.message || error}`;
+              console.error(error);
+            }
+          }
         }
-        status.textContent = `Mounted the stream at ${streamPath}`;
+
+        document.getElementById("beginning").onclick = () => attach("beginning");
+        document.getElementById("live").onclick = () => attach("live");
+        await attach("beginning");
       } catch (error) {
-        status.textContent = `Could not open the stream: ${error.message || error}`;
+        status.textContent = `Could not initialize weeb-3: ${error.message || error}`;
         console.error(error);
       }
     </script>
