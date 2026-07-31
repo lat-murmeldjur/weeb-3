@@ -14,6 +14,7 @@ use crate::{
         retrieve_feed_update_at_index_bounded, seek_latest_feed_update,
         seek_latest_feed_update_indexed_bounded_from, seek_latest_feed_update_indexed_from,
         seek_latest_feed_update_indexed_observing_positive,
+        seek_latest_feed_update_indexed_wide_bounded,
     },
     retrieve_cancel_token_current,
 };
@@ -23,6 +24,7 @@ use std::{rc::Rc, time::Duration};
 
 const RANGE_RETRIEVE_RETRY_COUNT: usize = 2;
 const RANGE_RETRIEVE_RETRY_WAIT_MS: u64 = 120;
+const FEED_STARTUP_OVERSCAN: u64 = 16;
 
 #[derive(Clone, Debug)]
 pub struct BzzResource {
@@ -258,6 +260,46 @@ async fn raw_feed_payload_from_update(
     None
 }
 
+async fn overscan_feed_candidate(
+    owner: &str,
+    topic: &str,
+    candidate: (u64, Vec<u8>),
+    chunk_retrieve_chan: &ChunkRetrieveSender,
+) -> (u64, Vec<u8>) {
+    let mut latest = candidate;
+    for stride in [FEED_STARTUP_OVERSCAN, 1] {
+        let base = latest.0;
+        let indices = (1..=FEED_STARTUP_OVERSCAN)
+            .filter_map(|offset| base.checked_add(offset.saturating_mul(stride)));
+        let mut probes = stream::iter(indices)
+            .map(|index| {
+                let owner = owner.to_string();
+                let topic = topic.to_string();
+                async move {
+                    (
+                        index,
+                        retrieve_feed_update_at_index_bounded(
+                            owner,
+                            topic,
+                            index,
+                            chunk_retrieve_chan,
+                        )
+                        .await,
+                    )
+                }
+            })
+            .buffer_unordered(FEED_STARTUP_OVERSCAN as usize);
+        while let Some((index, update)) = probes.next().await {
+            if index > latest.0
+                && let Some(update) = update
+            {
+                latest = (index, update);
+            }
+        }
+    }
+    latest
+}
+
 pub(crate) async fn acquire_raw_feed_payload_at_index(
     owner: String,
     topic: String,
@@ -281,11 +323,12 @@ pub(crate) async fn acquire_raw_feed_payload_at_index_bounded(
     Some(RawFeedPayload { index, bytes })
 }
 
-pub(crate) async fn acquire_latest_raw_feed_payload_observing_positive(
+pub(crate) async fn acquire_latest_raw_feed_payload_startup(
     owner: String,
     topic: String,
     chunk_retrieve_chan: &ChunkRetrieveSender,
     early_payloads: Option<mpsc::Sender<RawFeedPayload>>,
+    early_payload_max_index: Option<u64>,
 ) -> Option<RawFeedPayload> {
     let early_updates = early_payloads.map(|early_payloads| {
         let (early_update_out, early_update_in) = mpsc::bounded::<(u64, Vec<u8>)>(16);
@@ -294,6 +337,9 @@ pub(crate) async fn acquire_latest_raw_feed_payload_observing_positive(
             while let Ok((index, update)) = early_update_in.recv().await {
                 if early_payloads.is_closed() {
                     return;
+                }
+                if early_payload_max_index.is_some_and(|maximum| index > maximum) {
+                    continue;
                 }
                 let Some(bytes) = raw_feed_payload_from_update(&update, &chunk_retrieve_chan).await
                 else {
@@ -304,13 +350,49 @@ pub(crate) async fn acquire_latest_raw_feed_payload_observing_positive(
         });
         early_update_out
     });
-    let (index, update) = seek_latest_feed_update_indexed_observing_positive(
-        owner,
-        topic,
-        chunk_retrieve_chan,
-        early_updates,
-    )
-    .await?;
+    let (index, update) = match early_updates {
+        Some(early_updates) => {
+            seek_latest_feed_update_indexed_observing_positive(
+                owner,
+                topic,
+                chunk_retrieve_chan,
+                Some(early_updates),
+            )
+            .await?
+        }
+        None => {
+            let candidate = seek_latest_feed_update_indexed_wide_bounded(
+                owner.clone(),
+                topic.clone(),
+                chunk_retrieve_chan,
+            )
+            .await?;
+            let (index, update) =
+                if !decode_span(&candidate.1).is_some_and(|(_, span)| span > CHUNK_SIZE as u64) {
+                    overscan_feed_candidate(&owner, &topic, candidate, chunk_retrieve_chan).await
+                } else {
+                    candidate
+                };
+            if decode_span(&update).is_some_and(|(_, span)| span > CHUNK_SIZE as u64)
+                && let Some(previous_index) = index.checked_sub(1)
+                && let Some(previous) = retrieve_feed_update_at_index_bounded(
+                    owner,
+                    topic,
+                    previous_index,
+                    chunk_retrieve_chan,
+                )
+                .await
+                && let Some(bytes) =
+                    raw_feed_payload_from_update(&previous, chunk_retrieve_chan).await
+            {
+                return Some(RawFeedPayload {
+                    index: previous_index,
+                    bytes,
+                });
+            }
+            (index, update)
+        }
+    };
     let bytes = raw_feed_payload_from_update(&update, chunk_retrieve_chan).await?;
     Some(RawFeedPayload { index, bytes })
 }

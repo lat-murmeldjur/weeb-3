@@ -1,7 +1,9 @@
 #![cfg(target_arch = "wasm32")]
 
 use crate::{
-    Weeb3, decode_resources, encrey,
+    Weeb3,
+    accounting::CONNECTION_DIAL_CONCURRENCY_LIMIT,
+    decode_resources, encrey,
     erasure_coding::RedundancyLevel,
     erasure_coding::validated_upload_redundancy_number,
     interface::{
@@ -13,6 +15,7 @@ use crate::{
     network_profile::{
         NetworkMode, NetworkProfile, activate_profile, active_profile,
         is_browser_dialable_underlay, profile_for_mode, profile_for_swarm_network_id,
+        randomized_bootnodes,
     },
     normalize_feed_topic,
     on_chain::{
@@ -340,11 +343,10 @@ fn start_options_from_js(options: Option<JsValue>) -> StartOptions {
     };
 
     let bootstrap_nodes = if configured_nodes.is_empty() {
-        profile
-            .bootnodes
-            .iter()
+        randomized_bootnodes(profile)
+            .into_iter()
             .map(|address| StartBootstrapNode {
-                multiaddr: (*address).to_string(),
+                multiaddr: address.to_string(),
                 usable: true,
             })
             .collect()
@@ -480,6 +482,7 @@ fn schedule_bootnode_dials(
         return;
     };
     let mut seen = std::collections::HashSet::new();
+    let mut dial_nodes = Vec::new();
 
     for node in bootstrap_nodes {
         if node.multiaddr.is_empty() || !seen.insert(node.multiaddr.clone()) {
@@ -492,17 +495,38 @@ fn schedule_bootnode_dials(
             ));
             continue;
         }
-        let dialer = inner.clone();
-        spawn_local(async move {
-            let _ = dialer
+        dial_nodes.push(node);
+    }
+
+    let backfill = dial_nodes.split_off(
+        dial_nodes
+            .len()
+            .min(CONNECTION_DIAL_CONCURRENCY_LIMIT as usize),
+    );
+    spawn_local(async move {
+        let first_wave = dial_nodes.into_iter().map(|node| {
+            let dialer = inner.clone();
+            async move {
+                let _ = dialer
+                    .connect_bootnode_for_current_network(
+                        node.multiaddr,
+                        expected_network_id,
+                        node.usable,
+                    )
+                    .await;
+            }
+        });
+        crate::join_all(first_wave).await;
+        for node in backfill {
+            let _ = inner
                 .connect_bootnode_for_current_network(
                     node.multiaddr,
                     expected_network_id,
                     node.usable,
                 )
                 .await;
-        });
-    }
+        }
+    });
 }
 
 #[wasm_bindgen]
@@ -593,11 +617,10 @@ impl Weeb3No103 {
             let network_id = s.get_network_id().await;
             let bootstrap_nodes = profile_for_swarm_network_id(network_id)
                 .map(|profile| {
-                    profile
-                        .bootnodes
-                        .iter()
+                    randomized_bootnodes(profile)
+                        .into_iter()
                         .map(|address| StartBootstrapNode {
-                            multiaddr: (*address).to_string(),
+                            multiaddr: address.to_string(),
                             usable: true,
                         })
                         .collect()
@@ -695,16 +718,16 @@ impl Weeb3No103 {
 
         let requested_bootnodes = Array::new();
         let skipped_bootnodes = Array::new();
-        let mut bootstrap_nodes = Vec::with_capacity(profile.bootnodes.len());
-        for address in profile.bootnodes {
+        let mut bootstrap_nodes = Vec::new();
+        for address in randomized_bootnodes(profile) {
             if is_browser_dialable_underlay(address) {
-                requested_bootnodes.push(&JsValue::from_str(&address));
+                requested_bootnodes.push(&JsValue::from_str(address));
                 bootstrap_nodes.push(StartBootstrapNode {
-                    multiaddr: (*address).to_string(),
+                    multiaddr: address.to_string(),
                     usable: true,
                 });
             } else {
-                skipped_bootnodes.push(&JsValue::from_str(&address));
+                skipped_bootnodes.push(&JsValue::from_str(address));
             }
         }
         schedule_bootnode_dials(self.inner.clone(), network_id, bootstrap_nodes);

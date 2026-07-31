@@ -1,4 +1,5 @@
 #![cfg(target_arch = "wasm32")]
+use alloy::signers::local::PrivateKeySigner;
 use async_lock::Semaphore;
 use async_std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -22,7 +23,7 @@ use libp2p::{
     core::{self, Endpoint, Multiaddr, Transport, transport::PortUse},
     futures::{StreamExt, future::join_all, join},
     identify, identity,
-    identity::{ecdsa, ecdsa::SecretKey},
+    identity::ecdsa,
     noise, ping,
     swarm::{
         ConnectionDenied, ConnectionId, DialError, FromSwarm, NetworkBehaviour, SwarmEvent,
@@ -437,7 +438,7 @@ pub fn init_wasm_runtime() {
 
 pub(crate) struct Weeb3 {
     swarm: Arc<Mutex<Swarm<Behaviour>>>,
-    secret_key: Arc<Mutex<SecretKey>>,
+    handshake_signer: Arc<PrivateKeySigner>,
     wings: Mutex<Arc<Wings>>,
     log_port: (mpsc::Sender<String>, mpsc::Receiver<String>),
     log_start_ms: f64,
@@ -1619,9 +1620,10 @@ impl Weeb3 {
     pub fn new(_st: String) -> Weeb3 {
         init_panic_hook();
 
-        let secret_key_o = ecdsa::SecretKey::generate();
-        let secret_key = secret_key_o.clone();
-        let keypair: ecdsa::Keypair = secret_key_o.into();
+        let secret_key = ecdsa::SecretKey::generate();
+        let handshake_signer =
+            PrivateKeySigner::from_slice(&secret_key.to_bytes()).expect("valid handshake key");
+        let keypair: ecdsa::Keypair = secret_key.into();
 
         let swarm = libp2p::SwarmBuilder::with_existing_identity(keypair.clone().into())
             .with_wasm_bindgen()
@@ -1699,7 +1701,7 @@ impl Weeb3 {
         )>();
 
         return Weeb3 {
-            secret_key: Arc::new(Mutex::new(secret_key)),
+            handshake_signer: Arc::new(handshake_signer),
             swarm: Arc::new(Mutex::new(swarm)),
             wings: Mutex::new(Arc::new(Wings {
                 connected_peers: connected_peers,
@@ -3798,7 +3800,7 @@ impl Weeb3 {
                     let accounting_peer_chan_outgoing = accounting_peer_chan_outgoing.clone();
                     let connection_generation = self.connection_generation.clone();
                     let ongoing_connections = self.ongoing_connections.clone();
-                    let secret_key = self.secret_key.clone();
+                    let handshake_signer = self.handshake_signer.clone();
                     let swarm = self.swarm.clone();
                     let nid: u64;
                     {
@@ -3933,7 +3935,7 @@ impl Weeb3 {
                                 self_ephemeral,
                                 ctrl3,
                                 &addr3,
-                                &secret_key,
+                                &handshake_signer,
                                 &accounting_peer_chan_outgoing,
                             ),
                         )

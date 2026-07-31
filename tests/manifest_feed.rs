@@ -221,8 +221,10 @@ mod feed_frontier {
 
     use feed::{
         FEED_FRONTIER_LOOKAHEAD_LEVELS, FEED_FRONTIER_LOOKAHEAD_TIMEOUT,
-        seek_sequence_feed_frontier, seek_sequence_feed_frontier_bounded_from_observing_positive,
+        WIDE_FEED_FRONTIER_LOOKAHEAD, seek_sequence_feed_frontier,
+        seek_sequence_feed_frontier_bounded_from_observing_positive,
         seek_sequence_feed_frontier_bounded_observing_positive, seek_sequence_feed_frontier_from,
+        seek_sequence_feed_frontier_wide_bounded,
     };
     use futures::executor::block_on;
 
@@ -322,6 +324,140 @@ mod feed_frontier {
                 );
                 assert_eq!(next, head.map_or(0, |head| head.saturating_add(1)));
             }
+        });
+    }
+
+    #[test]
+    fn wide_bounded_frontier_finds_a_long_archive_in_three_bounded_waves() {
+        block_on(async {
+            let probes = Arc::new(AtomicUsize::new(0));
+            let (latest, next) = seek_sequence_feed_frontier_wide_bounded({
+                let probes = probes.clone();
+                move |index| {
+                    probes.fetch_add(1, Ordering::SeqCst);
+                    async move { (index <= 1_704).then_some(index) }
+                }
+            })
+            .await;
+
+            assert_eq!(latest, Some((1_704, 1_704)));
+            assert_eq!(next, 1_705);
+            let probe_count = probes.load(Ordering::SeqCst);
+            assert!(probe_count <= 46, "wide lookup used {probe_count} probes");
+        });
+    }
+
+    #[test]
+    fn wide_bounded_frontier_handles_boundaries() {
+        block_on(async {
+            for head in [
+                None,
+                Some(0),
+                Some(1),
+                Some(255),
+                Some(256),
+                Some(646),
+                Some(1_704),
+                Some(u64::MAX - 1),
+                Some(u64::MAX),
+            ] {
+                let (latest, next) = seek_sequence_feed_frontier_wide_bounded(|index| async move {
+                    head.filter(|head| index <= *head).map(|_| index)
+                })
+                .await;
+                assert_eq!(
+                    latest.map(|(index, payload)| (index, payload)),
+                    head.map(|head| (head, head))
+                );
+                assert_eq!(next, head.map_or(0, |head| head.saturating_add(1)));
+            }
+        });
+    }
+
+    #[test]
+    fn wide_bounded_frontier_does_not_wait_for_a_slow_zero_after_a_higher_update() {
+        assert_lookup_ready(
+            seek_sequence_feed_frontier_wide_bounded(|index| DeterministicProbe {
+                result: if index == 0 {
+                    DeterministicProbeResult::Pending
+                } else {
+                    DeterministicProbeResult::Ready((index <= 1_704).then_some(index))
+                },
+            }),
+            1_704,
+        );
+    }
+
+    #[test]
+    fn wide_bounded_frontier_refinement_drops_irrelevant_lower_probe_tails() {
+        assert_lookup_ready(
+            seek_sequence_feed_frontier_wide_bounded(|index| DeterministicProbe {
+                result: if index == 1_551 {
+                    DeterministicProbeResult::Pending
+                } else {
+                    DeterministicProbeResult::Ready((index <= 1_704).then_some(index))
+                },
+            }),
+            1_704,
+        );
+    }
+
+    #[test]
+    fn wide_bounded_frontier_does_not_treat_timed_out_positives_as_missing() {
+        block_on(async {
+            for slow_positive in [1_701, 1_703] {
+                let (latest, next) =
+                    seek_sequence_feed_frontier_wide_bounded(|index| DeterministicProbe {
+                        result: if index == slow_positive {
+                            DeterministicProbeResult::Pending
+                        } else {
+                            DeterministicProbeResult::Ready((index <= 1_704).then_some(index))
+                        },
+                    })
+                    .await;
+
+                assert_eq!(latest, Some((1_704, 1_704)));
+                assert_eq!(next, 1_705);
+            }
+        });
+    }
+
+    #[test]
+    fn wide_bounded_frontier_never_exceeds_its_probe_limit() {
+        block_on(async {
+            let active = Arc::new(AtomicUsize::new(0));
+            let maximum = Arc::new(AtomicUsize::new(0));
+            let (latest, next) = seek_sequence_feed_frontier_wide_bounded({
+                let active = active.clone();
+                let maximum = maximum.clone();
+                move |index| OverlapProbe {
+                    index,
+                    active: active.clone(),
+                    maximum: maximum.clone(),
+                    pending_once: false,
+                    counted_active: false,
+                }
+            })
+            .await;
+
+            assert_eq!(latest, Some((646, 646)));
+            assert_eq!(next, 647);
+            assert!(maximum.load(Ordering::SeqCst) > 1);
+            assert!(maximum.load(Ordering::SeqCst) <= WIDE_FEED_FRONTIER_LOOKAHEAD);
+        });
+    }
+
+    #[test]
+    fn wide_bounded_frontier_retains_the_zero_anchor_without_higher_updates() {
+        block_on(async {
+            let (latest, next) =
+                seek_sequence_feed_frontier_wide_bounded(|index| DeterministicProbe {
+                    result: DeterministicProbeResult::Ready((index == 0).then_some(index)),
+                })
+                .await;
+
+            assert_eq!(latest, Some((0, 0)));
+            assert_eq!(next, 1);
         });
     }
 

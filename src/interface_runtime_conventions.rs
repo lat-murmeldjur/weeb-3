@@ -401,14 +401,16 @@ pub(super) async fn connect_all_bootnode_settings(weeb3: Arc<Weeb3>, apply_gener
     let mut seen = std::collections::HashSet::<String>::new();
     let mut dial_requests = Vec::<(String, String)>::new();
 
-    if let Ok(network_id_number) = network_id.parse::<u64>() {
-        if let Some(profile) = profile_for_swarm_network_id(network_id_number) {
-            for address in profile.bootnodes {
-                let address = address.to_string();
-                let key = format!("{}|{}", network_id, address);
-                if seen.insert(key) {
-                    dial_requests.push((address, network_id.clone()));
-                }
+    let profile = network_id
+        .parse::<u64>()
+        .ok()
+        .and_then(profile_for_swarm_network_id);
+    if let Some(profile) = profile {
+        for address in randomized_bootnodes(profile) {
+            let address = address.to_string();
+            let key = format!("{}|{}", network_id, address);
+            if seen.insert(key) {
+                dial_requests.push((address, network_id.clone()));
             }
         }
     }
@@ -416,6 +418,13 @@ pub(super) async fn connect_all_bootnode_settings(weeb3: Arc<Weeb3>, apply_gener
     for element_id in BOOTNODE_INPUT_IDS {
         let (address, node_network_id) = parsebootconnect(element_id.to_string());
         if address.trim().is_empty() || node_network_id.trim().is_empty() {
+            continue;
+        }
+        if node_network_id == network_id
+            && profile
+                .map(|profile| profile.bootnodes.contains(&address.as_str()))
+                .unwrap_or(false)
+        {
             continue;
         }
         let key = format!("{}|{}", node_network_id, address);
@@ -430,6 +439,11 @@ pub(super) async fn connect_all_bootnode_settings(weeb3: Arc<Weeb3>, apply_gener
         network_id
     ));
 
+    let backfill = dial_requests.split_off(
+        dial_requests
+            .len()
+            .min(CONNECTION_DIAL_CONCURRENCY_LIMIT as usize),
+    );
     let futures = dial_requests.into_iter().map(|(address, network_id)| {
         let weeb300 = weeb3.clone();
         async move {
@@ -438,6 +452,14 @@ pub(super) async fn connect_all_bootnode_settings(weeb3: Arc<Weeb3>, apply_gener
     });
 
     join_all(futures).await;
+    if !backfill.is_empty() {
+        spawn_local(async move {
+            for (address, network_id) in backfill {
+                connect_bootnode_address(weeb3.clone(), address, network_id, apply_generation)
+                    .await;
+            }
+        });
+    }
 }
 
 async fn connect_bootnode_address(

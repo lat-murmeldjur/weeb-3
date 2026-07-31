@@ -25,6 +25,7 @@ use web_sys::{
 
 use crate::{
     Weeb3,
+    accounting::CONNECTION_DIAL_CONCURRENCY_LIMIT,
     bzz_stream::{BzzMetadata, bzz_reference_hex, normalize_bzz_path},
     decode_resources, encrey,
     erasure_coding::{upload_redundancy_from_number, upload_redundancy_from_select},
@@ -36,6 +37,7 @@ use crate::{
     },
     network_profile::{
         NetworkMode, is_browser_dialable_underlay, profile_for_mode, profile_for_swarm_network_id,
+        randomized_bootnodes,
     },
     on_chain::{
         buy_postage_batch_with_payer, chequebook_balance, chunk_count_for_depth,

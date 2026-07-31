@@ -12,6 +12,7 @@ use crate::{
         FEED_FRONTIER_LOOKAHEAD_TIMEOUT, seek_sequence_feed_frontier,
         seek_sequence_feed_frontier_bounded_from_observing_positive,
         seek_sequence_feed_frontier_bounded_observing_positive, seek_sequence_feed_frontier_from,
+        seek_sequence_feed_frontier_wide_bounded,
     },
     get_feed_address, get_proximity, mpsc, price, reserve,
     retrieval_conventions::SingleflightRegistry,
@@ -2208,6 +2209,18 @@ pub(crate) async fn seek_latest_feed_update_indexed_observing_positive(
         (Some((index, payload)), _) => Some((index, payload)),
         (None, _) => None,
     }
+}
+
+pub(crate) async fn seek_latest_feed_update_indexed_wide_bounded(
+    owner: String,
+    topic: String,
+    chunk_retrieve_chan: &ChunkRetrieveSender,
+) -> Option<(u64, Vec<u8>)> {
+    seek_sequence_feed_frontier_wide_bounded(|index| {
+        probe_feed_update(&owner, &topic, index, chunk_retrieve_chan)
+    })
+    .await
+    .0
 }
 
 pub(crate) async fn seek_latest_feed_update_indexed_bounded_from(

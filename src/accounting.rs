@@ -1,5 +1,5 @@
 pub(crate) const CONNECTION_BUILDUP_LIMIT: u64 = 200;
-pub(crate) const CONNECTION_DIAL_CONCURRENCY_LIMIT: u64 = 128;
+pub(crate) const CONNECTION_DIAL_CONCURRENCY_LIMIT: u64 = 160;
 pub(crate) const REFRESH_RATE: u64 = 450000;
 const PO_PRICE: u64 = 10000;
 

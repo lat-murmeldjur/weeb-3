@@ -60,7 +60,7 @@ mod connection {
 
     #[test]
     fn dial_storm_is_bounded_independently_of_the_peer_population() {
-        assert_eq!(CONNECTION_DIAL_CONCURRENCY_LIMIT, 128);
+        assert_eq!(CONNECTION_DIAL_CONCURRENCY_LIMIT, 160);
         assert!(connection_dial_capacity_available(
             0,
             CONNECTION_DIAL_CONCURRENCY_LIMIT - 1
@@ -145,6 +145,74 @@ mod connection {
             .find("*connections = connections.saturating_add(1);")
             .expect("connected counter promotion");
         assert!(connections < ongoing && ongoing < release && release < promote);
+    }
+
+    #[test]
+    fn mainnet_startup_samples_the_complete_dns_bootnode_database() {
+        use std::collections::HashSet;
+
+        let profile_source = include_str!("../src/network_profile.rs");
+        let mainnet = profile_source
+            .split_once("pub(crate) const MAINNET_BOOTNODES: &[&str] = &[")
+            .and_then(|(_, source)| source.split_once("pub(crate) const TESTNET_PROFILE"))
+            .map(|(source, _)| source)
+            .expect("mainnet bootnode constant");
+        let addresses = mainnet
+            .lines()
+            .filter_map(|line| {
+                line.trim()
+                    .strip_prefix('"')
+                    .and_then(|line| line.strip_suffix("\","))
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(addresses.len(), 319);
+        assert_eq!(addresses.iter().copied().collect::<HashSet<_>>().len(), 319);
+
+        let mut peers = HashSet::new();
+        for address in addresses {
+            assert!(address.is_ascii());
+            let parts = address.split('/').collect::<Vec<_>>();
+            assert_eq!(parts.len(), 9, "invalid browser underlay: {address}");
+            assert_eq!(parts[0], "");
+            assert_eq!(parts[1], "dns4");
+            assert!(parts[2].ends_with(".libp2p.direct"));
+            assert_eq!(parts[3], "tcp");
+            assert!(parts[4].parse::<u16>().is_ok());
+            assert_eq!(&parts[5..8], &["tls", "ws", "p2p"]);
+            assert!(parts[8].starts_with("Qm"));
+            assert!(peers.insert(parts[8]), "duplicate peer: {}", parts[8]);
+        }
+        assert_eq!(peers.len(), 319);
+
+        assert!(profile_source.contains("bootnodes.shuffle(&mut rand::thread_rng())"));
+        assert!(!profile_source.contains("bootnodes.truncate("));
+
+        let interface = include_str!("../src/interface_runtime_conventions.rs");
+        assert!(interface.contains("for address in randomized_bootnodes(profile)"));
+        assert!(interface.contains("profile.bootnodes.contains(&address.as_str())"));
+        assert!(interface.contains(".min(CONNECTION_DIAL_CONCURRENCY_LIMIT as usize)"));
+        assert!(interface.contains("for (address, network_id) in backfill"));
+
+        let library = include_str!("../src/library.rs");
+        assert_eq!(library.matches("randomized_bootnodes(profile)").count(), 3);
+        assert!(library.contains("for address in profile.bootnodes"));
+        let scheduler = library
+            .split_once("fn schedule_bootnode_dials(")
+            .and_then(|(_, source)| source.split_once("#[wasm_bindgen]"))
+            .map(|(source, _)| source)
+            .expect("bootnode scheduler");
+        assert!(scheduler.contains("crate::join_all(first_wave).await"));
+        assert!(scheduler.contains("for node in backfill"));
+    }
+
+    #[test]
+    fn handshake_signer_is_derived_once_per_node() {
+        let runtime = include_str!("../src/lib.rs");
+        let handlers = include_str!("../src/handlers.rs");
+        assert!(runtime.contains("handshake_signer: Arc<PrivateKeySigner>"));
+        assert_eq!(runtime.matches("PrivateKeySigner::from_slice(").count(), 1);
+        assert!(!handlers.contains("PrivateKeySigner::from_slice("));
     }
 
     #[test]
@@ -639,6 +707,34 @@ mod connection {
         assert!(!retrieval.contains("stream.read("));
         assert!(retrieval.contains("etiquette_6::Delivery::decode("));
         assert!(!retrieval.contains("Delivery::decode_length_delimited"));
+    }
+
+    #[test]
+    fn hive_reads_complete_length_delimited_frames_despite_transport_fragmentation() {
+        let handlers = include_str!("../src/handlers.rs");
+        let hive = handlers
+            .split("pub async fn gossip_handler(")
+            .nth(1)
+            .and_then(|source| source.split("pub async fn fresh(").next())
+            .expect("Hive protocol handler");
+
+        assert_eq!(
+            hive.matches("read_control_protocol_frame(&mut stream).await")
+                .count(),
+            1,
+            "Headers must use exact length-delimited framing"
+        );
+        assert_eq!(
+            hive.matches(
+                "read_control_protocol_frame_bounded(&mut stream, HIVE_PROTOCOL_MAX_FRAME_BYTES)"
+            )
+            .count(),
+            1,
+            "Peers must use the Bee-compatible Hive frame bound"
+        );
+        assert!(!hive.contains("stream.read("));
+        assert!(hive.contains("etiquette_2::Peers::decode("));
+        assert!(!hive.contains("Peers::decode_length_delimited"));
     }
 
     #[test]

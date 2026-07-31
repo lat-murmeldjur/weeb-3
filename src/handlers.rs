@@ -12,7 +12,6 @@ use crate::{OpenStreamError, StreamControl};
 use libp2p::{
     PeerId, Stream, StreamProtocol,
     futures::{AsyncReadExt, AsyncWriteExt},
-    identity::ecdsa,
     swarm::ConnectionId,
 };
 
@@ -46,6 +45,7 @@ use crate::SWAP_PROTOCOL;
 use crate::{OutboundProtocolSession, TransportConnectionSession};
 
 const CONTROL_PROTOCOL_MAX_FRAME_BYTES: u64 = 64 * 1024;
+const HIVE_PROTOCOL_MAX_FRAME_BYTES: u64 = 128 * 1024;
 
 fn trimmed_big_endian(bytes: &[u8]) -> Vec<u8> {
     let first = bytes
@@ -78,6 +78,10 @@ struct OutgoingChequeState {
 }
 
 async fn read_control_protocol_frame(stream: &mut Stream) -> Option<Vec<u8>> {
+    read_control_protocol_frame_bounded(stream, CONTROL_PROTOCOL_MAX_FRAME_BYTES).await
+}
+
+async fn read_control_protocol_frame_bounded(stream: &mut Stream, maximum: u64) -> Option<Vec<u8>> {
     let mut frame_len = 0_u64;
     for shift in (0_u32..64).step_by(7) {
         let mut byte = [0_u8; 1];
@@ -87,7 +91,7 @@ async fn read_control_protocol_frame(stream: &mut Stream) -> Option<Vec<u8>> {
             return None;
         }
         frame_len |= value << shift;
-        if frame_len > CONTROL_PROTOCOL_MAX_FRAME_BYTES {
+        if frame_len > maximum {
             return None;
         }
         if byte[0] & 0x80 == 0 {
@@ -160,7 +164,7 @@ pub async fn ceive(
     self_ephemeral: libp2p::core::Multiaddr,
     mut stream: Stream,
     a: libp2p::core::Multiaddr,
-    pk: &Arc<Mutex<ecdsa::SecretKey>>,
+    signer: &PrivateKeySigner,
     chan: &mpsc::Sender<PeerFile>,
 ) -> bool {
     let mut step_0 = etiquette_1::Syn::default();
@@ -230,8 +234,6 @@ pub async fn ceive(
     let chequebook_address = EMPTY_CHEQUEBOOK_ADDRESS.to_vec();
     let mut step_1 = etiquette_1::Ack::default();
     {
-        let signer: PrivateKeySigner =
-            PrivateKeySigner::from_slice(&pk.lock().await.to_bytes()).unwrap();
         let addrep = signer.address();
         let addre = addrep.to_vec();
 
@@ -358,19 +360,8 @@ pub async fn gossip_handler(
     chan: &mpsc::Sender<(etiquette_2::BzzAddress, u64)>,
     generation: u64,
 ) {
-    let mut buf_nondiscard_0 = Vec::new();
-    let mut buf_discard_0: [u8; 255] = [0; 255];
-    loop {
-        let n = match stream.read(&mut buf_discard_0).await {
-            Ok(a) => a,
-            Err(_) => {
-                return;
-            }
-        };
-        buf_nondiscard_0.extend_from_slice(&buf_discard_0[..n]);
-        if n < 255 {
-            break;
-        }
+    if read_control_protocol_frame(&mut stream).await.is_none() {
+        return;
     }
 
     let empty = etiquette_0::Headers::default();
@@ -390,22 +381,13 @@ pub async fn gossip_handler(
     let _ = stream.flush().await;
     let _ = stream.close().await;
 
-    let mut buf_nondiscard_0 = Vec::new();
-    let mut buf_discard_0: [u8; 255] = [0; 255];
-    loop {
-        let n = match stream.read(&mut buf_discard_0).await {
-            Ok(a) => a,
-            Err(_) => {
-                return;
-            }
-        };
-        buf_nondiscard_0.extend_from_slice(&buf_discard_0[..n]);
-        if n < 255 {
-            break;
-        }
-    }
+    let Some(peers_frame) =
+        read_control_protocol_frame_bounded(&mut stream, HIVE_PROTOCOL_MAX_FRAME_BYTES).await
+    else {
+        return;
+    };
 
-    let rec_0_u = etiquette_2::Peers::decode_length_delimited(&mut Cursor::new(buf_nondiscard_0));
+    let rec_0_u = etiquette_2::Peers::decode(&mut Cursor::new(peers_frame));
 
     let rec_0 = match rec_0_u {
         Ok(x) => x,
@@ -697,7 +679,7 @@ pub async fn connection_handler(
     self_ephemeral: libp2p::core::Multiaddr,
     mut control: StreamControl,
     a: &libp2p::core::Multiaddr,
-    pk: &Arc<Mutex<ecdsa::SecretKey>>,
+    signer: &PrivateKeySigner,
     chan: &mpsc::Sender<PeerFile>,
 ) -> bool {
     if !session.is_current() {
@@ -725,7 +707,7 @@ pub async fn connection_handler(
         self_ephemeral,
         stream,
         a.clone(),
-        &pk,
+        signer,
         chan,
     )
     .await

@@ -49,10 +49,14 @@ fn weeb3_loads_in_browser() -> Result<()> {
         let wall_load_ms = elapsed_ms(started);
 
         let ready_ms = if let Some(selector) = &ready_selector {
-            tab.wait_until_visible_with_custom_timeout(selector, timeout)
+            let element = tab
+                .wait_for_element_with_custom_timeout(selector, timeout)
                 .map_err(|err| {
                     anyhow!("ready selector did not become visible: {selector}: {err:?}")
                 })?;
+            element.is_visible_with_timeout(timeout).map_err(|err| {
+                anyhow!("ready selector did not become visible: {selector}: {err:?}")
+            })?;
 
             Some(elapsed_ms(started))
         } else {
