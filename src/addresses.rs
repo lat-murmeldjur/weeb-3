@@ -4,9 +4,11 @@ use libp2p::{Multiaddr, multiaddr::Protocol};
 use std::{convert::TryFrom, str::FromStr};
 
 const UNDERLAY_LIST_PREFIX: u8 = 0x99;
+const MAX_UNDERLAYS_PER_PEER: usize = 20;
+const MAX_UNDERLAY_BYTES: usize = 2048;
 
 pub(crate) fn deserialize_underlays(data: &[u8]) -> Vec<Multiaddr> {
-    if data.is_empty() {
+    if data.is_empty() || data.len() > MAX_UNDERLAY_BYTES {
         return Vec::new();
     }
     if data[0] == UNDERLAY_LIST_PREFIX {
@@ -21,18 +23,21 @@ fn deserialize_underlay_list(data: &[u8]) -> Vec<Multiaddr> {
 
     while offset < data.len() {
         let (address_len, varint_len) = read_underlay_uvarint(&data[offset..]);
-        if varint_len == 0 || address_len > usize::MAX as u64 {
-            break;
+        if addresses.len() >= MAX_UNDERLAYS_PER_PEER
+            || varint_len == 0
+            || address_len > usize::MAX as u64
+        {
+            return Vec::new();
         }
         offset += varint_len;
         let address_len = address_len as usize;
         if data.len().saturating_sub(offset) < address_len {
-            break;
+            return Vec::new();
         }
         let end = offset + address_len;
         match Multiaddr::try_from(data[offset..end].to_vec()) {
             Ok(address) => addresses.push(address),
-            Err(_) => break,
+            Err(_) => return Vec::new(),
         }
         offset = end;
     }

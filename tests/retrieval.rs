@@ -91,11 +91,38 @@ mod connection {
         );
         assert!(dial_feeder.contains("start_owned_connection_attempt("));
         assert!(dial_feeder.contains("try_mark_connection_attempt(&wings, &candidate.peer)"));
+        assert!(dial_feeder.contains("let mut new_peers = VecDeque::<QueuedPeerDial>::new()"));
+        assert!(dial_feeder.contains("let mut retries = VecDeque::<QueuedPeerDial>::new()"));
+        assert!(dial_feeder.contains("let mut queued_underlays = HashSet::<Vec<u8>>::new()"));
+        assert!(dial_feeder.contains("for _ in 0..PEER_DIAL_INGEST_BATCH"));
         assert!(
-            dial_feeder.contains(
-                ".try_send((candidate.bzzaddr, false, candidate.generation, attempt_id))"
-            )
+            dial_feeder
+                .matches("current_connection_generation().await")
+                .count()
+                >= 2
         );
+        assert!(dial_feeder.contains("queued_underlays.len() >= MAX_QUEUED_PEER_DIALS"));
+        assert!(dial_feeder.contains("let underlay = candidate.dial_addr.to_vec()"));
+        let ingestion_end = dial_feeder.find("let mut unavailable_peers").unwrap();
+        assert!(!dial_feeder[..ingestion_end].contains("peer_already_connected_or_attempting"));
+        assert!(dial_feeder.contains("let mut take_eligible ="));
+        assert!(dial_feeder.contains("let retry_due ="));
+        assert!(dial_feeder.contains("fresh_dials_since_retry >= FRESH_PEER_DIALS_PER_RETRY"));
+        assert!(
+            dial_feeder
+                .contains("take_eligible(&mut new_peers).or_else(|| take_eligible(&mut retries))")
+        );
+        assert!(dial_feeder.contains("if candidate.peer == local_peer_id"));
+        assert!(!dial_feeder.contains("prefer_new_peer"));
+        assert!(dial_feeder.contains("candidate.retry = candidate.retry"));
+        assert!(dial_feeder.contains("known_peer_underlays"));
+        assert!(dial_feeder.contains("underlay == &candidate.dial_addr"));
+        assert!(dial_feeder.contains("candidate.bootnode,"));
+        assert!(include_str!("../src/handlers.rs").contains("underlay: peer.underlay,"));
+        assert!(include_str!("../src/handlers.rs").contains(".send(PeerDialInstruction {"));
+        assert!(runtime.contains("peers_instructions\n        .send(PeerDialInstruction {"));
+        assert!(runtime.contains("mpsc::bounded::<PeerDialInstruction>(MAX_QUEUED_PEER_DIALS)"));
+        assert!(runtime.contains("const FRESH_PEER_DIALS_PER_RETRY: usize = 32;"));
 
         let dial_attempt = runtime
             .split_once("async fn start_owned_connection_attempt(")
@@ -103,6 +130,17 @@ mod connection {
             .1;
         assert!(dial_attempt.contains("PeerCondition::DisconnectedAndNotDialing"));
         assert!(dial_attempt.contains("swarm.dial(options)?;"));
+
+        let swarm_events = runtime
+            .split_once("let swarm_event_handle_1 = async")
+            .expect("swarm event loop")
+            .1;
+        assert!(runtime.contains("const CONNECTION_BUILDUP_SWARM_POLL_MS: u64 = 5;"));
+        assert!(runtime.contains("const STARTUP_QUEUE_POLL_MS: u64 = 15;"));
+        assert!(swarm_events.contains("let connection_building = ongoing > 0;"));
+        assert!(swarm_events.contains("if connection_building"));
+        assert!(swarm_events.contains("swarm.next().now_or_never().flatten()"));
+        assert!(swarm_events.contains("Duration::from_millis(swarm_poll_ms)"));
 
         let reserve = runtime
             .split("async fn try_reserve_connection_capacity(")
@@ -190,9 +228,11 @@ mod connection {
 
         let interface = include_str!("../src/interface_runtime_conventions.rs");
         assert!(interface.contains("for address in randomized_bootnodes(profile)"));
-        assert!(interface.contains("profile.bootnodes.contains(&address.as_str())"));
-        assert!(interface.contains(".min(CONNECTION_DIAL_CONCURRENCY_LIMIT as usize)"));
-        assert!(interface.contains("for (address, network_id) in backfill"));
+        assert!(interface.contains(".take(CONNECTION_DIAL_CONCURRENCY_LIMIT as usize)"));
+        assert!(!interface.contains("profile.bootnodes.contains(&address.as_str())"));
+        assert!(interface.contains("BOOTNODE_INPUT_IDS.iter().enumerate()"));
+        assert!(interface.contains("profile.bootnodes.get(index)"));
+        assert!(!interface.contains("backfill"));
 
         let library = include_str!("../src/library.rs");
         assert_eq!(library.matches("randomized_bootnodes(profile)").count(), 3);
@@ -202,8 +242,18 @@ mod connection {
             .and_then(|(_, source)| source.split_once("#[wasm_bindgen]"))
             .map(|(source, _)| source)
             .expect("bootnode scheduler");
-        assert!(scheduler.contains("crate::join_all(first_wave).await"));
-        assert!(scheduler.contains("for node in backfill"));
+        assert!(scheduler.contains("crate::join_all(dials).await"));
+        assert!(!scheduler.contains("backfill"));
+        assert_eq!(
+            library
+                .matches(".take(CONNECTION_DIAL_CONCURRENCY_LIMIT as usize)")
+                .count(),
+            3
+        );
+
+        let runtime = include_str!("../src/lib.rs");
+        assert!(runtime.contains("const MAX_QUEUED_PEER_DIALS: usize = 4_096;"));
+        assert!(!runtime.contains("prefer_new_peer"));
     }
 
     #[test]
@@ -394,6 +444,10 @@ mod connection {
             "another physical connection must not hide an exact failed dial or leak its capacity"
         );
         assert!(outgoing_error.contains("if physically_connected && !had_attempt"));
+        assert!(outgoing_error.contains("let retryable = !matches!("));
+        assert!(outgoing_error.contains("DialError::LocalPeerId { .. }"));
+        assert!(outgoing_error.contains("DialError::WrongPeerId { .. }"));
+        assert!(outgoing_error.contains("should_retry = retryable"));
     }
 
     #[test]
@@ -442,8 +496,9 @@ mod connection {
             .find(".remove(&peer_id)")
             .expect("same-generation cooldown release");
         let enqueue = close[sleep..]
-            .find(".try_send((bzzaddr, retry_generation))")
+            .find("PeerDialInstruction {")
             .expect("reconnect enqueue");
+        assert!(close[enqueue..].contains("retry: true,"));
         assert!(
             snapshot < backoff
                 && backoff < cooldown
@@ -609,6 +664,30 @@ mod connection {
         let handlers = include_str!("../src/handlers.rs");
         assert!(handlers.contains("let Some(ack) = rec_0.ack.as_ref()"));
         assert!(handlers.contains("let Some(peer_address) = ack.address.as_ref()"));
+        let handshake = handlers
+            .split("pub async fn ceive(")
+            .nth(1)
+            .and_then(|source| source.split("pub async fn pricing_handler(").next())
+            .expect("handshake initiator");
+        assert!(handshake.contains("deserialize_underlays(&syn.observed_underlay)"));
+        assert!(handshake.contains("try_from_multiaddr(underlay).as_ref() != Some(&local_peer)"));
+        assert!(handshake.contains("let underlay = syn.observed_underlay.clone();"));
+        assert!(handshake.contains("if ack.network_id != network_id"));
+
+        let connection = handlers
+            .split("pub async fn connection_handler(")
+            .nth(1)
+            .and_then(|source| source.split("pub async fn refresh_handler(").next())
+            .expect("handshake connection binding");
+        let open = connection
+            .find("control.open_stream(")
+            .expect("stream open");
+        let capture = connection
+            .find("TransportConnectionSession::capture(")
+            .expect("physical session capture");
+        assert!(open < capture);
+        assert!(connection.contains("peer, connection_id, physical_connections"));
+        assert!(!runtime.contains("self_ephemerals"));
         assert!(handlers.contains("read_control_protocol_frame(&mut stream).await"));
         assert!(handlers.contains("stream.read_exact(&mut frame).await"));
         assert!(handlers.contains("enum RefreshmentOutcome"));

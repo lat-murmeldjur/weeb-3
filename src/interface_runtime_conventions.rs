@@ -406,7 +406,10 @@ pub(super) async fn connect_all_bootnode_settings(weeb3: Arc<Weeb3>, apply_gener
         .ok()
         .and_then(profile_for_swarm_network_id);
     if let Some(profile) = profile {
-        for address in randomized_bootnodes(profile) {
+        for address in randomized_bootnodes(profile)
+            .into_iter()
+            .take(CONNECTION_DIAL_CONCURRENCY_LIMIT as usize)
+        {
             let address = address.to_string();
             let key = format!("{}|{}", network_id, address);
             if seen.insert(key) {
@@ -415,15 +418,15 @@ pub(super) async fn connect_all_bootnode_settings(weeb3: Arc<Weeb3>, apply_gener
         }
     }
 
-    for element_id in BOOTNODE_INPUT_IDS {
+    for (index, element_id) in BOOTNODE_INPUT_IDS.iter().enumerate() {
         let (address, node_network_id) = parsebootconnect(element_id.to_string());
         if address.trim().is_empty() || node_network_id.trim().is_empty() {
             continue;
         }
         if node_network_id == network_id
             && profile
-                .map(|profile| profile.bootnodes.contains(&address.as_str()))
-                .unwrap_or(false)
+                .and_then(|profile| profile.bootnodes.get(index))
+                .is_some_and(|default| address == *default)
         {
             continue;
         }
@@ -439,11 +442,6 @@ pub(super) async fn connect_all_bootnode_settings(weeb3: Arc<Weeb3>, apply_gener
         network_id
     ));
 
-    let backfill = dial_requests.split_off(
-        dial_requests
-            .len()
-            .min(CONNECTION_DIAL_CONCURRENCY_LIMIT as usize),
-    );
     let futures = dial_requests.into_iter().map(|(address, network_id)| {
         let weeb300 = weeb3.clone();
         async move {
@@ -452,14 +450,6 @@ pub(super) async fn connect_all_bootnode_settings(weeb3: Arc<Weeb3>, apply_gener
     });
 
     join_all(futures).await;
-    if !backfill.is_empty() {
-        spawn_local(async move {
-            for (address, network_id) in backfill {
-                connect_bootnode_address(weeb3.clone(), address, network_id, apply_generation)
-                    .await;
-            }
-        });
-    }
 }
 
 async fn connect_bootnode_address(

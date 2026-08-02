@@ -42,7 +42,7 @@ use crate::PSEUDOSETTLE_PROTOCOL;
 use crate::PUSHSYNC_PROTOCOL;
 use crate::RETRIEVAL_PROTOCOL;
 use crate::SWAP_PROTOCOL;
-use crate::{OutboundProtocolSession, TransportConnectionSession};
+use crate::{OutboundProtocolSession, PeerDialInstruction, TransportConnectionSession};
 
 const CONTROL_PROTOCOL_MAX_FRAME_BYTES: u64 = 64 * 1024;
 const HIVE_PROTOCOL_MAX_FRAME_BYTES: u64 = 128 * 1024;
@@ -158,10 +158,10 @@ async fn prepare_outgoing_cheque_state(
 
 pub async fn ceive(
     peer: PeerId,
+    local_peer: PeerId,
     connection_attempt_id: usize,
     connection_id: ConnectionId,
     network_id: u64,
-    self_ephemeral: libp2p::core::Multiaddr,
     mut stream: Stream,
     a: libp2p::core::Multiaddr,
     signer: &PrivateKeySigner,
@@ -201,11 +201,25 @@ pub async fn ceive(
         }
     };
 
-    let underlay = self_ephemeral.to_vec();
+    let Some(syn) = rec_0.syn.as_ref() else {
+        return false;
+    };
+    let observed_underlays = crate::addresses::deserialize_underlays(&syn.observed_underlay);
+    if observed_underlays.is_empty()
+        || observed_underlays
+            .iter()
+            .any(|underlay| try_from_multiaddr(underlay).as_ref() != Some(&local_peer))
+    {
+        return false;
+    }
+    let underlay = syn.observed_underlay.clone();
 
     let Some(ack) = rec_0.ack.as_ref() else {
         return false;
     };
+    if ack.network_id != network_id {
+        return false;
+    }
     let Some(peer_address) = ack.address.as_ref() else {
         return false;
     };
@@ -357,7 +371,7 @@ pub async fn pricing_handler(
 pub async fn gossip_handler(
     _peer: PeerId,
     mut stream: Stream,
-    chan: &mpsc::Sender<(etiquette_2::BzzAddress, u64)>,
+    chan: &mpsc::Sender<PeerDialInstruction>,
     generation: u64,
 ) {
     if read_control_protocol_frame(&mut stream).await.is_none() {
@@ -397,7 +411,19 @@ pub async fn gossip_handler(
     };
 
     for peer in rec_0.peers {
-        if chan.try_send((peer, generation)).is_err() {
+        if chan
+            .send(PeerDialInstruction {
+                address: etiquette_2::BzzAddress {
+                    underlay: peer.underlay,
+                    ..Default::default()
+                },
+                generation,
+                retry: false,
+                bootnode: false,
+            })
+            .await
+            .is_err()
+        {
             return;
         }
     }
@@ -673,18 +699,16 @@ pub async fn trieve(
 
 pub async fn connection_handler(
     peer: PeerId,
+    local_peer: PeerId,
     connection_attempt_id: usize,
-    session: TransportConnectionSession,
+    connection_id: ConnectionId,
+    physical_connections: crate::PhysicalConnectionMap,
     network_id: u64,
-    self_ephemeral: libp2p::core::Multiaddr,
     mut control: StreamControl,
     a: &libp2p::core::Multiaddr,
     signer: &PrivateKeySigner,
     chan: &mpsc::Sender<PeerFile>,
 ) -> bool {
-    if !session.is_current() {
-        return false;
-    }
     let stream = match control.open_stream(peer, HANDSHAKE_PROTOCOL).await {
         Ok(stream) => stream,
         Err(OpenStreamError::UnsupportedProtocol(_)) => {
@@ -694,17 +718,19 @@ pub async fn connection_handler(
             return false;
         }
     };
-    if !session.is_current() {
+    let Some(session) =
+        TransportConnectionSession::capture(peer, connection_id, physical_connections)
+    else {
         drop(stream);
         return false;
-    }
+    };
 
     if !ceive(
         peer,
+        local_peer,
         connection_attempt_id,
         session.connection_id(),
         network_id,
-        self_ephemeral,
         stream,
         a.clone(),
         signer,

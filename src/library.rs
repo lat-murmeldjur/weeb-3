@@ -345,6 +345,7 @@ fn start_options_from_js(options: Option<JsValue>) -> StartOptions {
     let bootstrap_nodes = if configured_nodes.is_empty() {
         randomized_bootnodes(profile)
             .into_iter()
+            .take(CONNECTION_DIAL_CONCURRENCY_LIMIT as usize)
             .map(|address| StartBootstrapNode {
                 multiaddr: address.to_string(),
                 usable: true,
@@ -498,13 +499,8 @@ fn schedule_bootnode_dials(
         dial_nodes.push(node);
     }
 
-    let backfill = dial_nodes.split_off(
-        dial_nodes
-            .len()
-            .min(CONNECTION_DIAL_CONCURRENCY_LIMIT as usize),
-    );
     spawn_local(async move {
-        let first_wave = dial_nodes.into_iter().map(|node| {
+        let dials = dial_nodes.into_iter().map(|node| {
             let dialer = inner.clone();
             async move {
                 let _ = dialer
@@ -516,16 +512,7 @@ fn schedule_bootnode_dials(
                     .await;
             }
         });
-        crate::join_all(first_wave).await;
-        for node in backfill {
-            let _ = inner
-                .connect_bootnode_for_current_network(
-                    node.multiaddr,
-                    expected_network_id,
-                    node.usable,
-                )
-                .await;
-        }
+        crate::join_all(dials).await;
     });
 }
 
@@ -619,6 +606,7 @@ impl Weeb3No103 {
                 .map(|profile| {
                     randomized_bootnodes(profile)
                         .into_iter()
+                        .take(CONNECTION_DIAL_CONCURRENCY_LIMIT as usize)
                         .map(|address| StartBootstrapNode {
                             multiaddr: address.to_string(),
                             usable: true,
@@ -719,7 +707,10 @@ impl Weeb3No103 {
         let requested_bootnodes = Array::new();
         let skipped_bootnodes = Array::new();
         let mut bootstrap_nodes = Vec::new();
-        for address in randomized_bootnodes(profile) {
+        for address in randomized_bootnodes(profile)
+            .into_iter()
+            .take(CONNECTION_DIAL_CONCURRENCY_LIMIT as usize)
+        {
             if is_browser_dialable_underlay(address) {
                 requested_bootnodes.push(&JsValue::from_str(address));
                 bootstrap_nodes.push(StartBootstrapNode {
