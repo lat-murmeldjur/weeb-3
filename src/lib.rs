@@ -1966,6 +1966,38 @@ impl Weeb3 {
         *connected
     }
 
+    pub(crate) async fn available_retrieve_slots(&self) -> u64 {
+        let wings = { self.wings.lock().await.clone() };
+        let selectable = wings
+            .overlay_peers
+            .lock()
+            .await
+            .values()
+            .cloned()
+            .collect::<HashSet<_>>();
+        let accounts = wings
+            .accounting_peers
+            .lock()
+            .await
+            .iter()
+            .filter(|(peer, _)| selectable.contains(*peer))
+            .map(|(_, account)| account.clone())
+            .collect::<Vec<_>>();
+        let mut slots = 0_u64;
+        for account in accounts {
+            let account = account.lock().await;
+            if account.connection_id.is_some() {
+                slots = slots.saturating_add(
+                    account
+                        .threshold
+                        .saturating_sub(account.balance.saturating_add(account.reserve))
+                        / accounting::MAX_CHUNK_PRICE,
+                );
+            }
+        }
+        slots
+    }
+
     pub async fn get_network_id(&self) -> u64 {
         let network_id = self.network_id.lock().await;
         *network_id

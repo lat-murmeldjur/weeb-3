@@ -72,9 +72,30 @@ mod hls {
             None,
             0
         ));
-        assert!(!hls_live_frontier_is_ready(48, None, 0.0, 10.0, Some(7), 7));
-        assert!(hls_live_frontier_is_ready(48, None, 0.0, 10.0, Some(7), 0));
-        assert!(hls_live_frontier_is_ready(48, None, 0.0, 10.0, Some(7), 8));
+        assert!(!hls_live_frontier_is_ready(
+            48,
+            None,
+            0.0,
+            10.0,
+            Some((7, 47)),
+            7
+        ));
+        assert!(hls_live_frontier_is_ready(
+            48,
+            None,
+            0.0,
+            10.0,
+            Some((7, 47)),
+            0
+        ));
+        assert!(!hls_live_frontier_is_ready(
+            48,
+            None,
+            0.0,
+            10.0,
+            Some((7, 48)),
+            8
+        ));
     }
 
     #[test]
@@ -97,6 +118,19 @@ mod hls {
             hls_media_references(augmented.as_bytes()),
             [REF, REF2, REF3]
         );
+    }
+
+    #[test]
+    fn live_codec_bootstrap_uses_the_first_sequence_zero_segment() {
+        let bootstrap = format!(
+            "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:0\n#EXTINF:4.166667,\n{REF}\n#EXTINF:4.166667,\n{REF2}\n"
+        );
+        let live = format!(
+            "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:304\n#EXTINF:4.166667,\n{REF2}\n#EXTINF:4.166667,\n{REF3}\n"
+        );
+        let augmented = prepend_hls_codec_bootstrap(live.as_bytes(), bootstrap.as_bytes()).unwrap();
+
+        assert_eq!(hls_media_references(&augmented), [REF, REF2, REF3]);
     }
 
     #[test]
@@ -2688,16 +2722,18 @@ mod service_worker {
         assert!(live_frontier.contains("state.confirmed_head_index"));
         assert!(live_frontier.contains("hls_live_frontier_is_ready("));
         assert!(!live_frontier.contains("frontier_refinement"));
-        assert!(live_frontier.contains("initial_check_token: Option<u64>"));
+        assert!(live_frontier.contains("initial_check: Option<(u64, u64)>"));
         assert!(live_frontier.contains("state.checking_token"));
         assert!(HLS_PLAYER.contains("checking_token != token"));
-        assert!(live_frontier.contains("initial_check_token.is_some() || now >= deadline_ms"));
+        assert!(HLS_PLAYER.contains("snapshot_index > initial_index"));
+        assert!(live_frontier.contains("initial_check.is_some() || now >= deadline_ms"));
         assert!(live_frontier.contains("now >= deadline_ms"));
         assert!(!live_frontier.contains("provisional_index"));
         assert!(load.contains("refresh_head && wait_for_live_frontier"));
         assert!(load.contains("let initial_check_token = if let Some(initial)"));
-        assert!(load.contains("Some(()) if initial_check_token.is_some()"));
-        assert!(load.contains("initial_check_token,"));
+        assert!(load.contains("let initial_check = initial_check_token.map("));
+        assert!(load.contains("Some(()) if initial_check.is_some()"));
+        assert!(load.contains("initial_check,"));
         let stabilization = source_between(
             HLS_PLAYER,
             "async fn stabilize_initial_unindexed_hls_payload",
@@ -2814,12 +2850,12 @@ mod service_worker {
             feed_response
                 .contains("reference,\n                false,\n                generation,")
         );
-        assert!(!feed_response.contains("Some(HLS_EARLY_FEED_PREFIX_INDEX)"));
+        assert!(feed_response.contains("[HLS_EARLY_FEED_PREFIX_INDEX, 0]"));
 
         let early_decode = source_between(
             BZZ_STREAM,
             "pub(crate) async fn acquire_latest_raw_feed_payload_startup(",
-            "pub(crate) async fn acquire_latest_raw_feed_payload_bounded_from(",
+            "pub(crate) async fn acquire_latest_raw_feed_payload_bounded_from",
         );
         assert!(early_decode.contains("seek_latest_feed_update_indexed_wide_bounded("));
         assert!(!early_decode.contains("overscan_sequence_feed_candidate("));
@@ -2835,14 +2871,13 @@ mod service_worker {
         assert!(observed_decode.contains("span > CHUNK_SIZE as u64"));
         let observed_frontier = source_between(
             BZZ_STREAM,
-            "pub(crate) async fn acquire_latest_raw_feed_payload_bounded_from(",
+            "pub(crate) async fn acquire_latest_raw_feed_payload_bounded_from",
             "pub(crate) async fn acquire_latest_raw_feed_payload_from(",
         );
         assert!(observed_frontier.contains("observed_updates.try_send((index, update.clone()))"));
         assert!(stabilization.contains("select(search, Box::pin(observed_in.recv()))"));
-        assert!(stabilization.contains(
-            "loaded.clone(),\n                true,\n                &weeb3.chunk_port.0,\n                Some(observed_out)"
-        ));
+        assert!(stabilization.contains("await_feed_probe_wave_credit"));
+        assert!(stabilization.contains("Some(observed_out)"));
         let sequence_zero_startup = source_between(
             HLS_PLAYER,
             "fn publish_sequence_zero_startup_snapshot(",
@@ -2889,11 +2924,15 @@ mod service_worker {
         assert!(live_history.contains("HLS_EARLY_FEED_PREFIX_INDEX"));
         assert!(live_history.contains("feed_followup_batch_limit("));
         assert!(live_history.contains("feed_followup_max_parallel("));
+        assert!(live_history.contains("fallback_remaining"));
+        assert!(live_history.contains(".rev()"));
+        assert!(live_history.contains("expected_index <= current_index"));
         assert!(live_history.contains(".collect::<Vec<_>>()"));
         assert!(live_history.contains("append_hls_sequence_zero_archive_suffix("));
         assert!(live_history.contains("raise_hls_target_duration(&mut archive, target_duration)"));
+        assert!(live_history.contains("current_index == canonical_index"));
         assert!(live_history.contains("current_source.as_slice() == canonical_source.as_ref()"));
-        assert!(live_history.contains("confirmed_head_index == Some(canonical_index)"));
+        assert!(!live_history.contains("confirmed_head_index == Some(canonical_index)"));
         assert!(live_history.contains("session.live_history_active = true"));
         assert_eq!(live_history.matches("cache.insert(").count(), 1);
         assert!(!live_history.contains("extend_hls_sequence_zero_archive("));

@@ -1,7 +1,7 @@
 use crate::{
     ChunkRetrieveSender, RetrieveCancelToken, RetrieveGenerationMap,
     erasure_coding::{CHUNK_SIZE, decode_span, encoded_reference_payload_len},
-    feed::{FEED_FRONTIER_LOOKAHEAD_TIMEOUT, FeedProbe, overscan_sequence_feed_candidate},
+    feed::overscan_sequence_feed_candidate,
     manifest::{
         BzzManifestFork, MAX_PARALLEL_MANIFEST_FORKS, ParsedBzzManifest, ResolutionGuard,
         is_bzz_manifest_header, manifest_payload_size_allowed, manifest_wrapped_reference,
@@ -367,33 +367,33 @@ pub(crate) async fn acquire_latest_raw_feed_payload_startup(
     Some(RawFeedPayload { index, bytes })
 }
 
-pub(crate) async fn acquire_latest_raw_feed_payload_bounded_from(
+pub(crate) async fn acquire_latest_raw_feed_payload_bounded_from<AdmitWave, AdmitFuture>(
     owner: String,
     topic: String,
     initial: RawFeedPayload,
     force_coarse: bool,
     chunk_retrieve_chan: &ChunkRetrieveSender,
+    admit_wave: AdmitWave,
     observed_payloads: Option<mpsc::Sender<RawFeedPayload>>,
-) -> Option<(RawFeedPayload, bool)> {
+) -> Option<(RawFeedPayload, bool)>
+where
+    AdmitWave: Fn(usize) -> AdmitFuture,
+    AdmitFuture: std::future::Future<Output = bool>,
+{
     let observed_updates = observed_payloads
         .map(|payloads| decode_observed_feed_updates(payloads, None, chunk_retrieve_chan));
     let ((index, update), verified) = overscan_sequence_feed_candidate(
         (initial.index, Vec::new()),
         force_coarse,
         |index| {
-            let lookup = retrieve_feed_update_at_index_status(
+            retrieve_feed_update_at_index_status(
                 owner.clone(),
                 topic.clone(),
                 index,
                 chunk_retrieve_chan,
-            );
-            async move {
-                match async_std::future::timeout(FEED_FRONTIER_LOOKAHEAD_TIMEOUT, lookup).await {
-                    Ok(result) => result,
-                    Err(_) => FeedProbe::Transient,
-                }
-            }
+            )
         },
+        admit_wave,
         |index, update| {
             if let Some(observed_updates) = observed_updates.as_ref() {
                 let _ = observed_updates.try_send((index, update.clone()));

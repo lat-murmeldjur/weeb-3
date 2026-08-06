@@ -1015,14 +1015,15 @@ pub(crate) fn prepend_hls_codec_bootstrap(
         return None;
     }
     let current = hls_segment_identities(manifest)?;
-    let bootstrap = hls_segment_identities(bootstrap_manifest)?
-        .into_iter()
-        .rev()
-        .find(|candidate| {
-            !current
-                .iter()
-                .any(|segment| segment.reference == candidate.reference)
-        })?;
+    let mut bootstrap_segments = hls_segment_identities(bootstrap_manifest)?;
+    if hls_media_sequence(bootstrap_manifest) != Some(0) {
+        bootstrap_segments.reverse();
+    }
+    let bootstrap = bootstrap_segments.into_iter().find(|candidate| {
+        !current
+            .iter()
+            .any(|segment| segment.reference == candidate.reference)
+    })?;
     if bootstrap.byte_range.is_some() || bootstrap.discontinuity_counter != 0 {
         return None;
     }
@@ -1624,13 +1625,15 @@ pub(crate) fn hls_live_frontier_is_ready(
     confirmed_head_index: Option<u64>,
     last_head_check_ms: f64,
     checked_after_ms: f64,
-    initial_check_token: Option<u64>,
+    initial_check: Option<(u64, u64)>,
     checking_token: u64,
 ) -> bool {
     (confirmed_head_index == Some(snapshot_index)
         && last_head_check_ms.is_finite()
         && last_head_check_ms > checked_after_ms)
-        || initial_check_token.is_some_and(|token| checking_token != token)
+        || initial_check.is_some_and(|(token, initial_index)| {
+            checking_token != token && snapshot_index > initial_index
+        })
 }
 
 pub(crate) fn feed_followup_batch_limit(mode: FeedFollowupMode) -> usize {
@@ -3701,6 +3704,9 @@ mod runtime {
     const HLS_LIVE_FRONTIER_MAX_WAIT: Duration = Duration::from_secs(15);
     const HLS_LIVE_FRONTIER_CONNECTION_WAIT: Duration = Duration::from_secs(7);
     const HLS_LIVE_FRONTIER_MIN_PRICED_PEERS: u64 = 1;
+    const HLS_FEED_WAVE_CREDIT_WAIT: Duration = Duration::from_secs(7);
+    const HLS_FEED_WAVE_FOREGROUND_MARGIN_CHUNKS: u64 = 64;
+    const HLS_FEED_WAVE_RESERVATIONS_PER_PROBE: u64 = 2;
     const HLS_ASSET_METADATA_CACHE_MAX_ENTRIES: usize = 1024;
     const HLS_ASSET_PROBE_BYTES: u64 = 512;
     const HLS_REPRESENTATION_VERSION: &str = "weeb3-hls-v2";
@@ -6077,22 +6083,45 @@ mod runtime {
                 let presentation = if hls_media_sequence(&snapshot.body) == Some(0) {
                     rewrite_hls_sequence_zero_codec_bootstrap(&snapshot.body, true)
                 } else {
-                    let Some(bootstrap_index) = snapshot.index.checked_sub(1) else {
-                        return FetchResponse::error(503, "HLS codec bootstrap is not available");
+                    let mut bootstrap = None;
+                    for index in [HLS_EARLY_FEED_PREFIX_INDEX, 0] {
+                        if let Some(prefix) = weeb3
+                            .hls_feed_payload_at_index_bounded(owner.clone(), topic.clone(), index)
+                            .await
+                            .filter(|prefix| hls_media_sequence(&prefix.bytes) == Some(0))
+                        {
+                            bootstrap = Some(prefix.bytes);
+                            break;
+                        }
+                    }
+                    let bootstrap = match bootstrap {
+                        Some(bootstrap) => bootstrap,
+                        None => {
+                            let Some(bootstrap_index) = snapshot.index.checked_sub(1) else {
+                                return FetchResponse::error(
+                                    503,
+                                    "HLS codec bootstrap is not available",
+                                );
+                            };
+                            let Some(bootstrap) = load_feed_snapshot(
+                                weeb3.clone(),
+                                owner.clone(),
+                                topic.clone(),
+                                Some(bootstrap_index),
+                                HlsStart::Beginning,
+                                None,
+                            )
+                            .await
+                            else {
+                                return FetchResponse::error(
+                                    503,
+                                    "HLS codec bootstrap is not available",
+                                );
+                            };
+                            bootstrap.body.to_vec()
+                        }
                     };
-                    let Some(bootstrap) = load_feed_snapshot(
-                        weeb3.clone(),
-                        owner.clone(),
-                        topic.clone(),
-                        Some(bootstrap_index),
-                        HlsStart::Beginning,
-                        None,
-                    )
-                    .await
-                    else {
-                        return FetchResponse::error(503, "HLS codec bootstrap is not available");
-                    };
-                    prepend_hls_codec_bootstrap(&snapshot.body, &bootstrap.body)
+                    prepend_hls_codec_bootstrap(&snapshot.body, &bootstrap)
                 };
                 let Some(presentation) = presentation else {
                     return FetchResponse::error(502, "HLS codec bootstrap is not supported");
@@ -6246,7 +6275,7 @@ mod runtime {
         cache_key: &str,
         checked_after_ms: f64,
         deadline_ms: f64,
-        initial_check_token: Option<u64>,
+        initial_check: Option<(u64, u64)>,
     ) -> Option<FeedRouteSnapshot> {
         loop {
             let state = FEED_ROUTE_CACHE.with(|cache| {
@@ -6266,13 +6295,13 @@ mod runtime {
                     confirmed_head_index,
                     last_head_check,
                     checked_after_ms,
-                    initial_check_token,
+                    initial_check,
                     checking_token,
                 ) || now >= deadline_ms
                 {
                     return Some(snapshot);
                 }
-            } else if initial_check_token.is_some() || now >= deadline_ms {
+            } else if initial_check.is_some() || now >= deadline_ms {
                 return None;
             }
             async_std::task::sleep(Duration::from_millis(15)).await;
@@ -6867,12 +6896,13 @@ mod runtime {
         } else {
             None
         };
+        let initial_check = initial_check_token.map(|token| (token, snapshot.index));
         let snapshot = match await_live_frontier {
-            Some(()) if initial_check_token.is_some() => await_live_frontier_snapshot(
+            Some(()) if initial_check.is_some() => await_live_frontier_snapshot(
                 &cache_key,
                 last_head_check,
                 live_frontier_deadline_ms,
-                initial_check_token,
+                initial_check,
             )
             .await
             .unwrap_or(snapshot),
@@ -6947,6 +6977,33 @@ mod runtime {
         (confirmed, true)
     }
 
+    async fn await_feed_probe_wave_credit(
+        weeb3: Arc<Weeb3>,
+        expected_network_id: u64,
+        probe_count: usize,
+        deadline_ms: f64,
+    ) -> bool {
+        let probe_count = u64::try_from(probe_count).unwrap_or(u64::MAX);
+        let foreground_margin = (probe_count / 2).min(HLS_FEED_WAVE_FOREGROUND_MARGIN_CHUNKS);
+        let required = probe_count
+            .saturating_mul(HLS_FEED_WAVE_RESERVATIONS_PER_PROBE)
+            .saturating_add(foreground_margin);
+        loop {
+            if weeb3.get_network_id().await != expected_network_id
+                || active_profile().swarm_network_id != expected_network_id
+            {
+                return false;
+            }
+            if weeb3.available_retrieve_slots().await >= required {
+                return true;
+            }
+            if js_sys::Date::now() >= deadline_ms {
+                return false;
+            }
+            async_std::task::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
     async fn stabilize_initial_unindexed_hls_payload<ObserveCandidate>(
         weeb3: Arc<Weeb3>,
         owner: &str,
@@ -6983,23 +7040,45 @@ mod runtime {
         let reliable = if hls_is_finalized(&loaded.bytes) {
             Some((loaded.clone(), true))
         } else if !observe_progress {
+            let admission_client = weeb3.clone();
+            let admission_deadline =
+                js_sys::Date::now() + HLS_FEED_WAVE_CREDIT_WAIT.as_millis() as f64;
             acquire_latest_raw_feed_payload_bounded_from(
                 owner.to_string(),
                 topic.to_string(),
                 loaded.clone(),
                 false,
                 &weeb3.chunk_port.0,
+                move |probe_count| {
+                    await_feed_probe_wave_credit(
+                        admission_client.clone(),
+                        network_id,
+                        probe_count,
+                        admission_deadline,
+                    )
+                },
                 None,
             )
             .await
         } else {
             let (observed_out, observed_in) = mpsc::bounded::<crate::bzz_stream::RawFeedPayload>(2);
+            let admission_client = weeb3.clone();
+            let admission_deadline =
+                js_sys::Date::now() + HLS_FEED_WAVE_CREDIT_WAIT.as_millis() as f64;
             let mut search = Box::pin(acquire_latest_raw_feed_payload_bounded_from(
                 owner.to_string(),
                 topic.to_string(),
                 loaded.clone(),
                 true,
                 &weeb3.chunk_port.0,
+                move |probe_count| {
+                    await_feed_probe_wave_credit(
+                        admission_client.clone(),
+                        network_id,
+                        probe_count,
+                        admission_deadline,
+                    )
+                },
                 Some(observed_out),
             ));
             loop {
@@ -7528,21 +7607,22 @@ mod runtime {
                     let last_prefix_index = HLS_EARLY_FEED_PREFIX_INDEX
                         .saturating_add(HLS_EARLY_FEED_PREFIX_TARGET_SEGMENTS as u64)
                         .min(initial_index);
-                    let candidates =
-                        stream::iter(0..=last_prefix_index)
-                            .map(|index| {
-                                let client = weeb3.clone();
-                                let owner = owner.clone();
-                                let topic = topic.clone();
-                                async move {
-                                    client.hls_feed_payload_at_index(owner, topic, index).await
-                                }
-                            })
-                            .buffered(feed_followup_max_parallel(
-                                FeedFollowupMode::SequenceZeroPresentation,
-                            ))
-                            .collect::<Vec<_>>()
-                            .await;
+                    let candidates = stream::iter(0..=last_prefix_index)
+                        .map(|index| {
+                            let client = weeb3.clone();
+                            let owner = owner.clone();
+                            let topic = topic.clone();
+                            async move {
+                                client
+                                    .hls_feed_payload_at_index_bounded(owner, topic, index)
+                                    .await
+                            }
+                        })
+                        .buffered(feed_followup_max_parallel(
+                            FeedFollowupMode::SequenceZeroPresentation,
+                        ))
+                        .collect::<Vec<_>>()
+                        .await;
                     let unavailable = candidates.iter().any(Option::is_none);
                     if let Some(prefix) = candidates.into_iter().rev().flatten().find(|payload| {
                         payload.bytes.len() <= MAX_STREAM_FEED_PAYLOAD_BYTES
@@ -7606,7 +7686,6 @@ mod runtime {
                             (
                                 state.snapshot.index,
                                 state.snapshot.finalized,
-                                state.confirmed_head_index,
                                 state.last_head_check,
                                 state.source_body.clone(),
                             )
@@ -7615,12 +7694,10 @@ mod runtime {
                     if let Some((
                         canonical_index,
                         canonical_finalized,
-                        confirmed_head_index,
                         last_head_check,
                         canonical_source,
                     )) = canonical
                         && current_index == canonical_index
-                        && confirmed_head_index == Some(canonical_index)
                         && current_source.as_slice() == canonical_source.as_ref()
                     {
                         if raise_hls_target_duration(&mut archive, target_duration).is_none()
@@ -7681,65 +7758,101 @@ mod runtime {
                     continue;
                 }
 
-                let Some(first_index) = current_index.checked_add(1) else {
+                let source_segments = match hls_segment_identities(&current_source) {
+                    Some(segments) if !segments.is_empty() => segments.len(),
+                    _ => return,
+                };
+                let stride =
+                    u64::try_from(source_segments.saturating_sub(1).max(1)).unwrap_or(u64::MAX);
+                let fallback_limit =
+                    feed_followup_batch_limit(FeedFollowupMode::SequenceZeroPresentation);
+                let batch_limit = fallback_limit.min(feed_followup_max_parallel(
+                    FeedFollowupMode::SequenceZeroPresentation,
+                ));
+                let mut batch_indices = Vec::with_capacity(batch_limit);
+                let mut next_index = current_index;
+                for _ in 0..batch_limit {
+                    next_index = next_index.saturating_add(stride).min(target_index);
+                    if next_index <= current_index {
+                        break;
+                    }
+                    batch_indices.push(next_index);
+                    if next_index == target_index {
+                        break;
+                    }
+                }
+                let Some(&preferred_index) = batch_indices.first() else {
                     return;
                 };
-                let batch_end = current_index
-                    .saturating_add(feed_followup_batch_limit(
-                        FeedFollowupMode::SequenceZeroPresentation,
-                    ) as u64)
-                    .min(target_index);
-                let batch = stream::iter(first_index..=batch_end)
-                    .map(|index| {
-                        let client = weeb3.clone();
-                        let owner = owner.clone();
-                        let topic = topic.clone();
-                        async move {
-                            (
-                                index,
-                                client.hls_feed_payload_at_index(owner, topic, index).await,
+                let previous_index = current_index;
+                let mut fallback_end = preferred_index;
+                let mut fallback_remaining = fallback_limit;
+                loop {
+                    let batch = stream::iter(std::mem::take(&mut batch_indices))
+                        .map(|index| {
+                            let client = weeb3.clone();
+                            let owner = owner.clone();
+                            let topic = topic.clone();
+                            async move {
+                                (
+                                    index,
+                                    client
+                                        .hls_feed_payload_at_index_bounded(owner, topic, index)
+                                        .await,
+                                )
+                            }
+                        })
+                        .buffered(feed_followup_max_parallel(
+                            FeedFollowupMode::SequenceZeroPresentation,
+                        ))
+                        .collect::<Vec<_>>()
+                        .await;
+                    for (expected_index, payload) in batch {
+                        let Some(payload) = payload else {
+                            continue;
+                        };
+                        if payload.index != expected_index
+                            || expected_index <= current_index
+                            || payload.bytes.len() > MAX_STREAM_FEED_PAYLOAD_BYTES
+                            || !is_hls_manifest(&payload.bytes)
+                            || append_hls_sequence_zero_archive_suffix(
+                                &mut archive,
+                                &mut archive_segment_count,
+                                &mut archive_media_end,
+                                &current_source,
+                                &payload.bytes,
                             )
+                            .is_none()
+                        {
+                            continue;
                         }
-                    })
-                    .buffered(feed_followup_max_parallel(
-                        FeedFollowupMode::SequenceZeroPresentation,
-                    ))
-                    .collect::<Vec<_>>()
-                    .await;
-
-                let mut unresolved_missing = false;
-                for (expected_index, payload) in batch {
-                    let Some(payload) = payload else {
-                        unresolved_missing = true;
-                        continue;
-                    };
-                    if payload.index != expected_index
-                        || payload.bytes.len() > MAX_STREAM_FEED_PAYLOAD_BYTES
-                        || !is_hls_manifest(&payload.bytes)
-                        || append_hls_sequence_zero_archive_suffix(
-                            &mut archive,
-                            &mut archive_segment_count,
-                            &mut archive_media_end,
-                            &current_source,
-                            &payload.bytes,
-                        )
-                        .is_none()
+                        let Some(candidate_target_duration) = hls_target_duration(&payload.bytes)
+                        else {
+                            return;
+                        };
+                        target_duration = target_duration.max(candidate_target_duration);
+                        current_index = expected_index;
+                        current_source = payload.bytes;
+                    }
+                    if current_index != previous_index
+                        || preferred_index <= previous_index + 1
+                        || fallback_remaining == 0
                     {
-                        continue;
+                        break;
                     }
-                    let Some(candidate_target_duration) = hls_target_duration(&payload.bytes)
-                    else {
-                        return;
-                    };
-                    target_duration = target_duration.max(candidate_target_duration);
-                    current_index = expected_index;
-                    current_source = payload.bytes;
-                    unresolved_missing = false;
+                    batch_indices = (previous_index + 1..fallback_end)
+                        .rev()
+                        .take(batch_limit.min(fallback_remaining))
+                        .collect();
+                    if batch_indices.is_empty() {
+                        break;
+                    }
+                    fallback_remaining -= batch_indices.len();
+                    fallback_end = *batch_indices
+                        .last()
+                        .expect("a non-empty fallback has a lower boundary");
                 }
-                if current_index < batch_end {
-                    if !unresolved_missing {
-                        return;
-                    }
+                if current_index == previous_index {
                     async_std::task::sleep(Duration::from_millis(HLS_PAYLOAD_RETRY_DELAY_MS)).await;
                     continue;
                 }
@@ -8007,12 +8120,23 @@ mod runtime {
         let (latest, verified) = if hls_is_finalized(&initial.bytes) {
             (initial, true)
         } else {
+            let admission_client = weeb3.clone();
+            let admission_deadline =
+                js_sys::Date::now() + HLS_FEED_WAVE_CREDIT_WAIT.as_millis() as f64;
             let Some(latest) = acquire_latest_raw_feed_payload_bounded_from(
                 owner.to_string(),
                 topic.to_string(),
                 initial,
                 force_coarse,
                 &weeb3.chunk_port.0,
+                move |probe_count| {
+                    await_feed_probe_wave_credit(
+                        admission_client.clone(),
+                        network_id,
+                        probe_count,
+                        admission_deadline,
+                    )
+                },
                 None,
             )
             .await

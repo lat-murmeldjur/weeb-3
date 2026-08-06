@@ -1,6 +1,7 @@
 pub(crate) const CONNECTION_BUILDUP_LIMIT: u64 = 200;
 pub(crate) const REFRESH_RATE: u64 = 450000;
 const PO_PRICE: u64 = 10000;
+pub(crate) const MAX_CHUNK_PRICE: u64 = 32 * PO_PRICE;
 
 pub(crate) fn refreshment_due(balance: u64, last_refreshment: f64, payment_threshold: u64) -> bool {
     let target = if last_refreshment == 0.0 {
@@ -143,7 +144,8 @@ pub(crate) async fn cancel_reserve(accounting: &Mutex<PeerAccounting>, amount: u
 
 #[cfg(target_arch = "wasm32")]
 pub(crate) fn price(peer_overlay: &[u8], chunk_address: &[u8]) -> u64 {
-    (u64::from(crate::conventions::MAX_PO) - u64::from(get_proximity(peer_overlay, chunk_address))
+    (u64::from(crate::conventions::MAX_PO)
+        - u64::from(get_proximity(peer_overlay, chunk_address).min(crate::conventions::MAX_PO))
         + 1)
         * PO_PRICE
 }
