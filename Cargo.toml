@@ -56,17 +56,16 @@ alloy = { git = "https://github.com/alloy-rs/alloy.git", default-features = fals
 getrandom = { version = "0.3.3", features = ["wasm_js"] }
 async-std = { git = "https://github.com/async-rs/async-std.git" }
 console_error_panic_hook = "0.1.7"
-libp2p = { git = "https://github.com/libp2p/rust-libp2p.git", rev = "8072a73f62f07adc273e4270a22564f94462b58c", features = [ 
+libp2p = { git = "https://github.com/libp2p/rust-libp2p.git", rev = "6348a0be4aeb5b48eecf17a5d0aae15ff8239984", features = [
 "ecdsa",
 "identify", 
 "macros",
 "noise",
 "ping", 
-"wasm-bindgen", 
 "websocket-websys",
 "yamux",
 ] }
-libp2p-stream = { git = "https://github.com/libp2p/rust-libp2p.git", rev = "8072a73f62f07adc273e4270a22564f94462b58c" }
+libp2p-stream = { git = "https://github.com/libp2p/rust-libp2p.git", rev = "6348a0be4aeb5b48eecf17a5d0aae15ff8239984" }
 wasm-bindgen = "0.2.100"
 wasm-bindgen-futures = "0.4.50"
 js-sys = { version = "0.3.77" }
@@ -77,6 +76,7 @@ web-sys = { version = "0.3.77", features = [
   'CustomEvent',
   'CustomEventInit',
   'Document',
+  'DocumentFragment',
   'Element',
   'Event',
   'EventTarget',

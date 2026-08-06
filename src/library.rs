@@ -1,9 +1,7 @@
 #![cfg(target_arch = "wasm32")]
 
 use crate::{
-    Weeb3,
-    accounting::CONNECTION_DIAL_CONCURRENCY_LIMIT,
-    decode_resources, encrey,
+    Weeb3, decode_resources, encrey,
     erasure_coding::RedundancyLevel,
     erasure_coding::validated_upload_redundancy_number,
     interface::{
@@ -13,9 +11,8 @@ use crate::{
     interface_conventions::render_interface_shell,
     nav::route_network_mode_from_location,
     network_profile::{
-        NetworkMode, NetworkProfile, activate_profile, active_profile,
+        NetworkMode, NetworkProfile, activate_profile, active_profile, initial_bootnodes,
         is_browser_dialable_underlay, profile_for_mode, profile_for_swarm_network_id,
-        randomized_bootnodes,
     },
     normalize_feed_topic,
     on_chain::{
@@ -343,9 +340,8 @@ fn start_options_from_js(options: Option<JsValue>) -> StartOptions {
     };
 
     let bootstrap_nodes = if configured_nodes.is_empty() {
-        randomized_bootnodes(profile)
+        initial_bootnodes(profile)
             .into_iter()
-            .take(CONNECTION_DIAL_CONCURRENCY_LIMIT as usize)
             .map(|address| StartBootstrapNode {
                 multiaddr: address.to_string(),
                 usable: true,
@@ -500,19 +496,15 @@ fn schedule_bootnode_dials(
     }
 
     spawn_local(async move {
-        let dials = dial_nodes.into_iter().map(|node| {
-            let dialer = inner.clone();
-            async move {
-                let _ = dialer
-                    .connect_bootnode_for_current_network(
-                        node.multiaddr,
-                        expected_network_id,
-                        node.usable,
-                    )
-                    .await;
-            }
-        });
-        crate::join_all(dials).await;
+        inner
+            .connect_bootnodes_for_current_network(
+                dial_nodes
+                    .into_iter()
+                    .map(|node| (node.multiaddr, node.usable))
+                    .collect(),
+                expected_network_id,
+            )
+            .await;
     });
 }
 
@@ -604,9 +596,8 @@ impl Weeb3No103 {
             let network_id = s.get_network_id().await;
             let bootstrap_nodes = profile_for_swarm_network_id(network_id)
                 .map(|profile| {
-                    randomized_bootnodes(profile)
+                    initial_bootnodes(profile)
                         .into_iter()
-                        .take(CONNECTION_DIAL_CONCURRENCY_LIMIT as usize)
                         .map(|address| StartBootstrapNode {
                             multiaddr: address.to_string(),
                             usable: true,
@@ -707,10 +698,7 @@ impl Weeb3No103 {
         let requested_bootnodes = Array::new();
         let skipped_bootnodes = Array::new();
         let mut bootstrap_nodes = Vec::new();
-        for address in randomized_bootnodes(profile)
-            .into_iter()
-            .take(CONNECTION_DIAL_CONCURRENCY_LIMIT as usize)
-        {
+        for address in initial_bootnodes(profile) {
             if is_browser_dialable_underlay(address) {
                 requested_bootnodes.push(&JsValue::from_str(address));
                 bootstrap_nodes.push(StartBootstrapNode {

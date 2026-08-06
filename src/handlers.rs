@@ -46,7 +46,6 @@ use crate::{OutboundProtocolSession, PeerDialInstruction, TransportConnectionSes
 
 const CONTROL_PROTOCOL_MAX_FRAME_BYTES: u64 = 64 * 1024;
 const HIVE_PROTOCOL_MAX_FRAME_BYTES: u64 = 128 * 1024;
-
 fn trimmed_big_endian(bytes: &[u8]) -> Vec<u8> {
     let first = bytes
         .iter()
@@ -369,7 +368,6 @@ pub async fn pricing_handler(
 }
 
 pub async fn gossip_handler(
-    _peer: PeerId,
     mut stream: Stream,
     chan: &mpsc::Sender<PeerDialInstruction>,
     generation: u64,
@@ -413,10 +411,7 @@ pub async fn gossip_handler(
     for peer in rec_0.peers {
         if chan
             .send(PeerDialInstruction {
-                address: etiquette_2::BzzAddress {
-                    underlay: peer.underlay,
-                    ..Default::default()
-                },
+                underlay: peer.underlay,
                 generation,
                 retry: false,
                 bootnode: false,

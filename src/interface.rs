@@ -25,7 +25,6 @@ use web_sys::{
 
 use crate::{
     Weeb3,
-    accounting::CONNECTION_DIAL_CONCURRENCY_LIMIT,
     bzz_stream::{BzzMetadata, bzz_reference_hex, normalize_bzz_path},
     decode_resources, encrey,
     erasure_coding::{upload_redundancy_from_number, upload_redundancy_from_select},
@@ -36,8 +35,8 @@ use crate::{
         route_network_mode_from_location,
     },
     network_profile::{
-        NetworkMode, is_browser_dialable_underlay, profile_for_mode, profile_for_swarm_network_id,
-        randomized_bootnodes,
+        NetworkMode, initial_bootnodes, is_browser_dialable_underlay, profile_for_mode,
+        profile_for_swarm_network_id,
     },
     on_chain::{
         buy_postage_batch_with_payer, chequebook_balance, chunk_count_for_depth,
@@ -376,6 +375,18 @@ pub(crate) async fn mount_interface_after_service_worker_bridge_install(
         });
     }
 
+    if schedule_initial_connections {
+        let weeb39 = weeb3.clone();
+        let initial_network_apply_generation = next_network_apply_generation();
+        spawn_local(async move {
+            connect_all_bootnode_settings(weeb39, initial_network_apply_generation).await;
+        });
+    }
+
+    spawn_local(async {
+        let _ = get_service_worker().await;
+    });
+
     async_std::task::yield_now().await;
     if !interface_mount_is_current(mount_generation) {
         return Ok(());
@@ -403,20 +414,8 @@ pub(crate) async fn mount_interface_after_service_worker_bridge_install(
     let weeb34 = weeb3.clone();
     let weeb35 = weeb3.clone();
     let weeb36 = weeb3.clone();
-    let weeb39 = weeb3.clone();
     let weeb40 = weeb3.clone();
     let weeb41 = weeb3.clone();
-
-    if schedule_initial_connections {
-        let initial_network_apply_generation = next_network_apply_generation();
-        spawn_local(async move {
-            connect_all_bootnode_settings(weeb39, initial_network_apply_generation).await;
-        });
-    }
-
-    spawn_local(async {
-        let _ = get_service_worker().await;
-    });
 
     let chequebook_state = Rc::new(RefCell::new(None::<Address>));
 
@@ -1123,9 +1122,7 @@ pub(crate) async fn mount_interface_after_service_worker_bridge_install(
             if !interface_mount_can_poll(mount_generation) {
                 break;
             }
-            for log_message in logs_current.iter() {
-                render_log_message(&log_message);
-            }
+            render_log_messages(&logs_current);
 
             let ongoing = weeb35.get_ongoing_connections().await;
             if !interface_mount_can_poll(mount_generation) {

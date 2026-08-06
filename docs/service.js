@@ -630,13 +630,15 @@ function requestRustRange(clients, url, start, end, networkId) {
   });
 }
 
-function createRustRangeStream(clients, url, size, networkId) {
+function createRustRangeStream(clients, url, size, networkId, stagedStart) {
   let position = 0;
   let schedulePosition = 0;
+  let stagedWindows = stagedStart ? 4 : 0;
   const scheduled = new Map();
 
   const scheduleMore = () => {
-    while (schedulePosition < size && scheduled.size < STREAM_LOOKAHEAD_CHUNKS) {
+    const lookahead = stagedWindows > 0 ? 4 : STREAM_LOOKAHEAD_CHUNKS;
+    while (schedulePosition < size && scheduled.size < lookahead) {
       const start = schedulePosition;
       const end = Math.min(start + STREAM_STORAGE_WINDOW_BYTES - 1, size - 1);
       scheduled.set(start, requestRustRange(clients, url, start, end, networkId));
@@ -670,6 +672,7 @@ function createRustRangeStream(clients, url, size, networkId) {
         const body = toUint8Array(response.body);
         position = start + body.byteLength;
         controller.enqueue(body);
+        stagedWindows = Math.max(0, stagedWindows - 1);
         scheduleMore();
       } catch (error) {
         controller.error(error);
@@ -711,7 +714,8 @@ async function forwardRequestToRust(request, event) {
 
     if (response.stream && request.method !== "HEAD") {
       const size = Number(headers.get("Content-Length") || "0");
-      return new Response(createRustRangeStream(clients, request.url, size, networkId), {
+      const stagedStart = headers.get("X-Weeb3-Stream-Start") === "1";
+      return new Response(createRustRangeStream(clients, request.url, size, networkId, stagedStart), {
         status,
         headers
       });

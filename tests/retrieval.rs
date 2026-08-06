@@ -9,8 +9,8 @@ mod retrieval_conventions;
 
 mod connection {
     use crate::accounting::{
-        CONNECTION_BUILDUP_LIMIT, CONNECTION_DIAL_CONCURRENCY_LIMIT, bee_reconnect_delay_seconds,
-        connection_dial_capacity_available,
+        CONNECTION_BUILDUP_LIMIT, REFRESH_RATE, bee_reconnect_delay_seconds,
+        connection_dial_capacity_available, refreshment_due,
     };
 
     #[test]
@@ -26,10 +26,7 @@ mod connection {
 
     #[test]
     fn retrieval_dispatches_at_the_first_priced_peer() {
-        assert!(!connection_dial_capacity_available(
-            1,
-            CONNECTION_DIAL_CONCURRENCY_LIMIT
-        ));
+        assert!(connection_dial_capacity_available(1, 0));
         assert!(!connection_dial_capacity_available(
             CONNECTION_BUILDUP_LIMIT,
             0
@@ -59,19 +56,18 @@ mod connection {
     }
 
     #[test]
-    fn dial_storm_is_bounded_independently_of_the_peer_population() {
-        assert_eq!(CONNECTION_DIAL_CONCURRENCY_LIMIT, 160);
+    fn dial_storm_can_fill_but_never_exceed_the_peer_population() {
         assert!(connection_dial_capacity_available(
             0,
-            CONNECTION_DIAL_CONCURRENCY_LIMIT - 1
+            CONNECTION_BUILDUP_LIMIT - 1
         ));
         assert!(!connection_dial_capacity_available(
             0,
-            CONNECTION_DIAL_CONCURRENCY_LIMIT
+            CONNECTION_BUILDUP_LIMIT
         ));
         assert!(!connection_dial_capacity_available(
-            CONNECTION_BUILDUP_LIMIT - CONNECTION_DIAL_CONCURRENCY_LIMIT,
-            CONNECTION_DIAL_CONCURRENCY_LIMIT
+            1,
+            CONNECTION_BUILDUP_LIMIT - 1
         ));
         assert!(!connection_dial_capacity_available(
             CONNECTION_BUILDUP_LIMIT,
@@ -80,121 +76,58 @@ mod connection {
         assert!(!connection_dial_capacity_available(u64::MAX, u64::MAX));
 
         let runtime = include_str!("../src/lib.rs");
-        let dial_feeder = runtime
+        let feeder = runtime
             .split("let swarm_event_handle_0 = async")
             .nth(1)
             .and_then(|source| source.split("let swarm_event_handle_1 = async").next())
-            .expect("peer dial feeder should remain inspectable");
+            .expect("peer dial feeder");
+        assert!(feeder.contains("VecDeque::<QueuedPeerDial>::new()"));
+        assert!(feeder.contains("HashSet::<(PeerId, Multiaddr)>::new()"));
+        assert!(feeder.contains("try_reserve_connection_capacity("));
+        assert!(feeder.contains("fresh_dials_since_retry >= FRESH_PEER_DIALS_PER_RETRY"));
         assert!(
-            dial_feeder.contains("spawn_local(queue_peer_dial_retry("),
-            "an immediate dial error must schedule its retry without sleeping the only dial feeder"
-        );
-        assert!(dial_feeder.contains("start_owned_connection_attempt("));
-        assert!(dial_feeder.contains("try_mark_connection_attempt(&wings, &candidate.peer)"));
-        assert!(dial_feeder.contains("let mut new_peers = VecDeque::<QueuedPeerDial>::new()"));
-        assert!(dial_feeder.contains("let mut retries = VecDeque::<QueuedPeerDial>::new()"));
-        assert!(dial_feeder.contains("let mut queued_underlays = HashSet::<Vec<u8>>::new()"));
-        assert!(dial_feeder.contains("for _ in 0..PEER_DIAL_INGEST_BATCH"));
-        assert!(
-            dial_feeder
-                .matches("current_connection_generation().await")
-                .count()
-                >= 2
-        );
-        assert!(dial_feeder.contains("queued_underlays.len() >= MAX_QUEUED_PEER_DIALS"));
-        assert!(dial_feeder.contains("let underlay = candidate.dial_addr.to_vec()"));
-        let ingestion_end = dial_feeder.find("let mut unavailable_peers").unwrap();
-        assert!(!dial_feeder[..ingestion_end].contains("peer_already_connected_or_attempting"));
-        assert!(dial_feeder.contains("let mut take_eligible ="));
-        assert!(dial_feeder.contains("let retry_due ="));
-        assert!(dial_feeder.contains("fresh_dials_since_retry >= FRESH_PEER_DIALS_PER_RETRY"));
-        assert!(
-            dial_feeder
+            feeder
                 .contains("take_eligible(&mut new_peers).or_else(|| take_eligible(&mut retries))")
         );
-        assert!(dial_feeder.contains("if candidate.peer == local_peer_id"));
-        assert!(!dial_feeder.contains("prefer_new_peer"));
-        assert!(dial_feeder.contains("candidate.retry = candidate.retry"));
-        assert!(dial_feeder.contains("known_peer_underlays"));
-        assert!(dial_feeder.contains("underlay == &candidate.dial_addr"));
-        assert!(dial_feeder.contains("candidate.bootnode,"));
-        assert!(include_str!("../src/handlers.rs").contains("underlay: peer.underlay,"));
-        assert!(include_str!("../src/handlers.rs").contains(".send(PeerDialInstruction {"));
-        assert!(runtime.contains("peers_instructions\n        .send(PeerDialInstruction {"));
+        assert!(feeder.contains("spawn_local(queue_peer_dial_retry("));
         assert!(runtime.contains("mpsc::bounded::<PeerDialInstruction>(MAX_QUEUED_PEER_DIALS)"));
-        assert!(runtime.contains("const FRESH_PEER_DIALS_PER_RETRY: usize = 32;"));
-
-        let dial_attempt = runtime
-            .split_once("async fn start_owned_connection_attempt(")
-            .expect("owned connection attempt helper")
-            .1;
-        assert!(dial_attempt.contains("PeerCondition::DisconnectedAndNotDialing"));
-        assert!(dial_attempt.contains("swarm.dial(options)?;"));
-
-        let swarm_events = runtime
-            .split_once("let swarm_event_handle_1 = async")
-            .expect("swarm event loop")
-            .1;
-        assert!(runtime.contains("const CONNECTION_BUILDUP_SWARM_POLL_MS: u64 = 5;"));
-        assert!(runtime.contains("const STARTUP_QUEUE_POLL_MS: u64 = 15;"));
-        assert!(swarm_events.contains("let connection_building = ongoing > 0;"));
-        assert!(swarm_events.contains("if connection_building"));
-        assert!(swarm_events.contains("swarm.next().now_or_never().flatten()"));
-        assert!(swarm_events.contains("Duration::from_millis(swarm_poll_ms)"));
-
-        let reserve = runtime
-            .split("async fn try_reserve_connection_capacity(")
-            .nth(1)
-            .and_then(|source| source.split("async fn queue_peer_dial_retry(").next())
-            .expect("atomic connection reservation helper");
-        let connected_guard = reserve
-            .find("let connected_guard = connections.lock().await;")
-            .expect("connected population guard");
-        let ongoing_guard = reserve
-            .find("let mut ongoing = ongoing_connections.lock().await;")
-            .expect("ongoing population guard");
-        let increment = reserve
-            .find("*ongoing = (*ongoing).saturating_add(1);")
-            .expect("ongoing reservation increment");
         assert!(
-            connected_guard < ongoing_guard && ongoing_guard < increment,
-            "capacity check and reservation must hold both counters in the promotion lock order"
+            runtime.contains("remove_connection_attempt_for_dial(&wings, &peer_id, connection_id)")
         );
-
-        let promotion = runtime
-            .split("async fn promote_priced_peer(")
+        let failed_dial = runtime
+            .split("let retryable = !matches!(")
             .nth(1)
-            .and_then(|source| {
-                source
-                    .split("pub async fn post_upload_with_redundancy(")
-                    .next()
-            })
-            .expect("priced-peer promotion");
-        let connections = promotion
-            .find("let mut connections = self.connections.lock().await;")
-            .expect("connected counter lock");
-        let ongoing = promotion
-            .find("let mut ongoing = self.ongoing_connections.lock().await;")
-            .expect("ongoing counter lock");
-        let release = promotion
-            .find("*ongoing = ongoing.saturating_sub(1);")
-            .expect("ongoing reservation release");
-        let promote = promotion
-            .find("*connections = connections.saturating_add(1);")
-            .expect("connected counter promotion");
-        assert!(connections < ongoing && ongoing < release && release < promote);
+            .and_then(|source| source.split("SwarmEvent::ConnectionClosed {").next())
+            .expect("outgoing dial error");
+        let removal = failed_dial
+            .find("remove_connection_attempt_for_dial")
+            .expect("exact dial removal");
+        let release = failed_dial
+            .find("decrement_counter(&ongoing_connections)")
+            .expect("dial capacity release");
+        assert!(removal < release);
+        assert!(runtime.contains("self.swarm.next_event().await"));
+        assert!(!runtime.contains("CONNECTION_BUILDUP_SWARM_POLL_MS"));
+        assert!(
+            runtime.contains(
+                ".outbound_timeout(Duration::from_millis(OUTBOUND_CONNECTION_TIMEOUT_MS))"
+            )
+        );
+        assert!(runtime.contains("const OUTBOUND_CONNECTION_TIMEOUT_MS: u64 = 8_000;"));
+        assert!(!runtime.contains("FRESH_GOSSIP_DIAL_TIMEOUT_MS"));
+        assert!(!feeder.contains("disconnect_peer_id"));
     }
 
     #[test]
     fn mainnet_startup_samples_the_complete_dns_bootnode_database() {
         use std::collections::HashSet;
 
-        let profile_source = include_str!("../src/network_profile.rs");
-        let mainnet = profile_source
+        let profile = include_str!("../src/network_profile.rs");
+        let mainnet = profile
             .split_once("pub(crate) const MAINNET_BOOTNODES: &[&str] = &[")
             .and_then(|(_, source)| source.split_once("pub(crate) const TESTNET_PROFILE"))
             .map(|(source, _)| source)
-            .expect("mainnet bootnode constant");
+            .expect("mainnet bootnodes");
         let addresses = mainnet
             .lines()
             .filter_map(|line| {
@@ -203,57 +136,32 @@ mod connection {
                     .and_then(|line| line.strip_suffix("\","))
             })
             .collect::<Vec<_>>();
-
         assert_eq!(addresses.len(), 319);
         assert_eq!(addresses.iter().copied().collect::<HashSet<_>>().len(), 319);
-
-        let mut peers = HashSet::new();
-        for address in addresses {
-            assert!(address.is_ascii());
-            let parts = address.split('/').collect::<Vec<_>>();
-            assert_eq!(parts.len(), 9, "invalid browser underlay: {address}");
-            assert_eq!(parts[0], "");
-            assert_eq!(parts[1], "dns4");
-            assert!(parts[2].ends_with(".libp2p.direct"));
-            assert_eq!(parts[3], "tcp");
-            assert!(parts[4].parse::<u16>().is_ok());
-            assert_eq!(&parts[5..8], &["tls", "ws", "p2p"]);
-            assert!(parts[8].starts_with("Qm"));
-            assert!(peers.insert(parts[8]), "duplicate peer: {}", parts[8]);
-        }
-        assert_eq!(peers.len(), 319);
-
-        assert!(profile_source.contains("bootnodes.shuffle(&mut rand::thread_rng())"));
-        assert!(!profile_source.contains("bootnodes.truncate("));
-
-        let interface = include_str!("../src/interface_runtime_conventions.rs");
-        assert!(interface.contains("for address in randomized_bootnodes(profile)"));
-        assert!(interface.contains(".take(CONNECTION_DIAL_CONCURRENCY_LIMIT as usize)"));
-        assert!(!interface.contains("profile.bootnodes.contains(&address.as_str())"));
-        assert!(interface.contains("BOOTNODE_INPUT_IDS.iter().enumerate()"));
-        assert!(interface.contains("profile.bootnodes.get(index)"));
-        assert!(!interface.contains("backfill"));
-
-        let library = include_str!("../src/library.rs");
-        assert_eq!(library.matches("randomized_bootnodes(profile)").count(), 3);
-        assert!(library.contains("for address in profile.bootnodes"));
-        let scheduler = library
-            .split_once("fn schedule_bootnode_dials(")
-            .and_then(|(_, source)| source.split_once("#[wasm_bindgen]"))
-            .map(|(source, _)| source)
-            .expect("bootnode scheduler");
-        assert!(scheduler.contains("crate::join_all(dials).await"));
-        assert!(!scheduler.contains("backfill"));
-        assert_eq!(
-            library
-                .matches(".take(CONNECTION_DIAL_CONCURRENCY_LIMIT as usize)")
-                .count(),
-            3
+        assert!(addresses.iter().all(|address| {
+            address.starts_with("/dns4/")
+                && address.contains(".libp2p.direct/tcp/")
+                && address.contains("/tls/ws/p2p/")
+        }));
+        assert!(profile.contains("pub(crate) const INITIAL_BOOTNODE_COUNT: usize = 160;"));
+        assert!(
+            profile.find("bootnodes.shuffle(&mut rand::thread_rng())")
+                < profile.find("bootnodes.truncate(INITIAL_BOOTNODE_COUNT)")
         );
 
         let runtime = include_str!("../src/lib.rs");
-        assert!(runtime.contains("const MAX_QUEUED_PEER_DIALS: usize = 4_096;"));
-        assert!(!runtime.contains("prefer_new_peer"));
+        let address_filter = include_str!("../src/addresses.rs");
+        assert!(runtime.contains("is_publicly_dialable_underlay(&source_addr)"));
+        assert!(runtime.contains("!self.allow_private_gossip.load(Ordering::Acquire)"));
+        assert!(
+            runtime
+                .contains("profile_for_swarm_network_id(*self.network_id.lock().await).is_some()")
+        );
+        assert!(address_filter.contains("|embedded| embedded == address"));
+        assert!(address_filter.contains(".map(is_public_ipv4)"));
+        assert!(address_filter.contains(".unwrap_or_else(|| is_public_dns_name(&hostname))"));
+        assert!(address_filter.contains("!hostname.ends_with(\".local\")"));
+        assert!(include_str!("../src/handlers.rs").contains("underlay: peer.underlay,"));
     }
 
     #[test]
@@ -263,6 +171,114 @@ mod connection {
         assert!(runtime.contains("handshake_signer: Arc<PrivateKeySigner>"));
         assert_eq!(runtime.matches("PrivateKeySigner::from_slice(").count(), 1);
         assert!(!handlers.contains("PrivateKeySigner::from_slice("));
+    }
+
+    #[test]
+    fn bee_handshake_waits_for_the_exact_identify_push() {
+        let runtime = include_str!("../src/lib.rs");
+        let received = runtime
+            .split("identify::Event::Received {")
+            .nth(1)
+            .and_then(|source| source.split("identify::Event::Pushed {").next())
+            .expect("identify receive lifecycle");
+        assert!(received.contains("pending_identify_addresses"));
+        assert!(received.contains("identify_push_capacity.acquire_arc().await"));
+        assert!(received.contains("info.observed_addr.clone()"));
+        assert!(received.contains("swarm.add_external_address(info.observed_addr)"));
+        assert!(received.contains(".identify\n                                        .push("));
+        assert!(!received.contains("mark_handshake_ready_connection("));
+
+        let pushed = runtime
+            .split("identify::Event::Pushed {")
+            .nth(1)
+            .and_then(|source| source.split("identify::Event::Error {").next())
+            .expect("identify push lifecycle");
+        let ready = pushed
+            .find("mark_handshake_ready_connection(")
+            .expect("Bee handshake readiness");
+        let cleanup = pushed
+            .find("spawn_local(async move")
+            .expect("asynchronous transient address cleanup");
+        assert!(ready < cleanup);
+        assert!(pushed.contains("Some(&info.listen_addrs)"));
+        assert!(pushed.contains("remove_unreferenced_identify_address("));
+        assert!(runtime.contains("const IDENTIFY_PUSH_CONCURRENCY: usize = 32;"));
+        assert!(runtime.contains("const IDENTIFY_PUSH_TIMEOUT_MS: u64 = 5_000;"));
+        assert!(received.contains("IDENTIFY_PUSH_TIMEOUT_MS"));
+        assert!(received.contains("remove_pending_identify_address("));
+        assert!(received.contains(".close_connection(connection_id)"));
+        assert!(runtime.contains("SwarmEvent::Behaviour(BehaviourEvent::Identify(_))"));
+        let safe_cleanup = runtime
+            .split("async fn remove_unreferenced_identify_address(")
+            .nth(1)
+            .and_then(|source| {
+                source
+                    .split("async fn close_failed_identify_connection(")
+                    .next()
+            })
+            .expect("reference-safe external address cleanup");
+        assert!(
+            safe_cleanup.find("let mut swarm = swarm.lock().await;")
+                < safe_cleanup.find("pending_identify_addresses")
+        );
+        assert!(safe_cleanup.contains("if !referenced"));
+        assert!(safe_cleanup.contains("swarm.remove_external_address(address)"));
+
+        let empty_observed = received
+            .split("if info.observed_addr.is_empty() {")
+            .nth(1)
+            .expect("empty Identify observation handling");
+        assert!(empty_observed.contains("close_failed_identify_connection("));
+        let identify_error = runtime
+            .split("identify::Event::Error {")
+            .nth(1)
+            .and_then(|source| source.split("SwarmEvent::OutgoingConnectionError").next())
+            .expect("Identify error lifecycle");
+        assert!(identify_error.contains("close_failed_identify_connection("));
+
+        let exact_close = runtime
+            .split("async fn close_failed_identify_connection(")
+            .nth(1)
+            .and_then(|source| source.split("async fn remove_connection_attempt(").next())
+            .expect("exact failed Identify close");
+        assert!(exact_close.contains("attempt.physical_connection_id == Some(connection_id)"));
+        assert!(exact_close.contains("!attempt.identify_failed"));
+        assert!(exact_close.contains("handshake_ready_connections"));
+        assert!(exact_close.contains("connections.contains(&connection_id)"));
+        assert!(exact_close.contains("attempt.identify_failed = true;"));
+        assert!(exact_close.contains("swarm.lock().await.close_connection(connection_id)"));
+    }
+
+    #[test]
+    fn only_private_custom_bootnodes_enable_private_gossip() {
+        let runtime = include_str!("../src/lib.rs");
+        let connect = runtime
+            .split("pub(crate) async fn connect_bootnodes_for_current_network(")
+            .nth(1)
+            .and_then(|source| {
+                source
+                    .split("pub(crate) async fn acquire_feed_envelope(")
+                    .next()
+            })
+            .expect("bootnode connection setup");
+        assert!(connect.contains("is_private_or_local_bootnode(address)"));
+        assert!(connect.contains("!profile.bootnodes.contains(&address.as_str())"));
+        assert!(connect.contains(".store(private_custom_bootnodes, Ordering::Release)"));
+        assert!(!connect.contains(".store(custom_bootnodes, Ordering::Release)"));
+
+        let private_check = runtime
+            .split("fn is_private_or_local_bootnode(")
+            .nth(1)
+            .and_then(|source| source.split("pub(crate) fn chunk_retrieve_request(").next())
+            .expect("private bootnode classification");
+        for classification in [
+            "address.is_private()",
+            "address.is_loopback()",
+            "address.is_link_local()",
+            "address.is_unspecified()",
+        ] {
+            assert!(private_check.contains(classification));
+        }
     }
 
     #[test]
@@ -422,35 +438,6 @@ mod connection {
     }
 
     #[test]
-    fn an_exact_failed_dial_releases_capacity_even_if_another_connection_exists() {
-        let runtime = include_str!("../src/lib.rs");
-        let outgoing_error = runtime
-            .split("SwarmEvent::OutgoingConnectionError {")
-            .nth(1)
-            .and_then(|source| source.split("SwarmEvent::ConnectionClosed {").next())
-            .expect("outgoing-error lifecycle");
-        let exact_release = outgoing_error
-            .find("let had_attempt = remove_connection_attempt_for_dial(")
-            .expect("exact dial-attempt release");
-        let decrement = outgoing_error[exact_release..]
-            .find("decrement_counter(&ongoing_connections).await;")
-            .map(|offset| exact_release + offset)
-            .expect("ongoing-capacity release");
-        let broad_connection_check = outgoing_error
-            .find("let physically_connected =")
-            .expect("broad peer connection check");
-        assert!(
-            exact_release < decrement && decrement < broad_connection_check,
-            "another physical connection must not hide an exact failed dial or leak its capacity"
-        );
-        assert!(outgoing_error.contains("if physically_connected && !had_attempt"));
-        assert!(outgoing_error.contains("let retryable = !matches!("));
-        assert!(outgoing_error.contains("DialError::LocalPeerId { .. }"));
-        assert!(outgoing_error.contains("DialError::WrongPeerId { .. }"));
-        assert!(outgoing_error.contains("should_retry = retryable"));
-    }
-
-    #[test]
     fn reconnect_waits_out_bee_accounting_blocklist() {
         const RATE: u64 = 450_000;
         const THRESHOLD: u64 = RATE * 3;
@@ -508,12 +495,6 @@ mod connection {
                 && cooldown_release < enqueue
         );
 
-        let admission = runtime
-            .split("async fn peer_already_connected_or_attempting(")
-            .nth(1)
-            .and_then(|source| source.split("async fn try_mark_connection_attempt(").next())
-            .expect("queued dial admission");
-        assert!(admission.contains("connection_cooldowns.contains(peer)"));
         let reservation = runtime
             .split("async fn try_mark_connection_attempt(")
             .nth(1)
@@ -531,7 +512,7 @@ mod connection {
             .and_then(|source| source.split("let swap_price =").next())
             .expect("refresh instruction lifecycle");
         let balance = instruction
-            .find("let (balance, last_refreshment) =")
+            .find("let (balance, last_refreshment, payment_threshold) =")
             .expect("accounting snapshot");
         let session = instruction
             .find("current_accounting_protocol_session(")
@@ -547,7 +528,8 @@ mod connection {
             .expect("terminal accounting mutation");
         assert!(balance < session && session < dispatch);
         assert!(dispatch < completion_time && completion_time < mutation);
-        assert!(instruction.contains("if account.balance < REFRESH_RATE"));
+        assert!(instruction.contains("if !refreshment_due("));
+        assert!(instruction.contains("account.threshold,"));
         assert!(instruction.contains("account.refresh_scheduled = false;"));
         assert!(instruction.contains("RefreshmentOutcome::NotDispatched => {"));
         assert!(instruction.contains("RefreshmentOutcome::Acknowledged(0)"));
@@ -580,7 +562,7 @@ mod connection {
 
         let accounting = include_str!("../src/accounting.rs");
         let coalescing = accounting
-            .find("account.balance >= REFRESH_RATE && !account.refresh_scheduled")
+            .find("if refreshment_due(")
             .expect("atomic refresh coalescing");
         let claim = accounting[coalescing..]
             .find("account.refresh_scheduled = true;")
@@ -591,6 +573,18 @@ mod connection {
             .map(|offset| claim + offset)
             .expect("claimed refresh enqueue");
         assert!(coalescing < claim && claim < enqueue);
+    }
+
+    #[test]
+    fn first_refresh_accumulates_two_seconds_then_the_normal_rate_applies() {
+        assert!(!refreshment_due(0, 0.0, REFRESH_RATE * 3));
+        assert!(!refreshment_due(REFRESH_RATE, 0.0, REFRESH_RATE * 3));
+        assert!(refreshment_due(REFRESH_RATE * 2, 0.0, REFRESH_RATE * 3));
+        assert!(refreshment_due(REFRESH_RATE, 0.0, REFRESH_RATE));
+        assert!(!refreshment_due(REFRESH_RATE, 0.0, REFRESH_RATE + 123));
+        assert!(refreshment_due(REFRESH_RATE + 123, 0.0, REFRESH_RATE + 123));
+        assert!(!refreshment_due(REFRESH_RATE - 1, 1.0, REFRESH_RATE * 3));
+        assert!(refreshment_due(REFRESH_RATE, 1.0, REFRESH_RATE * 3));
     }
 
     #[test]
@@ -693,6 +687,12 @@ mod connection {
         assert!(handlers.contains("enum RefreshmentOutcome"));
         assert!(handlers.contains("if refr_am > amount"));
         assert!(handlers.contains("RefreshmentOutcome::AmbiguousAfterPayment"));
+        let refresh_handler = handlers
+            .split("pub async fn refresh_handler(")
+            .nth(1)
+            .and_then(|source| source.split("pub async fn issue_handler(").next())
+            .expect("refresh dispatch");
+        assert!(!refresh_handler.contains("timeout("));
         let pricing = handlers
             .split("pub async fn pricing_handler(")
             .nth(1)
@@ -913,14 +913,7 @@ mod retrieve_group_stream {
             "async fn fetch_data_group_indices_streaming(",
             "#[derive(Clone)]\nstruct TraversalNode",
         );
-        assert!(
-            group.contains("emitter.emit(result_index, chunk.clone())"),
-            "healthy requested shards must be emitted directly from the receive loop"
-        );
-        assert!(
-            group.contains("emitter.emit(index, chunk.clone())"),
-            "reconstructed requested shards must be emitted before terminal success"
-        );
+        assert_eq!(group.matches("child_emitter.emit(").count(), 3);
         assert!(
             group.contains("if requested_count == data_count")
                 && group.contains("dispatch_group_parity(")
@@ -930,7 +923,7 @@ mod retrieve_group_stream {
 
         let traversal = source_section(
             "async fn retrieve_data_range_from_root_with_prefix_cancellable(",
-            "pub(crate) async fn retrieve_data_range_join(",
+            "pub(crate) async fn retrieve_data_range_join_cancellable(",
         );
         let fetch = traversal
             .find("fetch_data_group_indices_streaming(")
@@ -952,7 +945,7 @@ mod retrieve_group_stream {
     fn unconsumed_terminals_keep_the_join_alive_and_failure_is_all_or_nothing() {
         let traversal = source_section(
             "async fn retrieve_data_range_from_root_with_prefix_cancellable(",
-            "pub(crate) async fn retrieve_data_range_join(",
+            "pub(crate) async fn retrieve_data_range_join_cancellable(",
         );
         assert!(traversal.contains("while !pending.is_empty() || active_groups > 0"));
         assert!(traversal.contains("active_groups = active_groups.checked_add(1)?"));

@@ -1,11 +1,23 @@
 pub(crate) const CONNECTION_BUILDUP_LIMIT: u64 = 200;
-pub(crate) const CONNECTION_DIAL_CONCURRENCY_LIMIT: u64 = 160;
 pub(crate) const REFRESH_RATE: u64 = 450000;
 const PO_PRICE: u64 = 10000;
 
+pub(crate) fn refreshment_due(balance: u64, last_refreshment: f64, payment_threshold: u64) -> bool {
+    let target = if last_refreshment == 0.0 {
+        REFRESH_RATE.saturating_mul(2)
+    } else {
+        REFRESH_RATE
+    };
+    balance
+        >= if payment_threshold == 0 {
+            target
+        } else {
+            target.min(payment_threshold)
+        }
+}
+
 pub(crate) fn connection_dial_capacity_available(connected: u64, ongoing: u64) -> bool {
     connected.saturating_add(ongoing) < CONNECTION_BUILDUP_LIMIT
-        && ongoing < CONNECTION_DIAL_CONCURRENCY_LIMIT
 }
 
 pub(crate) fn bee_reconnect_delay_seconds(
@@ -83,7 +95,9 @@ pub(crate) async fn apply_credit(
     debt_increase -= compensated;
     account.balance = account.balance.saturating_add(debt_increase);
 
-    let instruction = if account.balance >= REFRESH_RATE && !account.refresh_scheduled {
+    let instruction = if refreshment_due(account.balance, account.refreshment, account.threshold)
+        && !account.refresh_scheduled
+    {
         account.connection_id.map(|connection_id| {
             account.refresh_scheduled = true;
             (account.id, accounting.clone(), connection_id)

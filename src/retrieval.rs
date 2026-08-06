@@ -9,8 +9,7 @@ use crate::{
         split_references,
     },
     feed::{
-        FEED_FRONTIER_LOOKAHEAD_TIMEOUT, seek_sequence_feed_frontier,
-        seek_sequence_feed_frontier_bounded_from_observing_positive,
+        FEED_FRONTIER_LOOKAHEAD_TIMEOUT, FeedProbe, seek_sequence_feed_frontier,
         seek_sequence_feed_frontier_bounded_observing_positive, seek_sequence_feed_frontier_from,
         seek_sequence_feed_frontier_wide_bounded,
     },
@@ -36,7 +35,7 @@ const RETRIEVE_ATTEMPT_TIMEOUT_MS: u64 = 10_000;
 const RETRIEVE_HOT_LOOP_GUARD_MS: u64 = 25;
 const RETRIEVE_CHECK_RETRY_WAIT_MS: u64 = 160;
 const RETRIEVE_CHUNK_MAX_ATTEMPT_ERRORS: usize = 20;
-const RETRIEVE_DATA_GROUP_CONCURRENCY: usize = 4;
+const RETRIEVE_DATA_GROUP_CONCURRENCY: usize = 8;
 const RETRIEVE_DECODED_CHUNK_CACHE_ENTRIES: usize = 2048;
 
 struct RetrieveAttemptResult {
@@ -999,8 +998,8 @@ async fn fetch_data_group_indices_streaming(
     chunk_retrieve_chan: &ChunkRetrieveSender,
     cancel_generations: Option<RetrieveGenerationMap>,
     cancel: Option<RetrieveCancelToken>,
-    child_emitter: Option<GroupChildEmitter>,
-) -> Option<Vec<(usize, DecodedJoinChunk)>> {
+    child_emitter: GroupChildEmitter,
+) -> Option<()> {
     let data_count = data_references.len();
     let total_count = data_count.checked_add(parity_references.len())?;
     let expected_data_ref_len = if encrypted {
@@ -1022,7 +1021,7 @@ async fn fetch_data_group_indices_streaming(
     requested_indices.sort_unstable();
     requested_indices.dedup();
     if requested_indices.is_empty() {
-        return Some(vec![]);
+        return Some(());
     }
     if requested_indices.iter().any(|&index| index >= data_count) {
         return None;
@@ -1042,15 +1041,13 @@ async fn fetch_data_group_indices_streaming(
 
     let (result_out, result_in) = mpsc::unbounded::<RawFetchResult>();
     let mut dispatched_shards = vec![false; total_count];
-    let mut cached_chunks = vec![None; data_count];
+    let mut requested_ready = vec![false; data_count];
     let mut dispatched = 0usize;
     for &index in &requested_indices {
         let reference = &data_references[index];
         if let Some(chunk) = cached_decoded_chunk(reference) {
-            if let Some(emitter) = child_emitter.as_ref() {
-                emitter.emit(index, chunk.clone());
-            }
-            cached_chunks[index] = Some(chunk);
+            child_emitter.emit(index, chunk);
+            requested_ready[index] = true;
             continue;
         }
         let address = reference[..HASH_SIZE].to_vec();
@@ -1076,10 +1073,10 @@ async fn fetch_data_group_indices_streaming(
     let started = Date::now();
 
     loop {
-        let requested_ready = requested_indices
+        let all_requested_ready = requested_indices
             .iter()
-            .all(|&index| cached_chunks[index].is_some() || received_shards[index].is_some());
-        if requested_ready || (recovery_dispatched && successes >= data_count) {
+            .all(|&index| requested_ready[index]);
+        if all_requested_ready || (recovery_dispatched && successes >= data_count) {
             admission.close();
             if !join_cancel_token_current(&cancel_generations, &cancel).await {
                 return None;
@@ -1190,24 +1187,22 @@ async fn fetch_data_group_indices_streaming(
 
             if result_index < data_count
                 && requested_mask[result_index]
-                && cached_chunks[result_index].is_none()
+                && !requested_ready[result_index]
             {
                 let reference = &data_references[result_index];
-                let canonical_cac = result.canonical_cac
-                    || valid_cac(result_chunk.as_ref(), &reference[..HASH_SIZE]);
-                let chunk = if canonical_cac {
-                    remember_raw_chunk(reference.clone(), Rc::clone(&result_chunk));
-                    cached_decoded_chunk(reference)?
+                let chunk = if result.canonical_cac {
+                    cached_decoded_chunk(reference).or_else(|| {
+                        remember_raw_chunk(reference.clone(), Rc::clone(&result_chunk));
+                        cached_decoded_chunk(reference)
+                    })?
                 } else {
                     if !parity_references.is_empty() {
                         return None;
                     }
                     decode_raw_join_chunk(result_chunk.as_ref(), reference)?
                 };
-                if let Some(emitter) = child_emitter.as_ref() {
-                    emitter.emit(result_index, chunk.clone());
-                }
-                cached_chunks[result_index] = Some(chunk);
+                child_emitter.emit(result_index, chunk);
+                requested_ready[result_index] = true;
             }
         } else if !recovery_dispatched {
             if parity_references.is_empty() {
@@ -1221,73 +1216,41 @@ async fn fetch_data_group_indices_streaming(
         }
     }
 
-    let needs_reconstruction = requested_indices
+    for (index, raw) in received_shards.iter().take(data_count).enumerate() {
+        if authenticated_shards[index]
+            && let Some(raw) = raw
+        {
+            remember_raw_chunk(data_references[index].clone(), Rc::clone(raw));
+        }
+    }
+
+    let missing_indices = requested_indices
         .iter()
-        .any(|&index| cached_chunks[index].is_none() && received_shards[index].is_none());
-    let mut reconstructed_shards = if needs_reconstruction {
-        if !join_cancel_token_current(&cancel_generations, &cancel).await {
-            return None;
-        }
-        let mut shards = received_shards
-            .iter()
-            .map(|chunk| chunk.as_ref().and_then(|chunk| padded_rs_shard(chunk)))
-            .collect::<Vec<_>>();
-        reconstruct_data_indices(&mut shards, data_count, &requested_indices).ok()?;
-        Some(shards)
-    } else {
-        None
-    };
+        .copied()
+        .filter(|&index| !requested_ready[index])
+        .collect::<Vec<_>>();
+    if missing_indices.is_empty() {
+        return Some(());
+    }
+    if !join_cancel_token_current(&cancel_generations, &cancel).await {
+        return None;
+    }
+    let mut reconstructed_shards = received_shards
+        .iter()
+        .map(|chunk| chunk.as_ref().and_then(|chunk| padded_rs_shard(chunk)))
+        .collect::<Vec<_>>();
+    reconstruct_data_indices(&mut reconstructed_shards, data_count, &missing_indices).ok()?;
 
-    let mut decoded = Vec::with_capacity(requested_count);
-    for index in 0..data_count {
+    for index in missing_indices {
         let reference = &data_references[index];
-        if let Some(chunk) = cached_chunks[index].take() {
-            if requested_mask[index] {
-                decoded.push((index, chunk));
-            }
-            continue;
-        }
-        if let Some(raw) = received_shards[index].take() {
-            let canonical_cac =
-                authenticated_shards[index] || valid_cac(raw.as_ref(), &reference[..HASH_SIZE]);
-            if !canonical_cac {
-                if !parity_references.is_empty() {
-                    return None;
-                }
-                if requested_mask[index] {
-                    decoded.push((index, decode_raw_join_chunk(raw.as_ref(), reference)?));
-                }
-                continue;
-            }
-            remember_raw_chunk(reference.clone(), Rc::clone(&raw));
-            if requested_mask[index] {
-                decoded.push((index, cached_decoded_chunk(reference)?));
-            }
-            continue;
-        }
-
-        let reconstructed = reconstructed_shards
-            .as_mut()
-            .and_then(|shards| shards[index].take());
-        let Some(raw) = reconstructed else {
-            if requested_mask[index] {
-                return None;
-            }
-            continue;
-        };
+        let raw = reconstructed_shards[index].take()?;
         if !valid_cac(&raw, &reference[..HASH_SIZE]) {
             return None;
         }
         remember_raw_chunk(reference.clone(), raw.into());
-        if requested_mask[index] {
-            let chunk = cached_decoded_chunk(reference)?;
-            if let Some(emitter) = child_emitter.as_ref() {
-                emitter.emit(index, chunk.clone());
-            }
-            decoded.push((index, chunk));
-        }
+        child_emitter.emit(index, cached_decoded_chunk(reference)?);
     }
-    (decoded.len() == requested_count).then_some(decoded)
+    Some(())
 }
 
 #[derive(Clone)]
@@ -1508,7 +1471,7 @@ async fn retrieve_data_range_from_root_with_prefix_cancellable(
                     &sender,
                     group_cancel_generations,
                     group_cancel,
-                    Some(emitter),
+                    emitter,
                 )
                 .await
                 .is_some();
@@ -1572,23 +1535,6 @@ async fn retrieve_data_range_from_root_with_prefix_cancellable(
     }
 
     (written == requested_len).then_some(output)
-}
-
-pub(crate) async fn retrieve_data_range_join(
-    data_address: &Vec<u8>,
-    payload_start: u64,
-    payload_end_inclusive: u64,
-    chunk_retrieve_chan: &ChunkRetrieveSender,
-) -> Vec<u8> {
-    retrieve_data_range_join_cancellable(
-        data_address,
-        payload_start,
-        payload_end_inclusive,
-        chunk_retrieve_chan,
-        None,
-        None,
-    )
-    .await
 }
 
 pub(crate) async fn retrieve_data_range_join_cancellable(
@@ -2067,39 +2013,45 @@ pub fn decrypt(cd: &Vec<u8>, encrey: Vec<u8>) -> Vec<u8> {
 async fn get_feed_probe_chunk(
     data_address: Vec<u8>,
     chunk_retrieve_chan: &ChunkRetrieveSender,
-) -> Vec<u8> {
+) -> FeedProbe<Vec<u8>> {
     let admission = RetrieveAdmission::new();
     let _close_admission = admission.close_on_drop();
     let (chan_out, chan_in) = mpsc::unbounded::<Vec<u8>>();
-    let _ = chunk_retrieve_chan.try_send(crate::ChunkRetrieveRequest {
-        address: data_address,
-        chan: chan_out,
-        cancel: None,
-        admission: Some(admission),
-    });
+    if chunk_retrieve_chan
+        .try_send(crate::ChunkRetrieveRequest {
+            address: data_address,
+            chan: chan_out,
+            cancel: None,
+            admission: Some(admission),
+        })
+        .is_err()
+    {
+        return FeedProbe::Transient;
+    }
 
     // Dropping the listener stops admission, not dispatched accounting settlement.
-    chan_in.recv().await.unwrap_or_default()
+    match chan_in.recv().await {
+        Ok(payload) if valid_feed_update_payload(&payload) => FeedProbe::Found(payload),
+        Ok(_) => FeedProbe::Missing,
+        Err(_) => FeedProbe::Transient,
+    }
 }
 
 fn valid_feed_update_payload(data: &[u8]) -> bool {
     !data.is_empty()
 }
 
-async fn probe_feed_update(
+async fn probe_feed_update_status(
     owner: &String,
     topic: &String,
     index: u64,
     chunk_retrieve_chan: &ChunkRetrieveSender,
-) -> Option<Vec<u8>> {
+) -> FeedProbe<Vec<u8>> {
     let address = get_feed_address(owner, topic, index);
     if address.len() != 32 {
-        return None;
+        return FeedProbe::Missing;
     }
-    let payload = get_feed_probe_chunk(address, chunk_retrieve_chan).await;
-    let found = valid_feed_update_payload(&payload);
-
-    if found { Some(payload) } else { None }
+    get_feed_probe_chunk(address, chunk_retrieve_chan).await
 }
 
 pub(crate) async fn retrieve_feed_update_at_index(
@@ -2108,7 +2060,18 @@ pub(crate) async fn retrieve_feed_update_at_index(
     index: u64,
     chunk_retrieve_chan: &ChunkRetrieveSender,
 ) -> Option<Vec<u8>> {
-    probe_feed_update(&owner, &topic, index, chunk_retrieve_chan).await
+    retrieve_feed_update_at_index_status(owner, topic, index, chunk_retrieve_chan)
+        .await
+        .into_option()
+}
+
+pub(crate) async fn retrieve_feed_update_at_index_status(
+    owner: String,
+    topic: String,
+    index: u64,
+    chunk_retrieve_chan: &ChunkRetrieveSender,
+) -> FeedProbe<Vec<u8>> {
+    probe_feed_update_status(&owner, &topic, index, chunk_retrieve_chan).await
 }
 
 /// Bound only the SOC probe; dispatched transport still settles accounting.
@@ -2118,13 +2081,15 @@ pub(crate) async fn retrieve_feed_update_at_index_bounded(
     index: u64,
     chunk_retrieve_chan: &ChunkRetrieveSender,
 ) -> Option<Vec<u8>> {
-    async_std::future::timeout(
+    match async_std::future::timeout(
         FEED_FRONTIER_LOOKAHEAD_TIMEOUT,
-        probe_feed_update(&owner, &topic, index, chunk_retrieve_chan),
+        probe_feed_update_status(&owner, &topic, index, chunk_retrieve_chan),
     )
     .await
-    .ok()
-    .flatten()
+    {
+        Ok(result) => result.into_option(),
+        Err(_) => None,
+    }
 }
 
 async fn seek_feed_frontier(
@@ -2136,7 +2101,7 @@ async fn seek_feed_frontier(
     match early_updates {
         Some(early_updates) => {
             seek_sequence_feed_frontier_bounded_observing_positive(
-                |index| probe_feed_update(&owner, &topic, index, chunk_retrieve_chan),
+                |index| probe_feed_update_status(&owner, &topic, index, chunk_retrieve_chan),
                 move |index, payload| {
                     let _ = early_updates.try_send((index, payload.clone()));
                 },
@@ -2145,25 +2110,11 @@ async fn seek_feed_frontier(
         }
         None => {
             seek_sequence_feed_frontier(|index| {
-                probe_feed_update(&owner, &topic, index, chunk_retrieve_chan)
+                probe_feed_update_status(&owner, &topic, index, chunk_retrieve_chan)
             })
             .await
         }
     }
-}
-
-async fn seek_feed_frontier_bounded_from(
-    owner: String,
-    topic: String,
-    start_index: u64,
-    chunk_retrieve_chan: &ChunkRetrieveSender,
-) -> (Option<(u64, Vec<u8>)>, u64) {
-    seek_sequence_feed_frontier_bounded_from_observing_positive(
-        (start_index, Vec::new()),
-        |index| probe_feed_update(&owner, &topic, index, chunk_retrieve_chan),
-        |_, _| {},
-    )
-    .await
 }
 
 async fn seek_feed_frontier_from(
@@ -2173,7 +2124,7 @@ async fn seek_feed_frontier_from(
     chunk_retrieve_chan: &ChunkRetrieveSender,
 ) -> (Option<(u64, Vec<u8>)>, u64) {
     seek_sequence_feed_frontier_from((start_index, Vec::new()), |index| {
-        probe_feed_update(&owner, &topic, index, chunk_retrieve_chan)
+        probe_feed_update_status(&owner, &topic, index, chunk_retrieve_chan)
     })
     .await
 }
@@ -2217,21 +2168,10 @@ pub(crate) async fn seek_latest_feed_update_indexed_wide_bounded(
     chunk_retrieve_chan: &ChunkRetrieveSender,
 ) -> Option<(u64, Vec<u8>)> {
     seek_sequence_feed_frontier_wide_bounded(|index| {
-        probe_feed_update(&owner, &topic, index, chunk_retrieve_chan)
+        probe_feed_update_status(&owner, &topic, index, chunk_retrieve_chan)
     })
     .await
     .0
-}
-
-pub(crate) async fn seek_latest_feed_update_indexed_bounded_from(
-    owner: String,
-    topic: String,
-    start_index: u64,
-    chunk_retrieve_chan: &ChunkRetrieveSender,
-) -> Option<(u64, Vec<u8>)> {
-    seek_feed_frontier_bounded_from(owner, topic, start_index, chunk_retrieve_chan)
-        .await
-        .0
 }
 
 pub(crate) async fn seek_latest_feed_update_indexed_from(

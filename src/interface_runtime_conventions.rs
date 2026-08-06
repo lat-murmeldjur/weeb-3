@@ -398,22 +398,21 @@ pub(super) async fn connect_all_bootnode_settings(weeb3: Arc<Weeb3>, apply_gener
     }
 
     let network_id = current_network_id_input();
+    let Ok(expected_network_id) = network_id.parse::<u64>() else {
+        return;
+    };
     let mut seen = std::collections::HashSet::<String>::new();
-    let mut dial_requests = Vec::<(String, String)>::new();
+    let mut dial_requests = Vec::<(String, bool)>::new();
 
     let profile = network_id
         .parse::<u64>()
         .ok()
         .and_then(profile_for_swarm_network_id);
     if let Some(profile) = profile {
-        for address in randomized_bootnodes(profile)
-            .into_iter()
-            .take(CONNECTION_DIAL_CONCURRENCY_LIMIT as usize)
-        {
+        for address in initial_bootnodes(profile) {
             let address = address.to_string();
-            let key = format!("{}|{}", network_id, address);
-            if seen.insert(key) {
-                dial_requests.push((address, network_id.clone()));
+            if seen.insert(address.clone()) {
+                dial_requests.push((address, true));
             }
         }
     }
@@ -423,6 +422,9 @@ pub(super) async fn connect_all_bootnode_settings(weeb3: Arc<Weeb3>, apply_gener
         if address.trim().is_empty() || node_network_id.trim().is_empty() {
             continue;
         }
+        if node_network_id != network_id {
+            continue;
+        }
         if node_network_id == network_id
             && profile
                 .and_then(|profile| profile.bootnodes.get(index))
@@ -430,9 +432,15 @@ pub(super) async fn connect_all_bootnode_settings(weeb3: Arc<Weeb3>, apply_gener
         {
             continue;
         }
-        let key = format!("{}|{}", node_network_id, address);
-        if seen.insert(key) {
-            dial_requests.push((address, node_network_id));
+        if !is_browser_dialable_underlay(&address) {
+            weeb3.interface_log(format!(
+                "Skipped non-browser bootnode for network {}: {}",
+                network_id, address
+            ));
+            continue;
+        }
+        if seen.insert(address.clone()) {
+            dial_requests.push((address, true));
         }
     }
 
@@ -442,44 +450,11 @@ pub(super) async fn connect_all_bootnode_settings(weeb3: Arc<Weeb3>, apply_gener
         network_id
     ));
 
-    let futures = dial_requests.into_iter().map(|(address, network_id)| {
-        let weeb300 = weeb3.clone();
-        async move {
-            connect_bootnode_address(weeb300, address, network_id, apply_generation).await;
-        }
-    });
-
-    join_all(futures).await;
-}
-
-async fn connect_bootnode_address(
-    weeb3: Arc<Weeb3>,
-    bna: String,
-    nid: String,
-    apply_generation: u64,
-) {
     if !is_current_network_apply_generation(apply_generation) {
         return;
     }
-
-    if bna.trim().is_empty() {
-        return;
-    }
-    if !is_browser_dialable_underlay(&bna) {
-        weeb3.interface_log(format!(
-            "Skipped non-browser bootnode for network {}: {}",
-            nid, bna
-        ));
-        return;
-    }
-    if !is_current_network_apply_generation(apply_generation) {
-        return;
-    }
-    let Ok(expected_network_id) = nid.parse::<u64>() else {
-        return;
-    };
-    let _ = weeb3
-        .connect_bootnode_for_current_network(bna, expected_network_id, true)
+    weeb3
+        .connect_bootnodes_for_current_network(dial_requests, expected_network_id)
         .await;
 }
 
@@ -1315,14 +1290,21 @@ pub(super) fn render_text_result(message: &str) {
         .prepend_with_node_1(&result);
 }
 
-pub(super) fn render_log_message(log: &String) {
+pub(super) fn render_log_messages(messages: &[String]) {
+    if messages.is_empty() {
+        return;
+    }
     let document = web_sys::window().unwrap().document().unwrap();
-    let log_message_div = document.create_element("div").unwrap();
-    log_message_div.set_text_content(Some(log));
+    let fragment = document.create_document_fragment();
+    for message in messages.iter().rev() {
+        let element = document.create_element("div").unwrap();
+        element.set_text_content(Some(message));
+        let _ = fragment.append_child(&element);
+    }
     let logs = document
         .get_element_by_id("logsField")
         .expect("#logsField should exist");
-    let _ = logs.prepend_with_node_1(&log_message_div);
+    let _ = logs.prepend_with_node_1(&fragment);
     while logs.child_element_count() > crate::LOG_DOM_RETAINED {
         let Some(oldest) = logs.last_element_child() else {
             break;

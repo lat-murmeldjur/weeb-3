@@ -1,6 +1,7 @@
 use crate::{
     ChunkRetrieveSender, RetrieveCancelToken, RetrieveGenerationMap,
     erasure_coding::{CHUNK_SIZE, decode_span, encoded_reference_payload_len},
+    feed::{FEED_FRONTIER_LOOKAHEAD_TIMEOUT, FeedProbe, overscan_sequence_feed_candidate},
     manifest::{
         BzzManifestFork, MAX_PARALLEL_MANIFEST_FORKS, ParsedBzzManifest, ResolutionGuard,
         is_bzz_manifest_header, manifest_payload_size_allowed, manifest_wrapped_reference,
@@ -11,8 +12,8 @@ use crate::{
         DecodedJoinChunk, retrieve_data, retrieve_data_range_from_root,
         retrieve_data_range_from_root_cancellable, retrieve_decoded_data_root,
         retrieve_decoded_data_root_cancellable, retrieve_feed_update_at_index,
-        retrieve_feed_update_at_index_bounded, seek_latest_feed_update,
-        seek_latest_feed_update_indexed_bounded_from, seek_latest_feed_update_indexed_from,
+        retrieve_feed_update_at_index_bounded, retrieve_feed_update_at_index_status,
+        seek_latest_feed_update, seek_latest_feed_update_indexed_from,
         seek_latest_feed_update_indexed_observing_positive,
         seek_latest_feed_update_indexed_wide_bounded,
     },
@@ -24,7 +25,7 @@ use std::{rc::Rc, time::Duration};
 
 const RANGE_RETRIEVE_RETRY_COUNT: usize = 2;
 const RANGE_RETRIEVE_RETRY_WAIT_MS: u64 = 120;
-const FEED_STARTUP_OVERSCAN: u64 = 16;
+const OBSERVED_FEED_PAYLOAD_DECODES: usize = 3;
 
 #[derive(Clone, Debug)]
 pub struct BzzResource {
@@ -260,44 +261,36 @@ async fn raw_feed_payload_from_update(
     None
 }
 
-async fn overscan_feed_candidate(
-    owner: &str,
-    topic: &str,
-    candidate: (u64, Vec<u8>),
+fn decode_observed_feed_updates(
+    payloads: mpsc::Sender<RawFeedPayload>,
+    maximum_index: Option<u64>,
     chunk_retrieve_chan: &ChunkRetrieveSender,
-) -> (u64, Vec<u8>) {
-    let mut latest = candidate;
-    for stride in [FEED_STARTUP_OVERSCAN, 1] {
-        let base = latest.0;
-        let indices = (1..=FEED_STARTUP_OVERSCAN)
-            .filter_map(|offset| base.checked_add(offset.saturating_mul(stride)));
-        let mut probes = stream::iter(indices)
-            .map(|index| {
-                let owner = owner.to_string();
-                let topic = topic.to_string();
+) -> mpsc::Sender<(u64, Vec<u8>)> {
+    let (updates_out, updates_in) = mpsc::bounded::<(u64, Vec<u8>)>(16);
+    let chunk_retrieve_chan = chunk_retrieve_chan.clone();
+    wasm_bindgen_futures::spawn_local(async move {
+        let mut decoded = updates_in
+            .map(move |(index, update)| {
+                let chunk_retrieve_chan = chunk_retrieve_chan.clone();
                 async move {
-                    (
-                        index,
-                        retrieve_feed_update_at_index_bounded(
-                            owner,
-                            topic,
-                            index,
-                            chunk_retrieve_chan,
-                        )
-                        .await,
-                    )
+                    if maximum_index.is_some_and(|maximum| index > maximum)
+                        || decode_span(&update).is_some_and(|(_, span)| span > CHUNK_SIZE as u64)
+                    {
+                        return None;
+                    }
+                    raw_feed_payload_from_update(&update, &chunk_retrieve_chan)
+                        .await
+                        .map(|bytes| RawFeedPayload { index, bytes })
                 }
             })
-            .buffer_unordered(FEED_STARTUP_OVERSCAN as usize);
-        while let Some((index, update)) = probes.next().await {
-            if index > latest.0
-                && let Some(update) = update
-            {
-                latest = (index, update);
+            .buffer_unordered(OBSERVED_FEED_PAYLOAD_DECODES);
+        while let Some(Some(payload)) = decoded.next().await {
+            if payloads.send(payload).await.is_err() {
+                return;
             }
         }
-    }
-    latest
+    });
+    updates_out
 }
 
 pub(crate) async fn acquire_raw_feed_payload_at_index(
@@ -330,25 +323,8 @@ pub(crate) async fn acquire_latest_raw_feed_payload_startup(
     early_payloads: Option<mpsc::Sender<RawFeedPayload>>,
     early_payload_max_index: Option<u64>,
 ) -> Option<RawFeedPayload> {
-    let early_updates = early_payloads.map(|early_payloads| {
-        let (early_update_out, early_update_in) = mpsc::bounded::<(u64, Vec<u8>)>(16);
-        let chunk_retrieve_chan = chunk_retrieve_chan.clone();
-        wasm_bindgen_futures::spawn_local(async move {
-            while let Ok((index, update)) = early_update_in.recv().await {
-                if early_payloads.is_closed() {
-                    return;
-                }
-                if early_payload_max_index.is_some_and(|maximum| index > maximum) {
-                    continue;
-                }
-                let Some(bytes) = raw_feed_payload_from_update(&update, &chunk_retrieve_chan).await
-                else {
-                    continue;
-                };
-                let _ = early_payloads.try_send(RawFeedPayload { index, bytes });
-            }
-        });
-        early_update_out
+    let early_updates = early_payloads.map(|payloads| {
+        decode_observed_feed_updates(payloads, early_payload_max_index, chunk_retrieve_chan)
     });
     let (index, update) = match early_updates {
         Some(early_updates) => {
@@ -361,18 +337,12 @@ pub(crate) async fn acquire_latest_raw_feed_payload_startup(
             .await?
         }
         None => {
-            let candidate = seek_latest_feed_update_indexed_wide_bounded(
+            let (index, update) = seek_latest_feed_update_indexed_wide_bounded(
                 owner.clone(),
                 topic.clone(),
                 chunk_retrieve_chan,
             )
             .await?;
-            let (index, update) =
-                if !decode_span(&candidate.1).is_some_and(|(_, span)| span > CHUNK_SIZE as u64) {
-                    overscan_feed_candidate(&owner, &topic, candidate, chunk_retrieve_chan).await
-                } else {
-                    candidate
-                };
             if decode_span(&update).is_some_and(|(_, span)| span > CHUNK_SIZE as u64)
                 && let Some(previous_index) = index.checked_sub(1)
                 && let Some(previous) = retrieve_feed_update_at_index_bounded(
@@ -401,20 +371,41 @@ pub(crate) async fn acquire_latest_raw_feed_payload_bounded_from(
     owner: String,
     topic: String,
     initial: RawFeedPayload,
+    force_coarse: bool,
     chunk_retrieve_chan: &ChunkRetrieveSender,
-) -> Option<RawFeedPayload> {
-    let (index, update) = seek_latest_feed_update_indexed_bounded_from(
-        owner,
-        topic,
-        initial.index,
-        chunk_retrieve_chan,
+    observed_payloads: Option<mpsc::Sender<RawFeedPayload>>,
+) -> Option<(RawFeedPayload, bool)> {
+    let observed_updates = observed_payloads
+        .map(|payloads| decode_observed_feed_updates(payloads, None, chunk_retrieve_chan));
+    let ((index, update), verified) = overscan_sequence_feed_candidate(
+        (initial.index, Vec::new()),
+        force_coarse,
+        |index| {
+            let lookup = retrieve_feed_update_at_index_status(
+                owner.clone(),
+                topic.clone(),
+                index,
+                chunk_retrieve_chan,
+            );
+            async move {
+                match async_std::future::timeout(FEED_FRONTIER_LOOKAHEAD_TIMEOUT, lookup).await {
+                    Ok(result) => result,
+                    Err(_) => FeedProbe::Transient,
+                }
+            }
+        },
+        |index, update| {
+            if let Some(observed_updates) = observed_updates.as_ref() {
+                let _ = observed_updates.try_send((index, update.clone()));
+            }
+        },
     )
-    .await?;
+    .await;
     if index == initial.index {
-        return Some(initial);
+        return Some((initial, verified));
     }
     let bytes = raw_feed_payload_from_update(&update, chunk_retrieve_chan).await?;
-    Some(RawFeedPayload { index, bytes })
+    Some((RawFeedPayload { index, bytes }, verified))
 }
 
 pub(crate) async fn acquire_latest_raw_feed_payload_from(

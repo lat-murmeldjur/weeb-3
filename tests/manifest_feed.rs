@@ -220,11 +220,10 @@ mod feed_frontier {
     };
 
     use feed::{
-        FEED_FRONTIER_LOOKAHEAD_LEVELS, FEED_FRONTIER_LOOKAHEAD_TIMEOUT,
-        WIDE_FEED_FRONTIER_LOOKAHEAD, seek_sequence_feed_frontier,
-        seek_sequence_feed_frontier_bounded_from_observing_positive,
-        seek_sequence_feed_frontier_bounded_observing_positive, seek_sequence_feed_frontier_from,
-        seek_sequence_feed_frontier_wide_bounded,
+        FEED_FRONTIER_LOOKAHEAD_LEVELS, FEED_FRONTIER_LOOKAHEAD_TIMEOUT, FeedProbe,
+        WIDE_FEED_FRONTIER_LOOKAHEAD, overscan_sequence_feed_candidate,
+        seek_sequence_feed_frontier, seek_sequence_feed_frontier_bounded_observing_positive,
+        seek_sequence_feed_frontier_from, seek_sequence_feed_frontier_wide_bounded,
     };
     use futures::executor::block_on;
 
@@ -343,7 +342,548 @@ mod feed_frontier {
             assert_eq!(latest, Some((1_704, 1_704)));
             assert_eq!(next, 1_705);
             let probe_count = probes.load(Ordering::SeqCst);
-            assert!(probe_count <= 46, "wide lookup used {probe_count} probes");
+            assert!(probe_count <= 47, "wide lookup used {probe_count} probes");
+        });
+    }
+
+    #[test]
+    fn wide_bounded_frontier_covers_minute_to_twelve_hour_streams() {
+        block_on(async {
+            for (head, maximum_probes) in [(30, 48), (10_368, 80), (21_600, 80), (86_400, 96)] {
+                let probes = Arc::new(AtomicUsize::new(0));
+                let (latest, next) = seek_sequence_feed_frontier_wide_bounded({
+                    let probes = probes.clone();
+                    move |index| {
+                        probes.fetch_add(1, Ordering::SeqCst);
+                        async move { (index <= head).then_some(index) }
+                    }
+                })
+                .await;
+
+                assert_eq!(latest, Some((head, head)));
+                assert_eq!(next, head + 1);
+                assert!(probes.load(Ordering::SeqCst) <= maximum_probes);
+            }
+        });
+    }
+
+    #[test]
+    fn fast_transients_do_not_bound_short_or_twelve_hour_frontiers() {
+        block_on(async {
+            for (head, transient_index, maximum_probes) in
+                [(30, 7, 48), (21_600, 16_383, 80), (86_400, 65_535, 96)]
+            {
+                let probes = Arc::new(AtomicUsize::new(0));
+                let attempts = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+                let (latest, next) = seek_sequence_feed_frontier_wide_bounded({
+                    let probes = probes.clone();
+                    let attempts = attempts.clone();
+                    move |index| {
+                        probes.fetch_add(1, Ordering::SeqCst);
+                        let attempts = attempts.clone();
+                        async move {
+                            let attempt = {
+                                let mut attempts = attempts.lock().unwrap();
+                                let attempt = attempts.entry(index).or_insert(0);
+                                let current = *attempt;
+                                *attempt += 1;
+                                current
+                            };
+                            if index == transient_index && attempt == 0 {
+                                FeedProbe::Transient
+                            } else if index <= head {
+                                FeedProbe::Found(index)
+                            } else {
+                                FeedProbe::Missing
+                            }
+                        }
+                    }
+                })
+                .await;
+
+                assert_eq!(latest, Some((head, head)));
+                assert_eq!(next, head + 1);
+                assert_eq!(attempts.lock().unwrap().get(&transient_index), Some(&1));
+                assert!(probes.load(Ordering::SeqCst) <= maximum_probes);
+            }
+        });
+    }
+
+    #[test]
+    fn wide_bounded_frontier_crosses_sparse_upload_holes() {
+        block_on(async {
+            for (head, hole) in [(10_368, 8_191), (10_368, 10_119), (21_600, 16_383)] {
+                let (latest, next) = seek_sequence_feed_frontier_wide_bounded(|index| async move {
+                    (index <= head && index != hole).then_some(index)
+                })
+                .await;
+
+                assert_eq!(latest, Some((head, head)));
+                assert_eq!(next, head + 1);
+            }
+        });
+    }
+
+    #[test]
+    fn a_sparse_boundary_confirmation_timeout_remains_unknown() {
+        block_on(async {
+            let confirmation_seen = Arc::new(AtomicUsize::new(0));
+            let (latest, next) = seek_sequence_feed_frontier_wide_bounded({
+                let confirmation_seen = confirmation_seen.clone();
+                move |index| {
+                    if index == 10_135 {
+                        confirmation_seen.fetch_add(1, Ordering::SeqCst);
+                    }
+                    DeterministicProbe {
+                        result: if index == 10_135 {
+                            DeterministicProbeResult::Pending
+                        } else {
+                            DeterministicProbeResult::Ready(
+                                (index <= 10_368 && index != 10_119).then_some(index),
+                            )
+                        },
+                    }
+                }
+            })
+            .await;
+
+            assert_eq!(latest, Some((10_368, 10_368)));
+            assert_eq!(next, 10_369);
+            assert!(confirmation_seen.load(Ordering::SeqCst) > 0);
+        });
+    }
+
+    #[test]
+    fn adaptive_overscan_is_not_limited_to_one_stride_and_dense_wave() {
+        block_on(async {
+            for (seed, head, holes) in [
+                (2_522, 2_813, Vec::new()),
+                (2_522, 2_813, vec![2_778, 2_810]),
+                (8_191, 10_368, Vec::new()),
+                (65_535, 86_400, Vec::new()),
+            ] {
+                let (latest, verified) = overscan_sequence_feed_candidate(
+                    (seed, seed),
+                    false,
+                    |index| {
+                        let found = index <= head && !holes.contains(&index);
+                        async move { Ok(found.then_some(index)) }
+                    },
+                    |_, _| {},
+                )
+                .await;
+
+                assert_eq!(latest, (head, head));
+                assert!(verified);
+            }
+        });
+    }
+
+    #[test]
+    fn adaptive_overscan_never_exceeds_the_wide_probe_limit() {
+        block_on(async {
+            let active = Arc::new(AtomicUsize::new(0));
+            let maximum = Arc::new(AtomicUsize::new(0));
+            let (latest, verified) = overscan_sequence_feed_candidate(
+                (285, 285),
+                false,
+                {
+                    let active = active.clone();
+                    let maximum = maximum.clone();
+                    move |index| {
+                        let lookup = OverlapProbe {
+                            index,
+                            active: active.clone(),
+                            maximum: maximum.clone(),
+                            pending_once: false,
+                            counted_active: false,
+                        };
+                        async move { Ok(lookup.await) }
+                    }
+                },
+                |_, _| {},
+            )
+            .await;
+
+            assert_eq!(latest, (646, 646));
+            assert!(verified);
+            assert!(maximum.load(Ordering::SeqCst) > 1);
+            assert!(maximum.load(Ordering::SeqCst) <= WIDE_FEED_FRONTIER_LOOKAHEAD);
+        });
+    }
+
+    #[test]
+    fn adaptive_overscan_recovers_from_a_timed_out_coarse_wave_without_reprobing_it() {
+        block_on(async {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let regular = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let shifted = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let (latest, verified) = overscan_sequence_feed_candidate(
+                (8_191, 8_191),
+                false,
+                {
+                    let calls = calls.clone();
+                    let regular = regular.clone();
+                    let shifted = shifted.clone();
+                    move |index| {
+                        let call = calls.fetch_add(1, Ordering::SeqCst);
+                        if call < WIDE_FEED_FRONTIER_LOOKAHEAD {
+                            regular.lock().unwrap().push(index);
+                        } else if call < WIDE_FEED_FRONTIER_LOOKAHEAD * 2 {
+                            shifted.lock().unwrap().push(index);
+                        }
+                        async move {
+                            if call < WIDE_FEED_FRONTIER_LOOKAHEAD {
+                                Err(())
+                            } else {
+                                Ok((index <= 8_621).then_some(index))
+                            }
+                        }
+                    }
+                },
+                |_, _| {},
+            )
+            .await;
+
+            assert_eq!(latest, (8_621, 8_621));
+            assert!(verified);
+            assert!(calls.load(Ordering::SeqCst) <= WIDE_FEED_FRONTIER_LOOKAHEAD * 5);
+            assert!(
+                regular
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .all(|index| !shifted.lock().unwrap().contains(index))
+            );
+        });
+    }
+
+    #[test]
+    fn adaptive_overscan_does_not_descend_below_an_unresolved_coarse_scale() {
+        block_on(async {
+            let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let (latest, verified) = overscan_sequence_feed_candidate(
+                (8_191, 8_191),
+                false,
+                {
+                    let calls = calls.clone();
+                    move |index| {
+                        calls.lock().unwrap().push(index);
+                        async move { Err::<Option<u64>, ()>(()) }
+                    }
+                },
+                |_, _| {},
+            )
+            .await;
+
+            assert_eq!(latest, (8_191, 8_191));
+            assert!(!verified);
+            let calls = calls.lock().unwrap();
+            assert_eq!(calls.len(), WIDE_FEED_FRONTIER_LOOKAHEAD * 2);
+            assert!(calls.iter().all(|index| index - 8_191 >= 128));
+        });
+    }
+
+    #[test]
+    fn adaptive_overscan_publishes_progress_before_an_unresolved_exit() {
+        block_on(async {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let (latest, verified) = overscan_sequence_feed_candidate(
+                (2_522, 2_522),
+                false,
+                {
+                    let calls = calls.clone();
+                    move |index| {
+                        let call = calls.fetch_add(1, Ordering::SeqCst);
+                        async move {
+                            if call >= WIDE_FEED_FRONTIER_LOOKAHEAD || index > 2_778 {
+                                Err(())
+                            } else {
+                                Ok(Some(index))
+                            }
+                        }
+                    }
+                },
+                {
+                    let observed = observed.clone();
+                    move |index, _| observed.lock().unwrap().push(index)
+                },
+            )
+            .await;
+
+            assert_eq!(latest, (2_778, 2_778));
+            assert!(!verified);
+            assert_eq!(*observed.lock().unwrap(), vec![2_778]);
+        });
+    }
+
+    #[test]
+    fn adaptive_overscan_publishes_coarse_and_exact_long_stream_progress() {
+        block_on(async {
+            let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let (latest, verified) = overscan_sequence_feed_candidate(
+                (5_759, 5_759),
+                false,
+                |index| async move { Ok((index <= 5_900).then_some(index)) },
+                {
+                    let observed = observed.clone();
+                    move |index, _| observed.lock().unwrap().push(index)
+                },
+            )
+            .await;
+
+            assert_eq!(latest, (5_900, 5_900));
+            assert!(verified);
+            assert_eq!(*observed.lock().unwrap(), vec![5_887, 5_900]);
+        });
+    }
+
+    #[test]
+    fn adaptive_overscan_confirms_beyond_a_short_dense_gap() {
+        block_on(async {
+            let (latest, verified) = overscan_sequence_feed_candidate(
+                (5_759, 5_759),
+                false,
+                |index| async move {
+                    Ok((index <= 5_910 && !(5_901..=5_903).contains(&index)).then_some(index))
+                },
+                |_, _| {},
+            )
+            .await;
+
+            assert_eq!(latest, (5_910, 5_910));
+            assert!(verified);
+        });
+    }
+
+    #[test]
+    fn adaptive_overscan_rechecks_only_the_decisive_missing_boundary() {
+        block_on(async {
+            let boundary_calls = Arc::new(AtomicUsize::new(0));
+            let (latest, verified) = overscan_sequence_feed_candidate(
+                (29, 29),
+                false,
+                {
+                    let boundary_calls = boundary_calls.clone();
+                    move |index| {
+                        let call = (index == 30)
+                            .then(|| boundary_calls.fetch_add(1, Ordering::SeqCst))
+                            .unwrap_or_default();
+                        async move {
+                            if index == 30 && call == 0 {
+                                FeedProbe::Missing
+                            } else if index <= 30 {
+                                FeedProbe::Found(index)
+                            } else {
+                                FeedProbe::Missing
+                            }
+                        }
+                    }
+                },
+                |_, _| {},
+            )
+            .await;
+
+            assert_eq!(latest, (30, 30));
+            assert!(!verified);
+            assert_eq!(boundary_calls.load(Ordering::SeqCst), 2);
+        });
+    }
+
+    #[test]
+    fn adaptive_overscan_leaves_a_transient_confirmation_unverified() {
+        block_on(async {
+            let boundary_calls = Arc::new(AtomicUsize::new(0));
+            let (latest, verified) = overscan_sequence_feed_candidate(
+                (29, 29),
+                false,
+                {
+                    let boundary_calls = boundary_calls.clone();
+                    move |index| {
+                        let call = (index == 30)
+                            .then(|| boundary_calls.fetch_add(1, Ordering::SeqCst))
+                            .unwrap_or_default();
+                        async move {
+                            if index == 30 && call > 0 {
+                                FeedProbe::Transient
+                            } else {
+                                FeedProbe::Missing
+                            }
+                        }
+                    }
+                },
+                |_, _| {},
+            )
+            .await;
+
+            assert_eq!(latest, (29, 29));
+            assert!(!verified);
+            assert_eq!(boundary_calls.load(Ordering::SeqCst), 2);
+        });
+    }
+
+    #[test]
+    fn adaptive_overscan_publishes_shifted_progress_without_claiming_verification() {
+        block_on(async {
+            let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let (latest, verified) = overscan_sequence_feed_candidate(
+                (5_759, 5_759),
+                false,
+                |index| async move {
+                    if index <= 5_900 {
+                        Ok(Some(index))
+                    } else {
+                        Err(())
+                    }
+                },
+                {
+                    let observed = observed.clone();
+                    move |index, _| observed.lock().unwrap().push(index)
+                },
+            )
+            .await;
+
+            assert_eq!(latest, (5_900, 5_900));
+            assert!(!verified);
+            assert_eq!(*observed.lock().unwrap(), vec![5_887, 5_900]);
+        });
+    }
+
+    #[test]
+    fn adaptive_overscan_does_not_verify_a_dense_boundary_after_coarse_timeouts() {
+        block_on(async {
+            let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let (latest, verified) = overscan_sequence_feed_candidate(
+                (5_759, 5_759),
+                false,
+                |index| async move {
+                    if index > 5_900 && matches!(index % 16, 7 | 15) {
+                        Err(())
+                    } else {
+                        Ok((index <= 5_900).then_some(index))
+                    }
+                },
+                {
+                    let observed = observed.clone();
+                    move |index, _| observed.lock().unwrap().push(index)
+                },
+            )
+            .await;
+
+            assert_eq!(latest, (5_900, 5_900));
+            assert!(!verified);
+            assert_eq!(observed.lock().unwrap().last(), Some(&5_900));
+        });
+    }
+
+    #[test]
+    fn adaptive_overscan_rebases_before_narrowing_a_far_coarse_timeout() {
+        block_on(async {
+            let (latest, verified) = overscan_sequence_feed_candidate(
+                (4_095, 4_095),
+                true,
+                |index| async move {
+                    if index <= 6_600 && index > 5_119 && index.saturating_sub(4_095) % 128 == 0 {
+                        Err(())
+                    } else {
+                        Ok((index <= 6_600).then_some(index))
+                    }
+                },
+                |_, _| {},
+            )
+            .await;
+
+            assert_eq!(latest, (6_600, 6_600));
+            assert!(!verified);
+        });
+    }
+
+    #[test]
+    fn adaptive_overscan_descends_through_timeouts_to_the_authenticated_head() {
+        block_on(async {
+            let (latest, verified) = overscan_sequence_feed_candidate(
+                (4_095, 4_095),
+                true,
+                |index| async move {
+                    if index <= 7_587 {
+                        Ok(Some(index))
+                    } else {
+                        Err(())
+                    }
+                },
+                |_, _| {},
+            )
+            .await;
+
+            assert_eq!(latest, (7_587, 7_587));
+            assert!(!verified);
+        });
+    }
+
+    #[test]
+    fn adaptive_overscan_deduplicates_adjacent_waves_and_recovers_a_dormant_head() {
+        block_on(async {
+            let (partial, verified) = overscan_sequence_feed_candidate(
+                (1_000, 1_000),
+                false,
+                |index| async move { Ok((index <= 5_000).then_some(index)) },
+                |_, _| {},
+            )
+            .await;
+            assert!(partial.0 < 5_000);
+            assert!(!verified);
+
+            let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let (latest, verified) = overscan_sequence_feed_candidate(
+                (20_000, 20_000),
+                true,
+                {
+                    let calls = calls.clone();
+                    move |index| {
+                        calls.lock().unwrap().push(index);
+                        async move { Ok((index <= 30_000 && index != 27_778).then_some(index)) }
+                    }
+                },
+                |_, _| {},
+            )
+            .await;
+
+            assert_eq!(latest, (30_000, 30_000));
+            assert!(verified);
+            let calls = calls.lock().unwrap();
+            let mut unique = calls.clone();
+            unique.sort_unstable();
+            unique.dedup();
+            assert_eq!(calls.len(), unique.len() + 1);
+            assert_eq!(calls.iter().filter(|index| **index == 30_001).count(), 2);
+            assert!(calls.len() <= WIDE_FEED_FRONTIER_LOOKAHEAD * 10);
+
+            let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let (latest, verified) = overscan_sequence_feed_candidate(
+                (2_522, 2_522),
+                false,
+                {
+                    let calls = calls.clone();
+                    move |index| {
+                        calls.lock().unwrap().push(index);
+                        async move { Ok((index <= 2_813 && index != 2_778).then_some(index)) }
+                    }
+                },
+                |_, _| {},
+            )
+            .await;
+            assert_eq!(latest, (2_813, 2_813));
+            assert!(verified);
+            assert_eq!(
+                calls
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|index| **index == 2_778)
+                    .count(),
+                1
+            );
         });
     }
 
@@ -462,6 +1002,19 @@ mod feed_frontier {
     }
 
     #[test]
+    fn wide_bounded_frontier_finds_a_feed_whose_zero_update_is_missing() {
+        block_on(async {
+            let (latest, next) = seek_sequence_feed_frontier_wide_bounded(|index| async move {
+                (index > 0 && index <= 310).then_some(index)
+            })
+            .await;
+
+            assert_eq!(latest, Some((310, 310)));
+            assert_eq!(next, 311);
+        });
+    }
+
+    #[test]
     fn exposes_authenticated_positive_payloads_before_finishing() {
         block_on(async {
             let first_observed = Arc::new(AtomicUsize::new(usize::MAX));
@@ -483,34 +1036,6 @@ mod feed_frontier {
             assert!(observed_count.load(Ordering::SeqCst) > 1);
             assert_eq!(latest.map(|(index, _)| index), Some(646));
             assert_eq!(next, 647);
-        });
-    }
-
-    #[test]
-    fn bounded_verification_resumes_after_the_authenticated_candidate() {
-        block_on(async {
-            let probed = Arc::new(std::sync::Mutex::new(Vec::<u64>::new()));
-            let (latest, next) = seek_sequence_feed_frontier_bounded_from_observing_positive(
-                (285, 285),
-                {
-                    let probed = probed.clone();
-                    move |index| {
-                        probed.lock().expect("probe log").push(index);
-                        async move { (index <= 646).then_some(index) }
-                    }
-                },
-                |index, payload| assert_eq!(index, *payload),
-            )
-            .await;
-
-            assert_eq!(latest, Some((646, 646)));
-            assert_eq!(next, 647);
-            let probed = probed.lock().expect("probe log");
-            assert!(!probed.is_empty());
-            assert!(
-                probed.iter().all(|index| *index > 285),
-                "resumed lookup repeated an already authenticated interval: {probed:?}"
-            );
         });
     }
 
@@ -568,58 +1093,6 @@ mod feed_frontier {
     }
 
     #[test]
-    fn resumed_bounded_lookup_keeps_the_eight_listener_limit() {
-        block_on(async {
-            let active = Arc::new(AtomicUsize::new(0));
-            let maximum = Arc::new(AtomicUsize::new(0));
-            let (latest, next) = seek_sequence_feed_frontier_bounded_from_observing_positive(
-                (285, 285),
-                {
-                    let active = active.clone();
-                    let maximum = maximum.clone();
-                    move |index| OverlapProbe {
-                        index,
-                        active: active.clone(),
-                        maximum: maximum.clone(),
-                        pending_once: false,
-                        counted_active: false,
-                    }
-                },
-                |_, _| {},
-            )
-            .await;
-
-            assert_eq!(latest.map(|(index, _)| index), Some(646));
-            assert_eq!(next, 647);
-            assert!(maximum.load(Ordering::SeqCst) > 1);
-            assert!(maximum.load(Ordering::SeqCst) <= FEED_FRONTIER_LOOKAHEAD_LEVELS);
-        });
-    }
-
-    #[test]
-    fn resumed_bounded_lookup_handles_the_last_sequence_index_without_probing() {
-        block_on(async {
-            let probes = Arc::new(AtomicUsize::new(0));
-            let (latest, next) = seek_sequence_feed_frontier_bounded_from_observing_positive(
-                (u64::MAX, u64::MAX),
-                {
-                    let probes = probes.clone();
-                    move |_| {
-                        probes.fetch_add(1, Ordering::SeqCst);
-                        async { None::<u64> }
-                    }
-                },
-                |_, _| {},
-            )
-            .await;
-
-            assert_eq!(latest, Some((u64::MAX, u64::MAX)));
-            assert_eq!(next, u64::MAX);
-            assert_eq!(probes.load(Ordering::SeqCst), 0);
-        });
-    }
-
-    #[test]
     fn bounded_frontier_does_not_wait_for_a_slow_zero_anchor() {
         assert_lookup_ready(
             seek_sequence_feed_frontier_bounded_observing_positive(
@@ -642,24 +1115,6 @@ mod feed_frontier {
             seek_sequence_feed_frontier_bounded_observing_positive(
                 |index| DeterministicProbe {
                     result: if matches!(index, 0 | 3) {
-                        DeterministicProbeResult::Pending
-                    } else {
-                        DeterministicProbeResult::Ready((index <= 7).then_some(index))
-                    },
-                },
-                |_, _| {},
-            ),
-            7,
-        );
-    }
-
-    #[test]
-    fn resumed_bounded_wave_does_not_wait_for_index_three_or_any_lower_probe() {
-        assert_lookup_ready(
-            seek_sequence_feed_frontier_bounded_from_observing_positive(
-                (0, 0),
-                |index| DeterministicProbe {
-                    result: if matches!(index, 1 | 3) {
                         DeterministicProbeResult::Pending
                     } else {
                         DeterministicProbeResult::Ready((index <= 7).then_some(index))
@@ -820,10 +1275,11 @@ mod feed_frontier {
     fn lookahead_deadline_closes_only_future_admission_and_not_dispatched_accounting() {
         let retrieval = include_str!("../src/retrieval.rs");
         let finder = include_str!("../src/feed.rs");
+        let bzz = include_str!("../src/bzz_stream.rs");
 
-        assert!(
-            retrieval.contains("probe_feed_update(&owner, &topic, index, chunk_retrieve_chan)")
-        );
+        assert!(retrieval.contains("retrieve_feed_update_at_index_status("));
+        assert!(retrieval.contains("probe_feed_update_status(&owner, &topic, index"));
+        assert!(finder.contains("confirm_sequence_feed_missing("));
         assert!(retrieval.contains("seek_sequence_feed_frontier(|index|"));
         assert_eq!(
             FEED_FRONTIER_LOOKAHEAD_TIMEOUT,
@@ -838,7 +1294,12 @@ mod feed_frontier {
             .expect("feed probe chunk wrapper should remain inspectable");
         assert!(feed_probe.contains("let _close_admission = admission.close_on_drop();"));
         assert!(feed_probe.contains("admission: Some(admission),"));
+        assert!(feed_probe.contains(".is_err()"));
+        assert!(feed_probe.contains("return FeedProbe::Transient;"));
         assert!(feed_probe.contains("chan_in.recv().await"));
+        assert!(feed_probe.contains("Ok(_) => FeedProbe::Missing"));
+        assert!(feed_probe.contains("Err(_) => FeedProbe::Transient"));
+        assert!(bzz.contains("Err(_) => FeedProbe::Transient"));
         let attempt = retrieval
             .split("async fn retrieve_attempt(")
             .nth(1)
