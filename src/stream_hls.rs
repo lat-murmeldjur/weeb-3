@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::{
     borrow::Cow,
-    collections::{BTreeMap, HashMap, HashSet, VecDeque},
+    collections::{HashMap, HashSet},
     sync::Arc,
 };
 
@@ -37,11 +37,16 @@ pub(crate) enum HlsManifestProbe {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct HlsMediaCursor {
-    pub(crate) plan_id: u64,
+pub(crate) struct HlsMediaPlan {
+    pub(crate) id: u64,
     pub(crate) references: Arc<[String]>,
-    pub(crate) position: usize,
     pub(crate) early_overlap_limit: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct HlsMediaCursor {
+    pub(crate) plan: Arc<HlsMediaPlan>,
+    pub(crate) position: usize,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -67,6 +72,15 @@ impl HlsMediaPlanRegistry {
         }
     }
 
+    fn resize(&mut self, max_references: usize) {
+        let max_references = max_references.max(1);
+        if self.max_references != max_references {
+            self.max_references = max_references;
+            self.cursor_count = 0;
+            self.cursors.clear();
+        }
+    }
+
     pub(crate) fn install_with_early_overlap_limit(
         &mut self,
         mut references: Vec<String>,
@@ -78,39 +92,37 @@ impl HlsMediaPlanRegistry {
         } else {
             references.truncate(self.max_references);
         }
-        if references.is_empty() {
-            return;
-        }
-
-        if self.cursors.get(&references[0]).is_some_and(|candidates| {
-            candidates.iter().any(|cursor| {
-                cursor.position == 0
-                    && cursor.references.as_ref() == references.as_slice()
-                    && cursor.early_overlap_limit == early_overlap_limit
+        if references.is_empty()
+            || self.cursors.get(&references[0]).is_some_and(|candidates| {
+                candidates.iter().any(|cursor| {
+                    cursor.position == 0
+                        && cursor.plan.references.as_ref() == references
+                        && cursor.plan.early_overlap_limit == early_overlap_limit
+                })
             })
-        }) {
+        {
             return;
         }
-
         if self.cursor_count.saturating_add(references.len()) > self.max_references {
             self.cursors.clear();
             self.cursor_count = 0;
         }
 
         self.next_plan_id = next_nonzero_generation(self.next_plan_id);
-        let plan_id = self.next_plan_id;
-        let references: Arc<[String]> = references.into();
-        for (position, reference) in references.iter().enumerate() {
+        let plan = Arc::new(HlsMediaPlan {
+            id: self.next_plan_id,
+            references: references.into(),
+            early_overlap_limit,
+        });
+        for (position, reference) in plan.references.iter().enumerate() {
             self.cursors
                 .entry(reference.clone())
                 .or_default()
                 .push(HlsMediaCursor {
-                    plan_id,
-                    references: references.clone(),
+                    plan: plan.clone(),
                     position,
-                    early_overlap_limit,
                 });
-            self.cursor_count = self.cursor_count.saturating_add(1);
+            self.cursor_count += 1;
         }
     }
 
@@ -124,46 +136,36 @@ impl HlsMediaPlanRegistry {
             .iter()
             .enumerate()
             .filter_map(|(index, cursor)| {
-                let position = preferred.get(&cursor.plan_id)?;
-                Some((
-                    cursor.position.abs_diff(*position),
-                    usize::MAX - index,
-                    index,
-                ))
+                preferred.get(&cursor.plan.id).map(|position| {
+                    (
+                        cursor.position.abs_diff(*position),
+                        usize::MAX - index,
+                        index,
+                    )
+                })
             })
             .min_by_key(|candidate| (candidate.0, candidate.1))
             .map(|candidate| candidate.2);
-
-        let selected_index = if let Some(preferred_index) = preferred_index {
-            let preferred_cursor = &candidates[preferred_index];
-            candidates
-                .iter()
-                .enumerate()
-                .skip(preferred_index.saturating_add(1))
+        let selected_index = preferred_index.map_or(candidates.len() - 1, |index| {
+            ((index + 1)..candidates.len())
                 .rev()
-                .find(|(_, candidate)| {
-                    candidate.plan_id != preferred_cursor.plan_id
-                        && hls_media_cursors_compatible(preferred_cursor, candidate)
+                .find(|candidate| {
+                    candidates[*candidate].plan.id != candidates[index].plan.id
+                        && hls_media_cursors_compatible(&candidates[index], &candidates[*candidate])
                 })
-                .map(|(index, _)| index)
-                .unwrap_or(preferred_index)
-        } else {
-            candidates.len().checked_sub(1)?
-        };
+                .unwrap_or(index)
+        });
         let cursor = candidates[selected_index].clone();
-
-        let mut superseded_plan_ids = Vec::new();
         let mut seen = HashSet::new();
-        for candidate in candidates.iter().take(selected_index) {
-            if candidate.plan_id != cursor.plan_id
-                && preferred.contains_key(&candidate.plan_id)
-                && hls_media_cursors_compatible(candidate, &cursor)
-                && seen.insert(candidate.plan_id)
-            {
-                superseded_plan_ids.push(candidate.plan_id);
-            }
-        }
-
+        let superseded_plan_ids = candidates[..selected_index]
+            .iter()
+            .filter(|candidate| {
+                candidate.plan.id != cursor.plan.id
+                    && preferred.contains_key(&candidate.plan.id)
+                    && hls_media_cursors_compatible(candidate, &cursor)
+            })
+            .filter_map(|candidate| seen.insert(candidate.plan.id).then_some(candidate.plan.id))
+            .collect();
         Some(HlsMediaSelection {
             cursor,
             superseded_plan_ids,
@@ -172,153 +174,20 @@ impl HlsMediaPlanRegistry {
 }
 
 fn hls_media_cursors_compatible(left: &HlsMediaCursor, right: &HlsMediaCursor) -> bool {
-    if left.references.get(left.position) != right.references.get(right.position) {
-        return false;
-    }
-
-    let previous_matches = left.position.checked_sub(1).is_some_and(|left_position| {
-        right.position.checked_sub(1).is_some_and(|right_position| {
-            left.references.get(left_position) == right.references.get(right_position)
-        })
-    });
-    let next_matches = left
-        .references
-        .get(left.position.saturating_add(1))
-        .is_some_and(|left_reference| {
-            right.references.get(right.position.saturating_add(1)) == Some(left_reference)
-        });
-    let old_tail_is_new_head =
-        left.position.saturating_add(1) == left.references.len() && right.position == 0;
-
-    previous_matches || next_matches || old_tail_is_new_head
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct HlsTrackRetention {
-    pub(crate) plan_id: u64,
-    pub(crate) last_touch: u64,
-    pub(crate) running: bool,
-}
-
-/// Pruning stops future admission while detached retrieval and accounting settle.
-pub(crate) fn hls_track_ids_to_prune(
-    tracks: &[HlsTrackRetention],
-    selected_plan_id: u64,
-    superseded_plan_ids: &[u64],
-    max_entries: usize,
-) -> Vec<u64> {
-    let superseded = superseded_plan_ids.iter().copied().collect::<HashSet<_>>();
-    let mut prune = tracks
-        .iter()
-        .filter(|track| track.plan_id != selected_plan_id && superseded.contains(&track.plan_id))
-        .map(|track| track.plan_id)
-        .collect::<HashSet<_>>();
-
-    let mut retained = tracks.len().saturating_sub(prune.len());
-    if retained > max_entries {
-        let mut inactive = tracks
-            .iter()
-            .filter(|track| {
-                track.plan_id != selected_plan_id
-                    && !track.running
-                    && !prune.contains(&track.plan_id)
-            })
-            .copied()
-            .collect::<Vec<_>>();
-        inactive.sort_by_key(|track| track.last_touch);
-        for track in inactive {
-            if retained <= max_entries {
-                break;
-            }
-            if prune.insert(track.plan_id) {
-                retained = retained.saturating_sub(1);
-            }
-        }
-    }
-
-    let mut prune = prune.into_iter().collect::<Vec<_>>();
-    prune.sort_unstable();
-    prune
-}
-
-pub(crate) fn read_forward_cache_entry<T: Clone>(
-    order: &mut VecDeque<String>,
-    entries: &HashMap<String, T>,
-    key: &str,
-) -> Option<T> {
-    let value = entries.get(key)?.clone();
-    order.retain(|cached_key| cached_key != key);
-    order.push_front(key.to_string());
-    Some(value)
-}
-
-pub(crate) fn hls_foreground_cursor_transition(
-    last_position: usize,
-    requested_position: usize,
-    cached: bool,
-) -> (bool, usize) {
-    if cached && requested_position < last_position {
-        return (false, last_position);
-    }
-
-    (
-        last_position.abs_diff(requested_position) > 1,
-        requested_position,
-    )
-}
-
-pub(crate) struct HlsOrderedProbeWindow {
-    next_probe_position: usize,
-    next_admit_position: usize,
-    ready: BTreeMap<usize, Option<u64>>,
-}
-
-impl HlsOrderedProbeWindow {
-    pub(crate) fn new(first_position: usize) -> Self {
-        Self {
-            next_probe_position: first_position,
-            next_admit_position: first_position,
-            ready: BTreeMap::new(),
-        }
-    }
-
-    pub(crate) fn fill_positions(
-        &mut self,
-        reference_count: usize,
-        max_outstanding: usize,
-    ) -> Vec<usize> {
-        let mut positions = Vec::new();
-        while self.next_probe_position < reference_count
-            && self
-                .next_probe_position
-                .saturating_sub(self.next_admit_position)
-                < max_outstanding
-        {
-            positions.push(self.next_probe_position);
-            self.next_probe_position = self.next_probe_position.saturating_add(1);
-        }
-        positions
-    }
-
-    pub(crate) fn complete(&mut self, position: usize, size: Option<u64>) {
-        if position >= self.next_admit_position && position < self.next_probe_position {
-            self.ready.insert(position, size);
-        }
-    }
-
-    pub(crate) fn next_ready(&self) -> Option<(usize, Option<u64>)> {
-        self.ready
-            .get(&self.next_admit_position)
-            .copied()
-            .map(|size| (self.next_admit_position, size))
-    }
-
-    pub(crate) fn commit_ready(&mut self) -> Option<(usize, Option<u64>)> {
-        let position = self.next_admit_position;
-        let size = self.ready.remove(&position)?;
-        self.next_admit_position = self.next_admit_position.saturating_add(1);
-        Some((position, size))
-    }
+    let matches = |left_position, right_position| {
+        left.plan
+            .references
+            .get(left_position)
+            .is_some_and(|reference| right.plan.references.get(right_position) == Some(reference))
+    };
+    matches(left.position, right.position)
+        && (left.position.checked_sub(1).is_some_and(|left_position| {
+            right
+                .position
+                .checked_sub(1)
+                .is_some_and(|right_position| matches(left_position, right_position))
+        }) || matches(left.position + 1, right.position + 1)
+            || (left.position + 1 == left.plan.references.len() && right.position == 0))
 }
 
 pub(crate) const MAX_STREAM_FEED_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
@@ -333,8 +202,16 @@ pub(crate) fn is_hls_manifest(bytes: &[u8]) -> bool {
                 .lines()
                 .next()
         })
-        .map(|line| line.trim_end_matches('\r').trim() == HLS_HEADER)
+        .map(hls_header_line)
         .unwrap_or(false)
+}
+
+fn hls_header_line(line: &str) -> bool {
+    line.strip_prefix('\u{feff}')
+        .unwrap_or(line)
+        .trim_end_matches('\r')
+        .trim()
+        == HLS_HEADER
 }
 
 pub(crate) fn probe_hls_manifest(prefix: &[u8], total_len: u64) -> HlsManifestProbe {
@@ -400,112 +277,38 @@ pub(crate) fn hls_startup_prefix_is_preferred(
 }
 
 pub(crate) fn hls_manifest_reload_is_continuous(current: &[u8], candidate: &[u8]) -> bool {
-    let Some(current_sequence) = hls_media_sequence(current) else {
-        return false;
-    };
-    let Some(candidate_sequence) = hls_media_sequence(candidate) else {
-        return false;
-    };
-    let Some(current_segments) = hls_segment_identities(current) else {
-        return false;
-    };
-    let Some(candidate_segments) = hls_segment_identities(candidate) else {
-        return false;
-    };
-    if current_segments.is_empty() || candidate_segments.is_empty() {
-        return false;
-    }
-
-    let Ok(current_len) = u64::try_from(current_segments.len()) else {
-        return false;
-    };
-    let Ok(candidate_len) = u64::try_from(candidate_segments.len()) else {
-        return false;
-    };
-    let Some(current_end) = current_sequence.checked_add(current_len) else {
-        return false;
-    };
-    let Some(candidate_end) = candidate_sequence.checked_add(candidate_len) else {
-        return false;
-    };
-    if candidate_end < current_end {
-        return false;
-    }
-    let overlap_start = current_sequence.max(candidate_sequence);
-    let overlap_end = current_end.min(candidate_end);
-    if overlap_start >= overlap_end {
-        return false;
-    }
-
-    (overlap_start..overlap_end).all(|sequence| {
-        let current_position = usize::try_from(sequence - current_sequence).ok();
-        let candidate_position = usize::try_from(sequence - candidate_sequence).ok();
-        current_position.zip(candidate_position).is_some_and(
-            |(current_position, candidate_position)| {
-                current_segments.get(current_position) == candidate_segments.get(candidate_position)
-            },
-        )
-    })
+    HlsTimeline::parse(current)
+        .zip(HlsTimeline::parse(candidate))
+        .is_some_and(|(current, candidate)| current.is_continuous_with(&candidate))
 }
 
 pub(crate) fn hls_manifest_reload_is_forward(current: &[u8], candidate: &[u8]) -> bool {
-    let Some(current_sequence) = hls_media_sequence(current) else {
-        return false;
-    };
-    let Some(candidate_sequence) = hls_media_sequence(candidate) else {
-        return false;
-    };
-    let Some(current_len) =
-        hls_segment_identities(current).and_then(|segments| u64::try_from(segments.len()).ok())
-    else {
-        return false;
-    };
-    let Some(candidate_len) =
-        hls_segment_identities(candidate).and_then(|segments| u64::try_from(segments.len()).ok())
-    else {
-        return false;
-    };
-    let Some(current_end) = current_sequence.checked_add(current_len) else {
-        return false;
-    };
-    let Some(candidate_end) = candidate_sequence.checked_add(candidate_len) else {
-        return false;
-    };
-
-    candidate_sequence >= current_end && candidate_end > current_end
+    HlsTimeline::parse(current)
+        .zip(HlsTimeline::parse(candidate))
+        .is_some_and(|(current, candidate)| current.is_forward_of(&candidate))
 }
 
 pub(crate) fn hls_live_tail(bytes: &[u8]) -> Option<(usize, f64)> {
-    let segments = hls_segment_identities(bytes)?;
-    if segments.is_empty() {
-        return None;
-    }
-
-    let start = segments.len().saturating_sub(HLS_LIVE_SYNC_SEGMENTS);
-    let mut duration = 0.0;
-    for segment in &segments[start..] {
-        let segment_duration = f64::from_bits(segment.duration_bits);
-        if !segment_duration.is_finite() || segment_duration <= 0.0 {
-            return None;
-        }
-        duration += segment_duration;
-    }
-    (duration.is_finite() && duration > 0.0).then_some((start, duration))
+    HlsTimeline::parse(bytes)?.live_tail()
 }
 
 pub(crate) fn extend_hls_sequence_zero_archive(
     current: &[u8],
     candidate: &[u8],
 ) -> Option<Vec<u8>> {
-    if hls_media_sequence(current) != Some(0)
-        || !hls_manifest_reload_is_continuous(current, candidate)
+    let current_timeline = HlsTimeline::parse(current)?;
+    let candidate_timeline = HlsTimeline::parse(candidate)?;
+    let adjacent = current_timeline.is_adjacent_to(&candidate_timeline);
+    if current_timeline.sequence != 0
+        || (!current_timeline.is_continuous_with(&candidate_timeline) && !adjacent)
         || !hls_has_at_most_one_endlist(current)
         || !hls_has_at_most_one_endlist(candidate)
     {
         return None;
     }
 
-    let candidate_sequence = hls_media_sequence(candidate)?;
+    let candidate_sequence = candidate_timeline.sequence;
+    let candidate_media_start = candidate_timeline.media_start;
     if candidate_sequence == 0 {
         return Some(candidate.to_vec());
     }
@@ -515,33 +318,34 @@ pub(crate) fn extend_hls_sequence_zero_archive(
         return None;
     }
 
-    let current_segments = hls_segment_identities(current)?;
-    let candidate_segments = hls_segment_identities(candidate)?;
+    let current_segments = current_timeline.segments;
+    let candidate_segments = candidate_timeline.segments;
     let current_len = u64::try_from(current_segments.len()).ok()?;
     let candidate_len = u64::try_from(candidate_segments.len()).ok()?;
     let current_end = current_len;
     let candidate_end = candidate_sequence.checked_add(candidate_len)?;
-    if candidate_sequence >= current_end || candidate_end <= current_end {
+    if candidate_sequence > current_end || candidate_end <= current_end {
         return None;
     }
 
-    let current_uri_ends = hls_segment_uri_line_ends(current)?;
-    let candidate_uri_ends = hls_segment_uri_line_ends(candidate)?;
-    if current_uri_ends.len() != current_segments.len()
-        || candidate_uri_ends.len() != candidate_segments.len()
-    {
-        return None;
-    }
+    let current_uri_ends = current_timeline.uri_ends;
+    let candidate_uri_ends = candidate_timeline.uri_ends;
 
-    let overlap_position = usize::try_from(
-        current_end
-            .checked_sub(1)?
-            .checked_sub(candidate_sequence)?,
-    )
-    .ok()?;
-    let appended_position = overlap_position.checked_add(1)?;
     let current_prefix_end = *current_uri_ends.last()?;
-    let candidate_suffix_start = *candidate_uri_ends.get(overlap_position)?;
+    let (candidate_suffix_start, appended_position) = if adjacent {
+        (candidate_media_start?, 0)
+    } else {
+        let overlap_position = usize::try_from(
+            current_end
+                .checked_sub(1)?
+                .checked_sub(candidate_sequence)?,
+        )
+        .ok()?;
+        (
+            *candidate_uri_ends.get(overlap_position)?,
+            overlap_position.checked_add(1)?,
+        )
+    };
     let candidate_suffix = candidate.get(candidate_suffix_start..)?;
 
     let mut merged = Vec::with_capacity(
@@ -574,9 +378,8 @@ pub(crate) fn extend_hls_sequence_zero_archive(
 
     let mut expected = current_segments;
     expected.extend_from_slice(candidate_segments.get(appended_position..)?);
-    (hls_media_sequence(&merged) == Some(0)
-        && hls_segment_identities(&merged).as_ref() == Some(&expected))
-    .then_some(merged)
+    let merged_timeline = HlsTimeline::parse(&merged)?;
+    (merged_timeline.sequence == 0 && merged_timeline.segments == expected).then_some(merged)
 }
 
 pub(crate) fn hls_target_duration(bytes: &[u8]) -> Option<u64> {
@@ -629,35 +432,40 @@ pub(crate) fn append_hls_sequence_zero_archive_suffix(
     current_source: &[u8],
     candidate: &[u8],
 ) -> Option<()> {
-    if !hls_manifest_reload_is_continuous(current_source, candidate)
+    let current_timeline = HlsTimeline::parse(current_source)?;
+    let candidate_timeline = HlsTimeline::parse(candidate)?;
+    let adjacent = candidate_timeline.sequence == *archive_segment_count;
+    if (!current_timeline.is_continuous_with(&candidate_timeline) && !adjacent)
         || !hls_append_only_tags_are_supported(candidate)
         || !hls_has_at_most_one_endlist(candidate)
     {
         return None;
     }
 
-    let candidate_sequence = hls_media_sequence(candidate)?;
-    let candidate_segments = hls_segment_identities(candidate)?;
+    let candidate_sequence = candidate_timeline.sequence;
+    let candidate_media_start = candidate_timeline.media_start;
+    let candidate_segments = candidate_timeline.segments;
     let candidate_len = u64::try_from(candidate_segments.len()).ok()?;
     let candidate_end = candidate_sequence.checked_add(candidate_len)?;
-    if candidate_sequence >= *archive_segment_count {
+    if candidate_sequence > *archive_segment_count {
         return None;
     }
     if candidate_end <= *archive_segment_count {
         return Some(());
     }
 
-    let uri_ends = hls_segment_uri_line_ends(candidate)?;
-    if uri_ends.len() != candidate_segments.len() {
-        return None;
-    }
-    let overlap_position = usize::try_from(
-        archive_segment_count
-            .checked_sub(1)?
-            .checked_sub(candidate_sequence)?,
-    )
-    .ok()?;
-    let suffix_start = *uri_ends.get(overlap_position)?;
+    let uri_ends = candidate_timeline.uri_ends;
+    let suffix_start = if adjacent {
+        candidate_media_start?
+    } else {
+        let overlap_position = usize::try_from(
+            archive_segment_count
+                .checked_sub(1)?
+                .checked_sub(candidate_sequence)?,
+        )
+        .ok()?;
+        *uri_ends.get(overlap_position)?
+    };
     let candidate_media_end = *uri_ends.last()?;
     let suffix = candidate.get(suffix_start..)?;
     let insert_newline = !archive.get(..*archive_media_end)?.ends_with(b"\n") && !suffix.is_empty();
@@ -733,32 +541,6 @@ fn hls_has_at_most_one_endlist(bytes: &[u8]) -> bool {
     })
 }
 
-fn hls_segment_uri_line_ends(bytes: &[u8]) -> Option<Vec<usize>> {
-    let text = std::str::from_utf8(bytes).ok()?;
-    let mut uri_ends = Vec::new();
-    let mut expects_media_uri = false;
-    let mut offset = 0usize;
-    for raw_line in text.split_inclusive('\n') {
-        let line = raw_line
-            .trim_end_matches('\n')
-            .trim_end_matches('\r')
-            .trim();
-        if line.starts_with("#EXTINF:") {
-            if expects_media_uri {
-                return None;
-            }
-            expects_media_uri = true;
-        } else if line.starts_with('#') || line.is_empty() {
-        } else if expects_media_uri {
-            swarm_bytes_reference(line)?;
-            uri_ends.push(offset.checked_add(raw_line.len())?);
-            expects_media_uri = false;
-        }
-        offset = offset.checked_add(raw_line.len())?;
-    }
-    (!expects_media_uri).then_some(uri_ends)
-}
-
 pub(crate) fn hls_media_sequence(bytes: &[u8]) -> Option<u64> {
     let text = std::str::from_utf8(bytes).ok()?;
     let mut values = text.lines().filter_map(|line| {
@@ -827,79 +609,180 @@ struct HlsSegmentIdentity {
     discontinuity_counter: u64,
 }
 
-fn hls_segment_identities(bytes: &[u8]) -> Option<Vec<HlsSegmentIdentity>> {
-    if !stream_feed_payload_len_is_supported(bytes.len()) || !is_hls_manifest(bytes) {
-        return None;
-    }
-    let text = std::str::from_utf8(bytes).ok()?;
+struct HlsTimeline {
+    sequence: u64,
+    segments: Vec<HlsSegmentIdentity>,
+    uri_ends: Vec<usize>,
+    media_start: Option<usize>,
+}
 
-    let mut segments = Vec::new();
-    let mut expects_media_uri = false;
-    let mut duration_bits = None::<u64>;
-    let mut byte_range = None::<(u64, Option<u64>)>;
-    let mut previous_range_end = None::<(String, u64)>;
-    let mut discontinuity_counter = 0_u64;
-    let mut saw_discontinuity_sequence = false;
-    for original_line in text.lines() {
-        let line = original_line.trim_end_matches('\r').trim();
-        if line.starts_with("#EXTINF:") {
-            if expects_media_uri {
-                return None;
-            }
-            let duration = line
-                .strip_prefix("#EXTINF:")?
-                .split(',')
-                .next()?
-                .trim()
-                .parse::<f64>()
-                .ok()
-                .filter(|duration| duration.is_finite() && *duration >= 0.0)?;
-            expects_media_uri = true;
-            duration_bits = Some(duration.to_bits());
-            byte_range = None;
-        } else if let Some(value) = line.strip_prefix("#EXT-X-DISCONTINUITY-SEQUENCE:") {
-            if saw_discontinuity_sequence || expects_media_uri || !segments.is_empty() {
-                return None;
-            }
-            discontinuity_counter = value.trim().parse().ok()?;
-            saw_discontinuity_sequence = true;
-        } else if line == "#EXT-X-DISCONTINUITY" {
-            discontinuity_counter = discontinuity_counter.checked_add(1)?;
-        } else if let Some(value) = line.strip_prefix("#EXT-X-BYTERANGE:") {
-            if !expects_media_uri || byte_range.is_some() || value.trim().is_empty() {
-                return None;
-            }
-            byte_range = Some(parse_hls_byte_range(value.trim())?);
-        } else if line.starts_with('#') || line.is_empty() {
-        } else if expects_media_uri {
-            let reference = swarm_bytes_reference(line)?.to_ascii_lowercase();
-            let effective_range = match byte_range.take() {
-                Some((length, Some(offset))) => Some((offset, length)),
-                Some((length, None)) => {
-                    let (previous_reference, offset) = previous_range_end.as_ref()?;
-                    if previous_reference != &reference {
-                        return None;
-                    }
-                    Some((*offset, length))
-                }
-                None => None,
-            };
-            previous_range_end = match effective_range {
-                Some((offset, length)) => Some((reference.clone(), offset.checked_add(length)?)),
-                None => None,
-            };
-            segments.push(HlsSegmentIdentity {
-                reference,
-                duration_bits: duration_bits.take()?,
-                byte_range: effective_range,
-                discontinuity_counter,
-            });
-            expects_media_uri = false;
-        } else {
+impl HlsTimeline {
+    fn parse(bytes: &[u8]) -> Option<Self> {
+        if !stream_feed_payload_len_is_supported(bytes.len()) || !is_hls_manifest(bytes) {
             return None;
         }
+        let text = std::str::from_utf8(bytes).ok()?;
+
+        let mut sequence = None;
+        let mut segments = Vec::new();
+        let mut uri_ends = Vec::new();
+        let mut expects_media_uri = false;
+        let mut duration_bits = None::<u64>;
+        let mut byte_range = None::<(u64, Option<u64>)>;
+        let mut media_start = None;
+        let mut previous_range_end = None::<(String, u64)>;
+        let mut discontinuity_counter = 0_u64;
+        let mut saw_discontinuity_sequence = false;
+        let mut offset = 0usize;
+        for original_line in text.split_inclusive('\n') {
+            let line = original_line.trim();
+            if let Some(value) = line.strip_prefix("#EXT-X-MEDIA-SEQUENCE:") {
+                if sequence.is_some() {
+                    return None;
+                }
+                sequence = Some(value.trim().parse().ok()?);
+            }
+            if line.starts_with("#EXTINF:") {
+                if expects_media_uri {
+                    return None;
+                }
+                let duration = line
+                    .strip_prefix("#EXTINF:")?
+                    .split(',')
+                    .next()?
+                    .trim()
+                    .parse::<f64>()
+                    .ok()
+                    .filter(|duration| duration.is_finite() && *duration >= 0.0)?;
+                expects_media_uri = true;
+                media_start.get_or_insert(offset);
+                duration_bits = Some(duration.to_bits());
+                byte_range = None;
+            } else if let Some(value) = line.strip_prefix("#EXT-X-DISCONTINUITY-SEQUENCE:") {
+                if saw_discontinuity_sequence || expects_media_uri || !segments.is_empty() {
+                    return None;
+                }
+                discontinuity_counter = value.trim().parse().ok()?;
+                saw_discontinuity_sequence = true;
+            } else if line == "#EXT-X-DISCONTINUITY" {
+                media_start.get_or_insert(offset);
+                discontinuity_counter = discontinuity_counter.checked_add(1)?;
+            } else if let Some(value) = line.strip_prefix("#EXT-X-BYTERANGE:") {
+                if !expects_media_uri || byte_range.is_some() || value.trim().is_empty() {
+                    return None;
+                }
+                byte_range = Some(parse_hls_byte_range(value.trim())?);
+            } else if hls_header_line(line) || line.starts_with('#') || line.is_empty() {
+            } else if expects_media_uri {
+                let reference = swarm_bytes_reference(line)?.to_ascii_lowercase();
+                let effective_range = match byte_range.take() {
+                    Some((length, Some(offset))) => Some((offset, length)),
+                    Some((length, None)) => {
+                        let (previous_reference, offset) = previous_range_end.as_ref()?;
+                        if previous_reference != &reference {
+                            return None;
+                        }
+                        Some((*offset, length))
+                    }
+                    None => None,
+                };
+                previous_range_end = match effective_range {
+                    Some((offset, length)) => {
+                        Some((reference.clone(), offset.checked_add(length)?))
+                    }
+                    None => None,
+                };
+                segments.push(HlsSegmentIdentity {
+                    reference,
+                    duration_bits: duration_bits.take()?,
+                    byte_range: effective_range,
+                    discontinuity_counter,
+                });
+                uri_ends.push(offset.checked_add(original_line.len())?);
+                expects_media_uri = false;
+            } else {
+                return None;
+            }
+            offset = offset.checked_add(original_line.len())?;
+        }
+        if expects_media_uri {
+            return None;
+        }
+        Some(Self {
+            sequence: sequence.unwrap_or(0),
+            segments,
+            uri_ends,
+            media_start,
+        })
     }
-    (!expects_media_uri).then_some(segments)
+
+    fn end(&self) -> Option<u64> {
+        self.sequence
+            .checked_add(u64::try_from(self.segments.len()).ok()?)
+    }
+
+    fn is_continuous_with(&self, candidate: &Self) -> bool {
+        if self.segments.is_empty() || candidate.segments.is_empty() {
+            return false;
+        }
+        let Some(current_end) = self.end() else {
+            return false;
+        };
+        let Some(candidate_end) = candidate.end() else {
+            return false;
+        };
+        if candidate_end < current_end {
+            return false;
+        }
+        let overlap_start = self.sequence.max(candidate.sequence);
+        let overlap_end = current_end.min(candidate_end);
+        overlap_start < overlap_end
+            && (overlap_start..overlap_end).all(|sequence| {
+                let current_position = usize::try_from(sequence - self.sequence).ok();
+                let candidate_position = usize::try_from(sequence - candidate.sequence).ok();
+                current_position.zip(candidate_position).is_some_and(
+                    |(current_position, candidate_position)| {
+                        self.segments.get(current_position)
+                            == candidate.segments.get(candidate_position)
+                    },
+                )
+            })
+    }
+
+    fn is_forward_of(&self, candidate: &Self) -> bool {
+        self.end()
+            .zip(candidate.end())
+            .is_some_and(|(current_end, candidate_end)| {
+                candidate.sequence >= current_end && candidate_end > current_end
+            })
+    }
+
+    fn is_adjacent_to(&self, candidate: &Self) -> bool {
+        self.end() == Some(candidate.sequence) && !candidate.segments.is_empty()
+    }
+
+    fn live_tail(&self) -> Option<(usize, f64)> {
+        if self.segments.is_empty() {
+            return None;
+        }
+        let start = self.segments.len().saturating_sub(HLS_LIVE_SYNC_SEGMENTS);
+        let duration = self.segments[start..]
+            .iter()
+            .try_fold(0.0, |duration, segment| {
+                let segment_duration = f64::from_bits(segment.duration_bits);
+                (segment_duration.is_finite() && segment_duration > 0.0)
+                    .then_some(duration + segment_duration)
+            })?;
+        (duration.is_finite() && duration > 0.0).then_some((start, duration))
+    }
+}
+
+fn hls_segment_identities(bytes: &[u8]) -> Option<Vec<HlsSegmentIdentity>> {
+    Some(HlsTimeline::parse(bytes)?.segments)
+}
+
+fn hls_segment_uri_line_ends(bytes: &[u8]) -> Option<Vec<usize>> {
+    Some(HlsTimeline::parse(bytes)?.uri_ends)
 }
 
 fn parse_hls_byte_range(value: &str) -> Option<(u64, Option<u64>)> {
@@ -1147,7 +1030,7 @@ fn rewrite_hls_codec_bootstrap(
         if !output.is_empty() {
             output.push('\n');
         }
-        if trimmed == HLS_HEADER {
+        if hls_header_line(line) {
             if header_seen {
                 return None;
             }
@@ -1286,7 +1169,7 @@ fn rewrite_hls_manifest_inner(
         wrote_line = true;
 
         let insert_start_after_line =
-            rewrote_playlist_type || (!rewrite_vod_as_event && line.trim() == HLS_HEADER);
+            rewrote_playlist_type || (!rewrite_vod_as_event && hls_header_line(line));
         if let Some(forced_start_tag) = forced_start_tag.as_deref()
             && insert_start_after_line
             && !has_start_tag
@@ -1625,40 +1508,10 @@ pub(crate) fn hls_live_frontier_is_ready(
     confirmed_head_index: Option<u64>,
     last_head_check_ms: f64,
     checked_after_ms: f64,
-    initial_check: Option<(u64, u64)>,
-    checking_token: u64,
 ) -> bool {
-    (confirmed_head_index == Some(snapshot_index)
+    confirmed_head_index == Some(snapshot_index)
         && last_head_check_ms.is_finite()
-        && last_head_check_ms > checked_after_ms)
-        || initial_check.is_some_and(|(token, initial_index)| {
-            checking_token != token && snapshot_index > initial_index
-        })
-}
-
-pub(crate) fn feed_followup_batch_limit(mode: FeedFollowupMode) -> usize {
-    match mode {
-        FeedFollowupMode::Canonical => FEED_FOLLOWUP_BATCH_LIMIT,
-        FeedFollowupMode::SequenceZeroPresentation => HLS_SEQUENCE_ZERO_PRESENTATION_BATCH_LIMIT,
-    }
-}
-
-pub(crate) fn feed_followup_max_parallel(mode: FeedFollowupMode) -> usize {
-    match mode {
-        FeedFollowupMode::Canonical => 1,
-        FeedFollowupMode::SequenceZeroPresentation => HLS_SEQUENCE_ZERO_FOLLOWUP_MAX_PARALLEL,
-    }
-}
-
-pub(crate) fn feed_followup_should_refresh_head(
-    mode: FeedFollowupMode,
-    successes: usize,
-    saw_tentative_endlist: bool,
-    recovered_missing_index: bool,
-) -> bool {
-    saw_tentative_endlist
-        || (mode == FeedFollowupMode::Canonical
-            && (successes >= FEED_FOLLOWUP_BATCH_LIMIT || recovered_missing_index))
+        && last_head_check_ms > checked_after_ms
 }
 
 const STORAGE_KEY: &str = "weeb3-hls-vod-index-hints-v2";
@@ -1852,14 +1705,19 @@ pub(crate) fn forget_vod_index(network_id: u64, owner: &str, normalized_topic: &
 }
 
 #[cfg(target_arch = "wasm32")]
+fn js_error_message(error: &wasm_bindgen::JsValue) -> String {
+    js_sys::Reflect::get(error, &wasm_bindgen::JsValue::from_str("message"))
+        .ok()
+        .and_then(|message| message.as_string())
+        .or_else(|| error.as_string())
+        .unwrap_or_else(|| "unknown browser error".to_string())
+}
+
+#[cfg(target_arch = "wasm32")]
 mod player {
     //! Rust owns HLS policy; `hls.js` supplies MSE playback through dynamic import.
 
-    use std::{
-        cell::{Cell, RefCell},
-        collections::HashMap,
-        time::Duration,
-    };
+    use std::{cell::RefCell, collections::HashMap, time::Duration};
 
     use async_std::task::sleep;
     use js_sys::{Array, Error, Function, Object, Promise, Reflect};
@@ -1869,6 +1727,7 @@ mod player {
 
     use super::{
         HLS_LIVE_SYNC_SEGMENTS, classify_hls_level_transition, hls_timeline_rebase_position,
+        js_error_message,
     };
 
     const SWARM_REQUEST_TIMEOUT_MS: f64 = 240_000.0;
@@ -1877,13 +1736,15 @@ mod player {
     const HLS_BEGINNING_AUTOPLAY_HEAD_START: Duration = Duration::from_millis(500);
     const HLS_WARMUP_STOP_DELAY: Duration = Duration::from_millis(500);
 
-    const HLS_ERROR_EVENT: &str = "hlsError";
-    const HLS_BUFFER_CREATED_EVENT: &str = "hlsBufferCreated";
-    const HLS_FRAGMENT_BUFFERED_EVENT: &str = "hlsFragBuffered";
-    const HLS_LEVEL_LOADED_EVENT: &str = "hlsLevelLoaded";
-    const HLS_MANIFEST_PARSED_EVENT: &str = "hlsManifestParsed";
-    const HLS_NETWORK_ERROR: &str = "networkError";
-    const HLS_MEDIA_ERROR: &str = "mediaError";
+    const HLS_CALLBACK_EVENTS: [&str; 5] = [
+        "hlsError",
+        "hlsBufferCreated",
+        "hlsFragBuffered",
+        "hlsLevelLoaded",
+        "hlsManifestParsed",
+    ];
+    const HLS_DOM_EVENTS: [&str; 3] = ["play", "pause", "resize"];
+    const NATIVE_DOM_EVENTS: [&str; 2] = ["error", "loadedmetadata"];
     pub(crate) const HLS_AUTOPLAY_AUTHORIZED_EVENT: &str = "weeb3-hls-autoplay-authorized";
     pub(crate) const HLS_EXPLICIT_PAUSE_EVENT: &str = "weeb3-hls-explicit-pause";
     pub(crate) const HLS_TIMELINE_REBASE_EVENT: &str = "weeb3-hls-timeline-rebase";
@@ -1931,86 +1792,131 @@ mod player {
     }
 
     thread_local! {
-        static NEXT_SESSION_ID: Cell<u64> = const { Cell::new(0) };
-        static ACTIVE_PLAYER_REQUEST: Cell<u64> = const { Cell::new(0) };
-        static CURRENT_SESSION: RefCell<Option<HlsSession>> = const { RefCell::new(None) };
+        static PLAYER: RefCell<Player> = const {
+            RefCell::new(Player { epoch: 0, session: None })
+        };
     }
 
-    enum PlayerMode {
+    enum Backend {
         Hls(Hls),
         Native,
     }
 
-    struct DomCallback {
-        event_name: &'static str,
-        callback: Closure<dyn FnMut(Event)>,
-    }
-
-    struct HlsCallback {
-        event_name: &'static str,
+    struct HlsListener {
+        registered: usize,
         callback: Closure<dyn FnMut(JsValue, JsValue)>,
     }
 
-    struct HlsSession {
-        id: u64,
-        media: HtmlMediaElement,
-        source: String,
-        mode: PlayerMode,
-        dom_callbacks: Vec<DomCallback>,
-        hls_callbacks: Vec<HlsCallback>,
-        autoplay_pending: bool,
-        autoplay_allowed: bool,
-        codec_bootstrap_pending: bool,
-        codec_bootstrap_required: bool,
-        hard_restart_attempts: u8,
-        initial_start_position: f64,
-        level_snapshots: HashMap<u64, (u64, bool, Option<f64>)>,
-        load_started: bool,
-        manifest_parsed: bool,
-        media_recovery_attempts: u8,
-        network_recovery_attempts: u8,
-        playback_authorized: bool,
-        recovery_pending: bool,
-        resume_authorized_playback: bool,
-        rebase_origin: Option<(f64, f64)>,
-        rebase_position: Option<f64>,
-        timeline_rebase_attempted: bool,
-        warmup_active: bool,
+    struct DomListener {
+        names: &'static [&'static str],
+        registered: usize,
+        callback: Closure<dyn FnMut(Event)>,
     }
 
-    impl HlsSession {
+    enum LoadPhase {
+        Cold,
+        Warmup,
+        Started,
+    }
+
+    struct Session {
+        media: HtmlMediaElement,
+        source: String,
+        backend: Backend,
+        hls_listener: Option<HlsListener>,
+        dom_listener: Option<DomListener>,
+        codec_required: bool,
+        codec_pending: bool,
+        load: LoadPhase,
+        manifest_parsed: bool,
+        playback_authorized: bool,
+        autoplay_allowed: bool,
+        autoplay_pending: bool,
+        resume: bool,
+        recovery_pending: bool,
+        hard_restarts: u8,
+        network_recoveries: u8,
+        media_recoveries: u8,
+        timeline_rebased: bool,
+        initial_position: f64,
+        rebase_position: Option<f64>,
+        level_snapshots: HashMap<u64, (u64, bool, Option<f64>)>,
+    }
+
+    struct Player {
+        epoch: u64,
+        session: Option<Session>,
+    }
+
+    struct Launch {
+        media: HtmlMediaElement,
+        source: String,
+        loader: Option<JsFuture>,
+        initial_position: f64,
+        rebase_position: Option<f64>,
+        hard_attempts: u8,
+        timeline_rebased: bool,
+        resume: bool,
+        autoplay_allowed: bool,
+    }
+
+    enum EventKind {
+        Hls(String, JsValue),
+        Dom(String),
+    }
+
+    enum Wait {
+        Microtask,
+        Millis(u64),
+    }
+
+    enum Recovery {
+        Network(u64),
+        Media(Hls),
+        Hard(Wait, HtmlMediaElement, String, u8, bool),
+        Stop(&'static str, JsValue),
+    }
+
+    enum Autoplay {
+        Policy,
+        Resume,
+    }
+
+    impl Session {
         fn hls(&self) -> Option<&Hls> {
-            match &self.mode {
-                PlayerMode::Hls(hls) => Some(hls),
-                PlayerMode::Native => None,
+            match &self.backend {
+                Backend::Hls(hls) => Some(hls),
+                Backend::Native => None,
             }
         }
 
         fn restart_position(&self) -> f64 {
-            if self.codec_bootstrap_pending {
+            if self.codec_pending {
                 return 0.0;
             }
-            if !self.playback_authorized {
-                return self.initial_start_position;
+            if let Some(position) = self.rebase_position {
+                return position;
             }
-            let current_position = self.media.current_time();
-            if current_position.is_finite() && current_position > 0.0 {
-                current_position
+            if !self.playback_authorized {
+                return self.initial_position;
+            }
+            let current = self.media.current_time();
+            if current.is_finite() && current > 0.0 {
+                current
             } else {
-                self.initial_start_position
+                self.initial_position
             }
         }
 
         fn dispose(mut self) {
-            quarantine_dom_callbacks(&self.media, &mut self.dom_callbacks);
-
-            match &self.mode {
-                PlayerMode::Hls(hls) => {
-                    // Player destruction cannot cancel requests already dispatched to Rust.
-                    destroy_hls_and_quarantine_callbacks(hls, &mut self.hls_callbacks);
+            if let Some(listener) = self.dom_listener.take() {
+                dispose_dom_listener(&self.media, listener);
+            }
+            match self.backend {
+                Backend::Hls(hls) => {
+                    dispose_hls_listener(&hls, self.hls_listener.take());
                 }
-                PlayerMode::Native => {
-                    // Clearing src stops future native requests, not dispatched Rust work.
+                Backend::Native => {
                     let _ = self.media.pause();
                     self.media.remove_attribute("src").ok();
                     self.media.load();
@@ -2019,63 +1925,36 @@ mod player {
         }
     }
 
-    fn next_session_id() -> u64 {
-        NEXT_SESSION_ID.with(|sequence| {
-            let mut next = sequence.get().wrapping_add(1);
-            if next == 0 {
-                next = 1;
-            }
-            sequence.set(next);
-            next
+    fn with_session<T>(epoch: u64, action: impl FnOnce(&mut Session) -> T) -> Option<T> {
+        PLAYER.with(|player| {
+            let mut player = player.try_borrow_mut().ok()?;
+            (player.epoch == epoch).then_some(())?;
+            Some(action(player.session.as_mut()?))
         })
     }
 
-    fn with_session_mut<T>(
-        session_id: u64,
-        action: impl FnOnce(&mut HlsSession) -> T,
-    ) -> Option<T> {
-        CURRENT_SESSION.with(|current| {
-            let Ok(mut current) = current.try_borrow_mut() else {
-                return None;
-            };
-            let session = current.as_mut()?;
-            if session.id != session_id {
-                return None;
-            }
-            Some(action(session))
-        })
-    }
-
-    fn session_is_current(session_id: u64) -> bool {
-        CURRENT_SESSION.with(|current| {
-            current
+    fn is_current(epoch: u64) -> bool {
+        PLAYER.with(|player| {
+            player
                 .try_borrow()
-                .ok()
-                .and_then(|current| current.as_ref().map(|session| session.id == session_id))
-                .unwrap_or(false)
+                .is_ok_and(|player| player.epoch == epoch)
         })
     }
 
-    fn dispose_current_session() {
-        if let Some(session) = CURRENT_SESSION.with(|current| current.borrow_mut().take()) {
+    fn next_epoch() -> u64 {
+        let (epoch, retired) = PLAYER.with(|player| {
+            let mut player = player.borrow_mut();
+            player.epoch = player.epoch.wrapping_add(1).max(1);
+            (player.epoch, player.session.take())
+        });
+        if let Some(session) = retired {
             session.dispose();
         }
-    }
-
-    fn begin_player_request() -> u64 {
-        let session_id = next_session_id();
-        ACTIVE_PLAYER_REQUEST.with(|active| active.set(session_id));
-        dispose_current_session();
-        session_id
-    }
-
-    fn player_request_is_current(session_id: u64) -> bool {
-        ACTIVE_PLAYER_REQUEST.with(|active| active.get() == session_id)
+        epoch
     }
 
     pub(crate) fn destroy_current_hls() {
-        ACTIVE_PLAYER_REQUEST.with(|active| active.set(next_session_id()));
-        dispose_current_session();
+        next_epoch();
     }
 
     pub(crate) async fn play_hls(
@@ -2094,52 +1973,46 @@ mod player {
                 "HLS playback requires a non-empty source",
             ));
         }
-        start_hls_request(
+        launch(Launch {
             media,
-            source.to_string(),
-            Some(hls_loader),
-            initial_start_position,
-            0,
-            false,
-            false,
-            true,
-            None,
-        )
+            source: source.to_string(),
+            loader: Some(hls_loader),
+            initial_position: initial_start_position,
+            rebase_position: None,
+            hard_attempts: 0,
+            timeline_rebased: false,
+            resume: false,
+            autoplay_allowed: true,
+        })
         .await
     }
 
-    async fn start_hls_request(
-        media: HtmlMediaElement,
-        source: String,
-        hls_loader: Option<JsFuture>,
-        initial_start_position: f64,
-        hard_restart_attempts: u8,
-        timeline_rebase_attempted: bool,
-        resume_authorized_playback: bool,
-        autoplay_allowed: bool,
-        rebase_origin: Option<(f64, f64)>,
-    ) -> Result<&'static str, JsValue> {
-        let resume_authorized_playback = resume_authorized_playback
-            || media
-                .get_attribute(HLS_PLAYBACK_AUTHORIZED_ATTRIBUTE)
-                .as_deref()
-                == Some("1");
-        let session_id = begin_player_request();
-        media.remove_attribute("data-weeb3-hls-mode").ok();
-        media.remove_attribute("data-weeb3-hls-state").ok();
-        media.remove_attribute(HLS_AUTOPLAY_PENDING_ATTRIBUTE).ok();
-        media
+    async fn launch(mut request: Launch) -> Result<&'static str, JsValue> {
+        request.resume |= request
+            .media
+            .get_attribute(HLS_PLAYBACK_AUTHORIZED_ATTRIBUTE)
+            .as_deref()
+            == Some("1");
+        let epoch = next_epoch();
+        request.media.remove_attribute("data-weeb3-hls-mode").ok();
+        request.media.remove_attribute("data-weeb3-hls-state").ok();
+        request
+            .media
+            .remove_attribute(HLS_AUTOPLAY_PENDING_ATTRIBUTE)
+            .ok();
+        request
+            .media
             .remove_attribute(HLS_PLAYBACK_AUTHORIZED_ATTRIBUTE)
             .ok();
 
-        let native_supported = supports_native_hls(&media);
-        let hls_class = match match hls_loader {
+        let native_supported = supports_native_hls(&request.media);
+        let hls_class = match match request.loader.take() {
             Some(loader) => loader.await,
             None => JsFuture::from(load_hls()).await,
         } {
             Ok(hls_class) => Some(hls_class),
             Err(error) => {
-                if !player_request_is_current(session_id) {
+                if !is_current(epoch) {
                     return Ok("superseded");
                 }
                 if !native_supported {
@@ -2148,7 +2021,7 @@ mod player {
                 None
             }
         };
-        if !player_request_is_current(session_id) {
+        if !is_current(epoch) {
             return Ok("superseded");
         }
 
@@ -2166,88 +2039,145 @@ mod player {
                     "HLS playback is not supported by this browser",
                 ));
             }
-            attach_native_hls(
-                media,
-                source,
-                session_id,
-                initial_start_position,
-                autoplay_allowed,
-                hard_restart_attempts,
-                timeline_rebase_attempted,
+            request
+                .media
+                .set_attribute("data-weeb3-hls-mode", "native")?;
+            let rebase = request.rebase_position.or_else(|| {
+                (request.initial_position.is_finite() && request.initial_position > 0.0)
+                    .then_some(request.initial_position)
+            });
+            let dom = install_dom_listener(&request.media, epoch, &NATIVE_DOM_EVENTS)?;
+            let media = request.media.clone();
+            let source = request.source.clone();
+            let resume = request.resume;
+            install_session(
+                epoch,
+                session_from(
+                    &request,
+                    Backend::Native,
+                    (None, Some(dom)),
+                    (false, false),
+                    LoadPhase::Started,
+                    true,
+                    false,
+                    rebase,
+                ),
             )?;
-            if resume_authorized_playback {
-                resume_authorized_hls_playback(session_id);
+            media.set_src(&source);
+            media.load();
+            autoplay(epoch, Autoplay::Policy);
+            if resume {
+                autoplay(epoch, Autoplay::Resume);
             }
             return Ok("native");
         }
 
-        media.set_attribute("data-weeb3-hls-mode", "hls.js")?;
-        media.set_attribute("data-weeb3-hls-state", "loading-manifest")?;
-        let codec_bootstrap_required = source.contains("&codec-bootstrap=");
-        let codec_bootstrap_pending = codec_bootstrap_required && initial_start_position == 0.0;
-        if codec_bootstrap_pending {
-            let _ = media.pause();
+        request
+            .media
+            .set_attribute("data-weeb3-hls-mode", "hls.js")?;
+        request
+            .media
+            .set_attribute("data-weeb3-hls-state", "loading-manifest")?;
+        let codec = (
+            request.source.contains("&codec-bootstrap="),
+            request.source.contains("&codec-bootstrap=") && request.initial_position == 0.0,
+        );
+        if codec.1 {
+            let _ = request.media.pause();
         }
-        let config = hls_config(!source.contains("start=live"));
+        let config = hls_config(!request.source.contains("start=live"));
         let hls = construct_hls(
             hls_class
                 .as_ref()
                 .expect("an MSE-capable load must retain the hls.js class"),
             &config,
         )?;
-        let mut hls_callbacks = register_hls_callbacks(&hls, session_id)?;
-        let dom_callbacks = match register_hls_dom_callbacks(&media, session_id) {
-            Ok(callbacks) => callbacks,
+        let hls_listener = install_hls_listener(&hls, epoch)?;
+        let dom_listener = match install_dom_listener(&request.media, epoch, &HLS_DOM_EVENTS) {
+            Ok(listener) => listener,
             Err(error) => {
-                destroy_hls_and_quarantine_callbacks(&hls, &mut hls_callbacks);
+                dispose_hls_listener(&hls, Some(hls_listener));
                 return Err(error);
             }
         };
-
-        CURRENT_SESSION.with(|current| {
-            *current.borrow_mut() = Some(HlsSession {
-                id: session_id,
-                media: media.clone(),
-                source: source.clone(),
-                mode: PlayerMode::Hls(hls),
-                dom_callbacks,
-                hls_callbacks,
-                autoplay_pending: false,
-                autoplay_allowed,
-                codec_bootstrap_pending,
-                codec_bootstrap_required,
-                hard_restart_attempts,
-                initial_start_position,
-                level_snapshots: HashMap::new(),
-                load_started: false,
-                manifest_parsed: false,
-                media_recovery_attempts: 0,
-                network_recovery_attempts: 0,
-                playback_authorized: false,
-                recovery_pending: false,
-                resume_authorized_playback,
-                rebase_origin,
-                rebase_position: None,
-                timeline_rebase_attempted,
-                warmup_active: false,
-            });
-        });
-
-        let attached = with_session_mut(session_id, |session| session.hls().cloned())
-            .flatten()
-            .ok_or_else(|| JsValue::from_str("HLS session was superseded"))
-            .and_then(|hls| {
-                hls.load_source(&source)?;
-                hls.attach_media(&media)
-            });
+        let media = request.media.clone();
+        let source = request.source.clone();
+        let rebase = request.rebase_position;
+        install_session(
+            epoch,
+            session_from(
+                &request,
+                Backend::Hls(hls.clone()),
+                (Some(hls_listener), Some(dom_listener)),
+                codec,
+                LoadPhase::Cold,
+                false,
+                request.resume,
+                rebase,
+            ),
+        )?;
+        let attached = hls
+            .load_source(&source)
+            .and_then(|_| hls.attach_media(&media));
         if let Err(error) = attached {
-            if session_is_current(session_id) {
+            if is_current(epoch) {
                 destroy_current_hls();
             }
             return Err(error);
         }
 
         Ok("hls.js")
+    }
+
+    fn session_from(
+        request: &Launch,
+        backend: Backend,
+        listeners: (Option<HlsListener>, Option<DomListener>),
+        codec: (bool, bool),
+        load: LoadPhase,
+        manifest_parsed: bool,
+        resume: bool,
+        rebase_position: Option<f64>,
+    ) -> Session {
+        Session {
+            media: request.media.clone(),
+            source: request.source.clone(),
+            backend,
+            hls_listener: listeners.0,
+            dom_listener: listeners.1,
+            codec_required: codec.0,
+            codec_pending: codec.1,
+            load,
+            manifest_parsed,
+            playback_authorized: false,
+            autoplay_allowed: request.autoplay_allowed,
+            autoplay_pending: false,
+            resume,
+            recovery_pending: false,
+            hard_restarts: request.hard_attempts,
+            network_recoveries: 0,
+            media_recoveries: 0,
+            timeline_rebased: request.timeline_rebased,
+            initial_position: request.initial_position,
+            rebase_position,
+            level_snapshots: HashMap::new(),
+        }
+    }
+
+    fn install_session(epoch: u64, session: Session) -> Result<(), JsValue> {
+        let mut session = Some(session);
+        PLAYER.with(|player| {
+            let mut player = player.borrow_mut();
+            if player.epoch == epoch {
+                player.session = session.take();
+            }
+        });
+        if let Some(session) = session {
+            session.dispose();
+            Err(JsValue::from_str("HLS session was superseded"))
+        } else {
+            Ok(())
+        }
     }
 
     fn hls_is_supported(hls_class: &JsValue) -> Result<bool, JsValue> {
@@ -2269,403 +2199,311 @@ mod player {
         Reflect::construct(constructor, &arguments).map(JsCast::unchecked_into)
     }
 
-    fn attach_native_hls(
-        media: HtmlMediaElement,
-        source: String,
-        session_id: u64,
-        initial_start_position: f64,
-        autoplay_allowed: bool,
-        hard_restart_attempts: u8,
-        timeline_rebase_attempted: bool,
-    ) -> Result<(), JsValue> {
-        media.set_attribute("data-weeb3-hls-mode", "native")?;
-        let mut dom_callbacks = Vec::with_capacity(1);
-        let callback = Closure::<dyn FnMut(Event)>::new(move |_| {
-            let Some((media, message)) = with_session_mut(session_id, |session| {
-                let message = session
-                    .media
-                    .error()
-                    .map(|error| error.message())
-                    .filter(|message| !message.is_empty())
-                    .unwrap_or_else(|| "native HLS media error".to_string());
-                (session.media.clone(), message)
-            }) else {
-                return;
-            };
-            report_playback_error(&media, &message, &JsValue::from_str(&message));
-        });
-        register_dom_callback(&media, "error", callback, &mut dom_callbacks)?;
-
-        CURRENT_SESSION.with(|current| {
-            *current.borrow_mut() = Some(HlsSession {
-                id: session_id,
-                media: media.clone(),
-                source: source.clone(),
-                mode: PlayerMode::Native,
-                dom_callbacks,
-                hls_callbacks: Vec::new(),
-                autoplay_pending: false,
-                autoplay_allowed,
-                codec_bootstrap_pending: false,
-                codec_bootstrap_required: false,
-                hard_restart_attempts,
-                initial_start_position,
-                level_snapshots: HashMap::new(),
-                load_started: true,
-                manifest_parsed: true,
-                media_recovery_attempts: 0,
-                network_recovery_attempts: 0,
-                playback_authorized: false,
-                recovery_pending: false,
-                resume_authorized_playback: false,
-                rebase_origin: None,
-                rebase_position: None,
-                timeline_rebase_attempted,
-                warmup_active: false,
-            });
-        });
-
-        media.set_src(&source);
-        media.load();
-        maybe_autoplay(session_id);
-        Ok(())
-    }
-
     fn supports_native_hls(media: &HtmlMediaElement) -> bool {
         ["application/vnd.apple.mpegurl", "application/x-mpegURL"]
             .iter()
             .any(|mime| matches!(media.can_play_type(mime).as_str(), "probably" | "maybe"))
     }
 
-    fn register_hls_callbacks(hls: &Hls, session_id: u64) -> Result<Vec<HlsCallback>, JsValue> {
-        let mut retained = Vec::with_capacity(5);
-
-        let error = Closure::<dyn FnMut(JsValue, JsValue)>::new(move |_, data| {
-            handle_hls_error(session_id, data);
-        });
-        register_hls_callback(hls, HLS_ERROR_EVENT, error, &mut retained)?;
-
-        let buffer_created = Closure::<dyn FnMut(JsValue, JsValue)>::new(move |_, data| {
-            let video_track =
-                js_property(&data, "tracks").and_then(|tracks| js_property(&tracks, "video"));
-            let Some(video_track) = video_track else {
-                return;
-            };
-            if let Some(resolution) = js_video_resolution(&video_track) {
-                super::set_hls_video_resolution(Some(resolution));
-            }
-            let seek = with_session_mut(session_id, |session| {
-                if !session.codec_bootstrap_pending {
-                    return None;
+    fn install_hls_listener(hls: &Hls, epoch: u64) -> Result<HlsListener, JsValue> {
+        let callback =
+            Closure::<dyn FnMut(JsValue, JsValue)>::new(move |event: JsValue, data: JsValue| {
+                if let Some(event) = event.as_string() {
+                    dispatch(epoch, EventKind::Hls(event, data));
                 }
-                let hls = session.hls().cloned()?;
-                let target = Reflect::get(hls.as_ref(), &JsValue::from_str("liveSyncPosition"))
-                    .ok()?
-                    .as_f64()
-                    .filter(|target| target.is_finite() && *target >= 0.0)?;
-                Some((session.media.clone(), session.source.clone(), target))
-            })
-            .flatten();
-            if let Some((media, source, target)) = seek {
-                super::runtime::finish_hls_codec_bootstrap(&source);
-                let clean_source = source
-                    .split("&codec-bootstrap=")
-                    .next()
-                    .unwrap_or(&source)
-                    .to_string();
-                media.set_current_time(target);
-                let ready = with_session_mut(session_id, |session| {
-                    if !session.codec_bootstrap_pending {
-                        return false;
-                    }
-                    session.source = clean_source;
-                    session.codec_bootstrap_pending = false;
-                    session.codec_bootstrap_required = false;
-                    session.initial_start_position = -1.0;
-                    true
-                })
-                .unwrap_or(false);
-                if ready {
-                    spawn_local(async move {
-                        let _ = JsFuture::from(Promise::resolve(&JsValue::UNDEFINED)).await;
-                        if session_is_current(session_id) {
-                            resume_authorized_hls_playback(session_id);
-                            maybe_autoplay(session_id);
-                        }
-                    });
-                }
-            }
-        });
-        register_hls_callback(hls, HLS_BUFFER_CREATED_EVENT, buffer_created, &mut retained)?;
-
-        let fragment_buffered = Closure::<dyn FnMut(JsValue, JsValue)>::new(move |_, _| {
-            let action = with_session_mut(session_id, |session| {
-                session.network_recovery_attempts = 0;
-                session.media_recovery_attempts = 0;
-                let stop_warmup = session.warmup_active
-                    && session.media.paused()
-                    && !session.codec_bootstrap_pending;
-                (session.media.clone(), stop_warmup)
             });
-            if let Some((media, stop_warmup)) = action {
-                media.set_attribute("data-weeb3-hls-state", "buffered").ok();
-                set_playback_status(&media, "HLS media buffered through weeb-3.", "buffered");
-                if stop_warmup {
-                    spawn_local(async move {
-                        sleep(HLS_WARMUP_STOP_DELAY).await;
-                        let warmup_hls = with_session_mut(session_id, |session| {
-                            if !session.warmup_active || !session.media.paused() {
-                                return None;
-                            }
-                            session.warmup_active = false;
-                            session.hls().cloned()
-                        })
-                        .flatten();
-                        if let Some(hls) = warmup_hls
-                            && let Err(error) = hls.stop_load()
-                        {
-                            stop_with_error(
-                                session_id,
-                                "Could not stop bounded HLS warm-up",
-                                error,
-                            );
-                        }
-                    });
-                }
+        let mut listener = HlsListener {
+            registered: 0,
+            callback,
+        };
+        for name in HLS_CALLBACK_EVENTS {
+            listener.registered += 1;
+            if let Err(error) = hls.on(name, listener.callback.as_ref().unchecked_ref()) {
+                dispose_hls_listener(hls, Some(listener));
+                return Err(error);
             }
-        });
-        register_hls_callback(
-            hls,
-            HLS_FRAGMENT_BUFFERED_EVENT,
-            fragment_buffered,
-            &mut retained,
-        )?;
-
-        let level_loaded = Closure::<dyn FnMut(JsValue, JsValue)>::new(move |_, data| {
-            handle_hls_level_loaded(session_id, &data);
-        });
-        register_hls_callback(hls, HLS_LEVEL_LOADED_EVENT, level_loaded, &mut retained)?;
-
-        let manifest_parsed = Closure::<dyn FnMut(JsValue, JsValue)>::new(move |_, _| {
-            let ready = with_session_mut(session_id, |session| {
-                session.manifest_parsed = true;
-                let resume_authorized = session.resume_authorized_playback;
-                let rebase_ready =
-                    session.rebase_origin.is_none() || session.rebase_position.is_some();
-                let startup_hls = if !session.load_started
-                    && rebase_ready
-                    && (resume_authorized || session.media.paused())
-                {
-                    let start_position = session
-                        .rebase_position
-                        .take()
-                        .unwrap_or(session.initial_start_position);
-                    session.load_started = true;
-                    session.warmup_active = true;
-                    session
-                        .hls()
-                        .cloned()
-                        .map(|hls| (hls, resume_authorized, start_position))
-                } else {
-                    None
-                };
-                let beginning_autoplay_head_start =
-                    startup_hls
-                        .as_ref()
-                        .is_some_and(|(_, resume_authorized, start_position)| {
-                            !resume_authorized
-                                && *start_position == 0.0
-                                && !session.source.contains("start=live")
-                        });
-                (
-                    session.media.clone(),
-                    startup_hls,
-                    beginning_autoplay_head_start,
-                )
-            });
-            if let Some((media, startup_hls, beginning_autoplay_head_start)) = ready {
-                media
-                    .set_attribute("data-weeb3-hls-state", "manifest-ready")
-                    .ok();
-                set_playback_status(
-                    &media,
-                    "HLS manifest ready through weeb-3. Press Play if autoplay is blocked.",
-                    "manifest-ready",
-                );
-                if let Some((hls, resume_authorized, start_position)) = startup_hls {
-                    dispatch_custom_event(&media, HLS_WARMUP_START_EVENT, &JsValue::UNDEFINED);
-                    if !session_is_current(session_id) {
-                        return;
-                    }
-                    if let Err(error) = hls.start_load_at(start_position) {
-                        schedule_hard_restart(session_id, error);
-                        return;
-                    }
-                    if resume_authorized {
-                        resume_authorized_hls_playback(session_id);
-                    }
-                }
-                if beginning_autoplay_head_start {
-                    spawn_local(async move {
-                        sleep(HLS_BEGINNING_AUTOPLAY_HEAD_START).await;
-                        if session_is_current(session_id) {
-                            maybe_autoplay(session_id);
-                        }
-                    });
-                } else {
-                    maybe_autoplay(session_id);
-                }
-            }
-        });
-        register_hls_callback(
-            hls,
-            HLS_MANIFEST_PARSED_EVENT,
-            manifest_parsed,
-            &mut retained,
-        )?;
-
-        Ok(retained)
+        }
+        Ok(listener)
     }
 
-    fn handle_hls_level_loaded(session_id: u64, data: &JsValue) {
-        let Some(level) = js_safe_u64_property(data, "level") else {
+    fn install_dom_listener(
+        media: &HtmlMediaElement,
+        epoch: u64,
+        names: &'static [&'static str],
+    ) -> Result<DomListener, JsValue> {
+        let callback = Closure::<dyn FnMut(Event)>::new(move |event: Event| {
+            dispatch(epoch, EventKind::Dom(event.type_()));
+        });
+        let mut listener = DomListener {
+            names,
+            registered: 0,
+            callback,
+        };
+        for name in listener.names {
+            listener.registered += 1;
+            if let Err(error) = media
+                .add_event_listener_with_callback(name, listener.callback.as_ref().unchecked_ref())
+            {
+                dispose_dom_listener(media, listener);
+                return Err(error);
+            }
+        }
+        Ok(listener)
+    }
+
+    fn dispose_hls_listener(hls: &Hls, listener: Option<HlsListener>) {
+        let Some(listener) = listener else {
+            let _ = hls.destroy();
             return;
         };
+        let mut detached = true;
+        for name in HLS_CALLBACK_EVENTS.iter().take(listener.registered) {
+            detached &= hls
+                .off(name, listener.callback.as_ref().unchecked_ref())
+                .is_ok();
+        }
+        let destroyed = hls.destroy().is_ok();
+        if !detached && !destroyed {
+            std::mem::forget(listener);
+        }
+    }
+
+    fn dispose_dom_listener(media: &HtmlMediaElement, listener: DomListener) {
+        let mut detached = true;
+        for name in listener.names.iter().take(listener.registered) {
+            detached &= media
+                .remove_event_listener_with_callback(
+                    name,
+                    listener.callback.as_ref().unchecked_ref(),
+                )
+                .is_ok();
+        }
+        if !detached {
+            std::mem::forget(listener);
+        }
+    }
+    fn dispatch(epoch: u64, event: EventKind) {
+        match event {
+            EventKind::Hls(name, data) => match name.as_str() {
+                "hlsError" => handle_error(epoch, data),
+                "hlsBufferCreated" => buffer_created(epoch, &data),
+                "hlsFragBuffered" => fragment_buffered(epoch),
+                "hlsLevelLoaded" => level_loaded(epoch, &data),
+                "hlsManifestParsed" => manifest_parsed(epoch),
+                _ => {}
+            },
+            EventKind::Dom(name) => dom_event(epoch, &name),
+        }
+    }
+
+    fn buffer_created(epoch: u64, data: &JsValue) {
+        let Some(track) =
+            js_property(data, "tracks").and_then(|tracks| js_property(&tracks, "video"))
+        else {
+            return;
+        };
+        if let Some(resolution) = js_video_resolution(&track) {
+            super::set_hls_video_resolution(Some(resolution));
+        }
+        let bootstrap = with_session(epoch, |session| {
+            session.codec_pending.then(|| {
+                session
+                    .hls()
+                    .cloned()
+                    .map(|hls| (session.media.clone(), session.source.clone(), hls))
+            })
+        })
+        .flatten()
+        .flatten();
+        let Some((media, source, hls)) = bootstrap else {
+            return;
+        };
+        let target = Reflect::get(hls.as_ref(), &JsValue::from_str("liveSyncPosition"))
+            .ok()
+            .and_then(|value| value.as_f64())
+            .filter(|target| target.is_finite() && *target >= 0.0);
+        let Some(target) = target else { return };
+        if !is_current(epoch) {
+            return;
+        }
+        super::runtime::finish_hls_codec_bootstrap(&source);
+        let clean = source
+            .split("&codec-bootstrap=")
+            .next()
+            .unwrap_or(&source)
+            .to_string();
+        media.set_current_time(target);
+        let ready = with_session(epoch, |session| {
+            if !session.codec_pending {
+                return false;
+            }
+            session.source = clean;
+            session.codec_required = false;
+            session.codec_pending = false;
+            session.initial_position = -1.0;
+            true
+        })
+        .unwrap_or(false);
+        if ready {
+            spawn_local(async move {
+                Wait::Microtask.wait().await;
+                if is_current(epoch) {
+                    autoplay(epoch, Autoplay::Resume);
+                    autoplay(epoch, Autoplay::Policy);
+                }
+            });
+        }
+    }
+
+    fn fragment_buffered(epoch: u64) {
+        let action = with_session(epoch, |session| {
+            session.network_recoveries = 0;
+            session.media_recoveries = 0;
+            let stop = matches!(session.load, LoadPhase::Warmup)
+                && session.media.paused()
+                && !session.codec_pending;
+            (session.media.clone(), stop)
+        });
+        let Some((media, stop)) = action else {
+            return;
+        };
+        set_state(&media, "buffered", "HLS media buffered through weeb-3.");
+        if stop {
+            spawn_local(async move {
+                sleep(HLS_WARMUP_STOP_DELAY).await;
+                let hls = with_session(epoch, |session| {
+                    if !matches!(session.load, LoadPhase::Warmup) || !session.media.paused() {
+                        return None;
+                    }
+                    session.load = LoadPhase::Started;
+                    session.hls().cloned()
+                })
+                .flatten();
+                if let Some(hls) = hls
+                    && let Err(error) = hls.stop_load()
+                {
+                    run_recovery(
+                        epoch,
+                        Recovery::Stop("Could not stop bounded HLS warm-up", error),
+                    );
+                }
+            });
+        }
+    }
+
+    fn manifest_parsed(epoch: u64) {
+        let action = with_session(epoch, |session| {
+            session.manifest_parsed = true;
+            let resume = session.resume;
+            let start = matches!(session.load, LoadPhase::Cold)
+                && (session.rebase_position.is_some() || resume || session.media.paused());
+            let position = session.rebase_position.unwrap_or(session.initial_position);
+            let load = start.then(|| {
+                session.load = LoadPhase::Warmup;
+                session.hls().cloned().map(|hls| (hls, resume, position))
+            });
+            let head_start =
+                start && !resume && position == 0.0 && !session.source.contains("start=live");
+            (session.media.clone(), load.flatten(), head_start)
+        });
+        let Some((media, load, head_start)) = action else {
+            return;
+        };
+        set_state(
+            &media,
+            "manifest-ready",
+            "HLS manifest ready through weeb-3. Press Play if autoplay is blocked.",
+        );
+        if let Some((hls, resume, position)) = load {
+            emit(&media, HLS_WARMUP_START_EVENT);
+            if !is_current(epoch) || !start_at(epoch, &hls, position) {
+                return;
+            }
+            if resume {
+                autoplay(epoch, Autoplay::Resume);
+            }
+        }
+        if head_start {
+            spawn_local(async move {
+                sleep(HLS_BEGINNING_AUTOPLAY_HEAD_START).await;
+                if is_current(epoch) {
+                    autoplay(epoch, Autoplay::Policy);
+                }
+            });
+        } else {
+            autoplay(epoch, Autoplay::Policy);
+        }
+    }
+
+    fn level_loaded(epoch: u64, data: &JsValue) {
         let Some(details) = js_property(data, "details") else {
             return;
         };
-        let Some(start_sequence) = js_safe_u64_property(&details, "startSN") else {
-            return;
-        };
-        let Some(live) = js_bool_property(&details, "live") else {
+        let (Some(level), Some(start), Some(live)) = (
+            js_safe_u64_property(data, "level"),
+            js_safe_u64_property(&details, "startSN"),
+            js_bool_property(&details, "live"),
+        ) else {
             return;
         };
         let edge = js_property(&details, "edge")
             .and_then(|value| value.as_f64())
             .filter(|value| value.is_finite() && *value >= 0.0);
-
-        let rebase_start = with_session_mut(session_id, |session| {
-            if session.rebase_position.is_none()
-                && let Some((previous_edge, current_time)) = session.rebase_origin
-                && let Some(edge) = edge
-                && let Some(position) =
-                    hls_timeline_rebase_position(previous_edge, current_time, edge)
+        let action = with_session(epoch, |session| {
+            let previous = session.level_snapshots.insert(level, (start, live, edge));
+            if !classify_hls_level_transition(
+                previous.map(|(start, live, _)| (start, live)),
+                session.timeline_rebased,
+                start,
+            )
+            .rebase
             {
-                session.rebase_origin = None;
-                session.rebase_position = Some(position);
-            }
-            if !session.manifest_parsed || session.load_started {
                 return None;
             }
-            let position = session.rebase_position.take()?;
-            session.load_started = true;
-            session.warmup_active = true;
-            session.hls().cloned().map(|hls| {
-                (
-                    session.media.clone(),
-                    hls,
-                    session.resume_authorized_playback,
-                    position,
-                )
-            })
-        })
-        .flatten();
-
-        let outcome = with_session_mut(session_id, |session| {
-            let previous = session
-                .level_snapshots
-                .insert(level, (start_sequence, live, edge));
-            let transition = classify_hls_level_transition(
-                previous.map(|(start_sequence, live, _)| (start_sequence, live)),
-                session.timeline_rebase_attempted,
-                start_sequence,
-            );
-
-            if !transition.rebase {
-                return None;
-            }
-
-            session.timeline_rebase_attempted = true;
+            session.timeline_rebased = true;
             session.recovery_pending = true;
-            let rebase_origin = previous
+            let rebase = previous
                 .and_then(|(_, _, edge)| edge)
-                .map(|edge| (edge, session.media.current_time()));
+                .zip(edge)
+                .and_then(|(old, new)| {
+                    hls_timeline_rebase_position(old, session.media.current_time(), new)
+                });
             Some((
                 session.media.clone(),
-                session.source.clone(),
-                session.hard_restart_attempts,
-                session.initial_start_position,
-                session.playback_authorized,
-                session.autoplay_allowed,
+                Launch {
+                    media: session.media.clone(),
+                    source: session.source.clone(),
+                    loader: None,
+                    initial_position: session.initial_position,
+                    rebase_position: rebase,
+                    hard_attempts: session.hard_restarts,
+                    timeline_rebased: true,
+                    resume: session.playback_authorized,
+                    autoplay_allowed: session.autoplay_allowed,
+                },
                 session.hls().cloned(),
-                rebase_origin,
             ))
-        });
-        if let Some((media, hls, resume_authorized, position)) = rebase_start {
-            dispatch_custom_event(&media, HLS_WARMUP_START_EVENT, &JsValue::UNDEFINED);
-            if !session_is_current(session_id) {
-                return;
-            }
-            if let Err(error) = hls.start_load_at(position) {
-                schedule_hard_restart(session_id, error);
-                return;
-            }
-            if resume_authorized {
-                resume_authorized_hls_playback(session_id);
-            }
-            maybe_autoplay(session_id);
-        }
-        let Some(restart) = outcome else {
+        })
+        .flatten();
+        let Some((media, request, retiring)) = action else {
             return;
         };
-        let Some((
-            media,
-            source,
-            hard_restart_attempts,
-            initial_start_position,
-            resume_authorized,
-            autoplay_allowed,
-            retiring_hls,
-            rebase_origin,
-        )) = restart
-        else {
-            return;
-        };
-
-        media
-            .set_attribute("data-weeb3-hls-state", "rebasing-timeline")
-            .ok();
-        set_playback_status(
+        set_state(
             &media,
-            "Complete HLS archive found; rebuilding its finalized timeline.",
             "rebasing-timeline",
+            "Complete HLS archive found; rebuilding its finalized timeline.",
         );
-        dispatch_custom_event(&media, HLS_TIMELINE_REBASE_EVENT, &JsValue::UNDEFINED);
-        // Stop admission before the retiring LEVEL_LOADED callback can dispatch again.
-        if let Some(hls) = retiring_hls {
+        emit(&media, HLS_TIMELINE_REBASE_EVENT);
+        if let Some(hls) = retiring {
             let _ = hls.stop_load();
         }
-
-        // Defer destruction until its callback returns; dispatched Rust work still settles.
         spawn_local(async move {
-            let _ = JsFuture::from(Promise::resolve(&JsValue::UNDEFINED)).await;
-            if !session_is_current(session_id) {
+            Wait::Microtask.wait().await;
+            if !is_current(epoch) {
                 return;
             }
-            if let Err(error) = start_hls_request(
-                media.clone(),
-                source,
-                None,
-                initial_start_position,
-                hard_restart_attempts,
-                true,
-                resume_authorized,
-                autoplay_allowed,
-                rebase_origin,
-            )
-            .await
-            {
-                report_playback_error(
+            if let Err(error) = launch(request).await {
+                playback_error(
                     &media,
                     &format!(
                         "Could not rebuild the finalized HLS timeline: {}",
@@ -2677,257 +2515,166 @@ mod player {
         });
     }
 
-    fn register_hls_callback(
-        hls: &Hls,
-        event_name: &'static str,
-        callback: Closure<dyn FnMut(JsValue, JsValue)>,
-        retained: &mut Vec<HlsCallback>,
-    ) -> Result<(), JsValue> {
-        if let Err(error) = hls.on(event_name, callback.as_ref().unchecked_ref::<Function>()) {
-            retained.push(HlsCallback {
-                event_name,
-                callback,
-            });
-            destroy_hls_and_quarantine_callbacks(hls, retained);
-            return Err(error);
-        }
-        retained.push(HlsCallback {
-            event_name,
-            callback,
-        });
-        Ok(())
-    }
-
-    fn destroy_hls_and_quarantine_callbacks(hls: &Hls, retained: &mut Vec<HlsCallback>) {
-        let mut callbacks_detached = true;
-        for registered in retained.iter() {
-            callbacks_detached &= hls
-                .off(
-                    registered.event_name,
-                    registered.callback.as_ref().unchecked_ref(),
-                )
-                .is_ok();
-        }
-        let destroyed = hls.destroy().is_ok();
-        if !callbacks_detached && !destroyed {
-            // JS may still retain these wasm closures after a failed destroy.
-            std::mem::forget(std::mem::take(retained));
-        } else {
-            retained.clear();
-        }
-    }
-
-    fn register_dom_callback(
-        media: &HtmlMediaElement,
-        event_name: &'static str,
-        callback: Closure<dyn FnMut(Event)>,
-        retained: &mut Vec<DomCallback>,
-    ) -> Result<(), JsValue> {
-        let result =
-            media.add_event_listener_with_callback(event_name, callback.as_ref().unchecked_ref());
-        retained.push(DomCallback {
-            event_name,
-            callback,
-        });
-        if let Err(error) = result {
-            quarantine_dom_callbacks(media, retained);
-            return Err(error);
-        }
-        Ok(())
-    }
-
-    fn quarantine_dom_callbacks(media: &HtmlMediaElement, retained: &mut Vec<DomCallback>) {
-        let mut quarantined = Vec::new();
-        for registered in std::mem::take(retained) {
-            if media
-                .remove_event_listener_with_callback(
-                    registered.event_name,
-                    registered.callback.as_ref().unchecked_ref(),
-                )
-                .is_err()
-            {
-                quarantined.push(registered);
-            }
-        }
-        if !quarantined.is_empty() {
-            // Preserve closures for listeners the DOM refused to remove.
-            std::mem::forget(quarantined);
-        }
-    }
-
-    fn register_hls_dom_callbacks(
-        media: &HtmlMediaElement,
-        session_id: u64,
-    ) -> Result<Vec<DomCallback>, JsValue> {
-        let mut retained = Vec::with_capacity(3);
-        let play = Closure::<dyn FnMut(Event)>::new(move |_| {
-            let action = with_session_mut(session_id, |session| {
-                let autoplay_pending = session.autoplay_pending;
-                let first_load = !session.load_started;
-                let resume_load = !first_load && !session.warmup_active;
-                let initial_start_position = session.initial_start_position;
-                session.load_started = true;
-                if !autoplay_pending {
-                    session.playback_authorized = true;
-                    session.autoplay_allowed = true;
-                    session.warmup_active = false;
-                }
-                (
-                    session.hls().cloned(),
-                    first_load,
-                    resume_load,
-                    initial_start_position,
-                    autoplay_pending,
-                    session.media.clone(),
-                )
-            });
-            if let Some((
-                hls,
-                first_load,
-                resume_load,
-                initial_start_position,
-                autoplay_pending,
-                media,
-            )) = action
-            {
-                if !autoplay_pending {
+    fn dom_event(epoch: u64, name: &str) {
+        match name {
+            "play" => {
+                let action = with_session(epoch, |session| {
+                    let pending = session.autoplay_pending;
+                    let first = matches!(session.load, LoadPhase::Cold);
+                    let resume = !first && !matches!(session.load, LoadPhase::Warmup);
+                    let position = session.rebase_position.unwrap_or(session.initial_position);
+                    if !pending || first {
+                        session.load = LoadPhase::Started;
+                    }
+                    if !pending {
+                        session.playback_authorized = true;
+                        session.autoplay_allowed = true;
+                    }
+                    let load = session.hls().cloned().and_then(|hls| {
+                        (first || resume).then_some((hls, first.then_some(position)))
+                    });
+                    (session.media.clone(), load, !pending)
+                });
+                let Some((media, load, user)) = action else {
+                    return;
+                };
+                if user {
                     media
                         .set_attribute(HLS_PLAYBACK_AUTHORIZED_ATTRIBUTE, "1")
                         .ok();
-                    dispatch_custom_event(
-                        &media,
-                        HLS_AUTOPLAY_AUTHORIZED_EVENT,
-                        &JsValue::UNDEFINED,
-                    );
+                    emit(&media, HLS_AUTOPLAY_AUTHORIZED_EVENT);
                 }
                 media
                     .set_attribute("data-weeb3-hls-state", "loading-media")
                     .ok();
-                if let Some(hls) = hls {
-                    let result = if first_load {
-                        Some(hls.start_load_at(initial_start_position))
-                    } else if resume_load {
-                        Some(hls.start_load())
-                    } else {
-                        None
-                    };
-                    if let Some(Err(error)) = result {
-                        schedule_hard_restart(session_id, error);
+                if let Some((hls, position)) = load {
+                    match position {
+                        Some(position) => {
+                            start_at(epoch, &hls, position);
+                        }
+                        None => {
+                            if let Err(error) = hls.start_load() {
+                                hard_recovery(epoch, error);
+                            }
+                        }
                     }
                 }
             }
-        });
-        register_dom_callback(media, "play", play, &mut retained)?;
-
-        let pause = Closure::<dyn FnMut(Event)>::new(move |_| {
-            let action = with_session_mut(session_id, |session| {
-                // Chrome may emit play/pause before rejecting autoplay.
-                if !session.playback_authorized {
-                    return None;
-                }
-                session.playback_authorized = false;
-                session.autoplay_allowed = false;
-                session.resume_authorized_playback = false;
-                session.warmup_active = false;
-                Some((session.hls().cloned(), session.media.clone()))
-            })
-            .flatten();
-            if let Some((hls, media)) = action {
+            "pause" => {
+                let action = with_session(epoch, |session| {
+                    if !session.playback_authorized {
+                        return None;
+                    }
+                    session.playback_authorized = false;
+                    session.autoplay_allowed = false;
+                    session.resume = false;
+                    session.load = LoadPhase::Started;
+                    Some((session.media.clone(), session.hls().cloned()))
+                })
+                .flatten();
+                let Some((media, hls)) = action else { return };
                 media
                     .remove_attribute(HLS_PLAYBACK_AUTHORIZED_ATTRIBUTE)
                     .ok();
-                dispatch_custom_event(&media, HLS_EXPLICIT_PAUSE_EVENT, &JsValue::UNDEFINED);
+                emit(&media, HLS_EXPLICIT_PAUSE_EVENT);
                 if let Some(hls) = hls
                     && let Err(error) = hls.stop_load()
                 {
-                    stop_with_error(session_id, "Could not pause HLS loading", error);
+                    run_recovery(epoch, Recovery::Stop("Could not pause HLS loading", error));
                 }
             }
-        });
-        register_dom_callback(media, "pause", pause, &mut retained)?;
-
-        let resize = Closure::<dyn FnMut(Event)>::new(move |_| {
-            let resolution = with_session_mut(session_id, |session| {
-                js_video_resolution(session.media.as_ref())
-            })
-            .flatten();
-            if let Some(resolution) = resolution {
-                super::set_hls_video_resolution(Some(resolution));
+            "resize" => {
+                let media = with_session(epoch, |session| session.media.clone());
+                if let Some(resolution) =
+                    media.and_then(|media| js_video_resolution(media.as_ref()))
+                {
+                    super::set_hls_video_resolution(Some(resolution));
+                }
             }
-        });
-        register_dom_callback(media, "resize", resize, &mut retained)?;
-
-        Ok(retained)
+            "error" => {
+                let Some(media) = with_session(epoch, |session| session.media.clone()) else {
+                    return;
+                };
+                let message = media
+                    .error()
+                    .map(|error| error.message())
+                    .filter(|message| !message.is_empty())
+                    .unwrap_or_else(|| "native HLS media error".to_string());
+                playback_error(&media, &message, &JsValue::from_str(&message));
+            }
+            "loadedmetadata" => {
+                let seek = with_session(epoch, |session| {
+                    (session.media.clone(), session.rebase_position.take())
+                });
+                if let Some((media, Some(position))) = seek {
+                    media.set_current_time(position);
+                }
+            }
+            _ => {}
+        }
     }
 
-    fn handle_hls_error(session_id: u64, data: JsValue) {
-        let codec_bootstrap = js_string_property(&data, "type").as_deref() == Some(HLS_MEDIA_ERROR)
+    fn handle_error(epoch: u64, data: JsValue) {
+        let codec_bootstrap = js_string_property(&data, "type").as_deref() == Some("mediaError")
             && js_string_property(&data, "details").as_deref() == Some("bufferAppendError")
             && js_string_property(&data, "sourceBufferName").as_deref() == Some("video")
             && js_property(&data, "error")
                 .is_some_and(|error| js_error_message(&error).contains("video SourceBuffer"))
-            && with_session_mut(session_id, |session| {
-                if session.codec_bootstrap_pending
+            && with_session(epoch, |session| {
+                if session.codec_pending
                     || !session.source.contains("start=live")
-                    || session.hard_restart_attempts >= MAX_HARD_RESTART_ATTEMPTS
+                    || session.hard_restarts >= MAX_HARD_RESTART_ATTEMPTS
                 {
                     return false;
                 }
-                session.codec_bootstrap_pending = true;
-                session.codec_bootstrap_required = true;
-                session.initial_start_position = 0.0;
+                session.codec_required = true;
+                session.codec_pending = true;
+                session.initial_position = 0.0;
                 true
             })
             .unwrap_or(false);
         if codec_bootstrap {
-            schedule_hard_restart(session_id, data);
+            hard_recovery(epoch, data);
             return;
         }
-
-        let fatal = js_bool_property(&data, "fatal").unwrap_or(false);
-        if !fatal {
-            let Some(media) = with_session_mut(session_id, |session| session.media.clone()) else {
-                return;
-            };
-            let diagnostic = playback_diagnostic(&media, &data);
-            web_sys::console::warn_2(
-                &JsValue::from_str("weeb-3 HLS non-fatal event"),
-                diagnostic.as_ref(),
-            );
+        if !js_bool_property(&data, "fatal").unwrap_or(false) {
+            if let Some(media) = with_session(epoch, |session| session.media.clone()) {
+                web_sys::console::warn_2(
+                    &JsValue::from_str("weeb-3 HLS non-fatal event"),
+                    playback_diagnostic(&media, &data).as_ref(),
+                );
+            }
             return;
         }
-
         match js_string_property(&data, "type").as_deref() {
-            Some(HLS_NETWORK_ERROR) => {
-                let manifest_parsed =
-                    with_session_mut(session_id, |session| session.manifest_parsed)
-                        .unwrap_or(false);
-                if !manifest_parsed {
-                    schedule_hard_restart(session_id, data);
+            Some("networkError") => {
+                let parsed =
+                    with_session(epoch, |session| session.manifest_parsed).unwrap_or(false);
+                if !parsed {
+                    hard_recovery(epoch, data);
                     return;
                 }
-
-                let next_attempt = with_session_mut(session_id, |session| {
-                    if session.network_recovery_attempts >= MAX_NETWORK_RECOVERY_ATTEMPTS {
+                let attempt = with_session(epoch, |session| {
+                    if session.network_recoveries >= MAX_NETWORK_RECOVERY_ATTEMPTS {
                         return None;
                     }
-                    let attempt = session.network_recovery_attempts;
-                    session.network_recovery_attempts =
-                        session.network_recovery_attempts.saturating_add(1);
+                    let attempt = session.network_recoveries;
+                    session.network_recoveries = session.network_recoveries.saturating_add(1);
                     Some(attempt)
                 })
                 .flatten();
-                let Some(attempt) = next_attempt else {
-                    stop_with_error(session_id, "HLS network recovery limit reached", data);
-                    return;
+                let recovery = match attempt {
+                    Some(attempt) => Recovery::Network(
+                        (1_000_u64.saturating_mul(1_u64 << u32::from(attempt))).min(30_000),
+                    ),
+                    None => Recovery::Stop("HLS network recovery limit reached", data),
                 };
-                let delay = 1_000_u64.saturating_mul(1_u64 << u32::from(attempt));
-                schedule_network_recovery(session_id, delay.min(30_000));
+                run_recovery(epoch, recovery);
             }
-            Some(HLS_MEDIA_ERROR) => {
-                let recovery = with_session_mut(session_id, |session| {
-                    if session.media_recovery_attempts == 0 {
-                        session.media_recovery_attempts = 1;
+            Some("mediaError") => {
+                let recovery = with_session(epoch, |session| {
+                    if session.media_recoveries == 0 {
+                        session.media_recoveries = 1;
                         session.hls().cloned()
                     } else {
                         None
@@ -2935,128 +2682,141 @@ mod player {
                 })
                 .flatten();
                 if let Some(hls) = recovery {
-                    spawn_local(async move {
-                        let _ = JsFuture::from(Promise::resolve(&JsValue::UNDEFINED)).await;
-                        if !session_is_current(session_id) {
-                            return;
-                        }
-                        if let Err(error) = hls.recover_media_error() {
-                            schedule_hard_restart(session_id, error);
-                        }
-                    });
+                    run_recovery(epoch, Recovery::Media(hls));
                 } else {
-                    schedule_hard_restart(session_id, data);
+                    hard_recovery(epoch, data);
                 }
             }
-            _ => schedule_hard_restart(session_id, data),
+            _ => hard_recovery(epoch, data),
         }
     }
 
-    fn schedule_network_recovery(session_id: u64, delay_ms: u64) {
-        let scheduled = with_session_mut(session_id, |session| {
-            if session.recovery_pending {
-                return false;
-            }
-            session.recovery_pending = true;
-            true
-        })
-        .unwrap_or(false);
-        if !scheduled {
-            return;
-        }
-
-        spawn_local(async move {
-            sleep(Duration::from_millis(delay_ms)).await;
-            let recovery = with_session_mut(session_id, |session| {
-                session.recovery_pending = false;
-                if session.warmup_active || !session.media.paused() {
-                    let restart_position = session.restart_position();
-                    return session.hls().cloned().map(|hls| (hls, restart_position));
-                }
-                None
-            })
-            .flatten();
-            if let Some((hls, restart_position)) = recovery {
-                if let Err(error) = hls.start_load_at(restart_position) {
-                    schedule_hard_restart(session_id, error);
-                }
-            }
-        });
-    }
-
-    fn schedule_hard_restart(session_id: u64, data: JsValue) {
-        let restart = with_session_mut(session_id, |session| {
-            if session.hard_restart_attempts >= MAX_HARD_RESTART_ATTEMPTS {
-                return None;
+    fn hard_recovery(epoch: u64, data: JsValue) {
+        let decision = with_session(epoch, |session| {
+            if session.hard_restarts >= MAX_HARD_RESTART_ATTEMPTS {
+                return Err(());
             }
             if session.recovery_pending {
-                return Some(None);
+                return Ok(None);
             }
             session.recovery_pending = true;
-            if session.codec_bootstrap_required {
-                session.codec_bootstrap_pending = true;
+            if session.codec_required {
+                session.codec_pending = true;
             }
-            let source = if session.codec_bootstrap_required {
+            let source = if session.codec_required {
                 let source = session
                     .source
                     .split("&codec-bootstrap=")
                     .next()
                     .unwrap_or(&session.source);
-                format!("{source}&codec-bootstrap={}", session.id)
+                format!("{source}&codec-bootstrap={epoch}")
             } else {
                 session.source.clone()
             };
-            let codec_bootstrap_restart =
-                session.codec_bootstrap_required && session.hard_restart_attempts == 0;
-            Some(Some((
+            let fast = session.codec_required && session.hard_restarts == 0;
+            Ok(Some(Recovery::Hard(
+                if fast {
+                    Wait::Microtask
+                } else {
+                    Wait::Millis(1_000)
+                },
                 session.media.clone(),
                 source,
-                session.hard_restart_attempts.saturating_add(1),
-                session.timeline_rebase_attempted,
-                codec_bootstrap_restart,
+                session.hard_restarts.saturating_add(1),
+                session.timeline_rebased,
             )))
-        })
-        .flatten();
+        });
+        match decision {
+            Some(Ok(Some(recovery))) => run_recovery(epoch, recovery),
+            Some(Err(())) => run_recovery(
+                epoch,
+                Recovery::Stop("HLS media remained invalid after two clean restarts", data),
+            ),
+            _ => {}
+        }
+    }
 
-        match restart {
-            Some(Some((
-                media,
-                source,
-                attempt,
-                timeline_rebase_attempted,
-                codec_bootstrap_restart,
-            ))) => {
-                spawn_local(async move {
-                    if codec_bootstrap_restart {
-                        let _ = JsFuture::from(Promise::resolve(&JsValue::UNDEFINED)).await;
-                    } else {
-                        sleep(Duration::from_millis(1_000)).await;
+    fn start_at(epoch: u64, hls: &Hls, position: f64) -> bool {
+        match hls.start_load_at(position) {
+            Ok(()) => {
+                with_session(epoch, |session| session.rebase_position = None);
+                true
+            }
+            Err(error) => {
+                hard_recovery(epoch, error);
+                false
+            }
+        }
+    }
+
+    impl Wait {
+        async fn wait(self) {
+            match self {
+                Self::Microtask => {
+                    let _ = JsFuture::from(Promise::resolve(&JsValue::UNDEFINED)).await;
+                }
+                Self::Millis(milliseconds) => sleep(Duration::from_millis(milliseconds)).await,
+            }
+        }
+    }
+
+    fn run_recovery(epoch: u64, recovery: Recovery) {
+        match recovery {
+            Recovery::Network(delay) => {
+                let scheduled = with_session(epoch, |session| {
+                    if session.recovery_pending {
+                        return false;
                     }
-                    let Some((initial_start_position, resume_authorized, autoplay_allowed)) =
-                        with_session_mut(session_id, |session| {
-                            (
-                                session.restart_position(),
-                                session.playback_authorized || session.resume_authorized_playback,
-                                session.autoplay_allowed,
-                            )
-                        })
-                    else {
-                        return;
-                    };
-                    if let Err(error) = start_hls_request(
-                        media.clone(),
+                    session.recovery_pending = true;
+                    true
+                })
+                .unwrap_or(false);
+                if !scheduled {
+                    return;
+                }
+                spawn_local(async move {
+                    sleep(Duration::from_millis(delay)).await;
+                    let resume = with_session(epoch, |session| {
+                        session.recovery_pending = false;
+                        if matches!(session.load, LoadPhase::Warmup) || !session.media.paused() {
+                            return session
+                                .hls()
+                                .cloned()
+                                .map(|hls| (hls, session.restart_position()));
+                        }
+                        None
+                    })
+                    .flatten();
+                    if let Some((hls, position)) = resume {
+                        start_at(epoch, &hls, position);
+                    }
+                });
+            }
+            Recovery::Media(hls) => spawn_local(async move {
+                Wait::Microtask.wait().await;
+                if is_current(epoch)
+                    && let Err(error) = hls.recover_media_error()
+                {
+                    hard_recovery(epoch, error);
+                }
+            }),
+            Recovery::Hard(wait, media, source, attempt, timeline_rebased) => {
+                spawn_local(async move {
+                    wait.wait().await;
+                    let request = with_session(epoch, |session| Launch {
+                        media: media.clone(),
                         source,
-                        None,
-                        initial_start_position,
-                        attempt,
-                        timeline_rebase_attempted,
-                        resume_authorized,
-                        autoplay_allowed,
-                        None,
-                    )
-                    .await
-                    {
-                        report_playback_error(
+                        loader: None,
+                        initial_position: session.restart_position(),
+                        rebase_position: session.rebase_position.filter(|_| !session.codec_pending),
+                        hard_attempts: attempt,
+                        timeline_rebased,
+                        resume: session.playback_authorized || session.resume,
+                        autoplay_allowed: session.autoplay_allowed,
+                    });
+                    let Some(request) = request else { return };
+                    if let Err(error) = launch(request).await {
+                        playback_error(
                             &media,
                             &format!(
                                 "Could not restart HLS playback: {}",
@@ -3065,44 +2825,29 @@ mod player {
                             &error,
                         );
                     }
+                })
+            }
+            Recovery::Stop(message, detail) => {
+                let Some(media) = with_session(epoch, |session| session.media.clone()) else {
+                    return;
+                };
+                playback_error(&media, message, &detail);
+                spawn_local(async move {
+                    Wait::Microtask.wait().await;
+                    if is_current(epoch) {
+                        destroy_current_hls();
+                    }
                 });
             }
-            Some(None) => {}
-            None => stop_with_error(
-                session_id,
-                "HLS media remained invalid after two clean restarts",
-                data,
-            ),
         }
     }
 
-    fn stop_with_error(session_id: u64, message: &str, detail: JsValue) {
-        let Some(media) = with_session_mut(session_id, |session| session.media.clone()) else {
-            return;
-        };
-        report_playback_error(&media, message, &detail);
-
-        // Drop the retained callback only after it returns.
-        spawn_local(async move {
-            let _ = JsFuture::from(Promise::resolve(&JsValue::UNDEFINED)).await;
-            if session_is_current(session_id) {
-                destroy_current_hls();
-            }
-        });
-    }
-
-    fn maybe_autoplay(session_id: u64) {
-        request_programmatic_hls_playback(session_id, true);
-    }
-
-    fn resume_authorized_hls_playback(session_id: u64) {
-        request_programmatic_hls_playback(session_id, false);
-    }
-
-    fn request_programmatic_hls_playback(session_id: u64, require_autoplay: bool) {
-        let Some(media) = with_session_mut(session_id, |session| {
-            ((!require_autoplay || (session.autoplay_allowed && session.media.autoplay()))
-                && !session.codec_bootstrap_pending
+    fn autoplay(epoch: u64, intent: Autoplay) {
+        let media = with_session(epoch, |session| {
+            let allowed = matches!(intent, Autoplay::Resume)
+                || (session.autoplay_allowed && session.media.autoplay());
+            (allowed
+                && !session.codec_pending
                 && !session.playback_authorized
                 && !session.autoplay_pending)
                 .then(|| {
@@ -3110,85 +2855,58 @@ mod player {
                     session.media.clone()
                 })
         })
-        .flatten() else {
-            return;
-        };
+        .flatten();
+        let Some(media) = media else { return };
         media
             .set_attribute(HLS_AUTOPLAY_PENDING_ATTRIBUTE, "1")
             .ok();
-
         spawn_local(async move {
-            let promise = match media.play() {
-                Ok(promise) => promise,
-                Err(error) => {
-                    settle_autoplay(session_id, false);
-                    report_autoplay_blocked(&media, &error);
-                    return;
-                }
+            let result = match media.play() {
+                Ok(promise) => JsFuture::from(promise).await.map(|_| ()),
+                Err(error) => Err(error),
             };
-            match JsFuture::from(promise).await {
-                Ok(_) => {
-                    if let Some(media) = settle_autoplay(session_id, true) {
-                        dispatch_custom_event(
-                            &media,
-                            HLS_AUTOPLAY_AUTHORIZED_EVENT,
-                            &JsValue::UNDEFINED,
-                        );
+            let authorized = result.is_ok();
+            let settled = with_session(epoch, |session| {
+                if !session.autoplay_pending {
+                    return None;
+                }
+                session.autoplay_pending = false;
+                session.resume = false;
+                if authorized {
+                    session.playback_authorized = true;
+                    if matches!(session.load, LoadPhase::Warmup) {
+                        session.load = LoadPhase::Started;
                     }
                 }
-                Err(error) => {
-                    let Some(media) = settle_autoplay(session_id, false) else {
-                        return;
-                    };
-                    report_autoplay_blocked(&media, &error);
-                }
+                Some(session.media.clone())
+            })
+            .flatten();
+            let Some(media) = settled else { return };
+            media.remove_attribute(HLS_AUTOPLAY_PENDING_ATTRIBUTE).ok();
+            if authorized {
+                media
+                    .set_attribute(HLS_PLAYBACK_AUTHORIZED_ATTRIBUTE, "1")
+                    .ok();
+                emit(&media, HLS_AUTOPLAY_AUTHORIZED_EVENT);
+            } else {
+                set_state(
+                    &media,
+                    "autoplay-blocked",
+                    "HLS startup media is warming. Autoplay was blocked; press Play to start playback.",
+                );
             }
         });
     }
 
-    fn settle_autoplay(session_id: u64, authorized: bool) -> Option<HtmlMediaElement> {
-        let media = with_session_mut(session_id, |session| {
-            if !session.autoplay_pending {
-                return None;
-            }
-            session.autoplay_pending = false;
-            session.resume_authorized_playback = false;
-            if authorized {
-                session.playback_authorized = true;
-                session.warmup_active = false;
-            }
-            Some(session.media.clone())
-        })
-        .flatten()?;
-        media.remove_attribute(HLS_AUTOPLAY_PENDING_ATTRIBUTE).ok();
-        if authorized {
-            media
-                .set_attribute(HLS_PLAYBACK_AUTHORIZED_ATTRIBUTE, "1")
-                .ok();
-        }
-        Some(media)
-    }
-
-    fn report_autoplay_blocked(media: &HtmlMediaElement, _error: &JsValue) {
-        media
-            .set_attribute("data-weeb3-hls-state", "autoplay-blocked")
-            .ok();
-        set_playback_status(
-            media,
-            "HLS startup media is warming. Autoplay was blocked; press Play to start playback.",
-            "autoplay-blocked",
-        );
-    }
-
-    fn report_playback_error(media: &HtmlMediaElement, message: &str, detail: &JsValue) {
+    fn playback_error(media: &HtmlMediaElement, message: &str, detail: &JsValue) {
         let error = Error::new(message);
         let _ = Reflect::set(error.as_ref(), &JsValue::from_str("cause"), detail);
         let error: JsValue = error.into();
         web_sys::console::error_2(&JsValue::from_str("weeb-3 HLS playback error"), &error);
-        set_playback_status(media, &format!("HLS playback failed: {message}"), "error");
+        media_status(media, &format!("HLS playback failed: {message}"), "error");
     }
 
-    fn set_playback_status(media: &HtmlMediaElement, message: &str, state: &str) {
+    fn media_status(media: &HtmlMediaElement, message: &str, state: &str) {
         let Some(parent) = media.parent_element() else {
             return;
         };
@@ -3199,9 +2917,14 @@ mod player {
         status.set_attribute("data-state", state).ok();
     }
 
-    fn dispatch_custom_event(media: &HtmlMediaElement, name: &str, detail: &JsValue) {
+    fn set_state(media: &HtmlMediaElement, state: &str, message: &str) {
+        media.set_attribute("data-weeb3-hls-state", state).ok();
+        media_status(media, message, state);
+    }
+
+    fn emit(media: &HtmlMediaElement, name: &str) {
         let init = CustomEventInit::new();
-        init.set_detail(detail);
+        init.set_detail(&JsValue::UNDEFINED);
         if let Ok(event) = CustomEvent::new_with_event_init_dict(name, &init) {
             let _ = media.dispatch_event(&event);
         }
@@ -3209,34 +2932,21 @@ mod player {
 
     fn playback_diagnostic(media: &HtmlMediaElement, data: &JsValue) -> Object {
         let diagnostic = Object::new();
-        set_property(
-            &diagnostic,
-            "type",
-            js_property(data, "type").unwrap_or(JsValue::UNDEFINED),
-        );
-        set_property(
-            &diagnostic,
-            "details",
-            js_property(data, "details").unwrap_or(JsValue::UNDEFINED),
-        );
-
+        for name in ["type", "details"] {
+            set_property(
+                &diagnostic,
+                name,
+                js_property(data, name).unwrap_or(JsValue::UNDEFINED),
+            );
+        }
         let fragment = js_property(data, "frag");
-        set_property(
-            &diagnostic,
-            "fragmentSequence",
-            fragment
+        for (source, target) in [("sn", "fragmentSequence"), ("url", "fragmentUrl")] {
+            let value = fragment
                 .as_ref()
-                .and_then(|fragment| js_property(fragment, "sn"))
-                .unwrap_or(JsValue::UNDEFINED),
-        );
-        set_property(
-            &diagnostic,
-            "fragmentUrl",
-            fragment
-                .as_ref()
-                .and_then(|fragment| js_property(fragment, "url"))
-                .unwrap_or(JsValue::UNDEFINED),
-        );
+                .and_then(|fragment| js_property(fragment, source))
+                .unwrap_or(JsValue::UNDEFINED);
+            set_property(&diagnostic, target, value);
+        }
         set_property(
             &diagnostic,
             "currentTime",
@@ -3246,16 +2956,12 @@ mod player {
         let buffered = Array::new();
         let ranges = media.buffered();
         for index in 0..ranges.length() {
-            let Ok(start) = ranges.start(index) else {
-                continue;
-            };
-            let Ok(end) = ranges.end(index) else {
-                continue;
-            };
-            let range = Array::new();
-            range.push(&JsValue::from_f64(start));
-            range.push(&JsValue::from_f64(end));
-            buffered.push(&range);
+            if let (Ok(start), Ok(end)) = (ranges.start(index), ranges.end(index)) {
+                let range = Array::new();
+                range.push(&JsValue::from_f64(start));
+                range.push(&JsValue::from_f64(end));
+                buffered.push(&range);
+            }
         }
         set_property(&diagnostic, "buffered", buffered.into());
         diagnostic
@@ -3267,7 +2973,6 @@ mod player {
         set_property(&config, "autoStartLoad", JsValue::FALSE);
         set_property(&config, "startFragPrefetch", JsValue::FALSE);
         set_property(&config, "progressive", JsValue::from_bool(progressive));
-
         for name in [
             "manifestLoadPolicy",
             "playlistLoadPolicy",
@@ -3284,28 +2989,22 @@ mod player {
                 JsValue::from_f64(HLS_LIVE_SYNC_SEGMENTS as f64),
             );
         }
-        let low_memory = device_memory_gib()
+        let low_memory = web_sys::window()
+            .and_then(|window| js_property(window.navigator().as_ref(), "deviceMemory"))
+            .and_then(|memory| memory.as_f64())
             .filter(|memory| memory.is_finite())
             .is_some_and(|memory| memory <= 2.0);
-        set_property(&config, "backBufferLength", JsValue::from_f64(30.0));
-        if low_memory {
-            set_property(&config, "maxBufferLength", JsValue::from_f64(30.0));
-            set_property(&config, "maxMaxBufferLength", JsValue::from_f64(60.0));
-            set_property(
-                &config,
-                "maxBufferSize",
-                JsValue::from_f64(32.0 * 1024.0 * 1024.0),
-            );
+        let (length, maximum, bytes) = if low_memory {
+            (30.0, 60.0, 32.0)
         } else {
-            set_property(&config, "maxBufferLength", JsValue::from_f64(90.0));
-            set_property(&config, "maxMaxBufferLength", JsValue::from_f64(120.0));
-            set_property(
-                &config,
-                "maxBufferSize",
-                JsValue::from_f64(96.0 * 1024.0 * 1024.0),
-            );
-        }
-        set_property(&config, "maxBufferHole", JsValue::from_f64(1.0));
+            (90.0, 120.0, 96.0)
+        };
+        let number = |name, value| set_property(&config, name, JsValue::from_f64(value));
+        number("backBufferLength", 30.0);
+        number("maxBufferLength", length);
+        number("maxMaxBufferLength", maximum);
+        number("maxBufferSize", bytes * 1024.0 * 1024.0);
+        number("maxBufferHole", 1.0);
         config
     }
 
@@ -3317,29 +3016,15 @@ mod player {
         set_property(&retry, "backoff", JsValue::from_str("exponential"));
 
         let defaults = Object::new();
-        set_property(
-            &defaults,
-            "maxTimeToFirstByteMs",
-            JsValue::from_f64(SWARM_REQUEST_TIMEOUT_MS + 10_000.0),
-        );
-        set_property(
-            &defaults,
-            "maxLoadTimeMs",
-            JsValue::from_f64(SWARM_REQUEST_TIMEOUT_MS + 20_000.0),
-        );
+        let number = |name, value| set_property(&defaults, name, JsValue::from_f64(value));
+        number("maxTimeToFirstByteMs", SWARM_REQUEST_TIMEOUT_MS + 10_000.0);
+        number("maxLoadTimeMs", SWARM_REQUEST_TIMEOUT_MS + 20_000.0);
         set_property(&defaults, "timeoutRetry", JsValue::NULL);
         set_property(&defaults, "errorRetry", retry.into());
 
         let policy = Object::new();
         set_property(&policy, "default", defaults.into());
         policy
-    }
-
-    fn device_memory_gib() -> Option<f64> {
-        let navigator = web_sys::window()?.navigator();
-        Reflect::get(navigator.as_ref(), &JsValue::from_str("deviceMemory"))
-            .ok()?
-            .as_f64()
     }
 
     fn set_property(target: &Object, name: &str, value: JsValue) {
@@ -3373,28 +3058,18 @@ mod player {
             .chain(std::iter::once(target.clone()))
         {
             for (width_name, height_name) in [("width", "height"), ("videoWidth", "videoHeight")] {
-                let Some(width) = js_safe_u64_property(&candidate, width_name)
-                    .and_then(|width| u32::try_from(width).ok())
-                else {
-                    continue;
+                let dimension = |name| {
+                    js_safe_u64_property(&candidate, name)
+                        .and_then(|value| u32::try_from(value).ok())
+                        .filter(|value| *value > 0)
                 };
-                let Some(height) = js_safe_u64_property(&candidate, height_name)
-                    .and_then(|height| u32::try_from(height).ok())
-                else {
-                    continue;
-                };
-                if width > 0 && height > 0 {
+                if let (Some(width), Some(height)) = (dimension(width_name), dimension(height_name))
+                {
                     return Some((width, height));
                 }
             }
         }
         None
-    }
-
-    fn js_error_message(error: &JsValue) -> String {
-        js_string_property(error, "message")
-            .or_else(|| error.as_string())
-            .unwrap_or_else(|| "unknown browser error".to_string())
     }
 }
 #[cfg(target_arch = "wasm32")]
@@ -3409,8 +3084,9 @@ mod runtime {
     use super::*;
     use std::{
         cell::RefCell,
-        collections::{HashMap, HashSet, VecDeque},
+        collections::{BTreeMap, HashMap, HashSet, VecDeque},
         future::Future,
+        ops::{Deref, DerefMut},
         rc::Rc,
         time::Duration,
     };
@@ -3535,21 +3211,6 @@ mod runtime {
             bytes
         }
 
-        async fn publish_hls_generation(&self, stream_key: String, stream_generation: u64) -> bool {
-            let Some(cancel) = stream_retrieve_cancel_token(stream_key, stream_generation) else {
-                return false;
-            };
-            register_retrieve_cancel_token(&self.retrieve_cancel_generations, &Some(cancel)).await;
-            true
-        }
-
-        async fn hls_payload_size(&self, address: String) -> Option<u64> {
-            let reference = hex::decode(address).ok()?;
-            retrieve_decoded_data_root(&reference, &self.chunk_port.0)
-                .await
-                .map(|root| root.span)
-        }
-
         async fn retrieve_hls_payload_range(
             &self,
             address: String,
@@ -3604,15 +3265,6 @@ mod runtime {
             )
             .await;
             bytes
-        }
-
-        async fn latest_hls_feed_payload_from(
-            &self,
-            owner: String,
-            topic: String,
-            initial: RawFeedPayload,
-        ) -> Option<RawFeedPayload> {
-            acquire_latest_raw_feed_payload_from(owner, topic, initial, &self.chunk_port.0).await
         }
 
         async fn latest_hls_feed_payload_startup(
@@ -3677,23 +3329,11 @@ mod runtime {
     }
 
     thread_local! {
-        static FEED_ROUTE_CHECK_SEQUENCE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-        static FEED_ROUTE_CACHE: RefCell<HashMap<String, FeedRouteState>> =
-            RefCell::new(HashMap::new());
-        static HLS_ASSET_METADATA_CACHE: RefCell<HashMap<String, HlsAssetMetadataState>> =
-            RefCell::new(HashMap::new());
-        static HLS_MEDIA_PLANS: RefCell<HlsMediaPlanRegistry> =
-            RefCell::new(HlsMediaPlanRegistry::new(HLS_MEDIA_PLAN_MAX_REFERENCES));
-        static HLS_PREFETCH_SESSION: RefCell<HlsPrefetchSession> =
-            RefCell::new(HlsPrefetchSession::new());
+        static FEED_ROUTE_CACHE: RefCell<FeedRegistry> = RefCell::new(FeedRegistry::new());
+        static HLS_PLAYBACK: RefCell<HlsPlaybackState> = RefCell::new(HlsPlaybackState::new());
         static HLS_CODEC_BOOTSTRAP_PRESENTATION: RefCell<Option<HlsCodecBootstrapPresentation>> =
             const { RefCell::new(None) };
-        static HLS_PAYLOAD_DURATIONS: RefCell<HashMap<String, f64>> = RefCell::new(HashMap::new());
-        static HLS_PAYLOAD_SIZES: RefCell<HashMap<String, u64>> = RefCell::new(HashMap::new());
-        static HLS_PAYLOAD_SIZE_PROBES: RefCell<HashMap<String, Vec<mpsc::Sender<Option<u64>>>>> =
-            RefCell::new(HashMap::new());
-        static HLS_PAYLOAD_CACHE: RefCell<HlsPayloadCache> =
-            RefCell::new(HlsPayloadCache::new());
+        static HLS_ASSET_CACHE: RefCell<HlsAssetCache> = RefCell::new(HlsAssetCache::new());
     }
 
     const FEED_ROUTE_CACHE_MAX_ENTRIES: usize = 64;
@@ -3711,6 +3351,7 @@ mod runtime {
     const HLS_ASSET_PROBE_BYTES: u64 = 512;
     const HLS_REPRESENTATION_VERSION: &str = "weeb3-hls-v2";
     const HLS_MEDIA_PLAN_MAX_REFERENCES: usize = 4096;
+    const HLS_ARCHIVE_MEDIA_PLAN_MAX_REFERENCES: usize = 32768;
     const HLS_PREFETCH_TRACK_MAX_ENTRIES: usize = 16;
     const HLS_STREAM_KEY: &str = "weeb3:hls-playback";
     const HLS_PAYLOAD_SINGLEFLIGHT_MAX_WAITERS: usize = 64;
@@ -3735,7 +3376,7 @@ mod runtime {
     const HLS_INITIAL_RESPONSE_BUDGET_MS: f64 = 15_000.0;
     const HLS_PAYLOAD_RETRY_DELAY_MS: u64 = 75;
     const HLS_PAYLOAD_SIZE_RETRY_DELAY_MS: u64 = 250;
-    const HLS_STARTUP_LOOKAHEAD_BYTES: u64 = 3 * MEDIA_STARTUP_RESPONSE_BYTES;
+    const HLS_STARTUP_LOOKAHEAD_BYTES: u64 = 2 * MEDIA_STARTUP_RESPONSE_BYTES;
     const HLS_PROGRESSIVE_SUCCESSOR_PREFIX_BYTES: u64 = MEDIA_STORAGE_WINDOW_BYTES * 3;
 
     fn hls_segment_progress_detail(reference: &str, size: Option<usize>) -> String {
@@ -3743,9 +3384,10 @@ mod runtime {
             || "starting".to_string(),
             |size| format!("size {:.2} MB", size as f64 / 1_000_000.0),
         );
-        if let Some(duration) = HLS_PAYLOAD_DURATIONS.with(|durations| {
-            durations
+        if let Some(duration) = HLS_PLAYBACK.with(|playback| {
+            playback
                 .borrow()
+                .durations
                 .get(&reference.to_ascii_lowercase())
                 .copied()
         }) {
@@ -3781,18 +3423,97 @@ mod runtime {
         source_body: Arc<[u8]>,
         body_tracks_source: bool,
         source_endlist_confirmed: bool,
-        canonical_stabilization_started: bool,
-        canonical_stabilization_running: bool,
         checking_token: u64,
         confirmed_head_index: Option<u64>,
         last_head_check: f64,
         last_touch: f64,
     }
 
+    struct FeedRegistry {
+        next_task: u64,
+        followers: HashMap<String, FeedRouteState>,
+    }
+
+    #[derive(Clone)]
+    struct FeedTask {
+        cache_key: String,
+        token: u64,
+        mode: FeedFollowupMode,
+    }
+
+    impl FeedTask {
+        fn publish(&self, candidate: &RawFeedPayload, head_confirmed: bool) -> bool {
+            if candidate.bytes.len() > MAX_STREAM_FEED_PAYLOAD_BYTES
+                || !is_hls_manifest(&candidate.bytes)
+            {
+                return false;
+            }
+            apply_feed_candidate(
+                &self.cache_key,
+                FeedCandidate {
+                    index: candidate.index,
+                    source: Arc::from(candidate.bytes.clone()),
+                    terminal: hls_snapshot_is_terminal(
+                        hls_is_finalized(&candidate.bytes),
+                        false,
+                        head_confirmed,
+                    ),
+                    head_confirmed,
+                    mode: self.mode,
+                    admission: FeedCandidateAdmission::Task {
+                        token: self.token,
+                        expected_index: None,
+                        require_confirmed_same_index: true,
+                    },
+                },
+            )
+            .is_some()
+        }
+    }
+
+    impl FeedRegistry {
+        fn new() -> Self {
+            Self {
+                next_task: 0,
+                followers: HashMap::new(),
+            }
+        }
+    }
+
+    impl Deref for FeedRegistry {
+        type Target = HashMap<String, FeedRouteState>;
+
+        fn deref(&self) -> &Self::Target {
+            &self.followers
+        }
+    }
+
+    impl DerefMut for FeedRegistry {
+        fn deref_mut(&mut self) -> &mut Self::Target {
+            &mut self.followers
+        }
+    }
+
     enum InitialCanonicalFeedResolution {
         Ready(crate::bzz_stream::RawFeedPayload),
         Pending(mpsc::Receiver<Option<crate::bzz_stream::RawFeedPayload>>),
         Unavailable,
+    }
+
+    struct HlsPlaybackState {
+        plans: HlsMediaPlanRegistry,
+        session: HlsPrefetchSession,
+        durations: HashMap<String, f64>,
+    }
+
+    impl HlsPlaybackState {
+        fn new() -> Self {
+            Self {
+                plans: HlsMediaPlanRegistry::new(HLS_MEDIA_PLAN_MAX_REFERENCES),
+                session: HlsPrefetchSession::new(),
+                durations: HashMap::new(),
+            }
+        }
     }
 
     #[derive(Clone)]
@@ -3802,20 +3523,28 @@ mod runtime {
         is_manifest: bool,
     }
 
-    struct HlsAssetMetadataState {
-        metadata: HlsAssetMetadata,
-        last_touch: f64,
-    }
-
     struct ResolvedHlsAsset {
         metadata: HlsAssetMetadata,
         prefetched_body: Option<Arc<[u8]>>,
     }
 
+    #[derive(Clone, Copy, Eq, PartialEq)]
+    struct PlaybackStamp {
+        generation: u64,
+        timeline_epoch: u64,
+    }
+
+    #[derive(Clone, Copy, Eq, PartialEq)]
+    struct PrefetchTicket {
+        stamp: PlaybackStamp,
+        plan_id: u64,
+        schedule_id: u64,
+    }
+
     struct HlsPrefetchTrack {
         schedule_id: u64,
         last_foreground_position: usize,
-        running_generation: Option<u64>,
+        running: Option<PrefetchTicket>,
         last_touch: u64,
     }
 
@@ -3826,6 +3555,13 @@ mod runtime {
         Sustained,
     }
 
+    struct BeginningRunway {
+        first: String,
+        successor: Option<String>,
+        successor_prefix_started: bool,
+        successor_prefix_ready: bool,
+    }
+
     struct HlsPrefetchSession {
         generation: u64,
         timeline_epoch: u64,
@@ -3834,8 +3570,7 @@ mod runtime {
         mode: HlsPrefetchMode,
         client: Option<Arc<Weeb3>>,
         feed_identity: Option<(String, String)>,
-        progressive_start: Option<(String, Option<String>)>,
-        progressive_successor_prefix_ready: bool,
+        runway: Option<BeginningRunway>,
         sequence_zero_runway_closed: bool,
         presentation_id: u64,
         live_start: bool,
@@ -3857,8 +3592,7 @@ mod runtime {
                 mode: HlsPrefetchMode::Inactive,
                 client: None,
                 feed_identity: None,
-                progressive_start: None,
-                progressive_successor_prefix_ready: false,
+                runway: None,
                 sequence_zero_runway_closed: false,
                 presentation_id: 0,
                 live_start: false,
@@ -3871,57 +3605,188 @@ mod runtime {
             }
         }
 
+        fn stamp(&self) -> PlaybackStamp {
+            PlaybackStamp {
+                generation: self.generation,
+                timeline_epoch: self.timeline_epoch,
+            }
+        }
+
         fn advance_generation(&mut self) -> u64 {
             self.generation = next_media_generation();
-            self.progressive_start = None;
-            self.progressive_successor_prefix_ready = false;
+            self.runway = None;
+            self.startup_overlap_plans.clear();
             self.completed_media_payloads = if self.live_start {
                 HLS_SERIAL_PREFETCH_COMPLETIONS.saturating_sub(1)
             } else {
                 0
             };
             for track in self.tracks.values_mut() {
-                track.running_generation = None;
+                track.running = None;
             }
             self.generation
         }
 
         fn advance_timeline(&mut self) -> u64 {
             self.timeline_epoch = next_nonzero_generation(self.timeline_epoch);
-            self.progressive_start = None;
-            self.progressive_successor_prefix_ready = false;
+            self.runway = None;
             self.timeline_epoch
+        }
+
+        fn ticket_current(&self, ticket: PrefetchTicket, sustained: bool) -> bool {
+            (!sustained || self.mode == HlsPrefetchMode::Sustained)
+                && self.mode != HlsPrefetchMode::Inactive
+                && !self.timeline_rebasing
+                && self.stamp() == ticket.stamp
+                && self.tracks.get(&ticket.plan_id).is_some_and(|track| {
+                    track.schedule_id == ticket.schedule_id && track.running == Some(ticket)
+                })
+        }
+
+        fn progressive_current(&self, reference: &str, stamp: PlaybackStamp) -> bool {
+            self.stamp() == stamp
+                && !self.live_start
+                && !self.timeline_rebasing
+                && !self.sequence_zero_runway_closed
+                && self.runway.as_ref().is_some_and(|runway| {
+                    runway.first == reference
+                        || runway
+                            .successor
+                            .as_ref()
+                            .is_some_and(|successor| successor == reference)
+                })
+        }
+
+        fn body_parallelism(&self, generation: u64) -> usize {
+            if self.generation != generation
+                || self.completed_media_payloads < HLS_SERIAL_PREFETCH_COMPLETIONS
+            {
+                1
+            } else if self.completed_media_payloads < HLS_TWO_BODY_PREFETCH_COMPLETIONS {
+                2
+            } else {
+                HLS_PREFETCH_BODY_MAX_PARALLEL
+            }
+        }
+
+        fn prune_tracks(&mut self, selected: u64, superseded: &[u64]) {
+            for plan in superseded {
+                if *plan != selected {
+                    self.tracks.remove(plan);
+                    self.startup_overlap_plans.remove(plan);
+                }
+            }
+            if self.tracks.len() <= HLS_PREFETCH_TRACK_MAX_ENTRIES {
+                return;
+            }
+            let mut inactive = self
+                .tracks
+                .iter()
+                .filter(|(plan, track)| **plan != selected && track.running.is_none())
+                .map(|(plan, track)| (*plan, track.last_touch))
+                .collect::<Vec<_>>();
+            inactive.sort_by_key(|entry| entry.1);
+            for (plan, _) in inactive {
+                if self.tracks.len() <= HLS_PREFETCH_TRACK_MAX_ENTRIES {
+                    break;
+                }
+                self.tracks.remove(&plan);
+                self.startup_overlap_plans.remove(&plan);
+            }
         }
     }
 
     #[derive(Clone)]
     struct HlsForegroundContext {
-        generation: u64,
-        timeline_epoch: u64,
-        schedule_id: Option<u64>,
+        stamp: PlaybackStamp,
+        ticket: Option<PrefetchTicket>,
         cursor: Option<HlsMediaCursor>,
         progressive_successor_prefix_ready: bool,
+        seek_successor: Option<String>,
     }
 
-    struct HlsPayloadCache {
-        order: VecDeque<String>,
+    #[derive(Default)]
+    struct HlsAssetCache {
+        metadata: HashMap<String, (HlsAssetMetadata, f64)>,
+        sizes: HashMap<String, u64>,
+        body_order: VecDeque<String>,
         bodies: HashMap<String, Arc<[u8]>>,
-        pending: HashMap<String, PendingHlsPayload>,
+        body_pending: HashMap<String, PendingHlsPayload>,
+        size_pending: HashMap<String, Vec<mpsc::Sender<Option<u64>>>>,
         next_load_id: u64,
         body_bytes: u64,
         retain_completed: bool,
     }
 
-    impl HlsPayloadCache {
+    impl HlsAssetCache {
         fn new() -> Self {
             Self {
-                order: VecDeque::new(),
-                bodies: HashMap::new(),
-                pending: HashMap::new(),
-                next_load_id: 0,
-                body_bytes: 0,
                 retain_completed: true,
+                ..Self::default()
             }
+        }
+
+        fn metadata(&mut self, reference: &str) -> Option<HlsAssetMetadata> {
+            let (metadata, touched) = self.metadata.get_mut(reference)?;
+            *touched = js_sys::Date::now();
+            Some(metadata.clone())
+        }
+
+        fn remember_metadata(&mut self, reference: &str, metadata: HlsAssetMetadata) {
+            if !self.metadata.contains_key(reference)
+                && self.metadata.len() >= HLS_ASSET_METADATA_CACHE_MAX_ENTRIES
+                && let Some(oldest) = self
+                    .metadata
+                    .iter()
+                    .min_by(|left, right| left.1.1.total_cmp(&right.1.1))
+                    .map(|entry| entry.0.clone())
+            {
+                self.metadata.remove(&oldest);
+            }
+            self.metadata
+                .insert(reference.to_string(), (metadata, js_sys::Date::now()));
+        }
+
+        fn payload_size(&self, reference: &str) -> Option<u64> {
+            self.bodies
+                .get(reference)
+                .and_then(|body| u64::try_from(body.len()).ok())
+                .or_else(|| self.sizes.get(reference).copied())
+        }
+
+        fn remember_size(&mut self, reference: &str, size: u64) {
+            if size == 0 {
+                return;
+            }
+            if !self.sizes.contains_key(reference)
+                && self.sizes.len() >= HLS_MEDIA_PLAN_MAX_REFERENCES
+            {
+                self.sizes.clear();
+            }
+            self.sizes.insert(reference.to_string(), size);
+        }
+
+        fn body(&mut self, reference: &str, foreground: bool) -> Option<Arc<[u8]>> {
+            let body = self.bodies.get(reference).cloned()?;
+            self.body_order.retain(|key| key != reference);
+            if foreground {
+                self.body_order.push_front(reference.to_string());
+            } else {
+                self.body_order.push_back(reference.to_string());
+            }
+            Some(body)
+        }
+
+        fn waiter(pending: &mut PendingHlsPayload) -> HlsPayloadLoadRole {
+            pending.waiters.retain(|waiter| !waiter.is_closed());
+            if pending.waiters.len() >= HLS_PAYLOAD_SINGLEFLIGHT_MAX_WAITERS {
+                return HlsPayloadLoadRole::Reject(
+                    "HLS fragment already has too many waiting requests".to_string(),
+                );
+            }
+            let (sender, receiver) = mpsc::bounded(1);
+            pending.waiters.push(sender);
+            HlsPayloadLoadRole::Wait(receiver)
         }
 
         fn load_role(
@@ -3931,28 +3796,12 @@ mod runtime {
             generation: u64,
             prefetch_limit: usize,
         ) -> HlsPayloadLoadRole {
-            let cached = if prefetch {
-                self.body(reference)
-            } else {
-                read_forward_cache_entry(&mut self.order, &self.bodies, reference)
-            };
-            if let Some(body) = cached {
+            if let Some(body) = self.body(reference, !prefetch) {
                 return HlsPayloadLoadRole::Cached(body);
             }
-
-            if let Some(pending) = self.pending.get_mut(reference) {
+            if let Some(pending) = self.body_pending.get_mut(reference) {
                 match pending_generation_relation(pending.generation, generation) {
-                    PendingGenerationRelation::Join => {
-                        pending.waiters.retain(|waiter| !waiter.is_closed());
-                        if pending.waiters.len() >= HLS_PAYLOAD_SINGLEFLIGHT_MAX_WAITERS {
-                            return HlsPayloadLoadRole::Reject(
-                                "HLS fragment already has too many waiting requests".to_string(),
-                            );
-                        }
-                        let (sender, receiver) = mpsc::bounded(1);
-                        pending.waiters.push(sender);
-                        return HlsPayloadLoadRole::Wait(receiver);
-                    }
+                    PendingGenerationRelation::Join => return Self::waiter(pending),
                     PendingGenerationRelation::RejectStale => {
                         return HlsPayloadLoadRole::Reject(
                             "stale HLS fragment generation".to_string(),
@@ -3961,28 +3810,26 @@ mod runtime {
                     PendingGenerationRelation::Replace => {}
                 }
             }
-            if let Some(stale) = self.pending.remove(reference) {
+            if let Some(stale) = self.body_pending.remove(reference) {
                 stale.finish(Err(
                     "stale HLS fragment generation was superseded".to_string()
                 ));
             }
-
-            let active_loads = self
-                .pending
-                .values()
-                .filter(|pending| pending.generation == generation)
-                .count();
-            if prefetch && active_loads >= prefetch_limit {
+            if prefetch
+                && self
+                    .body_pending
+                    .values()
+                    .filter(|pending| pending.generation == generation)
+                    .count()
+                    >= prefetch_limit
+            {
                 return HlsPayloadLoadRole::AtCapacity;
             }
 
             let (sender, receiver) = mpsc::bounded(1);
-            self.next_load_id = self.next_load_id.wrapping_add(1);
-            if self.next_load_id == 0 {
-                self.next_load_id = 1;
-            }
+            self.next_load_id = next_nonzero_generation(self.next_load_id);
             let load_id = self.next_load_id;
-            self.pending.insert(
+            self.body_pending.insert(
                 reference.to_string(),
                 PendingHlsPayload {
                     generation,
@@ -3993,6 +3840,22 @@ mod runtime {
             HlsPayloadLoadRole::Lead(receiver, load_id)
         }
 
+        fn join_pending(&mut self, reference: &str, generation: u64) -> Option<HlsPayloadLoadRole> {
+            if let Some(body) = self.body(reference, false) {
+                return Some(HlsPayloadLoadRole::Cached(body));
+            }
+            let pending = self.body_pending.get_mut(reference)?;
+            Some(
+                match pending_generation_relation(pending.generation, generation) {
+                    PendingGenerationRelation::Join => Self::waiter(pending),
+                    PendingGenerationRelation::RejectStale => {
+                        HlsPayloadLoadRole::Reject("stale HLS fragment generation".to_string())
+                    }
+                    PendingGenerationRelation::Replace => return None,
+                },
+            )
+        }
+
         fn finish_load(
             &mut self,
             reference: &str,
@@ -4001,79 +3864,38 @@ mod runtime {
             result: Result<Arc<[u8]>, String>,
             hot: bool,
         ) -> bool {
-            let owns_pending = self.pending.get(reference).is_some_and(|pending| {
+            let owns_pending = self.body_pending.get(reference).is_some_and(|pending| {
                 pending.generation == generation && pending.load_id == load_id
             });
-
-            if self.retain_completed
-                && let Ok(body) = &result
-            {
-                self.remember(reference.to_string(), body.clone(), hot);
+            if let Ok(body) = &result {
+                self.remember_size(reference, u64::try_from(body.len()).unwrap_or(u64::MAX));
+                if self.retain_completed {
+                    self.remember_body(reference.to_string(), body.clone(), hot);
+                }
             }
-            if !owns_pending {
-                return false;
-            }
-            if let Some(pending) = self.pending.remove(reference) {
+            if owns_pending && let Some(pending) = self.body_pending.remove(reference) {
                 pending.finish(result);
             }
-            true
+            owns_pending
         }
 
-        fn body(&mut self, reference: &str) -> Option<Arc<[u8]>> {
-            let body = self.bodies.get(reference).cloned()?;
-            self.order.retain(|key| key != reference);
-            self.order.push_back(reference.to_string());
-            Some(body)
-        }
-
-        fn body_size(&self, reference: &str) -> Option<u64> {
-            self.bodies
-                .get(reference)
-                .and_then(|body| u64::try_from(body.len()).ok())
-        }
-
-        fn join_pending(&mut self, reference: &str, generation: u64) -> Option<HlsPayloadLoadRole> {
-            if let Some(body) = self.body(reference) {
-                return Some(HlsPayloadLoadRole::Cached(body));
-            }
-            let pending = self.pending.get_mut(reference)?;
-            match pending_generation_relation(pending.generation, generation) {
-                PendingGenerationRelation::Join => {
-                    pending.waiters.retain(|waiter| !waiter.is_closed());
-                    if pending.waiters.len() >= HLS_PAYLOAD_SINGLEFLIGHT_MAX_WAITERS {
-                        return Some(HlsPayloadLoadRole::Reject(
-                            "HLS fragment already has too many waiting requests".to_string(),
-                        ));
-                    }
-                    let (sender, receiver) = mpsc::bounded(1);
-                    pending.waiters.push(sender);
-                    Some(HlsPayloadLoadRole::Wait(receiver))
-                }
-                PendingGenerationRelation::RejectStale => Some(HlsPayloadLoadRole::Reject(
-                    "stale HLS fragment generation".to_string(),
-                )),
-                PendingGenerationRelation::Replace => None,
-            }
-        }
-
-        fn remember(&mut self, reference: String, body: Arc<[u8]>, hot: bool) {
+        fn remember_body(&mut self, reference: String, body: Arc<[u8]>, hot: bool) {
             let body_len = body.len() as u64;
             let max_bytes = hls_payload_cache_capacity_bytes();
             if body_len > max_bytes {
                 return;
             }
-
             if let Some(previous) = self.bodies.remove(&reference) {
                 self.body_bytes = self.body_bytes.saturating_sub(previous.len() as u64);
             }
-            self.order.retain(|key| key != &reference);
+            self.body_order.retain(|key| key != &reference);
             if hot {
-                self.order.push_back(reference.clone());
+                self.body_order.push_back(reference.clone());
             } else {
-                self.order.push_front(reference.clone());
+                self.body_order.push_front(reference.clone());
             }
-            self.bodies.insert(reference, body);
             self.body_bytes = self.body_bytes.saturating_add(body_len);
+            self.bodies.insert(reference, body);
 
             let max_entries = usize::try_from(
                 media_cache_max_bytes()
@@ -4083,7 +3905,7 @@ mod runtime {
             )
             .unwrap_or(usize::MAX);
             while self.body_bytes > max_bytes || self.bodies.len() > max_entries {
-                let Some(oldest) = self.order.pop_front() else {
+                let Some(oldest) = self.body_order.pop_front() else {
                     break;
                 };
                 if let Some(previous) = self.bodies.remove(&oldest) {
@@ -4092,13 +3914,9 @@ mod runtime {
             }
         }
 
-        fn resume_completed_retention(&mut self) {
-            self.retain_completed = true;
-        }
-
-        fn suspend_completed_retention(&mut self) {
+        fn clear_completed_bodies(&mut self) {
             self.retain_completed = false;
-            self.order.clear();
+            self.body_order.clear();
             self.bodies.clear();
             self.body_bytes = 0;
         }
@@ -4131,7 +3949,7 @@ mod runtime {
     }
 
     pub(crate) fn hls_payload_cache_body_bytes() -> u64 {
-        HLS_PAYLOAD_CACHE.with(|cache| cache.borrow().body_bytes)
+        HLS_ASSET_CACHE.with(|cache| cache.borrow().body_bytes)
     }
 
     fn hls_payload_cache_capacity_bytes() -> u64 {
@@ -4154,23 +3972,20 @@ mod runtime {
         if range.is_some() && !if_range_allows_range(if_range.as_deref(), &etag) {
             range = None;
         }
-        let progressive_generation = HLS_PREFETCH_SESSION.with(|session| {
-            let session = session.borrow();
-            (session.generation != 0
-                && !session.live_start
-                && !session.timeline_rebasing
-                && session
-                    .progressive_start
-                    .as_ref()
-                    .is_some_and(|start| start.0 == reference))
-            .then_some(session.generation)
+        let progressive_stamp = HLS_PLAYBACK.with(|playback| {
+            let playback = playback.borrow();
+            let session = &playback.session;
+            let stamp = session.stamp();
+            (stamp.generation != 0 && session.progressive_current(&reference, stamp))
+                .then_some(stamp)
         });
-        let progressive_start = progressive_generation.is_some();
+        let progressive_start = progressive_stamp.is_some();
         if method != "HEAD" && range.is_none() && progressive_start {
             let Some(resolved) = resolve_hls_asset(weeb3.clone(), reference.clone()).await else {
                 return FetchResponse::error(503, "weeb-3 did not retrieve resource");
             };
             if !resolved.metadata.is_manifest && resolved.prefetched_body.is_none() {
+                hls_foreground_context(&reference, false);
                 let mut headers = hls_bytes_headers(&reference, resolved.metadata.mime);
                 headers.push((
                     "Content-Length".to_string(),
@@ -4196,14 +4011,16 @@ mod runtime {
                 return FetchResponse::error(413, "HLS manifest exceeds the supported size limit");
             }
             let mime = hls_payload_mime(&bytes);
-            remember_hls_asset_metadata(
-                &reference,
-                HlsAssetMetadata {
-                    payload_size,
-                    mime,
-                    is_manifest: looks_like_manifest,
-                },
-            );
+            HLS_ASSET_CACHE.with(|cache| {
+                cache.borrow_mut().remember_metadata(
+                    &reference,
+                    HlsAssetMetadata {
+                        payload_size,
+                        mime,
+                        is_manifest: looks_like_manifest,
+                    },
+                );
+            });
             if looks_like_manifest {
                 let Some(rewritten) = rewrite_hls_manifest(&bytes, &local_bytes_base) else {
                     return FetchResponse::error(502, "invalid nested HLS manifest");
@@ -4226,7 +4043,8 @@ mod runtime {
             return FetchResponse::error(503, "weeb-3 did not retrieve resource");
         };
 
-        if resolved.metadata.is_manifest {
+        let is_manifest = resolved.metadata.is_manifest;
+        let (size, mime, body) = if is_manifest {
             if resolved.metadata.payload_size > MAX_STREAM_FEED_PAYLOAD_BYTES as u64 {
                 return FetchResponse::error(413, "HLS manifest exceeds the supported size limit");
             }
@@ -4245,46 +4063,19 @@ mod runtime {
                 Ok(size) => size,
                 Err(_) => return FetchResponse::error(502, "HLS manifest is too large"),
             };
-            let mut headers = hls_bytes_headers(&reference, "application/vnd.apple.mpegurl");
-
-            if method == "HEAD" {
-                headers.push(("Content-Length".to_string(), size.to_string()));
-                return FetchResponse::ok(200, headers, None);
-            }
-
-            let (start, end) = match parse_single_range(range.as_deref(), size) {
-                Some(Ok(range)) => range,
-                Some(Err(())) | None => {
-                    headers.push(("Content-Range".to_string(), format!("bytes */{}", size)));
-                    headers.push(("Content-Length".to_string(), "0".to_string()));
-                    return FetchResponse::ok(416, headers, None);
-                }
-            };
-            let start_index = match usize::try_from(start) {
-                Ok(start) => start,
-                Err(_) => return FetchResponse::error(502, "HLS manifest range is too large"),
-            };
-            let end_index = match usize::try_from(end.saturating_add(1)) {
-                Ok(end) => end,
-                Err(_) => return FetchResponse::error(502, "HLS manifest range is too large"),
-            };
-            let Some(selected) = bytes.get(start_index..end_index) else {
-                return FetchResponse::error(
-                    502,
-                    "HLS manifest range is outside its representation",
-                );
-            };
-            let selected = selected.to_vec();
-            headers.push(("Content-Length".to_string(), selected.len().to_string()));
-            headers.push((
-                "Content-Range".to_string(),
-                format!("bytes {}-{}/{}", start, end, size),
-            ));
-            return FetchResponse::ok(206, headers, Some(selected));
-        }
-
-        let size = resolved.metadata.payload_size;
-        let mut headers = hls_bytes_headers(&reference, resolved.metadata.mime);
+            (
+                size,
+                "application/vnd.apple.mpegurl",
+                Some(Either::Left(bytes)),
+            )
+        } else {
+            (
+                resolved.metadata.payload_size,
+                resolved.metadata.mime,
+                resolved.prefetched_body.map(Either::Right),
+            )
+        };
+        let mut headers = hls_bytes_headers(&reference, mime);
         if method == "HEAD" {
             headers.push(("Content-Length".to_string(), size.to_string()));
             return FetchResponse::ok(200, headers, None);
@@ -4302,17 +4093,32 @@ mod runtime {
             .checked_sub(start)
             .and_then(|length| length.checked_add(1))
             .and_then(|length| usize::try_from(length).ok());
-        let bytes = if let Some(body) = resolved.prefetched_body {
+        let bytes = if let Some(body) = body {
+            let (too_large, outside) = if is_manifest {
+                (
+                    "HLS manifest range is too large",
+                    "HLS manifest range is outside its representation",
+                )
+            } else {
+                (
+                    "HLS range is too large",
+                    "HLS range is outside its cached representation",
+                )
+            };
             let start_index = match usize::try_from(start) {
                 Ok(start) => start,
-                Err(_) => return FetchResponse::error(502, "HLS range is too large"),
+                Err(_) => return FetchResponse::error(502, too_large),
             };
             let end_index = match usize::try_from(end.saturating_add(1)) {
                 Ok(end) => end,
-                Err(_) => return FetchResponse::error(502, "HLS range is too large"),
+                Err(_) => return FetchResponse::error(502, too_large),
             };
-            let Some(selected) = body.get(start_index..end_index) else {
-                return FetchResponse::error(502, "HLS range is outside its cached representation");
+            let body = match &body {
+                Either::Left(body) => body.get(start_index..end_index),
+                Either::Right(body) => body.get(start_index..end_index),
+            };
+            let Some(selected) = body else {
+                return FetchResponse::error(502, outside);
             };
             selected.to_vec()
         } else {
@@ -4323,7 +4129,7 @@ mod runtime {
                         reference.clone(),
                         start,
                         end,
-                        progressive_generation,
+                        progressive_stamp.map(|stamp| stamp.generation),
                     )
                     .await;
                 if expected_len.is_some_and(|expected| bytes.len() == expected) {
@@ -4338,23 +4144,19 @@ mod runtime {
             }
             bytes
         };
-        if !expected_len.is_some_and(|expected| bytes.len() == expected) {
+        if !is_manifest && !expected_len.is_some_and(|expected| bytes.len() == expected) {
             return FetchResponse::error(502, "weeb-3 returned a short HLS byte range");
         }
-        if (end.saturating_add(1) >= MEDIA_STORAGE_WINDOW_BYTES.saturating_mul(2)
-            || end.saturating_add(1) == size)
-            && let Some((successor, generation, timeline_epoch)) =
-                take_hls_progressive_successor(&reference)
+        if !is_manifest
+            && (end.saturating_add(1) >= MEDIA_STORAGE_WINDOW_BYTES.saturating_mul(2)
+                || end.saturating_add(1) == size)
+            && let Some((successor, stamp)) = take_hls_progressive_successor(&reference)
         {
             let successor_client = weeb3.clone();
             let source_reference = reference.clone();
             spawn_local(async move {
                 async_std::task::sleep(Duration::from_millis(MEDIA_PREFETCH_BATCH_YIELD_MS)).await;
-                if !hls_progressive_successor_admission_is_current(
-                    &source_reference,
-                    generation,
-                    timeline_epoch,
-                ) {
+                if !hls_progressive_successor_admission_is_current(&source_reference, stamp) {
                     return;
                 }
                 let size =
@@ -4366,25 +4168,17 @@ mod runtime {
                 let Some(size) = size.filter(|size| *size > 0) else {
                     return;
                 };
-                if !hls_progressive_successor_admission_is_current(
-                    &source_reference,
-                    generation,
-                    timeline_epoch,
-                ) {
+                if !hls_progressive_successor_admission_is_current(&source_reference, stamp) {
                     return;
                 }
                 let prefix_end = size
                     .saturating_sub(1)
                     .min(HLS_PROGRESSIVE_SUCCESSOR_PREFIX_BYTES.saturating_sub(1));
                 let prefix = successor_client
-                    .retrieve_hls_payload_range(successor, 0, prefix_end, Some(generation))
+                    .retrieve_hls_payload_range(successor, 0, prefix_end, Some(stamp.generation))
                     .await;
                 if u64::try_from(prefix.len()).ok() == Some(prefix_end.saturating_add(1)) {
-                    mark_hls_progressive_successor_prefix_ready(
-                        &source_reference,
-                        generation,
-                        timeline_epoch,
-                    );
+                    mark_hls_progressive_successor_prefix_ready(&source_reference, stamp);
                 }
             });
         }
@@ -4429,69 +4223,57 @@ mod runtime {
     }
 
     fn remember_hls_media_plan(manifest: &[u8]) {
-        let live_start = HLS_PREFETCH_SESSION.with(|session| session.borrow().live_start);
         let Some(mut segments) = hls_segment_identities(manifest) else {
             return;
         };
-        if live_start && segments.len() > HLS_MEDIA_PLAN_MAX_REFERENCES {
-            segments.drain(..segments.len() - HLS_MEDIA_PLAN_MAX_REFERENCES);
-        } else {
-            segments.truncate(HLS_MEDIA_PLAN_MAX_REFERENCES);
-        }
-        HLS_PAYLOAD_DURATIONS.with(|durations| {
-            let mut durations = durations.borrow_mut();
-            if durations.len().saturating_add(segments.len()) > HLS_MEDIA_PLAN_MAX_REFERENCES {
-                durations.clear();
+        HLS_PLAYBACK.with(|playback| {
+            let mut playback = playback.borrow_mut();
+            let plan_limit = if hls_is_finalized(manifest) {
+                HLS_ARCHIVE_MEDIA_PLAN_MAX_REFERENCES
+            } else {
+                HLS_MEDIA_PLAN_MAX_REFERENCES
+            };
+            playback.plans.resize(plan_limit);
+            if playback.session.live_start && segments.len() > plan_limit {
+                segments.drain(..segments.len() - plan_limit);
+            } else {
+                segments.truncate(plan_limit);
+            }
+            if playback.durations.len().saturating_add(segments.len()) > plan_limit {
+                playback.durations.clear();
             }
             for segment in &segments {
-                durations.insert(
+                playback.durations.insert(
                     segment.reference.clone(),
                     f64::from_bits(segment.duration_bits),
                 );
             }
-        });
-        let references = segments
-            .into_iter()
-            .map(|segment| segment.reference)
-            .collect();
-        let early_overlap_limit =
-            if hls_media_sequence(manifest).is_some_and(|sequence| sequence > 0) {
+            let references = segments
+                .into_iter()
+                .map(|segment| segment.reference)
+                .collect();
+            let overlap = if hls_media_sequence(manifest).is_some_and(|sequence| sequence > 0) {
                 HLS_ROLLING_EARLY_OVERLAP_SEGMENTS
             } else {
                 HLS_EXACT_NEXT_OVERLAP_SEGMENTS
             };
-        HLS_MEDIA_PLANS.with(|plans| {
-            plans.borrow_mut().install_with_early_overlap_limit(
-                references,
-                early_overlap_limit,
-                live_start,
-            )
+            let live_start = playback.session.live_start;
+            playback
+                .plans
+                .install_with_early_overlap_limit(references, overlap, live_start);
         });
     }
 
     fn cached_hls_payload(reference: &str) -> Option<Arc<[u8]>> {
-        let reference = reference.to_ascii_lowercase();
-        HLS_PAYLOAD_CACHE.with(|cache| cache.borrow_mut().body(&reference))
+        HLS_ASSET_CACHE.with(|cache| {
+            cache
+                .borrow_mut()
+                .body(&reference.to_ascii_lowercase(), false)
+        })
     }
 
     fn cached_hls_payload_size(reference: &str) -> Option<u64> {
-        let reference = reference.to_ascii_lowercase();
-        HLS_PAYLOAD_CACHE
-            .with(|cache| cache.borrow().body_size(&reference))
-            .or_else(|| HLS_PAYLOAD_SIZES.with(|sizes| sizes.borrow().get(&reference).copied()))
-    }
-
-    fn remember_hls_payload_size(reference: &str, size: u64) {
-        if size == 0 {
-            return;
-        }
-        HLS_PAYLOAD_SIZES.with(|sizes| {
-            let mut sizes = sizes.borrow_mut();
-            if !sizes.contains_key(reference) && sizes.len() >= HLS_MEDIA_PLAN_MAX_REFERENCES {
-                sizes.clear();
-            }
-            sizes.insert(reference.to_ascii_lowercase(), size);
-        });
+        HLS_ASSET_CACHE.with(|cache| cache.borrow().payload_size(&reference.to_ascii_lowercase()))
     }
 
     fn start_hls_payload_size_probe(
@@ -4504,73 +4286,74 @@ mod runtime {
             let _ = sender.try_send(Some(size));
             return receiver;
         }
-
-        let should_spawn = HLS_PAYLOAD_SIZE_PROBES.with(|probes| {
-            let mut probes = probes.borrow_mut();
-            if let Some(waiters) = probes.get_mut(&reference) {
+        let start = HLS_ASSET_CACHE.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            if let Some(waiters) = cache.size_pending.get_mut(&reference) {
                 waiters.retain(|waiter| !waiter.is_closed());
-                if waiters.len() >= HLS_PAYLOAD_SINGLEFLIGHT_MAX_WAITERS {
-                    let _ = sender.try_send(None);
-                } else {
+                if waiters.len() < HLS_PAYLOAD_SINGLEFLIGHT_MAX_WAITERS {
                     waiters.push(sender);
+                } else {
+                    let _ = sender.try_send(None);
                 }
                 false
             } else {
-                probes.insert(reference.clone(), vec![sender]);
+                cache.size_pending.insert(reference.clone(), vec![sender]);
                 true
             }
         });
-        if !should_spawn {
-            return receiver;
+        if start {
+            spawn_local(async move {
+                let size = match hex::decode(&reference) {
+                    Ok(address) => retrieve_decoded_data_root(&address, &weeb3.chunk_port.0)
+                        .await
+                        .map(|root| root.span),
+                    Err(_) => None,
+                };
+                HLS_ASSET_CACHE.with(|cache| {
+                    let mut cache = cache.borrow_mut();
+                    if let Some(size) = size {
+                        cache.remember_size(&reference, size);
+                    }
+                    for waiter in cache.size_pending.remove(&reference).unwrap_or_default() {
+                        let _ = waiter.try_send(size);
+                    }
+                });
+            });
         }
-
-        // Dropping a probe waiter does not cancel its detached accounting owner.
-        spawn_local(async move {
-            let size = weeb3.hls_payload_size(reference.clone()).await;
-            if let Some(size) = size {
-                remember_hls_payload_size(&reference, size);
-            }
-            let waiters = HLS_PAYLOAD_SIZE_PROBES
-                .with(|probes| probes.borrow_mut().remove(&reference).unwrap_or_default());
-            for waiter in waiters {
-                let _ = waiter.try_send(size);
-            }
-        });
-
         receiver
     }
 
     fn publish_hls_stream_generation(client: Arc<Weeb3>, generation: u64) {
         spawn_local(async move {
-            let _ = client
-                .publish_hls_generation(HLS_STREAM_KEY.to_string(), generation)
-                .await;
+            if let Some(cancel) =
+                stream_retrieve_cancel_token(HLS_STREAM_KEY.to_string(), generation)
+            {
+                register_retrieve_cancel_token(&client.retrieve_cancel_generations, &Some(cancel))
+                    .await;
+            }
         });
     }
 
     fn begin_hls_prefetch_session(
         client: Arc<Weeb3>,
-        normalized_owner: String,
-        normalized_topic: String,
+        owner: String,
+        topic: String,
         presentation_id: u64,
         live_start: bool,
     ) {
-        // Reclaim completed ranges; pending/dispatched reads keep their transport.
         clear_completed_bzz_media_ranges();
-        HLS_PAYLOAD_CACHE.with(|cache| cache.borrow_mut().resume_completed_retention());
-        let generation = HLS_PREFETCH_SESSION.with(|session| {
-            let mut session = session.borrow_mut();
+        HLS_ASSET_CACHE.with(|cache| cache.borrow_mut().retain_completed = true);
+        let generation = HLS_PLAYBACK.with(|playback| {
+            let mut playback = playback.borrow_mut();
+            let session = &mut playback.session;
             session.client = Some(client.clone());
-            session.feed_identity = Some((
-                normalized_owner.to_ascii_lowercase(),
-                normalized_topic.to_ascii_lowercase(),
-            ));
+            session.feed_identity = Some((owner.to_ascii_lowercase(), topic.to_ascii_lowercase()));
             session.sequence_zero_runway_closed = false;
             session.presentation_id = presentation_id;
             session.live_start = live_start;
             session.live_history_active = false;
             session.startup_deadline_ms = hls_monotonic_now_ms()
-                .map(|now_ms| now_ms + HLS_INITIAL_RESPONSE_BUDGET_MS)
+                .map(|now| now + HLS_INITIAL_RESPONSE_BUDGET_MS)
                 .unwrap_or(0.0);
             session.startup_overlap_plans.clear();
             session.mode = HlsPrefetchMode::Inactive;
@@ -4656,8 +4439,9 @@ mod runtime {
         topic: &str,
     ) -> Option<u64> {
         let identity = (owner.to_ascii_lowercase(), topic.to_ascii_lowercase());
-        HLS_PREFETCH_SESSION.with(|session| {
-            let session = session.borrow();
+        HLS_PLAYBACK.with(|playback| {
+            let playback = playback.borrow();
+            let session = &playback.session;
             (session.generation != 0
                 && session
                     .client
@@ -4668,63 +4452,54 @@ mod runtime {
         })
     }
 
-    fn take_hls_progressive_successor(reference: &str) -> Option<(String, u64, u64)> {
-        HLS_PREFETCH_SESSION.with(|session| {
-            let mut session = session.borrow_mut();
-            if session.live_start || session.timeline_rebasing || session.generation == 0 {
+    fn take_hls_progressive_successor(reference: &str) -> Option<(String, PlaybackStamp)> {
+        HLS_PLAYBACK.with(|playback| {
+            let mut playback = playback.borrow_mut();
+            let session = &mut playback.session;
+            let stamp = session.stamp();
+            if stamp.generation == 0
+                || session.live_start
+                || session.timeline_rebasing
+                || !session.progressive_current(reference, stamp)
+            {
                 return None;
             }
-            let generation = session.generation;
-            let timeline_epoch = session.timeline_epoch;
-            let start = session.progressive_start.as_mut()?;
-            if start.0 != reference {
+            let runway = session.runway.as_mut()?;
+            if runway.first != reference || runway.successor_prefix_started {
                 return None;
             }
-            let successor = start.1.take()?;
-            Some((successor, generation, timeline_epoch))
+            let successor = runway.successor.clone()?;
+            runway.successor_prefix_started = true;
+            Some((successor, stamp))
         })
     }
 
-    fn mark_hls_progressive_successor_prefix_ready(
-        reference: &str,
-        generation: u64,
-        timeline_epoch: u64,
-    ) {
-        HLS_PREFETCH_SESSION.with(|session| {
-            let mut session = session.borrow_mut();
-            if session.generation == generation
-                && session.timeline_epoch == timeline_epoch
-                && !session.live_start
-                && !session.timeline_rebasing
-                && !session.sequence_zero_runway_closed
-                && session
-                    .progressive_start
-                    .as_ref()
-                    .is_some_and(|(first, successor)| {
-                        successor.is_none() && first.eq_ignore_ascii_case(reference)
-                    })
+    fn mark_hls_progressive_successor_prefix_ready(reference: &str, stamp: PlaybackStamp) {
+        HLS_PLAYBACK.with(|playback| {
+            let mut playback = playback.borrow_mut();
+            let session = &mut playback.session;
+            if session.progressive_current(reference, stamp)
+                && let Some(runway) = session.runway.as_mut()
+                && runway.first == reference
+                && runway.successor_prefix_started
             {
-                session.progressive_successor_prefix_ready = true;
+                runway.successor_prefix_ready = true;
             }
         });
     }
 
     fn hls_progressive_successor_admission_is_current(
         reference: &str,
-        generation: u64,
-        timeline_epoch: u64,
+        stamp: PlaybackStamp,
     ) -> bool {
-        HLS_PREFETCH_SESSION.with(|session| {
-            let session = session.borrow();
-            session.generation == generation
-                && session.timeline_epoch == timeline_epoch
-                && !session.live_start
-                && !session.timeline_rebasing
-                && !session.sequence_zero_runway_closed
+        HLS_PLAYBACK.with(|playback| {
+            let playback = playback.borrow();
+            let session = &playback.session;
+            session.progressive_current(reference, stamp)
                 && session
-                    .progressive_start
+                    .runway
                     .as_ref()
-                    .is_some_and(|start| start.0 == reference)
+                    .is_some_and(|runway| runway.first == reference)
         })
     }
 
@@ -4734,8 +4509,9 @@ mod runtime {
         topic: &str,
     ) -> Option<(u64, bool)> {
         let identity = (owner.to_ascii_lowercase(), topic.to_ascii_lowercase());
-        HLS_PREFETCH_SESSION.with(|session| {
-            let session = session.borrow();
+        HLS_PLAYBACK.with(|playback| {
+            let playback = playback.borrow();
+            let session = &playback.session;
             (session.generation != 0
                 && session.presentation_id != 0
                 && session
@@ -4747,55 +4523,49 @@ mod runtime {
         })
     }
 
-    fn hls_playback_prefetch_admission_is_current(
-        generation: u64,
-        timeline_epoch: u64,
-        schedule_id: u64,
-        plan_id: u64,
-    ) -> bool {
-        HLS_PREFETCH_SESSION.with(|session| {
-            let session = session.borrow();
-            session.generation == generation
-                && session.timeline_epoch == timeline_epoch
+    fn hls_playback_prefetch_admission_is_current(ticket: PrefetchTicket) -> bool {
+        HLS_PLAYBACK.with(|playback| {
+            let playback = playback.borrow();
+            let session = &playback.session;
+            session.stamp() == ticket.stamp
                 && !session.timeline_rebasing
                 && session.mode != HlsPrefetchMode::Inactive
                 && session
                     .tracks
-                    .get(&plan_id)
-                    .is_some_and(|track| track.schedule_id == schedule_id)
+                    .get(&ticket.plan_id)
+                    .is_some_and(|track| track.schedule_id == ticket.schedule_id)
                 && (session.mode == HlsPrefetchMode::Sustained
-                    || hls_monotonic_now_ms()
-                        .is_some_and(|now_ms| now_ms < session.startup_deadline_ms))
+                    || hls_monotonic_now_ms().is_some_and(|now| now < session.startup_deadline_ms))
         })
     }
 
     fn set_hls_prefetch_mode(mode: HlsPrefetchMode) {
-        HLS_PREFETCH_SESSION.with(|session| {
-            let mut session = session.borrow_mut();
+        HLS_PLAYBACK.with(|playback| {
+            let mut playback = playback.borrow_mut();
             if mode == HlsPrefetchMode::Inactive {
-                session.sequence_zero_runway_closed = true;
+                playback.session.sequence_zero_runway_closed = true;
             }
-            session.mode = mode;
+            playback.session.mode = mode;
         });
     }
 
     fn activate_hls_prefetch_warmup() {
-        let now_ms = hls_monotonic_now_ms();
-        HLS_PREFETCH_SESSION.with(|session| {
-            let mut session = session.borrow_mut();
-            let timeline_rebasing = session.timeline_rebasing;
-            let initial_warmup = !timeline_rebasing && session.mode == HlsPrefetchMode::Inactive;
-            if timeline_rebasing {
-                // Retire the old timeline before its LEVEL_LOADED callback can schedule work.
+        let now = hls_monotonic_now_ms();
+        HLS_PLAYBACK.with(|playback| {
+            let mut playback = playback.borrow_mut();
+            let session = &mut playback.session;
+            let rebasing = session.timeline_rebasing;
+            let initial = !rebasing && session.mode == HlsPrefetchMode::Inactive;
+            if rebasing {
                 session.advance_timeline();
                 session.tracks.clear();
                 session.startup_overlap_plans.clear();
                 session.timeline_rebasing = false;
             }
-            if (initial_warmup || timeline_rebasing)
-                && let Some(now_ms) = now_ms
+            if (initial || rebasing)
+                && let Some(now) = now
             {
-                session.startup_deadline_ms = now_ms + HLS_INITIAL_RESPONSE_BUDGET_MS;
+                session.startup_deadline_ms = now + HLS_INITIAL_RESPONSE_BUDGET_MS;
             }
             if session.mode != HlsPrefetchMode::Sustained {
                 session.mode = HlsPrefetchMode::StartupOnly;
@@ -4804,9 +4574,9 @@ mod runtime {
     }
 
     fn retire_hls_prefetch_timeline() {
-        HLS_PREFETCH_SESSION.with(|session| {
-            let mut session = session.borrow_mut();
-            // Keep immutable work joinable while replacing the archive timeline.
+        HLS_PLAYBACK.with(|playback| {
+            let mut playback = playback.borrow_mut();
+            let session = &mut playback.session;
             session.timeline_rebasing = true;
             session.advance_timeline();
             session.tracks.clear();
@@ -4814,32 +4584,26 @@ mod runtime {
         });
     }
 
-    fn retire_hls_prefetch_plan(
-        generation: u64,
-        timeline_epoch: u64,
-        schedule_id: u64,
-        plan_id: u64,
-    ) {
-        HLS_PREFETCH_SESSION.with(|session| {
-            let mut session = session.borrow_mut();
-            if session.generation != generation || session.timeline_epoch != timeline_epoch {
-                return;
-            }
-            if !session
-                .tracks
-                .get(&plan_id)
-                .is_some_and(|track| track.schedule_id == schedule_id)
+    fn retire_hls_prefetch_plan(ticket: PrefetchTicket) {
+        HLS_PLAYBACK.with(|playback| {
+            let mut playback = playback.borrow_mut();
+            let session = &mut playback.session;
+            if session.stamp() == ticket.stamp
+                && session
+                    .tracks
+                    .get(&ticket.plan_id)
+                    .is_some_and(|track| track.schedule_id == ticket.schedule_id)
             {
-                return;
+                session.tracks.remove(&ticket.plan_id);
+                session.startup_overlap_plans.remove(&ticket.plan_id);
             }
-            session.tracks.remove(&plan_id);
-            session.startup_overlap_plans.remove(&plan_id);
         });
     }
 
     fn invalidate_hls_prefetch_session() {
-        let publish = HLS_PREFETCH_SESSION.with(|session| {
-            let mut session = session.borrow_mut();
+        let publish = HLS_PLAYBACK.with(|playback| {
+            let mut playback = playback.borrow_mut();
+            let session = &mut playback.session;
             session.mode = HlsPrefetchMode::Inactive;
             let generation = session.advance_generation();
             session.tracks.clear();
@@ -4857,138 +4621,133 @@ mod runtime {
 
     fn hls_foreground_context(reference: &str, cached: bool) -> HlsForegroundContext {
         let reference = reference.to_ascii_lowercase();
-        let preferred = HLS_PREFETCH_SESSION.with(|session| {
-            session
-                .borrow()
-                .tracks
-                .iter()
-                .map(|(plan_id, track)| (*plan_id, track.last_foreground_position))
-                .collect::<HashMap<_, _>>()
-        });
-        let selection = HLS_MEDIA_PLANS.with(|plans| plans.borrow().cursor(&reference, &preferred));
-        let cursor = selection.as_ref().map(|selection| selection.cursor.clone());
-        let superseded_plan_ids = selection
-            .as_ref()
-            .map(|selection| selection.superseded_plan_ids.as_slice())
-            .unwrap_or_default();
-
         let mut publish = None;
-        let (generation, timeline_epoch, schedule_id, progressive_successor_prefix_ready) =
-            HLS_PREFETCH_SESSION.with(|session| {
-                let mut session = session.borrow_mut();
-                let mut selected_schedule_id = None;
+        let (stamp, ticket, cursor, progressive_ready, seek_successor) =
+            HLS_PLAYBACK.with(|playback| {
+                let mut playback = playback.borrow_mut();
+                let preferred = playback
+                    .session
+                    .tracks
+                    .iter()
+                    .map(|(plan, track)| (*plan, track.last_foreground_position))
+                    .collect::<HashMap<_, _>>();
+                let selection = playback.plans.cursor(&reference, &preferred);
+                let cursor = selection.as_ref().map(|selected| selected.cursor.clone());
+                let superseded = selection
+                    .as_ref()
+                    .map(|selected| selected.superseded_plan_ids.as_slice())
+                    .unwrap_or_default();
+                let session = &mut playback.session;
                 if session.generation == 0 {
                     session.advance_generation();
                 }
 
+                let mut seek_successor = None;
+                let mut schedule_id = None;
                 if let Some(cursor) = &cursor {
-                    let transition = session.tracks.get(&cursor.plan_id).map(|track| {
-                        hls_foreground_cursor_transition(
-                            track.last_foreground_position,
-                            cursor.position,
-                            cached,
-                        )
+                    let transition = session.tracks.get(&cursor.plan.id).map(|track| {
+                        if cached && cursor.position < track.last_foreground_position {
+                            (false, track.last_foreground_position)
+                        } else {
+                            (
+                                track.last_foreground_position.abs_diff(cursor.position) > 1,
+                                cursor.position,
+                            )
+                        }
                     });
-                    let is_seek = transition.is_some_and(|(is_seek, _)| is_seek);
-                    if is_seek {
+                    if transition.is_some_and(|transition| transition.0) {
+                        let completed_media_payloads = session
+                            .completed_media_payloads
+                            .min(HLS_TWO_BODY_PREFETCH_COMPLETIONS);
                         let generation = session.advance_generation();
+                        session.completed_media_payloads = completed_media_payloads;
+                        seek_successor = cursor
+                            .plan
+                            .references
+                            .get(cursor.position.saturating_add(1))
+                            .cloned();
                         publish = session
                             .client
                             .as_ref()
                             .cloned()
                             .map(|client| (client, generation));
                     }
-
-                    if !session.tracks.contains_key(&cursor.plan_id) {
+                    if !session.tracks.contains_key(&cursor.plan.id) {
                         session.schedule_sequence =
                             next_nonzero_generation(session.schedule_sequence);
-                        let schedule_id = session.schedule_sequence;
                         session.tracks.insert(
-                            cursor.plan_id,
+                            cursor.plan.id,
                             HlsPrefetchTrack {
-                                schedule_id,
+                                schedule_id: session.schedule_sequence,
                                 last_foreground_position: cursor.position,
-                                running_generation: None,
+                                running: None,
                                 last_touch: 0,
                             },
                         );
                     }
-                    if let Some(track) = session.tracks.get_mut(&cursor.plan_id) {
-                        track.last_foreground_position = transition
-                            .map(|(_, next_position)| next_position)
-                            .unwrap_or(cursor.position);
-                        selected_schedule_id = Some(track.schedule_id);
-                    }
                     session.track_touch_sequence =
                         next_nonzero_generation(session.track_touch_sequence);
                     let touch = session.track_touch_sequence;
-                    if let Some(track) = session.tracks.get_mut(&cursor.plan_id) {
+                    if let Some(track) = session.tracks.get_mut(&cursor.plan.id) {
+                        track.last_foreground_position = transition
+                            .map(|transition| transition.1)
+                            .unwrap_or(cursor.position);
                         track.last_touch = touch;
+                        schedule_id = Some(track.schedule_id);
                     }
 
-                    let tracks = session
-                        .tracks
-                        .iter()
-                        .map(|(plan_id, track)| HlsTrackRetention {
-                            plan_id: *plan_id,
-                            last_touch: track.last_touch,
-                            running: track.running_generation == Some(session.generation),
-                        })
-                        .collect::<Vec<_>>();
-                    for plan_id in hls_track_ids_to_prune(
-                        &tracks,
-                        cursor.plan_id,
-                        superseded_plan_ids,
-                        HLS_PREFETCH_TRACK_MAX_ENTRIES,
-                    ) {
-                        session.tracks.remove(&plan_id);
-                        session.startup_overlap_plans.remove(&plan_id);
-                    }
+                    session.prune_tracks(cursor.plan.id, superseded);
                 }
-                let progressive_successor_prefix_ready = cursor.as_ref().is_some_and(|cursor| {
-                    !session.live_start
-                        && !session.timeline_rebasing
-                        && session.progressive_successor_prefix_ready
-                        && cursor.position == 1
-                        && session
-                            .progressive_start
-                            .as_ref()
-                            .is_some_and(|(first, successor)| {
-                                successor.is_none()
-                                    && cursor.references.first().is_some_and(|reference| {
-                                        reference.eq_ignore_ascii_case(first)
+
+                let stamp = session.stamp();
+                let ticket = cursor
+                    .as_ref()
+                    .zip(schedule_id)
+                    .map(|(cursor, schedule_id)| PrefetchTicket {
+                        stamp,
+                        plan_id: cursor.plan.id,
+                        schedule_id,
+                    });
+                let progressive_ready =
+                    cursor.as_ref().is_some_and(|cursor| {
+                        !session.live_start
+                            && !session.timeline_rebasing
+                            && cursor.position == 1
+                            && session.runway.as_ref().is_some_and(|runway| {
+                                runway.successor_prefix_started
+                                    && runway.successor_prefix_ready
+                                    && runway
+                                        .successor
+                                        .as_ref()
+                                        .is_some_and(|successor| successor == &reference)
+                                    && cursor.plan.references.first().is_some_and(|first| {
+                                        first.eq_ignore_ascii_case(&runway.first)
                                     })
                             })
-                });
-                (
-                    session.generation,
-                    session.timeline_epoch,
-                    selected_schedule_id,
-                    progressive_successor_prefix_ready,
-                )
+                    });
+                (stamp, ticket, cursor, progressive_ready, seek_successor)
             });
         if let Some((client, generation)) = publish {
             publish_hls_stream_generation(client, generation);
         }
-
         HlsForegroundContext {
-            generation,
-            timeline_epoch,
-            schedule_id,
+            stamp,
+            ticket,
             cursor,
-            progressive_successor_prefix_ready,
+            progressive_successor_prefix_ready: progressive_ready,
+            seek_successor,
         }
     }
 
     fn hls_generation_current(generation: u64) -> bool {
-        HLS_PREFETCH_SESSION.with(|session| session.borrow().generation == generation)
+        HLS_PLAYBACK.with(|playback| playback.borrow().session.generation == generation)
     }
 
-    fn hls_foreground_retry_is_current(generation: u64, timeline_epoch: u64) -> bool {
-        HLS_PREFETCH_SESSION.with(|session| {
-            let session = session.borrow();
-            session.generation == generation
-                && session.timeline_epoch == timeline_epoch
+    fn hls_foreground_retry_is_current(stamp: PlaybackStamp) -> bool {
+        HLS_PLAYBACK.with(|playback| {
+            let playback = playback.borrow();
+            let session = &playback.session;
+            session.stamp() == stamp
                 && !session.timeline_rebasing
                 && session.mode != HlsPrefetchMode::Inactive
         })
@@ -4997,70 +4756,35 @@ mod runtime {
     fn hls_monotonic_now_ms() -> Option<f64> {
         let window = web_sys::window()?;
         let performance = Reflect::get(window.as_ref(), &JsValue::from_str("performance")).ok()?;
-        let now = Reflect::get(&performance, &JsValue::from_str("now")).ok()?;
-        now.dyn_ref::<Function>()
-            .and_then(|now| now.call0(&performance).ok())?
+        Reflect::get(&performance, &JsValue::from_str("now"))
+            .ok()?
+            .dyn_ref::<Function>()?
+            .call0(&performance)
+            .ok()?
             .as_f64()
-            .filter(|now_ms| now_ms.is_finite())
+            .filter(|now| now.is_finite())
     }
 
-    fn claim_hls_exact_next_overlap(
-        generation: u64,
-        timeline_epoch: u64,
-        schedule_id: u64,
-        cursor: &HlsMediaCursor,
-    ) -> bool {
-        HLS_PREFETCH_SESSION.with(|session| {
-            let mut session = session.borrow_mut();
-            if session.generation != generation
-                || session.timeline_epoch != timeline_epoch
+    fn claim_hls_exact_next_overlap(ticket: PrefetchTicket, cursor: &HlsMediaCursor) -> bool {
+        HLS_PLAYBACK.with(|playback| {
+            let mut playback = playback.borrow_mut();
+            let session = &mut playback.session;
+            if session.stamp() != ticket.stamp
                 || session.timeline_rebasing
                 || !session
                     .tracks
-                    .get(&cursor.plan_id)
-                    .is_some_and(|track| track.schedule_id == schedule_id)
-                || session.startup_overlap_plans.contains(&cursor.plan_id)
+                    .get(&ticket.plan_id)
+                    .is_some_and(|track| track.schedule_id == ticket.schedule_id)
+                || session.startup_overlap_plans.contains(&cursor.plan.id)
             {
                 return false;
             }
-            session.startup_overlap_plans.insert(cursor.plan_id)
+            session.startup_overlap_plans.insert(cursor.plan.id)
         })
     }
 
-    fn hls_prefetch_ticket_current(
-        plan_id: u64,
-        generation: u64,
-        timeline_epoch: u64,
-        schedule_id: u64,
-    ) -> bool {
-        HLS_PREFETCH_SESSION.with(|session| {
-            let session = session.borrow();
-            session.mode != HlsPrefetchMode::Inactive
-                && session.generation == generation
-                && session.timeline_epoch == timeline_epoch
-                && !session.timeline_rebasing
-                && session.tracks.get(&plan_id).is_some_and(|track| {
-                    track.schedule_id == schedule_id && track.running_generation == Some(generation)
-                })
-        })
-    }
-
-    fn hls_sustained_prefetch_ticket_current(
-        plan_id: u64,
-        generation: u64,
-        timeline_epoch: u64,
-        schedule_id: u64,
-    ) -> bool {
-        HLS_PREFETCH_SESSION.with(|session| {
-            let session = session.borrow();
-            session.mode == HlsPrefetchMode::Sustained
-                && session.generation == generation
-                && session.timeline_epoch == timeline_epoch
-                && !session.timeline_rebasing
-                && session.tracks.get(&plan_id).is_some_and(|track| {
-                    track.schedule_id == schedule_id && track.running_generation == Some(generation)
-                })
-        })
+    fn hls_prefetch_ticket_current(ticket: PrefetchTicket, sustained: bool) -> bool {
+        HLS_PLAYBACK.with(|playback| playback.borrow().session.ticket_current(ticket, sustained))
     }
 
     fn start_hls_payload_load(
@@ -5070,62 +4794,46 @@ mod runtime {
         generation: u64,
     ) -> HlsPayloadLoadRole {
         let reference = reference.to_ascii_lowercase();
-        let (prefetch_limit, timeline_epoch) = HLS_PREFETCH_SESSION.with(|session| {
-            let session = session.borrow();
-            let limit = if session.generation != generation
-                || session.completed_media_payloads < HLS_SERIAL_PREFETCH_COMPLETIONS
-            {
-                1
-            } else if session.completed_media_payloads < HLS_TWO_BODY_PREFETCH_COMPLETIONS {
-                2
-            } else {
-                HLS_PREFETCH_BODY_MAX_PARALLEL
-            };
-            (limit, session.timeline_epoch)
+        let (limit, timeline_epoch) = HLS_PLAYBACK.with(|playback| {
+            let playback = playback.borrow();
+            (
+                playback.session.body_parallelism(generation),
+                playback.session.timeline_epoch,
+            )
         });
-        let role = HLS_PAYLOAD_CACHE.with(|cache| {
+        let role = HLS_ASSET_CACHE.with(|cache| {
             cache
                 .borrow_mut()
-                .load_role(&reference, prefetch, generation, prefetch_limit)
+                .load_role(&reference, prefetch, generation, limit)
         });
-
         if let HlsPayloadLoadRole::Lead(_, load_id) = &role {
             let load_id = *load_id;
-            let leader_reference = reference;
             spawn_local(async move {
                 let bytes = weeb3
                     .retrieve_hls_payload_cancellable(
-                        leader_reference.clone(),
+                        reference.clone(),
                         HLS_STREAM_KEY.to_string(),
                         generation,
                     )
                     .await;
                 let result = if bytes.is_empty() {
-                    Err(format!(
-                        "weeb-3 did not retrieve HLS fragment {}",
-                        leader_reference
-                    ))
+                    Err(format!("weeb-3 did not retrieve HLS fragment {reference}"))
                 } else {
-                    let size = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
-                    remember_hls_payload_size(&leader_reference, size);
                     Ok(Arc::<[u8]>::from(bytes))
                 };
-                let media_payload = result
+                let media = result
                     .as_ref()
                     .is_ok_and(|body| !is_hls_manifest(body.as_ref()));
                 let hot = hls_generation_current(generation);
-                let owned = HLS_PAYLOAD_CACHE.with(|cache| {
-                    cache.borrow_mut().finish_load(
-                        &leader_reference,
-                        generation,
-                        load_id,
-                        result,
-                        hot,
-                    )
+                let owned = HLS_ASSET_CACHE.with(|cache| {
+                    cache
+                        .borrow_mut()
+                        .finish_load(&reference, generation, load_id, result, hot)
                 });
-                if owned && hot && media_payload {
-                    HLS_PREFETCH_SESSION.with(|session| {
-                        let mut session = session.borrow_mut();
+                if owned && hot && media {
+                    HLS_PLAYBACK.with(|playback| {
+                        let mut playback = playback.borrow_mut();
+                        let session = &mut playback.session;
                         if session.generation == generation
                             && session.timeline_epoch == timeline_epoch
                         {
@@ -5136,7 +4844,6 @@ mod runtime {
                 }
             });
         }
-
         role
     }
 
@@ -5156,8 +4863,8 @@ mod runtime {
 
     async fn wait_for_pending_hls_payload(reference: &str) -> Option<Arc<[u8]>> {
         let reference = reference.to_ascii_lowercase();
-        let generation = HLS_PREFETCH_SESSION.with(|session| session.borrow().generation);
-        let role = HLS_PAYLOAD_CACHE
+        let generation = HLS_PLAYBACK.with(|playback| playback.borrow().session.generation);
+        let role = HLS_ASSET_CACHE
             .with(|cache| cache.borrow_mut().join_pending(&reference, generation))?;
         wait_hls_payload_load(role).await.ok()
     }
@@ -5165,85 +4872,66 @@ mod runtime {
     fn spawn_hls_prefetch_stages(
         weeb3: Arc<Weeb3>,
         cursor: HlsMediaCursor,
-        generation: u64,
-        timeline_epoch: u64,
-        schedule_id: u64,
+        ticket: PrefetchTicket,
         foreground_ready: mpsc::Receiver<bool>,
     ) -> bool {
-        let Some(now_ms) = hls_monotonic_now_ms() else {
+        let Some(now) = hls_monotonic_now_ms() else {
             return false;
         };
-        let should_spawn = HLS_PREFETCH_SESSION.with(|session| {
-            let mut session = session.borrow_mut();
-            if session.mode == HlsPrefetchMode::Inactive
-                || session.generation != generation
-                || session.timeline_epoch != timeline_epoch
+        let start = HLS_PLAYBACK.with(|playback| {
+            let mut playback = playback.borrow_mut();
+            let session = &mut playback.session;
+            if session.stamp() != ticket.stamp
                 || session.timeline_rebasing
+                || session.mode == HlsPrefetchMode::Inactive
+                || !session
+                    .tracks
+                    .get(&ticket.plan_id)
+                    .is_some_and(|track| track.schedule_id == ticket.schedule_id)
+                || (session.mode != HlsPrefetchMode::Sustained
+                    && now >= session.startup_deadline_ms)
             {
                 return false;
             }
-            if session.mode != HlsPrefetchMode::Sustained && now_ms >= session.startup_deadline_ms {
-                return false;
-            }
-            let Some(track) = session.tracks.get_mut(&cursor.plan_id) else {
+            let Some(track) = session.tracks.get_mut(&ticket.plan_id) else {
                 return false;
             };
-            if track.schedule_id != schedule_id {
+            if track.running.is_some() {
                 return false;
             }
-            if track.running_generation == Some(generation) {
-                return false;
-            }
-            track.running_generation = Some(generation);
+            track.running = Some(ticket);
             true
         });
-        if !should_spawn {
+        if !start {
             return false;
         }
 
         spawn_local(async move {
-            let restart_weeb3 = weeb3.clone();
-            prefetch_hls_media_stages(
-                weeb3,
-                cursor.clone(),
-                generation,
-                timeline_epoch,
-                schedule_id,
-                foreground_ready,
-            )
-            .await;
-            let restart_position = HLS_PREFETCH_SESSION.with(|session| {
-                let mut session = session.borrow_mut();
-                let session_is_current = session.mode == HlsPrefetchMode::Sustained
-                    && session.generation == generation
-                    && session.timeline_epoch == timeline_epoch
+            let restart_client = weeb3.clone();
+            prefetch_hls_media_stages(weeb3, cursor.clone(), ticket, foreground_ready).await;
+            let restart = HLS_PLAYBACK.with(|playback| {
+                let mut playback = playback.borrow_mut();
+                let session = &mut playback.session;
+                let current = session.mode == HlsPrefetchMode::Sustained
+                    && session.stamp() == ticket.stamp
                     && !session.timeline_rebasing;
-                let Some(track) = session.tracks.get_mut(&cursor.plan_id) else {
-                    return None;
-                };
-                if track.schedule_id != schedule_id || track.running_generation != Some(generation)
-                {
+                let track = session.tracks.get_mut(&ticket.plan_id)?;
+                if track.running != Some(ticket) {
                     return None;
                 }
-                track.running_generation = None;
-                (session_is_current
+                track.running = None;
+                (current
                     && track.last_foreground_position > cursor.position
-                    && track.last_foreground_position.saturating_add(1) < cursor.references.len())
+                    && track.last_foreground_position.saturating_add(1)
+                        < cursor.plan.references.len())
                 .then_some(track.last_foreground_position)
             });
-            if let Some(position) = restart_position {
-                let mut restart_cursor = cursor;
-                restart_cursor.position = position;
-                let (foreground_ready_out, foreground_ready_in) = mpsc::bounded(1);
-                let _ = foreground_ready_out.try_send(true);
-                spawn_hls_prefetch_stages(
-                    restart_weeb3,
-                    restart_cursor,
-                    generation,
-                    timeline_epoch,
-                    schedule_id,
-                    foreground_ready_in,
-                );
+            if let Some(position) = restart {
+                let mut cursor = cursor;
+                cursor.position = position;
+                let (ready_out, ready_in) = mpsc::bounded(1);
+                let _ = ready_out.try_send(true);
+                spawn_hls_prefetch_stages(restart_client, cursor, ticket, ready_in);
             }
         });
         true
@@ -5252,34 +4940,26 @@ mod runtime {
     async fn hls_payload_size_for_prefetch(
         weeb3: Arc<Weeb3>,
         reference: String,
-        plan_id: u64,
-        generation: u64,
-        timeline_epoch: u64,
-        schedule_id: u64,
+        ticket: PrefetchTicket,
     ) -> Option<u64> {
         for attempt in 0..HLS_PREFETCH_MAX_ATTEMPTS {
             if let Some(size) = cached_hls_payload_size(&reference) {
                 return Some(size);
             }
-            if !hls_prefetch_ticket_current(plan_id, generation, timeline_epoch, schedule_id) {
+            if !hls_prefetch_ticket_current(ticket, false) {
                 return None;
             }
-
             let size = start_hls_payload_size_probe(weeb3.clone(), reference.clone())
                 .recv()
                 .await
                 .ok()
                 .flatten();
-            if !hls_prefetch_ticket_current(plan_id, generation, timeline_epoch, schedule_id) {
-                return None;
-            }
-            if size.is_some() {
+            if !hls_prefetch_ticket_current(ticket, false) || size.is_some() {
                 return size;
             }
-            if attempt.saturating_add(1) < HLS_PREFETCH_MAX_ATTEMPTS {
+            if attempt + 1 < HLS_PREFETCH_MAX_ATTEMPTS {
                 async_std::task::sleep(Duration::from_millis(
-                    HLS_PAYLOAD_SIZE_RETRY_DELAY_MS
-                        .saturating_mul(attempt.saturating_add(1) as u64),
+                    HLS_PAYLOAD_SIZE_RETRY_DELAY_MS * (attempt + 1) as u64,
                 ))
                 .await;
             }
@@ -5290,83 +4970,69 @@ mod runtime {
     type HlsPrefetchProbeResult = (usize, Option<u64>);
     type HlsPrefetchBodyResult = (usize, Result<Arc<[u8]>, String>);
 
-    enum HlsPrefetchProgress {
+    enum HlsPrefetchWork {
         Probe(HlsPrefetchProbeResult),
         Body(HlsPrefetchBodyResult),
     }
 
-    enum HlsStartupProgress {
-        Foreground(bool),
-        Work(HlsPrefetchProgress),
+    struct PrefetchRun {
+        ticket: PrefetchTicket,
+        cursor: HlsMediaCursor,
+        next_probe: usize,
+        next_admit: usize,
+        ready_sizes: BTreeMap<usize, Option<u64>>,
+        planned_bytes: u64,
+        startup: bool,
     }
 
-    async fn probe_hls_payload_size_at_position(
-        weeb3: Arc<Weeb3>,
-        reference: String,
-        plan_id: u64,
-        generation: u64,
-        timeline_epoch: u64,
-        schedule_id: u64,
-        position: usize,
-    ) -> HlsPrefetchProbeResult {
-        (
-            position,
-            hls_payload_size_for_prefetch(
-                weeb3,
-                reference,
-                plan_id,
-                generation,
-                timeline_epoch,
-                schedule_id,
-            )
-            .await,
-        )
+    impl PrefetchRun {
+        fn probe_positions(&mut self) -> std::ops::Range<usize> {
+            let end = self
+                .cursor
+                .plan
+                .references
+                .len()
+                .min(
+                    self.next_admit
+                        .saturating_add(HLS_PREFETCH_PROBE_MAX_PARALLEL),
+                )
+                .max(self.next_probe);
+            let positions = self.next_probe..end;
+            self.next_probe = end;
+            positions
+        }
+
+        fn ready_size(&self) -> Option<(usize, Option<u64>)> {
+            self.ready_sizes
+                .get(&self.next_admit)
+                .copied()
+                .map(|size| (self.next_admit, size))
+        }
+
+        fn commit_size(&mut self) {
+            self.ready_sizes.remove(&self.next_admit);
+            self.next_admit = self.next_admit.saturating_add(1);
+        }
     }
 
-    async fn next_hls_prefetch_progress<ProbeFuture, BodyFuture>(
+    async fn next_hls_prefetch_work<ProbeFuture, BodyFuture>(
         probes: &mut FuturesUnordered<ProbeFuture>,
         bodies: &mut FuturesUnordered<BodyFuture>,
-    ) -> Option<HlsPrefetchProgress>
+    ) -> Option<HlsPrefetchWork>
     where
         ProbeFuture: Future<Output = HlsPrefetchProbeResult>,
         BodyFuture: Future<Output = HlsPrefetchBodyResult>,
     {
         match (probes.is_empty(), bodies.is_empty()) {
             (false, false) => {
-                let probe = Box::pin(probes.next());
-                let body = Box::pin(bodies.next());
-                match select(probe, body).await {
-                    Either::Left((result, _)) => result.map(HlsPrefetchProgress::Probe),
-                    Either::Right((result, _)) => result.map(HlsPrefetchProgress::Body),
+                match select(Box::pin(probes.next()), Box::pin(bodies.next())).await {
+                    Either::Left((result, _)) => result.map(HlsPrefetchWork::Probe),
+                    Either::Right((result, _)) => result.map(HlsPrefetchWork::Body),
                 }
             }
-            (false, true) => probes.next().await.map(HlsPrefetchProgress::Probe),
-            (true, false) => bodies.next().await.map(HlsPrefetchProgress::Body),
+            (false, true) => probes.next().await.map(HlsPrefetchWork::Probe),
+            (true, false) => bodies.next().await.map(HlsPrefetchWork::Body),
             (true, true) => None,
-        }
-    }
-
-    async fn next_hls_startup_progress<ProbeFuture, BodyFuture>(
-        foreground_ready: &mpsc::Receiver<bool>,
-        probes: &mut FuturesUnordered<ProbeFuture>,
-        bodies: &mut FuturesUnordered<BodyFuture>,
-    ) -> HlsStartupProgress
-    where
-        ProbeFuture: Future<Output = HlsPrefetchProbeResult>,
-        BodyFuture: Future<Output = HlsPrefetchBodyResult>,
-    {
-        if probes.is_empty() && bodies.is_empty() {
-            return HlsStartupProgress::Foreground(foreground_ready.recv().await == Ok(true));
-        }
-
-        let foreground = Box::pin(foreground_ready.recv());
-        let work = Box::pin(next_hls_prefetch_progress(probes, bodies));
-        match select(foreground, work).await {
-            Either::Left((result, _)) => HlsStartupProgress::Foreground(result == Ok(true)),
-            Either::Right((Some(progress), _)) => HlsStartupProgress::Work(progress),
-            Either::Right((None, foreground)) => {
-                HlsStartupProgress::Foreground(foreground.await == Ok(true))
-            }
         }
     }
 
@@ -5374,28 +5040,29 @@ mod runtime {
         weeb3: Arc<Weeb3>,
         reference: String,
         role: HlsPayloadLoadRole,
-        plan_id: u64,
-        generation: u64,
-        timeline_epoch: u64,
-        schedule_id: u64,
+        ticket: PrefetchTicket,
         position: usize,
-    ) -> (usize, Result<Arc<[u8]>, String>) {
+    ) -> HlsPrefetchBodyResult {
         let mut result = wait_hls_payload_load(role).await;
         let mut attempts = 1;
         while result.is_err()
             && attempts < HLS_PREFETCH_MAX_ATTEMPTS
-            && hls_prefetch_ticket_current(plan_id, generation, timeline_epoch, schedule_id)
+            && hls_prefetch_ticket_current(ticket, false)
         {
-            // Retry only terminal failures so accounting cannot be duplicated.
             async_std::task::sleep(Duration::from_millis(
-                HLS_PAYLOAD_RETRY_DELAY_MS.saturating_mul(attempts as u64),
+                HLS_PAYLOAD_RETRY_DELAY_MS * attempts as u64,
             ))
             .await;
-            if !hls_prefetch_ticket_current(plan_id, generation, timeline_epoch, schedule_id) {
+            if !hls_prefetch_ticket_current(ticket, false) {
                 break;
             }
-            let retry = start_hls_payload_load(weeb3.clone(), reference.clone(), true, generation);
-            if matches!(&retry, HlsPayloadLoadRole::AtCapacity) {
+            let retry = start_hls_payload_load(
+                weeb3.clone(),
+                reference.clone(),
+                true,
+                ticket.stamp.generation,
+            );
+            if matches!(retry, HlsPayloadLoadRole::AtCapacity) {
                 continue;
             }
             result = wait_hls_payload_load(retry).await;
@@ -5407,263 +5074,196 @@ mod runtime {
     async fn prefetch_hls_media_stages(
         weeb3: Arc<Weeb3>,
         cursor: HlsMediaCursor,
-        generation: u64,
-        timeline_epoch: u64,
-        schedule_id: u64,
+        ticket: PrefetchTicket,
         foreground_ready: mpsc::Receiver<bool>,
     ) {
-        let ahead_limit_bytes =
-            media_prefetch_ahead_limit_bytes(hls_payload_cache_capacity_bytes());
-        let startup_target_bytes = HLS_STARTUP_LOOKAHEAD_BYTES.min(ahead_limit_bytes);
-        let startup_body_limit = HLS_STARTUP_BODY_MAX_PARALLEL.min(cursor.early_overlap_limit);
-        let mut planned_bytes = 0_u64;
+        let ahead_limit = media_prefetch_ahead_limit_bytes(hls_payload_cache_capacity_bytes());
+        let startup_limit = HLS_STARTUP_LOOKAHEAD_BYTES.min(ahead_limit);
+        let startup_bodies = HLS_STARTUP_BODY_MAX_PARALLEL.min(cursor.plan.early_overlap_limit);
         let first_position = cursor.position.saturating_add(1);
-        let mut probe_window = HlsOrderedProbeWindow::new(first_position);
+        let mut run = PrefetchRun {
+            ticket,
+            cursor,
+            next_probe: first_position,
+            next_admit: first_position,
+            ready_sizes: BTreeMap::new(),
+            planned_bytes: 0,
+            startup: true,
+        };
         let mut size_probes = FuturesUnordered::new();
-        let mut loads = FuturesUnordered::new();
+        let mut bodies = FuturesUnordered::new();
         let mut budget_blocked = false;
 
-        // Detached leaders outlive scheduler observers and settle accounting.
-        let foreground_succeeded = loop {
-            if !hls_prefetch_ticket_current(cursor.plan_id, generation, timeline_epoch, schedule_id)
-            {
-                break false;
-            }
-            let mut capacity_blocked = false;
-
-            if !budget_blocked && planned_bytes < startup_target_bytes {
-                for position in probe_window
-                    .fill_positions(cursor.references.len(), HLS_PREFETCH_PROBE_MAX_PARALLEL)
-                {
-                    let reference = cursor.references[position].clone();
-                    size_probes.push(probe_hls_payload_size_at_position(
-                        weeb3.clone(),
-                        reference,
-                        cursor.plan_id,
-                        generation,
-                        timeline_epoch,
-                        schedule_id,
-                        position,
-                    ));
-                }
-            }
-
-            while !budget_blocked
-                && loads.len() < startup_body_limit
-                && planned_bytes < startup_target_bytes
-            {
-                let Some((position, size)) = probe_window.next_ready() else {
-                    break;
-                };
-                let Some(size) = size else {
-                    let _ = probe_window.commit_ready();
-                    return;
-                };
-                let reference = cursor.references[position].clone();
-                let batch = plan_media_prefetch_batch(
-                    planned_bytes,
-                    startup_target_bytes,
-                    ahead_limit_bytes,
-                    &[size],
-                );
-                if batch.unit_count == 0 {
-                    budget_blocked = true;
-                    break;
-                }
-
-                let role =
-                    start_hls_payload_load(weeb3.clone(), reference.clone(), true, generation);
-                if matches!(&role, HlsPayloadLoadRole::AtCapacity) {
-                    capacity_blocked = true;
-                    break;
-                }
-                let _ = probe_window.commit_ready();
-                loads.push(wait_hls_prefetch_load_with_retry(
-                    weeb3.clone(),
-                    reference,
-                    role,
-                    cursor.plan_id,
-                    generation,
-                    timeline_epoch,
-                    schedule_id,
-                    position,
-                ));
-                planned_bytes = batch.planned_end_bytes;
-            }
-
-            if capacity_blocked {
-                let foreground = Box::pin(foreground_ready.recv());
-                let retry = Box::pin(async_std::task::sleep(Duration::from_millis(
-                    MEDIA_PREFETCH_BATCH_YIELD_MS,
-                )));
-                match select(foreground, retry).await {
-                    Either::Left((result, _)) => break result == Ok(true),
-                    Either::Right(_) => continue,
-                }
-            }
-
-            match next_hls_startup_progress(&foreground_ready, &mut size_probes, &mut loads).await {
-                HlsStartupProgress::Foreground(result) => break result,
-                HlsStartupProgress::Work(HlsPrefetchProgress::Probe((position, size))) => {
-                    probe_window.complete(position, size);
-                }
-                HlsStartupProgress::Work(HlsPrefetchProgress::Body((_position, result))) => {
-                    if result.is_err() {
-                        return;
-                    }
-                }
-            }
-        };
-
-        if !foreground_succeeded
-            || !hls_prefetch_ticket_current(cursor.plan_id, generation, timeline_epoch, schedule_id)
-        {
-            return;
-        }
-        if !hls_sustained_prefetch_ticket_current(
-            cursor.plan_id,
-            generation,
-            timeline_epoch,
-            schedule_id,
-        ) {
-            return;
-        }
-
         loop {
-            if !hls_sustained_prefetch_ticket_current(
-                cursor.plan_id,
-                generation,
-                timeline_epoch,
-                schedule_id,
-            ) {
+            if !hls_prefetch_ticket_current(run.ticket, !run.startup) {
                 return;
             }
-            let mut capacity_blocked = false;
+            let byte_limit = if run.startup {
+                startup_limit
+            } else {
+                ahead_limit
+            };
+            let body_limit = if run.startup {
+                startup_bodies
+            } else {
+                HLS_PREFETCH_BODY_MAX_PARALLEL
+            };
 
-            if planned_bytes >= ahead_limit_bytes {
-                while let Some(result) = loads.next().await {
-                    if !hls_sustained_prefetch_ticket_current(
-                        cursor.plan_id,
-                        generation,
-                        timeline_epoch,
-                        schedule_id,
-                    ) {
+            if run.planned_bytes >= byte_limit {
+                if run.startup {
+                    if foreground_ready.recv().await != Ok(true) {
                         return;
                     }
-                    let (_position, Ok(_body)) = result else {
-                        return;
+                    run.startup = false;
+                    budget_blocked = false;
+                    continue;
+                }
+                loop {
+                    let completed: Option<HlsPrefetchBodyResult> = bodies.next().await;
+                    let Some((_, result)) = completed else {
+                        break;
                     };
+                    if !hls_prefetch_ticket_current(run.ticket, true) || result.is_err() {
+                        return;
+                    }
                 }
                 return;
             }
 
             if !budget_blocked {
-                for position in probe_window
-                    .fill_positions(cursor.references.len(), HLS_PREFETCH_PROBE_MAX_PARALLEL)
-                {
-                    let reference = cursor.references[position].clone();
-                    size_probes.push(probe_hls_payload_size_at_position(
-                        weeb3.clone(),
-                        reference,
-                        cursor.plan_id,
-                        generation,
-                        timeline_epoch,
-                        schedule_id,
-                        position,
-                    ));
+                for position in run.probe_positions() {
+                    let client = weeb3.clone();
+                    let reference = run.cursor.plan.references[position].clone();
+                    let ticket = run.ticket;
+                    size_probes.push(async move {
+                        (
+                            position,
+                            hls_payload_size_for_prefetch(client, reference, ticket).await,
+                        )
+                    });
                 }
             }
 
-            while !budget_blocked
-                && loads.len() < HLS_PREFETCH_BODY_MAX_PARALLEL
-                && planned_bytes < ahead_limit_bytes
-            {
-                let Some((position, size)) = probe_window.next_ready() else {
+            let mut capacity_blocked = false;
+            while !budget_blocked && bodies.len() < body_limit && run.planned_bytes < byte_limit {
+                let Some((position, size)) = run.ready_size() else {
                     break;
                 };
                 let Some(size) = size else {
-                    let _ = probe_window.commit_ready();
+                    run.commit_size();
                     return;
                 };
-                let reference = cursor.references[position].clone();
-                let batch = plan_media_prefetch_batch(
-                    planned_bytes,
-                    ahead_limit_bytes,
-                    ahead_limit_bytes,
-                    &[size],
-                );
+                let batch =
+                    plan_media_prefetch_batch(run.planned_bytes, byte_limit, ahead_limit, &[size]);
                 if batch.unit_count == 0 {
                     budget_blocked = true;
                     break;
                 }
-                let role =
-                    start_hls_payload_load(weeb3.clone(), reference.clone(), true, generation);
-                if matches!(&role, HlsPayloadLoadRole::AtCapacity) {
+                let reference = run.cursor.plan.references[position].clone();
+                let role = start_hls_payload_load(
+                    weeb3.clone(),
+                    reference.clone(),
+                    true,
+                    run.ticket.stamp.generation,
+                );
+                if matches!(role, HlsPayloadLoadRole::AtCapacity) {
                     capacity_blocked = true;
                     break;
                 }
-                let stagger_admission = matches!(&role, HlsPayloadLoadRole::Lead(_, _));
-                let _ = probe_window.commit_ready();
-                loads.push(wait_hls_prefetch_load_with_retry(
+                let stagger = !run.startup && matches!(role, HlsPayloadLoadRole::Lead(_, _));
+                run.commit_size();
+                bodies.push(wait_hls_prefetch_load_with_retry(
                     weeb3.clone(),
                     reference,
                     role,
-                    cursor.plan_id,
-                    generation,
-                    timeline_epoch,
-                    schedule_id,
+                    run.ticket,
                     position,
                 ));
-                planned_bytes = batch.planned_end_bytes;
-                if stagger_admission {
+                run.planned_bytes = batch.planned_end_bytes;
+                if stagger {
                     async_std::task::sleep(HLS_NEXT_RESERVE_STAGGER).await;
-                    if !hls_sustained_prefetch_ticket_current(
-                        cursor.plan_id,
-                        generation,
-                        timeline_epoch,
-                        schedule_id,
-                    ) {
+                    if !hls_prefetch_ticket_current(run.ticket, true) {
                         return;
                     }
                 }
             }
 
             if capacity_blocked {
-                async_std::task::sleep(Duration::from_millis(MEDIA_PREFETCH_BATCH_YIELD_MS)).await;
+                if run.startup {
+                    match select(
+                        Box::pin(foreground_ready.recv()),
+                        Box::pin(async_std::task::sleep(Duration::from_millis(
+                            MEDIA_PREFETCH_BATCH_YIELD_MS,
+                        ))),
+                    )
+                    .await
+                    {
+                        Either::Left((ready, _)) => {
+                            if ready != Ok(true) {
+                                return;
+                            }
+                            run.startup = false;
+                            budget_blocked = false;
+                        }
+                        Either::Right(_) => {}
+                    }
+                } else {
+                    async_std::task::sleep(Duration::from_millis(MEDIA_PREFETCH_BATCH_YIELD_MS))
+                        .await;
+                }
                 continue;
             }
 
-            if budget_blocked {
-                while let Some((_position, result)) = loads.next().await {
-                    if !hls_sustained_prefetch_ticket_current(
-                        cursor.plan_id,
-                        generation,
-                        timeline_epoch,
-                        schedule_id,
-                    ) {
-                        return;
-                    }
-                    if result.is_err() {
+            if budget_blocked && !run.startup {
+                loop {
+                    let completed: Option<HlsPrefetchBodyResult> = bodies.next().await;
+                    let Some((_, result)) = completed else {
+                        break;
+                    };
+                    if !hls_prefetch_ticket_current(run.ticket, true) || result.is_err() {
                         return;
                     }
                 }
                 return;
             }
 
-            if loads.is_empty() && size_probes.is_empty() {
-                return;
-            }
-
-            match next_hls_prefetch_progress(&mut size_probes, &mut loads).await {
-                Some(HlsPrefetchProgress::Probe((position, size))) => {
-                    probe_window.complete(position, size);
-                }
-                Some(HlsPrefetchProgress::Body((_position, result))) => {
-                    if result.is_err() {
+            let work = if run.startup {
+                if size_probes.is_empty() && bodies.is_empty() {
+                    if foreground_ready.recv().await != Ok(true) {
                         return;
                     }
+                    run.startup = false;
+                    budget_blocked = false;
+                    continue;
                 }
-                None => return,
+                match select(
+                    Box::pin(foreground_ready.recv()),
+                    Box::pin(next_hls_prefetch_work(&mut size_probes, &mut bodies)),
+                )
+                .await
+                {
+                    Either::Left((ready, _)) => {
+                        if ready != Ok(true) {
+                            return;
+                        }
+                        run.startup = false;
+                        budget_blocked = false;
+                        continue;
+                    }
+                    Either::Right((work, _)) => work,
+                }
+            } else {
+                next_hls_prefetch_work(&mut size_probes, &mut bodies).await
+            };
+
+            match work {
+                Some(HlsPrefetchWork::Probe((position, size))) => {
+                    if position >= run.next_admit && position < run.next_probe {
+                        run.ready_sizes.insert(position, size);
+                    }
+                }
+                Some(HlsPrefetchWork::Body((_, Ok(_)))) => {}
+                Some(HlsPrefetchWork::Body((_, Err(_)))) | None => return,
             }
         }
     }
@@ -5673,106 +5273,77 @@ mod runtime {
         reference: String,
     ) -> Option<Arc<[u8]>> {
         let reference = reference.to_ascii_lowercase();
-        let foreground_cached =
-            HLS_PAYLOAD_CACHE.with(|cache| cache.borrow().bodies.contains_key(&reference));
-        let context = hls_foreground_context(&reference, foreground_cached);
-        let prefetch_head_ready = foreground_cached || context.progressive_successor_prefix_ready;
-        let foreground =
-            start_hls_payload_load(weeb3.clone(), reference.clone(), false, context.generation);
-        if let Some(overlap_schedule_id) = context.schedule_id
-            && let Some((cursor, exact_successors)) = context.cursor.as_ref().and_then(|cursor| {
-                let exact_successors = cursor
+        let cached = HLS_ASSET_CACHE.with(|cache| cache.borrow().bodies.contains_key(&reference));
+        let context = hls_foreground_context(&reference, cached);
+        let head_ready = cached || context.progressive_successor_prefix_ready;
+        let foreground = start_hls_payload_load(
+            weeb3.clone(),
+            reference.clone(),
+            false,
+            context.stamp.generation,
+        );
+
+        if let (Some(ticket), Some(cursor)) = (context.ticket, context.cursor.as_ref())
+            && let Some(successors) = {
+                let successors = cursor
+                    .plan
                     .references
                     .iter()
                     .skip(cursor.position.saturating_add(1))
                     .take(
                         cursor
+                            .plan
                             .early_overlap_limit
                             .min(HLS_EXACT_NEXT_OVERLAP_SEGMENTS),
                     )
                     .cloned()
                     .collect::<Vec<_>>();
-                (!exact_successors.is_empty()).then_some((cursor, exact_successors))
-            })
-            && claim_hls_exact_next_overlap(
-                context.generation,
-                context.timeline_epoch,
-                overlap_schedule_id,
-                cursor,
-            )
+                (!successors.is_empty()).then_some(successors)
+            }
+            && claim_hls_exact_next_overlap(ticket, cursor)
         {
-            let overlap_weeb3 = weeb3.clone();
-            let overlap_generation = context.generation;
-            let overlap_timeline_epoch = context.timeline_epoch;
-            let overlap_plan_id = cursor.plan_id;
-            let overlap_head_start_ms = if prefetch_head_ready {
-                0
-            } else {
-                u64::try_from(HLS_EXACT_NEXT_HEAD_START.as_millis()).unwrap_or(u64::MAX)
-            };
+            let client = weeb3.clone();
             spawn_local(async move {
-                let overlap_started_ms = hls_monotonic_now_ms();
-                let stagger_ms =
-                    u64::try_from(HLS_NEXT_RESERVE_STAGGER.as_millis()).unwrap_or(u64::MAX);
-                let capacity_retry_limit =
-                    u64::try_from(HLS_EXACT_OVERLAP_ADMISSION_BUDGET.as_millis())
-                        .unwrap_or(u64::MAX)
-                        .checked_div(MEDIA_PREFETCH_BATCH_YIELD_MS.max(1))
-                        .unwrap_or(u64::MAX)
-                        .max(1);
-                let mut capacity_retries = 0_u64;
-
-                for (successor, reference) in exact_successors.into_iter().enumerate() {
-                    let scheduled_offset_ms = overlap_head_start_ms.saturating_add(
-                        stagger_ms.saturating_mul(u64::try_from(successor).unwrap_or(u64::MAX)),
-                    );
-                    let remaining_ms = match (overlap_started_ms, hls_monotonic_now_ms()) {
-                        (Some(started_ms), Some(now_ms))
-                            if started_ms.is_finite()
-                                && now_ms.is_finite()
-                                && now_ms >= started_ms =>
-                        {
-                            let elapsed_ms = now_ms - started_ms;
-                            if elapsed_ms >= scheduled_offset_ms as f64 {
-                                0
-                            } else {
-                                (scheduled_offset_ms as f64 - elapsed_ms).ceil() as u64
-                            }
-                        }
-                        _ => scheduled_offset_ms,
-                    };
-                    if remaining_ms > 0 {
-                        async_std::task::sleep(Duration::from_millis(remaining_ms)).await;
+                let started = hls_monotonic_now_ms();
+                let first_delay = if head_ready {
+                    0
+                } else {
+                    HLS_EXACT_NEXT_HEAD_START.as_millis() as u64
+                };
+                let stagger = HLS_NEXT_RESERVE_STAGGER.as_millis() as u64;
+                let retry_limit = (HLS_EXACT_OVERLAP_ADMISSION_BUDGET.as_millis() as u64)
+                    / MEDIA_PREFETCH_BATCH_YIELD_MS.max(1);
+                let mut retries = 0_u64;
+                for (offset, successor) in successors.into_iter().enumerate() {
+                    let due = first_delay.saturating_add(stagger.saturating_mul(offset as u64));
+                    let remaining = started
+                        .zip(hls_monotonic_now_ms())
+                        .map(|(start, now)| (due as f64 - (now - start)).max(0.0).ceil() as u64)
+                        .unwrap_or(due);
+                    if remaining > 0 {
+                        async_std::task::sleep(Duration::from_millis(remaining)).await;
                     }
-
                     loop {
-                        if !hls_playback_prefetch_admission_is_current(
-                            overlap_generation,
-                            overlap_timeline_epoch,
-                            overlap_schedule_id,
-                            overlap_plan_id,
-                        ) {
+                        if !hls_playback_prefetch_admission_is_current(ticket) {
                             return;
                         }
                         match start_hls_payload_load(
-                            overlap_weeb3.clone(),
-                            reference.clone(),
+                            client.clone(),
+                            successor.clone(),
                             true,
-                            overlap_generation,
+                            ticket.stamp.generation,
                         ) {
-                            HlsPayloadLoadRole::AtCapacity => {
-                                if capacity_retries >= capacity_retry_limit {
-                                    return;
-                                }
-                                capacity_retries = capacity_retries.saturating_add(1);
+                            HlsPayloadLoadRole::AtCapacity if retries < retry_limit => {
+                                retries += 1;
                                 async_std::task::sleep(Duration::from_millis(
                                     MEDIA_PREFETCH_BATCH_YIELD_MS,
                                 ))
                                 .await;
                             }
-                            HlsPayloadLoadRole::Reject(_) => return,
+                            HlsPayloadLoadRole::AtCapacity | HlsPayloadLoadRole::Reject(_) => {
+                                return;
+                            }
                             role => {
-                                // Foreground retrieval will join this detached leader by hash.
                                 drop(role);
                                 break;
                             }
@@ -5782,31 +5353,15 @@ mod runtime {
             });
         }
 
-        let (foreground_ready_out, foreground_ready_in) = mpsc::bounded(1);
-        if let (Some(schedule_id), Some(cursor)) = (context.schedule_id, context.cursor.clone()) {
-            if prefetch_head_ready {
-                spawn_hls_prefetch_stages(
-                    weeb3.clone(),
-                    cursor,
-                    context.generation,
-                    context.timeline_epoch,
-                    schedule_id,
-                    foreground_ready_in,
-                );
+        let (ready_out, ready_in) = mpsc::bounded(1);
+        if let (Some(ticket), Some(cursor)) = (context.ticket, context.cursor.clone()) {
+            if head_ready {
+                spawn_hls_prefetch_stages(weeb3.clone(), cursor, ticket, ready_in);
             } else {
-                let prefetch_weeb3 = weeb3.clone();
-                let generation = context.generation;
-                let timeline_epoch = context.timeline_epoch;
+                let client = weeb3.clone();
                 spawn_local(async move {
                     async_std::task::sleep(HLS_EXACT_NEXT_HEAD_START).await;
-                    spawn_hls_prefetch_stages(
-                        prefetch_weeb3,
-                        cursor,
-                        generation,
-                        timeline_epoch,
-                        schedule_id,
-                        foreground_ready_in,
-                    );
+                    spawn_hls_prefetch_stages(client, cursor, ticket, ready_in);
                 });
             }
         }
@@ -5815,86 +5370,51 @@ mod runtime {
         let mut attempts = 1;
         while body.is_err()
             && attempts < HLS_FOREGROUND_MAX_ATTEMPTS
-            && hls_foreground_retry_is_current(context.generation, context.timeline_epoch)
+            && hls_foreground_retry_is_current(context.stamp)
         {
-            // Retry only after the shared accounting-sensitive result is terminal.
             async_std::task::sleep(Duration::from_millis(
-                HLS_PAYLOAD_RETRY_DELAY_MS.saturating_mul(attempts as u64),
+                HLS_PAYLOAD_RETRY_DELAY_MS * attempts as u64,
             ))
             .await;
-            if !hls_foreground_retry_is_current(context.generation, context.timeline_epoch) {
+            if !hls_foreground_retry_is_current(context.stamp) {
                 break;
             }
-            let retry =
-                start_hls_payload_load(weeb3.clone(), reference.clone(), false, context.generation);
-            body = wait_hls_payload_load(retry).await;
+            body = wait_hls_payload_load(start_hls_payload_load(
+                weeb3.clone(),
+                reference.clone(),
+                false,
+                context.stamp.generation,
+            ))
+            .await;
             attempts += 1;
         }
-        let foreground_succeeded = body.is_ok();
-        if !foreground_succeeded
-            && let (Some(schedule_id), Some(cursor)) =
-                (context.schedule_id, context.cursor.as_ref())
-        {
-            retire_hls_prefetch_plan(
-                context.generation,
-                context.timeline_epoch,
-                schedule_id,
-                cursor.plan_id,
-            );
+
+        let succeeded = body.is_ok();
+        if !succeeded && let Some(ticket) = context.ticket {
+            retire_hls_prefetch_plan(ticket);
         }
-        let _ = foreground_ready_out.try_send(foreground_succeeded);
-        if foreground_succeeded
-            && let (Some(schedule_id), Some(cursor)) = (context.schedule_id, context.cursor.clone())
+        if succeeded
+            && hls_foreground_retry_is_current(context.stamp)
+            && let Some(successor) = context.seek_successor
         {
+            let successor =
+                start_hls_payload_load(weeb3.clone(), successor, true, context.stamp.generation);
+            let _ = wait_hls_payload_load(successor).await;
+        }
+        let _ = ready_out.try_send(succeeded);
+        if succeeded && let (Some(ticket), Some(cursor)) = (context.ticket, context.cursor) {
             let (completed_out, completed_in) = mpsc::bounded(1);
             let _ = completed_out.try_send(true);
-            spawn_hls_prefetch_stages(
-                weeb3.clone(),
-                cursor,
-                context.generation,
-                context.timeline_epoch,
-                schedule_id,
-                completed_in,
-            );
+            spawn_hls_prefetch_stages(weeb3, cursor, ticket, completed_in);
         }
-        // Return foreground bytes immediately while detached lookahead continues.
         body.ok()
     }
 
-    fn cached_hls_asset_metadata(reference: &str) -> Option<HlsAssetMetadata> {
-        HLS_ASSET_METADATA_CACHE.with(|cache| {
-            let mut cache = cache.borrow_mut();
-            let state = cache.get_mut(&reference.to_ascii_lowercase())?;
-            state.last_touch = js_sys::Date::now();
-            Some(state.metadata.clone())
-        })
-    }
-
-    fn remember_hls_asset_metadata(reference: &str, metadata: HlsAssetMetadata) {
-        HLS_ASSET_METADATA_CACHE.with(|cache| {
-            let mut cache = cache.borrow_mut();
-            let key = reference.to_ascii_lowercase();
-            if !cache.contains_key(&key) && cache.len() >= HLS_ASSET_METADATA_CACHE_MAX_ENTRIES {
-                if let Some(oldest) = cache
-                    .iter()
-                    .min_by(|left, right| left.1.last_touch.total_cmp(&right.1.last_touch))
-                    .map(|(key, _)| key.clone())
-                {
-                    cache.remove(&oldest);
-                }
-            }
-            cache.insert(
-                key,
-                HlsAssetMetadataState {
-                    metadata,
-                    last_touch: js_sys::Date::now(),
-                },
-            );
-        });
-    }
-
     async fn resolve_hls_asset(weeb3: Arc<Weeb3>, reference: String) -> Option<ResolvedHlsAsset> {
-        if let Some(metadata) = cached_hls_asset_metadata(&reference) {
+        let reference = reference.to_ascii_lowercase();
+        if let Some(metadata) =
+            HLS_ASSET_CACHE.with(|cache| cache.borrow_mut().metadata(&reference))
+        {
             return Some(ResolvedHlsAsset {
                 metadata,
                 prefetched_body: cached_hls_payload(&reference),
@@ -5908,7 +5428,11 @@ mod runtime {
                 mime: hls_payload_mime(&body),
                 is_manifest,
             };
-            remember_hls_asset_metadata(&reference, metadata.clone());
+            HLS_ASSET_CACHE.with(|cache| {
+                cache
+                    .borrow_mut()
+                    .remember_metadata(&reference, metadata.clone());
+            });
             return Some(ResolvedHlsAsset {
                 metadata,
                 prefetched_body: Some(body),
@@ -5929,7 +5453,11 @@ mod runtime {
                 mime: "application/octet-stream",
                 is_manifest: false,
             };
-            remember_hls_asset_metadata(&reference, metadata.clone());
+            HLS_ASSET_CACHE.with(|cache| {
+                cache
+                    .borrow_mut()
+                    .remember_metadata(&reference, metadata.clone());
+            });
             return Some(ResolvedHlsAsset {
                 metadata,
                 prefetched_body: None,
@@ -5975,7 +5503,11 @@ mod runtime {
             mime,
             is_manifest,
         };
-        remember_hls_asset_metadata(&reference, metadata.clone());
+        HLS_ASSET_CACHE.with(|cache| {
+            cache
+                .borrow_mut()
+                .remember_metadata(&reference, metadata.clone());
+        });
         Some(ResolvedHlsAsset {
             metadata,
             prefetched_body,
@@ -6236,8 +5768,9 @@ mod runtime {
         let Some(generation) = hls_prefix_generation_for_feed(weeb3, owner, topic) else {
             return;
         };
-        if !HLS_PREFETCH_SESSION.with(|session| {
-            let session = session.borrow();
+        if !HLS_PLAYBACK.with(|playback| {
+            let playback = playback.borrow();
+            let session = &playback.session;
             session.live_start && session.generation == generation
         }) {
             return;
@@ -6275,7 +5808,7 @@ mod runtime {
         cache_key: &str,
         checked_after_ms: f64,
         deadline_ms: f64,
-        initial_check: Option<(u64, u64)>,
+        missing_is_terminal: bool,
     ) -> Option<FeedRouteSnapshot> {
         loop {
             let state = FEED_ROUTE_CACHE.with(|cache| {
@@ -6284,24 +5817,21 @@ mod runtime {
                         state.snapshot.clone(),
                         state.confirmed_head_index,
                         state.last_head_check,
-                        state.checking_token,
                     )
                 })
             });
             let now = js_sys::Date::now();
-            if let Some((snapshot, confirmed_head_index, last_head_check, checking_token)) = state {
+            if let Some((snapshot, confirmed_head_index, last_head_check)) = state {
                 if hls_live_frontier_is_ready(
                     snapshot.index,
                     confirmed_head_index,
                     last_head_check,
                     checked_after_ms,
-                    initial_check,
-                    checking_token,
                 ) || now >= deadline_ms
                 {
                     return Some(snapshot);
                 }
-            } else if initial_check.is_some() || now >= deadline_ms {
+            } else if missing_is_terminal || now >= deadline_ms {
                 return None;
             }
             async_std::task::sleep(Duration::from_millis(15)).await;
@@ -6326,8 +5856,9 @@ mod runtime {
         };
         let successor = references.next();
         let successor_probe = successor.clone();
-        let timeline_epoch = HLS_PREFETCH_SESSION.with(|session| {
-            let mut session = session.borrow_mut();
+        let stamp = HLS_PLAYBACK.with(|playback| {
+            let mut playback = playback.borrow_mut();
+            let session = &mut playback.session;
             if session.generation != generation
                 || session.live_start
                 || session.timeline_rebasing
@@ -6335,11 +5866,15 @@ mod runtime {
             {
                 return None;
             }
-            session.progressive_start = Some((reference.clone(), successor));
-            session.progressive_successor_prefix_ready = false;
-            Some(session.timeline_epoch)
+            session.runway = Some(BeginningRunway {
+                first: reference.clone(),
+                successor,
+                successor_prefix_started: false,
+                successor_prefix_ready: false,
+            });
+            Some(session.stamp())
         });
-        let Some(timeline_epoch) = timeline_epoch else {
+        let Some(stamp) = stamp else {
             return;
         };
 
@@ -6355,11 +5890,7 @@ mod runtime {
             let Some(size) = size.recv().await.ok().flatten() else {
                 return;
             };
-            if !hls_progressive_successor_admission_is_current(
-                &reference,
-                generation,
-                timeline_epoch,
-            ) {
+            if !hls_progressive_successor_admission_is_current(&reference, stamp) {
                 return;
             }
             let prefix_end = size
@@ -6433,14 +5964,12 @@ mod runtime {
             let mut cache = cache.borrow_mut();
             let selected_key = if cache.contains_key(&cache_key) {
                 cache_key.clone()
-            } else if sequence_zero_start_requested
+            } else if (sequence_zero_start_requested
                 && cache
                     .get(&canonical_cache_key)
-                    .is_some_and(|state| hls_media_sequence(&state.snapshot.body) == Some(0))
-            {
-                canonical_cache_key.clone()
-            } else if live_history_presentation_id.is_some()
-                && cache.contains_key(&canonical_cache_key)
+                    .is_some_and(|state| hls_media_sequence(&state.snapshot.body) == Some(0)))
+                || (live_history_presentation_id.is_some()
+                    && cache.contains_key(&canonical_cache_key))
             {
                 canonical_cache_key.clone()
             } else {
@@ -6455,18 +5984,13 @@ mod runtime {
                 state.snapshot.clone(),
                 refresh_head,
                 selected_key,
-                state.canonical_stabilization_running,
+                state.checking_token != 0,
                 state.last_head_check,
             ))
         });
 
-        if let Some((
-            mut snapshot,
-            refresh_head,
-            cached_key,
-            canonical_stabilization_running,
-            last_head_check,
-        )) = cached
+        if let Some((mut snapshot, refresh_head, cached_key, feed_task_running, last_head_check)) =
+            cached
             && !(start == HlsStart::Live
                 && index_hint.is_none()
                 && persisted_vod_index(active_profile().swarm_network_id, &owner, &topic)
@@ -6483,7 +6007,7 @@ mod runtime {
                 } else {
                     FeedFollowupMode::Canonical
                 };
-                if !canonical_stabilization_running {
+                if !feed_task_running {
                     schedule_feed_followup(
                         weeb3.clone(),
                         cached_key.clone(),
@@ -6499,7 +6023,7 @@ mod runtime {
                             &cached_key,
                             last_head_check,
                             live_frontier_deadline_ms,
-                            None,
+                            false,
                         )
                         .await
                         .unwrap_or(snapshot);
@@ -6819,7 +6343,7 @@ mod runtime {
                 network_id,
                 canonical_loaded.clone(),
                 false,
-                |_, _| {},
+                None,
             )
             .await
         } else {
@@ -6872,7 +6396,7 @@ mod runtime {
         if index_hint.is_none() && snapshot.finalized {
             remember_authenticated_endlist_index(network_id, &owner, &topic, snapshot.index);
         }
-        let initial_check_token = if let Some(initial) = stabilization_seed {
+        let initial_check = if let Some(initial) = stabilization_seed {
             schedule_initial_feed_stabilization(
                 weeb3.clone(),
                 cache_key.clone(),
@@ -6896,13 +6420,12 @@ mod runtime {
         } else {
             None
         };
-        let initial_check = initial_check_token.map(|token| (token, snapshot.index));
         let snapshot = match await_live_frontier {
             Some(()) if initial_check.is_some() => await_live_frontier_snapshot(
                 &cache_key,
                 last_head_check,
                 live_frontier_deadline_ms,
-                initial_check,
+                true,
             )
             .await
             .unwrap_or(snapshot),
@@ -6957,9 +6480,13 @@ mod runtime {
             return (candidate, false);
         }
 
-        let Some(confirmed) = weeb3
-            .latest_hls_feed_payload_from(owner.to_string(), topic.to_string(), candidate.clone())
-            .await
+        let Some(confirmed) = acquire_latest_raw_feed_payload_from(
+            owner.to_string(),
+            topic.to_string(),
+            candidate.clone(),
+            &weeb3.chunk_port.0,
+        )
+        .await
         else {
             return (candidate, false);
         };
@@ -7004,18 +6531,15 @@ mod runtime {
         }
     }
 
-    async fn stabilize_initial_unindexed_hls_payload<ObserveCandidate>(
+    async fn stabilize_initial_unindexed_hls_payload(
         weeb3: Arc<Weeb3>,
         owner: &str,
         topic: &str,
         network_id: u64,
         mut loaded: crate::bzz_stream::RawFeedPayload,
         observe_progress: bool,
-        mut observe_candidate: ObserveCandidate,
-    ) -> (crate::bzz_stream::RawFeedPayload, bool)
-    where
-        ObserveCandidate: FnMut(&crate::bzz_stream::RawFeedPayload, bool),
-    {
+        task: Option<&FeedTask>,
+    ) -> (crate::bzz_stream::RawFeedPayload, bool) {
         if loaded.bytes.len() > MAX_STREAM_FEED_PAYLOAD_BYTES || !is_hls_manifest(&loaded.bytes) {
             return (loaded, false);
         }
@@ -7069,7 +6593,7 @@ mod runtime {
                 owner.to_string(),
                 topic.to_string(),
                 loaded.clone(),
-                true,
+                false,
                 &weeb3.chunk_port.0,
                 move |probe_count| {
                     await_feed_probe_wave_credit(
@@ -7104,7 +6628,9 @@ mod runtime {
                                     && is_hls_manifest(&candidate.bytes)
                                 {
                                     loaded = candidate;
-                                    observe_candidate(&loaded, false);
+                                    if let Some(task) = task {
+                                        task.publish(&loaded, false);
+                                    }
                                 }
                             }
                         };
@@ -7127,7 +6653,9 @@ mod runtime {
                             && is_hls_manifest(&candidate.bytes)
                         {
                             loaded = candidate;
-                            observe_candidate(&loaded, false);
+                            if let Some(task) = task {
+                                task.publish(&loaded, false);
+                            }
                         }
                     }
                     Either::Right((Err(_), remaining)) => break remaining.await,
@@ -7145,7 +6673,9 @@ mod runtime {
                     && is_hls_manifest(&reliable.bytes) =>
             {
                 loaded = reliable;
-                observe_candidate(&loaded, false);
+                if let Some(task) = task {
+                    task.publish(&loaded, false);
+                }
                 if !verified {
                     format!(
                         "kept authenticated candidate {} while the frontier remained unresolved",
@@ -7157,8 +6687,8 @@ mod runtime {
                             .await;
                     loaded = confirmation.0;
                     head_confirmed = confirmation.1;
-                    if head_confirmed {
-                        observe_candidate(&loaded, true);
+                    if head_confirmed && let Some(task) = task {
+                        task.publish(&loaded, true);
                     }
                     if hls_is_finalized(&loaded.bytes) && head_confirmed {
                         format!("validated finalized VOD index {}", loaded.index)
@@ -7191,89 +6721,6 @@ mod runtime {
         (loaded, head_confirmed)
     }
 
-    fn publish_stabilized_feed_candidate(
-        cache_key: &str,
-        checking_token: u64,
-        candidate: &crate::bzz_stream::RawFeedPayload,
-        head_confirmed: bool,
-        followup_mode: FeedFollowupMode,
-    ) -> bool {
-        if candidate.bytes.len() > MAX_STREAM_FEED_PAYLOAD_BYTES
-            || !is_hls_manifest(&candidate.bytes)
-        {
-            return false;
-        }
-
-        let candidate_finalized =
-            hls_snapshot_is_terminal(hls_is_finalized(&candidate.bytes), false, head_confirmed);
-        FEED_ROUTE_CACHE.with(|cache| {
-            let mut cache = cache.borrow_mut();
-            let Some(state) = cache.get_mut(cache_key) else {
-                return false;
-            };
-            if state.checking_token != checking_token
-                || state.snapshot.finalized
-                || candidate.index < state.snapshot.index
-            {
-                return false;
-            }
-
-            if candidate.index == state.snapshot.index {
-                if !head_confirmed || candidate.bytes.as_slice() != state.source_body.as_ref() {
-                    return false;
-                }
-                state.source_endlist_confirmed = hls_is_finalized(&candidate.bytes);
-                if state.body_tracks_source && hls_is_finalized(&state.snapshot.body) {
-                    state.snapshot.finalized = candidate_finalized;
-                }
-                let now = js_sys::Date::now();
-                state.confirmed_head_index = Some(candidate.index);
-                state.last_head_check = now;
-                state.last_touch = now;
-                return true;
-            }
-
-            let source_body: Arc<[u8]> = Arc::from(candidate.bytes.clone());
-            let Some(update) = feed_route_update_body(
-                &state.snapshot.body,
-                &state.source_body,
-                &source_body,
-                followup_mode,
-            ) else {
-                return false;
-            };
-            let (body, body_tracks_source) = match update {
-                FeedRouteBodyUpdate::Publish(body) => {
-                    let tracks_source = body.as_ref() == source_body.as_ref();
-                    (body, tracks_source)
-                }
-                FeedRouteBodyUpdate::Hold => (state.snapshot.body.clone(), false),
-            };
-            let finalized =
-                candidate_finalized && body_tracks_source && hls_is_finalized(body.as_ref());
-
-            state.source_body = source_body;
-            state.body_tracks_source = body_tracks_source;
-            state.source_endlist_confirmed = head_confirmed && hls_is_finalized(&candidate.bytes);
-            state.snapshot = FeedRouteSnapshot {
-                index: candidate.index,
-                body,
-                finalized,
-            };
-            let now = js_sys::Date::now();
-            if head_confirmed {
-                state.confirmed_head_index = Some(candidate.index);
-                state.last_head_check = now;
-            } else {
-                state.confirmed_head_index = None;
-                state.last_head_check = 0.0;
-            }
-            state.last_touch = now;
-            trim_feed_route_cache(&mut cache, cache_key);
-            true
-        })
-    }
-
     async fn stabilize_claimed_feed_route(
         weeb3: Arc<Weeb3>,
         cache_key: String,
@@ -7283,9 +6730,22 @@ mod runtime {
         checking_token: u64,
         initial: crate::bzz_stream::RawFeedPayload,
         observe_progress: bool,
+        resume_exact_followup: bool,
         followup_mode: FeedFollowupMode,
     ) {
-        // Head verification outlives the response and publishes continuous advances.
+        if !FEED_ROUTE_CACHE.with(|cache| {
+            cache
+                .borrow()
+                .get(&cache_key)
+                .is_some_and(|state| state.checking_token == checking_token)
+        }) {
+            return;
+        }
+        let task = FeedTask {
+            cache_key: cache_key.clone(),
+            token: checking_token,
+            mode: followup_mode,
+        };
         let (_, head_confirmed) = stabilize_initial_unindexed_hls_payload(
             weeb3.clone(),
             &owner,
@@ -7293,15 +6753,7 @@ mod runtime {
             network_id,
             initial,
             observe_progress,
-            |candidate, candidate_head_confirmed| {
-                let _ = publish_stabilized_feed_candidate(
-                    &cache_key,
-                    checking_token,
-                    candidate,
-                    candidate_head_confirmed,
-                    followup_mode,
-                );
-            },
+            Some(&task),
         )
         .await;
 
@@ -7313,7 +6765,7 @@ mod runtime {
         {
             if cache_finalized {
                 remember_authenticated_endlist_index(network_id, &owner, &topic, cache_index);
-            } else {
+            } else if resume_exact_followup {
                 if head_confirmed {
                     forget_vod_index(network_id, &owner, &topic);
                 }
@@ -7327,81 +6779,6 @@ mod runtime {
                 );
             }
         }
-    }
-
-    fn claim_sequence_zero_canonical_stabilization(cache_key: &str) -> bool {
-        FEED_ROUTE_CACHE.with(|cache| {
-            let mut cache = cache.borrow_mut();
-            let Some(state) = cache.get_mut(cache_key) else {
-                return false;
-            };
-            if state.snapshot.finalized || state.canonical_stabilization_started {
-                return false;
-            }
-            state.canonical_stabilization_started = true;
-            state.canonical_stabilization_running = true;
-            true
-        })
-    }
-
-    fn finish_sequence_zero_canonical_stabilization(cache_key: &str) -> bool {
-        FEED_ROUTE_CACHE.with(|cache| {
-            let mut cache = cache.borrow_mut();
-            let Some(state) = cache.get_mut(cache_key) else {
-                return false;
-            };
-            let released = state.canonical_stabilization_running;
-            state.canonical_stabilization_running = false;
-            trim_feed_route_cache(&mut cache, cache_key);
-            released
-        })
-    }
-
-    async fn stabilize_sequence_zero_canonical_route(
-        weeb3: Arc<Weeb3>,
-        cache_key: String,
-        owner: String,
-        topic: String,
-        network_id: u64,
-        initial: crate::bzz_stream::RawFeedPayload,
-    ) {
-        // Preserve the exact follower's token while stabilizing the canonical seed.
-        let (candidate, head_confirmed) = stabilize_initial_unindexed_hls_payload(
-            weeb3.clone(),
-            &owner,
-            &topic,
-            network_id,
-            initial,
-            false,
-            |_, _| {},
-        )
-        .await;
-
-        if weeb3.get_network_id().await == network_id
-            && active_profile().swarm_network_id == network_id
-        {
-            let candidate_index = candidate.index;
-            let snapshot = FeedRouteSnapshot {
-                index: candidate_index,
-                finalized: hls_snapshot_is_terminal(
-                    hls_is_finalized(&candidate.bytes),
-                    false,
-                    head_confirmed,
-                ),
-                body: Arc::from(candidate.bytes),
-            };
-            let stored = store_feed_snapshot(
-                &cache_key,
-                snapshot,
-                true,
-                FeedFollowupMode::SequenceZeroPresentation,
-            );
-            if stored.finalized && stored.index == candidate_index {
-                remember_authenticated_endlist_index(network_id, &owner, &topic, stored.index);
-            }
-        }
-
-        finish_sequence_zero_canonical_stabilization(&cache_key);
     }
 
     fn schedule_initial_feed_stabilization(
@@ -7430,6 +6807,7 @@ mod runtime {
             checking_token,
             initial,
             observe_progress,
+            true,
             followup_mode,
         ));
         Some(checking_token)
@@ -7454,8 +6832,9 @@ mod runtime {
             true,
             FeedFollowupMode::SequenceZeroPresentation,
         );
-        let canonical_reserved = claim_sequence_zero_canonical_stabilization(&cache_key);
-        if canonical_reserved {
+        let canonical_token =
+            claim_feed_route_check(&cache_key, Some(snapshot.index)).map(|(_, token)| token);
+        if let Some(token) = canonical_token {
             let fallback_client = weeb3.clone();
             let fallback_cache_key = cache_key.clone();
             let fallback_owner = owner.clone();
@@ -7463,7 +6842,7 @@ mod runtime {
             spawn_local(async move {
                 async_std::task::sleep(HLS_SEQUENCE_ZERO_CANONICAL_EXCLUSIVITY).await;
                 if fallback_client.get_network_id().await == network_id
-                    && finish_sequence_zero_canonical_stabilization(&fallback_cache_key)
+                    && release_feed_route_check(&fallback_cache_key, token).is_some()
                 {
                     schedule_feed_followup(
                         fallback_client,
@@ -7484,19 +6863,26 @@ mod runtime {
                 }
                 InitialCanonicalFeedResolution::Unavailable => None,
             };
-            if let Some(initial) = initial {
-                if canonical_reserved {
-                    stabilize_sequence_zero_canonical_route(
-                        weeb3, cache_key, owner, topic, network_id, initial,
-                    )
-                    .await;
-                }
+            if let (Some(initial), Some(token)) = (initial, canonical_token) {
+                stabilize_claimed_feed_route(
+                    weeb3,
+                    cache_key,
+                    owner,
+                    topic,
+                    network_id,
+                    token,
+                    initial,
+                    false,
+                    false,
+                    FeedFollowupMode::SequenceZeroPresentation,
+                )
+                .await;
                 return;
             }
-
-            let follower_released =
-                !canonical_reserved || finish_sequence_zero_canonical_stabilization(&cache_key);
-            if follower_released && weeb3.get_network_id().await == network_id {
+            if canonical_token
+                .is_some_and(|token| release_feed_route_check(&cache_key, token).is_some())
+                && weeb3.get_network_id().await == network_id
+            {
                 schedule_feed_followup(
                     weeb3,
                     cache_key,
@@ -7523,9 +6909,10 @@ mod runtime {
         spawn_local(async move {
             let initial_index = initial.index;
             let feed_identity = (owner.to_ascii_lowercase(), topic.to_ascii_lowercase());
-            let generation = loop {
-                let admission = HLS_PREFETCH_SESSION.with(|session| {
-                    let session = session.borrow();
+            loop {
+                let admission = HLS_PLAYBACK.with(|playback| {
+                    let playback = playback.borrow();
+                    let session = &playback.session;
                     if session.presentation_id != presentation_id
                         || !session.live_start
                         || session.live_history_active
@@ -7540,19 +6927,13 @@ mod runtime {
                     Some(
                         session.mode == HlsPrefetchMode::Sustained
                             && session.completed_media_payloads
-                                >= HLS_TWO_BODY_PREFETCH_COMPLETIONS,
+                                >= HLS_TWO_BODY_PREFETCH_COMPLETIONS
+                                    + HLS_PREFETCH_BODY_MAX_PARALLEL,
                     )
                 });
                 match admission {
                     None => return,
-                    Some(true) => {
-                        let Some(generation) =
-                            hls_prefix_generation_for_feed(&weeb3, &owner, &topic)
-                        else {
-                            return;
-                        };
-                        break generation;
-                    }
+                    Some(true) => break,
                     Some(false) => {
                         async_std::task::sleep(Duration::from_millis(
                             MEDIA_PREFETCH_BATCH_YIELD_MS,
@@ -7560,16 +6941,16 @@ mod runtime {
                         .await;
                     }
                 }
-            };
+            }
             if weeb3.get_network_id().await != network_id {
                 return;
             }
 
             let session_is_current = || {
-                HLS_PREFETCH_SESSION.with(|session| {
-                    let session = session.borrow();
-                    session.generation == generation
-                        && session.presentation_id == presentation_id
+                HLS_PLAYBACK.with(|playback| {
+                    let playback = playback.borrow();
+                    let session = &playback.session;
+                    session.presentation_id == presentation_id
                         && session.live_start
                         && !session.live_history_active
                         && session.feed_identity.as_ref() == Some(&feed_identity)
@@ -7618,9 +6999,7 @@ mod runtime {
                                     .await
                             }
                         })
-                        .buffered(feed_followup_max_parallel(
-                            FeedFollowupMode::SequenceZeroPresentation,
-                        ))
+                        .buffered(HLS_SEQUENCE_ZERO_FOLLOWUP_MAX_PARALLEL)
                         .collect::<Vec<_>>()
                         .await;
                     let unavailable = candidates.iter().any(Option::is_none);
@@ -7732,8 +7111,6 @@ mod runtime {
                                     source_body,
                                     body_tracks_source,
                                     source_endlist_confirmed: canonical_finalized,
-                                    canonical_stabilization_started: false,
-                                    canonical_stabilization_running: false,
                                     checking_token: 0,
                                     confirmed_head_index: Some(current_index),
                                     last_head_check,
@@ -7742,12 +7119,10 @@ mod runtime {
                             );
                             trim_feed_route_cache(&mut cache, &history_cache_key);
                         });
-                        HLS_PREFETCH_SESSION.with(|session| {
-                            let mut session = session.borrow_mut();
-                            if session.generation == generation
-                                && session.presentation_id == presentation_id
-                                && session.live_start
-                            {
+                        HLS_PLAYBACK.with(|playback| {
+                            let mut playback = playback.borrow_mut();
+                            let session = &mut playback.session;
+                            if session.presentation_id == presentation_id && session.live_start {
                                 session.live_history_active = true;
                             }
                         });
@@ -7764,11 +7139,8 @@ mod runtime {
                 };
                 let stride =
                     u64::try_from(source_segments.saturating_sub(1).max(1)).unwrap_or(u64::MAX);
-                let fallback_limit =
-                    feed_followup_batch_limit(FeedFollowupMode::SequenceZeroPresentation);
-                let batch_limit = fallback_limit.min(feed_followup_max_parallel(
-                    FeedFollowupMode::SequenceZeroPresentation,
-                ));
+                let fallback_limit = HLS_SEQUENCE_ZERO_PRESENTATION_BATCH_LIMIT;
+                let batch_limit = fallback_limit.min(HLS_SEQUENCE_ZERO_FOLLOWUP_MAX_PARALLEL);
                 let mut batch_indices = Vec::with_capacity(batch_limit);
                 let mut next_index = current_index;
                 for _ in 0..batch_limit {
@@ -7802,9 +7174,7 @@ mod runtime {
                                 )
                             }
                         })
-                        .buffered(feed_followup_max_parallel(
-                            FeedFollowupMode::SequenceZeroPresentation,
-                        ))
+                        .buffered(HLS_SEQUENCE_ZERO_FOLLOWUP_MAX_PARALLEL)
                         .collect::<Vec<_>>()
                         .await;
                     for (expected_index, payload) in batch {
@@ -7886,6 +7256,26 @@ mod runtime {
         Hold,
     }
 
+    enum FeedCandidateAdmission {
+        Seed {
+            advancing: bool,
+        },
+        Task {
+            token: u64,
+            expected_index: Option<u64>,
+            require_confirmed_same_index: bool,
+        },
+    }
+
+    struct FeedCandidate {
+        index: u64,
+        source: Arc<[u8]>,
+        terminal: bool,
+        head_confirmed: bool,
+        mode: FeedFollowupMode,
+        admission: FeedCandidateAdmission,
+    }
+
     fn feed_route_update_body(
         current: &[u8],
         current_source: &[u8],
@@ -7900,7 +7290,15 @@ mod runtime {
             return None;
         }
         let continuous = hls_manifest_reload_is_continuous(current_source, candidate.as_ref());
+        let adjacent_sequence_zero = !continuous
+            && followup_mode == FeedFollowupMode::SequenceZeroPresentation
+            && HlsTimeline::parse(current)
+                .zip(HlsTimeline::parse(candidate.as_ref()))
+                .is_some_and(|(current, candidate)| {
+                    current.sequence == 0 && current.is_adjacent_to(&candidate)
+                });
         if !continuous
+            && !adjacent_sequence_zero
             && !(followup_mode == FeedFollowupMode::Canonical
                 && hls_manifest_reload_is_forward(current_source, candidate.as_ref()))
         {
@@ -7921,96 +7319,156 @@ mod runtime {
         }
     }
 
-    fn store_feed_snapshot(
+    fn apply_feed_candidate(
         cache_key: &str,
-        snapshot: FeedRouteSnapshot,
-        advancing_live_route: bool,
-        followup_mode: FeedFollowupMode,
-    ) -> FeedRouteSnapshot {
+        candidate: FeedCandidate,
+    ) -> Option<FeedRouteSnapshot> {
+        let seeded = matches!(candidate.admission, FeedCandidateAdmission::Seed { .. });
+        if candidate.source.len() > MAX_STREAM_FEED_PAYLOAD_BYTES
+            || (!seeded && !is_hls_manifest(&candidate.source))
+        {
+            return None;
+        }
         FEED_ROUTE_CACHE.with(|cache| {
             let mut cache = cache.borrow_mut();
             if let Some(existing) = cache.get_mut(cache_key) {
-                if existing.snapshot.finalized || existing.snapshot.index > snapshot.index {
+                let accepted = || seeded.then(|| existing.snapshot.clone());
+                if existing.snapshot.finalized || existing.snapshot.index > candidate.index {
                     existing.last_touch = js_sys::Date::now();
-                    return existing.snapshot.clone();
+                    return accepted();
                 }
-                if existing.snapshot.index == snapshot.index {
-                    if snapshot.finalized && existing.source_body == snapshot.body {
-                        existing.source_endlist_confirmed = true;
-                        if existing.body_tracks_source && hls_is_finalized(&existing.snapshot.body)
+                let (advancing, task) = match candidate.admission {
+                    FeedCandidateAdmission::Seed { advancing } => (advancing, None),
+                    FeedCandidateAdmission::Task {
+                        token,
+                        expected_index,
+                        require_confirmed_same_index,
+                    } => {
+                        if existing.checking_token != token
+                            || expected_index.is_some_and(|index| {
+                                existing.snapshot.index != index || candidate.index <= index
+                            })
                         {
-                            existing.snapshot.finalized = true;
+                            return None;
                         }
-                        existing.confirmed_head_index = Some(existing.snapshot.index);
+                        (
+                            true,
+                            Some((require_confirmed_same_index, candidate.head_confirmed)),
+                        )
+                    }
+                };
+                if existing.snapshot.index == candidate.index {
+                    if existing.source_body.as_ref() != candidate.source.as_ref()
+                        || task.is_some_and(|(required, confirmed)| required && !confirmed)
+                    {
+                        return accepted();
+                    }
+                    if candidate.head_confirmed {
+                        existing.source_endlist_confirmed = hls_is_finalized(&candidate.source);
+                        existing.snapshot.finalized = candidate.terminal
+                            && existing.body_tracks_source
+                            && hls_is_finalized(&existing.snapshot.body);
+                        existing.confirmed_head_index = Some(candidate.index);
                         existing.last_head_check = js_sys::Date::now();
+                    } else if task.is_some_and(|(requires_confirmation, _)| !requires_confirmation)
+                    {
+                        existing.source_endlist_confirmed = false;
+                        existing.confirmed_head_index = None;
+                        existing.last_head_check = 0.0;
                     }
                     existing.last_touch = js_sys::Date::now();
-                    return existing.snapshot.clone();
+                    return Some(existing.snapshot.clone());
                 }
-                let source_body = snapshot.body.clone();
-                let update = if advancing_live_route {
+                let update = if advancing {
                     let Some(update) = feed_route_update_body(
                         &existing.snapshot.body,
                         &existing.source_body,
-                        &source_body,
-                        followup_mode,
+                        &candidate.source,
+                        candidate.mode,
                     ) else {
                         existing.last_touch = js_sys::Date::now();
-                        return existing.snapshot.clone();
+                        return accepted();
                     };
                     update
                 } else {
-                    FeedRouteBodyUpdate::Publish(source_body.clone())
+                    FeedRouteBodyUpdate::Publish(candidate.source.clone())
                 };
                 let (body, body_tracks_source) = match update {
                     FeedRouteBodyUpdate::Publish(body) => {
-                        let tracks_source = body.as_ref() == source_body.as_ref();
+                        let tracks_source = body.as_ref() == candidate.source.as_ref();
                         (body, tracks_source)
                     }
                     FeedRouteBodyUpdate::Hold => (existing.snapshot.body.clone(), false),
                 };
                 let finalized =
-                    snapshot.finalized && body_tracks_source && hls_is_finalized(body.as_ref());
-                existing.source_body = source_body;
+                    candidate.terminal && body_tracks_source && hls_is_finalized(body.as_ref());
+                existing.source_body = candidate.source;
                 existing.body_tracks_source = body_tracks_source;
-                existing.source_endlist_confirmed = snapshot.finalized;
+                existing.source_endlist_confirmed =
+                    candidate.head_confirmed && hls_is_finalized(&existing.source_body);
                 existing.snapshot = FeedRouteSnapshot {
+                    index: candidate.index,
                     body,
                     finalized,
-                    ..snapshot
                 };
                 let now = js_sys::Date::now();
-                existing.confirmed_head_index = finalized.then_some(existing.snapshot.index);
-                existing.last_head_check = if finalized { now } else { 0.0 };
+                let proof_confirmed = if seeded {
+                    finalized
+                } else {
+                    candidate.head_confirmed
+                };
+                existing.confirmed_head_index = proof_confirmed.then_some(candidate.index);
+                existing.last_head_check = if proof_confirmed { now } else { 0.0 };
                 existing.last_touch = now;
                 let stored = existing.snapshot.clone();
                 trim_feed_route_cache(&mut cache, cache_key);
-                return stored;
+                return Some(stored);
             }
-            let source_body = snapshot.body.clone();
-            let stored = snapshot.clone();
+            let FeedCandidateAdmission::Seed { .. } = candidate.admission else {
+                return None;
+            };
+            let snapshot = FeedRouteSnapshot {
+                index: candidate.index,
+                body: candidate.source.clone(),
+                finalized: candidate.terminal,
+            };
+            let now = js_sys::Date::now();
             cache.insert(
                 cache_key.to_string(),
                 FeedRouteState {
-                    snapshot,
-                    source_body,
+                    snapshot: snapshot.clone(),
+                    source_body: candidate.source,
                     body_tracks_source: true,
-                    source_endlist_confirmed: stored.finalized,
-                    canonical_stabilization_started: false,
-                    canonical_stabilization_running: false,
+                    source_endlist_confirmed: candidate.head_confirmed,
                     checking_token: 0,
-                    confirmed_head_index: stored.finalized.then_some(stored.index),
-                    last_head_check: if stored.finalized {
-                        js_sys::Date::now()
-                    } else {
-                        0.0
-                    },
-                    last_touch: js_sys::Date::now(),
+                    confirmed_head_index: candidate.head_confirmed.then_some(candidate.index),
+                    last_head_check: if candidate.head_confirmed { now } else { 0.0 },
+                    last_touch: now,
                 },
             );
             trim_feed_route_cache(&mut cache, cache_key);
-            stored
+            Some(snapshot)
         })
+    }
+
+    fn store_feed_snapshot(
+        cache_key: &str,
+        snapshot: FeedRouteSnapshot,
+        advancing: bool,
+        mode: FeedFollowupMode,
+    ) -> FeedRouteSnapshot {
+        apply_feed_candidate(
+            cache_key,
+            FeedCandidate {
+                index: snapshot.index,
+                source: snapshot.body,
+                terminal: snapshot.finalized,
+                head_confirmed: snapshot.finalized,
+                mode,
+                admission: FeedCandidateAdmission::Seed { advancing },
+            },
+        )
+        .expect("a feed seed always returns a snapshot")
     }
 
     fn trim_feed_route_cache(cache: &mut HashMap<String, FeedRouteState>, protected_key: &str) {
@@ -8033,11 +7491,7 @@ mod runtime {
 
             let Some(oldest) = cache
                 .iter()
-                .filter(|(key, state)| {
-                    key.as_str() != protected_key
-                        && state.checking_token == 0
-                        && !state.canonical_stabilization_running
-                })
+                .filter(|(key, state)| key.as_str() != protected_key && state.checking_token == 0)
                 .min_by(|left, right| left.1.last_touch.total_cmp(&right.1.last_touch))
                 .map(|(key, _)| key.clone())
             else {
@@ -8048,9 +7502,10 @@ mod runtime {
     }
 
     fn next_feed_route_check_token() -> u64 {
-        FEED_ROUTE_CHECK_SEQUENCE.with(|sequence| {
-            let next = next_nonzero_generation(sequence.get());
-            sequence.set(next);
+        FEED_ROUTE_CACHE.with(|registry| {
+            let mut registry = registry.borrow_mut();
+            let next = next_nonzero_generation(registry.next_task);
+            registry.next_task = next;
             next
         })
     }
@@ -8160,104 +7615,36 @@ mod runtime {
         }
 
         let latest_index = latest.index;
-        let latest_is_hls = is_hls_manifest(&latest.bytes);
-        let finalized = hls_snapshot_is_terminal(
-            latest_is_hls && hls_is_finalized(&latest.bytes),
-            false,
-            head_confirmed,
+        let accepted = apply_feed_candidate(
+            cache_key,
+            FeedCandidate {
+                index: latest_index,
+                terminal: hls_snapshot_is_terminal(
+                    hls_is_finalized(&latest.bytes),
+                    false,
+                    head_confirmed,
+                ),
+                source: Arc::from(latest.bytes),
+                head_confirmed,
+                mode: followup_mode,
+                admission: FeedCandidateAdmission::Task {
+                    token: checking_token,
+                    expected_index: None,
+                    require_confirmed_same_index: false,
+                },
+            },
         );
-        let latest_source: Arc<[u8]> = Arc::from(latest.bytes);
-        let accepted = FEED_ROUTE_CACHE.with(|cache| {
-            let mut cache = cache.borrow_mut();
-            let Some((
-                current_index,
-                current_finalized,
-                current_body,
-                current_source,
-                body_tracks_source,
-                source_matches,
-            )) = cache.get(cache_key).and_then(|state| {
-                (state.checking_token == checking_token).then_some((
-                    state.snapshot.index,
-                    state.snapshot.finalized,
-                    state.snapshot.body.clone(),
-                    state.source_body.clone(),
-                    state.body_tracks_source,
-                    state.source_body.as_ref() == latest_source.as_ref(),
-                ))
-            })
-            else {
-                return None;
-            };
-            if latest_index < current_index {
-                return None;
-            }
-            if latest_index == current_index && !source_matches {
-                return None;
-            }
-            if !current_finalized {
-                let (body, body_tracks_source) = if latest_index == current_index {
-                    (current_body, body_tracks_source)
-                } else {
-                    match feed_route_update_body(
-                        &current_body,
-                        &current_source,
-                        &latest_source,
-                        followup_mode,
-                    )? {
-                        FeedRouteBodyUpdate::Publish(body) => {
-                            let tracks_source = body.as_ref() == latest_source.as_ref();
-                            (body, tracks_source)
-                        }
-                        FeedRouteBodyUpdate::Hold => (current_body, false),
-                    }
-                };
-                let finalized = finalized && body_tracks_source && hls_is_finalized(body.as_ref());
-                let Some(state) = cache.get_mut(cache_key) else {
-                    return None;
-                };
-                state.source_body = latest_source.clone();
-                state.body_tracks_source = body_tracks_source;
-                state.source_endlist_confirmed =
-                    latest_is_hls && hls_is_finalized(latest_source.as_ref()) && head_confirmed;
-                state.snapshot = FeedRouteSnapshot {
-                    index: latest_index,
-                    body,
-                    finalized,
-                };
-                state.last_touch = js_sys::Date::now();
-                trim_feed_route_cache(&mut cache, cache_key);
-            }
-            let state = cache.get_mut(cache_key)?;
-            let now = js_sys::Date::now();
-            if head_confirmed {
-                state.confirmed_head_index = Some(latest_index);
-                state.last_head_check = now;
-            } else {
-                state.confirmed_head_index = None;
-                state.last_head_check = 0.0;
-            }
-            state.last_touch = now;
-            Some(
-                cache
-                    .get(cache_key)
-                    .and_then(|state| state.snapshot.finalized.then_some(state.snapshot.index)),
-            )
-        });
-        if let Some(Some(index)) = accepted {
+        if let Some(index) = accepted
+            .as_ref()
+            .and_then(|snapshot| snapshot.finalized.then_some(snapshot.index))
+        {
             remember_authenticated_endlist_index(network_id, owner, topic, index);
         }
-        if accepted.is_some()
-            && let Some(snapshot) = FEED_ROUTE_CACHE.with(|cache| {
-                cache
-                    .borrow()
-                    .get(cache_key)
-                    .map(|state| state.snapshot.clone())
-            })
-        {
+        if let Some(snapshot) = accepted {
             prefetch_live_snapshot_start(&weeb3, owner, topic, &snapshot);
+            return Some((latest_index, head_confirmed));
         }
-        accepted.map(|_| (latest_index, head_confirmed))
+        None
     }
 
     fn schedule_feed_followup(
@@ -8328,7 +7715,12 @@ mod runtime {
                 let _ = release_feed_route_check(&cache_key, checking_token);
                 return;
             }
-            let exact_followup_limit = feed_followup_batch_limit(followup_mode);
+            let exact_followup_limit = match followup_mode {
+                FeedFollowupMode::Canonical => FEED_FOLLOWUP_BATCH_LIMIT,
+                FeedFollowupMode::SequenceZeroPresentation => {
+                    HLS_SEQUENCE_ZERO_PRESENTATION_BATCH_LIMIT
+                }
+            };
             let exact_indices =
                 std::iter::successors(Some(current_index), |index| index.checked_add(1))
                     .skip(1)
@@ -8347,7 +7739,12 @@ mod runtime {
                         )
                     }
                 })
-                .buffered(feed_followup_max_parallel(followup_mode));
+                .buffered(match followup_mode {
+                    FeedFollowupMode::Canonical => 1,
+                    FeedFollowupMode::SequenceZeroPresentation => {
+                        HLS_SEQUENCE_ZERO_FOLLOWUP_MAX_PARALLEL
+                    }
+                });
             while let Some((next_index, next)) = exact_followups.next().await {
                 if weeb3.get_network_id().await != network_id
                     || active_profile().swarm_network_id != network_id
@@ -8368,50 +7765,22 @@ mod runtime {
                 let next_is_hls = is_hls_manifest(&next.bytes);
                 let has_endlist = next_is_hls && hls_is_finalized(&next.bytes);
                 let source_body: Arc<[u8]> = Arc::from(next.bytes);
-                let accepted = FEED_ROUTE_CACHE.with(|cache| {
-                    let mut cache = cache.borrow_mut();
-                    let Some(state) = cache.get_mut(&cache_key) else {
-                        return false;
-                    };
-                    if state.checking_token != checking_token
-                        || state.snapshot.index != current_index
-                        || state.snapshot.finalized
-                    {
-                        return false;
-                    }
-                    if !next_is_hls {
-                        return false;
-                    }
-                    let Some(update) = feed_route_update_body(
-                        &state.snapshot.body,
-                        &state.source_body,
-                        &source_body,
-                        followup_mode,
-                    ) else {
-                        return false;
-                    };
-                    let (body, body_tracks_source) = match update {
-                        FeedRouteBodyUpdate::Publish(body) => {
-                            let tracks_source = body.as_ref() == source_body.as_ref();
-                            (body, tracks_source)
-                        }
-                        FeedRouteBodyUpdate::Hold => (state.snapshot.body.clone(), false),
-                    };
-                    state.source_body = source_body.clone();
-                    state.body_tracks_source = body_tracks_source;
-                    state.source_endlist_confirmed = false;
-                    state.snapshot = FeedRouteSnapshot {
+                let accepted = apply_feed_candidate(
+                    &cache_key,
+                    FeedCandidate {
                         index: next.index,
-                        body,
-                        finalized: false,
-                    };
-                    state.confirmed_head_index = None;
-                    state.last_head_check = 0.0;
-                    state.last_touch = js_sys::Date::now();
-                    trim_feed_route_cache(&mut cache, &cache_key);
-                    true
-                });
-                if !accepted {
+                        source: source_body.clone(),
+                        terminal: false,
+                        head_confirmed: false,
+                        mode: followup_mode,
+                        admission: FeedCandidateAdmission::Task {
+                            token: checking_token,
+                            expected_index: Some(current_index),
+                            require_confirmed_same_index: false,
+                        },
+                    },
+                );
+                if accepted.is_none() {
                     break;
                 }
                 prefetch_live_snapshot_start(
@@ -8443,12 +7812,10 @@ mod runtime {
             }
 
             if !refresh_head
-                && feed_followup_should_refresh_head(
-                    followup_mode,
-                    successful_followups,
-                    saw_tentative_endlist,
-                    recovered_missing_index,
-                )
+                && (saw_tentative_endlist
+                    || (followup_mode == FeedFollowupMode::Canonical
+                        && (successful_followups >= FEED_FOLLOWUP_BATCH_LIMIT
+                            || recovered_missing_index)))
             {
                 let _ = refresh_live_feed_head(
                     weeb3,
@@ -8824,14 +8191,6 @@ mod runtime {
         let _ = replace_stream_result_view(&status, view_generation);
     }
 
-    fn js_error_message(error: &JsValue) -> String {
-        Reflect::get(error, &JsValue::from_str("message"))
-            .ok()
-            .and_then(|message| message.as_string())
-            .or_else(|| error.as_string())
-            .unwrap_or_else(|| "unknown browser error".to_string())
-    }
-
     fn install_hls_prefetch_lifecycle(
         player: &Element,
         weeb3: Arc<Weeb3>,
@@ -8931,7 +8290,7 @@ mod runtime {
 
     pub(crate) fn release_hls_for_bzz_view() {
         release_hls_view();
-        HLS_PAYLOAD_CACHE.with(|cache| cache.borrow_mut().suspend_completed_retention());
+        HLS_ASSET_CACHE.with(|cache| cache.borrow_mut().clear_completed_bodies());
     }
 }
 
