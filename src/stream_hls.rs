@@ -1,16 +1,32 @@
 use serde::{Deserialize, Serialize};
 use std::{
     borrow::Cow,
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     sync::Arc,
 };
 
-use crate::{retrieval_conventions::next_nonzero_generation, stream_conventions::HlsStart};
+use crate::{
+    feed::FeedFrontierConfidence, retrieval_conventions::next_nonzero_generation,
+    stream_conventions::HlsStart,
+};
 
 const HLS_HEADER: &str = "#EXTM3U";
 const HLS_ENDLIST: &str = "#EXT-X-ENDLIST";
 const HLS_SERVER_CONTROL: &str = "#EXT-X-SERVER-CONTROL";
 pub(crate) const HLS_LIVE_SYNC_SEGMENTS: usize = 8;
+pub(crate) const HLS_LIVE_HISTORY_UNRESOLVED_MAX_PARALLEL: usize = 8;
+pub(crate) const HLS_LIVE_HISTORY_MAX_PARALLEL: usize = 32;
+
+pub(crate) fn hls_live_history_active_parallelism(
+    frontier_frozen: bool,
+    work_items: usize,
+) -> usize {
+    work_items.min(if frontier_frozen {
+        HLS_LIVE_HISTORY_MAX_PARALLEL
+    } else {
+        HLS_LIVE_HISTORY_UNRESOLVED_MAX_PARALLEL
+    })
+}
 
 #[cfg(target_arch = "wasm32")]
 thread_local! {
@@ -191,6 +207,23 @@ fn hls_media_cursors_compatible(left: &HlsMediaCursor, right: &HlsMediaCursor) -
 }
 
 pub(crate) const MAX_STREAM_FEED_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
+pub(crate) const HLS_MEDIA_PLAN_MAX_REFERENCES: usize = 4096;
+pub(crate) const HLS_LIVE_HISTORY_MEDIA_PLAN_MAX_REFERENCES: usize = 16_384;
+pub(crate) const HLS_ARCHIVE_MEDIA_PLAN_MAX_REFERENCES: usize = 32768;
+
+pub(crate) fn hls_media_plan_reference_limit(
+    finalized: bool,
+    live_start: bool,
+    media_sequence: Option<u64>,
+) -> usize {
+    if finalized {
+        HLS_ARCHIVE_MEDIA_PLAN_MAX_REFERENCES
+    } else if live_start && media_sequence == Some(0) {
+        HLS_LIVE_HISTORY_MEDIA_PLAN_MAX_REFERENCES
+    } else {
+        HLS_MEDIA_PLAN_MAX_REFERENCES
+    }
+}
 
 pub(crate) fn is_hls_manifest(bytes: &[u8]) -> bool {
     std::str::from_utf8(bytes)
@@ -601,6 +634,185 @@ pub(crate) fn classify_hls_level_transition(
     }
 }
 
+pub(crate) fn hls_foreground_cursor_transition(
+    previous: usize,
+    candidate: usize,
+    cached: bool,
+    explicit_seek: bool,
+) -> (bool, usize, bool) {
+    let cached_back_read = cached && candidate < previous;
+    if cached_back_read && !explicit_seek {
+        return (false, previous, false);
+    }
+    (
+        previous.abs_diff(candidate) > 1,
+        candidate,
+        cached_back_read && explicit_seek,
+    )
+}
+
+pub(crate) fn hls_cross_plan_seek_transition(
+    previous_reference: &str,
+    candidate_references: &[String],
+    candidate_position: usize,
+    explicit_seek: bool,
+) -> bool {
+    if !explicit_seek || candidate_references.get(candidate_position).is_none() {
+        return false;
+    }
+    let mut anchors = candidate_references
+        .iter()
+        .enumerate()
+        .filter(|(_, reference)| reference.eq_ignore_ascii_case(previous_reference));
+    let Some((anchor_position, _)) = anchors.next() else {
+        return false;
+    };
+    anchors.next().is_none() && anchor_position.abs_diff(candidate_position) > 1
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum HlsProgressiveRangeUpdate {
+    Pending,
+    Complete,
+    Duplicate,
+    Rejected,
+}
+
+pub(crate) const HLS_PROGRESSIVE_RANGE_COVERAGE_MAX_WINDOWS: usize = 4096;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct HlsProgressiveRangeKey {
+    reference: String,
+    generation: u64,
+    timeline_epoch: u64,
+    size: u64,
+}
+
+#[derive(Default)]
+pub(crate) struct HlsProgressiveRangeCoverage {
+    key: Option<HlsProgressiveRangeKey>,
+    ranges: BTreeMap<u64, u64>,
+    contiguous_end: u64,
+    failed: bool,
+    complete: bool,
+}
+
+impl HlsProgressiveRangeCoverage {
+    pub(crate) fn begin(
+        &mut self,
+        reference: &str,
+        generation: u64,
+        timeline_epoch: u64,
+        size: u64,
+    ) {
+        self.key = (size > 0).then(|| HlsProgressiveRangeKey {
+            reference: reference.to_ascii_lowercase(),
+            generation,
+            timeline_epoch,
+            size,
+        });
+        self.ranges.clear();
+        self.contiguous_end = 0;
+        self.failed = size == 0;
+        self.complete = false;
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.key = None;
+        self.ranges.clear();
+        self.contiguous_end = 0;
+        self.failed = false;
+        self.complete = false;
+    }
+
+    pub(crate) fn clear_unless(&mut self, reference: &str, generation: u64, timeline_epoch: u64) {
+        let current = self.key.as_ref().is_some_and(|key| {
+            key.reference.eq_ignore_ascii_case(reference)
+                && key.generation == generation
+                && key.timeline_epoch == timeline_epoch
+        });
+        if !current {
+            self.clear();
+        }
+    }
+
+    pub(crate) fn fail(&mut self, reference: &str, generation: u64, timeline_epoch: u64) {
+        if self.key.as_ref().is_some_and(|key| {
+            key.reference.eq_ignore_ascii_case(reference)
+                && key.generation == generation
+                && key.timeline_epoch == timeline_epoch
+        }) {
+            self.failed = true;
+        }
+    }
+
+    pub(crate) fn record_success(
+        &mut self,
+        reference: &str,
+        generation: u64,
+        timeline_epoch: u64,
+        size: u64,
+        start: u64,
+        end: u64,
+        window_size: u64,
+    ) -> HlsProgressiveRangeUpdate {
+        let Some(key) = self.key.as_ref() else {
+            return HlsProgressiveRangeUpdate::Rejected;
+        };
+        if key.generation != generation
+            || key.timeline_epoch != timeline_epoch
+            || !key.reference.eq_ignore_ascii_case(reference)
+        {
+            return HlsProgressiveRangeUpdate::Rejected;
+        }
+        if key.size != size {
+            self.clear();
+            return HlsProgressiveRangeUpdate::Rejected;
+        }
+        if self.failed || self.complete {
+            return HlsProgressiveRangeUpdate::Rejected;
+        }
+        if window_size == 0
+            || start > end
+            || end >= size
+            || start % window_size != 0
+            || end != start.saturating_add(window_size - 1).min(size - 1)
+        {
+            self.failed = true;
+            return HlsProgressiveRangeUpdate::Rejected;
+        }
+        let expected_windows = size.saturating_add(window_size - 1) / window_size;
+        if expected_windows > HLS_PROGRESSIVE_RANGE_COVERAGE_MAX_WINDOWS as u64 {
+            self.failed = true;
+            return HlsProgressiveRangeUpdate::Rejected;
+        }
+        if start < self.contiguous_end {
+            return HlsProgressiveRangeUpdate::Duplicate;
+        }
+        if self.ranges.get(&start) == Some(&end) {
+            return HlsProgressiveRangeUpdate::Duplicate;
+        }
+        if self.ranges.len() >= HLS_PROGRESSIVE_RANGE_COVERAGE_MAX_WINDOWS {
+            self.failed = true;
+            return HlsProgressiveRangeUpdate::Rejected;
+        }
+        if self.ranges.insert(start, end).is_some() {
+            self.failed = true;
+            return HlsProgressiveRangeUpdate::Rejected;
+        }
+
+        while let Some(end) = self.ranges.remove(&self.contiguous_end) {
+            self.contiguous_end = end.saturating_add(1);
+        }
+        if self.contiguous_end == size {
+            self.complete = true;
+            HlsProgressiveRangeUpdate::Complete
+        } else {
+            HlsProgressiveRangeUpdate::Pending
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct HlsSegmentIdentity {
     reference: String,
@@ -921,6 +1133,14 @@ pub(crate) fn continue_hls_codec_bootstrap(manifest: &[u8]) -> Option<Vec<u8>> {
 }
 
 fn rewrite_hls_sequence_zero_codec_bootstrap(manifest: &[u8], bootstrap: bool) -> Option<Vec<u8>> {
+    rewrite_hls_sequence_zero_codec_bootstrap_at(manifest, bootstrap, None).map(|(body, _)| body)
+}
+
+fn rewrite_hls_sequence_zero_codec_bootstrap_at(
+    manifest: &[u8],
+    bootstrap: bool,
+    pinned_anchor: Option<Option<usize>>,
+) -> Option<(Vec<u8>, Option<usize>)> {
     if !hls_codec_bootstrap_tags_are_supported(manifest) {
         return None;
     }
@@ -946,20 +1166,24 @@ fn rewrite_hls_sequence_zero_codec_bootstrap(manifest: &[u8], bootstrap: bool) -
     if segments.is_empty() {
         return None;
     }
-    let tail_start = segments.len().saturating_sub(HLS_LIVE_SYNC_SEGMENTS);
+    let discontinuity_anchor = match pinned_anchor {
+        Some(anchor) => {
+            if anchor.is_some_and(|position| position == 0 || position >= segments.len()) {
+                return None;
+            }
+            anchor
+        }
+        None => (segments.len() > HLS_LIVE_SYNC_SEGMENTS)
+            .then_some(segments.len() - HLS_LIVE_SYNC_SEGMENTS),
+    };
 
     let mut output = String::with_capacity(manifest.len().saturating_add(32));
     output.push_str(HLS_HEADER);
     output.push_str(&format!(
-        "\n#EXT-X-VERSION:{version}\n#EXT-X-TARGETDURATION:{target_duration}\n#EXT-X-PLAYLIST-TYPE:{}\n#EXT-X-MEDIA-SEQUENCE:0",
-        if bootstrap || !hls_is_finalized(manifest) {
-            "EVENT"
-        } else {
-            "VOD"
-        }
+        "\n#EXT-X-VERSION:{version}\n#EXT-X-TARGETDURATION:{target_duration}\n#EXT-X-PLAYLIST-TYPE:EVENT\n#EXT-X-MEDIA-SEQUENCE:0"
     ));
     for (position, segment) in segments.iter().enumerate() {
-        if tail_start > 0 && position == tail_start {
+        if discontinuity_anchor == Some(position) {
             output.push_str("\n#EXT-X-DISCONTINUITY");
         }
         output.push_str(&format!(
@@ -977,7 +1201,42 @@ fn rewrite_hls_sequence_zero_codec_bootstrap(manifest: &[u8], bootstrap: bool) -
     (stream_feed_payload_len_is_supported(output.len())
         && hls_media_sequence(&output) == Some(0)
         && hls_segment_identities(&output)?.len() == segments.len())
-    .then_some(output)
+    .then_some((output, discontinuity_anchor))
+}
+
+pub(crate) fn continue_hls_sequence_zero_codec_bootstrap(
+    manifest: &[u8],
+    discontinuity_anchor: Option<usize>,
+) -> Option<Vec<u8>> {
+    (hls_media_sequence(manifest)? == 0)
+        .then_some(())
+        .and_then(|()| {
+            rewrite_hls_sequence_zero_codec_bootstrap_at(
+                manifest,
+                false,
+                Some(discontinuity_anchor),
+            )
+        })
+        .map(|(body, _)| body)
+}
+
+pub(crate) fn hls_exact_sequence_zero_live_target(
+    start_sequence: u64,
+    live: bool,
+    edge: f64,
+    start_time_offset: f64,
+) -> Option<f64> {
+    if start_sequence != 0
+        || !live
+        || !edge.is_finite()
+        || edge < 0.0
+        || !start_time_offset.is_finite()
+        || start_time_offset >= 0.0
+    {
+        return None;
+    }
+    let target = edge + start_time_offset;
+    target.is_finite().then_some(target.max(0.0))
 }
 
 fn rewrite_hls_codec_bootstrap(
@@ -1076,6 +1335,35 @@ fn hls_codec_bootstrap_tags_are_supported(bytes: &[u8]) -> bool {
             text.lines()
                 .all(|line| !line.trim().starts_with("#EXT-X-BYTERANGE:"))
         })
+}
+
+fn hls_sequence_zero_codec_bootstrap_is_supported(bytes: &[u8]) -> bool {
+    if !stream_feed_payload_len_is_supported(bytes.len().saturating_add(32))
+        || hls_media_sequence(bytes) != Some(0)
+        || !hls_codec_bootstrap_tags_are_supported(bytes)
+    {
+        return false;
+    }
+    let Ok(text) = std::str::from_utf8(bytes) else {
+        return false;
+    };
+    let mut versions = text
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("#EXT-X-VERSION:").map(str::trim));
+    if !matches!(
+        (versions.next(), versions.next()),
+        (Some(version), None) if version.parse::<u64>().is_ok_and(|version| version > 0)
+    ) || hls_target_duration(bytes).is_none_or(|duration| duration == 0)
+    {
+        return false;
+    }
+    HlsTimeline::parse(bytes).is_some_and(|timeline| {
+        timeline.live_tail().is_some()
+            && timeline
+                .segments
+                .iter()
+                .all(|segment| segment.byte_range.is_none() && segment.discontinuity_counter == 0)
+    })
 }
 
 fn rewrite_hls_manifest_inner(
@@ -1503,15 +1791,27 @@ pub(crate) fn cached_feed_should_refresh_head(last_head_check_ms: f64, now_ms: f
         && now_ms - last_head_check_ms >= FEED_HEAD_REFRESH_INTERVAL_MS
 }
 
-pub(crate) fn hls_live_frontier_is_ready(
-    snapshot_index: u64,
-    confirmed_head_index: Option<u64>,
-    last_head_check_ms: f64,
-    checked_after_ms: f64,
+pub(crate) fn hls_live_frontier_observation_is_authoritative(
+    confidence: FeedFrontierConfidence,
+    observed_at_ms: f64,
+    frontier_started_ms: f64,
 ) -> bool {
-    confirmed_head_index == Some(snapshot_index)
-        && last_head_check_ms.is_finite()
-        && last_head_check_ms > checked_after_ms
+    confidence.is_authoritative()
+        && observed_at_ms.is_finite()
+        && frontier_started_ms.is_finite()
+        && observed_at_ms >= frontier_started_ms
+}
+
+pub(crate) fn hls_live_tail_prefetch_ready(
+    live_history_active: bool,
+    frontier_matches_snapshot: bool,
+) -> bool {
+    live_history_active || frontier_matches_snapshot
+}
+
+pub(crate) fn hls_live_frontier_remaining_ms(deadline_ms: f64, now_ms: f64) -> Option<f64> {
+    (deadline_ms.is_finite() && now_ms.is_finite() && deadline_ms > now_ms)
+        .then_some(deadline_ms - now_ms)
 }
 
 const STORAGE_KEY: &str = "weeb3-hls-vod-index-hints-v2";
@@ -1726,8 +2026,8 @@ mod player {
     use web_sys::{CustomEvent, CustomEventInit, Element, Event, HtmlMediaElement};
 
     use super::{
-        HLS_LIVE_SYNC_SEGMENTS, classify_hls_level_transition, hls_timeline_rebase_position,
-        js_error_message,
+        HLS_LIVE_SYNC_SEGMENTS, classify_hls_level_transition, hls_exact_sequence_zero_live_target,
+        hls_timeline_rebase_position, js_error_message,
     };
 
     const SWARM_REQUEST_TIMEOUT_MS: f64 = 240_000.0;
@@ -1743,7 +2043,7 @@ mod player {
         "hlsLevelLoaded",
         "hlsManifestParsed",
     ];
-    const HLS_DOM_EVENTS: [&str; 3] = ["play", "pause", "resize"];
+    const HLS_DOM_EVENTS: [&str; 4] = ["play", "playing", "pause", "resize"];
     const NATIVE_DOM_EVENTS: [&str; 2] = ["error", "loadedmetadata"];
     pub(crate) const HLS_AUTOPLAY_AUTHORIZED_EVENT: &str = "weeb3-hls-autoplay-authorized";
     pub(crate) const HLS_EXPLICIT_PAUSE_EVENT: &str = "weeb3-hls-explicit-pause";
@@ -1827,6 +2127,9 @@ mod player {
         dom_listener: Option<DomListener>,
         codec_required: bool,
         codec_pending: bool,
+        codec_token: Option<u64>,
+        codec_target: Option<f64>,
+        codec_buffer_ready: bool,
         load: LoadPhase,
         manifest_parsed: bool,
         playback_authorized: bool,
@@ -1852,6 +2155,9 @@ mod player {
         media: HtmlMediaElement,
         source: String,
         loader: Option<JsFuture>,
+        codec_required: bool,
+        force_codec_bootstrap: bool,
+        codec_target: Option<f64>,
         initial_position: f64,
         rebase_position: Option<f64>,
         hard_attempts: u8,
@@ -1908,6 +2214,17 @@ mod player {
             }
         }
 
+        fn arm_codec_bootstrap(&mut self, preserve_position: bool) {
+            if !self.codec_pending {
+                self.codec_target = preserve_position
+                    .then(|| self.media.current_time())
+                    .filter(|position| position.is_finite() && *position >= 0.0);
+            }
+            self.codec_pending = true;
+            self.codec_buffer_ready = false;
+            self.initial_position = 0.0;
+        }
+
         fn dispose(mut self) {
             if let Some(listener) = self.dom_listener.take() {
                 dispose_dom_listener(&self.media, listener);
@@ -1933,6 +2250,36 @@ mod player {
         })
     }
 
+    pub(super) fn hls_codec_token_is_active(token: u64) -> bool {
+        PLAYER.with(|player| {
+            player.try_borrow().is_ok_and(|player| {
+                player
+                    .session
+                    .as_ref()
+                    .and_then(|session| session.codec_token)
+                    == Some(token)
+            })
+        })
+    }
+
+    fn hls_codec_bootstrap_token(source: &str) -> Option<u64> {
+        source
+            .split_once('?')
+            .map(|(_, query)| query)
+            .into_iter()
+            .flat_map(|query| query.split('&'))
+            .find_map(|parameter| parameter.strip_prefix("codec-bootstrap="))
+            .and_then(|token| token.parse().ok())
+    }
+
+    fn clean_hls_codec_bootstrap_source(source: &str) -> String {
+        source
+            .split("&codec-bootstrap=")
+            .next()
+            .unwrap_or(source)
+            .to_string()
+    }
+
     fn is_current(epoch: u64) -> bool {
         PLAYER.with(|player| {
             player
@@ -1955,6 +2302,7 @@ mod player {
 
     pub(crate) fn destroy_current_hls() {
         next_epoch();
+        super::runtime::reset_hls_codec_bootstrap();
     }
 
     pub(crate) async fn play_hls(
@@ -1962,6 +2310,7 @@ mod player {
         source: &str,
         hls_loader: JsFuture,
         initial_start_position: f64,
+        proactive_codec_bootstrap: bool,
     ) -> Result<&'static str, JsValue> {
         let media = player
             .clone()
@@ -1977,6 +2326,9 @@ mod player {
             media,
             source: source.to_string(),
             loader: Some(hls_loader),
+            codec_required: proactive_codec_bootstrap,
+            force_codec_bootstrap: proactive_codec_bootstrap,
+            codec_target: None,
             initial_position: initial_start_position,
             rebase_position: None,
             hard_attempts: 0,
@@ -2004,6 +2356,9 @@ mod player {
             .media
             .remove_attribute(HLS_PLAYBACK_AUTHORIZED_ATTRIBUTE)
             .ok();
+        if request.force_codec_bootstrap {
+            request.source = clean_hls_codec_bootstrap_source(&request.source);
+        }
 
         let native_supported = supports_native_hls(&request.media);
         let hls_class = match match request.loader.take() {
@@ -2039,16 +2394,23 @@ mod player {
                     "HLS playback is not supported by this browser",
                 ));
             }
+            if request.codec_required {
+                super::runtime::reset_hls_codec_bootstrap();
+            }
             request
                 .media
                 .set_attribute("data-weeb3-hls-mode", "native")?;
-            let rebase = request.rebase_position.or_else(|| {
-                (request.initial_position.is_finite() && request.initial_position > 0.0)
-                    .then_some(request.initial_position)
-            });
+            request.source = clean_hls_codec_bootstrap_source(&request.source);
+            let rebase = request
+                .codec_target
+                .or(request.rebase_position)
+                .or_else(|| {
+                    (request.initial_position.is_finite() && request.initial_position > 0.0)
+                        .then_some(request.initial_position)
+                });
             let dom = install_dom_listener(&request.media, epoch, &NATIVE_DOM_EVENTS)?;
             let media = request.media.clone();
-            let source = request.source.clone();
+            let source = clean_hls_codec_bootstrap_source(&request.source);
             let resume = request.resume;
             install_session(
                 epoch,
@@ -2057,6 +2419,7 @@ mod player {
                     Backend::Native,
                     (None, Some(dom)),
                     (false, false),
+                    None,
                     LoadPhase::Started,
                     true,
                     false,
@@ -2072,17 +2435,25 @@ mod player {
             return Ok("native");
         }
 
+        if request.force_codec_bootstrap
+            && request.source.contains("start=live")
+            && !request.source.contains("&codec-bootstrap=")
+        {
+            request
+                .source
+                .push_str(&format!("&codec-bootstrap={epoch}"));
+            request.initial_position = 0.0;
+        }
+
         request
             .media
             .set_attribute("data-weeb3-hls-mode", "hls.js")?;
         request
             .media
             .set_attribute("data-weeb3-hls-state", "loading-manifest")?;
-        let codec = (
-            request.source.contains("&codec-bootstrap="),
-            request.source.contains("&codec-bootstrap=") && request.initial_position == 0.0,
-        );
-        if codec.1 {
+        let codec_token = hls_codec_bootstrap_token(&request.source);
+        let codec_pending = codec_token.is_some() && request.initial_position == 0.0;
+        if codec_pending {
             let _ = request.media.pause();
         }
         let config = hls_config(!request.source.contains("start=live"));
@@ -2109,7 +2480,11 @@ mod player {
                 &request,
                 Backend::Hls(hls.clone()),
                 (Some(hls_listener), Some(dom_listener)),
-                codec,
+                (
+                    request.codec_required || codec_token.is_some(),
+                    codec_pending,
+                ),
+                codec_token,
                 LoadPhase::Cold,
                 false,
                 request.resume,
@@ -2134,6 +2509,7 @@ mod player {
         backend: Backend,
         listeners: (Option<HlsListener>, Option<DomListener>),
         codec: (bool, bool),
+        codec_token: Option<u64>,
         load: LoadPhase,
         manifest_parsed: bool,
         resume: bool,
@@ -2147,6 +2523,9 @@ mod player {
             dom_listener: listeners.1,
             codec_required: codec.0,
             codec_pending: codec.1,
+            codec_token,
+            codec_target: request.codec_target,
+            codec_buffer_ready: false,
             load,
             manifest_parsed,
             playback_authorized: false,
@@ -2297,62 +2676,58 @@ mod player {
     }
 
     fn buffer_created(epoch: u64, data: &JsValue) {
-        let Some(track) =
-            js_property(data, "tracks").and_then(|tracks| js_property(&tracks, "video"))
-        else {
+        let Some(tracks) = js_property(data, "tracks") else {
             return;
         };
-        if let Some(resolution) = js_video_resolution(&track) {
+        let video = js_property(&tracks, "video");
+        if video.is_none()
+            && js_property(&tracks, "audio").is_none()
+            && js_property(&tracks, "audiovideo").is_none()
+        {
+            return;
+        }
+        if let Some(video) = video
+            && let Some(resolution) = js_video_resolution(&video)
+        {
             super::set_hls_video_resolution(Some(resolution));
         }
-        let bootstrap = with_session(epoch, |session| {
-            session.codec_pending.then(|| {
-                session
-                    .hls()
-                    .cloned()
-                    .map(|hls| (session.media.clone(), session.source.clone(), hls))
-            })
+        with_session(epoch, |session| {
+            if session.codec_pending {
+                session.codec_buffer_ready = true;
+            }
+        });
+        apply_codec_bootstrap_target(epoch);
+    }
+
+    fn apply_codec_bootstrap_target(epoch: u64) {
+        let ready = with_session(epoch, |session| {
+            if !session.codec_pending || !session.codec_buffer_ready {
+                return None;
+            }
+            let target = session.codec_target.take()?;
+            session.codec_pending = false;
+            session.codec_buffer_ready = false;
+            session.initial_position = target;
+            Some((
+                session.media.clone(),
+                target,
+                session.resume || session.playback_authorized,
+            ))
         })
-        .flatten()
         .flatten();
-        let Some((media, source, hls)) = bootstrap else {
+        let Some((media, target, resume)) = ready else {
             return;
         };
-        let target = Reflect::get(hls.as_ref(), &JsValue::from_str("liveSyncPosition"))
-            .ok()
-            .and_then(|value| value.as_f64())
-            .filter(|target| target.is_finite() && *target >= 0.0);
-        let Some(target) = target else { return };
-        if !is_current(epoch) {
-            return;
-        }
-        super::runtime::finish_hls_codec_bootstrap(&source);
-        let clean = source
-            .split("&codec-bootstrap=")
-            .next()
-            .unwrap_or(&source)
-            .to_string();
         media.set_current_time(target);
-        let ready = with_session(epoch, |session| {
-            if !session.codec_pending {
-                return false;
-            }
-            session.source = clean;
-            session.codec_required = false;
-            session.codec_pending = false;
-            session.initial_position = -1.0;
-            true
-        })
-        .unwrap_or(false);
-        if ready {
-            spawn_local(async move {
-                Wait::Microtask.wait().await;
-                if is_current(epoch) {
+        spawn_local(async move {
+            Wait::Microtask.wait().await;
+            if is_current(epoch) {
+                if resume {
                     autoplay(epoch, Autoplay::Resume);
-                    autoplay(epoch, Autoplay::Policy);
                 }
-            });
-        }
+                autoplay(epoch, Autoplay::Policy);
+            }
+        });
     }
 
     fn fragment_buffered(epoch: u64) {
@@ -2449,7 +2824,15 @@ mod player {
         let edge = js_property(&details, "edge")
             .and_then(|value| value.as_f64())
             .filter(|value| value.is_finite() && *value >= 0.0);
+        let codec_target = edge
+            .zip(js_property(&details, "startTimeOffset").and_then(|value| value.as_f64()))
+            .and_then(|(edge, offset)| {
+                hls_exact_sequence_zero_live_target(start, live, edge, offset)
+            });
         let action = with_session(epoch, |session| {
+            if session.codec_pending && session.codec_target.is_none() {
+                session.codec_target = codec_target;
+            }
             let previous = session.level_snapshots.insert(level, (start, live, edge));
             if !classify_hls_level_transition(
                 previous.map(|(start, live, _)| (start, live)),
@@ -2468,23 +2851,40 @@ mod player {
                 .and_then(|(old, new)| {
                     hls_timeline_rebase_position(old, session.media.current_time(), new)
                 });
+            let codec_required = session.codec_required;
+            let codec_target = if codec_required {
+                rebase.or(session.codec_target).or_else(|| {
+                    let position = session.media.current_time();
+                    (position.is_finite() && position >= 0.0).then_some(position)
+                })
+            } else {
+                session.codec_target
+            };
             Some((
                 session.media.clone(),
                 Launch {
                     media: session.media.clone(),
-                    source: session.source.clone(),
+                    source: if codec_required {
+                        clean_hls_codec_bootstrap_source(&session.source)
+                    } else {
+                        session.source.clone()
+                    },
                     loader: None,
+                    codec_required,
+                    force_codec_bootstrap: codec_required,
+                    codec_target,
                     initial_position: session.initial_position,
-                    rebase_position: rebase,
+                    rebase_position: (!codec_required).then_some(rebase).flatten(),
                     hard_attempts: session.hard_restarts,
                     timeline_rebased: true,
-                    resume: session.playback_authorized,
+                    resume: session.playback_authorized || session.resume,
                     autoplay_allowed: session.autoplay_allowed,
                 },
                 session.hls().cloned(),
             ))
         })
         .flatten();
+        apply_codec_bootstrap_target(epoch);
         let Some((media, request, retiring)) = action else {
             return;
         };
@@ -2518,6 +2918,17 @@ mod player {
     fn dom_event(epoch: u64, name: &str) {
         match name {
             "play" => {
+                let held = with_session(epoch, |session| {
+                    session.codec_pending.then(|| {
+                        session.resume = true;
+                        session.media.clone()
+                    })
+                })
+                .flatten();
+                if let Some(media) = held {
+                    let _ = media.pause();
+                    return;
+                }
                 let action = with_session(epoch, |session| {
                     let pending = session.autoplay_pending;
                     let first = matches!(session.load, LoadPhase::Cold);
@@ -2560,6 +2971,7 @@ mod player {
                     }
                 }
             }
+            "playing" => finish_codec_bootstrap_on_playing(epoch),
             "pause" => {
                 let action = with_session(epoch, |session| {
                     if !session.playback_authorized {
@@ -2614,6 +3026,27 @@ mod player {
         }
     }
 
+    fn finish_codec_bootstrap_on_playing(epoch: u64) {
+        let source = with_session(epoch, |session| {
+            (session.codec_required
+                && !session.codec_pending
+                && session.source.contains("&codec-bootstrap="))
+            .then(|| session.source.clone())
+        })
+        .flatten();
+        let Some(source) = source else { return };
+        super::runtime::finish_hls_codec_bootstrap(&source);
+        with_session(epoch, |session| {
+            if !session.codec_pending && session.source == source {
+                session.source = source
+                    .split("&codec-bootstrap=")
+                    .next()
+                    .unwrap_or(&source)
+                    .to_string();
+            }
+        });
+    }
+
     fn handle_error(epoch: u64, data: JsValue) {
         let codec_bootstrap = js_string_property(&data, "type").as_deref() == Some("mediaError")
             && js_string_property(&data, "details").as_deref() == Some("bufferAppendError")
@@ -2627,9 +3060,9 @@ mod player {
                 {
                     return false;
                 }
+                let preserve_position = session.codec_required;
                 session.codec_required = true;
-                session.codec_pending = true;
-                session.initial_position = 0.0;
+                session.arm_codec_bootstrap(preserve_position);
                 true
             })
             .unwrap_or(false);
@@ -2672,6 +3105,10 @@ mod player {
                 run_recovery(epoch, recovery);
             }
             Some("mediaError") => {
+                if with_session(epoch, |session| session.codec_required).unwrap_or(false) {
+                    hard_recovery(epoch, data);
+                    return;
+                }
                 let recovery = with_session(epoch, |session| {
                     if session.media_recoveries == 0 {
                         session.media_recoveries = 1;
@@ -2701,18 +3138,9 @@ mod player {
             }
             session.recovery_pending = true;
             if session.codec_required {
-                session.codec_pending = true;
+                session.arm_codec_bootstrap(true);
             }
-            let source = if session.codec_required {
-                let source = session
-                    .source
-                    .split("&codec-bootstrap=")
-                    .next()
-                    .unwrap_or(&session.source);
-                format!("{source}&codec-bootstrap={epoch}")
-            } else {
-                session.source.clone()
-            };
+            let source = clean_hls_codec_bootstrap_source(&session.source);
             let fast = session.codec_required && session.hard_restarts == 0;
             Ok(Some(Recovery::Hard(
                 if fast {
@@ -2803,16 +3231,24 @@ mod player {
             Recovery::Hard(wait, media, source, attempt, timeline_rebased) => {
                 spawn_local(async move {
                     wait.wait().await;
-                    let request = with_session(epoch, |session| Launch {
-                        media: media.clone(),
-                        source,
-                        loader: None,
-                        initial_position: session.restart_position(),
-                        rebase_position: session.rebase_position.filter(|_| !session.codec_pending),
-                        hard_attempts: attempt,
-                        timeline_rebased,
-                        resume: session.playback_authorized || session.resume,
-                        autoplay_allowed: session.autoplay_allowed,
+                    let request = with_session(epoch, |session| {
+                        let codec_required = session.codec_required;
+                        Launch {
+                            media: media.clone(),
+                            source,
+                            loader: None,
+                            codec_required,
+                            force_codec_bootstrap: codec_required,
+                            codec_target: session.codec_target,
+                            initial_position: session.restart_position(),
+                            rebase_position: session
+                                .rebase_position
+                                .filter(|_| !session.codec_pending),
+                            hard_attempts: attempt,
+                            timeline_rebased,
+                            resume: session.playback_authorized || session.resume,
+                            autoplay_allowed: session.autoplay_allowed,
+                        }
                     });
                     let Some(request) = request else { return };
                     if let Err(error) = launch(request).await {
@@ -3104,9 +3540,10 @@ mod runtime {
         bzz_stream::{
             RawFeedPayload, acquire_latest_raw_feed_payload_bounded_from,
             acquire_latest_raw_feed_payload_from, acquire_latest_raw_feed_payload_startup,
-            acquire_raw_feed_payload_at_index, acquire_raw_feed_payload_at_index_bounded,
+            acquire_live_history_feed_payload_at_index, acquire_raw_feed_payload_at_index,
+            acquire_raw_feed_payload_at_index_bounded,
         },
-        feed::FEED_FRONTIER_LOOKAHEAD_TIMEOUT,
+        feed::{FEED_FRONTIER_LOOKAHEAD_TIMEOUT, WIDE_FEED_FRONTIER_EDGE_GUARD},
         interface::{service_worker_controls_bzz_requests, service_worker_scope_protocol_error},
         mpsc,
         network_profile::active_profile,
@@ -3273,6 +3710,7 @@ mod runtime {
             topic: String,
             early_payloads: Option<mpsc::Sender<RawFeedPayload>>,
             early_payload_max_index: Option<u64>,
+            maximum_wait: Option<Duration>,
         ) -> Option<RawFeedPayload> {
             let progress_id = self
                 .start_progress(
@@ -3283,14 +3721,23 @@ mod runtime {
                     "seeking bounded startup candidate from the first accounting-ready peer",
                 )
                 .await;
-            let result = acquire_latest_raw_feed_payload_startup(
+            let acquire = acquire_latest_raw_feed_payload_startup(
                 owner,
                 topic,
                 &self.chunk_port.0,
                 early_payloads,
                 early_payload_max_index,
-            )
-            .await;
+            );
+            // Dropping acquisition at the deadline closes further probe admission;
+            // already-dispatched accounting attempts remain free to drain.
+            let (result, timed_out) = match maximum_wait {
+                Some(maximum_wait) => match async_std::future::timeout(maximum_wait, acquire).await
+                {
+                    Ok(result) => (result, false),
+                    Err(_) => (None, true),
+                },
+                None => (acquire.await, false),
+            };
             match result.as_ref() {
                 Some(payload) => {
                     self.finish_progress(
@@ -3302,8 +3749,17 @@ mod runtime {
                     .await;
                 }
                 None => {
-                    self.finish_progress(&progress_id, "failed", "feed update not found", false)
-                        .await;
+                    self.finish_progress(
+                        &progress_id,
+                        "failed",
+                        if timed_out {
+                            "live frontier deadline elapsed"
+                        } else {
+                            "feed update not found"
+                        },
+                        false,
+                    )
+                    .await;
                 }
             }
             result
@@ -3326,6 +3782,16 @@ mod runtime {
         ) -> Option<RawFeedPayload> {
             acquire_raw_feed_payload_at_index_bounded(owner, topic, index, &self.chunk_port.0).await
         }
+
+        async fn hls_live_history_feed_payload_at_index(
+            &self,
+            owner: String,
+            topic: String,
+            index: u64,
+        ) -> Option<RawFeedPayload> {
+            acquire_live_history_feed_payload_at_index(owner, topic, index, &self.chunk_port.0)
+                .await
+        }
     }
 
     thread_local! {
@@ -3334,6 +3800,8 @@ mod runtime {
         static HLS_CODEC_BOOTSTRAP_PRESENTATION: RefCell<Option<HlsCodecBootstrapPresentation>> =
             const { RefCell::new(None) };
         static HLS_ASSET_CACHE: RefCell<HlsAssetCache> = RefCell::new(HlsAssetCache::new());
+        static HLS_PROGRESSIVE_RANGE_COVERAGE: RefCell<HlsProgressiveRangeCoverage> =
+            RefCell::new(HlsProgressiveRangeCoverage::default());
     }
 
     const FEED_ROUTE_CACHE_MAX_ENTRIES: usize = 64;
@@ -3342,6 +3810,7 @@ mod runtime {
     const HLS_TERMINAL_CONFIRMATION_POLL_INTERVAL: Duration = Duration::from_millis(500);
     const HLS_TERMINAL_CONFIRMATION_MAX_POLLS: usize = 18;
     const HLS_LIVE_FRONTIER_MAX_WAIT: Duration = Duration::from_secs(15);
+    const HLS_LIVE_HISTORY_MAX_WAIT: Duration = Duration::from_secs(20);
     const HLS_LIVE_FRONTIER_CONNECTION_WAIT: Duration = Duration::from_secs(7);
     const HLS_LIVE_FRONTIER_MIN_PRICED_PEERS: u64 = 1;
     const HLS_FEED_WAVE_CREDIT_WAIT: Duration = Duration::from_secs(7);
@@ -3350,8 +3819,6 @@ mod runtime {
     const HLS_ASSET_METADATA_CACHE_MAX_ENTRIES: usize = 1024;
     const HLS_ASSET_PROBE_BYTES: u64 = 512;
     const HLS_REPRESENTATION_VERSION: &str = "weeb3-hls-v2";
-    const HLS_MEDIA_PLAN_MAX_REFERENCES: usize = 4096;
-    const HLS_ARCHIVE_MEDIA_PLAN_MAX_REFERENCES: usize = 32768;
     const HLS_PREFETCH_TRACK_MAX_ENTRIES: usize = 16;
     const HLS_STREAM_KEY: &str = "weeb3:hls-playback";
     const HLS_PAYLOAD_SINGLEFLIGHT_MAX_WAITERS: usize = 64;
@@ -3409,24 +3876,38 @@ mod runtime {
     #[derive(Clone, Copy)]
     enum HlsCodecBootstrapManifest {
         Bootstrap(u64),
-        Continuation,
+        Continuation(u64),
     }
 
     struct HlsCodecBootstrapPresentation {
         token: u64,
         complete: bool,
         snapshot: Option<FeedRouteSnapshot>,
+        sequence_zero: bool,
+        discontinuity_anchor: Option<usize>,
     }
 
     struct FeedRouteState {
         snapshot: FeedRouteSnapshot,
         source_body: Arc<[u8]>,
-        body_tracks_source: bool,
+        body_includes_source: bool,
         source_endlist_confirmed: bool,
         checking_token: u64,
         confirmed_head_index: Option<u64>,
         last_head_check: f64,
+        frontier_observation: Option<FeedFrontierObservation>,
         last_touch: f64,
+    }
+
+    #[derive(Clone)]
+    struct FeedFrontierObservation {
+        index: u64,
+        source: Arc<[u8]>,
+        finalized: bool,
+        confirmed_head_index: Option<u64>,
+        confidence: FeedFrontierConfidence,
+        last_head_check: f64,
+        observed_at: f64,
     }
 
     struct FeedRegistry {
@@ -3469,6 +3950,42 @@ mod runtime {
             )
             .is_some()
         }
+    }
+
+    fn record_completed_frontier_scout(
+        cache_key: &str,
+        checking_token: u64,
+        observed_index: u64,
+        observed_source: &[u8],
+        head_confirmed: bool,
+        confidence: FeedFrontierConfidence,
+    ) -> bool {
+        FEED_ROUTE_CACHE.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            let Some(state) = cache.get_mut(cache_key) else {
+                return false;
+            };
+            if !confidence.is_authoritative()
+                || state.checking_token != checking_token
+                || state.snapshot.index != observed_index
+                || state.source_body.as_ref() != observed_source
+                || state.confirmed_head_index != head_confirmed.then_some(observed_index)
+            {
+                return false;
+            }
+            let observed_at = js_sys::Date::now();
+            state.last_head_check = observed_at;
+            state.frontier_observation = Some(FeedFrontierObservation {
+                index: state.snapshot.index,
+                source: state.source_body.clone(),
+                finalized: state.snapshot.finalized,
+                confirmed_head_index: state.confirmed_head_index,
+                confidence,
+                last_head_check: observed_at,
+                observed_at,
+            });
+            true
+        })
     }
 
     impl FeedRegistry {
@@ -3544,6 +4061,7 @@ mod runtime {
     struct HlsPrefetchTrack {
         schedule_id: u64,
         last_foreground_position: usize,
+        last_foreground_reference: String,
         running: Option<PrefetchTicket>,
         last_touch: u64,
     }
@@ -3576,6 +4094,7 @@ mod runtime {
         live_start: bool,
         live_history_active: bool,
         timeline_rebasing: bool,
+        seek_pending: bool,
         startup_deadline_ms: f64,
         completed_media_payloads: usize,
         startup_overlap_plans: HashSet<u64>,
@@ -3598,6 +4117,7 @@ mod runtime {
                 live_start: false,
                 live_history_active: false,
                 timeline_rebasing: false,
+                seek_pending: false,
                 startup_deadline_ms: 0.0,
                 completed_media_payloads: 0,
                 startup_overlap_plans: HashSet::new(),
@@ -3613,8 +4133,10 @@ mod runtime {
         }
 
         fn advance_generation(&mut self) -> u64 {
+            clear_hls_progressive_range_coverage();
             self.generation = next_media_generation();
             self.runway = None;
+            self.seek_pending = false;
             self.startup_overlap_plans.clear();
             self.completed_media_payloads = if self.live_start {
                 HLS_SERIAL_PREFETCH_COMPLETIONS.saturating_sub(1)
@@ -3628,6 +4150,7 @@ mod runtime {
         }
 
         fn advance_timeline(&mut self) -> u64 {
+            clear_hls_progressive_range_coverage();
             self.timeline_epoch = next_nonzero_generation(self.timeline_epoch);
             self.runway = None;
             self.timeline_epoch
@@ -3972,13 +4495,20 @@ mod runtime {
         if range.is_some() && !if_range_allows_range(if_range.as_deref(), &etag) {
             range = None;
         }
-        let progressive_stamp = HLS_PLAYBACK.with(|playback| {
+        let runway_stamp = HLS_PLAYBACK.with(|playback| {
             let playback = playback.borrow();
             let session = &playback.session;
             let stamp = session.stamp();
             (stamp.generation != 0 && session.progressive_current(&reference, stamp))
                 .then_some(stamp)
         });
+        let progressive_stamp = if range.is_some() {
+            runway_stamp.or_else(|| {
+                current_hls_progressive_foreground(&reference).map(|(_, ticket)| ticket.stamp)
+            })
+        } else {
+            runway_stamp
+        };
         let progressive_start = progressive_stamp.is_some();
         if method != "HEAD" && range.is_none() && progressive_start {
             let Some(resolved) = resolve_hls_asset(weeb3.clone(), reference.clone()).await else {
@@ -3993,6 +4523,37 @@ mod runtime {
                 ));
                 headers.push(("X-Weeb3-Stream-Start".to_string(), "1".to_string()));
                 return FetchResponse::stream(200, headers);
+            }
+        }
+        if method != "HEAD"
+            && range.is_none()
+            && !progressive_start
+            && hls_progressive_foreground_candidate(&reference)
+            && hls_progressive_media_body_absent(&reference)
+        {
+            let context = hls_foreground_context(&reference, false);
+            if current_hls_progressive_foreground_for_context(&reference, &context).is_some() {
+                let Some(resolved) = resolve_hls_asset(weeb3.clone(), reference.clone()).await
+                else {
+                    return FetchResponse::error(503, "weeb-3 did not resolve HLS media");
+                };
+                if current_hls_progressive_foreground_for_context(&reference, &context).is_none() {
+                    return FetchResponse::error(503, "HLS foreground was superseded");
+                }
+                if !resolved.metadata.is_manifest && resolved.prefetched_body.is_none() {
+                    begin_hls_progressive_range_coverage(
+                        &reference,
+                        context.stamp,
+                        resolved.metadata.payload_size,
+                    );
+                    let mut headers = hls_bytes_headers(&reference, resolved.metadata.mime);
+                    headers.push((
+                        "Content-Length".to_string(),
+                        resolved.metadata.payload_size.to_string(),
+                    ));
+                    headers.push(("X-Weeb3-Stream-Start".to_string(), "1".to_string()));
+                    return FetchResponse::stream(200, headers);
+                }
             }
         }
         if method != "HEAD" && range.is_none() {
@@ -4040,6 +4601,12 @@ mod runtime {
             let _ = wait_for_pending_hls_payload(&reference).await;
         }
         let Some(resolved) = resolve_hls_asset(weeb3.clone(), reference.clone()).await else {
+            if range.is_some()
+                && runway_stamp.is_none()
+                && let Some(stamp) = progressive_stamp
+            {
+                fail_hls_progressive_range_coverage(&reference, stamp);
+            }
             return FetchResponse::error(503, "weeb-3 did not retrieve resource");
         };
 
@@ -4084,6 +4651,12 @@ mod runtime {
         let (start, end) = match parse_single_range(range.as_deref(), size) {
             Some(Ok(range)) => range,
             Some(Err(())) | None => {
+                if !is_manifest
+                    && runway_stamp.is_none()
+                    && let Some(stamp) = progressive_stamp
+                {
+                    fail_hls_progressive_range_coverage(&reference, stamp);
+                }
                 headers.push(("Content-Range".to_string(), format!("bytes */{}", size)));
                 headers.push(("Content-Length".to_string(), "0".to_string()));
                 return FetchResponse::ok(416, headers, None);
@@ -4145,6 +4718,11 @@ mod runtime {
             bytes
         };
         if !is_manifest && !expected_len.is_some_and(|expected| bytes.len() == expected) {
+            if runway_stamp.is_none()
+                && let Some(stamp) = progressive_stamp
+            {
+                fail_hls_progressive_range_coverage(&reference, stamp);
+            }
             return FetchResponse::error(502, "weeb-3 returned a short HLS byte range");
         }
         if !is_manifest
@@ -4181,6 +4759,13 @@ mod runtime {
                     mark_hls_progressive_successor_prefix_ready(&source_reference, stamp);
                 }
             });
+        }
+        if !is_manifest
+            && runway_stamp.is_none()
+            && let Some(stamp) = progressive_stamp
+            && complete_hls_progressive_range(&reference, stamp, size, start, end)
+        {
+            restart_hls_progressive_prefetch_stages(weeb3.clone(), reference.clone(), stamp);
         }
 
         headers.push(("Content-Length".to_string(), bytes.len().to_string()));
@@ -4226,13 +4811,14 @@ mod runtime {
         let Some(mut segments) = hls_segment_identities(manifest) else {
             return;
         };
+        let media_sequence = hls_media_sequence(manifest);
         HLS_PLAYBACK.with(|playback| {
             let mut playback = playback.borrow_mut();
-            let plan_limit = if hls_is_finalized(manifest) {
-                HLS_ARCHIVE_MEDIA_PLAN_MAX_REFERENCES
-            } else {
-                HLS_MEDIA_PLAN_MAX_REFERENCES
-            };
+            let plan_limit = hls_media_plan_reference_limit(
+                hls_is_finalized(manifest),
+                playback.session.live_start,
+                media_sequence,
+            );
             playback.plans.resize(plan_limit);
             if playback.session.live_start && segments.len() > plan_limit {
                 segments.drain(..segments.len() - plan_limit);
@@ -4252,7 +4838,7 @@ mod runtime {
                 .into_iter()
                 .map(|segment| segment.reference)
                 .collect();
-            let overlap = if hls_media_sequence(manifest).is_some_and(|sequence| sequence > 0) {
+            let overlap = if media_sequence.is_some_and(|sequence| sequence > 0) {
                 HLS_ROLLING_EARLY_OVERLAP_SEGMENTS
             } else {
                 HLS_EXACT_NEXT_OVERLAP_SEGMENTS
@@ -4274,6 +4860,18 @@ mod runtime {
 
     fn cached_hls_payload_size(reference: &str) -> Option<u64> {
         HLS_ASSET_CACHE.with(|cache| cache.borrow().payload_size(&reference.to_ascii_lowercase()))
+    }
+
+    fn hls_progressive_media_body_absent(reference: &str) -> bool {
+        let reference = reference.to_ascii_lowercase();
+        HLS_ASSET_CACHE.with(|cache| {
+            let cache = cache.borrow();
+            !cache.bodies.contains_key(&reference)
+                && cache
+                    .metadata
+                    .get(&reference)
+                    .is_none_or(|(metadata, _)| !metadata.is_manifest)
+        })
     }
 
     fn start_hls_payload_size_probe(
@@ -4549,6 +5147,23 @@ mod runtime {
         });
     }
 
+    fn mark_hls_seek() {
+        HLS_PLAYBACK.with(|playback| {
+            let mut playback = playback.borrow_mut();
+            let session = &mut playback.session;
+            if session.mode != HlsPrefetchMode::StartupOnly
+                && !session.timeline_rebasing
+                && !session.tracks.is_empty()
+            {
+                session.seek_pending = true;
+            }
+        });
+    }
+
+    fn finish_hls_seek() {
+        HLS_PLAYBACK.with(|playback| playback.borrow_mut().session.seek_pending = false);
+    }
+
     fn activate_hls_prefetch_warmup() {
         let now = hls_monotonic_now_ms();
         HLS_PLAYBACK.with(|playback| {
@@ -4625,12 +5240,7 @@ mod runtime {
         let (stamp, ticket, cursor, progressive_ready, seek_successor) =
             HLS_PLAYBACK.with(|playback| {
                 let mut playback = playback.borrow_mut();
-                let preferred = playback
-                    .session
-                    .tracks
-                    .iter()
-                    .map(|(plan, track)| (*plan, track.last_foreground_position))
-                    .collect::<HashMap<_, _>>();
+                let preferred = hls_prefetch_track_positions(&playback.session);
                 let selection = playback.plans.cursor(&reference, &preferred);
                 let cursor = selection.as_ref().map(|selected| selected.cursor.clone());
                 let superseded = selection
@@ -4645,17 +5255,21 @@ mod runtime {
                 let mut seek_successor = None;
                 let mut schedule_id = None;
                 if let Some(cursor) = &cursor {
+                    let explicit_seek = session.seek_pending;
+                    let cross_plan_seek =
+                        hls_cross_plan_seek_transition_for_session(session, cursor);
                     let transition = session.tracks.get(&cursor.plan.id).map(|track| {
-                        if cached && cursor.position < track.last_foreground_position {
-                            (false, track.last_foreground_position)
-                        } else {
-                            (
-                                track.last_foreground_position.abs_diff(cursor.position) > 1,
-                                cursor.position,
-                            )
-                        }
+                        hls_foreground_cursor_transition(
+                            track.last_foreground_position,
+                            cursor.position,
+                            cached,
+                            explicit_seek,
+                        )
                     });
-                    if transition.is_some_and(|transition| transition.0) {
+                    if transition.is_some_and(|transition| transition.2) {
+                        session.seek_pending = false;
+                    }
+                    if cross_plan_seek || transition.is_some_and(|transition| transition.0) {
                         let completed_media_payloads = session
                             .completed_media_payloads
                             .min(HLS_TWO_BODY_PREFETCH_COMPLETIONS);
@@ -4671,6 +5285,9 @@ mod runtime {
                             .as_ref()
                             .cloned()
                             .map(|client| (client, generation));
+                        if cross_plan_seek {
+                            session.tracks.clear();
+                        }
                     }
                     if !session.tracks.contains_key(&cursor.plan.id) {
                         session.schedule_sequence =
@@ -4680,6 +5297,8 @@ mod runtime {
                             HlsPrefetchTrack {
                                 schedule_id: session.schedule_sequence,
                                 last_foreground_position: cursor.position,
+                                last_foreground_reference: cursor.plan.references[cursor.position]
+                                    .clone(),
                                 running: None,
                                 last_touch: 0,
                             },
@@ -4689,9 +5308,15 @@ mod runtime {
                         next_nonzero_generation(session.track_touch_sequence);
                     let touch = session.track_touch_sequence;
                     if let Some(track) = session.tracks.get_mut(&cursor.plan.id) {
-                        track.last_foreground_position = transition
+                        let accepted_position = transition
                             .map(|transition| transition.1)
                             .unwrap_or(cursor.position);
+                        track.last_foreground_position = accepted_position;
+                        if let Some(accepted_reference) =
+                            cursor.plan.references.get(accepted_position)
+                        {
+                            track.last_foreground_reference = accepted_reference.clone();
+                        }
                         track.last_touch = touch;
                         schedule_id = Some(track.schedule_id);
                     }
@@ -4727,6 +5352,7 @@ mod runtime {
                     });
                 (stamp, ticket, cursor, progressive_ready, seek_successor)
             });
+        clear_hls_progressive_range_coverage_unless(&reference, stamp);
         if let Some((client, generation)) = publish {
             publish_hls_stream_generation(client, generation);
         }
@@ -4737,6 +5363,160 @@ mod runtime {
             progressive_successor_prefix_ready: progressive_ready,
             seek_successor,
         }
+    }
+
+    fn hls_prefetch_track_positions(session: &HlsPrefetchSession) -> HashMap<u64, usize> {
+        session
+            .tracks
+            .iter()
+            .map(|(plan, track)| (*plan, track.last_foreground_position))
+            .collect()
+    }
+
+    fn hls_progressive_foreground_allowed(session: &HlsPrefetchSession) -> bool {
+        session.generation != 0
+            && session.mode != HlsPrefetchMode::Inactive
+            && !session.live_start
+            && !session.timeline_rebasing
+    }
+
+    fn begin_hls_progressive_range_coverage(reference: &str, stamp: PlaybackStamp, size: u64) {
+        HLS_PROGRESSIVE_RANGE_COVERAGE.with(|coverage| {
+            coverage
+                .borrow_mut()
+                .begin(reference, stamp.generation, stamp.timeline_epoch, size);
+        });
+    }
+
+    fn clear_hls_progressive_range_coverage() {
+        HLS_PROGRESSIVE_RANGE_COVERAGE.with(|coverage| coverage.borrow_mut().clear());
+    }
+
+    fn clear_hls_progressive_range_coverage_unless(reference: &str, stamp: PlaybackStamp) {
+        HLS_PROGRESSIVE_RANGE_COVERAGE.with(|coverage| {
+            coverage
+                .borrow_mut()
+                .clear_unless(reference, stamp.generation, stamp.timeline_epoch);
+        });
+    }
+
+    fn fail_hls_progressive_range_coverage(reference: &str, stamp: PlaybackStamp) {
+        HLS_PROGRESSIVE_RANGE_COVERAGE.with(|coverage| {
+            coverage
+                .borrow_mut()
+                .fail(reference, stamp.generation, stamp.timeline_epoch);
+        });
+    }
+
+    fn complete_hls_progressive_range(
+        reference: &str,
+        stamp: PlaybackStamp,
+        size: u64,
+        start: u64,
+        end: u64,
+    ) -> bool {
+        HLS_PROGRESSIVE_RANGE_COVERAGE.with(|coverage| {
+            coverage.borrow_mut().record_success(
+                reference,
+                stamp.generation,
+                stamp.timeline_epoch,
+                size,
+                start,
+                end,
+                MEDIA_STORAGE_WINDOW_BYTES,
+            ) == HlsProgressiveRangeUpdate::Complete
+        })
+    }
+
+    fn hls_cross_plan_seek_transition_for_session(
+        session: &HlsPrefetchSession,
+        cursor: &HlsMediaCursor,
+    ) -> bool {
+        if !session.seek_pending || session.tracks.contains_key(&cursor.plan.id) {
+            return false;
+        }
+        let Some(previous) = session
+            .tracks
+            .values()
+            .filter(|track| track.schedule_id != 0)
+            .max_by_key(|track| track.last_touch)
+        else {
+            return false;
+        };
+        hls_cross_plan_seek_transition(
+            &previous.last_foreground_reference,
+            &cursor.plan.references,
+            cursor.position,
+            session.seek_pending,
+        )
+    }
+
+    fn hls_progressive_foreground_candidate(reference: &str) -> bool {
+        let reference = reference.to_ascii_lowercase();
+        HLS_PLAYBACK.with(|playback| {
+            let playback = playback.borrow();
+            let session = &playback.session;
+            if !hls_progressive_foreground_allowed(session) {
+                return false;
+            }
+            let preferred = hls_prefetch_track_positions(session);
+            let Some(selection) = playback.plans.cursor(&reference, &preferred) else {
+                return false;
+            };
+            session
+                .tracks
+                .get(&selection.cursor.plan.id)
+                .is_some_and(|track| track.schedule_id != 0)
+                || hls_cross_plan_seek_transition_for_session(session, &selection.cursor)
+        })
+    }
+
+    fn current_hls_progressive_foreground(
+        reference: &str,
+    ) -> Option<(HlsMediaCursor, PrefetchTicket)> {
+        let reference = reference.to_ascii_lowercase();
+        HLS_PLAYBACK.with(|playback| {
+            let playback = playback.borrow();
+            let session = &playback.session;
+            if !hls_progressive_foreground_allowed(session) {
+                return None;
+            }
+            let preferred = hls_prefetch_track_positions(session);
+            let cursor = playback.plans.cursor(&reference, &preferred)?.cursor;
+            if !cursor
+                .plan
+                .references
+                .get(cursor.position)
+                .is_some_and(|current| current.eq_ignore_ascii_case(&reference))
+            {
+                return None;
+            }
+            let track = session.tracks.get(&cursor.plan.id)?;
+            if track.schedule_id == 0 || track.last_foreground_position != cursor.position {
+                return None;
+            }
+            Some((
+                cursor.clone(),
+                PrefetchTicket {
+                    stamp: session.stamp(),
+                    plan_id: cursor.plan.id,
+                    schedule_id: track.schedule_id,
+                },
+            ))
+        })
+    }
+
+    fn current_hls_progressive_foreground_for_context(
+        reference: &str,
+        context: &HlsForegroundContext,
+    ) -> Option<(HlsMediaCursor, PrefetchTicket)> {
+        let expected_cursor = context.cursor.as_ref()?;
+        let expected_ticket = context.ticket?;
+        let (cursor, ticket) = current_hls_progressive_foreground(reference)?;
+        (ticket == expected_ticket
+            && cursor.plan.id == expected_cursor.plan.id
+            && cursor.position == expected_cursor.position)
+            .then_some((cursor, ticket))
     }
 
     fn hls_generation_current(generation: u64) -> bool {
@@ -4781,6 +5561,77 @@ mod runtime {
             }
             session.startup_overlap_plans.insert(cursor.plan.id)
         })
+    }
+
+    fn spawn_hls_exact_next_overlap(
+        weeb3: Arc<Weeb3>,
+        ticket: PrefetchTicket,
+        cursor: &HlsMediaCursor,
+        head_ready: bool,
+    ) {
+        let successors = cursor
+            .plan
+            .references
+            .iter()
+            .skip(cursor.position.saturating_add(1))
+            .take(
+                cursor
+                    .plan
+                    .early_overlap_limit
+                    .min(HLS_EXACT_NEXT_OVERLAP_SEGMENTS),
+            )
+            .cloned()
+            .collect::<Vec<_>>();
+        if successors.is_empty() || !claim_hls_exact_next_overlap(ticket, cursor) {
+            return;
+        }
+
+        spawn_local(async move {
+            let started = hls_monotonic_now_ms();
+            let first_delay = if head_ready {
+                0
+            } else {
+                HLS_EXACT_NEXT_HEAD_START.as_millis() as u64
+            };
+            let stagger = HLS_NEXT_RESERVE_STAGGER.as_millis() as u64;
+            let retry_limit = (HLS_EXACT_OVERLAP_ADMISSION_BUDGET.as_millis() as u64)
+                / MEDIA_PREFETCH_BATCH_YIELD_MS.max(1);
+            let mut retries = 0_u64;
+            for (offset, successor) in successors.into_iter().enumerate() {
+                let due = first_delay.saturating_add(stagger.saturating_mul(offset as u64));
+                let remaining = started
+                    .zip(hls_monotonic_now_ms())
+                    .map(|(start, now)| (due as f64 - (now - start)).max(0.0).ceil() as u64)
+                    .unwrap_or(due);
+                if remaining > 0 {
+                    async_std::task::sleep(Duration::from_millis(remaining)).await;
+                }
+                loop {
+                    if !hls_playback_prefetch_admission_is_current(ticket) {
+                        return;
+                    }
+                    match start_hls_payload_load(
+                        weeb3.clone(),
+                        successor.clone(),
+                        true,
+                        ticket.stamp.generation,
+                    ) {
+                        HlsPayloadLoadRole::AtCapacity if retries < retry_limit => {
+                            retries += 1;
+                            async_std::task::sleep(Duration::from_millis(
+                                MEDIA_PREFETCH_BATCH_YIELD_MS,
+                            ))
+                            .await;
+                        }
+                        HlsPayloadLoadRole::AtCapacity | HlsPayloadLoadRole::Reject(_) => return,
+                        role => {
+                            drop(role);
+                            break;
+                        }
+                    }
+                }
+            }
+        });
     }
 
     fn hls_prefetch_ticket_current(ticket: PrefetchTicket, sustained: bool) -> bool {
@@ -4935,6 +5786,22 @@ mod runtime {
             }
         });
         true
+    }
+
+    fn restart_hls_progressive_prefetch_stages(
+        weeb3: Arc<Weeb3>,
+        reference: String,
+        stamp: PlaybackStamp,
+    ) {
+        let Some((cursor, ticket)) = current_hls_progressive_foreground(&reference) else {
+            return;
+        };
+        if ticket.stamp != stamp {
+            return;
+        }
+        let (ready_out, ready_in) = mpsc::bounded(1);
+        let _ = ready_out.try_send(true);
+        spawn_hls_prefetch_stages(weeb3, cursor, ticket, ready_in);
     }
 
     async fn hls_payload_size_for_prefetch(
@@ -5283,74 +6150,8 @@ mod runtime {
             context.stamp.generation,
         );
 
-        if let (Some(ticket), Some(cursor)) = (context.ticket, context.cursor.as_ref())
-            && let Some(successors) = {
-                let successors = cursor
-                    .plan
-                    .references
-                    .iter()
-                    .skip(cursor.position.saturating_add(1))
-                    .take(
-                        cursor
-                            .plan
-                            .early_overlap_limit
-                            .min(HLS_EXACT_NEXT_OVERLAP_SEGMENTS),
-                    )
-                    .cloned()
-                    .collect::<Vec<_>>();
-                (!successors.is_empty()).then_some(successors)
-            }
-            && claim_hls_exact_next_overlap(ticket, cursor)
-        {
-            let client = weeb3.clone();
-            spawn_local(async move {
-                let started = hls_monotonic_now_ms();
-                let first_delay = if head_ready {
-                    0
-                } else {
-                    HLS_EXACT_NEXT_HEAD_START.as_millis() as u64
-                };
-                let stagger = HLS_NEXT_RESERVE_STAGGER.as_millis() as u64;
-                let retry_limit = (HLS_EXACT_OVERLAP_ADMISSION_BUDGET.as_millis() as u64)
-                    / MEDIA_PREFETCH_BATCH_YIELD_MS.max(1);
-                let mut retries = 0_u64;
-                for (offset, successor) in successors.into_iter().enumerate() {
-                    let due = first_delay.saturating_add(stagger.saturating_mul(offset as u64));
-                    let remaining = started
-                        .zip(hls_monotonic_now_ms())
-                        .map(|(start, now)| (due as f64 - (now - start)).max(0.0).ceil() as u64)
-                        .unwrap_or(due);
-                    if remaining > 0 {
-                        async_std::task::sleep(Duration::from_millis(remaining)).await;
-                    }
-                    loop {
-                        if !hls_playback_prefetch_admission_is_current(ticket) {
-                            return;
-                        }
-                        match start_hls_payload_load(
-                            client.clone(),
-                            successor.clone(),
-                            true,
-                            ticket.stamp.generation,
-                        ) {
-                            HlsPayloadLoadRole::AtCapacity if retries < retry_limit => {
-                                retries += 1;
-                                async_std::task::sleep(Duration::from_millis(
-                                    MEDIA_PREFETCH_BATCH_YIELD_MS,
-                                ))
-                                .await;
-                            }
-                            HlsPayloadLoadRole::AtCapacity | HlsPayloadLoadRole::Reject(_) => {
-                                return;
-                            }
-                            role => {
-                                drop(role);
-                                break;
-                            }
-                        }
-                    }
-                }
-            });
+        if let (Some(ticket), Some(cursor)) = (context.ticket, context.cursor.as_ref()) {
+            spawn_hls_exact_next_overlap(weeb3.clone(), ticket, cursor, head_ready);
         }
 
         let (ready_out, ready_in) = mpsc::bounded(1);
@@ -5514,28 +6315,37 @@ mod runtime {
         })
     }
 
-    fn hls_codec_bootstrap_manifest(token: u64) -> HlsCodecBootstrapManifest {
-        HLS_CODEC_BOOTSTRAP_PRESENTATION.with(|presentation| {
+    fn hls_codec_bootstrap_manifest(token: u64) -> Option<HlsCodecBootstrapManifest> {
+        if !super::player::hls_codec_token_is_active(token) {
+            return None;
+        }
+        Some(HLS_CODEC_BOOTSTRAP_PRESENTATION.with(|presentation| {
             let mut presentation = presentation.borrow_mut();
-            if presentation
+            let replace = presentation
                 .as_ref()
-                .is_none_or(|current| current.token != token)
-            {
+                .is_none_or(|current| current.token != token && current.complete);
+            if replace {
                 *presentation = Some(HlsCodecBootstrapPresentation {
                     token,
                     complete: false,
                     snapshot: None,
+                    sequence_zero: false,
+                    discontinuity_anchor: None,
                 });
+            } else if let Some(current) = presentation.as_mut()
+                && current.token != token
+            {
+                current.token = token;
             }
             if presentation
                 .as_ref()
                 .is_some_and(|current| current.complete)
             {
-                HlsCodecBootstrapManifest::Continuation
+                HlsCodecBootstrapManifest::Continuation(token)
             } else {
                 HlsCodecBootstrapManifest::Bootstrap(token)
             }
-        })
+        }))
     }
 
     pub(super) fn finish_hls_codec_bootstrap(source: &str) {
@@ -5554,14 +6364,40 @@ mod runtime {
                 && current.token == token
             {
                 current.complete = true;
+                current.snapshot = None;
             }
         });
     }
 
-    fn reset_hls_codec_bootstrap() {
+    pub(super) fn reset_hls_codec_bootstrap() {
         HLS_CODEC_BOOTSTRAP_PRESENTATION.with(|presentation| {
             presentation.borrow_mut().take();
         });
+    }
+
+    fn exact_live_codec_bootstrap_ready(owner: &str, topic: &str, presentation_id: u64) -> bool {
+        let active = HLS_PLAYBACK.with(|playback| {
+            let playback = playback.borrow();
+            let session = &playback.session;
+            (session.live_start && session.presentation_id == presentation_id)
+                .then_some(session.live_history_active)
+        });
+        let Some(history_active) = active else {
+            return false;
+        };
+        FEED_ROUTE_CACHE.with(|cache| {
+            let cache = cache.borrow();
+            let state = if history_active {
+                cache.get(&sequence_zero_feed_cache_key(owner, topic, presentation_id))
+            } else {
+                cache
+                    .get(&feed_cache_key(owner, topic, None))
+                    .filter(|state| state.snapshot.finalized)
+            };
+            state.is_some_and(|state| {
+                hls_sequence_zero_codec_bootstrap_is_supported(&state.snapshot.body)
+            })
+        })
     }
 
     async fn fetch_feed_response(
@@ -5585,7 +6421,7 @@ mod runtime {
                 }),
             _ => None,
         };
-        let snapshot = match cached_bootstrap.clone() {
+        let mut snapshot = match cached_bootstrap.clone() {
             Some(snapshot) => snapshot,
             None => match load_feed_snapshot(
                 weeb3.clone(),
@@ -5613,7 +6449,7 @@ mod runtime {
             Some(HlsCodecBootstrapManifest::Bootstrap(_)) if cached_bootstrap.is_some() => None,
             Some(HlsCodecBootstrapManifest::Bootstrap(token)) => {
                 let presentation = if hls_media_sequence(&snapshot.body) == Some(0) {
-                    rewrite_hls_sequence_zero_codec_bootstrap(&snapshot.body, true)
+                    rewrite_hls_sequence_zero_codec_bootstrap_at(&snapshot.body, true, None)
                 } else {
                     let mut bootstrap = None;
                     for index in [HLS_EARLY_FEED_PREFIX_INDEX, 0] {
@@ -5654,25 +6490,52 @@ mod runtime {
                         }
                     };
                     prepend_hls_codec_bootstrap(&snapshot.body, &bootstrap)
+                        .map(|presentation| (presentation, None))
                 };
-                let Some(presentation) = presentation else {
+                let Some((presentation, discontinuity_anchor)) = presentation else {
                     return FetchResponse::error(502, "HLS codec bootstrap is not supported");
                 };
-                HLS_CODEC_BOOTSTRAP_PRESENTATION.with(|state| {
-                    if let Some(current) = state.borrow_mut().as_mut()
-                        && current.token == token
-                        && !current.complete
-                    {
-                        current.snapshot = Some(FeedRouteSnapshot {
-                            body: Arc::from(presentation.clone()),
-                            ..snapshot.clone()
-                        });
+                let candidate = FeedRouteSnapshot {
+                    body: Arc::from(presentation),
+                    ..snapshot.clone()
+                };
+                let selected = HLS_CODEC_BOOTSTRAP_PRESENTATION.with(|state| {
+                    let mut state = state.borrow_mut();
+                    let current = state
+                        .as_mut()
+                        .filter(|current| current.token == token && !current.complete)?;
+                    if current.snapshot.is_none() {
+                        current.sequence_zero = hls_media_sequence(&snapshot.body) == Some(0);
+                        current.discontinuity_anchor = discontinuity_anchor;
+                        current.snapshot = Some(candidate);
                     }
+                    current.snapshot.clone()
                 });
-                Some(presentation)
+                let Some(selected) = selected else {
+                    return FetchResponse::error(409, "stale HLS codec bootstrap");
+                };
+                snapshot = selected;
+                None
             }
-            Some(HlsCodecBootstrapManifest::Continuation) => {
-                let Some(presentation) = continue_hls_codec_bootstrap(&snapshot.body) else {
+            Some(HlsCodecBootstrapManifest::Continuation(token)) => {
+                let sequence_zero_anchor = HLS_CODEC_BOOTSTRAP_PRESENTATION.with(|state| {
+                    state
+                        .borrow()
+                        .as_ref()
+                        .filter(|current| current.token == token && current.complete)
+                        .and_then(|current| {
+                            current
+                                .sequence_zero
+                                .then_some(current.discontinuity_anchor)
+                        })
+                });
+                let presentation = match sequence_zero_anchor {
+                    Some(anchor) => {
+                        continue_hls_sequence_zero_codec_bootstrap(&snapshot.body, anchor)
+                    }
+                    None => continue_hls_codec_bootstrap(&snapshot.body),
+                };
+                let Some(presentation) = presentation else {
                     return FetchResponse::error(502, "invalid HLS codec continuation");
                 };
                 Some(presentation)
@@ -5768,11 +6631,32 @@ mod runtime {
         let Some(generation) = hls_prefix_generation_for_feed(weeb3, owner, topic) else {
             return;
         };
-        if !HLS_PLAYBACK.with(|playback| {
+        let Some(live_history_active) = HLS_PLAYBACK.with(|playback| {
             let playback = playback.borrow();
             let session = &playback.session;
-            session.live_start && session.generation == generation
-        }) {
+            (session.live_start && session.generation == generation)
+                .then_some(session.live_history_active)
+        }) else {
+            return;
+        };
+        let frontier_matches_snapshot = FEED_ROUTE_CACHE.with(|cache| {
+            cache
+                .borrow()
+                .get(&feed_cache_key(owner, topic, None))
+                .and_then(|state| {
+                    state
+                        .frontier_observation
+                        .as_ref()
+                        .map(|seen| (state, seen))
+                })
+                .is_some_and(|(state, seen)| {
+                    seen.confidence.is_authoritative()
+                        && seen.index == snapshot.index
+                        && state.snapshot.index == snapshot.index
+                        && seen.source.as_ref() == state.source_body.as_ref()
+                })
+        });
+        if !hls_live_tail_prefetch_ready(live_history_active, frontier_matches_snapshot) {
             return;
         }
         let references = hls_media_references(&snapshot.body);
@@ -5801,40 +6685,6 @@ mod runtime {
                 false,
                 generation,
             ));
-        }
-    }
-
-    async fn await_live_frontier_snapshot(
-        cache_key: &str,
-        checked_after_ms: f64,
-        deadline_ms: f64,
-        missing_is_terminal: bool,
-    ) -> Option<FeedRouteSnapshot> {
-        loop {
-            let state = FEED_ROUTE_CACHE.with(|cache| {
-                cache.borrow().get(cache_key).map(|state| {
-                    (
-                        state.snapshot.clone(),
-                        state.confirmed_head_index,
-                        state.last_head_check,
-                    )
-                })
-            });
-            let now = js_sys::Date::now();
-            if let Some((snapshot, confirmed_head_index, last_head_check)) = state {
-                if hls_live_frontier_is_ready(
-                    snapshot.index,
-                    confirmed_head_index,
-                    last_head_check,
-                    checked_after_ms,
-                ) || now >= deadline_ms
-                {
-                    return Some(snapshot);
-                }
-            } else if missing_is_terminal || now >= deadline_ms {
-                return None;
-            }
-            async_std::task::sleep(Duration::from_millis(15)).await;
         }
     }
 
@@ -5934,14 +6784,19 @@ mod runtime {
         start: HlsStart,
         live_frontier_deadline_ms: Option<f64>,
     ) -> Option<FeedRouteSnapshot> {
-        let wait_for_live_frontier = live_frontier_deadline_ms.is_some();
-        let live_frontier_deadline_ms = live_frontier_deadline_ms
-            .unwrap_or_else(|| js_sys::Date::now() + HLS_LIVE_FRONTIER_MAX_WAIT.as_millis() as f64);
+        let active_live_frontier_deadline_ms =
+            live_frontier_deadline_ms.filter(|_| start == HlsStart::Live);
+        let wait_for_live_frontier = active_live_frontier_deadline_ms.is_some();
         let owner = owner
             .trim_start_matches("0x")
             .trim_start_matches("0X")
             .to_string();
         let topic = normalize_feed_topic(&topic);
+        let active_live_generation = if active_live_frontier_deadline_ms.is_some() {
+            Some(hls_prefix_generation_for_feed(&weeb3, &owner, &topic)?)
+        } else {
+            None
+        };
         let active_presentation =
             hls_presentation_for_feed(&weeb3, &owner, &topic).filter(|_| index_hint.is_none());
         let sequence_zero_presentation_id = active_presentation.and_then(|(presentation_id, _)| {
@@ -5964,12 +6819,10 @@ mod runtime {
             let mut cache = cache.borrow_mut();
             let selected_key = if cache.contains_key(&cache_key) {
                 cache_key.clone()
-            } else if (sequence_zero_start_requested
+            } else if sequence_zero_start_requested
                 && cache
                     .get(&canonical_cache_key)
-                    .is_some_and(|state| hls_media_sequence(&state.snapshot.body) == Some(0)))
-                || (live_history_presentation_id.is_some()
-                    && cache.contains_key(&canonical_cache_key))
+                    .is_some_and(|state| hls_media_sequence(&state.snapshot.body) == Some(0))
             {
                 canonical_cache_key.clone()
             } else {
@@ -5977,20 +6830,20 @@ mod runtime {
             };
             let state = cache.get_mut(&selected_key)?;
             let now = js_sys::Date::now();
-            let refresh_head =
-                index_hint.is_none() && cached_feed_should_refresh_head(state.last_head_check, now);
+            let refresh_head = index_hint.is_none()
+                && !state.snapshot.finalized
+                && ((start == HlsStart::Live && wait_for_live_frontier)
+                    || cached_feed_should_refresh_head(state.last_head_check, now));
             state.last_touch = now;
             Some((
                 state.snapshot.clone(),
                 refresh_head,
                 selected_key,
                 state.checking_token != 0,
-                state.last_head_check,
             ))
         });
 
-        if let Some((mut snapshot, refresh_head, cached_key, feed_task_running, last_head_check)) =
-            cached
+        if let Some((snapshot, refresh_head, cached_key, feed_task_running)) = cached
             && !(start == HlsStart::Live
                 && index_hint.is_none()
                 && persisted_vod_index(active_profile().swarm_network_id, &owner, &topic)
@@ -6018,21 +6871,14 @@ mod runtime {
                     );
                 }
                 if start == HlsStart::Live {
-                    if refresh_head && wait_for_live_frontier {
-                        snapshot = await_live_frontier_snapshot(
-                            &cached_key,
-                            last_head_check,
-                            live_frontier_deadline_ms,
-                            false,
-                        )
-                        .await
-                        .unwrap_or(snapshot);
-                    }
                     prefetch_live_snapshot_start(&weeb3, &owner, &topic, &snapshot);
                 }
                 return Some(snapshot);
             }
             return Some(snapshot);
+        }
+        if live_history_presentation_id.is_some() {
+            return None;
         }
 
         let network_id = active_profile().swarm_network_id;
@@ -6052,27 +6898,32 @@ mod runtime {
                 let persisted = match persisted_index {
                     Some(index) if start == HlsStart::Live => {
                         let predecessor = match index.checked_sub(1) {
-                            Some(previous_index) => weeb3
-                                .hls_feed_payload_at_index_bounded(
+                            Some(previous_index) => await_before_hls_live_frontier_deadline(
+                                active_live_frontier_deadline_ms,
+                                weeb3.hls_feed_payload_at_index_bounded(
                                     owner.clone(),
                                     topic.clone(),
                                     previous_index,
-                                )
-                                .await
-                                .filter(|payload| {
-                                    payload.bytes.len() <= MAX_STREAM_FEED_PAYLOAD_BYTES
-                                        && is_hls_manifest(&payload.bytes)
-                                }),
+                                ),
+                            )
+                            .await
+                            .flatten()
+                            .filter(|payload| {
+                                payload.bytes.len() <= MAX_STREAM_FEED_PAYLOAD_BYTES
+                                    && is_hls_manifest(&payload.bytes)
+                            }),
                             None => None,
                         };
                         match predecessor {
                             Some(predecessor) => Some(predecessor),
-                            None => {
+                            None => await_before_hls_live_frontier_deadline(
+                                active_live_frontier_deadline_ms,
                                 load_persisted_vod_payload(
                                     &weeb3, network_id, &owner, &topic, index, false,
-                                )
-                                .await
-                            }
+                                ),
+                            )
+                            .await
+                            .flatten(),
                         }
                     }
                     Some(index) if !sequence_zero_start_requested => {
@@ -6085,10 +6936,15 @@ mod runtime {
                 match persisted {
                     Some(loaded) => loaded,
                     None if !sequence_zero_start_requested => {
-                        if start == HlsStart::Live {
-                            let still_current = async_std::future::timeout(
-                                HLS_LIVE_FRONTIER_CONNECTION_WAIT,
-                                async {
+                        if let (Some(generation), Some(deadline_ms)) =
+                            (active_live_generation, active_live_frontier_deadline_ms)
+                        {
+                            let remaining_ms =
+                                hls_live_frontier_remaining_ms(deadline_ms, js_sys::Date::now())?;
+                            let connection_wait = HLS_LIVE_FRONTIER_CONNECTION_WAIT
+                                .min(Duration::from_secs_f64(remaining_ms / 1_000.0));
+                            let still_current =
+                                async_std::future::timeout(connection_wait, async {
                                     loop {
                                         if weeb3.get_connections().await
                                             >= HLS_LIVE_FRONTIER_MIN_PRICED_PEERS
@@ -6096,28 +6952,60 @@ mod runtime {
                                             return true;
                                         }
                                         if hls_prefix_generation_for_feed(&weeb3, &owner, &topic)
-                                            .is_none()
+                                            != Some(generation)
                                         {
                                             return false;
                                         }
                                         async_std::task::sleep(Duration::from_millis(15)).await;
                                     }
-                                },
-                            )
-                            .await
-                            .unwrap_or(true);
-                            if !still_current {
+                                })
+                                .await
+                                .unwrap_or(true);
+                            if !still_current
+                                || hls_live_frontier_remaining_ms(deadline_ms, js_sys::Date::now())
+                                    .is_none()
+                                || hls_prefix_generation_for_feed(&weeb3, &owner, &topic)
+                                    != Some(generation)
+                            {
                                 return None;
                             }
                         }
-                        weeb3
-                            .latest_hls_feed_payload_startup(
-                                owner.clone(),
-                                topic.clone(),
-                                None,
-                                None,
-                            )
-                            .await?
+                        if let Some(deadline_ms) = active_live_frontier_deadline_ms {
+                            if hls_prefix_generation_for_feed(&weeb3, &owner, &topic)
+                                != active_live_generation
+                            {
+                                return None;
+                            }
+                            let remaining_ms =
+                                hls_live_frontier_remaining_ms(deadline_ms, js_sys::Date::now())?;
+                            let loaded = weeb3
+                                .latest_hls_feed_payload_startup(
+                                    owner.clone(),
+                                    topic.clone(),
+                                    None,
+                                    None,
+                                    Some(Duration::from_secs_f64(remaining_ms / 1_000.0)),
+                                )
+                                .await?;
+                            if hls_live_frontier_remaining_ms(deadline_ms, js_sys::Date::now())
+                                .is_none()
+                                || hls_prefix_generation_for_feed(&weeb3, &owner, &topic)
+                                    != active_live_generation
+                            {
+                                return None;
+                            }
+                            loaded
+                        } else {
+                            weeb3
+                                .latest_hls_feed_payload_startup(
+                                    owner.clone(),
+                                    topic.clone(),
+                                    None,
+                                    None,
+                                    None,
+                                )
+                                .await?
+                        }
                     }
                     None => {
                         let (early_payload_out, early_payload_in) =
@@ -6208,6 +7096,7 @@ mod runtime {
                                             canonical_topic,
                                             early_payloads,
                                             early_payload_max_index,
+                                            None,
                                         )
                                         .await
                                 }
@@ -6335,7 +7224,7 @@ mod runtime {
         let provisional_hls = index_hint.is_none()
             && canonical_loaded.bytes.len() <= MAX_STREAM_FEED_PAYLOAD_BYTES
             && is_hls_manifest(&canonical_loaded.bytes);
-        let (loaded, head_confirmed) = if index_hint.is_none() && !provisional_hls {
+        let (loaded, head_confirmed, _) = if index_hint.is_none() && !provisional_hls {
             stabilize_initial_unindexed_hls_payload(
                 weeb3.clone(),
                 &owner,
@@ -6347,7 +7236,11 @@ mod runtime {
             )
             .await
         } else {
-            (presentation_loaded, false)
+            (
+                presentation_loaded,
+                false,
+                FeedFrontierConfidence::Unresolved,
+            )
         };
         if weeb3.get_network_id().await != network_id
             || active_profile().swarm_network_id != network_id
@@ -6376,6 +7269,12 @@ mod runtime {
         } else {
             cache_key
         };
+        if let Some(deadline_ms) = active_live_frontier_deadline_ms
+            && (hls_live_frontier_remaining_ms(deadline_ms, js_sys::Date::now()).is_none()
+                || hls_prefix_generation_for_feed(&weeb3, &owner, &topic) != active_live_generation)
+        {
+            return None;
+        }
         let snapshot = FeedRouteSnapshot {
             index: loaded.index,
             body: Arc::from(loaded.bytes),
@@ -6383,21 +7282,11 @@ mod runtime {
         };
         let snapshot =
             store_feed_snapshot(&cache_key, snapshot, index_hint.is_none(), followup_mode);
-        let last_head_check = FEED_ROUTE_CACHE.with(|cache| {
-            cache
-                .borrow()
-                .get(&cache_key)
-                .map(|state| state.last_head_check)
-                .unwrap_or_default()
-        });
-        let await_live_frontier =
-            (start == HlsStart::Live && index_hint.is_none() && stabilization_seed.is_some())
-                .then_some(());
         if index_hint.is_none() && snapshot.finalized {
             remember_authenticated_endlist_index(network_id, &owner, &topic, snapshot.index);
         }
-        let initial_check = if let Some(initial) = stabilization_seed {
-            schedule_initial_feed_stabilization(
+        if let Some(initial) = stabilization_seed {
+            let _ = schedule_initial_feed_stabilization(
                 weeb3.clone(),
                 cache_key.clone(),
                 owner.clone(),
@@ -6406,7 +7295,7 @@ mod runtime {
                 initial,
                 start == HlsStart::Live,
                 followup_mode,
-            )
+            );
         } else if index_hint.is_none() {
             schedule_feed_followup(
                 weeb3.clone(),
@@ -6416,21 +7305,7 @@ mod runtime {
                 false,
                 followup_mode,
             );
-            None
-        } else {
-            None
-        };
-        let snapshot = match await_live_frontier {
-            Some(()) if initial_check.is_some() => await_live_frontier_snapshot(
-                &cache_key,
-                last_head_check,
-                live_frontier_deadline_ms,
-                true,
-            )
-            .await
-            .unwrap_or(snapshot),
-            _ => snapshot,
-        };
+        }
         if start == HlsStart::Live && index_hint.is_none() {
             prefetch_live_snapshot_start(&weeb3, &owner, &topic, &snapshot);
         }
@@ -6504,6 +7379,21 @@ mod runtime {
         (confirmed, true)
     }
 
+    async fn await_before_hls_live_frontier_deadline<T>(
+        deadline_ms: Option<f64>,
+        future: impl Future<Output = T>,
+    ) -> Option<T> {
+        let Some(deadline_ms) = deadline_ms else {
+            return Some(future.await);
+        };
+        let remaining_ms = hls_live_frontier_remaining_ms(deadline_ms, js_sys::Date::now())?;
+        let result =
+            async_std::future::timeout(Duration::from_secs_f64(remaining_ms / 1_000.0), future)
+                .await
+                .ok()?;
+        hls_live_frontier_remaining_ms(deadline_ms, js_sys::Date::now()).map(|_| result)
+    }
+
     async fn await_feed_probe_wave_credit(
         weeb3: Arc<Weeb3>,
         expected_network_id: u64,
@@ -6521,11 +7411,12 @@ mod runtime {
             {
                 return false;
             }
-            if weeb3.available_retrieve_slots().await >= required {
-                return true;
-            }
+            let available = weeb3.available_retrieve_slots().await;
             if js_sys::Date::now() >= deadline_ms {
                 return false;
+            }
+            if available >= required {
+                return true;
             }
             async_std::task::sleep(Duration::from_millis(50)).await;
         }
@@ -6539,14 +7430,18 @@ mod runtime {
         mut loaded: crate::bzz_stream::RawFeedPayload,
         observe_progress: bool,
         task: Option<&FeedTask>,
-    ) -> (crate::bzz_stream::RawFeedPayload, bool) {
+    ) -> (
+        crate::bzz_stream::RawFeedPayload,
+        bool,
+        FeedFrontierConfidence,
+    ) {
         if loaded.bytes.len() > MAX_STREAM_FEED_PAYLOAD_BYTES || !is_hls_manifest(&loaded.bytes) {
-            return (loaded, false);
+            return (loaded, false, FeedFrontierConfidence::Unresolved);
         }
         if weeb3.get_network_id().await != network_id
             || active_profile().swarm_network_id != network_id
         {
-            return (loaded, false);
+            return (loaded, false, FeedFrontierConfidence::Unresolved);
         }
 
         let progress_id = weeb3
@@ -6562,7 +7457,7 @@ mod runtime {
             )
             .await;
         let reliable = if hls_is_finalized(&loaded.bytes) {
-            Some((loaded.clone(), true))
+            Some((loaded.clone(), FeedFrontierConfidence::Exact))
         } else if !observe_progress {
             let admission_client = weeb3.clone();
             let admission_deadline =
@@ -6593,7 +7488,7 @@ mod runtime {
                 owner.to_string(),
                 topic.to_string(),
                 loaded.clone(),
-                false,
+                true,
                 &weeb3.chunk_port.0,
                 move |probe_count| {
                     await_feed_probe_wave_credit(
@@ -6608,8 +7503,8 @@ mod runtime {
             loop {
                 match select(search, Box::pin(observed_in.recv())).await {
                     Either::Left((result, _)) => {
-                        if result.as_ref().is_some_and(|(candidate, verified)| {
-                            *verified
+                        if result.as_ref().is_some_and(|(candidate, confidence)| {
+                            confidence.is_authoritative()
                                 && candidate.index >= loaded.index
                                 && candidate.bytes.len() <= MAX_STREAM_FEED_PAYLOAD_BYTES
                                 && is_hls_manifest(&candidate.bytes)
@@ -6665,21 +7560,28 @@ mod runtime {
         let network_current = weeb3.get_network_id().await == network_id
             && active_profile().swarm_network_id == network_id;
         let mut head_confirmed = false;
+        let mut completed_confidence = FeedFrontierConfidence::Unresolved;
         let detail = match reliable {
-            Some((reliable, verified))
+            Some((reliable, confidence))
                 if network_current
                     && reliable.index >= loaded.index
                     && reliable.bytes.len() <= MAX_STREAM_FEED_PAYLOAD_BYTES
                     && is_hls_manifest(&reliable.bytes) =>
             {
                 loaded = reliable;
+                completed_confidence = confidence;
                 if let Some(task) = task {
                     task.publish(&loaded, false);
                 }
-                if !verified {
+                if confidence == FeedFrontierConfidence::Unresolved {
                     format!(
                         "kept authenticated candidate {} while the frontier remained unresolved",
                         loaded.index
+                    )
+                } else if confidence == FeedFrontierConfidence::Guarded {
+                    format!(
+                        "validated live candidate {} with a {}-update missing guard",
+                        loaded.index, WIDE_FEED_FRONTIER_EDGE_GUARD
                     )
                 } else {
                     let confirmation =
@@ -6710,6 +7612,9 @@ mod runtime {
 
         let ok =
             loaded.bytes.len() <= MAX_STREAM_FEED_PAYLOAD_BYTES && is_hls_manifest(&loaded.bytes);
+        if !ok {
+            completed_confidence = FeedFrontierConfidence::Unresolved;
+        }
         weeb3
             .finish_progress(
                 &progress_id,
@@ -6718,7 +7623,7 @@ mod runtime {
                 ok,
             )
             .await;
-        (loaded, head_confirmed)
+        (loaded, head_confirmed, completed_confidence)
     }
 
     async fn stabilize_claimed_feed_route(
@@ -6746,7 +7651,7 @@ mod runtime {
             token: checking_token,
             mode: followup_mode,
         };
-        let (_, head_confirmed) = stabilize_initial_unindexed_hls_payload(
+        let (observed, head_confirmed, confidence) = stabilize_initial_unindexed_hls_payload(
             weeb3.clone(),
             &owner,
             &topic,
@@ -6759,6 +7664,16 @@ mod runtime {
 
         let network_current = weeb3.get_network_id().await == network_id
             && active_profile().swarm_network_id == network_id;
+        if network_current && observe_progress {
+            let _ = record_completed_frontier_scout(
+                &cache_key,
+                checking_token,
+                observed.index,
+                &observed.bytes,
+                head_confirmed,
+                confidence,
+            );
+        }
         if let Some((cache_finalized, cache_index)) =
             release_feed_route_check(&cache_key, checking_token)
             && network_current
@@ -6896,339 +7811,435 @@ mod runtime {
         snapshot
     }
 
-    fn start_live_history_accumulator(
+    async fn build_live_history(
         weeb3: Arc<Weeb3>,
         owner: String,
         topic: String,
         presentation_id: u64,
         initial: FeedRouteSnapshot,
-    ) {
+        frontier_started_ms: f64,
+        frontier_deadline_ms: f64,
+    ) -> bool {
         let network_id = active_profile().swarm_network_id;
         let canonical_cache_key = feed_cache_key(&owner, &topic, None);
         let history_cache_key = sequence_zero_feed_cache_key(&owner, &topic, presentation_id);
-        spawn_local(async move {
-            let initial_index = initial.index;
-            let feed_identity = (owner.to_ascii_lowercase(), topic.to_ascii_lowercase());
-            loop {
-                let admission = HLS_PLAYBACK.with(|playback| {
-                    let playback = playback.borrow();
-                    let session = &playback.session;
-                    if session.presentation_id != presentation_id
-                        || !session.live_start
-                        || session.live_history_active
-                        || session.feed_identity.as_ref() != Some(&feed_identity)
-                        || session
-                            .client
-                            .as_ref()
-                            .is_none_or(|active| !Arc::ptr_eq(active, &weeb3))
-                    {
-                        return None;
-                    }
-                    Some(
-                        session.mode == HlsPrefetchMode::Sustained
-                            && session.completed_media_payloads
-                                >= HLS_TWO_BODY_PREFETCH_COMPLETIONS
-                                    + HLS_PREFETCH_BODY_MAX_PARALLEL,
-                    )
-                });
-                match admission {
-                    None => return,
-                    Some(true) => break,
-                    Some(false) => {
-                        async_std::task::sleep(Duration::from_millis(
-                            MEDIA_PREFETCH_BATCH_YIELD_MS,
-                        ))
-                        .await;
-                    }
-                }
-            }
-            if weeb3.get_network_id().await != network_id {
-                return;
-            }
+        let initial_index = initial.index;
+        let feed_identity = (owner.to_ascii_lowercase(), topic.to_ascii_lowercase());
+        if weeb3.get_network_id().await != network_id {
+            return false;
+        }
 
-            let session_is_current = || {
-                HLS_PLAYBACK.with(|playback| {
-                    let playback = playback.borrow();
-                    let session = &playback.session;
-                    session.presentation_id == presentation_id
-                        && session.live_start
-                        && !session.live_history_active
-                        && session.feed_identity.as_ref() == Some(&feed_identity)
-                        && session
-                            .client
-                            .as_ref()
-                            .is_some_and(|active| Arc::ptr_eq(active, &weeb3))
-                })
-            };
-            let initial_prefix = (hls_media_sequence(&initial.body) == Some(0)).then(|| {
-                crate::bzz_stream::RawFeedPayload {
-                    index: initial.index,
-                    bytes: initial.body.to_vec(),
-                }
-            });
-            let canonical_prefix = initial_prefix.or_else(|| {
-                FEED_ROUTE_CACHE.with(|cache| {
-                    cache.borrow().get(&canonical_cache_key).and_then(|state| {
-                        (hls_media_sequence(&state.snapshot.body) == Some(0)).then(|| {
-                            crate::bzz_stream::RawFeedPayload {
-                                index: state.snapshot.index,
-                                bytes: state.snapshot.body.to_vec(),
-                            }
-                        })
+        let session_is_current = || {
+            HLS_PLAYBACK.with(|playback| {
+                let playback = playback.borrow();
+                let session = &playback.session;
+                session.presentation_id == presentation_id
+                    && session.live_start
+                    && !session.live_history_active
+                    && session.feed_identity.as_ref() == Some(&feed_identity)
+                    && session
+                        .client
+                        .as_ref()
+                        .is_some_and(|active| Arc::ptr_eq(active, &weeb3))
+            })
+        };
+        let mut deadline_ms = frontier_deadline_ms;
+        let initial_prefix = (hls_media_sequence(&initial.body) == Some(0)).then(|| {
+            crate::bzz_stream::RawFeedPayload {
+                index: initial.index,
+                bytes: initial.body.to_vec(),
+            }
+        });
+        let canonical_prefix = initial_prefix.or_else(|| {
+            FEED_ROUTE_CACHE.with(|cache| {
+                cache.borrow().get(&canonical_cache_key).and_then(|state| {
+                    (hls_media_sequence(&state.snapshot.body) == Some(0)).then(|| {
+                        crate::bzz_stream::RawFeedPayload {
+                            index: state.snapshot.index,
+                            bytes: state.snapshot.body.to_vec(),
+                        }
                     })
                 })
-            });
-            let prefix = if let Some(prefix) = canonical_prefix {
-                prefix
-            } else {
-                loop {
-                    if !session_is_current() {
-                        return;
-                    }
-                    let last_prefix_index = HLS_EARLY_FEED_PREFIX_INDEX
-                        .saturating_add(HLS_EARLY_FEED_PREFIX_TARGET_SEGMENTS as u64)
-                        .min(initial_index);
-                    let candidates = stream::iter(0..=last_prefix_index)
-                        .map(|index| {
-                            let client = weeb3.clone();
-                            let owner = owner.clone();
-                            let topic = topic.clone();
-                            async move {
-                                client
-                                    .hls_feed_payload_at_index_bounded(owner, topic, index)
-                                    .await
-                            }
-                        })
-                        .buffered(HLS_SEQUENCE_ZERO_FOLLOWUP_MAX_PARALLEL)
-                        .collect::<Vec<_>>()
-                        .await;
-                    let unavailable = candidates.iter().any(Option::is_none);
-                    if let Some(prefix) = candidates.into_iter().rev().flatten().find(|payload| {
-                        payload.bytes.len() <= MAX_STREAM_FEED_PAYLOAD_BYTES
-                            && hls_media_sequence(&payload.bytes) == Some(0)
-                    }) {
-                        break prefix;
-                    }
-                    if !unavailable {
-                        return;
-                    }
-                    async_std::task::sleep(Duration::from_millis(HLS_PAYLOAD_RETRY_DELAY_MS)).await;
-                }
-            };
-            if !is_hls_manifest(&prefix.bytes)
-                || !hls_append_only_tags_are_supported(&prefix.bytes)
-                || !hls_has_at_most_one_endlist(&prefix.bytes)
-            {
-                return;
-            }
-            let mut current_index = prefix.index;
-            let mut target_duration = match hls_target_duration(&prefix.bytes) {
-                Some(duration) => duration,
-                None => return,
-            };
-            let mut archive_segment_count = match hls_segment_identities(&prefix.bytes)
-                .and_then(|segments| u64::try_from(segments.len()).ok())
-            {
-                Some(count) if count > 0 => count,
-                _ => return,
-            };
-            let archive_uri_ends = match hls_segment_uri_line_ends(&prefix.bytes) {
-                Some(ends) if u64::try_from(ends.len()).ok() == Some(archive_segment_count) => ends,
-                _ => return,
-            };
-            let mut archive_media_end = *archive_uri_ends
-                .last()
-                .expect("a non-empty archive has a final media URI");
-            let mut current_source = prefix.bytes.clone();
-            let mut archive = prefix.bytes;
-
+            })
+        });
+        let prefix = if let Some(prefix) = canonical_prefix {
+            prefix
+        } else {
             loop {
-                if !session_is_current()
-                    || weeb3.get_network_id().await != network_id
-                    || active_profile().swarm_network_id != network_id
-                {
-                    return;
+                if !session_is_current() || js_sys::Date::now() >= deadline_ms {
+                    return false;
                 }
-
-                let target_index = FEED_ROUTE_CACHE.with(|cache| {
-                    cache
-                        .borrow()
-                        .get(&canonical_cache_key)
-                        .map(|state| state.snapshot.index)
-                });
-                let Some(target_index) = target_index else {
-                    return;
-                };
-                if current_index >= target_index {
-                    let canonical = FEED_ROUTE_CACHE.with(|cache| {
+                let last_prefix_index = HLS_EARLY_FEED_PREFIX_INDEX
+                    .saturating_add(HLS_EARLY_FEED_PREFIX_TARGET_SEGMENTS as u64)
+                    .min(initial_index);
+                let prefix_work_items = last_prefix_index.saturating_add(1) as usize;
+                let prefix_parallelism =
+                    hls_live_history_active_parallelism(false, prefix_work_items);
+                if !await_feed_probe_wave_credit(
+                    weeb3.clone(),
+                    network_id,
+                    prefix_parallelism,
+                    deadline_ms,
+                )
+                .await
+                    || !session_is_current()
+                {
+                    return false;
+                }
+                let mut candidates = stream::iter(0..=last_prefix_index)
+                    .map(|index| {
+                        let client = weeb3.clone();
+                        let owner = owner.clone();
+                        let topic = topic.clone();
+                        async move {
+                            client
+                                .hls_live_history_feed_payload_at_index(owner, topic, index)
+                                .await
+                        }
+                    })
+                    .buffered(prefix_parallelism);
+                let mut unavailable = false;
+                let mut latest_prefix = None;
+                loop {
+                    let candidate = match await_before_hls_live_frontier_deadline(
+                        Some(deadline_ms),
+                        candidates.next(),
+                    )
+                    .await
+                    {
+                        Some(Some(candidate)) => candidate,
+                        Some(None) => break,
+                        // Dropping the buffered stream closes future admission while
+                        // already-dispatched accounting attempts continue to drain.
+                        None => return false,
+                    };
+                    let Some(payload) = candidate else {
+                        unavailable = true;
+                        continue;
+                    };
+                    if payload.bytes.len() <= MAX_STREAM_FEED_PAYLOAD_BYTES
+                        && hls_media_sequence(&payload.bytes) == Some(0)
+                    {
+                        latest_prefix = Some(payload);
+                    }
+                }
+                if let Some(prefix) = latest_prefix {
+                    break prefix;
+                }
+                if !unavailable {
+                    return false;
+                }
+                async_std::task::sleep(Duration::from_millis(HLS_PAYLOAD_RETRY_DELAY_MS)).await;
+            }
+        };
+        if !is_hls_manifest(&prefix.bytes)
+            || !hls_append_only_tags_are_supported(&prefix.bytes)
+            || !hls_has_at_most_one_endlist(&prefix.bytes)
+        {
+            return false;
+        }
+        let mut current_index = prefix.index;
+        let mut target_duration = match hls_target_duration(&prefix.bytes) {
+            Some(duration) => duration,
+            None => return false,
+        };
+        let mut archive_segment_count = match hls_segment_identities(&prefix.bytes)
+            .and_then(|segments| u64::try_from(segments.len()).ok())
+        {
+            Some(count) if count > 0 => count,
+            _ => return false,
+        };
+        let archive_uri_ends = match hls_segment_uri_line_ends(&prefix.bytes) {
+            Some(ends) if u64::try_from(ends.len()).ok() == Some(archive_segment_count) => ends,
+            _ => return false,
+        };
+        let mut archive_media_end = *archive_uri_ends
+            .last()
+            .expect("a non-empty archive has a final media URI");
+        let mut current_source = prefix.bytes.clone();
+        let mut archive = prefix.bytes;
+        let mut frozen_frontier = None;
+        let refresh_frozen_frontier =
+            |frozen_frontier: &mut Option<FeedFrontierObservation>, deadline_ms: &mut f64| {
+                let (canonical_index, frontier_idle, observation) =
+                    FEED_ROUTE_CACHE.with(|cache| {
                         cache.borrow().get(&canonical_cache_key).map(|state| {
                             (
                                 state.snapshot.index,
-                                state.snapshot.finalized,
-                                state.last_head_check,
-                                state.source_body.clone(),
+                                state.checking_token == 0,
+                                state.frontier_observation.as_ref().cloned(),
                             )
                         })
-                    });
-                    if let Some((
-                        canonical_index,
-                        canonical_finalized,
-                        last_head_check,
-                        canonical_source,
-                    )) = canonical
-                        && current_index == canonical_index
-                        && current_source.as_slice() == canonical_source.as_ref()
-                    {
-                        if raise_hls_target_duration(&mut archive, target_duration).is_none()
-                            || archive.len() > MAX_STREAM_FEED_PAYLOAD_BYTES
-                            || hls_media_sequence(&archive) != Some(0)
-                            || !hls_append_only_tags_are_supported(&archive)
-                            || !hls_has_at_most_one_endlist(&archive)
-                            || hls_segment_identities(&archive)
-                                .and_then(|segments| u64::try_from(segments.len()).ok())
-                                != Some(archive_segment_count)
-                        {
-                            return;
-                        }
-                        let body: Arc<[u8]> = Arc::from(archive);
-                        let body_tracks_source = body.as_ref() == current_source.as_slice();
-                        let source_body = if body_tracks_source {
-                            body.clone()
-                        } else {
-                            Arc::from(current_source)
-                        };
-                        let finalized = canonical_finalized && hls_is_finalized(&body);
-                        FEED_ROUTE_CACHE.with(|cache| {
-                            let mut cache = cache.borrow_mut();
-                            cache.insert(
-                                history_cache_key.clone(),
-                                FeedRouteState {
-                                    snapshot: FeedRouteSnapshot {
-                                        index: current_index,
-                                        body,
-                                        finalized,
-                                    },
-                                    source_body,
-                                    body_tracks_source,
-                                    source_endlist_confirmed: canonical_finalized,
-                                    checking_token: 0,
-                                    confirmed_head_index: Some(current_index),
-                                    last_head_check,
-                                    last_touch: js_sys::Date::now(),
-                                },
-                            );
-                            trim_feed_route_cache(&mut cache, &history_cache_key);
-                        });
-                        HLS_PLAYBACK.with(|playback| {
-                            let mut playback = playback.borrow_mut();
-                            let session = &mut playback.session;
-                            if session.presentation_id == presentation_id && session.live_start {
-                                session.live_history_active = true;
-                            }
-                        });
-                        return;
-                    }
-                    async_std::task::sleep(Duration::from_millis(MEDIA_PREFETCH_BATCH_YIELD_MS))
-                        .await;
-                    continue;
+                    })?;
+                if frozen_frontier.is_none()
+                    && let Some(observation) = observation.filter(|observation| {
+                        observation.observed_at <= *deadline_ms
+                            && hls_live_frontier_observation_is_authoritative(
+                                observation.confidence,
+                                observation.observed_at,
+                                frontier_started_ms,
+                            )
+                    })
+                {
+                    *deadline_ms =
+                        observation.observed_at + HLS_LIVE_HISTORY_MAX_WAIT.as_millis() as f64;
+                    *frozen_frontier = Some(observation);
                 }
+                Some((canonical_index, frontier_idle))
+            };
 
-                let source_segments = match hls_segment_identities(&current_source) {
-                    Some(segments) if !segments.is_empty() => segments.len(),
-                    _ => return,
-                };
-                let stride =
-                    u64::try_from(source_segments.saturating_sub(1).max(1)).unwrap_or(u64::MAX);
-                let fallback_limit = HLS_SEQUENCE_ZERO_PRESENTATION_BATCH_LIMIT;
-                let batch_limit = fallback_limit.min(HLS_SEQUENCE_ZERO_FOLLOWUP_MAX_PARALLEL);
-                let mut batch_indices = Vec::with_capacity(batch_limit);
-                let mut next_index = current_index;
-                for _ in 0..batch_limit {
-                    next_index = next_index.saturating_add(stride).min(target_index);
-                    if next_index <= current_index {
-                        break;
-                    }
-                    batch_indices.push(next_index);
-                    if next_index == target_index {
-                        break;
-                    }
-                }
-                let Some(&preferred_index) = batch_indices.first() else {
-                    return;
-                };
-                let previous_index = current_index;
-                let mut fallback_end = preferred_index;
-                let mut fallback_remaining = fallback_limit;
-                loop {
-                    let batch = stream::iter(std::mem::take(&mut batch_indices))
-                        .map(|index| {
-                            let client = weeb3.clone();
-                            let owner = owner.clone();
-                            let topic = topic.clone();
-                            async move {
-                                (
-                                    index,
-                                    client
-                                        .hls_feed_payload_at_index_bounded(owner, topic, index)
-                                        .await,
-                                )
-                            }
-                        })
-                        .buffered(HLS_SEQUENCE_ZERO_FOLLOWUP_MAX_PARALLEL)
-                        .collect::<Vec<_>>()
-                        .await;
-                    for (expected_index, payload) in batch {
-                        let Some(payload) = payload else {
-                            continue;
-                        };
-                        if payload.index != expected_index
-                            || expected_index <= current_index
-                            || payload.bytes.len() > MAX_STREAM_FEED_PAYLOAD_BYTES
-                            || !is_hls_manifest(&payload.bytes)
-                            || append_hls_sequence_zero_archive_suffix(
-                                &mut archive,
-                                &mut archive_segment_count,
-                                &mut archive_media_end,
-                                &current_source,
-                                &payload.bytes,
-                            )
-                            .is_none()
-                        {
-                            continue;
-                        }
-                        let Some(candidate_target_duration) = hls_target_duration(&payload.bytes)
-                        else {
-                            return;
-                        };
-                        target_duration = target_duration.max(candidate_target_duration);
-                        current_index = expected_index;
-                        current_source = payload.bytes;
-                    }
-                    if current_index != previous_index
-                        || preferred_index <= previous_index + 1
-                        || fallback_remaining == 0
+        loop {
+            if !session_is_current()
+                || weeb3.get_network_id().await != network_id
+                || active_profile().swarm_network_id != network_id
+            {
+                return false;
+            }
+
+            let Some((canonical_index, frontier_idle)) =
+                refresh_frozen_frontier(&mut frozen_frontier, &mut deadline_ms)
+            else {
+                return false;
+            };
+            if frozen_frontier.is_none() && frontier_idle && js_sys::Date::now() < deadline_ms {
+                schedule_feed_followup(
+                    weeb3.clone(),
+                    canonical_cache_key.clone(),
+                    owner.clone(),
+                    topic.clone(),
+                    true,
+                    FeedFollowupMode::Canonical,
+                );
+            }
+            let target_index = frozen_frontier
+                .as_ref()
+                .map(|observation| observation.index)
+                .unwrap_or(canonical_index);
+            if current_index >= target_index {
+                if let Some(observation) = frozen_frontier.clone()
+                    && current_index == observation.index
+                    && current_source.as_slice() == observation.source.as_ref()
+                {
+                    if raise_hls_target_duration(&mut archive, target_duration).is_none()
+                        || archive.len() > MAX_STREAM_FEED_PAYLOAD_BYTES
+                        || hls_media_sequence(&archive) != Some(0)
+                        || !hls_append_only_tags_are_supported(&archive)
+                        || !hls_has_at_most_one_endlist(&archive)
+                        || hls_segment_identities(&archive)
+                            .and_then(|segments| u64::try_from(segments.len()).ok())
+                            != Some(archive_segment_count)
                     {
-                        break;
+                        return false;
                     }
-                    batch_indices = (previous_index + 1..fallback_end)
-                        .rev()
-                        .take(batch_limit.min(fallback_remaining))
-                        .collect();
-                    if batch_indices.is_empty() {
-                        break;
+                    if weeb3.get_network_id().await != network_id
+                        || active_profile().swarm_network_id != network_id
+                        || !session_is_current()
+                        || hls_live_frontier_remaining_ms(deadline_ms, js_sys::Date::now())
+                            .is_none()
+                    {
+                        return false;
                     }
-                    fallback_remaining -= batch_indices.len();
-                    fallback_end = *batch_indices
-                        .last()
-                        .expect("a non-empty fallback has a lower boundary");
+                    let body: Arc<[u8]> = Arc::from(archive);
+                    let source_body = if body.as_ref() == current_source.as_slice() {
+                        body.clone()
+                    } else {
+                        Arc::from(current_source)
+                    };
+                    let finalized = observation.finalized && hls_is_finalized(&body);
+                    FEED_ROUTE_CACHE.with(|cache| {
+                        let mut cache = cache.borrow_mut();
+                        cache.insert(
+                            history_cache_key.clone(),
+                            FeedRouteState {
+                                snapshot: FeedRouteSnapshot {
+                                    index: current_index,
+                                    body,
+                                    finalized,
+                                },
+                                source_body,
+                                body_includes_source: true,
+                                source_endlist_confirmed: observation.finalized,
+                                checking_token: 0,
+                                confirmed_head_index: observation.confirmed_head_index,
+                                last_head_check: observation.last_head_check,
+                                frontier_observation: Some(observation),
+                                last_touch: js_sys::Date::now(),
+                            },
+                        );
+                        trim_feed_route_cache(&mut cache, &history_cache_key);
+                    });
+                    HLS_PLAYBACK.with(|playback| {
+                        let mut playback = playback.borrow_mut();
+                        let session = &mut playback.session;
+                        if session.presentation_id == presentation_id && session.live_start {
+                            session.live_history_active = true;
+                        }
+                    });
+                    return true;
                 }
-                if current_index == previous_index {
-                    async_std::task::sleep(Duration::from_millis(HLS_PAYLOAD_RETRY_DELAY_MS)).await;
-                    continue;
+                if js_sys::Date::now() >= deadline_ms {
+                    return false;
                 }
                 async_std::task::sleep(Duration::from_millis(MEDIA_PREFETCH_BATCH_YIELD_MS)).await;
+                continue;
             }
-        });
+
+            if js_sys::Date::now() >= deadline_ms {
+                return false;
+            }
+            let source_segments = match hls_segment_identities(&current_source) {
+                Some(segments) if !segments.is_empty() => segments.len(),
+                _ => return false,
+            };
+            let stride =
+                u64::try_from(source_segments.saturating_sub(1).max(1)).unwrap_or(u64::MAX);
+            let fallback_limit = HLS_SEQUENCE_ZERO_PRESENTATION_BATCH_LIMIT;
+            let mut frontier_frozen = frozen_frontier.is_some();
+            let mut batch_limit =
+                hls_live_history_active_parallelism(frontier_frozen, fallback_limit);
+            let mut batch_indices = Vec::with_capacity(batch_limit);
+            let mut next_index = current_index;
+            for _ in 0..batch_limit {
+                next_index = next_index.saturating_add(stride).min(target_index);
+                if next_index <= current_index {
+                    break;
+                }
+                batch_indices.push(next_index);
+                if next_index == target_index {
+                    break;
+                }
+            }
+            let Some(&preferred_index) = batch_indices.first() else {
+                return false;
+            };
+            let previous_index = current_index;
+            let mut fallback_end = preferred_index;
+            let mut fallback_remaining = fallback_limit;
+            loop {
+                let batch_parallelism =
+                    hls_live_history_active_parallelism(frontier_frozen, batch_indices.len());
+                if !session_is_current()
+                    || js_sys::Date::now() >= deadline_ms
+                    || !await_feed_probe_wave_credit(
+                        weeb3.clone(),
+                        network_id,
+                        batch_parallelism,
+                        deadline_ms,
+                    )
+                    .await
+                    || !session_is_current()
+                {
+                    return false;
+                }
+                let mut batch = stream::iter(std::mem::take(&mut batch_indices))
+                    .map(|index| {
+                        let client = weeb3.clone();
+                        let owner = owner.clone();
+                        let topic = topic.clone();
+                        async move {
+                            (
+                                index,
+                                client
+                                    .hls_live_history_feed_payload_at_index(owner, topic, index)
+                                    .await,
+                            )
+                        }
+                    })
+                    .buffered(batch_parallelism);
+                let mut batch_failed = false;
+                loop {
+                    let (expected_index, payload) = match await_before_hls_live_frontier_deadline(
+                        Some(deadline_ms),
+                        batch.next(),
+                    )
+                    .await
+                    {
+                        Some(Some(candidate)) => candidate,
+                        Some(None) => break,
+                        // The batch drop closes only future admission; detached
+                        // transports retain their accounting settlement path.
+                        None => return false,
+                    };
+                    if batch_failed {
+                        continue;
+                    }
+                    let Some(payload) = payload else {
+                        continue;
+                    };
+                    if payload.index != expected_index
+                        || expected_index <= current_index
+                        || payload.bytes.len() > MAX_STREAM_FEED_PAYLOAD_BYTES
+                        || !is_hls_manifest(&payload.bytes)
+                        || append_hls_sequence_zero_archive_suffix(
+                            &mut archive,
+                            &mut archive_segment_count,
+                            &mut archive_media_end,
+                            &current_source,
+                            &payload.bytes,
+                        )
+                        .is_none()
+                    {
+                        continue;
+                    }
+                    let Some(candidate_target_duration) = hls_target_duration(&payload.bytes)
+                    else {
+                        batch_failed = true;
+                        continue;
+                    };
+                    target_duration = target_duration.max(candidate_target_duration);
+                    current_index = expected_index;
+                    current_source = payload.bytes;
+                }
+                if batch_failed {
+                    return false;
+                }
+                if frozen_frontier.is_none() {
+                    let Some((_, frontier_idle)) =
+                        refresh_frozen_frontier(&mut frozen_frontier, &mut deadline_ms)
+                    else {
+                        return false;
+                    };
+                    if frozen_frontier.is_none()
+                        && frontier_idle
+                        && js_sys::Date::now() < deadline_ms
+                    {
+                        schedule_feed_followup(
+                            weeb3.clone(),
+                            canonical_cache_key.clone(),
+                            owner.clone(),
+                            topic.clone(),
+                            true,
+                            FeedFollowupMode::Canonical,
+                        );
+                    }
+                    frontier_frozen = frozen_frontier.is_some();
+                    batch_limit =
+                        hls_live_history_active_parallelism(frontier_frozen, fallback_limit);
+                }
+                if current_index != previous_index
+                    || preferred_index <= previous_index + 1
+                    || fallback_remaining == 0
+                {
+                    break;
+                }
+                batch_indices = (previous_index + 1..fallback_end)
+                    .rev()
+                    .take(batch_limit.min(fallback_remaining))
+                    .collect();
+                if batch_indices.is_empty() {
+                    break;
+                }
+                fallback_remaining -= batch_indices.len();
+                fallback_end = *batch_indices
+                    .last()
+                    .expect("a non-empty fallback has a lower boundary");
+            }
+            if current_index == previous_index {
+                async_std::task::sleep(Duration::from_millis(HLS_PAYLOAD_RETRY_DELAY_MS)).await;
+                continue;
+            }
+            async_std::task::sleep(Duration::from_millis(MEDIA_PREFETCH_BATCH_YIELD_MS)).await;
+        }
     }
 
     fn feed_cache_key(owner: &str, topic: &str, index_hint: Option<u64>) -> String {
@@ -7366,7 +8377,7 @@ mod runtime {
                     if candidate.head_confirmed {
                         existing.source_endlist_confirmed = hls_is_finalized(&candidate.source);
                         existing.snapshot.finalized = candidate.terminal
-                            && existing.body_tracks_source
+                            && existing.body_includes_source
                             && hls_is_finalized(&existing.snapshot.body);
                         existing.confirmed_head_index = Some(candidate.index);
                         existing.last_head_check = js_sys::Date::now();
@@ -7393,17 +8404,14 @@ mod runtime {
                 } else {
                     FeedRouteBodyUpdate::Publish(candidate.source.clone())
                 };
-                let (body, body_tracks_source) = match update {
-                    FeedRouteBodyUpdate::Publish(body) => {
-                        let tracks_source = body.as_ref() == candidate.source.as_ref();
-                        (body, tracks_source)
-                    }
+                let (body, body_includes_source) = match update {
+                    FeedRouteBodyUpdate::Publish(body) => (body, true),
                     FeedRouteBodyUpdate::Hold => (existing.snapshot.body.clone(), false),
                 };
                 let finalized =
-                    candidate.terminal && body_tracks_source && hls_is_finalized(body.as_ref());
+                    candidate.terminal && body_includes_source && hls_is_finalized(body.as_ref());
                 existing.source_body = candidate.source;
-                existing.body_tracks_source = body_tracks_source;
+                existing.body_includes_source = body_includes_source;
                 existing.source_endlist_confirmed =
                     candidate.head_confirmed && hls_is_finalized(&existing.source_body);
                 existing.snapshot = FeedRouteSnapshot {
@@ -7438,11 +8446,12 @@ mod runtime {
                 FeedRouteState {
                     snapshot: snapshot.clone(),
                     source_body: candidate.source,
-                    body_tracks_source: true,
+                    body_includes_source: true,
                     source_endlist_confirmed: candidate.head_confirmed,
                     checking_token: 0,
                     confirmed_head_index: candidate.head_confirmed.then_some(candidate.index),
                     last_head_check: if candidate.head_confirmed { now } else { 0.0 },
+                    frontier_observation: None,
                     last_touch: now,
                 },
             );
@@ -7472,6 +8481,16 @@ mod runtime {
     }
 
     fn trim_feed_route_cache(cache: &mut HashMap<String, FeedRouteState>, protected_key: &str) {
+        let presentation_key = HLS_PLAYBACK.with(|playback| {
+            let session = &playback.borrow().session;
+            (session.presentation_id != 0 && (!session.live_start || session.live_history_active))
+                .then(|| {
+                    session.feed_identity.as_ref().map(|(owner, topic)| {
+                        sequence_zero_feed_cache_key(owner, topic, session.presentation_id)
+                    })
+                })
+                .flatten()
+        });
         loop {
             let total_bytes = cache
                 .values()
@@ -7491,7 +8510,11 @@ mod runtime {
 
             let Some(oldest) = cache
                 .iter()
-                .filter(|(key, state)| key.as_str() != protected_key && state.checking_token == 0)
+                .filter(|(key, state)| {
+                    key.as_str() != protected_key
+                        && presentation_key.as_ref() != Some(*key)
+                        && state.checking_token == 0
+                })
                 .min_by(|left, right| left.1.last_touch.total_cmp(&right.1.last_touch))
                 .map(|(key, _)| key.clone())
             else {
@@ -7564,16 +8587,17 @@ mod runtime {
                     index: state.snapshot.index,
                     bytes: state.source_body.to_vec(),
                 },
-                state.last_head_check > 0.0
-                    && state.last_head_check.is_finite()
-                    && now >= state.last_head_check
-                    && now - state.last_head_check >= FEED_HEAD_REFRESH_INTERVAL_MS * 4.0,
+                state.confirmed_head_index.is_none()
+                    || (state.last_head_check > 0.0
+                        && state.last_head_check.is_finite()
+                        && now >= state.last_head_check
+                        && now - state.last_head_check >= FEED_HEAD_REFRESH_INTERVAL_MS * 4.0),
             ))
         }) else {
             return None;
         };
-        let (latest, verified) = if hls_is_finalized(&initial.bytes) {
-            (initial, true)
+        let (latest, confidence) = if hls_is_finalized(&initial.bytes) {
+            (initial, FeedFrontierConfidence::Exact)
         } else {
             let admission_client = weeb3.clone();
             let admission_deadline =
@@ -7603,7 +8627,7 @@ mod runtime {
         if latest.bytes.len() > MAX_STREAM_FEED_PAYLOAD_BYTES {
             return None;
         }
-        let (latest, head_confirmed) = if verified {
+        let (latest, head_confirmed) = if confidence.is_exact() {
             confirm_terminal_feed_head(weeb3.clone(), owner, topic, latest, network_id).await
         } else {
             (latest, false)
@@ -7615,16 +8639,17 @@ mod runtime {
         }
 
         let latest_index = latest.index;
+        let latest_source: Arc<[u8]> = Arc::from(latest.bytes);
         let accepted = apply_feed_candidate(
             cache_key,
             FeedCandidate {
                 index: latest_index,
                 terminal: hls_snapshot_is_terminal(
-                    hls_is_finalized(&latest.bytes),
+                    hls_is_finalized(latest_source.as_ref()),
                     false,
                     head_confirmed,
                 ),
-                source: Arc::from(latest.bytes),
+                source: latest_source.clone(),
                 head_confirmed,
                 mode: followup_mode,
                 admission: FeedCandidateAdmission::Task {
@@ -7641,6 +8666,14 @@ mod runtime {
             remember_authenticated_endlist_index(network_id, owner, topic, index);
         }
         if let Some(snapshot) = accepted {
+            let _ = record_completed_frontier_scout(
+                cache_key,
+                checking_token,
+                latest_index,
+                latest_source.as_ref(),
+                head_confirmed,
+                confidence,
+            );
             prefetch_live_snapshot_start(&weeb3, owner, topic, &snapshot);
             return Some((latest_index, head_confirmed));
         }
@@ -7886,7 +8919,10 @@ mod runtime {
                 let Ok(token) = token.parse::<u64>() else {
                     return Some(FetchResponse::error(400, "invalid HLS codec bootstrap"));
                 };
-                Some(hls_codec_bootstrap_manifest(token))
+                let Some(manifest) = hls_codec_bootstrap_manifest(token) else {
+                    return Some(FetchResponse::error(409, "stale HLS codec bootstrap"));
+                };
+                Some(manifest)
             }
             Some(_) => return Some(FetchResponse::error(400, "invalid HLS codec bootstrap")),
         };
@@ -8033,8 +9069,9 @@ mod runtime {
         let snapshot_client = weeb3.clone();
         let snapshot_owner = owner.clone();
         let snapshot_topic = topic.clone();
+        let live_frontier_started_ms = js_sys::Date::now();
         let live_frontier_deadline_ms =
-            js_sys::Date::now() + HLS_LIVE_FRONTIER_MAX_WAIT.as_millis() as f64;
+            live_frontier_started_ms + HLS_LIVE_FRONTIER_MAX_WAIT.as_millis() as f64;
         let snapshot_load = Box::pin(async move {
             let snapshot = load_feed_snapshot(
                 snapshot_client.clone(),
@@ -8067,12 +9104,34 @@ mod runtime {
                 snapshot_load.await
             }
             Either::Right((snapshot, worker_ready)) => {
-                if !worker_ready.await {
-                    return Err(service_worker_scope_protocol_error(
-                        "HLS feed and segment requests",
-                    ));
+                if start == HlsStart::Live {
+                    if snapshot.is_none() {
+                        drop(worker_ready);
+                        snapshot
+                    } else {
+                        match await_before_hls_live_frontier_deadline(
+                            Some(live_frontier_deadline_ms),
+                            worker_ready,
+                        )
+                        .await
+                        {
+                            Some(true) => snapshot,
+                            Some(false) => {
+                                return Err(service_worker_scope_protocol_error(
+                                    "HLS feed and segment requests",
+                                ));
+                            }
+                            None => None,
+                        }
+                    }
+                } else {
+                    if !worker_ready.await {
+                        return Err(service_worker_scope_protocol_error(
+                            "HLS feed and segment requests",
+                        ));
+                    }
+                    snapshot
                 }
-                snapshot
             }
         };
         if !result_view_request_is_current(view_generation) {
@@ -8096,23 +9155,59 @@ mod runtime {
         if !result_view_request_is_current(view_generation) {
             return Err("HLS open was superseded".to_string());
         }
-        let live_history_seed = snapshot
-            .as_ref()
-            .filter(|snapshot| start == HlsStart::Live && !snapshot.finalized)
-            .cloned();
+        if start == HlsStart::Live {
+            let history_ready = match snapshot.as_ref() {
+                Some(initial)
+                    if initial.finalized && hls_media_sequence(&initial.body) == Some(0) =>
+                {
+                    true
+                }
+                Some(initial) if hls_media_sequence(&initial.body).is_some() => {
+                    build_live_history(
+                        weeb3.clone(),
+                        owner.clone(),
+                        topic.clone(),
+                        presentation_id,
+                        initial.clone(),
+                        live_frontier_started_ms,
+                        live_frontier_deadline_ms,
+                    )
+                    .await
+                }
+                _ => false,
+            };
+            if !history_ready {
+                if !result_view_request_is_current(view_generation) {
+                    return Err("HLS open was superseded".to_string());
+                }
+                invalidate_hls_prefetch_session();
+                return Err(
+                    "Could not establish a stable live timeline before the deadline; retry live playback."
+                        .to_string(),
+                );
+            }
+        }
+        if !result_view_request_is_current(view_generation) {
+            return Err("HLS open was superseded".to_string());
+        }
 
         let initial_start_position = match start {
             HlsStart::Beginning => 0.0,
             HlsStart::Live => -1.0,
         };
-        let mode = play_hls(player, &source, hls_loader, initial_start_position)
-            .await
-            .map_err(|error| format!("Could not initialize HLS: {}", js_error_message(&error)))?;
+        let proactive_codec_bootstrap = start == HlsStart::Live
+            && exact_live_codec_bootstrap_ready(&owner, &topic, presentation_id);
+        let mode = play_hls(
+            player,
+            &source,
+            hls_loader,
+            initial_start_position,
+            proactive_codec_bootstrap,
+        )
+        .await
+        .map_err(|error| format!("Could not initialize HLS: {}", js_error_message(&error)))?;
         if !result_view_request_is_current(view_generation) {
             return Err("HLS open was superseded".to_string());
-        }
-        if let Some(initial) = live_history_seed {
-            start_live_history_accumulator(weeb3, owner, topic, presentation_id, initial);
         }
         Ok(mode)
     }
@@ -8276,13 +9371,14 @@ mod runtime {
         });
         retain_media_element_callback(player, "pause", pause_callback);
 
-        // Ignore generic seeking; cursor discontinuity distinguishes real seeks
-        // from hls.js startup alignment and gap traversal.
+        let seek_callback = Closure::<dyn FnMut()>::new(mark_hls_seek);
+        retain_media_element_callback(player, "seeking", seek_callback);
+        let seeked_callback = Closure::<dyn FnMut()>::new(finish_hls_seek);
+        retain_media_element_callback(player, "seeked", seeked_callback);
     }
 
     pub(crate) fn release_hls_view() {
         // View closure cannot cancel dispatched accounting work.
-        reset_hls_codec_bootstrap();
         super::set_hls_video_resolution(None);
         invalidate_hls_prefetch_session();
         destroy_current_hls();

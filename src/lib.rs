@@ -688,6 +688,7 @@ fn chunk_retrieve_channel() -> (ChunkRetrieveSender, ChunkRetrieveReceiver) {
         receiver,
     )
 }
+
 type ConnectionAttemptId = usize;
 
 struct ConnectionAttempt {
@@ -791,20 +792,22 @@ pub(crate) struct RetrieveCancelToken {
 #[derive(Clone)]
 pub(crate) struct ChunkRetrieveRequest {
     pub address: Vec<u8>,
-    pub chan: mpsc::Sender<Vec<u8>>,
+    pub chan: mpsc::Sender<retrieval_conventions::RetrievedChunk>,
     pub cancel: Option<RetrieveCancelToken>,
     pub admission: Option<retrieval_conventions::RetrieveAdmission>,
+    pub max_attempt_errors: Option<usize>,
 }
 
 pub(crate) fn chunk_retrieve_request(
     address: Vec<u8>,
-    chan: mpsc::Sender<Vec<u8>>,
+    chan: mpsc::Sender<retrieval_conventions::RetrievedChunk>,
 ) -> ChunkRetrieveRequest {
     ChunkRetrieveRequest {
         address,
         chan,
         cancel: None,
         admission: None,
+        max_attempt_errors: None,
     }
 }
 
@@ -1784,13 +1787,13 @@ impl Weeb3 {
             }
         };
 
-        let (chan_out, chan_in) = mpsc::unbounded::<Vec<u8>>();
+        let (chan_out, chan_in) = mpsc::unbounded::<retrieval_conventions::RetrievedChunk>();
         let _ = self
             .chunk_port
             .0
             .try_send(chunk_retrieve_request(valaddr, chan_out));
 
-        let bytes = chan_in.recv().await.unwrap_or_default();
+        let bytes = chan_in.recv().await.unwrap_or_default().into_bytes();
         let ok = !bytes.is_empty();
         self.finish_progress(
             &progress_id,
@@ -2097,7 +2100,7 @@ impl Weeb3 {
         let (refreshment_instructions_chan_outgoing, refreshment_instructions_chan_incoming) =
             mpsc::unbounded::<RefreshmentInstruction>();
 
-        let (chunk_retrieve_chan_outgoing, chunk_retrieve_chan_incoming) = chunk_retrieve_channel();
+        let chunk_retrieve_chan_outgoing = self.chunk_port.0.clone();
 
         let (data_upload_chan_outgoing, data_upload_chan_incoming) =
             mpsc::unbounded::<DataUploadRequest>();
@@ -3700,36 +3703,6 @@ impl Weeb3 {
             }
         };
 
-        let raw_chunk_handle = async {
-            loop {
-                let mut incoming_request = match self.chunk_port.1.recv().await {
-                    Ok(request) => request,
-                    Err(_) => break,
-                };
-                let mut forwarded = 0usize;
-
-                loop {
-                    let _ = chunk_retrieve_chan_outgoing.try_send(incoming_request);
-                    forwarded += 1;
-
-                    if forwarded % 128 == 0 {
-                        async_std::task::yield_now().await;
-                        async_std::task::sleep(Duration::from_millis(
-                            RETRIEVE_QUEUE_HOT_LOOP_GUARD_MS,
-                        ))
-                        .await;
-                    }
-
-                    match self.chunk_port.1.try_recv() {
-                        Ok(request) => incoming_request = request,
-                        Err(_) => break,
-                    }
-                }
-
-                async_std::task::yield_now().await;
-            }
-        };
-
         let resolve_bzz_handle = async {
             loop {
                 let mut incoming_request = match self.resolve_port.1.recv().await {
@@ -4154,7 +4127,7 @@ impl Weeb3 {
             let mut retrieve_dispatches_since_browser_yield = 0usize;
 
             loop {
-                let mut incoming_request = match chunk_retrieve_chan_incoming.recv().await {
+                let mut incoming_request = match self.chunk_port.1.recv().await {
                     Ok(request) => request,
                     Err(_) => {
                         async_std::task::sleep(Duration::from_millis(
@@ -4164,13 +4137,13 @@ impl Weeb3 {
                         continue;
                     }
                 };
-
                 loop {
                     let request = incoming_request;
                     let n = request.address;
                     let chan = request.chan;
                     let cancel = request.cancel;
                     let admission = request.admission;
+                    let max_attempt_errors = request.max_attempt_errors;
                     let admission_open =
                         wait_transfer_unpaused_for_admission(&self.transfer_paused, &admission)
                             .await;
@@ -4184,8 +4157,8 @@ impl Weeb3 {
                             &admission,
                         )
                     {
-                        let _ = chan.try_send(vec![]);
-                        match chunk_retrieve_chan_incoming.try_recv() {
+                        let _ = chan.try_send(retrieval_conventions::RetrievedChunk::default());
+                        match self.chunk_port.1.try_recv() {
                             Ok(request) => {
                                 incoming_request = request;
                                 async_std::task::sleep(Duration::from_millis(
@@ -4214,7 +4187,7 @@ impl Weeb3 {
                             if !wait_transfer_unpaused_for_admission(&transfer_paused, &admission)
                                 .await
                             {
-                                return vec![];
+                                return retrieval_conventions::RetrievedChunk::default();
                             }
 
                             let Some(_permit) = retrieval_conventions::acquire_retrieve_permit(
@@ -4223,13 +4196,13 @@ impl Weeb3 {
                             )
                             .await
                             else {
-                                return vec![];
+                                return retrieval_conventions::RetrievedChunk::default();
                             };
 
                             if !wait_transfer_unpaused_for_admission(&transfer_paused, &admission)
                                 .await
                             {
-                                return vec![];
+                                return retrieval_conventions::RetrievedChunk::default();
                             }
 
                             let stream_generation_current = retrieve_cancel_token_current(
@@ -4241,7 +4214,7 @@ impl Weeb3 {
                                 stream_generation_current,
                                 &admission,
                             ) {
-                                return vec![];
+                                return retrieval_conventions::RetrievedChunk::default();
                             }
 
                             retrieve_chunk(
@@ -4254,6 +4227,7 @@ impl Weeb3 {
                                 Some(retrieve_cancel_generations),
                                 cancel,
                                 admission,
+                                max_attempt_errors,
                                 Some(transfer_paused),
                             )
                             .await
@@ -4268,8 +4242,10 @@ impl Weeb3 {
                         async_std::task::sleep(Duration::ZERO).await;
                     }
 
-                    match chunk_retrieve_chan_incoming.try_recv() {
-                        Ok(request) => incoming_request = request,
+                    match self.chunk_port.1.try_recv() {
+                        Ok(request) => {
+                            incoming_request = request;
+                        }
                         Err(_) => break,
                     }
                 }
@@ -4480,7 +4456,6 @@ impl Weeb3 {
             refreshment_instruction_handle,
             cheque_instruction_handle,
             cheque_apply_handle,
-            raw_chunk_handle,
             resolve_bzz_handle,
             acquire_range_handle,
             retrieve_chunk_handle,

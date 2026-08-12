@@ -39,6 +39,57 @@ mod erasure_test_support {
     }
 }
 
+mod retrieval_encryption {
+    use crate::erasure_coding::{CHUNK_SIZE, HASH_SIZE, RedundancyLevel};
+    use sha3_crates_io::{Digest, Keccak256};
+
+    fn segment_key(key: &[u8; HASH_SIZE], counter: u32) -> [u8; HASH_SIZE] {
+        let mut seed = [0u8; HASH_SIZE + 4];
+        seed[..HASH_SIZE].copy_from_slice(key);
+        seed[HASH_SIZE..].copy_from_slice(&counter.to_le_bytes());
+        let first: [u8; HASH_SIZE] = Keccak256::digest(seed).into();
+        Keccak256::digest(first).into()
+    }
+
+    #[test]
+    fn double_keccak_segment_key_has_a_stable_golden_value() {
+        let key = std::array::from_fn(|index| index as u8);
+        assert_eq!(
+            segment_key(&key, 128),
+            [
+                0x83, 0x57, 0x5f, 0x37, 0x60, 0x9e, 0xc5, 0x3a, 0x2e, 0x2d, 0xe6, 0xbc, 0x0d, 0xdd,
+                0x7f, 0x22, 0xbe, 0x27, 0xf4, 0x03, 0x8e, 0x96, 0xcd, 0x94, 0x8e, 0x90, 0x29, 0xeb,
+                0xc1, 0x69, 0xe4, 0x0f,
+            ]
+        );
+    }
+
+    #[test]
+    fn production_decryption_keeps_bee_cipher_and_reference_layout() {
+        let retrieval = include_str!("../src/retrieval.rs");
+        assert!(!retrieval.contains("pub fn decrypt("));
+        for required in [
+            "seed[HASH_SIZE..].copy_from_slice(&counter.to_le_bytes())",
+            "keccak256(keccak256(seed))",
+            "chunk.get(97..)",
+            "decrypt_join_chunk(raw, &key)",
+            "raw.len() != erasure_coding::CHUNK_WITH_SPAN_SIZE",
+            "plain_chunk_layout(&span, true)",
+            "Vec::with_capacity(plain_len)",
+        ] {
+            assert!(retrieval.contains(required), "missing {required}");
+        }
+        assert_eq!(
+            crate::erasure_coding::encoded_reference_payload_len(
+                CHUNK_SIZE as u64 * 10,
+                RedundancyLevel::Strong,
+                true,
+            ),
+            Some(960)
+        );
+    }
+}
+
 mod bee_compatibility {
     #![allow(dead_code)]
     use crate::erasure_coding;
