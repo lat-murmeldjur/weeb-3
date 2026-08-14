@@ -162,7 +162,7 @@ fn bmt_root(content: &[u8]) -> Option<BmtHash> {
     }
 }
 
-pub(crate) fn content_address_array(chunk_content: &[u8]) -> Option<BmtHash> {
+fn content_address_array(chunk_content: &[u8]) -> Option<BmtHash> {
     if !(SPAN_SIZE..=SPAN_SIZE + CHUNK_SIZE).contains(&chunk_content.len()) {
         return None;
     }

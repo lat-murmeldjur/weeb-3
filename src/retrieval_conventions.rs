@@ -1,59 +1,3 @@
-use std::{fmt, ops::Deref, rc::Rc};
-
-/// An immutable chunk payload that can either own its exact bytes or view a
-/// range of a cached raw chunk without copying that range.
-#[derive(Clone)]
-pub(crate) struct ChunkBytes {
-    backing: Rc<[u8]>,
-    start: usize,
-    end: usize,
-}
-
-impl ChunkBytes {
-    pub(crate) fn copied(bytes: &[u8]) -> Self {
-        let backing: Rc<[u8]> = Rc::from(bytes);
-        let end = backing.len();
-        Self {
-            backing,
-            start: 0,
-            end,
-        }
-    }
-
-    pub(crate) fn shared(backing: Rc<[u8]>, start: usize, end: usize) -> Option<Self> {
-        (start <= end && end <= backing.len()).then_some(Self {
-            backing,
-            start,
-            end,
-        })
-    }
-
-    #[cfg(test)]
-    pub(crate) fn shares_backing(&self, backing: &Rc<[u8]>) -> bool {
-        Rc::ptr_eq(&self.backing, backing)
-    }
-}
-
-impl AsRef<[u8]> for ChunkBytes {
-    fn as_ref(&self) -> &[u8] {
-        &self.backing[self.start..self.end]
-    }
-}
-
-impl Deref for ChunkBytes {
-    type Target = [u8];
-
-    fn deref(&self) -> &Self::Target {
-        self.as_ref()
-    }
-}
-
-impl fmt::Debug for ChunkBytes {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.as_ref().fmt(formatter)
-    }
-}
-
 pub(crate) fn next_nonzero_generation(current: u64) -> u64 {
     let next = current.wrapping_add(1);
     if next == 0 { 1 } else { next }
@@ -100,34 +44,6 @@ pub(crate) fn cancel_generation_is_current(latest: Option<u64>, candidate: u64) 
     latest
         .map(|generation| generation == candidate || generation_is_newer(candidate, generation))
         .unwrap_or(true)
-}
-
-/// Bytes accepted by the retrieval transport together with the CAC proven by
-/// that validation. SOC retrievals carry the CAC of their wrapped chunk.
-#[derive(Debug, Default, Eq, PartialEq)]
-pub(crate) struct RetrievedChunk {
-    bytes: Vec<u8>,
-    canonical_cac: Option<[u8; 32]>,
-}
-
-impl RetrievedChunk {
-    pub(crate) fn verified(bytes: Vec<u8>, canonical_cac: [u8; 32]) -> Self {
-        if bytes.is_empty() {
-            return Self::default();
-        }
-        Self {
-            bytes,
-            canonical_cac: Some(canonical_cac),
-        }
-    }
-
-    pub(crate) fn into_bytes(self) -> Vec<u8> {
-        self.bytes
-    }
-
-    pub(crate) fn into_parts(self) -> (Vec<u8>, Option<[u8; 32]>) {
-        (self.bytes, self.canonical_cac)
-    }
 }
 
 use async_lock::{Semaphore, SemaphoreGuardArc};

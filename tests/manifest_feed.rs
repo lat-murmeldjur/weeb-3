@@ -220,11 +220,11 @@ mod feed_frontier {
     };
 
     use feed::{
-        FEED_FRONTIER_LOOKAHEAD_LEVELS, FEED_FRONTIER_LOOKAHEAD_TIMEOUT, FeedFrontierConfidence,
-        FeedProbe, WIDE_FEED_FRONTIER_LOOKAHEAD, overscan_sequence_feed_candidate,
-        seek_sequence_feed_frontier, seek_sequence_feed_frontier_bounded_observing_positive,
-        seek_sequence_feed_frontier_from, seek_sequence_feed_frontier_wide_bounded,
-        seek_sequence_feed_frontier_wide_bounded_observing_positive,
+        FEED_FRONTIER_LOOKAHEAD_LEVELS, FEED_FRONTIER_LOOKAHEAD_TIMEOUT, FeedProbe,
+        WIDE_FEED_FRONTIER_COARSE_STRIDE, WIDE_FEED_FRONTIER_LOOKAHEAD,
+        overscan_sequence_feed_candidate, seek_sequence_feed_frontier,
+        seek_sequence_feed_frontier_bounded_observing_positive, seek_sequence_feed_frontier_from,
+        seek_sequence_feed_frontier_wide_bounded,
     };
     use futures::executor::block_on;
 
@@ -369,79 +369,6 @@ mod feed_frontier {
     }
 
     #[test]
-    fn wide_bounded_observer_reaches_the_runtime_live_head_without_narrow_waves() {
-        block_on(async {
-            let probes = Arc::new(AtomicUsize::new(0));
-            let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
-            let (latest, next) = seek_sequence_feed_frontier_wide_bounded_observing_positive(
-                {
-                    let probes = probes.clone();
-                    move |index| {
-                        probes.fetch_add(1, Ordering::SeqCst);
-                        async move { (index <= 8_591).then_some(index) }
-                    }
-                },
-                {
-                    let observed = observed.clone();
-                    move |index, _| observed.lock().unwrap().push(index)
-                },
-            )
-            .await;
-
-            assert_eq!(latest, Some((8_591, 8_591)));
-            assert_eq!(next, 8_592);
-            let observed = observed.lock().unwrap();
-            for expected in [0, 1, 7, 8_191, 8_591] {
-                assert!(
-                    observed.contains(&expected),
-                    "did not observe index {expected}"
-                );
-            }
-            let probe_count = probes.load(Ordering::SeqCst);
-            assert!(probe_count <= 80, "wide startup used {probe_count} probes");
-        });
-    }
-
-    #[test]
-    fn wide_bounded_frontier_soft_bounds_a_transient_landmark_confirmation() {
-        block_on(async {
-            let probes = Arc::new(AtomicUsize::new(0));
-            let transient_confirmations = Arc::new(AtomicUsize::new(0));
-            let (candidate, next) = seek_sequence_feed_frontier_wide_bounded({
-                let probes = probes.clone();
-                let transient_confirmations = transient_confirmations.clone();
-                move |index| {
-                    probes.fetch_add(1, Ordering::SeqCst);
-                    let transient = [16_399, 65_551, 262_159, 1_048_591].contains(&index);
-                    if transient {
-                        transient_confirmations.fetch_add(1, Ordering::SeqCst);
-                    }
-                    async move {
-                        if transient {
-                            FeedProbe::Transient
-                        } else if index <= 8_591 {
-                            FeedProbe::Found(index)
-                        } else {
-                            FeedProbe::Missing
-                        }
-                    }
-                }
-            })
-            .await;
-
-            // This is only the provisional startup candidate; overscan still supplies confidence.
-            assert_eq!(candidate, Some((8_591, 8_591)));
-            assert_eq!(next, 8_592);
-            assert_eq!(transient_confirmations.load(Ordering::SeqCst), 1);
-            let probe_count = probes.load(Ordering::SeqCst);
-            assert!(
-                probe_count <= 80,
-                "transient landmark confirmation used {probe_count} probes"
-            );
-        });
-    }
-
-    #[test]
     fn fast_transients_do_not_bound_short_or_twelve_hour_frontiers() {
         block_on(async {
             for (head, transient_index, maximum_probes) in
@@ -528,24 +455,17 @@ mod feed_frontier {
     }
 
     #[test]
-    fn deterministic_adaptive_overscan_finds_exact_heads_across_feed_ages() {
+    fn deterministic_overscan_finds_exact_heads_at_coarse_block_boundaries() {
         block_on(async {
-            for head in [30, 349, 10_368, 21_600, 86_400] {
-                let probes = Arc::new(AtomicUsize::new(0));
+            for head in [30, 10_368, 28_799, 28_800, 28_801] {
                 let (latest, verified) = overscan_sequence_feed_candidate(
-                    (7, 7),
+                    (0, 0),
                     true,
-                    {
-                        let probes = probes.clone();
-                        move |index| {
-                            probes.fetch_add(1, Ordering::SeqCst);
-                            async move {
-                                if index <= head {
-                                    FeedProbe::Found(index)
-                                } else {
-                                    FeedProbe::Missing
-                                }
-                            }
+                    |index| async move {
+                        if index <= head {
+                            FeedProbe::Found(index)
+                        } else {
+                            FeedProbe::Missing
                         }
                     },
                     |_| async { true },
@@ -554,22 +474,21 @@ mod feed_frontier {
                 .await;
 
                 assert_eq!(latest, (head, head));
-                assert!(verified.is_exact(), "head {head} was not verified");
-                assert!(probes.load(Ordering::SeqCst) <= 200);
+                assert!(verified, "head {head} was not verified");
             }
         });
     }
 
     #[test]
-    fn deterministic_coarse_startup_recovers_a_head_beyond_the_dense_window() {
+    fn deterministic_overscan_extends_across_multiple_coarse_blocks() {
         block_on(async {
             let admitted = Arc::new(std::sync::Mutex::new(Vec::new()));
             let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
             let (latest, verified) = overscan_sequence_feed_candidate(
-                (511, 511),
+                (0, 0),
                 true,
                 |index| async move {
-                    if index <= 1_046 {
+                    if index <= 57_737 {
                         FeedProbe::Found(index)
                     } else {
                         FeedProbe::Missing
@@ -589,232 +508,13 @@ mod feed_frontier {
             )
             .await;
 
-            assert_eq!(latest, (1_046, 1_046));
-            assert!(verified.is_exact());
-            assert_eq!(*admitted.lock().unwrap(), vec![16, 32, 32, 1]);
-            assert_eq!(*observed.lock().unwrap(), vec![1_023, 1_039, 1_046]);
-        });
-    }
-
-    #[test]
-    fn adaptive_overscan_does_not_retry_a_progressing_power_wave() {
-        block_on(async {
-            let transient_attempts = Arc::new(AtomicUsize::new(0));
-            let admissions = Arc::new(std::sync::Mutex::new(Vec::new()));
-            let (latest, confidence) = overscan_sequence_feed_candidate(
-                (1_791, 1_791),
-                true,
-                {
-                    let transient_attempts = transient_attempts.clone();
-                    move |index| {
-                        let transient = index == 2_047
-                            && transient_attempts.fetch_add(1, Ordering::SeqCst) == 0;
-                        async move {
-                            if transient {
-                                FeedProbe::Transient
-                            } else if index <= 1_887 {
-                                FeedProbe::Found(index)
-                            } else {
-                                FeedProbe::Missing
-                            }
-                        }
-                    }
-                },
-                {
-                    let admissions = admissions.clone();
-                    move |count| {
-                        let mut admissions = admissions.lock().unwrap();
-                        admissions.push(count);
-                        let admitted = admissions.len() <= 4;
-                        async move { admitted }
-                    }
-                },
-                |_, _| {},
-            )
-            .await;
-
-            assert_eq!(latest, (1_887, 1_887));
-            assert_eq!(confidence, FeedFrontierConfidence::Exact);
-            assert_eq!(*admissions.lock().unwrap(), vec![16, 32, 32, 1]);
-            assert_eq!(transient_attempts.load(Ordering::SeqCst), 1);
-        });
-    }
-
-    #[test]
-    fn upper_hint_refines_the_runtime_feed_gap_in_four_waves() {
-        block_on(async {
-            for head in [2_900, 2_911] {
-                let admissions = Arc::new(std::sync::Mutex::new(Vec::new()));
-                let (latest, confidence) = overscan_sequence_feed_candidate(
-                    (2_047, 2_047),
-                    true,
-                    move |index| async move {
-                        if index <= head {
-                            FeedProbe::Found(index)
-                        } else {
-                            FeedProbe::Missing
-                        }
-                    },
-                    {
-                        let admissions = admissions.clone();
-                        move |count| {
-                            admissions.lock().unwrap().push(count);
-                            async { true }
-                        }
-                    },
-                    |_, _| {},
-                )
-                .await;
-
-                assert_eq!(latest, (head, head));
-                assert_eq!(confidence, FeedFrontierConfidence::Exact);
-                assert_eq!(*admissions.lock().unwrap(), vec![16, 32, 32, 1]);
-            }
-        });
-    }
-
-    #[test]
-    fn upper_hint_refines_the_observed_long_live_gap_in_four_waves() {
-        block_on(async {
-            let admissions = Arc::new(std::sync::Mutex::new(Vec::new()));
-            let (latest, confidence) = overscan_sequence_feed_candidate(
-                (8_191, 8_191),
-                true,
-                |index| async move {
-                    if index <= 8_591 {
-                        FeedProbe::Found(index)
-                    } else {
-                        FeedProbe::Missing
-                    }
-                },
-                {
-                    let admissions = admissions.clone();
-                    move |count| {
-                        admissions.lock().unwrap().push(count);
-                        async { true }
-                    }
-                },
-                |_, _| {},
-            )
-            .await;
-
-            assert_eq!(latest, (8_591, 8_591));
-            assert_eq!(confidence, FeedFrontierConfidence::Exact);
-            assert_eq!(*admissions.lock().unwrap(), vec![16, 32, 32, 1]);
-        });
-    }
-
-    #[test]
-    fn dense_guard_distinguishes_critical_and_cushion_transients() {
-        block_on(async {
-            for (transient_index, confidence) in [
-                (30, FeedFrontierConfidence::Unresolved),
-                (46, FeedFrontierConfidence::Guarded),
-            ] {
-                let (latest, actual) = overscan_sequence_feed_candidate(
-                    (29, 29),
-                    true,
-                    move |index| async move {
-                        if index == transient_index {
-                            FeedProbe::Transient
-                        } else {
-                            FeedProbe::Missing
-                        }
-                    },
-                    |_| async { true },
-                    |_, _| {},
-                )
-                .await;
-
-                assert_eq!(latest, (29, 29));
-                assert_eq!(actual, confidence, "transient index {transient_index}");
-            }
-        });
-    }
-
-    #[test]
-    fn moving_feed_reuses_the_shifted_dense_guard_before_the_deadline() {
-        block_on(async {
-            let next_probes = Arc::new(AtomicUsize::new(0));
-            let admissions = Arc::new(std::sync::Mutex::new(Vec::new()));
-            let (latest, confidence) = overscan_sequence_feed_candidate(
-                (29, 29),
-                true,
-                {
-                    let next_probes = next_probes.clone();
-                    move |index| {
-                        let found = index == 30 && next_probes.fetch_add(1, Ordering::SeqCst) == 2;
-                        async move {
-                            if found {
-                                FeedProbe::Found(index)
-                            } else {
-                                FeedProbe::Missing
-                            }
-                        }
-                    }
-                },
-                {
-                    let admissions = admissions.clone();
-                    move |count| {
-                        let mut admissions = admissions.lock().unwrap();
-                        admissions.push(count);
-                        let admitted = admissions.len() <= 3;
-                        async move { admitted }
-                    }
-                },
-                |_, _| {},
-            )
-            .await;
-
-            assert_eq!(latest, (30, 30));
-            assert_eq!(confidence, FeedFrontierConfidence::Guarded);
-            assert_eq!(*admissions.lock().unwrap(), vec![16, 32, 1, 1]);
-            assert_eq!(next_probes.load(Ordering::SeqCst), 3);
-        });
-    }
-
-    #[test]
-    fn deterministic_adaptive_overscan_crosses_sparse_holes() {
-        block_on(async {
-            for holes in [
-                vec![1_023],
-                vec![1_039],
-                vec![1_040],
-                vec![1_047],
-                vec![1_040, 1_041, 1_042],
-            ] {
-                let probes = Arc::new(AtomicUsize::new(0));
-                let probed_holes = holes.clone();
-                let (latest, verified) = overscan_sequence_feed_candidate(
-                    (511, 511),
-                    true,
-                    {
-                        let probes = probes.clone();
-                        move |index| {
-                            probes.fetch_add(1, Ordering::SeqCst);
-                            let missing = probed_holes.contains(&index);
-                            async move {
-                                if index <= 1_046 && !missing {
-                                    FeedProbe::Found(index)
-                                } else {
-                                    FeedProbe::Missing
-                                }
-                            }
-                        }
-                    },
-                    |_| async { true },
-                    |_, _| {},
-                )
-                .await;
-
-                assert_eq!(latest, (1_046, 1_046));
-                assert!(verified.is_exact());
-                let probe_count = probes.load(Ordering::SeqCst);
-                assert!(
-                    probe_count <= 161,
-                    "holes={holes:?} dispatched {probe_count} probes"
-                );
-            }
+            assert_eq!(latest, (57_737, 57_737));
+            assert!(verified);
+            assert_eq!(*admitted.lock().unwrap(), vec![240, 240, 240, 180, 1]);
+            assert_eq!(
+                *observed.lock().unwrap(),
+                vec![28_800, 57_600, 57_720, 57_737]
+            );
         });
     }
 
@@ -845,7 +545,7 @@ mod feed_frontier {
             .await;
 
             assert_eq!(latest, (6_100, 6_100));
-            assert!(verified.is_exact());
+            assert!(verified);
             let admitted = admitted.lock().unwrap();
             assert_eq!(admitted.len(), 24);
             assert!(admitted[..23].iter().all(|count| *count == 16));
@@ -879,163 +579,8 @@ mod feed_frontier {
             .await;
 
             assert_eq!(latest, (29, 29));
-            assert_eq!(verified, FeedFrontierConfidence::Unresolved);
-            assert_eq!(*admitted.lock().unwrap(), vec![16, 1, 1]);
-        });
-    }
-
-    #[test]
-    fn dense_guard_retries_a_runtime_critical_transient_one_additional_time() {
-        block_on(async {
-            let critical_attempts = Arc::new(AtomicUsize::new(0));
-            let admissions = Arc::new(std::sync::Mutex::new(Vec::new()));
-            let (latest, confidence) = overscan_sequence_feed_candidate(
-                (8_799, 8_799),
-                true,
-                {
-                    let critical_attempts = critical_attempts.clone();
-                    move |index| {
-                        let attempt = (index == 8_810)
-                            .then(|| critical_attempts.fetch_add(1, Ordering::SeqCst));
-                        async move {
-                            if index <= 8_800 {
-                                FeedProbe::Found(index)
-                            } else if attempt.is_some_and(|attempt| attempt < 2) {
-                                FeedProbe::Transient
-                            } else {
-                                FeedProbe::Missing
-                            }
-                        }
-                    }
-                },
-                {
-                    let admissions = admissions.clone();
-                    move |count| {
-                        admissions.lock().unwrap().push(count);
-                        async { true }
-                    }
-                },
-                |_, _| {},
-            )
-            .await;
-
-            assert_eq!(latest, (8_800, 8_800));
-            assert_eq!(confidence, FeedFrontierConfidence::Exact);
-            assert_eq!(critical_attempts.load(Ordering::SeqCst), 3);
-            assert_eq!(*admissions.lock().unwrap(), vec![16, 32, 1, 1, 1]);
-        });
-    }
-
-    #[test]
-    fn rejected_additional_dense_retry_dispatches_no_probe() {
-        block_on(async {
-            let critical_attempts = Arc::new(AtomicUsize::new(0));
-            let admissions = Arc::new(std::sync::Mutex::new(Vec::new()));
-            let (latest, confidence) = overscan_sequence_feed_candidate(
-                (29, 29),
-                false,
-                {
-                    let critical_attempts = critical_attempts.clone();
-                    move |index| {
-                        if index == 30 {
-                            critical_attempts.fetch_add(1, Ordering::SeqCst);
-                        }
-                        async move {
-                            if index == 30 {
-                                FeedProbe::Transient
-                            } else {
-                                FeedProbe::Missing
-                            }
-                        }
-                    }
-                },
-                {
-                    let admissions = admissions.clone();
-                    move |count| {
-                        let mut admissions = admissions.lock().unwrap();
-                        admissions.push(count);
-                        let admitted = admissions.len() <= 2;
-                        async move { admitted }
-                    }
-                },
-                |_, _| {},
-            )
-            .await;
-
-            assert_eq!(latest, (29, 29));
-            assert_eq!(confidence, FeedFrontierConfidence::Unresolved);
-            assert_eq!(critical_attempts.load(Ordering::SeqCst), 2);
-            assert_eq!(*admissions.lock().unwrap(), vec![16, 1, 1]);
-        });
-    }
-
-    #[test]
-    fn a_completed_dense_guard_is_authoritative_when_its_recheck_is_transient() {
-        block_on(async {
-            let next_probes = Arc::new(AtomicUsize::new(0));
-            let (latest, confidence) = overscan_sequence_feed_candidate(
-                (29, 29),
-                false,
-                {
-                    let next_probes = next_probes.clone();
-                    move |index| {
-                        let attempt =
-                            (index == 30).then(|| next_probes.fetch_add(1, Ordering::SeqCst));
-                        async move {
-                            if attempt == Some(0) || index != 30 {
-                                FeedProbe::Missing
-                            } else {
-                                FeedProbe::Transient
-                            }
-                        }
-                    }
-                },
-                |_| async { true },
-                |_, _| {},
-            )
-            .await;
-
-            assert_eq!(latest, (29, 29));
-            assert_eq!(confidence, FeedFrontierConfidence::Guarded);
-            assert_eq!(next_probes.load(Ordering::SeqCst), 3);
-        });
-    }
-
-    #[test]
-    fn a_moving_feed_invalidates_the_previous_dense_guard() {
-        block_on(async {
-            let next_probes = Arc::new(AtomicUsize::new(0));
-            let admissions = Arc::new(AtomicUsize::new(0));
-            let (latest, confidence) = overscan_sequence_feed_candidate(
-                (29, 29),
-                false,
-                {
-                    let next_probes = next_probes.clone();
-                    move |index| {
-                        let found = index == 30 && next_probes.fetch_add(1, Ordering::SeqCst) == 1;
-                        async move {
-                            if found {
-                                FeedProbe::Found(index)
-                            } else {
-                                FeedProbe::Missing
-                            }
-                        }
-                    }
-                },
-                {
-                    let admissions = admissions.clone();
-                    move |_| {
-                        let admitted = admissions.fetch_add(1, Ordering::SeqCst) < 2;
-                        async move { admitted }
-                    }
-                },
-                |_, _| {},
-            )
-            .await;
-
-            assert_eq!(latest, (30, 30));
-            assert_eq!(confidence, FeedFrontierConfidence::Unresolved);
-            assert_eq!(next_probes.load(Ordering::SeqCst), 2);
+            assert!(!verified);
+            assert_eq!(*admitted.lock().unwrap(), vec![16]);
         });
     }
 
@@ -1068,8 +613,8 @@ mod feed_frontier {
             .await;
 
             assert_eq!(latest, (10, 10));
-            assert!(verified.is_exact());
-            assert_eq!(index_eleven_probes.load(Ordering::SeqCst), 4);
+            assert!(verified);
+            assert_eq!(index_eleven_probes.load(Ordering::SeqCst), 3);
         });
     }
 
@@ -1085,7 +630,7 @@ mod feed_frontier {
             )
             .await;
             assert_eq!(latest.0, u64::MAX - 5);
-            assert!(verified.is_exact());
+            assert!(verified);
 
             let (latest, verified) = overscan_sequence_feed_candidate(
                 (u64::MAX - 1, u64::MAX - 1),
@@ -1096,7 +641,7 @@ mod feed_frontier {
             )
             .await;
             assert_eq!(latest.0, u64::MAX);
-            assert!(verified.is_exact());
+            assert!(verified);
         });
     }
 
@@ -1126,79 +671,8 @@ mod feed_frontier {
             .await;
 
             assert_eq!(latest, (1, 1));
-            assert!(verified.is_exact());
+            assert!(!verified);
             assert_eq!(next_probes.load(Ordering::SeqCst), 2);
-        });
-    }
-
-    #[test]
-    fn deterministic_adaptive_overscan_recovers_transient_scale_and_edge_probes() {
-        block_on(async {
-            for (transient_index, minimum_attempts) in [(1_023, 1), (1_047, 2)] {
-                let attempts = Arc::new(AtomicUsize::new(0));
-                let (latest, verified) = overscan_sequence_feed_candidate(
-                    (511, 511),
-                    true,
-                    {
-                        let attempts = attempts.clone();
-                        move |index| {
-                            let transient = index == transient_index
-                                && attempts.fetch_add(1, Ordering::SeqCst) == 0;
-                            async move {
-                                if transient {
-                                    FeedProbe::Transient
-                                } else if index <= 1_046 {
-                                    FeedProbe::Found(index)
-                                } else {
-                                    FeedProbe::Missing
-                                }
-                            }
-                        }
-                    },
-                    |_| async { true },
-                    |_, _| {},
-                )
-                .await;
-
-                assert_eq!(latest, (1_046, 1_046));
-                assert!(verified.is_exact());
-                assert!(attempts.load(Ordering::SeqCst) >= minimum_attempts);
-            }
-        });
-    }
-
-    #[test]
-    fn a_far_coarse_transient_does_not_veto_the_dense_edge_proof() {
-        block_on(async {
-            let transient_attempts = Arc::new(AtomicUsize::new(0));
-            let (latest, confidence) = overscan_sequence_feed_candidate(
-                (511, 511),
-                true,
-                {
-                    let transient_attempts = transient_attempts.clone();
-                    move |index| {
-                        if index == 1_535 {
-                            transient_attempts.fetch_add(1, Ordering::SeqCst);
-                        }
-                        async move {
-                            if index == 1_535 {
-                                FeedProbe::Transient
-                            } else if index <= 1_046 {
-                                FeedProbe::Found(index)
-                            } else {
-                                FeedProbe::Missing
-                            }
-                        }
-                    }
-                },
-                |_| async { true },
-                |_, _| {},
-            )
-            .await;
-
-            assert_eq!(latest, (1_046, 1_046));
-            assert_eq!(confidence, FeedFrontierConfidence::Exact);
-            assert_eq!(transient_attempts.load(Ordering::SeqCst), 1);
         });
     }
 
@@ -1209,7 +683,7 @@ mod feed_frontier {
                 (0, 0),
                 true,
                 |index| async move {
-                    if index == 1 {
+                    if index >= 240 && index % WIDE_FEED_FRONTIER_COARSE_STRIDE == 0 {
                         FeedProbe::Transient
                     } else {
                         FeedProbe::Missing
@@ -1221,12 +695,12 @@ mod feed_frontier {
             .await;
 
             assert_eq!(latest, (0, 0));
-            assert!(!verified.is_exact());
+            assert!(!verified);
         });
     }
 
     #[test]
-    fn deterministic_adaptive_overscan_never_exceeds_a_dense_wave() {
+    fn deterministic_overscan_never_exceeds_a_coarse_wave() {
         block_on(async {
             let active = Arc::new(AtomicUsize::new(0));
             let maximum = Arc::new(AtomicUsize::new(0));
@@ -1265,9 +739,9 @@ mod feed_frontier {
             .await;
 
             assert_eq!(latest, (646, 646));
-            assert!(verified.is_exact());
-            assert!(admitted.lock().unwrap().iter().all(|count| *count <= 32));
-            assert!(maximum.load(Ordering::SeqCst) <= 32);
+            assert!(verified);
+            assert_eq!(*admitted.lock().unwrap(), vec![240, 180, 1]);
+            assert_eq!(maximum.load(Ordering::SeqCst), 240);
         });
     }
 
@@ -1298,8 +772,8 @@ mod feed_frontier {
             .await;
 
             assert_eq!(latest, (0, 0));
-            assert!(!verified.is_exact());
-            assert_eq!(*admitted.lock().unwrap(), vec![16]);
+            assert!(!verified);
+            assert_eq!(*admitted.lock().unwrap(), vec![240, 180]);
             assert_eq!(probes.load(Ordering::SeqCst), 0);
         });
     }
@@ -1710,23 +1184,10 @@ mod feed_frontier {
             .expect("feed probe chunk wrapper should remain inspectable");
         assert!(feed_probe.contains("let _close_admission = admission.close_on_drop();"));
         assert!(feed_probe.contains("admission: Some(admission),"));
-        assert!(feed_probe.contains("max_attempt_errors: Some(FEED_PROBE_MAX_ATTEMPT_ERRORS),"));
-        assert!(retrieval.contains("const FEED_PROBE_MAX_ATTEMPT_ERRORS: usize = 2;"));
-        assert!(retrieval.contains(
-            "const LIVE_HISTORY_FEED_PROBE_TIMEOUT: Duration = Duration::from_millis(2_250);"
-        ));
-        let history_probe = retrieval
-            .split("pub(crate) async fn retrieve_live_history_feed_update_at_index(")
-            .nth(1)
-            .and_then(|source| source.split("async fn seek_feed_frontier(").next())
-            .expect("history feed probe should remain isolated");
-        assert!(history_probe.contains("LIVE_HISTORY_FEED_PROBE_TIMEOUT"));
-        assert!(!history_probe.contains("FEED_FRONTIER_LOOKAHEAD_TIMEOUT"));
         assert!(feed_probe.contains(".is_err()"));
         assert!(feed_probe.contains("return FeedProbe::Transient;"));
         assert!(feed_probe.contains("chan_in.recv().await"));
-        assert!(feed_probe.contains("let payload = retrieved.into_bytes();"));
-        assert!(feed_probe.contains("FeedProbe::Missing"));
+        assert!(feed_probe.contains("Ok(_) => FeedProbe::Missing"));
         assert!(feed_probe.contains("Err(_) => FeedProbe::Transient"));
         assert!(finder.contains(".map_or(FeedProbe::Transient, Into::into)"));
         let attempt = retrieval

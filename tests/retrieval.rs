@@ -56,23 +56,6 @@ mod connection {
     }
 
     #[test]
-    fn retrieval_uses_one_authoritative_queue() {
-        let runtime = include_str!("../src/lib.rs");
-        let dispatcher = runtime
-            .split("let retrieve_chunk_handle = async")
-            .nth(1)
-            .and_then(|source| source.split("let hive_joiner = async").next())
-            .expect("retrieve dispatcher");
-
-        assert!(runtime.contains("let chunk_retrieve_chan_outgoing = self.chunk_port.0.clone();"));
-        assert!(!runtime.contains("let raw_chunk_handle = async"));
-        assert!(!runtime.contains("chunk_retrieve_chan_incoming"));
-        assert!(dispatcher.contains("self.chunk_port.1.recv().await"));
-        assert!(dispatcher.contains("self.chunk_port.1.try_recv()"));
-        assert!(dispatcher.contains("sleep(Duration::ZERO)"));
-    }
-
-    #[test]
     fn dial_storm_can_fill_but_never_exceed_the_peer_population() {
         assert!(connection_dial_capacity_available(
             0,
@@ -648,7 +631,7 @@ mod connection {
             .expect("retrieve dispatcher");
         assert!(retrieve.contains("let retrieve_dispatch_yield_every = 128usize;"));
         assert!(retrieve.contains("let mut retrieve_dispatches_since_browser_yield = 0usize;"));
-        assert!(retrieve.contains("sleep(Duration::ZERO)"));
+        assert!(retrieve.contains("async_std::task::sleep(Duration::ZERO).await;"));
         assert!(!retrieve.contains("wave_done"));
         assert!(!retrieve.contains("Completed {} of {} chunk retrieval requests"));
 
@@ -1286,166 +1269,5 @@ mod retrieve_singleflight {
             .take(&3, successor.flight_id)
             .expect("successor remains registered");
         assert_eq!(flight.waiters, vec!["new"]);
-    }
-}
-
-mod verified_chunk_handoff {
-    use crate::retrieval_conventions::RetrievedChunk;
-
-    const RETRIEVAL: &str = include_str!("../src/retrieval.rs");
-    const RUNTIME: &str = include_str!("../src/lib.rs");
-
-    fn source_section(start: &str, end: &str) -> &'static str {
-        let start = RETRIEVAL
-            .find(start)
-            .unwrap_or_else(|| panic!("missing retrieval source marker: {start}"));
-        let tail = &RETRIEVAL[start..];
-        let end = tail
-            .find(end)
-            .unwrap_or_else(|| panic!("missing retrieval source marker: {end}"));
-        &tail[..end]
-    }
-
-    #[test]
-    fn verified_results_carry_direct_or_soc_wrapped_cac_and_fail_closed() {
-        let direct_cac = [0x11; 32];
-        let direct = RetrievedChunk::verified(vec![1, 2, 3], direct_cac);
-        assert_eq!(direct.into_parts(), (vec![1, 2, 3], Some(direct_cac)));
-
-        let wrapped_soc_cac = [0x22; 32];
-        let soc = RetrievedChunk::verified(vec![4, 5, 6], wrapped_soc_cac);
-        assert_eq!(soc.into_parts(), (vec![4, 5, 6], Some(wrapped_soc_cac)));
-
-        assert_eq!(
-            RetrievedChunk::verified(Vec::new(), [0x33; 32]).into_parts(),
-            (Vec::new(), None),
-            "empty or failed retrievals must never carry authentication"
-        );
-        assert_eq!(RetrievedChunk::default().into_parts(), (Vec::new(), None));
-    }
-
-    #[test]
-    fn transport_validation_exposes_the_authenticated_source_address() {
-        let verify = source_section("fn verify_chunk(", "fn valid_soc_wrapped_cac(");
-        assert!(verify.contains("content_address_array(&bytes)"));
-        assert!(verify.contains("canonical_cac == request_address"));
-        assert!(verify.contains("source: VerifiedChunkSource::Cac"));
-        assert!(verify.contains("valid_soc_wrapped_cac(&bytes, &request_address)?"));
-        assert!(verify.contains("source: VerifiedChunkSource::Soc"));
-
-        let soc = source_section(
-            "fn valid_soc_wrapped_cac(",
-            "async fn get_feed_probe_chunk(",
-        );
-        assert!(soc.contains("content_address_array(&chunk[SOC_HEADER_SIZE..])"));
-        assert!(soc.contains("recover_address_from_msg(signed_digest)"));
-        assert!(soc.contains("keccak256(address_payload)"));
-        assert!(soc.contains("(soc_address == *request_address).then_some(canonical_cac)"));
-    }
-
-    #[test]
-    fn each_peer_reply_validates_once_and_late_replies_still_settle() {
-        let settlement = source_section(
-            "async fn settle_retrieve_attempt(",
-            "async fn retrieve_attempt(",
-        );
-        assert_eq!(settlement.matches("verify_chunk(").count(), 1);
-        assert!(settlement.contains("apply_credit("));
-        assert!(settlement.contains("cancel_reserve("));
-
-        let attempt = source_section("async fn retrieve_attempt(", "fn chunk_address_parts(");
-        assert_eq!(attempt.matches("settle_retrieve_attempt(").count(), 2);
-        assert!(attempt.contains("failed_retrieve_attempt(&peer, false)"));
-        assert!(attempt.contains("result_chan.try_send(terminal_result)"));
-    }
-
-    #[test]
-    fn raw_completion_routes_only_the_carried_canonical_cac() {
-        let completion = source_section("fn complete_raw_fetch(", "fn queue_drained_raw_chunk(");
-        assert!(completion.contains("received_cac == Some(key.expected_cac)"));
-        assert!(!completion.contains("valid_cac("));
-        assert!(!completion.contains("content_address("));
-
-        let root = source_section(
-            "async fn retrieve_raw_root_cancellable(",
-            "pub(crate) async fn retrieve_decoded_data_root(",
-        );
-        assert!(root.contains("!result.chunk.is_empty() && result.canonical_cac"));
-        assert!(!root.contains("result.index == 0 || result.canonical_cac"));
-
-        let group = source_section(
-            "async fn fetch_data_group_indices_streaming(",
-            "async fn retrieve_data_range_from_root_with_prefix_cancellable(",
-        );
-        assert!(group.contains("!result.chunk.is_empty() && result.canonical_cac"));
-        assert!(!group.contains("result.canonical_cac || parity_references.is_empty()"));
-
-        assert!(RUNTIME.contains(".unwrap_or_default().into_bytes()"));
-    }
-
-    #[test]
-    fn only_unencrypted_decodes_share_the_cached_raw_backing() {
-        let shared = source_section(
-            "fn canonical_shared_plain_chunk(",
-            "pub(crate) fn decode_raw_join_chunk(",
-        );
-        assert!(shared.contains("plain_chunk_layout(raw.as_ref(), false)"));
-        assert!(shared.contains("DecodedJoinChunk::with_shared_payload("));
-        assert!(shared.contains("erasure_coding::SPAN_SIZE,"));
-
-        let decode = source_section(
-            "pub(crate) fn decode_raw_join_chunk(",
-            "fn bee_replica_address(",
-        );
-        assert!(decode.contains("let encrypted = reference.len()"));
-        assert!(decode.contains("decrypt_join_chunk(raw.as_ref(), &key)"));
-        assert!(decode.contains("canonical_plain_chunk(&plain, true)"));
-        assert!(decode.contains("canonical_shared_plain_chunk(raw)"));
-
-        let cache = source_section("struct CachedJoinChunk {", "thread_local!");
-        assert!(cache.contains("raw: Option<Rc<[u8]>>"));
-        assert!(cache.contains("decoded: Option<DecodedJoinChunk>"));
-    }
-}
-
-mod shared_chunk_backing {
-    use crate::retrieval_conventions::ChunkBytes;
-    use std::rc::Rc;
-
-    #[test]
-    fn shared_payload_is_an_exact_live_view_of_raw_chunk_storage() {
-        let raw: Rc<[u8]> = Rc::from([9, 8, 7, 6, 5, 4]);
-        let payload = ChunkBytes::shared(Rc::clone(&raw), 2, 5).expect("valid payload range");
-
-        assert_eq!(payload.as_ref(), [7, 6, 5]);
-        assert!(payload.shares_backing(&raw));
-        assert_eq!(Rc::strong_count(&raw), 2);
-
-        drop(raw);
-        assert_eq!(&*payload, [7, 6, 5]);
-    }
-
-    #[test]
-    fn copied_payload_keeps_encrypted_plaintext_on_distinct_storage() {
-        let ciphertext: Rc<[u8]> = Rc::from([1, 2, 3, 4]);
-        let plaintext = ChunkBytes::copied(ciphertext.as_ref());
-
-        assert_eq!(plaintext.as_ref(), ciphertext.as_ref());
-        assert!(!plaintext.shares_backing(&ciphertext));
-        assert_eq!(Rc::strong_count(&ciphertext), 1);
-    }
-
-    #[test]
-    fn shared_payload_rejects_invalid_bounds_and_accepts_empty_payloads() {
-        let raw: Rc<[u8]> = Rc::from([1, 2, 3, 4]);
-
-        assert!(ChunkBytes::shared(Rc::clone(&raw), 3, 2).is_none());
-        assert!(ChunkBytes::shared(Rc::clone(&raw), 0, 5).is_none());
-        assert_eq!(
-            ChunkBytes::shared(raw, 4, 4)
-                .expect("empty terminal range")
-                .as_ref(),
-            []
-        );
     }
 }
