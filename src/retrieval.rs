@@ -2,7 +2,7 @@ use crate::{
     ChunkRetrieveSender, Date, Duration, HashMap, HashSet, Mutex, OutboundProtocolSession,
     PeerAccounting, PeerId, PhysicalConnectionMap, RETRIEVE_CHECK_CONFIRMATION_PEERS,
     RefreshmentInstruction, RetrieveCancelToken, RetrieveGenerationMap, StreamControl,
-    apply_credit, cancel_reserve, content_address_array,
+    apply_credit, cancel_reserve,
     erasure_coding::{
         self, BEE_MAX_UPLOAD_TREE_LEVELS, CHUNK_SIZE, CHUNK_WITH_SPAN_SIZE, HASH_SIZE,
         RedundancyLevel, encoded_reference_payload_len, reconstruct_data_indices, reference_layout,
@@ -14,14 +14,12 @@ use crate::{
         seek_sequence_feed_frontier_wide_bounded,
     },
     get_feed_address, get_proximity, mpsc, price, reserve,
-    retrieval_conventions::{
-        ChunkBytes, RetrieveAdmission, RetrievedChunk, SingleflightRegistry,
-        retrieve_admission_current,
-    },
-    retrieve_cancel_token_current, retrieve_handler, transfer_pause_enabled, valid_cac,
+    retrieval_conventions::SingleflightRegistry,
+    retrieval_conventions::{RetrieveAdmission, retrieve_admission_current},
+    retrieve_cancel_token_current, retrieve_handler, transfer_pause_enabled, valid_cac, valid_soc,
 };
 
-use alloy::primitives::{Signature, keccak256, normalize_v};
+use alloy::primitives::keccak256;
 use async_std::sync::Arc;
 use std::{
     cell::RefCell, collections::VecDeque, future::Future, pin::Pin, rc::Rc,
@@ -37,26 +35,14 @@ const RETRIEVE_ATTEMPT_TIMEOUT_MS: u64 = 10_000;
 const RETRIEVE_HOT_LOOP_GUARD_MS: u64 = 25;
 const RETRIEVE_CHECK_RETRY_WAIT_MS: u64 = 160;
 const RETRIEVE_CHUNK_MAX_ATTEMPT_ERRORS: usize = 20;
-const FEED_PROBE_MAX_ATTEMPT_ERRORS: usize = 2;
-const LIVE_HISTORY_FEED_PROBE_TIMEOUT: Duration = Duration::from_millis(2_250);
 const RETRIEVE_DATA_GROUP_CONCURRENCY: usize = 8;
 const RETRIEVE_DECODED_CHUNK_CACHE_ENTRIES: usize = 2048;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum VerifiedChunkSource {
-    Cac,
-    Soc,
-}
-
-struct VerifiedChunk {
-    bytes: Vec<u8>,
-    canonical_cac: [u8; HASH_SIZE],
-    source: VerifiedChunkSource,
-}
-
 struct RetrieveAttemptResult {
     peer: PeerId,
-    verified: Option<VerifiedChunk>,
+    chunk: Vec<u8>,
+    valid: bool,
+    soc: bool,
     /// True only after the dispatched transport settles its accounting reserve.
     terminal: bool,
 }
@@ -155,7 +141,9 @@ fn reset_overdraft(skiplist: &mut HashSet<PeerId>, overdraftlist: &mut HashSet<P
 fn failed_retrieve_attempt(peer: &PeerId, terminal: bool) -> RetrieveAttemptResult {
     RetrieveAttemptResult {
         peer: peer.clone(),
-        verified: None,
+        chunk: vec![],
+        valid: false,
+        soc: false,
         terminal,
     }
 }
@@ -170,11 +158,14 @@ async fn settle_retrieve_attempt(
 ) -> RetrieveAttemptResult {
     match retrieve_result {
         Ok(chunk) => {
-            if let Some(verified) = verify_chunk(&caddr, chunk) {
+            let (chunk_valid, soc) = verify_chunk(&caddr, &chunk);
+            if chunk_valid {
                 apply_credit(&accounting_peer, req_price, &refresh_chan).await;
                 return RetrieveAttemptResult {
                     peer,
-                    verified: Some(verified),
+                    chunk,
+                    valid: true,
+                    soc,
                     terminal: true,
                 };
             }
@@ -248,71 +239,47 @@ async fn retrieve_attempt(
     }
 }
 
-fn chunk_address_parts(chunk_address: &[u8]) -> (Vec<u8>, Option<[u8; HASH_SIZE]>) {
+fn chunk_address_parts(chunk_address: &Vec<u8>) -> (Vec<u8>, Vec<u8>, bool) {
     if chunk_address.len() == 64 {
         return (
-            chunk_address[..HASH_SIZE].to_vec(),
-            chunk_address[HASH_SIZE..].try_into().ok(),
+            (&chunk_address[0..32]).to_vec(),
+            (&chunk_address[32..64]).to_vec(),
+            true,
         );
     }
 
-    (chunk_address.to_vec(), None)
+    (chunk_address.to_vec(), vec![], false)
 }
 
-fn decode_retrieved_chunk(mut chunk: Vec<u8>, soc: bool, key: Option<[u8; HASH_SIZE]>) -> Vec<u8> {
-    let raw = if soc {
-        let Some(raw) = chunk.get(97..) else {
-            return vec![];
-        };
-        raw
-    } else {
-        chunk.as_slice()
-    };
+fn decode_retrieved_chunk(cd: Vec<u8>, soc: bool, encrey: Vec<u8>, encred: bool) -> Vec<u8> {
+    if encred {
+        if soc {
+            if cd.len() < 97 {
+                return vec![];
+            }
 
-    if let Some(key) = key {
-        return decrypt_join_chunk(raw, &key).unwrap_or_default();
-    }
-
-    if soc {
-        if chunk.len() < 97 + erasure_coding::SPAN_SIZE {
-            return vec![];
+            let cd00 = decrypt(&(&cd[97..]).to_vec(), encrey);
+            if cd00.len() >= 8 {
+                return cd00;
+            } else {
+                return vec![];
+            }
         }
-        let payload_len = chunk.len() - 97;
-        chunk.copy_within(97.., 0);
-        chunk.truncate(payload_len);
+
+        return decrypt(&cd, encrey);
     }
-    chunk
+
+    if soc && cd.len() >= 97 + 8 {
+        return (&cd[97..]).to_vec();
+    }
+    cd
 }
 
 #[derive(Clone, Debug)]
 pub(crate) struct DecodedJoinChunk {
     pub level: RedundancyLevel,
     pub span: u64,
-    pub payload: ChunkBytes,
-}
-
-impl DecodedJoinChunk {
-    pub(crate) fn with_copied_payload(level: RedundancyLevel, span: u64, payload: &[u8]) -> Self {
-        Self {
-            level,
-            span,
-            payload: ChunkBytes::copied(payload),
-        }
-    }
-
-    fn with_shared_payload(
-        level: RedundancyLevel,
-        span: u64,
-        backing: Rc<[u8]>,
-        start: usize,
-        end: usize,
-    ) -> Option<Self> {
-        Some(Self {
-            level,
-            span,
-            payload: ChunkBytes::shared(backing, start, end)?,
-        })
-    }
+    pub payload: Rc<[u8]>,
 }
 
 #[derive(Clone)]
@@ -343,7 +310,7 @@ impl DecodedChunkCache {
             return Some(decoded);
         }
 
-        let decoded = decode_raw_join_chunk(raw?, reference)?;
+        let decoded = decode_raw_join_chunk(raw?.as_ref(), reference)?;
         if let Some(entry) = self.chunks.get_mut(reference) {
             entry.decoded = Some(decoded.clone());
         }
@@ -510,8 +477,8 @@ struct RawFetchResult {
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct RawFetchKey {
     runtime_scope: usize,
-    request_address: [u8; HASH_SIZE],
-    expected_cac: [u8; HASH_SIZE],
+    request_address: Vec<u8>,
+    expected_cac: Vec<u8>,
     cancel_scope: Option<(String, u64)>,
 }
 
@@ -521,15 +488,15 @@ impl RawFetchKey {
         request_address: Vec<u8>,
         expected_cac: Vec<u8>,
         cancel: &Option<RetrieveCancelToken>,
-    ) -> Option<Self> {
-        Some(Self {
+    ) -> Self {
+        Self {
             runtime_scope,
-            request_address: request_address.try_into().ok()?,
-            expected_cac: expected_cac.try_into().ok()?,
+            request_address,
+            expected_cac,
             cancel_scope: cancel
                 .as_ref()
                 .map(|cancel| (cancel.stream_key.clone(), cancel.generation)),
-        })
+        }
     }
 }
 
@@ -559,16 +526,15 @@ fn remove_raw_fetch_waiter(key: &RawFetchKey, flight_id: u64, waiter_id: u64) {
     }
 }
 
-fn complete_raw_fetch(key: &RawFetchKey, flight_id: u64, retrieved: RetrievedChunk) {
+fn complete_raw_fetch(key: &RawFetchKey, flight_id: u64, chunk: Vec<u8>) {
     let flight = RAW_FETCH_FLIGHTS.with(|flights| flights.borrow_mut().take(key, flight_id));
     let Some(flight) = flight else {
         return;
     };
     flight.shared.close();
 
-    let (chunk, received_cac) = retrieved.into_parts();
     let usable = (erasure_coding::SPAN_SIZE..=CHUNK_WITH_SPAN_SIZE).contains(&chunk.len());
-    let canonical_cac = usable && received_cac == Some(key.expected_cac);
+    let canonical_cac = usable && valid_cac(&chunk, &key.expected_cac);
     let chunk: Rc<[u8]> = chunk.into();
     let delivered = if usable { chunk } else { Rc::from([]) };
     let mut cached_references = HashSet::new();
@@ -613,19 +579,12 @@ fn queue_drained_raw_chunk(
         }
     }
 
-    let Some(key) = RawFetchKey::new(
+    let key = RawFetchKey::new(
         chunk_retrieve_chan.runtime_scope(),
         request_address,
         expected_cac,
         cancel,
-    ) else {
-        let _ = result_chan.try_send(RawFetchResult {
-            index,
-            chunk: Rc::from([]),
-            canonical_cac: false,
-        });
-        return;
-    };
+    );
     let registration = RAW_FETCH_FLIGHTS.with(|flights| {
         flights.borrow_mut().register(
             key,
@@ -652,59 +611,45 @@ fn queue_drained_raw_chunk(
         return;
     }
 
-    let (chan_out, chan_in) = mpsc::unbounded::<RetrievedChunk>();
+    let (chan_out, chan_in) = mpsc::unbounded::<Vec<u8>>();
     let _ = chunk_retrieve_chan.try_send(crate::ChunkRetrieveRequest {
-        address: registration.key.request_address.to_vec(),
+        address: registration.key.request_address.clone(),
         chan: chan_out,
         cancel: cancel.clone(),
         admission: Some(registration.shared),
-        max_attempt_errors: None,
     });
     let completion_key = registration.key;
 
     // The detached producer lets dispatched exchanges settle after callers leave.
     wasm_bindgen_futures::spawn_local(async move {
-        let retrieved = chan_in.recv().await.unwrap_or_default();
-        complete_raw_fetch(&completion_key, flight_id, retrieved);
+        let chunk = chan_in.recv().await.unwrap_or_default();
+        complete_raw_fetch(&completion_key, flight_id, chunk);
     });
 }
 
 #[inline]
-fn decryption_segment_key(key: &[u8; HASH_SIZE], counter: u32) -> [u8; HASH_SIZE] {
+fn decryption_segment_key(key: &[u8], counter: u32) -> [u8; HASH_SIZE] {
     let mut seed = [0u8; HASH_SIZE + 4];
     seed[..HASH_SIZE].copy_from_slice(key);
     seed[HASH_SIZE..].copy_from_slice(&counter.to_le_bytes());
     keccak256(keccak256(seed)).into()
 }
 
-fn plain_chunk_layout(span: &[u8], encrypted: bool) -> Option<(RedundancyLevel, u64, usize)> {
-    let (level, span) = erasure_coding::decode_span(span)?;
-    let payload_len = if span <= CHUNK_SIZE as u64 {
-        usize::try_from(span).ok()?
-    } else {
-        encoded_reference_payload_len(span, level, encrypted)?
-    };
-    Some((level, span, payload_len))
-}
-
-fn decrypt_join_chunk(raw: &[u8], key: &[u8; HASH_SIZE]) -> Option<Vec<u8>> {
-    if raw.len() != erasure_coding::CHUNK_WITH_SPAN_SIZE {
+fn decrypt_join_chunk(raw: &[u8], key: &[u8]) -> Option<Vec<u8>> {
+    if raw.len() < erasure_coding::SPAN_SIZE || key.len() != HASH_SIZE {
         return None;
     }
 
     let span_key = decryption_segment_key(key, (CHUNK_SIZE / key.len()) as u32);
-    let mut span = [0u8; erasure_coding::SPAN_SIZE];
+    let mut plain = Vec::with_capacity(raw.len());
     for index in 0..erasure_coding::SPAN_SIZE {
-        span[index] = raw[index] ^ span_key[index];
+        plain.push(raw[index] ^ span_key[index]);
     }
 
-    let (_, _, payload_len) = plain_chunk_layout(&span, true)?;
-    let plain_len = erasure_coding::SPAN_SIZE.checked_add(payload_len)?;
-    let encrypted_payload = raw.get(erasure_coding::SPAN_SIZE..plain_len)?;
-    let mut plain = Vec::with_capacity(plain_len);
-    plain.extend_from_slice(&span);
-
-    for (segment_index, segment) in encrypted_payload.chunks(key.len()).enumerate() {
+    for (segment_index, segment) in raw[erasure_coding::SPAN_SIZE..]
+        .chunks(key.len())
+        .enumerate()
+    {
         let segment_key = decryption_segment_key(key, segment_index as u32);
         plain.extend(
             segment
@@ -717,25 +662,24 @@ fn decrypt_join_chunk(raw: &[u8], key: &[u8; HASH_SIZE]) -> Option<Vec<u8>> {
 }
 
 fn canonical_plain_chunk(plain: &[u8], encrypted: bool) -> Option<DecodedJoinChunk> {
-    let (level, span, payload_len) = plain_chunk_layout(plain, encrypted)?;
+    let (level, span) = erasure_coding::decode_span(plain)?;
+    let payload_len = if span <= CHUNK_SIZE as u64 {
+        usize::try_from(span).ok()?
+    } else {
+        encoded_reference_payload_len(span, level, encrypted)?
+    };
     let chunk_len = erasure_coding::SPAN_SIZE.checked_add(payload_len)?;
     if plain.len() < chunk_len {
         return None;
     }
-    Some(DecodedJoinChunk::with_copied_payload(
+    Some(DecodedJoinChunk {
         level,
         span,
-        &plain[erasure_coding::SPAN_SIZE..chunk_len],
-    ))
+        payload: Rc::from(&plain[erasure_coding::SPAN_SIZE..chunk_len]),
+    })
 }
 
-fn canonical_shared_plain_chunk(raw: Rc<[u8]>) -> Option<DecodedJoinChunk> {
-    let (level, span, payload_len) = plain_chunk_layout(raw.as_ref(), false)?;
-    let chunk_len = erasure_coding::SPAN_SIZE.checked_add(payload_len)?;
-    DecodedJoinChunk::with_shared_payload(level, span, raw, erasure_coding::SPAN_SIZE, chunk_len)
-}
-
-pub(crate) fn decode_raw_join_chunk(raw: Rc<[u8]>, reference: &[u8]) -> Option<DecodedJoinChunk> {
+pub(crate) fn decode_raw_join_chunk(raw: &[u8], reference: &[u8]) -> Option<DecodedJoinChunk> {
     if reference.len() != HASH_SIZE && reference.len() != erasure_coding::ENCRYPTED_REFERENCE_SIZE {
         return None;
     }
@@ -745,11 +689,10 @@ pub(crate) fn decode_raw_join_chunk(raw: Rc<[u8]>, reference: &[u8]) -> Option<D
 
     let encrypted = reference.len() == erasure_coding::ENCRYPTED_REFERENCE_SIZE;
     if encrypted {
-        let key = reference[HASH_SIZE..].try_into().ok()?;
-        let plain = decrypt_join_chunk(raw.as_ref(), &key)?;
+        let plain = decrypt_join_chunk(raw, &reference[HASH_SIZE..])?;
         canonical_plain_chunk(&plain, true)
     } else {
-        canonical_shared_plain_chunk(raw)
+        canonical_plain_chunk(raw, false)
     }
 }
 
@@ -878,7 +821,7 @@ async fn retrieve_raw_root_cancellable(
             return None;
         };
         completed += 1;
-        let accepted = !result.chunk.is_empty() && result.canonical_cac;
+        let accepted = !result.chunk.is_empty() && (result.index == 0 || result.canonical_cac);
         if accepted {
             admission.close();
         }
@@ -930,7 +873,7 @@ pub(crate) async fn retrieve_decoded_data_root_cancellable(
             return Some(root);
         }
     }
-    let root = decode_raw_join_chunk(raw, data_address)?;
+    let root = decode_raw_join_chunk(raw.as_ref(), data_address)?;
     if canonical_cac {
         remember_decoded_chunk(data_address.clone(), &root);
     }
@@ -1234,7 +1177,8 @@ async fn fetch_data_group_indices_streaming(
         if !join_cancel_token_current(&cancel_generations, &cancel).await {
             return None;
         }
-        if !result.chunk.is_empty() && result.canonical_cac {
+        let canonical_for_group = result.canonical_cac || parity_references.is_empty();
+        if !result.chunk.is_empty() && canonical_for_group {
             let result_index = result.index;
             let result_chunk = Rc::clone(&result.chunk);
             received_shards[result_index] = Some(result.chunk);
@@ -1246,10 +1190,17 @@ async fn fetch_data_group_indices_streaming(
                 && !requested_ready[result_index]
             {
                 let reference = &data_references[result_index];
-                let chunk = cached_decoded_chunk(reference).or_else(|| {
-                    remember_raw_chunk(reference.clone(), Rc::clone(&result_chunk));
-                    cached_decoded_chunk(reference)
-                })?;
+                let chunk = if result.canonical_cac {
+                    cached_decoded_chunk(reference).or_else(|| {
+                        remember_raw_chunk(reference.clone(), Rc::clone(&result_chunk));
+                        cached_decoded_chunk(reference)
+                    })?
+                } else {
+                    if !parity_references.is_empty() {
+                        return None;
+                    }
+                    decode_raw_join_chunk(result_chunk.as_ref(), reference)?
+                };
                 child_emitter.emit(result_index, chunk);
                 requested_ready[result_index] = true;
             }
@@ -1725,27 +1676,26 @@ pub async fn retrieve_chunk(
     cancel_generations: Option<RetrieveGenerationMap>,
     cancel: Option<RetrieveCancelToken>,
     admission: Option<RetrieveAdmission>,
-    max_attempt_errors: Option<usize>,
     transfer_paused: Option<Arc<AtomicBool>>,
-) -> RetrievedChunk {
-    let (caddr, key) = chunk_address_parts(chunk_address);
+) -> Vec<u8> {
+    let (caddr, encrey, encred) = chunk_address_parts(chunk_address);
 
+    let mut soc = false;
     let mut skiplist: HashSet<PeerId> = HashSet::new();
     let mut overdraftlist: HashSet<PeerId> = HashSet::new();
 
     let mut attempt_count = 0;
     let mut error_count = 0;
-    let max_attempt_errors = max_attempt_errors
-        .unwrap_or(RETRIEVE_CHUNK_MAX_ATTEMPT_ERRORS)
-        .clamp(1, RETRIEVE_CHUNK_MAX_ATTEMPT_ERRORS);
 
-    let mut accepted = None;
+    #[allow(unused_assignments)]
+    let mut cd = vec![];
 
     let (attempt_out, attempt_in) = mpsc::unbounded::<RetrieveAttemptResult>();
     let mut in_flight = 0_usize;
     let mut last_attempt_started = 0.0;
 
-    while error_count < max_attempt_errors && (attempt_count < max_attempt_errors || in_flight > 0)
+    while error_count < RETRIEVE_CHUNK_MAX_ATTEMPT_ERRORS
+        && (attempt_count < RETRIEVE_CHUNK_MAX_ATTEMPT_ERRORS || in_flight > 0)
     {
         if in_flight > 0 {
             if let Ok(result) = attempt_in.try_recv() {
@@ -1753,11 +1703,13 @@ pub async fn retrieve_chunk(
                     continue;
                 }
                 in_flight = in_flight.saturating_sub(1);
-                if let Some(verified) = result.verified {
-                    accepted = Some(verified);
+                if result.valid {
+                    cd = result.chunk;
+                    soc = result.soc;
                     break;
                 }
                 error_count += 1;
+                cd = vec![];
 
                 async_std::task::sleep(Duration::from_millis(RETRIEVE_HOT_LOOP_GUARD_MS)).await;
                 continue;
@@ -1781,7 +1733,7 @@ pub async fn retrieve_chunk(
         }
 
         let now = Date::now();
-        let can_start_attempt = attempt_count < max_attempt_errors;
+        let can_start_attempt = attempt_count < RETRIEVE_CHUNK_MAX_ATTEMPT_ERRORS;
         let due = can_start_attempt
             && !paused
             && !cancelled
@@ -1864,26 +1816,20 @@ pub async fn retrieve_chunk(
                     continue;
                 }
                 in_flight = in_flight.saturating_sub(1);
-                if let Some(verified) = result.verified {
-                    accepted = Some(verified);
+                if result.valid {
+                    cd = result.chunk;
+                    soc = result.soc;
                     break;
                 }
                 error_count += 1;
+                cd = vec![];
             }
             Ok(Err(_)) => break,
             Err(_) => {}
         };
     }
 
-    let Some(verified) = accepted else {
-        return RetrievedChunk::default();
-    };
-    let bytes = decode_retrieved_chunk(
-        verified.bytes,
-        verified.source == VerifiedChunkSource::Soc,
-        key,
-    );
-    RetrievedChunk::verified(bytes, verified.canonical_cac)
+    decode_retrieved_chunk(cd, soc, encrey, encred)
 }
 
 pub async fn retrieve_check_chunk(
@@ -1895,7 +1841,7 @@ pub async fn retrieve_check_chunk(
     refresh_chan: &mpsc::Sender<RefreshmentInstruction>,
     transfer_paused: Option<Arc<AtomicBool>>,
 ) -> Vec<u8> {
-    let (caddr, key) = chunk_address_parts(chunk_address);
+    let (caddr, encrey, encred) = chunk_address_parts(chunk_address);
 
     let mut skiplist: HashSet<PeerId> = HashSet::new();
     let mut overdraftlist: HashSet<PeerId> = HashSet::new();
@@ -1905,7 +1851,9 @@ pub async fn retrieve_check_chunk(
     let mut error_count = 0;
     let max_error = 21 - RETRIEVE_CHECK_CONFIRMATION_PEERS;
 
-    let mut accepted = None;
+    #[allow(unused_assignments)]
+    let mut cd = vec![];
+    let mut soc = false;
     let (attempt_out, attempt_in) = mpsc::unbounded::<RetrieveAttemptResult>();
 
     while error_count < max_error && success_peers.len() < RETRIEVE_CHECK_CONFIRMATION_PEERS {
@@ -1914,9 +1862,10 @@ pub async fn retrieve_check_chunk(
             if !reported_peers.insert(result.peer.clone()) {
                 continue;
             }
-            if let Some(verified) = result.verified {
-                if success_peers.insert(result.peer) && accepted.is_none() {
-                    accepted = Some(verified);
+            if result.valid {
+                if success_peers.insert(result.peer) && cd.is_empty() {
+                    cd = result.chunk;
+                    soc = result.soc;
                 }
             } else {
                 error_count += 1;
@@ -1976,62 +1925,89 @@ pub async fn retrieve_check_chunk(
         return vec![];
     }
 
-    let Some(verified) = accepted else {
-        return vec![];
-    };
-    decode_retrieved_chunk(
-        verified.bytes,
-        verified.source == VerifiedChunkSource::Soc,
-        key,
-    )
+    decode_retrieved_chunk(cd, soc, encrey, encred)
 }
 
-fn verify_chunk(caddr: &[u8], bytes: Vec<u8>) -> Option<VerifiedChunk> {
-    let request_address: [u8; HASH_SIZE] = caddr.try_into().ok()?;
-    if let Some(canonical_cac) = content_address_array(&bytes) {
-        if canonical_cac == request_address {
-            return Some(VerifiedChunk {
-                bytes,
-                canonical_cac,
-                source: VerifiedChunkSource::Cac,
-            });
+pub fn verify_chunk(caddr: &Vec<u8>, cd: &Vec<u8>) -> (bool, bool) {
+    let contaddrd = valid_cac(&cd, &caddr);
+    if !contaddrd {
+        let soc = valid_soc(&cd, &caddr);
+        if !soc {
+            return (false, false);
+        } else {
+            return (true, true);
+        }
+    } else {
+        return (true, false);
+    }
+}
+
+pub fn decrypt(cd: &Vec<u8>, encrey: Vec<u8>) -> Vec<u8> {
+    if cd.len() < 8 {
+        return vec![];
+    }
+
+    let spancred = (&cd[0..8]).to_vec();
+    let concred = (&cd[8..]).to_vec();
+    let creylen = encrey.len();
+
+    let mut spanbytes: Vec<u8> = vec![];
+    let spansegmentkey0 = ((4096 / creylen) as u32).to_le_bytes();
+    let spansegmentkey1 =
+        keccak256(keccak256([encrey.clone(), spansegmentkey0.to_vec()].concat()).to_vec()).to_vec();
+
+    for j in 0..8 {
+        spanbytes.push(spancred[j] ^ spansegmentkey1[j])
+    }
+
+    let mut content: Vec<u8> = vec![];
+    let mut done = false;
+    let mut i = 0;
+    while !done {
+        let mut k = creylen;
+        if k > concred.len() - (i * creylen) {
+            k = concred.len() - (i * creylen);
+        };
+
+        let contentsegmentkey0 = (i as u32).to_le_bytes();
+        let contentsegmentkey1 = keccak256(keccak256(
+            [encrey.clone(), contentsegmentkey0.to_vec()].concat(),
+        ))
+        .to_vec();
+
+        for j in (i * creylen)..(i * creylen + k) {
+            content.push(concred[j] ^ contentsegmentkey1[j - i * creylen])
+        }
+
+        i += 1;
+
+        if !(i * creylen < concred.len()) {
+            done = true;
         }
     }
 
-    let canonical_cac = valid_soc_wrapped_cac(&bytes, &request_address)?;
-    Some(VerifiedChunk {
-        bytes,
-        canonical_cac,
-        source: VerifiedChunkSource::Soc,
-    })
-}
+    let mut span_decrypted = u64::from_le_bytes(spanbytes.clone().try_into().unwrap());
 
-fn valid_soc_wrapped_cac(
-    chunk: &[u8],
-    request_address: &[u8; HASH_SIZE],
-) -> Option<[u8; HASH_SIZE]> {
-    const SOC_HEADER_SIZE: usize = HASH_SIZE + 65;
+    if span_decrypted > 4096 {
+        let mut done0 = false;
+        let mut carry_span = 4096_u64;
+        while !done0 {
+            let k = span_decrypted / carry_span;
+            let mut l0 = span_decrypted % carry_span;
+            if l0 > 0 {
+                l0 = 1;
+            }
 
-    if chunk.len() < SOC_HEADER_SIZE + erasure_coding::SPAN_SIZE {
-        return None;
-    }
-    let id: &[u8; HASH_SIZE] = chunk[..HASH_SIZE].try_into().ok()?;
-    let signature = &chunk[HASH_SIZE..SOC_HEADER_SIZE];
-    let canonical_cac = content_address_array(&chunk[SOC_HEADER_SIZE..])?;
+            if k + l0 <= 64 {
+                done0 = true;
+                span_decrypted = (k + l0) * 64;
+            } else {
+                carry_span *= 64;
+            }
+        }
+    };
 
-    let mut signed_payload = [0u8; HASH_SIZE * 2];
-    signed_payload[..HASH_SIZE].copy_from_slice(id);
-    signed_payload[HASH_SIZE..].copy_from_slice(&canonical_cac);
-    let signed_digest = keccak256(signed_payload);
-    let parity = normalize_v(signature[64] as u64)?;
-    let signature = Signature::from_bytes_and_parity(&signature[..64], parity);
-    let owner = signature.recover_address_from_msg(signed_digest).ok()?;
-
-    let mut address_payload = [0u8; HASH_SIZE + 20];
-    address_payload[..HASH_SIZE].copy_from_slice(id);
-    address_payload[HASH_SIZE..].copy_from_slice(owner.as_slice());
-    let soc_address: [u8; HASH_SIZE] = keccak256(address_payload).into();
-    (soc_address == *request_address).then_some(canonical_cac)
+    return [spanbytes, content[..span_decrypted as usize].to_vec()].concat();
 }
 
 async fn get_feed_probe_chunk(
@@ -2040,14 +2016,13 @@ async fn get_feed_probe_chunk(
 ) -> FeedProbe<Vec<u8>> {
     let admission = RetrieveAdmission::new();
     let _close_admission = admission.close_on_drop();
-    let (chan_out, chan_in) = mpsc::unbounded::<RetrievedChunk>();
+    let (chan_out, chan_in) = mpsc::unbounded::<Vec<u8>>();
     if chunk_retrieve_chan
         .try_send(crate::ChunkRetrieveRequest {
             address: data_address,
             chan: chan_out,
             cancel: None,
             admission: Some(admission),
-            max_attempt_errors: Some(FEED_PROBE_MAX_ATTEMPT_ERRORS),
         })
         .is_err()
     {
@@ -2056,14 +2031,8 @@ async fn get_feed_probe_chunk(
 
     // Dropping the listener stops admission, not dispatched accounting settlement.
     match chan_in.recv().await {
-        Ok(retrieved) => {
-            let payload = retrieved.into_bytes();
-            if valid_feed_update_payload(&payload) {
-                FeedProbe::Found(payload)
-            } else {
-                FeedProbe::Missing
-            }
-        }
+        Ok(payload) if valid_feed_update_payload(&payload) => FeedProbe::Found(payload),
+        Ok(_) => FeedProbe::Missing,
         Err(_) => FeedProbe::Transient,
     }
 }
@@ -2106,15 +2075,14 @@ pub(crate) async fn retrieve_feed_update_at_index_status(
 }
 
 /// Bound only the SOC probe; dispatched transport still settles accounting.
-async fn retrieve_feed_update_at_index_with_timeout(
+pub(crate) async fn retrieve_feed_update_at_index_bounded(
     owner: String,
     topic: String,
     index: u64,
     chunk_retrieve_chan: &ChunkRetrieveSender,
-    timeout: Duration,
 ) -> Option<Vec<u8>> {
     match async_std::future::timeout(
-        timeout,
+        FEED_FRONTIER_LOOKAHEAD_TIMEOUT,
         probe_feed_update_status(&owner, &topic, index, chunk_retrieve_chan),
     )
     .await
@@ -2122,38 +2090,6 @@ async fn retrieve_feed_update_at_index_with_timeout(
         Ok(result) => result.into_option(),
         Err(_) => None,
     }
-}
-
-pub(crate) async fn retrieve_feed_update_at_index_bounded(
-    owner: String,
-    topic: String,
-    index: u64,
-    chunk_retrieve_chan: &ChunkRetrieveSender,
-) -> Option<Vec<u8>> {
-    retrieve_feed_update_at_index_with_timeout(
-        owner,
-        topic,
-        index,
-        chunk_retrieve_chan,
-        FEED_FRONTIER_LOOKAHEAD_TIMEOUT,
-    )
-    .await
-}
-
-pub(crate) async fn retrieve_live_history_feed_update_at_index(
-    owner: String,
-    topic: String,
-    index: u64,
-    chunk_retrieve_chan: &ChunkRetrieveSender,
-) -> Option<Vec<u8>> {
-    retrieve_feed_update_at_index_with_timeout(
-        owner,
-        topic,
-        index,
-        chunk_retrieve_chan,
-        LIVE_HISTORY_FEED_PROBE_TIMEOUT,
-    )
-    .await
 }
 
 async fn seek_feed_frontier(

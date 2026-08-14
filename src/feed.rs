@@ -9,9 +9,13 @@ const BOUNDED_INITIAL_LEVELS: [usize; FEED_FRONTIER_LOOKAHEAD_LEVELS] = [8, 7, 6
 pub(crate) const WIDE_FEED_FRONTIER_LOOKAHEAD: usize = 16;
 const WIDE_FEED_FRONTIER_RECOVERY_DISTANCE: u64 =
     WIDE_FEED_FRONTIER_LOOKAHEAD as u64 * (WIDE_FEED_FRONTIER_LOOKAHEAD as u64 + 1);
+pub(crate) const WIDE_FEED_FRONTIER_COARSE_STRIDE: u64 = 120;
+pub(crate) const WIDE_FEED_FRONTIER_COARSE_PROBES: usize = 240;
+pub(crate) const WIDE_FEED_FRONTIER_DENSE_PROBES: usize = 180;
 pub(crate) const WIDE_FEED_FRONTIER_EDGE_GUARD: usize = 16;
+pub(crate) const WIDE_FEED_FRONTIER_BLOCK: u64 =
+    WIDE_FEED_FRONTIER_COARSE_STRIDE * WIDE_FEED_FRONTIER_COARSE_PROBES as u64;
 const WIDE_FEED_FRONTIER_WAVE_TIMEOUT: Duration = Duration::from_millis(1_950);
-const WIDE_FEED_FRONTIER_CRITICAL_RETRIES: usize = 2;
 const WIDE_INITIAL_INDICES: [u64; WIDE_FEED_FRONTIER_LOOKAHEAD] = [
     0,
     1,
@@ -35,23 +39,6 @@ pub(crate) enum FeedProbe<T> {
     Found(T),
     Missing,
     Transient,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum FeedFrontierConfidence {
-    Unresolved,
-    Guarded,
-    Exact,
-}
-
-impl FeedFrontierConfidence {
-    pub(crate) fn is_authoritative(self) -> bool {
-        self != Self::Unresolved
-    }
-
-    pub(crate) fn is_exact(self) -> bool {
-        self == Self::Exact
-    }
 }
 
 impl<T> FeedProbe<T> {
@@ -159,25 +146,6 @@ where
     ProbeFuture: Future<Output = ProbeResult>,
     ProbeResult: Into<FeedProbe<T>>,
 {
-    seek_sequence_feed_frontier_wide_bounded_observing_positive(probe, |_, _| {}).await
-}
-
-pub(crate) async fn seek_sequence_feed_frontier_wide_bounded_observing_positive<
-    T,
-    Probe,
-    ProbeFuture,
-    ProbeResult,
-    ObservePositive,
->(
-    probe: Probe,
-    mut observe_positive: ObservePositive,
-) -> (Option<(u64, T)>, u64)
-where
-    Probe: Fn(u64) -> ProbeFuture,
-    ProbeFuture: Future<Output = ProbeResult>,
-    ProbeResult: Into<FeedProbe<T>>,
-    ObservePositive: FnMut(u64, &T),
-{
     let mut probes = FuturesUnordered::new();
     for (slot, index) in WIDE_INITIAL_INDICES.into_iter().enumerate() {
         let lookup = probe(index);
@@ -192,10 +160,7 @@ where
         };
         completed[slot] = true;
         match result.into() {
-            FeedProbe::Found(payload) => {
-                observe_positive(WIDE_INITIAL_INDICES[slot], &payload);
-                found[slot] = Some(payload);
-            }
+            FeedProbe::Found(payload) => found[slot] = Some(payload),
             FeedProbe::Missing => missing[slot] = true,
             FeedProbe::Transient => {}
         }
@@ -214,10 +179,7 @@ where
             };
             completed[slot] = true;
             match result.into() {
-                FeedProbe::Found(payload) => {
-                    observe_positive(WIDE_INITIAL_INDICES[slot], &payload);
-                    found[slot] = Some(payload);
-                }
+                FeedProbe::Found(payload) => found[slot] = Some(payload),
                 FeedProbe::Missing => missing[slot] = true,
                 FeedProbe::Transient => {}
             }
@@ -255,23 +217,14 @@ where
         match async_std::future::timeout(FEED_FRONTIER_LOOKAHEAD_TIMEOUT, probe(confirmation)).await
         {
             Ok(result) => match result.into() {
-                FeedProbe::Found(payload) => {
-                    observe_positive(confirmation, &payload);
-                    latest = (confirmation, payload);
-                }
+                FeedProbe::Found(payload) => latest = (confirmation, payload),
                 FeedProbe::Missing => {
                     upper = missing;
                     break;
                 }
-                FeedProbe::Transient => {
-                    upper = missing;
-                    break;
-                }
+                FeedProbe::Transient => {}
             },
-            Err(_) => {
-                upper = missing;
-                break;
-            }
+            Err(_) => {}
         }
     }
 
@@ -285,7 +238,6 @@ where
                 .await
             {
                 FeedProbe::Found(payload) => {
-                    observe_positive(next, &payload);
                     latest = (next, payload);
                     upper = u64::MAX;
                     continue;
@@ -326,10 +278,7 @@ where
             completed[slot] = true;
             if let Ok(result) = result {
                 match result.into() {
-                    FeedProbe::Found(payload) => {
-                        observe_positive(indices[slot], &payload);
-                        found[slot] = Some(payload);
-                    }
+                    FeedProbe::Found(payload) => found[slot] = Some(payload),
                     FeedProbe::Missing => missing[slot] = true,
                     FeedProbe::Transient => {}
                 }
@@ -380,10 +329,7 @@ where
         match async_std::future::timeout(FEED_FRONTIER_LOOKAHEAD_TIMEOUT, probe(confirmation)).await
         {
             Ok(result) => match result.into() {
-                FeedProbe::Found(payload) => {
-                    observe_positive(confirmation, &payload);
-                    latest = (confirmation, payload);
-                }
+                FeedProbe::Found(payload) => latest = (confirmation, payload),
                 FeedProbe::Missing => upper = missing,
                 FeedProbe::Transient if latest.0 == previous_latest => {
                     let next = latest.0.saturating_add(1);
@@ -440,7 +386,7 @@ pub(crate) async fn overscan_sequence_feed_candidate<
     probe: Probe,
     admit_wave: AdmitWave,
     mut observe_positive: ObservePositive,
-) -> ((u64, T), FeedFrontierConfidence)
+) -> ((u64, T), bool)
 where
     Probe: Fn(u64) -> ProbeFuture,
     ProbeFuture: Future<Output = ProbeResult>,
@@ -471,123 +417,72 @@ where
         (highest, missing, transient)
     };
     let mut unresolved_above = Vec::new();
-    let mut guarded_only = false;
-    let dense_wave_width = if force_coarse {
-        WIDE_FEED_FRONTIER_EDGE_GUARD * 2
-    } else {
-        WIDE_FEED_FRONTIER_EDGE_GUARD
-    };
+    let mut coarse_admission_rejected = false;
+
     if force_coarse {
-        let mut upper_hint: Option<u64> = None;
+        let mut block_start = latest.0 / WIDE_FEED_FRONTIER_BLOCK * WIDE_FEED_FRONTIER_BLOCK;
         loop {
-            let previous = latest.0;
-            let indices = if let Some(upper) = upper_hint.filter(|upper| *upper > latest.0) {
-                let span = upper.saturating_sub(latest.0);
-                let divisor = dense_wave_width as u128;
-                (1..=dense_wave_width)
-                    .filter_map(|position| {
-                        let offset = (u128::from(span)
-                            .saturating_mul(position as u128)
-                            .saturating_add(divisor.saturating_sub(1))
-                            / divisor) as u64;
-                        latest.0.checked_add(offset)
-                    })
-                    .collect::<Vec<_>>()
-            } else {
-                (0..WIDE_FEED_FRONTIER_LOOKAHEAD)
-                    .filter_map(|level| 1_u64.checked_shl(level as u32))
-                    .filter_map(|offset| latest.0.checked_add(offset))
-                    .collect::<Vec<_>>()
+            let Some(block_ceiling) = block_start.checked_add(WIDE_FEED_FRONTIER_BLOCK) else {
+                break;
             };
+            let indices = (1..=WIDE_FEED_FRONTIER_COARSE_PROBES as u64)
+                .filter_map(|slot| {
+                    block_start.checked_add(slot.saturating_mul(WIDE_FEED_FRONTIER_COARSE_STRIDE))
+                })
+                .filter(|index| *index > latest.0)
+                .collect::<Vec<_>>();
             if indices.is_empty() {
                 break;
             }
             if !admit_wave(indices.len()).await {
-                return (latest, FeedFrontierConfidence::Unresolved);
+                coarse_admission_rejected = true;
+                break;
             }
-            let (highest, mut missing, transient) =
+            let (highest, missing, transient) =
                 select_wave(probe_sequence_feed_wave(&probe, &indices).await);
+            unresolved_above.retain(|index| !missing.contains(index));
+            for index in transient {
+                if !unresolved_above.contains(&index) {
+                    unresolved_above.push(index);
+                }
+            }
             if let Some(highest) = highest
                 && highest.0 > latest.0
             {
                 latest = highest;
                 observe_positive(latest.0, &latest.1);
             }
-            let transient = transient
-                .into_iter()
-                .filter(|index| *index > latest.0)
-                .collect::<Vec<_>>();
-            let nearest_missing = missing
-                .iter()
-                .copied()
-                .filter(|index| *index > latest.0)
-                .min();
-            if nearest_missing
-                .is_some_and(|index| index.saturating_sub(latest.0) <= dense_wave_width as u64)
-            {
-                guarded_only |= transient
-                    .iter()
-                    .any(|index| index.saturating_sub(latest.0) > dense_wave_width as u64);
+            unresolved_above.retain(|index| *index > latest.0);
+            if latest.0 < block_ceiling.saturating_sub(WIDE_FEED_FRONTIER_COARSE_STRIDE * 2) {
                 break;
             }
-            if latest.0 == previous && !transient.is_empty() {
-                let retry = transient
-                    .into_iter()
-                    .filter(|index| {
-                        index.saturating_sub(latest.0) > dense_wave_width as u64
-                            && nearest_missing.is_none_or(|missing| *index < missing)
-                    })
-                    .collect::<Vec<_>>();
-                if !retry.is_empty() && !admit_wave(retry.len()).await {
-                    return (latest, FeedFrontierConfidence::Unresolved);
-                }
-                let (retry_highest, retry_missing, retry_transient) =
-                    select_wave(probe_sequence_feed_wave(&probe, &retry).await);
-                missing.extend(retry_missing);
-                guarded_only |= !retry_transient.is_empty();
-                if let Some(highest) = retry_highest
-                    && highest.0 > latest.0
-                {
-                    latest = highest;
-                    observe_positive(latest.0, &latest.1);
-                }
-            }
-            let nearest_missing = missing.into_iter().filter(|index| *index > latest.0).min();
-            upper_hint = nearest_missing;
-            if latest.0 == previous
-                || nearest_missing
-                    .is_some_and(|index| index.saturating_sub(latest.0) <= dense_wave_width as u64)
-            {
-                break;
-            }
+            block_start = block_ceiling;
         }
     }
 
-    'dense: loop {
-        let indices = (1..=dense_wave_width as u64)
+    let wave_width = if force_coarse {
+        WIDE_FEED_FRONTIER_DENSE_PROBES
+    } else {
+        WIDE_FEED_FRONTIER_EDGE_GUARD
+    };
+    loop {
+        let indices = (1..=wave_width as u64)
             .filter_map(|offset| latest.0.checked_add(offset))
             .collect::<Vec<_>>();
         if indices.is_empty() {
-            let confidence = if !unresolved_above.is_empty() {
-                FeedFrontierConfidence::Unresolved
-            } else if guarded_only {
-                FeedFrontierConfidence::Guarded
-            } else {
-                FeedFrontierConfidence::Exact
-            };
-            return (latest, confidence);
+            return (
+                latest,
+                unresolved_above.is_empty() && !coarse_admission_rejected,
+            );
         }
         if !admit_wave(indices.len()).await {
-            return (latest, FeedFrontierConfidence::Unresolved);
+            return (latest, false);
         }
         let wave_end = *indices.last().expect("a non-empty feed wave has an end");
-        let (highest, mut missing, transient) =
+        let (highest, missing, transient) =
             select_wave(probe_sequence_feed_wave(&probe, &indices).await);
         unresolved_above.retain(|index| !missing.contains(index));
         for index in transient {
-            if index.saturating_sub(latest.0) > WIDE_FEED_FRONTIER_EDGE_GUARD as u64 {
-                guarded_only = true;
-            }
             if !unresolved_above.contains(&index) {
                 unresolved_above.push(index);
             }
@@ -598,35 +493,7 @@ where
             latest = highest;
             observe_positive(latest.0, &latest.1);
         }
-        unresolved_above.retain(|index| {
-            *index > latest.0
-                && index.saturating_sub(latest.0) <= WIDE_FEED_FRONTIER_EDGE_GUARD as u64
-        });
-        let mut critical_retries = 0usize;
-        while !unresolved_above.is_empty() && critical_retries < WIDE_FEED_FRONTIER_CRITICAL_RETRIES
-        {
-            critical_retries += 1;
-            let unresolved = std::mem::take(&mut unresolved_above);
-            if !admit_wave(unresolved.len()).await {
-                return (latest, FeedFrontierConfidence::Unresolved);
-            }
-            let (highest, retry_missing, transient) =
-                select_wave(probe_sequence_feed_wave(&probe, &unresolved).await);
-            missing.extend(retry_missing);
-            unresolved_above = transient;
-            if let Some(highest) = highest
-                && highest.0 > latest.0
-            {
-                latest = highest;
-                observe_positive(latest.0, &latest.1);
-                unresolved_above.retain(|index| *index > latest.0);
-                continue 'dense;
-            }
-            unresolved_above.retain(|index| {
-                *index > latest.0
-                    && index.saturating_sub(latest.0) <= WIDE_FEED_FRONTIER_EDGE_GUARD as u64
-            });
-        }
+        unresolved_above.retain(|index| *index > latest.0);
         if wave_end != u64::MAX
             && wave_end.saturating_sub(latest.0) < WIDE_FEED_FRONTIER_EDGE_GUARD as u64
         {
@@ -635,53 +502,28 @@ where
         let verified = (1..=WIDE_FEED_FRONTIER_EDGE_GUARD as u64)
             .filter_map(|offset| latest.0.checked_add(offset))
             .all(|index| missing.contains(&index));
-        if !verified || !unresolved_above.is_empty() {
-            return (latest, FeedFrontierConfidence::Unresolved);
+        if !verified || !unresolved_above.is_empty() || coarse_admission_rejected {
+            return (latest, false);
         }
-        let mut retry_transient = true;
-        loop {
-            let Some(next) = latest.0.checked_add(1) else {
-                let confidence = if guarded_only {
-                    FeedFrontierConfidence::Guarded
-                } else {
-                    FeedFrontierConfidence::Exact
-                };
-                return (latest, confidence);
-            };
-            if !admit_wave(1).await {
-                return (latest, FeedFrontierConfidence::Guarded);
-            }
-            match probe_sequence_feed_wave(&probe, &[next])
-                .await
-                .pop()
-                .map(|(_, result)| result)
-            {
-                Some(FeedProbe::Found(payload)) => {
-                    latest = (next, payload);
-                    observe_positive(latest.0, &latest.1);
-                    let shifted_guard = (1..=WIDE_FEED_FRONTIER_EDGE_GUARD as u64)
-                        .filter_map(|offset| latest.0.checked_add(offset))
-                        .all(|index| missing.contains(&index));
-                    if shifted_guard {
-                        retry_transient = true;
-                        continue;
-                    }
-                    continue 'dense;
-                }
-                Some(FeedProbe::Missing) => {
-                    let confidence = if guarded_only {
-                        FeedFrontierConfidence::Guarded
-                    } else {
-                        FeedFrontierConfidence::Exact
-                    };
-                    return (latest, confidence);
-                }
-                Some(FeedProbe::Transient) if retry_transient => retry_transient = false,
-                Some(FeedProbe::Transient) | None => {
-                    return (latest, FeedFrontierConfidence::Guarded);
-                }
-            }
+        let Some(next) = latest.0.checked_add(1) else {
+            return (latest, true);
+        };
+        if !admit_wave(1).await {
+            return (latest, false);
         }
+        return match probe_sequence_feed_wave(&probe, &[next])
+            .await
+            .pop()
+            .map(|(_, result)| result)
+        {
+            Some(FeedProbe::Found(payload)) => {
+                latest = (next, payload);
+                observe_positive(latest.0, &latest.1);
+                (latest, false)
+            }
+            Some(FeedProbe::Missing) => (latest, true),
+            Some(FeedProbe::Transient) | None => (latest, false),
+        };
     }
 }
 
