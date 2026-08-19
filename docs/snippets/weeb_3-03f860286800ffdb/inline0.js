@@ -1,0 +1,1 @@
+export function weeb3BuildMarker(marker) { if (marker !== "weeb3-build:2e439621192f34bd") throw new Error('weeb-3 browser build marker mismatch'); }

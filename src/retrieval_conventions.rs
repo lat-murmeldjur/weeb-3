@@ -56,13 +56,17 @@ use std::{
     future::pending,
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
 };
 
 #[derive(Debug)]
 struct RetrieveAdmissionInner {
     open: AtomicBool,
+    attempt_limit: Option<usize>,
+    attempts_remaining: Option<AtomicUsize>,
+    timed_out_attempts: Option<AtomicUsize>,
+    confirmed_empty_attempts: Option<AtomicUsize>,
     closed: Event,
 }
 
@@ -74,9 +78,21 @@ pub(crate) struct RetrieveAdmission {
 
 impl RetrieveAdmission {
     pub(crate) fn new() -> Self {
+        Self::with_attempts_remaining(None)
+    }
+
+    pub(crate) fn new_with_attempt_limit(max_attempts: usize) -> Self {
+        Self::with_attempts_remaining(Some(max_attempts))
+    }
+
+    fn with_attempts_remaining(attempts_remaining: Option<usize>) -> Self {
         Self {
             inner: Arc::new(RetrieveAdmissionInner {
-                open: AtomicBool::new(true),
+                open: AtomicBool::new(attempts_remaining != Some(0)),
+                attempt_limit: attempts_remaining,
+                attempts_remaining: attempts_remaining.map(AtomicUsize::new),
+                timed_out_attempts: attempts_remaining.map(|_| AtomicUsize::new(0)),
+                confirmed_empty_attempts: attempts_remaining.map(|_| AtomicUsize::new(0)),
                 closed: Event::new(),
             }),
         }
@@ -89,6 +105,79 @@ impl RetrieveAdmission {
     pub(crate) fn close(&self) {
         if self.inner.open.swap(false, Ordering::SeqCst) {
             self.inner.closed.notify(usize::MAX);
+        }
+    }
+
+    pub(crate) fn physical_attempt_available(&self) -> bool {
+        self.inner
+            .attempts_remaining
+            .as_ref()
+            .is_none_or(|remaining| remaining.load(Ordering::SeqCst) != 0)
+    }
+
+    pub(crate) fn claimed_physical_attempts(&self) -> Option<usize> {
+        self.inner
+            .attempt_limit
+            .zip(self.inner.attempts_remaining.as_ref())
+            .map(|(limit, remaining)| limit.saturating_sub(remaining.load(Ordering::SeqCst)))
+    }
+
+    pub(crate) fn record_physical_attempt_timeout(&self) {
+        if let Some(timed_out) = self.inner.timed_out_attempts.as_ref() {
+            timed_out.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    pub(crate) fn timed_out_physical_attempts(&self) -> Option<usize> {
+        self.inner
+            .timed_out_attempts
+            .as_ref()
+            .map(|timed_out| timed_out.load(Ordering::SeqCst))
+    }
+
+    pub(crate) fn record_confirmed_empty_physical_attempt(&self) {
+        if let Some(confirmed_empty) = self.inner.confirmed_empty_attempts.as_ref() {
+            confirmed_empty.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    pub(crate) fn confirmed_empty_physical_attempts(&self) -> Option<usize> {
+        self.inner
+            .confirmed_empty_attempts
+            .as_ref()
+            .map(|confirmed_empty| confirmed_empty.load(Ordering::SeqCst))
+    }
+
+    /// Atomically claim one physical exchange before it is dispatched. An exhausted finite
+    /// budget closes only future admission; exchanges that already claimed a slot still settle.
+    pub(crate) fn try_claim_physical_attempt(&self) -> bool {
+        let Some(attempts_remaining) = self.inner.attempts_remaining.as_ref() else {
+            return true;
+        };
+        if !self.is_open() {
+            return false;
+        }
+
+        let mut remaining = attempts_remaining.load(Ordering::SeqCst);
+        loop {
+            if remaining == 0 {
+                return false;
+            }
+
+            match attempts_remaining.compare_exchange_weak(
+                remaining,
+                remaining - 1,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => {
+                    if remaining == 1 {
+                        self.close();
+                    }
+                    return true;
+                }
+                Err(current) => remaining = current,
+            }
         }
     }
 
@@ -115,6 +204,19 @@ impl Drop for RetrieveAdmissionGuard {
     fn drop(&mut self) {
         self.admission.close();
     }
+}
+
+/// An empty retained feed response is negative evidence only when every allowed physical
+/// exchange was claimed and actually returned an empty Bee delivery. Capacity, peer-selection,
+/// channel/transport failures, invalid nonempty chunks, and logical timeouts remain transient.
+pub(crate) fn retained_feed_probe_empty_is_missing(
+    admission: &RetrieveAdmission,
+    maximum_attempts: usize,
+) -> bool {
+    maximum_attempts > 0
+        && admission.claimed_physical_attempts() == Some(maximum_attempts)
+        && admission.confirmed_empty_physical_attempts() == Some(maximum_attempts)
+        && admission.timed_out_physical_attempts() == Some(0)
 }
 
 pub(crate) fn retrieve_admission_current(

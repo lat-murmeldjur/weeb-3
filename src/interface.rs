@@ -306,7 +306,10 @@ pub(crate) fn install_service_worker_message_bridge(weeb3: Arc<Weeb3>) {
         }
 
         let closure = Closure::<dyn FnMut(MessageEvent)>::new(handle_service_worker_bridge_event);
-        let service_worker = web_sys::window().unwrap().navigator().service_worker();
+        let Some(service_worker) = service_worker_container() else {
+            service_worker_missing();
+            return;
+        };
         if service_worker
             .add_event_listener_with_callback("message", closure.as_ref().unchecked_ref())
             .is_err()

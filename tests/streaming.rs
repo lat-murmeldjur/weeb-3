@@ -24,16 +24,21 @@ mod hls {
 
     use std::{collections::HashMap, sync::Arc};
     use stream_hls::{
-        HLS_LIVE_SYNC_SEGMENTS, HlsLevelTransition, HlsManifestProbe, HlsMediaPlanRegistry,
-        MAX_STREAM_FEED_PAYLOAD_BYTES, append_hls_sequence_zero_archive_suffix,
+        HLS_LIVE_SYNC_SEGMENTS, HLS_SPARSE_HISTORY_MAX_PARALLEL, HlsDirectArchiveDisposition,
+        HlsLevelTransition, HlsManifestProbe, HlsMediaPlanRegistry, MAX_STREAM_FEED_PAYLOAD_BYTES,
+        append_hls_sequence_zero_archive_suffix, assemble_hls_sparse_history,
         classify_hls_level_transition, continue_hls_codec_bootstrap,
-        extend_hls_sequence_zero_archive, hls_is_finalized, hls_live_frontier_is_ready,
-        hls_live_tail, hls_manifest_reload_is_continuous, hls_manifest_reload_is_forward,
-        hls_media_references, hls_media_sequence, hls_payload_mime,
-        hls_startup_prefix_is_preferred, hls_target_duration, hls_timeline_rebase_position,
-        hls_timeline_rebase_required, is_hls_manifest, prepend_hls_codec_bootstrap,
-        probe_hls_manifest, raise_hls_target_duration, rewrite_hls_manifest,
-        rewrite_hls_manifest_for_live_reload, stream_feed_payload_len_is_supported,
+        extend_hls_sequence_zero_archive, hls_direct_archive_disposition, hls_is_finalized,
+        hls_is_long_sequence_zero_checkpoint, hls_live_frontier_is_ready, hls_live_tail,
+        hls_manifest_reload_is_continuous, hls_manifest_reload_is_forward, hls_media_references,
+        hls_media_sequence, hls_payload_mime, hls_sequence_zero_covers_head,
+        hls_sequence_zero_sparse_tail, hls_startup_prefix_is_preferred, hls_target_duration,
+        hls_timeline_rebase_position, hls_timeline_rebase_required, is_hls_manifest,
+        plan_hls_sparse_forward_wave, plan_hls_sparse_history_from_lattice,
+        plan_hls_sparse_history_repairs_for_attempts, plan_hls_sparse_terminal_repairs,
+        prepend_hls_codec_bootstrap, probe_hls_manifest, raise_hls_target_duration,
+        rewrite_hls_manifest, rewrite_hls_manifest_for_live_reload,
+        stream_feed_payload_len_is_supported,
     };
 
     const REF: &str = "919b5395bf7a59cbb3b365769de09a2b15ac5d897823dda9270259a3c038d574";
@@ -42,6 +47,21 @@ mod hls {
     const REF4: &str = "68d3d40b39d5f17532e928a4b62f2a58ea1b63e20da0eb4b8a7da78d45d45812";
     const OWNER: &str = "352eabdea9cb05e984a8828d2a6df3d3b5023260";
     const TOPIC: &str = "cfbbc155d709547b198638d0fb11d733359561538d8bd606a9ab257354d13bcc";
+
+    fn sparse_manifest(sequence: u64, count: u64, finalized: bool) -> Vec<u8> {
+        let mut manifest =
+            format!("#EXTM3U\n#EXT-X-TARGETDURATION:2\n#EXT-X-MEDIA-SEQUENCE:{sequence}\n");
+        for position in sequence..sequence.saturating_add(count) {
+            manifest.push_str(&format!(
+                "#EXTINF:2.0,\n{:064x}\n",
+                position.saturating_add(1)
+            ));
+        }
+        if finalized {
+            manifest.push_str("#EXT-X-ENDLIST\n");
+        }
+        manifest.into_bytes()
+    }
 
     #[test]
     fn live_frontier_wait_requires_confirmation_for_the_published_index() {
@@ -1018,6 +1038,187 @@ mod hls {
                 .and_then(|merged| hls_target_duration(&merged)),
             Some(3),
             "steady-state sequence-zero reloads must retain a later maximum target duration"
+        );
+    }
+
+    #[test]
+    fn sparse_live_discovery_leaps_from_a_stale_lower_bound_and_bounds_terminal_repair() {
+        let wave = plan_hls_sparse_forward_wave(2_047, 1, HLS_SPARSE_HISTORY_MAX_PARALLEL)
+            .expect("bounded forward wave");
+        assert_eq!(wave.len(), 64);
+        assert_eq!(wave.first(), Some(&2_057));
+        assert_eq!(wave.last(), Some(&2_687));
+        assert!(wave.windows(2).all(|pair| pair[1] - pair[0] == 10));
+
+        let dense = plan_hls_sparse_terminal_repairs(3_797).expect("bounded terminal repair");
+        assert_eq!(dense.len(), 18);
+        assert_eq!(dense.first(), Some(&3_798));
+        assert_eq!(dense.last(), Some(&3_816));
+        assert!(!dense.contains(&3_807));
+        assert!(!dense.contains(&3_817));
+    }
+
+    #[test]
+    fn sparse_history_keeps_the_startup_lattice_when_dense_finds_an_off_residue_head() {
+        let head = sparse_manifest(3_788, 10, false);
+        let plan = plan_hls_sparse_history_from_lattice(3_798, &head, 7)
+            .expect("a ten-segment rolling head supports the startup lattice");
+        assert_eq!(plan.lattice_residue, 7);
+        assert_eq!(plan.requested_indices.first(), Some(&7));
+        assert_eq!(plan.requested_indices.last(), Some(&3_797));
+        assert!(plan.requested_indices.iter().all(|index| index % 10 == 7));
+    }
+
+    #[test]
+    fn sequence_zero_direct_archive_must_cover_every_authenticated_window() {
+        let pinned = sparse_manifest(2_038, 10, false);
+        let head = sparse_manifest(3_788, 10, false);
+        let complete = sparse_manifest(0, 3_798, true);
+        let shorter = sparse_manifest(0, 3_797, true);
+        assert!(hls_sequence_zero_covers_head(&head, &complete));
+        assert!(!hls_sequence_zero_covers_head(&head, &shorter));
+
+        let mut conflicting = String::from_utf8(complete).unwrap();
+        conflicting = conflicting.replacen(
+            &format!("{:064x}", 2_041_u64),
+            &format!("{:064x}", u64::MAX),
+            1,
+        );
+        assert!(hls_sequence_zero_covers_head(&head, conflicting.as_bytes()));
+        assert!(!hls_sequence_zero_covers_head(
+            &pinned,
+            conflicting.as_bytes()
+        ));
+    }
+
+    #[test]
+    fn large_nonterminal_and_stale_deferred_updates_are_nonblocking_edge_evidence() {
+        let current_edge = 2_048_u64;
+        let large_nonterminal = sparse_manifest(0, current_edge + 1, false);
+        assert!(large_nonterminal.len() > 64 * 1024);
+        assert_eq!(
+            hls_direct_archive_disposition(
+                current_edge,
+                current_edge - 1,
+                current_edge,
+                &large_nonterminal,
+            ),
+            HlsDirectArchiveDisposition::SequenceZeroCheckpoint
+        );
+        let sparse_tail = hls_sequence_zero_sparse_tail(&large_nonterminal)
+            .expect("a large sequence-zero checkpoint has a bounded rolling tail");
+        let plan = plan_hls_sparse_history_from_lattice(
+            current_edge,
+            &sparse_tail,
+            (current_edge - 1) % 10,
+        )
+        .expect("the demoted checkpoint remains reconstructable");
+        let windows = plan
+            .requested_indices
+            .iter()
+            .map(|index| {
+                let count = index.saturating_add(1).min(10);
+                (*index, sparse_manifest(index + 1 - count, count, false))
+            })
+            .collect::<Vec<_>>();
+        let archive = assemble_hls_sparse_history(
+            &plan,
+            &sparse_tail,
+            windows
+                .iter()
+                .map(|(index, bytes)| (*index, bytes.as_slice())),
+        )
+        .expect("the current-edge checkpoint tail assembles with its stride history");
+        assert_eq!(
+            hls_media_references(&archive),
+            hls_media_references(&large_nonterminal)
+        );
+
+        let small_stale_checkpoint = sparse_manifest(0, 11, false);
+        assert!(small_stale_checkpoint.len() <= 64 * 1024);
+        assert!(hls_is_long_sequence_zero_checkpoint(
+            &small_stale_checkpoint
+        ));
+        assert_eq!(
+            hls_direct_archive_disposition(17, 37, 37, &small_stale_checkpoint),
+            HlsDirectArchiveDisposition::Stale
+        );
+
+        let stale_terminal = sparse_manifest(0, 2_048, true);
+        assert_eq!(
+            hls_direct_archive_disposition(2_048, 3_797, 3_798, &stale_terminal),
+            HlsDirectArchiveDisposition::Stale
+        );
+    }
+
+    #[test]
+    fn sparse_repair_skips_consumed_feed_holes_when_media_coverage_is_proven() {
+        let lower = sparse_manifest(0, 10, false);
+        let abutting_head = sparse_manifest(10, 10, false);
+        let abutting_plan = plan_hls_sparse_history_from_lattice(27, &abutting_head, 7)
+            .expect("abutting sparse plan");
+        let no_repairs = plan_hls_sparse_history_repairs_for_attempts(
+            &abutting_plan,
+            &abutting_head,
+            [7, 17],
+            [(7, lower.as_slice())],
+        )
+        .expect("a consumed feed index with proven media coverage is harmless");
+        assert!(no_repairs.is_empty());
+
+        let gapped_head = sparse_manifest(20, 10, false);
+        let gapped_plan =
+            plan_hls_sparse_history_from_lattice(27, &gapped_head, 7).expect("gapped sparse plan");
+        let repairs = plan_hls_sparse_history_repairs_for_attempts(
+            &gapped_plan,
+            &gapped_head,
+            [7, 17],
+            [(7, lower.as_slice())],
+        )
+        .expect("an uncovered media interval requires dense repair");
+        assert_eq!(repairs.len(), 18);
+        assert!(!repairs.contains(&17));
+        assert_eq!(repairs.first(), Some(&8));
+        assert_eq!(repairs.last(), Some(&26));
+    }
+
+    #[test]
+    fn sparse_history_repairs_and_assembles_across_a_consumed_lattice_index() {
+        let feed_7 = sparse_manifest(0, 8, false);
+        let feed_17 = sparse_manifest(8, 10, false);
+        let head_37 = sparse_manifest(28, 10, false);
+        let plan = plan_hls_sparse_history_from_lattice(37, &head_37, 7)
+            .expect("head uses the startup residue");
+        assert_eq!(plan.requested_indices, [7, 17, 27]);
+
+        let repairs = plan_hls_sparse_history_repairs_for_attempts(
+            &plan,
+            &head_37,
+            [7, 17, 27],
+            [(7, feed_7.as_slice()), (17, feed_17.as_slice())],
+        )
+        .expect("the missing lattice update has bounded dense repair intervals");
+        assert_eq!(repairs, (18..27).chain(28..37).collect::<Vec<_>>());
+
+        let feed_18 = sparse_manifest(9, 10, false);
+        let feed_28 = sparse_manifest(19, 10, false);
+        let archive = assemble_hls_sparse_history(
+            &plan,
+            &head_37,
+            [
+                (7, feed_7.as_slice()),
+                (17, feed_17.as_slice()),
+                (18, feed_18.as_slice()),
+                (28, feed_28.as_slice()),
+            ],
+        )
+        .expect("dense bridge candidates cover the exact sequence-zero history");
+        assert_eq!(hls_media_sequence(&archive), Some(0));
+        assert_eq!(
+            hls_media_references(&archive),
+            (0..38)
+                .map(|position| format!("{:064x}", position + 1))
+                .collect::<Vec<_>>()
         );
     }
 
@@ -2634,6 +2835,7 @@ mod service_worker {
         assert!(load.contains("let live_history_presentation_id ="));
         assert!(load.contains("start == HlsStart::Live && history_active"));
         assert!(load.contains("sequence_zero_presentation_id.or(live_history_presentation_id)"));
+        assert!(load.contains("if start == HlsStart::Live && !defer_live_followup"));
         assert!(load.contains("get_connections().await"));
         assert!(load.contains("HLS_LIVE_FRONTIER_MIN_PRICED_PEERS"));
         assert!(load.contains("HLS_LIVE_FRONTIER_CONNECTION_WAIT"));
@@ -2642,7 +2844,8 @@ mod service_worker {
                 .contains("const HLS_LIVE_FRONTIER_MAX_WAIT: Duration = Duration::from_secs(15);")
         );
         assert!(load.contains("latest_hls_feed_payload_startup("));
-        assert!(load.contains("topic.clone(),\n                                None,\n                                None,"));
+        assert!(load.contains("latest_hls_feed_payload_startup_observing_deferred("));
+        assert!(load.contains("startup_deferred_out.as_ref()"));
         let canonical_startup = source_between(
             load,
             "let (early_payloads, early_payload_max_index) =",
@@ -2741,7 +2944,9 @@ mod service_worker {
         assert!(live_frontier.contains("now >= deadline_ms"));
         assert!(!live_frontier.contains("provisional_index"));
         assert!(load.contains("refresh_head && wait_for_live_frontier"));
-        assert!(load.contains("let initial_check = if let Some(initial)"));
+        assert!(
+            load.contains("let initial_check = if defer_live_followup && start == HlsStart::Live")
+        );
         assert!(load.contains("Some(()) if initial_check.is_some()"));
         let stabilization = source_between(
             HLS_PLAYER,
@@ -2790,6 +2995,14 @@ mod service_worker {
             "fn store_feed_snapshot(",
         );
         assert!(refresh.contains("acquire_latest_raw_feed_payload_bounded_from("));
+        assert!(refresh.contains("let still_current ="));
+        assert!(
+            refresh
+                .matches("sequence_zero_followup_is_current(")
+                .count()
+                >= 3,
+            "sequence-zero refresh admission must recheck ownership after waiting for credit"
+        );
         assert!(refresh.contains("apply_feed_candidate("));
         assert!(reducer.contains("(!seeded && !is_hls_manifest(&candidate.source))"));
         assert!(reducer.contains("if candidate.head_confirmed"));
@@ -2812,11 +3025,10 @@ mod service_worker {
             "pub(crate) async fn try_fetch_response(",
         );
         assert!(follower.contains("let mut skipped_missing_index = false;"));
-        assert!(follower.contains("if !skipped_missing_index"));
-        assert!(
-            !follower
-                .contains("followup_mode == FeedFollowupMode::Canonical && !skipped_missing_index")
-        );
+        assert!(follower.contains("FeedFollowupMode::Canonical => !skipped_missing_index"));
+        assert!(follower.contains("consecutive_sequence_zero_missing"));
+        assert!(follower.contains("successful_followups == 0"));
+        assert!(follower.contains("sequence_zero_followup_is_current("));
         assert!(!follower.contains("head_refresh_unresolved"));
         assert!(follower.contains("current_index = refreshed_index"));
         assert!(follower.contains("if !refresh_head"));
@@ -2903,7 +3115,7 @@ mod service_worker {
         let sequence_zero_startup = source_between(
             HLS_PLAYER,
             "fn publish_sequence_zero_startup_snapshot(",
-            "fn start_live_history_accumulator(",
+            "enum LiveHistoryProbeState",
         );
         assert_eq!(
             sequence_zero_startup
@@ -2941,36 +3153,23 @@ mod service_worker {
         );
         let live_history = source_between(
             HLS_PLAYER,
-            "fn start_live_history_accumulator(",
+            "struct LiveHistoryCollector",
             "fn feed_cache_key(",
         );
-        assert!(live_history.contains("session.mode == HlsPrefetchMode::Sustained"));
-        assert!(live_history.contains(">= HLS_TWO_BODY_PREFETCH_COMPLETIONS"));
-        assert!(live_history.contains("+ HLS_PREFETCH_BODY_MAX_PARALLEL"));
-        assert!(!live_history.contains("session.generation == generation"));
-        assert!(live_history.contains("initial: FeedRouteSnapshot"));
-        assert!(live_history.contains("let initial_prefix ="));
-        assert!(live_history.contains("hls_media_sequence(&initial.body) == Some(0)"));
-        assert!(live_history.contains("index: initial.index"));
-        assert!(live_history.contains("HLS_EARLY_FEED_PREFIX_INDEX"));
-        assert!(live_history.contains("HLS_SEQUENCE_ZERO_PRESENTATION_BATCH_LIMIT"));
-        assert!(live_history.contains("HLS_SEQUENCE_ZERO_FOLLOWUP_MAX_PARALLEL"));
-        assert!(live_history.contains("fallback_remaining"));
-        assert!(live_history.contains(".rev()"));
-        assert!(live_history.contains("expected_index <= current_index"));
-        assert!(live_history.contains(".collect::<Vec<_>>()"));
-        assert!(live_history.contains("append_hls_sequence_zero_archive_suffix("));
-        assert!(live_history.contains("raise_hls_target_duration(&mut archive, target_duration)"));
-        assert!(live_history.contains("current_index == canonical_index"));
-        assert!(live_history.contains("current_source.as_slice() == canonical_source.as_ref()"));
-        assert!(!live_history.contains("confirmed_head_index == Some(canonical_index)"));
+        assert!(live_history.contains("FuturesUnordered<LiveHistoryProbeFuture>"));
+        assert!(live_history.contains("collector.capacity_parallelism.max(1)"));
+        assert!(live_history.contains("wave.iter().rev().copied()"));
+        assert!(live_history.contains("collector.observe_forward_wave(&wave, head_index)"));
+        assert!(live_history.contains("plan_hls_sparse_terminal_repairs(head_index)"));
+        assert!(live_history.contains("initial_is_confirmed_terminal"));
+        assert!(live_history.contains("hls_sequence_zero_sparse_tail(&initial.bytes)"));
+        assert!(live_history.contains("hls_complete_history_timeline(&candidate.bytes)"));
+        assert!(
+            live_history
+                .contains("hls_sequence_zero_timeline_covers_head(window, candidate_timeline)")
+        );
         assert!(live_history.contains("session.live_history_active = true"));
-        assert_eq!(live_history.matches("cache.insert(").count(), 1);
-        assert!(!live_history.contains("extend_hls_sequence_zero_archive("));
-        assert!(!live_history.contains("store_feed_snapshot("));
-        assert!(!live_history.contains("remember_hls_media_plan("));
-        assert!(!live_history.contains("start_hls_payload_load("));
-        assert!(!live_history.contains("prefetch_live_snapshot_start("));
+        assert!(!HLS_PLAYER.contains("start_live_history_accumulator"));
 
         let attach = source_between(
             HLS_PLAYER,
@@ -2992,21 +3191,18 @@ mod service_worker {
         let overlap = attach
             .find("match select(worker_ready, snapshot_load).await")
             .unwrap();
-        let current = attach
-            .find("let current_snapshot = FEED_ROUTE_CACHE.with")
-            .unwrap();
         let play = attach.find("play_hls(").unwrap();
-        assert!(beginning_runway < overlap && overlap < current && current < play);
-        assert!(play < attach.find("start_live_history_accumulator(").unwrap());
-        let retained_seed = attach.find("let live_history_seed = snapshot").unwrap();
-        assert!(retained_seed < play);
-        assert!(
-            attach.contains(".filter(|snapshot| start == HlsStart::Live && !snapshot.finalized)")
-        );
-        assert!(attach.contains("presentation_id, initial"));
+        let prepare = attach.find("prepare_live_history(").unwrap();
+        assert!(beginning_runway < overlap && overlap < play);
+        assert!(prepare < overlap && overlap < play);
+        assert!(attach.contains("if start == HlsStart::Live"));
+        assert!(attach.contains("mpsc::bounded::<DeferredRawFeedPayload>(1)"));
+        assert!(attach.contains("(None, None)"));
+        assert!(attach.contains("startup_deferred_in.and_then"));
+        assert!(attach.contains("start == HlsStart::Live && snapshot.is_none()"));
         assert!(load.matches("await_live_frontier_snapshot(").count() >= 2);
         assert!(!attach.contains("await_live_frontier_snapshot("));
-        assert!(attach[current..play].contains("prefetch_live_snapshot_start("));
+        assert!(!attach.contains("start_live_history_accumulator("));
         let player_start = source_between(HLS_PLAYER, "async fn launch(", "fn session_from(");
         assert!(
             player_start
@@ -3026,6 +3222,136 @@ mod service_worker {
         assert!(fetch.contains("None => HlsStart::Beginning"));
         assert!(fetch.contains(r#"Some("live") => HlsStart::Live"#));
         assert!(fetch.contains("invalid HLS start"));
+    }
+
+    #[test]
+    fn live_sparse_preparation_is_edge_first_bounded_and_beginning_isolated() {
+        let discover = source_between(
+            HLS_PLAYER,
+            "async fn discover_live_history_head(",
+            "async fn assemble_live_history(",
+        );
+        let guard = discover
+            .find("let guard = [first_missing, second_missing]")
+            .unwrap();
+        let wave = discover.find("plan_hls_sparse_forward_wave(").unwrap();
+        assert!(
+            guard < wave,
+            "a true edge must not dispatch a 64-probe wave"
+        );
+        assert!(discover.contains("wave.iter().rev().copied()"));
+        assert!(discover.contains("plan_hls_sparse_terminal_repairs(head_index)"));
+        assert!(discover.contains("candidate.index > head_index"));
+        assert!(discover.contains("highest_authenticated_positive_index"));
+        assert!(!discover.contains("timeout("));
+
+        let collector = source_between(
+            HLS_PLAYER,
+            "struct LiveHistoryCollector",
+            "fn live_history_session_is_current(",
+        );
+        assert!(collector.contains("hls_complete_history_timeline(&candidate.bytes)"));
+        assert!(
+            collector
+                .contains("hls_sequence_zero_timeline_covers_head(window, candidate_timeline)")
+        );
+        assert!(collector.contains("candidate.index >= *index"));
+        assert!(collector.contains("candidate.index >= self.highest_authenticated_positive_index"));
+        assert!(collector.contains("candidate.index > floor"));
+        assert!(collector.contains("direct.as_mut().now_or_never()"));
+        assert!(collector.contains("direct_required"));
+        assert!(collector.contains("deferred.retained_bytes()"));
+        let nonterminal_direct = &collector[collector
+            .find("Some(HlsDirectArchiveDisposition::Stale)")
+            .unwrap()
+            ..collector
+                .find("Some(HlsDirectArchiveDisposition::SequenceZeroCheckpoint)")
+                .unwrap()];
+        assert!(nonterminal_direct.contains("self.drop_direct_work();"));
+        assert!(!nonterminal_direct.contains("return Err("));
+        let checkpoint_direct = &collector[collector
+            .find("Some(HlsDirectArchiveDisposition::SequenceZeroCheckpoint)")
+            .unwrap()
+            ..collector.find("None =>").unwrap()];
+        assert!(
+            checkpoint_direct.contains("verified_sequence_zero_checkpoint_tail(&checkpoint.bytes)")
+        );
+        assert!(checkpoint_direct.contains("self.remember_window(RawFeedPayload"));
+        assert!(checkpoint_direct.contains("LiveHistoryProbeState::Found"));
+        assert!(
+            collector
+                .matches("verified_sequence_zero_checkpoint_tail(")
+                .count()
+                >= 3
+        );
+        assert!(collector.contains("hls_sequence_zero_timeline_covers_head(window, &timeline)"));
+        assert!(
+            collector
+                .find("hls_is_long_sequence_zero_checkpoint(&payload.bytes)")
+                .unwrap()
+                < collector
+                    .find("self.verified_sequence_zero_checkpoint_tail(&payload.bytes)")
+                    .unwrap(),
+            "a late small checkpoint must be discarded before cross-window verification"
+        );
+
+        let prepare = source_between(
+            HLS_PLAYER,
+            "async fn prepare_live_history(",
+            "fn feed_cache_key(",
+        );
+        assert!(prepare.contains("initial_is_confirmed_terminal"));
+        assert!(prepare.contains("initial_needs_sparse_tail"));
+        assert!(prepare.contains("hls_sequence_zero_sparse_tail(&initial.bytes)"));
+        assert!(prepare.contains("Some(deferred.index) == direct_index"));
+        assert!(prepare.contains("deferred.index > initial_plan.head_index"));
+        assert!(prepare.contains("start_deferred_direct(observed_deferred, true)"));
+        assert!(prepare.contains("collector.admit(direct_index).await"));
+        assert!(
+            prepare.find("collector.admit(direct_index).await").unwrap()
+                < prepare
+                    .find("start_deferred_direct(observed_deferred, true)")
+                    .unwrap()
+        );
+        assert!(!prepare.contains("async_std::future::timeout"));
+
+        let load = source_between(
+            HLS_PLAYER,
+            "async fn load_feed_snapshot(",
+            "async fn await_terminal_feed_confirmation_view(",
+        );
+        assert!(load.contains("if start == HlsStart::Live && !defer_live_followup"));
+        assert!(load.contains("latest_hls_feed_payload_startup_observing_deferred("));
+        assert!(load.contains("start == HlsStart::Live && !defer_live_followup"));
+        assert!(load.contains("live_history_presentation_id.is_none()"));
+
+        let install = source_between(
+            HLS_PLAYER,
+            "fn install_prepared_live_history(",
+            "async fn prepare_live_history(",
+        );
+        assert!(install.contains("state.confirmed_head_index = Some(head.index)"));
+        assert!(install.contains("state.last_head_check = now"));
+        assert!(install.contains("session.live_history_active = true"));
+
+        let trimming = source_between(
+            HLS_PLAYER,
+            "fn active_live_history_feed_cache_key(",
+            "fn next_feed_route_check_token(",
+        );
+        assert!(trimming.contains("session.live_start && session.live_history_active"));
+        assert!(trimming.contains("active_live_history_key.as_ref() != Some(*key)"));
+
+        let attach = source_between(
+            HLS_PLAYER,
+            "pub(crate) async fn attach_hls_feed_player(",
+            "async fn open_hls_feed_view_generation(",
+        );
+        assert!(attach.contains("if start == HlsStart::Live"));
+        assert!(attach.contains("(None, None)"));
+        assert!(attach.contains("(HlsStart::Beginning, snapshot)"));
+        assert!(attach.contains("start_beginning_snapshot_runway("));
+        assert!(attach.contains("start == HlsStart::Live && snapshot.is_none()"));
     }
 
     #[test]
@@ -3138,8 +3464,9 @@ mod service_worker {
             "pub async fn get_service_worker()",
             "fn controlled_service_worker()",
         );
-        assert!(setup.contains("SERVICE_WORKER_SETUP_LOCK.with(std::rc::Rc::clone)"));
-        assert!(setup.contains("setup_lock.lock().await"));
+        assert!(setup.contains("SERVICE_WORKER_SETUP_LOCK.with(Arc::clone)"));
+        assert!(setup.contains("setup_lock.lock_arc().await"));
+        assert!(setup.contains("setup_lock.try_lock_arc()"));
 
         let readiness = INTERFACE_RUNTIME
             .split_once("pub(crate) async fn service_worker_controls_bzz_requests(")
@@ -3294,21 +3621,25 @@ mod hls_payload_cancellation {
     }
 
     #[test]
-    fn hls_chunk_timeouts_keep_accounting_and_raw_singleflight_draining() {
+    fn hls_chunk_timeouts_release_logical_work_but_keep_accounting_draining() {
         let attempt = source_section(
             RETRIEVAL,
             "async fn retrieve_attempt(",
             "fn chunk_address_parts(",
         );
-        assert!(attempt.contains("failed_retrieve_attempt(&peer, false)"));
-        assert!(attempt.contains("result_chan.try_send(terminal_result)"));
+        assert!(attempt.contains("failed_retrieve_attempt(&peer)"));
+        assert!(!attempt.contains("result_chan.try_send(terminal_result)"));
+        let detached = attempt
+            .find("let _ = settle_retrieve_attempt(")
+            .expect("detached accounting-only settlement");
+        assert!(!attempt[detached..].contains("result_chan.try_send("));
 
         let chunk = source_section(
             RETRIEVAL,
             "pub async fn retrieve_chunk(",
             "pub async fn retrieve_check_chunk(",
         );
-        assert_eq!(chunk.matches("if !result.terminal").count(), 2);
+        assert!(!chunk.contains("result.terminal"));
 
         let waiter = source_section(
             RETRIEVAL,

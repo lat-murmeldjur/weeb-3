@@ -1049,14 +1049,15 @@ mod retrieve_generations {
 
 mod retrieve_admission {
     use crate::retrieval_conventions::{
-        RetrieveAdmission, acquire_retrieve_permit, retrieve_admission_current,
+        RetrieveAdmission, acquire_retrieve_permit, retained_feed_probe_empty_is_missing,
+        retrieve_admission_current,
     };
     use async_lock::Semaphore;
     use std::{
         future::Future,
         pin::pin,
         sync::{
-            Arc,
+            Arc, Barrier,
             atomic::{AtomicUsize, Ordering},
         },
         task::{Context, Poll, Wake, Waker},
@@ -1087,6 +1088,79 @@ mod retrieve_admission {
 
         assert!(!admission.is_open());
         assert!(!queued.is_open());
+    }
+
+    #[test]
+    fn ordinary_admission_keeps_its_unlimited_attempt_semantics() {
+        let admission = RetrieveAdmission::new();
+
+        for _ in 0..64 {
+            assert!(admission.physical_attempt_available());
+            assert!(admission.try_claim_physical_attempt());
+        }
+
+        admission.record_physical_attempt_timeout();
+        admission.record_confirmed_empty_physical_attempt();
+        assert!(admission.is_open());
+        assert_eq!(admission.timed_out_physical_attempts(), None);
+        assert_eq!(admission.confirmed_empty_physical_attempts(), None);
+    }
+
+    #[test]
+    fn finite_attempt_budget_is_atomic_and_closes_after_exactly_two_claims() {
+        const CONTENDERS: usize = 32;
+        let admission = RetrieveAdmission::new_with_attempt_limit(2);
+        let barrier = Arc::new(Barrier::new(CONTENDERS + 1));
+        let attempts = (0..CONTENDERS)
+            .map(|_| {
+                let admission = admission.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    admission.try_claim_physical_attempt()
+                })
+            })
+            .collect::<Vec<_>>();
+
+        barrier.wait();
+        let claimed = attempts
+            .into_iter()
+            .map(|attempt| attempt.join().expect("attempt contender"))
+            .filter(|claimed| *claimed)
+            .count();
+
+        assert_eq!(claimed, 2);
+        assert!(!admission.is_open());
+        assert!(!admission.physical_attempt_available());
+        assert!(!admission.try_claim_physical_attempt());
+    }
+
+    #[test]
+    fn retained_empty_feed_probe_requires_two_confirmed_empty_responses() {
+        let admission = RetrieveAdmission::new_with_attempt_limit(2);
+        assert_eq!(admission.claimed_physical_attempts(), Some(0));
+        assert_eq!(admission.confirmed_empty_physical_attempts(), Some(0));
+        assert!(!retained_feed_probe_empty_is_missing(&admission, 2));
+
+        assert!(admission.try_claim_physical_attempt());
+        assert_eq!(admission.claimed_physical_attempts(), Some(1));
+        admission.record_confirmed_empty_physical_attempt();
+        assert_eq!(admission.confirmed_empty_physical_attempts(), Some(1));
+        assert!(!retained_feed_probe_empty_is_missing(&admission, 2));
+
+        assert!(admission.try_claim_physical_attempt());
+        assert_eq!(admission.claimed_physical_attempts(), Some(2));
+        // A claimed attempt that ended through a channel/transport failure or returned an
+        // invalid nonempty chunk is not evidence that this feed index is absent.
+        assert!(!retained_feed_probe_empty_is_missing(&admission, 2));
+
+        admission.record_confirmed_empty_physical_attempt();
+        assert_eq!(admission.confirmed_empty_physical_attempts(), Some(2));
+        assert!(retained_feed_probe_empty_is_missing(&admission, 2));
+
+        admission.record_physical_attempt_timeout();
+        assert_eq!(admission.timed_out_physical_attempts(), Some(1));
+        assert!(!retained_feed_probe_empty_is_missing(&admission, 2));
     }
 
     #[test]
@@ -1158,11 +1232,202 @@ mod retrieve_admission {
             assert!(waiting.await.is_none());
         });
     }
+
+    #[test]
+    fn retained_feed_deadline_stops_admission_but_not_late_response_ownership() {
+        let retrieval = include_str!("../src/retrieval.rs");
+        let retained = retrieval
+            .split("async fn get_feed_probe_chunk_with_hedge_admission(")
+            .nth(1)
+            .and_then(|source| source.split("fn valid_feed_update_payload").next())
+            .expect("retained feed probe");
+
+        let response = retained
+            .find("let response = chan_in.recv();")
+            .expect("owned response future");
+        let admission_close = retained[response..]
+            .find("admission.close();")
+            .map(|offset| response + offset)
+            .expect("admission deadline closure");
+        let late_response = retained[admission_close..]
+            .find("response.await")
+            .map(|offset| admission_close + offset)
+            .expect("late response wait");
+        assert!(response < admission_close && admission_close < late_response);
+        assert!(!retained.contains("cancel_reserve("));
+
+        let attempt = retrieval
+            .split("async fn retrieve_attempt(")
+            .nth(1)
+            .and_then(|source| source.split("fn chunk_address_parts").next())
+            .expect("physical retrieve attempt");
+        let confirmed_empty = attempt
+            .find("matches!(retrieve_result.as_ref(), Ok(chunk) if chunk.is_empty())")
+            .expect("only an actual empty Bee delivery is negative evidence");
+        let empty_marker = attempt[confirmed_empty..]
+            .find("admission.record_confirmed_empty_physical_attempt();")
+            .map(|offset| confirmed_empty + offset)
+            .expect("confirmed empty response marker");
+        let immediate_settlement = attempt[empty_marker..]
+            .find("settle_retrieve_attempt(")
+            .map(|offset| empty_marker + offset)
+            .expect("immediate physical settlement");
+        let logical_terminal = attempt
+            .find("failed_retrieve_attempt(&peer)")
+            .expect("ten-second terminal logical result");
+        let timeout_marker = attempt
+            .find("admission.record_physical_attempt_timeout();")
+            .expect("finite admission timeout marker");
+        let detached_settlement = attempt[logical_terminal..]
+            .find("settle_retrieve_attempt(")
+            .map(|offset| logical_terminal + offset)
+            .expect("late detached settlement");
+        assert!(confirmed_empty < empty_marker && empty_marker < immediate_settlement);
+        assert!(timeout_marker < logical_terminal && logical_terminal < detached_settlement);
+        assert_eq!(
+            attempt.matches("result_chan.try_send(").count(),
+            2,
+            "one immediate-completion send and one timeout send"
+        );
+        assert!(!attempt[detached_settlement..].contains("result_chan.try_send("));
+    }
+
+    #[test]
+    fn retained_feed_attempt_cap_is_claimed_before_physical_dispatch() {
+        let retrieval = include_str!("../src/retrieval.rs");
+        assert!(retrieval.contains("const RETRIEVE_FEED_MAX_PHYSICAL_ATTEMPTS: usize = 2;"));
+
+        let retrieve_chunk = retrieval
+            .split("pub async fn retrieve_chunk(")
+            .nth(1)
+            .and_then(|source| source.split("pub async fn retrieve_check_chunk(").next())
+            .expect("logical chunk retrieval");
+        let claim = retrieve_chunk
+            .find("!admission.try_claim_physical_attempt()")
+            .expect("atomic physical attempt claim");
+        let dispatch = retrieve_chunk[claim..]
+            .find("wasm_bindgen_futures::spawn_local(async move")
+            .map(|offset| claim + offset)
+            .expect("physical exchange dispatch");
+        let rejected_claim = &retrieve_chunk[claim..dispatch];
+
+        assert!(retrieve_chunk[..claim].contains("RetrieveAdmission::physical_attempt_available"));
+        assert!(rejected_claim.contains("cancel_reserve(&selected.accounting, selected.price)"));
+        assert!(claim < dispatch);
+
+        let retained = retrieval
+            .split("async fn get_feed_probe_chunk_with_hedge_admission(")
+            .nth(1)
+            .and_then(|source| source.split("fn valid_feed_update_payload").next())
+            .expect("retained feed probe");
+        assert!(
+            retained.contains(
+                "RetrieveAdmission::new_with_attempt_limit(policy.max_physical_attempts)"
+            )
+        );
+    }
 }
 
 mod retrieve_singleflight {
-    use crate::retrieval_conventions::SingleflightRegistry;
-    use std::{cell::Cell, rc::Rc};
+    use crate::retrieval_conventions::{RetrieveAdmission, SingleflightRegistry};
+    use std::{
+        cell::Cell,
+        collections::HashMap,
+        rc::Rc,
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+        },
+    };
+
+    #[derive(Default)]
+    struct AttemptLedger {
+        next_attempt: u64,
+        reserved: u64,
+        credited: u64,
+        cancelled: u64,
+        settled: usize,
+        pending: HashMap<u64, u64>,
+    }
+
+    impl AttemptLedger {
+        fn dispatch(&mut self, price: u64) -> u64 {
+            self.next_attempt += 1;
+            let attempt = self.next_attempt;
+            assert!(self.pending.insert(attempt, price).is_none());
+            self.reserved += price;
+            attempt
+        }
+
+        fn settle(&mut self, attempt: u64, success: bool) {
+            let price = self
+                .pending
+                .remove(&attempt)
+                .expect("each physical attempt settles exactly once");
+            self.reserved -= price;
+            if success {
+                self.credited += price;
+            } else {
+                self.cancelled += price;
+            }
+            self.settled += 1;
+        }
+    }
+
+    #[test]
+    fn finite_admission_caps_dispatch_without_cancelling_claimed_attempt_settlement() {
+        const PRICE: u64 = 17;
+        let admission = RetrieveAdmission::new_with_attempt_limit(2);
+        let mut ledger = AttemptLedger::default();
+
+        assert!(admission.try_claim_physical_attempt());
+        let primary = ledger.dispatch(PRICE);
+        assert!(admission.try_claim_physical_attempt());
+        let hedge = ledger.dispatch(PRICE);
+
+        assert!(!admission.is_open());
+        assert!(!admission.try_claim_physical_attempt());
+        assert_eq!(ledger.pending.len(), 2);
+
+        // Closing future admission does not alter either dispatched reserve. Each physical
+        // attempt still reaches the same terminal accounting paths.
+        ledger.settle(primary, true);
+        ledger.settle(hedge, false);
+
+        assert_eq!(ledger.reserved, 0);
+        assert_eq!(ledger.credited, PRICE);
+        assert_eq!(ledger.cancelled, PRICE);
+        assert_eq!(ledger.settled, 2);
+        assert!(ledger.pending.is_empty());
+    }
+
+    #[test]
+    fn logical_timeout_releases_once_while_late_accounting_settles_once() {
+        const PRICE: u64 = 17;
+        let mut ledger = AttemptLedger::default();
+        let attempt = ledger.dispatch(PRICE);
+        let mut logical_in_flight = 1_usize;
+        let mut logical_failures = 0_usize;
+
+        // The ten-second notification is terminal only for the logical retrieval.
+        logical_in_flight = logical_in_flight.saturating_sub(1);
+        logical_failures += 1;
+        assert_eq!(logical_in_flight, 0);
+        assert_eq!(logical_failures, 1);
+        assert_eq!(ledger.pending.len(), 1);
+        assert_eq!(ledger.settled, 0);
+
+        // A later authenticated response belongs exclusively to detached accounting settlement;
+        // it must not re-enter or resurrect the completed logical retrieval.
+        ledger.settle(attempt, true);
+        assert_eq!(logical_in_flight, 0);
+        assert_eq!(logical_failures, 1);
+        assert_eq!(ledger.reserved, 0);
+        assert_eq!(ledger.credited, PRICE);
+        assert_eq!(ledger.cancelled, 0);
+        assert_eq!(ledger.settled, 1);
+        assert!(ledger.pending.is_empty());
+    }
 
     #[test]
     fn identical_keys_share_one_leader_and_one_resource() {
@@ -1218,6 +1483,107 @@ mod retrieve_singleflight {
         let successor = flights.register(7, (), || Rc::new(Cell::new(true)));
         assert!(successor.leader);
         assert_ne!(successor.flight_id, first.flight_id);
+    }
+
+    #[test]
+    fn detached_waiter_does_not_ghost_dispatched_accounting_or_replace_the_producer() {
+        async_std::task::block_on(async {
+            const PRICE: u64 = 17;
+            type Flights = SingleflightRegistry<&'static str, Arc<AtomicUsize>, Arc<AtomicBool>>;
+
+            let logical_producers = Arc::new(AtomicUsize::new(0));
+            let detached_deliveries = Arc::new(AtomicUsize::new(0));
+            let joined_deliveries = Arc::new(AtomicUsize::new(0));
+            let flights = Arc::new(Mutex::new(Flights::default()));
+            let ledger = Arc::new(Mutex::new(AttemptLedger::default()));
+
+            let first = flights
+                .lock()
+                .unwrap()
+                .register("chunk", detached_deliveries.clone(), {
+                    let logical_producers = logical_producers.clone();
+                    move || {
+                        logical_producers.fetch_add(1, Ordering::SeqCst);
+                        Arc::new(AtomicBool::new(true))
+                    }
+                });
+            assert!(first.leader);
+            let first_flight_id = first.flight_id;
+            let first_waiter_id = first.waiter_id;
+
+            // Both reservations represent real, dispatched transports. The second is an
+            // intentional physical hedge, not another logical/raw-fetch producer.
+            let primary_attempt = ledger.lock().unwrap().dispatch(PRICE);
+            let hedge_attempt = ledger.lock().unwrap().dispatch(PRICE);
+            let (primary_out, primary_in) = async_std::channel::bounded::<bool>(1);
+            let (hedge_out, hedge_in) = async_std::channel::bounded::<bool>(1);
+
+            let primary = async_std::task::spawn({
+                let flights = flights.clone();
+                let ledger = ledger.clone();
+                async move {
+                    let success = primary_in.recv().await.expect("primary terminal result");
+                    ledger.lock().unwrap().settle(primary_attempt, success);
+                    if success {
+                        let completed = flights
+                            .lock()
+                            .unwrap()
+                            .take(&"chunk", first_flight_id)
+                            .expect("the dispatched producer still owns its flight");
+                        for waiter in completed.waiters {
+                            waiter.fetch_add(1, Ordering::SeqCst);
+                        }
+                    }
+                }
+            });
+            let hedge = async_std::task::spawn({
+                let ledger = ledger.clone();
+                async move {
+                    let success = hedge_in.recv().await.expect("hedge terminal result");
+                    ledger.lock().unwrap().settle(hedge_attempt, success);
+                }
+            });
+
+            async_std::task::yield_now().await;
+            let shared = flights
+                .lock()
+                .unwrap()
+                .remove_waiter(&"chunk", first_flight_id, first_waiter_id)
+                .expect("the last browser waiter releases admission only");
+            shared.store(false, Ordering::SeqCst);
+
+            let joined = flights
+                .lock()
+                .unwrap()
+                .register("chunk", joined_deliveries.clone(), {
+                    let logical_producers = logical_producers.clone();
+                    move || {
+                        logical_producers.fetch_add(1, Ordering::SeqCst);
+                        Arc::new(AtomicBool::new(true))
+                    }
+                });
+            assert!(!joined.leader);
+            assert_eq!(joined.flight_id, first_flight_id);
+            assert!(!joined.shared.load(Ordering::SeqCst));
+            assert_eq!(logical_producers.load(Ordering::SeqCst), 1);
+
+            // A response arriving after listener detachment still credits the dispatch.
+            primary_out.send(true).await.unwrap();
+            primary.await;
+            // Completion of the logical read cannot cancel an already-dispatched hedge.
+            hedge_out.send(false).await.unwrap();
+            hedge.await;
+
+            let ledger = ledger.lock().unwrap();
+            assert_eq!(ledger.reserved, 0);
+            assert_eq!(ledger.credited, PRICE);
+            assert_eq!(ledger.cancelled, PRICE);
+            assert_eq!(ledger.settled, 2);
+            assert!(ledger.pending.is_empty());
+            assert_eq!(detached_deliveries.load(Ordering::SeqCst), 0);
+            assert_eq!(joined_deliveries.load(Ordering::SeqCst), 1);
+            assert_eq!(logical_producers.load(Ordering::SeqCst), 1);
+        });
     }
 
     #[test]

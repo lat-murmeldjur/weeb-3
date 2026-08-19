@@ -1,7 +1,7 @@
 use crate::{
     ChunkRetrieveSender, RetrieveCancelToken, RetrieveGenerationMap,
     erasure_coding::{CHUNK_SIZE, decode_span, encoded_reference_payload_len},
-    feed::overscan_sequence_feed_candidate,
+    feed::{FeedProbe, overscan_sequence_feed_candidate},
     manifest::{
         BzzManifestFork, MAX_PARALLEL_MANIFEST_FORKS, ParsedBzzManifest, ResolutionGuard,
         is_bzz_manifest_header, manifest_payload_size_allowed, manifest_wrapped_reference,
@@ -12,9 +12,9 @@ use crate::{
         DecodedJoinChunk, retrieve_data, retrieve_data_range_from_root,
         retrieve_data_range_from_root_cancellable, retrieve_decoded_data_root,
         retrieve_decoded_data_root_cancellable, retrieve_feed_update_at_index,
-        retrieve_feed_update_at_index_bounded, retrieve_feed_update_at_index_status,
-        seek_latest_feed_update, seek_latest_feed_update_indexed_from,
-        seek_latest_feed_update_indexed_observing_positive,
+        retrieve_feed_update_at_index_bounded, retrieve_feed_update_at_index_retained_status,
+        retrieve_feed_update_at_index_status, seek_latest_feed_update,
+        seek_latest_feed_update_indexed_from, seek_latest_feed_update_indexed_observing_positive,
         seek_latest_feed_update_indexed_wide_bounded,
     },
     retrieve_cancel_token_current,
@@ -219,9 +219,18 @@ async fn retrieve_embedded_payload_with_span(
     encrypted: bool,
     chunk_retrieve_chan: &ChunkRetrieveSender,
 ) -> Option<(u64, Vec<u8>)> {
+    retrieve_embedded_payload_with_span_bounded(data, encrypted, chunk_retrieve_chan, None).await
+}
+
+async fn retrieve_embedded_payload_with_span_bounded(
+    data: &[u8],
+    encrypted: bool,
+    chunk_retrieve_chan: &ChunkRetrieveSender,
+    maximum_span: Option<u64>,
+) -> Option<(u64, Vec<u8>)> {
     let root = embedded_join_root(data, encrypted)?;
     let span = root.span;
-    if !manifest_payload_size_allowed(span) {
+    if !manifest_payload_size_allowed(span) || maximum_span.is_some_and(|maximum| span > maximum) {
         return None;
     }
     let payload = if span == 0 {
@@ -246,13 +255,70 @@ pub(crate) struct RawFeedPayload {
     pub bytes: Vec<u8>,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct DeferredRawFeedPayload {
+    pub(crate) index: u64,
+    update: Vec<u8>,
+    span: u64,
+}
+
+impl DeferredRawFeedPayload {
+    pub(crate) fn payload_span(&self) -> u64 {
+        self.span
+    }
+
+    pub(crate) fn retained_bytes(&self) -> usize {
+        self.update.len()
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum RetainedRawFeedPayloadProbe {
+    Found(RawFeedPayload),
+    Deferred(DeferredRawFeedPayload),
+    Missing,
+    Transient,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct StartupRawFeedPayload {
+    pub(crate) playable: RawFeedPayload,
+    pub(crate) observed_deferred: Option<DeferredRawFeedPayload>,
+}
+
+fn defer_large_raw_feed_update(index: u64, update: Vec<u8>) -> Option<DeferredRawFeedPayload> {
+    let span = [false, true]
+        .into_iter()
+        .find_map(|encrypted| embedded_join_root(&update, encrypted).map(|root| root.span))?;
+    (span > CHUNK_SIZE as u64 && manifest_payload_size_allowed(span)).then_some(
+        DeferredRawFeedPayload {
+            index,
+            update,
+            span,
+        },
+    )
+}
+
 async fn raw_feed_payload_from_update(
     update: &[u8],
     chunk_retrieve_chan: &ChunkRetrieveSender,
 ) -> Option<Vec<u8>> {
+    raw_feed_payload_from_update_bounded(update, chunk_retrieve_chan, None).await
+}
+
+async fn raw_feed_payload_from_update_bounded(
+    update: &[u8],
+    chunk_retrieve_chan: &ChunkRetrieveSender,
+    maximum_span: Option<u64>,
+) -> Option<Vec<u8>> {
     for encrypted in [false, true] {
-        let Some((_, payload)) =
-            retrieve_embedded_payload_with_span(update, encrypted, chunk_retrieve_chan).await
+        let Some((_, payload)) = retrieve_embedded_payload_with_span_bounded(
+            update,
+            encrypted,
+            chunk_retrieve_chan,
+            maximum_span,
+        )
+        .await
         else {
             continue;
         };
@@ -304,6 +370,71 @@ pub(crate) async fn acquire_raw_feed_payload_at_index(
     Some(RawFeedPayload { index, bytes })
 }
 
+pub(crate) async fn acquire_raw_feed_payload_at_index_retained_status(
+    owner: String,
+    topic: String,
+    index: u64,
+    maximum_payload_bytes: usize,
+    chunk_retrieve_chan: &ChunkRetrieveSender,
+) -> RetainedRawFeedPayloadProbe {
+    let update = match retrieve_feed_update_at_index_retained_status(
+        owner,
+        topic,
+        index,
+        chunk_retrieve_chan,
+    )
+    .await
+    {
+        FeedProbe::Found(update) => update,
+        FeedProbe::Missing => return RetainedRawFeedPayloadProbe::Missing,
+        FeedProbe::Transient => return RetainedRawFeedPayloadProbe::Transient,
+    };
+    let Some(maximum_span) = u64::try_from(maximum_payload_bytes).ok() else {
+        return RetainedRawFeedPayloadProbe::Transient;
+    };
+    let Some(span) = [false, true]
+        .into_iter()
+        .find_map(|encrypted| embedded_join_root(&update, encrypted).map(|root| root.span))
+    else {
+        return RetainedRawFeedPayloadProbe::Transient;
+    };
+    if span > maximum_span {
+        return RetainedRawFeedPayloadProbe::Deferred(DeferredRawFeedPayload {
+            index,
+            update,
+            span,
+        });
+    }
+    let Some(bytes) =
+        raw_feed_payload_from_update_bounded(&update, chunk_retrieve_chan, Some(maximum_span))
+            .await
+    else {
+        return RetainedRawFeedPayloadProbe::Transient;
+    };
+    RetainedRawFeedPayloadProbe::Found(RawFeedPayload { index, bytes })
+}
+
+pub(crate) async fn acquire_deferred_raw_feed_payload(
+    deferred: DeferredRawFeedPayload,
+    maximum_payload_bytes: usize,
+    chunk_retrieve_chan: &ChunkRetrieveSender,
+) -> Option<RawFeedPayload> {
+    let maximum_span = u64::try_from(maximum_payload_bytes).ok()?;
+    if deferred.span > maximum_span {
+        return None;
+    }
+    let bytes = raw_feed_payload_from_update_bounded(
+        &deferred.update,
+        chunk_retrieve_chan,
+        Some(maximum_span),
+    )
+    .await?;
+    (u64::try_from(bytes.len()).ok()? == deferred.span).then_some(RawFeedPayload {
+        index: deferred.index,
+        bytes,
+    })
+}
+
 pub(crate) async fn acquire_raw_feed_payload_at_index_bounded(
     owner: String,
     topic: String,
@@ -323,6 +454,24 @@ pub(crate) async fn acquire_latest_raw_feed_payload_startup(
     early_payloads: Option<mpsc::Sender<RawFeedPayload>>,
     early_payload_max_index: Option<u64>,
 ) -> Option<RawFeedPayload> {
+    acquire_latest_raw_feed_payload_startup_observing_deferred(
+        owner,
+        topic,
+        chunk_retrieve_chan,
+        early_payloads,
+        early_payload_max_index,
+    )
+    .await
+    .map(|resolved| resolved.playable)
+}
+
+pub(crate) async fn acquire_latest_raw_feed_payload_startup_observing_deferred(
+    owner: String,
+    topic: String,
+    chunk_retrieve_chan: &ChunkRetrieveSender,
+    early_payloads: Option<mpsc::Sender<RawFeedPayload>>,
+    early_payload_max_index: Option<u64>,
+) -> Option<StartupRawFeedPayload> {
     let early_updates = early_payloads.map(|payloads| {
         decode_observed_feed_updates(payloads, early_payload_max_index, chunk_retrieve_chan)
     });
@@ -355,16 +504,22 @@ pub(crate) async fn acquire_latest_raw_feed_payload_startup(
                 && let Some(bytes) =
                     raw_feed_payload_from_update(&previous, chunk_retrieve_chan).await
             {
-                return Some(RawFeedPayload {
-                    index: previous_index,
-                    bytes,
+                return Some(StartupRawFeedPayload {
+                    playable: RawFeedPayload {
+                        index: previous_index,
+                        bytes,
+                    },
+                    observed_deferred: defer_large_raw_feed_update(index, update),
                 });
             }
             (index, update)
         }
     };
     let bytes = raw_feed_payload_from_update(&update, chunk_retrieve_chan).await?;
-    Some(RawFeedPayload { index, bytes })
+    Some(StartupRawFeedPayload {
+        playable: RawFeedPayload { index, bytes },
+        observed_deferred: None,
+    })
 }
 
 pub(crate) async fn acquire_latest_raw_feed_payload_bounded_from<AdmitWave, AdmitFuture>(

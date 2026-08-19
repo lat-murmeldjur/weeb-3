@@ -2,13 +2,12 @@ use super::*;
 
 const SERVICE_WORKER_PROTOCOL: f64 = 5.0;
 const SERVICE_WORKER_CONTROL_TOTAL_TIMEOUT_MS: u64 = 30_000;
-const SERVICE_WORKER_CONTROL_MAX_FOLLOWUP_PROBES: u8 = 40;
-const SERVICE_WORKER_CONTROL_MAX_UNAVAILABLE_ROUNDS: u8 = 3;
+const SERVICE_WORKER_SETUP_RETRY_MS: f64 = 1_500.0;
 
 thread_local! {
     static SERVICE_WORKER_MISSING_VISIBLE: Cell<bool> = Cell::new(false);
-    static SERVICE_WORKER_SETUP_LOCK: std::rc::Rc<async_lock::Mutex<()>> =
-        std::rc::Rc::new(async_lock::Mutex::new(()));
+    static SERVICE_WORKER_SETUP_LOCK: Arc<async_lock::Mutex<()>> =
+        Arc::new(async_lock::Mutex::new(()));
 }
 
 pub(super) async fn check_upload_prerequisites(weeb3: Arc<Weeb3>) {
@@ -1256,23 +1255,30 @@ pub(super) fn create_element_wmt(tmype: String, blob_url: String) -> Element {
 }
 
 pub(crate) fn service_worker_missing() {
-    if service_worker_container().is_some() {
-        return;
-    }
-    if SERVICE_WORKER_MISSING_VISIBLE.with(|visible| visible.replace(true)) {
-        return;
-    }
+    let message = "The weeb-3 Service Worker is unavailable or did not become ready. Browser-routed Swarm resources require the configured /weeb-3/ scope in a secure context with a trusted HTTPS certificate.";
+    web_sys::console::warn_1(&JsValue::from_str(message));
 
-    let document = web_sys::window().unwrap().document().unwrap();
-    let errod = document.create_element("div").unwrap();
-    errod.set_inner_html("Service worker required and not found. Loading websites from swarm requires accessing weeb-3 via https through secure certificate.");
-    let _r = document
+    // npm consumers do not necessarily mount the built-in interface. A Service
+    // Worker diagnostic must not become a Wasm panic when #resultField is absent.
+    let Some(document) = web_sys::window().and_then(|window| window.document()) else {
+        return;
+    };
+    let Some(result_field) = document
         .get_element_by_id("resultField")
-        .expect("#resultField should exist")
-        .dyn_ref::<HtmlElement>()
-        .unwrap()
-        .prepend_with_node_1(&errod)
-        .unwrap();
+        .and_then(|element| element.dyn_into::<HtmlElement>().ok())
+    else {
+        return;
+    };
+    if SERVICE_WORKER_MISSING_VISIBLE.with(Cell::get) {
+        return;
+    }
+    let Ok(error) = document.create_element("div") else {
+        return;
+    };
+    error.set_text_content(Some(message));
+    if result_field.prepend_with_node_1(&error).is_ok() {
+        SERVICE_WORKER_MISSING_VISIBLE.with(|visible| visible.set(true));
+    }
 }
 
 pub(super) fn render_text_result(message: &str) {
@@ -1400,7 +1406,7 @@ pub fn parsebootconnect(boot_node_masettings_id: String) -> (String, String) {
     return ("".to_string(), "".to_string());
 }
 
-fn service_worker_container() -> Option<web_sys::ServiceWorkerContainer> {
+pub(super) fn service_worker_container() -> Option<web_sys::ServiceWorkerContainer> {
     let window = web_sys::window()?;
     let is_secure_context =
         js_sys::Reflect::get(window.as_ref(), &JsValue::from_str("isSecureContext"))
@@ -1444,10 +1450,48 @@ fn configured_service_worker_url() -> Option<String> {
         .map(|url| url.href())
 }
 
-fn warn_about_worker_conflict(worker_url: &str) {
+fn configured_service_worker_scope_url() -> Option<String> {
+    let window = web_sys::window()?;
+    let page_url = window.location().href().ok()?;
+    web_sys::Url::new_with_base(STREAMING_SERVICE_WORKER_SCOPE, &page_url)
+        .ok()
+        .map(|url| url.href())
+}
+
+fn expected_service_worker_registration(
+    registration: &ServiceWorkerRegistration,
+    expected_worker_url: &str,
+    expected_scope_url: &str,
+) -> bool {
+    if registration.scope() != expected_scope_url {
+        warn_about_worker_conflict(
+            &format!("scope {}", registration.scope()),
+            expected_scope_url,
+        );
+        return false;
+    }
+
+    for worker in [
+        registration.active(),
+        registration.waiting(),
+        registration.installing(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if worker.script_url() != expected_worker_url {
+            warn_about_worker_conflict(&worker.script_url(), expected_scope_url);
+            return false;
+        }
+    }
+    true
+}
+
+fn warn_about_worker_conflict(worker: &str, expected_scope_url: &str) {
     web_sys::console::warn_1(&JsValue::from_str(&format!(
-        "weeb-3 left the existing Service Worker in place ({worker_url}); \
-         integrate the weeb-3 forwarding protocol or configure a non-conflicting scope"
+        "weeb-3 left the existing Service Worker in place ({worker}); integrate the weeb-3 \
+         forwarding protocol or remove the conflicting registration before using scope \
+         {expected_scope_url}"
     )));
 }
 
@@ -1456,30 +1500,56 @@ pub async fn get_service_worker() -> Option<web_sys::ServiceWorker> {
         service_worker_missing();
         return None;
     };
-    let setup_lock = SERVICE_WORKER_SETUP_LOCK.with(std::rc::Rc::clone);
-    let _setup_guard = setup_lock.lock().await;
+    let setup_lock = SERVICE_WORKER_SETUP_LOCK.with(Arc::clone);
+    let _setup_guard = setup_lock.lock_arc().await;
+    get_service_worker_locked(&service0).await
+}
 
+fn start_service_worker_setup_if_idle() -> bool {
+    let Some(service0) = service_worker_container() else {
+        service_worker_missing();
+        return false;
+    };
+    let setup_lock = SERVICE_WORKER_SETUP_LOCK.with(Arc::clone);
+    let Some(setup_guard) = setup_lock.try_lock_arc() else {
+        // Startup already owns setup. Playback keeps polling the controller
+        // instead of spending its readiness deadline queued behind this lock.
+        return false;
+    };
+    spawn_local(async move {
+        let _setup_guard = setup_guard;
+        let _ = get_service_worker_locked(&service0).await;
+    });
+    true
+}
+
+async fn get_service_worker_locked(
+    service0: &web_sys::ServiceWorkerContainer,
+) -> Option<web_sys::ServiceWorker> {
     // Never replace an unrelated host application's worker.
     if service_worker_forwarder_ready().await {
         return controlled_service_worker();
     }
     let expected_worker_url = configured_service_worker_url()?;
+    let expected_scope_url = configured_service_worker_scope_url()?;
     if let Some(controller) = controlled_service_worker() {
         if controller.script_url() != expected_worker_url {
             if service_worker_forwarder_ready_with_timeout(1_500).await {
                 return Some(controller);
             }
-            warn_about_worker_conflict(&controller.script_url());
+            warn_about_worker_conflict(&controller.script_url(), &expected_scope_url);
             return None;
         }
     }
     if let Some(registration) = service_worker_registration(&service0).await {
+        if !expected_service_worker_registration(
+            &registration,
+            &expected_worker_url,
+            &expected_scope_url,
+        ) {
+            return None;
+        }
         if let Some(active) = registration.active() {
-            if active.script_url() != expected_worker_url {
-                warn_about_worker_conflict(&active.script_url());
-                return None;
-            }
-
             let _ = request_service_worker_claim(&active).await;
             if service_worker_forwarder_ready().await {
                 return controlled_service_worker();
@@ -1494,6 +1564,11 @@ pub async fn get_service_worker() -> Option<web_sys::ServiceWorker> {
 
     let registration_options = RegistrationOptions::new();
     registration_options.set_scope(STREAMING_SERVICE_WORKER_SCOPE);
+    let _ = Reflect::set(
+        registration_options.as_ref(),
+        &JsValue::from_str("updateViaCache"),
+        &JsValue::from_str("none"),
+    );
     match async_std::future::timeout(
         Duration::from_secs(10),
         JsFuture::from(
@@ -1504,11 +1579,14 @@ pub async fn get_service_worker() -> Option<web_sys::ServiceWorker> {
     {
         Ok(Ok(registration)) => {
             if let Ok(registration) = registration.dyn_into::<ServiceWorkerRegistration>() {
+                if !expected_service_worker_registration(
+                    &registration,
+                    &expected_worker_url,
+                    &expected_scope_url,
+                ) {
+                    return None;
+                }
                 if let Some(service_worker) = registration.active() {
-                    if service_worker.script_url() != expected_worker_url {
-                        warn_about_worker_conflict(&service_worker.script_url());
-                        return None;
-                    }
                     let _ = request_service_worker_claim(&service_worker).await;
                     if service_worker_forwarder_ready().await {
                         return controlled_service_worker();
@@ -1522,11 +1600,14 @@ pub async fn get_service_worker() -> Option<web_sys::ServiceWorker> {
                     async_std::future::timeout(Duration::from_secs(10), JsFuture::from(ready)).await
                 {
                     if let Ok(registration) = registration.dyn_into::<ServiceWorkerRegistration>() {
+                        if !expected_service_worker_registration(
+                            &registration,
+                            &expected_worker_url,
+                            &expected_scope_url,
+                        ) {
+                            return None;
+                        }
                         if let Some(service_worker) = registration.active() {
-                            if service_worker.script_url() != expected_worker_url {
-                                warn_about_worker_conflict(&service_worker.script_url());
-                                return None;
-                            }
                             let _ = request_service_worker_claim(&service_worker).await;
                             if service_worker_forwarder_ready().await {
                                 return controlled_service_worker();
@@ -1545,11 +1626,15 @@ pub async fn get_service_worker() -> Option<web_sys::ServiceWorker> {
         )),
     }
 
-    let active = service_worker_registration(&service0).await?.active()?;
-    if active.script_url() != expected_worker_url {
-        warn_about_worker_conflict(&active.script_url());
+    let registration = service_worker_registration(&service0).await?;
+    if !expected_service_worker_registration(
+        &registration,
+        &expected_worker_url,
+        &expected_scope_url,
+    ) {
         return None;
     }
+    let active = registration.active()?;
     let _ = request_service_worker_claim(&active).await;
     controlled_service_worker().or(Some(active))
 }
@@ -1658,13 +1743,12 @@ async fn service_worker_protocol_request(
 pub(crate) fn service_worker_scope_protocol_error(purpose: &str) -> String {
     format!(
         "Service Worker protocol {} did not become ready for {}: configured worker {} did not \
-         claim scope {} and answer WEEB3_PING within {} ms ({} follow-up probes maximum).",
+         claim scope {} and answer WEEB3_PING within {} ms.",
         SERVICE_WORKER_PROTOCOL as u8,
         purpose,
         STREAMING_SERVICE_WORKER_URL,
         STREAMING_SERVICE_WORKER_SCOPE,
         SERVICE_WORKER_CONTROL_TOTAL_TIMEOUT_MS,
-        SERVICE_WORKER_CONTROL_MAX_FOLLOWUP_PROBES,
     )
 }
 
@@ -1682,61 +1766,41 @@ async fn wait_for_service_worker_control(
     }
 
     weeb3.interface_log(format!("service worker activating for {}", purpose));
-    let mut unavailable_rounds = 0u8;
-    let mut protocol_probes = 0u8;
+    let mut next_setup_retry_ms: f64 = 0.0;
+    let mut activation_retry_logged = false;
     loop {
-        if !still_needed() || protocol_probes >= SERVICE_WORKER_CONTROL_MAX_FOLLOWUP_PROBES {
+        if !still_needed() {
             return false;
         }
 
-        let worker_available = get_service_worker().await.is_some();
-        unavailable_rounds = if worker_available {
-            0
-        } else {
-            unavailable_rounds.saturating_add(1)
-        };
-
+        let now = js_sys::Date::now();
+        if (!next_setup_retry_ms.is_finite()
+            || next_setup_retry_ms <= 0.0
+            || now < next_setup_retry_ms - SERVICE_WORKER_CONTROL_TOTAL_TIMEOUT_MS as f64
+            || now >= next_setup_retry_ms)
+            && start_service_worker_setup_if_idle()
+        {
+            // The setup lock prevents overlap. Retrying after it is released lets a transient
+            // registration/update failure recover even when a stale same-URL controller exists.
+            next_setup_retry_ms = now + SERVICE_WORKER_SETUP_RETRY_MS;
+        }
         if controlled_service_worker().is_none() {
-            if unavailable_rounds >= SERVICE_WORKER_CONTROL_MAX_UNAVAILABLE_ROUNDS {
-                return false;
+            if !activation_retry_logged {
+                activation_retry_logged = true;
+                weeb3.interface_log(format!(
+                    "service worker still activating for {}; retrying without a reload",
+                    purpose
+                ));
             }
-            weeb3.interface_log(format!(
-                "service worker still activating for {}; retrying without a reload",
-                purpose
-            ));
             async_std::task::sleep(Duration::from_millis(100)).await;
             continue;
         }
 
-        let remaining_probes =
-            SERVICE_WORKER_CONTROL_MAX_FOLLOWUP_PROBES.saturating_sub(protocol_probes);
-        let probes = if worker_available {
-            remaining_probes
-        } else {
-            remaining_probes.min(4)
-        };
-        for _ in 0..probes {
-            if !still_needed() {
-                return false;
-            }
-            if controlled_service_worker().is_none() {
-                break;
-            }
-            protocol_probes = protocol_probes.saturating_add(1);
-            if service_worker_forwarder_ready_with_timeout(1_500).await {
-                weeb3.interface_log(format!("service worker controls {}", purpose));
-                return true;
-            }
-            async_std::task::sleep(Duration::from_millis(100)).await;
+        if service_worker_forwarder_ready_with_timeout(500).await {
+            weeb3.interface_log(format!("service worker controls {}", purpose));
+            return true;
         }
-
-        if unavailable_rounds >= SERVICE_WORKER_CONTROL_MAX_UNAVAILABLE_ROUNDS {
-            return false;
-        }
-        weeb3.interface_log(format!(
-            "service worker still activating for {}; retrying without a reload",
-            purpose
-        ));
+        async_std::task::sleep(Duration::from_millis(100)).await;
     }
 }
 

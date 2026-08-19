@@ -15,7 +15,9 @@ use crate::{
     },
     get_feed_address, get_proximity, mpsc, price, reserve,
     retrieval_conventions::SingleflightRegistry,
-    retrieval_conventions::{RetrieveAdmission, retrieve_admission_current},
+    retrieval_conventions::{
+        RetrieveAdmission, retained_feed_probe_empty_is_missing, retrieve_admission_current,
+    },
     retrieve_cancel_token_current, retrieve_handler, transfer_pause_enabled, valid_cac, valid_soc,
 };
 
@@ -37,14 +39,20 @@ const RETRIEVE_CHECK_RETRY_WAIT_MS: u64 = 160;
 const RETRIEVE_CHUNK_MAX_ATTEMPT_ERRORS: usize = 20;
 const RETRIEVE_DATA_GROUP_CONCURRENCY: usize = 8;
 const RETRIEVE_DECODED_CHUNK_CACHE_ENTRIES: usize = 2048;
+const RETRIEVE_FEED_HEDGE_ADMISSION_MS: u64 = 1_950;
+const RETRIEVE_FEED_MAX_PHYSICAL_ATTEMPTS: usize = 2;
+
+#[derive(Clone, Copy)]
+struct RetainedFeedProbePolicy {
+    hedge_admission: Duration,
+    max_physical_attempts: usize,
+}
 
 struct RetrieveAttemptResult {
     peer: PeerId,
     chunk: Vec<u8>,
     valid: bool,
     soc: bool,
-    /// True only after the dispatched transport settles its accounting reserve.
-    terminal: bool,
 }
 
 struct ReservedRetrievePeer {
@@ -138,13 +146,12 @@ fn reset_overdraft(skiplist: &mut HashSet<PeerId>, overdraftlist: &mut HashSet<P
     }
 }
 
-fn failed_retrieve_attempt(peer: &PeerId, terminal: bool) -> RetrieveAttemptResult {
+fn failed_retrieve_attempt(peer: &PeerId) -> RetrieveAttemptResult {
     RetrieveAttemptResult {
         peer: peer.clone(),
         chunk: vec![],
         valid: false,
         soc: false,
-        terminal,
     }
 }
 
@@ -166,7 +173,6 @@ async fn settle_retrieve_attempt(
                     chunk,
                     valid: true,
                     soc,
-                    terminal: true,
                 };
             }
 
@@ -177,7 +183,7 @@ async fn settle_retrieve_attempt(
         }
     }
 
-    failed_retrieve_attempt(&peer, true)
+    failed_retrieve_attempt(&peer)
 }
 
 async fn retrieve_attempt(
@@ -186,6 +192,7 @@ async fn retrieve_attempt(
     control: StreamControl,
     refresh_chan: mpsc::Sender<RefreshmentInstruction>,
     result_chan: mpsc::Sender<RetrieveAttemptResult>,
+    admission: Option<RetrieveAdmission>,
 ) {
     let ReservedRetrievePeer {
         peer,
@@ -208,6 +215,11 @@ async fn retrieve_attempt(
 
     match retrieve_result {
         Ok(retrieve_result) => {
+            if matches!(retrieve_result.as_ref(), Ok(chunk) if chunk.is_empty())
+                && let Some(admission) = admission.as_ref()
+            {
+                admission.record_confirmed_empty_physical_attempt();
+            }
             let result = settle_retrieve_attempt(
                 peer,
                 caddr,
@@ -220,11 +232,17 @@ async fn retrieve_attempt(
             let _ = result_chan.try_send(result);
         }
         Err(_) => {
-            let _ = result_chan.try_send(failed_retrieve_attempt(&peer, false));
+            if let Some(admission) = admission.as_ref() {
+                admission.record_physical_attempt_timeout();
+            }
+            // Ten seconds is terminal for the logical retrieval, so its in-flight slot and
+            // dispatcher permit can be released. The dispatched exchange still owns a reserve;
+            // keep its response receiver alive in a detached accounting-only settlement task.
+            let _ = result_chan.try_send(failed_retrieve_attempt(&peer));
 
             // A timed-out dispatched request must still settle its accounting reserve.
             wasm_bindgen_futures::spawn_local(async move {
-                let terminal_result = settle_retrieve_attempt(
+                let _ = settle_retrieve_attempt(
                     peer,
                     caddr,
                     req_price,
@@ -233,7 +251,6 @@ async fn retrieve_attempt(
                     chunk_in.recv().await,
                 )
                 .await;
-                let _ = result_chan.try_send(terminal_result);
             });
         }
     }
@@ -1699,9 +1716,6 @@ pub async fn retrieve_chunk(
     {
         if in_flight > 0 {
             if let Ok(result) = attempt_in.try_recv() {
-                if !result.terminal {
-                    continue;
-                }
                 in_flight = in_flight.saturating_sub(1);
                 if result.valid {
                     cd = result.chunk;
@@ -1733,7 +1747,10 @@ pub async fn retrieve_chunk(
         }
 
         let now = Date::now();
-        let can_start_attempt = attempt_count < RETRIEVE_CHUNK_MAX_ATTEMPT_ERRORS;
+        let can_start_attempt = attempt_count < RETRIEVE_CHUNK_MAX_ATTEMPT_ERRORS
+            && admission
+                .as_ref()
+                .is_none_or(RetrieveAdmission::physical_attempt_available);
         let due = can_start_attempt
             && !paused
             && !cancelled
@@ -1772,12 +1789,34 @@ pub async fn retrieve_chunk(
                     continue;
                 }
 
+                if admission
+                    .as_ref()
+                    .is_some_and(|admission| !admission.try_claim_physical_attempt())
+                {
+                    cancel_reserve(&selected.accounting, selected.price).await;
+                    skiplist.remove(&selected.peer);
+                    if in_flight == 0 {
+                        break;
+                    }
+                    async_std::task::sleep(Duration::from_millis(RETRIEVE_HOT_LOOP_GUARD_MS)).await;
+                    continue;
+                }
+
                 let control = control.clone();
                 let refresh_chan = refresh_chan.clone();
                 let attempt_out = attempt_out.clone();
                 let caddr = caddr.clone();
+                let attempt_admission = admission.clone();
                 wasm_bindgen_futures::spawn_local(async move {
-                    retrieve_attempt(selected, caddr, control, refresh_chan, attempt_out).await;
+                    retrieve_attempt(
+                        selected,
+                        caddr,
+                        control,
+                        refresh_chan,
+                        attempt_out,
+                        attempt_admission,
+                    )
+                    .await;
                 });
                 attempt_count += 1;
                 in_flight += 1;
@@ -1812,9 +1851,6 @@ pub async fn retrieve_chunk(
 
         match async_std::future::timeout(Duration::from_millis(wait_ms), attempt_in.recv()).await {
             Ok(Ok(result)) => {
-                if !result.terminal {
-                    continue;
-                }
                 in_flight = in_flight.saturating_sub(1);
                 if result.valid {
                     cd = result.chunk;
@@ -1858,7 +1894,8 @@ pub async fn retrieve_check_chunk(
 
     while error_count < max_error && success_peers.len() < RETRIEVE_CHECK_CONFIRMATION_PEERS {
         while let Ok(result) = attempt_in.try_recv() {
-            // Late terminal replies settle accounting but not confirmation quorum.
+            // Each physical attempt reports exactly one logical result. A timed-out transport's
+            // later response is consumed only by its detached accounting settlement task.
             if !reported_peers.insert(result.peer.clone()) {
                 continue;
             }
@@ -1917,6 +1954,7 @@ pub async fn retrieve_check_chunk(
             control.clone(),
             refresh_chan.clone(),
             attempt_out.clone(),
+            None,
         )
         .await;
     }
@@ -2010,11 +2048,14 @@ pub fn decrypt(cd: &Vec<u8>, encrey: Vec<u8>) -> Vec<u8> {
     return [spanbytes, content[..span_decrypted as usize].to_vec()].concat();
 }
 
-async fn get_feed_probe_chunk(
+async fn get_feed_probe_chunk_with_hedge_admission(
     data_address: Vec<u8>,
     chunk_retrieve_chan: &ChunkRetrieveSender,
+    retained_policy: Option<RetainedFeedProbePolicy>,
 ) -> FeedProbe<Vec<u8>> {
-    let admission = RetrieveAdmission::new();
+    let admission = retained_policy.map_or_else(RetrieveAdmission::new, |policy| {
+        RetrieveAdmission::new_with_attempt_limit(policy.max_physical_attempts)
+    });
     let _close_admission = admission.close_on_drop();
     let (chan_out, chan_in) = mpsc::unbounded::<Vec<u8>>();
     if chunk_retrieve_chan
@@ -2022,17 +2063,46 @@ async fn get_feed_probe_chunk(
             address: data_address,
             chan: chan_out,
             cancel: None,
-            admission: Some(admission),
+            admission: Some(admission.clone()),
         })
         .is_err()
     {
         return FeedProbe::Transient;
     }
 
+    // Closing admission stops future peer hedges. The original receiver remains owned so a
+    // dispatched exchange can still return a late authenticated payload and settle accounting.
+    let retrieve_result = match retained_policy {
+        Some(policy) => {
+            let response = chan_in.recv();
+            let close_admission = async_std::task::sleep(policy.hedge_admission);
+            pin_mut!(response, close_admission);
+            match select(response, close_admission).await {
+                Either::Left((result, _)) => result,
+                Either::Right(((), response)) => {
+                    admission.close();
+                    response.await
+                }
+            }
+        }
+        None => chan_in.recv().await,
+    };
+
     // Dropping the listener stops admission, not dispatched accounting settlement.
-    match chan_in.recv().await {
+    match retrieve_result {
         Ok(payload) if valid_feed_update_payload(&payload) => FeedProbe::Found(payload),
-        Ok(_) => FeedProbe::Missing,
+        Ok(_) => match retained_policy {
+            Some(policy)
+                if retained_feed_probe_empty_is_missing(
+                    &admission,
+                    policy.max_physical_attempts,
+                ) =>
+            {
+                FeedProbe::Missing
+            }
+            Some(_) => FeedProbe::Transient,
+            None => FeedProbe::Missing,
+        },
         Err(_) => FeedProbe::Transient,
     }
 }
@@ -2041,17 +2111,28 @@ fn valid_feed_update_payload(data: &[u8]) -> bool {
     !data.is_empty()
 }
 
+async fn probe_feed_update_status_with_hedge_admission(
+    owner: &String,
+    topic: &String,
+    index: u64,
+    chunk_retrieve_chan: &ChunkRetrieveSender,
+    retained_policy: Option<RetainedFeedProbePolicy>,
+) -> FeedProbe<Vec<u8>> {
+    let address = get_feed_address(owner, topic, index);
+    if address.len() != 32 {
+        return FeedProbe::Missing;
+    }
+    get_feed_probe_chunk_with_hedge_admission(address, chunk_retrieve_chan, retained_policy).await
+}
+
 async fn probe_feed_update_status(
     owner: &String,
     topic: &String,
     index: u64,
     chunk_retrieve_chan: &ChunkRetrieveSender,
 ) -> FeedProbe<Vec<u8>> {
-    let address = get_feed_address(owner, topic, index);
-    if address.len() != 32 {
-        return FeedProbe::Missing;
-    }
-    get_feed_probe_chunk(address, chunk_retrieve_chan).await
+    probe_feed_update_status_with_hedge_admission(owner, topic, index, chunk_retrieve_chan, None)
+        .await
 }
 
 pub(crate) async fn retrieve_feed_update_at_index(
@@ -2072,6 +2153,27 @@ pub(crate) async fn retrieve_feed_update_at_index_status(
     chunk_retrieve_chan: &ChunkRetrieveSender,
 ) -> FeedProbe<Vec<u8>> {
     probe_feed_update_status(&owner, &topic, index, chunk_retrieve_chan).await
+}
+
+/// Stop admitting peer hedges after the bounded feed wave, but retain the original response
+/// receiver until the caller drops this future or the logical retrieval reaches a terminal result.
+pub(crate) async fn retrieve_feed_update_at_index_retained_status(
+    owner: String,
+    topic: String,
+    index: u64,
+    chunk_retrieve_chan: &ChunkRetrieveSender,
+) -> FeedProbe<Vec<u8>> {
+    probe_feed_update_status_with_hedge_admission(
+        &owner,
+        &topic,
+        index,
+        chunk_retrieve_chan,
+        Some(RetainedFeedProbePolicy {
+            hedge_admission: Duration::from_millis(RETRIEVE_FEED_HEDGE_ADMISSION_MS),
+            max_physical_attempts: RETRIEVE_FEED_MAX_PHYSICAL_ATTEMPTS,
+        }),
+    )
+    .await
 }
 
 /// Bound only the SOC probe; dispatched transport still settles accounting.

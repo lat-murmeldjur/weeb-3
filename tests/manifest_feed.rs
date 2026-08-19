@@ -1178,16 +1178,18 @@ mod feed_frontier {
         assert!(finder.contains("async_std::future::timeout("));
         assert!(!finder.contains("RetrieveCancelToken"));
         let feed_probe = retrieval
-            .split("async fn get_feed_probe_chunk(")
+            .split("async fn get_feed_probe_chunk_with_hedge_admission(")
             .nth(1)
             .and_then(|source| source.split("fn valid_feed_update_payload").next())
             .expect("feed probe chunk wrapper should remain inspectable");
         assert!(feed_probe.contains("let _close_admission = admission.close_on_drop();"));
-        assert!(feed_probe.contains("admission: Some(admission),"));
+        assert!(feed_probe.contains("admission: Some(admission.clone()),"));
         assert!(feed_probe.contains(".is_err()"));
         assert!(feed_probe.contains("return FeedProbe::Transient;"));
         assert!(feed_probe.contains("chan_in.recv().await"));
-        assert!(feed_probe.contains("Ok(_) => FeedProbe::Missing"));
+        assert!(feed_probe.contains("retained_feed_probe_empty_is_missing("));
+        assert!(feed_probe.contains("Some(_) => FeedProbe::Transient"));
+        assert!(feed_probe.contains("None => FeedProbe::Missing"));
         assert!(feed_probe.contains("Err(_) => FeedProbe::Transient"));
         assert!(finder.contains(".map_or(FeedProbe::Transient, Into::into)"));
         let attempt = retrieval
@@ -1197,6 +1199,174 @@ mod feed_frontier {
             .expect("retrieve attempt should remain inspectable");
         assert!(attempt.contains("settle_retrieve_attempt("));
         assert!(attempt.contains("spawn_local(async move"));
+    }
+
+    #[test]
+    fn retained_exact_probe_caps_hedges_without_dropping_the_response_receiver() {
+        let retrieval = include_str!("../src/retrieval.rs");
+        let bzz_stream = include_str!("../src/bzz_stream.rs");
+
+        assert!(retrieval.contains("const RETRIEVE_FEED_HEDGE_ADMISSION_MS: u64 = 1_950;"));
+        assert!(retrieval.contains("const RETRIEVE_FEED_MAX_PHYSICAL_ATTEMPTS: usize = 2;"));
+        let retained = retrieval
+            .split("async fn get_feed_probe_chunk_with_hedge_admission(")
+            .nth(1)
+            .and_then(|source| source.split("fn valid_feed_update_payload").next())
+            .expect("retained feed probe should remain inspectable");
+        let receiver = retained
+            .find("let response = chan_in.recv();")
+            .expect("one retained response receiver");
+        let race = retained[receiver..]
+            .find("select(response, close_admission).await")
+            .map(|offset| receiver + offset)
+            .expect("hedge admission deadline race");
+        let close = retained[race..]
+            .find("admission.close();")
+            .map(|offset| race + offset)
+            .expect("hedge admission closure");
+        let retained_wait = retained[close..]
+            .find("response.await")
+            .map(|offset| close + offset)
+            .expect("same response future retained after admission closes");
+        let classify = retained[retained_wait..]
+            .find("match retrieve_result")
+            .map(|offset| retained_wait + offset)
+            .expect("late response classification");
+        assert!(
+            receiver < race && race < close && close < retained_wait && retained_wait < classify
+        );
+        assert!(retained.contains("let _close_admission = admission.close_on_drop();"));
+        assert!(retained.contains("admission: Some(admission.clone()),"));
+        assert!(
+            retained.contains(
+                "RetrieveAdmission::new_with_attempt_limit(policy.max_physical_attempts)"
+            )
+        );
+        assert!(retained.contains("retained_feed_probe_empty_is_missing("));
+        assert!(retained.contains("Some(_) => FeedProbe::Transient"));
+
+        let attempt = retrieval
+            .split("async fn retrieve_attempt(")
+            .nth(1)
+            .and_then(|source| source.split("fn chunk_address_parts").next())
+            .expect("physical retrieve attempt");
+        let confirmed_empty = attempt
+            .find("matches!(retrieve_result.as_ref(), Ok(chunk) if chunk.is_empty())")
+            .expect("confirmed empty Bee response guard");
+        let empty_marker = attempt[confirmed_empty..]
+            .find("admission.record_confirmed_empty_physical_attempt();")
+            .map(|offset| confirmed_empty + offset)
+            .expect("confirmed empty response marker");
+        let immediate_settlement = attempt[empty_marker..]
+            .find("settle_retrieve_attempt(")
+            .map(|offset| empty_marker + offset)
+            .expect("immediate settlement after response classification");
+        let timeout_marker = attempt
+            .find("admission.record_physical_attempt_timeout();")
+            .expect("finite admission timeout marker");
+        let logical_timeout = attempt[timeout_marker..]
+            .find("failed_retrieve_attempt(&peer)")
+            .map(|offset| timeout_marker + offset)
+            .expect("logical timeout notification");
+        assert!(confirmed_empty < empty_marker && empty_marker < immediate_settlement);
+        assert!(timeout_marker < logical_timeout);
+
+        let retrieve_chunk = retrieval
+            .split("pub async fn retrieve_chunk(")
+            .nth(1)
+            .and_then(|source| source.split("pub async fn retrieve_check_chunk(").next())
+            .expect("logical chunk retrieval should remain inspectable");
+        let claim = retrieve_chunk
+            .find("!admission.try_claim_physical_attempt()")
+            .expect("atomic physical-attempt claim");
+        let dispatch = retrieve_chunk[claim..]
+            .find("wasm_bindgen_futures::spawn_local(async move")
+            .map(|offset| claim + offset)
+            .expect("physical retrieve dispatch");
+        assert!(retrieve_chunk[..claim].contains("RetrieveAdmission::physical_attempt_available"));
+        assert!(
+            retrieve_chunk[claim..dispatch]
+                .contains("cancel_reserve(&selected.accounting, selected.price)")
+        );
+        assert!(claim < dispatch);
+
+        let public_retrieval = retrieval
+            .split("pub(crate) async fn retrieve_feed_update_at_index_retained_status(")
+            .nth(1)
+            .and_then(|source| {
+                source
+                    .split("retrieve_feed_update_at_index_bounded(")
+                    .next()
+            })
+            .expect("retained exact feed retrieval API");
+        assert!(public_retrieval.contains("probe_feed_update_status_with_hedge_admission("));
+        assert!(public_retrieval.contains("RETRIEVE_FEED_HEDGE_ADMISSION_MS"));
+        assert!(public_retrieval.contains("RETRIEVE_FEED_MAX_PHYSICAL_ATTEMPTS"));
+        assert!(public_retrieval.contains("FeedProbe<Vec<u8>>"));
+
+        let raw_payload = bzz_stream
+            .split("pub(crate) async fn acquire_raw_feed_payload_at_index_retained_status(")
+            .nth(1)
+            .and_then(|source| {
+                source
+                    .split("acquire_raw_feed_payload_at_index_bounded(")
+                    .next()
+            })
+            .expect("retained raw feed payload API");
+        let exact_update = raw_payload
+            .find("retrieve_feed_update_at_index_retained_status(")
+            .expect("retained exact update acquisition");
+        let authenticated_body = raw_payload
+            .find("raw_feed_payload_from_update_bounded(")
+            .expect("authenticated update body decoding");
+        assert!(exact_update < authenticated_body);
+        assert!(raw_payload.contains("maximum_payload_bytes: usize"));
+        assert!(raw_payload.contains("Some(maximum_span)"));
+        assert!(raw_payload.contains("FeedProbe::Missing"));
+        assert!(raw_payload.contains("FeedProbe::Transient"));
+        assert!(
+            raw_payload
+                .contains("RetainedRawFeedPayloadProbe::Found(RawFeedPayload { index, bytes })")
+        );
+        assert!(raw_payload.contains("RetainedRawFeedPayloadProbe::Deferred("));
+    }
+
+    #[test]
+    fn startup_resolution_reuses_the_authenticated_large_head_observation() {
+        let bzz_stream = include_str!("../src/bzz_stream.rs");
+        let startup = bzz_stream
+            .split(
+                "pub(crate) async fn acquire_latest_raw_feed_payload_startup_observing_deferred(",
+            )
+            .nth(1)
+            .and_then(|source| {
+                source
+                    .split("acquire_latest_raw_feed_payload_bounded_from")
+                    .next()
+            })
+            .expect("startup resolution with deferred observation");
+
+        let latest = startup
+            .find("seek_latest_feed_update_indexed_wide_bounded(")
+            .expect("wide authenticated startup lookup");
+        let predecessor = startup[latest..]
+            .find("retrieve_feed_update_at_index_bounded(")
+            .map(|offset| latest + offset)
+            .expect("rolling predecessor lookup");
+        let deferred = startup[predecessor..]
+            .find("defer_large_raw_feed_update(index, update)")
+            .map(|offset| predecessor + offset)
+            .expect("already observed large update retained without another exact lookup");
+
+        assert!(latest < predecessor && predecessor < deferred);
+        assert!(startup.contains("playable: RawFeedPayload"));
+        assert!(startup.contains("observed_deferred: None"));
+        assert_eq!(
+            startup
+                .matches("retrieve_feed_update_at_index_bounded(")
+                .count(),
+            1
+        );
     }
 }
 mod manifest_format_contracts {
