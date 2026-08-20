@@ -69,6 +69,138 @@ fn readiness_requires_a_controlling_protocol_worker() {
 }
 
 #[test]
+fn staged_range_stream_awaits_its_first_window_then_keeps_four_window_lookahead() {
+    let stream = between(
+        WORKER,
+        "function createRustRangeStream(",
+        "async function forwardRequestToRust(",
+    );
+    assert!(WORKER.contains("const HLS_STREAM_LOOKAHEAD_CHUNKS = 4;"));
+    assert!(stream.contains(
+        "const lookahead = stagedStart ? HLS_STREAM_LOOKAHEAD_CHUNKS : STREAM_LOOKAHEAD_CHUNKS;"
+    ));
+    assert!(!stream.contains("stagedWindows"));
+    let scheduler = between(
+        stream,
+        "const scheduleMore = () => {",
+        "const drainScheduledRanges",
+    );
+    assert!(scheduler.contains("!schedulingAdmissionOpen || !lookaheadAdmitted"));
+    assert!(scheduler.contains("scheduled.size < lookahead"));
+
+    let pull = between(stream, "async pull(controller) {", "cancel() {");
+    let staged_gate = pull
+        .find("if (lookaheadAdmitted) {")
+        .expect("ordinary streams retain immediate bounded lookahead");
+    let foreground = pull
+        .find("const foreground = admitNextRange();")
+        .expect("first foreground range admission");
+    let awaited = pull
+        .find("const response = await request;")
+        .expect("foreground range completion");
+    let lookahead = pull
+        .find("lookaheadAdmitted = true;")
+        .expect("lookahead admission after foreground completion");
+    let schedule = pull
+        .rfind("scheduleMore();")
+        .expect("bounded speculative scheduling");
+    assert!(
+        staged_gate < foreground
+            && foreground < awaited
+            && awaited < lookahead
+            && lookahead < schedule
+    );
+    assert!(pull[staged_gate..foreground].contains("scheduleMore();"));
+}
+
+#[test]
+fn ordinary_range_streams_keep_their_immediate_bounded_lookahead() {
+    let stream = between(
+        WORKER,
+        "function createRustRangeStream(",
+        "async function forwardRequestToRust(",
+    );
+    assert!(WORKER.contains("const STREAM_LOOKAHEAD_CHUNKS = 8;"));
+    assert!(stream.contains(
+        "const lookahead = stagedStart ? HLS_STREAM_LOOKAHEAD_CHUNKS : STREAM_LOOKAHEAD_CHUNKS;"
+    ));
+    assert!(stream.contains("let lookaheadAdmitted = !stagedStart;"));
+    let pull = between(stream, "async pull(controller) {", "cancel() {");
+    let schedule = pull
+        .find("if (lookaheadAdmitted) {")
+        .expect("ordinary lookahead gate");
+    let await_response = pull
+        .find("const response = await request;")
+        .expect("range completion");
+    assert!(schedule < await_response);
+    assert!(pull[schedule..await_response].contains("scheduleMore();"));
+}
+
+#[test]
+fn progressive_range_streams_echo_the_outer_playback_token_to_every_rust_range() {
+    let request = between(
+        WORKER,
+        "function requestRustRange(",
+        "function createRustRangeStream(",
+    );
+    assert!(request.contains("streamToken = \"\""));
+    assert!(request.contains("streamToken\n"));
+
+    let stream = between(
+        WORKER,
+        "function createRustRangeStream(",
+        "async function forwardRequestToRust(",
+    );
+    assert!(stream.contains("stagedStart, streamToken = \"\""));
+    assert!(stream.contains("requestRustRange(clients, url, start, end, networkId, streamToken)"));
+
+    let forward = between(
+        WORKER,
+        "async function forwardRequestToRust(",
+        "function parseUploadRedundancyHeader(",
+    );
+    assert!(forward.contains("headers.get(\"X-Weeb3-Stream-Token\")"));
+    assert!(forward.contains("stagedStart,\n        streamToken"));
+}
+
+#[test]
+fn range_stream_cancel_closes_admission_and_drains_dispatched_promises() {
+    let stream = between(
+        WORKER,
+        "function createRustRangeStream(",
+        "async function forwardRequestToRust(",
+    );
+    let drain = between(
+        stream,
+        "const drainScheduledRanges = () => {",
+        "return new ReadableStream(",
+    );
+    let retained = drain
+        .find("Array.from(scheduled.values())")
+        .expect("already-dispatched range promises must be retained");
+    let settled = drain
+        .find("Promise.allSettled(dispatched)")
+        .expect("already-dispatched range promises must drain");
+    let clear = drain
+        .find("scheduled.clear();")
+        .expect("settled range bookkeeping cleanup");
+    assert!(retained < settled && settled < clear);
+
+    let cancel = between(stream, "cancel() {", "\n    }");
+    let close = cancel
+        .find("schedulingAdmissionOpen = false;")
+        .expect("future range scheduling must close first");
+    let drain = cancel
+        .find("return drainScheduledRanges();")
+        .expect("cancel must retain the drain promise");
+    assert!(close < drain);
+    assert!(!cancel.contains("scheduled.clear()"));
+    assert!(!cancel.contains("requestRustRange("));
+    assert!(!cancel.contains("AbortController"));
+    assert!(!cancel.contains(".abort("));
+}
+
+#[test]
 fn setup_validates_scope_and_every_registration_state() {
     let validation = between(
         RUNTIME,

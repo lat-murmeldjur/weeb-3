@@ -923,7 +923,7 @@ mod retrieve_group_stream {
 
         let traversal = source_section(
             "async fn retrieve_data_range_from_root_with_prefix_cancellable(",
-            "pub(crate) async fn retrieve_data_range_join_cancellable(",
+            "async fn retrieve_data_joined(",
         );
         let fetch = traversal
             .find("fetch_data_group_indices_streaming(")
@@ -945,7 +945,7 @@ mod retrieve_group_stream {
     fn unconsumed_terminals_keep_the_join_alive_and_failure_is_all_or_nothing() {
         let traversal = source_section(
             "async fn retrieve_data_range_from_root_with_prefix_cancellable(",
-            "pub(crate) async fn retrieve_data_range_join_cancellable(",
+            "async fn retrieve_data_joined(",
         );
         assert!(traversal.contains("while !pending.is_empty() || active_groups > 0"));
         assert!(traversal.contains("active_groups = active_groups.checked_add(1)?"));
@@ -971,6 +971,71 @@ mod retrieve_group_stream {
         assert!(
             RETRIEVAL_SOURCE
                 .contains("const RETRIEVE_RS_HEDGE_AFTER_MS: u64 = RETRIEVE_HEDGE_AFTER_MS * 2;")
+        );
+    }
+
+    #[test]
+    fn conservative_deferred_ranges_are_serial_direct_and_bounded() {
+        let policies = source_section(
+            "struct DataRangeTraversalPolicy",
+            "struct RetainedFeedProbePolicy",
+        );
+        assert!(policies.contains("group_concurrency: RETRIEVE_DATA_GROUP_CONCURRENCY"));
+        assert!(policies.contains("erasure_recovery: true"));
+        assert!(policies.contains("maximum_requested_children: usize::MAX"));
+        assert!(policies.contains("group_concurrency: 1"));
+        assert!(policies.contains("erasure_recovery: false"));
+        assert!(
+            policies
+                .contains("maximum_requested_children: CONSERVATIVE_DEFERRED_MAX_RANGE_CHILDREN")
+        );
+        assert!(RETRIEVAL_SOURCE.contains(
+            "CONSERVATIVE_DEFERRED_MAX_RANGE_CHILDREN * RETRIEVE_CHUNK_MAX_ATTEMPT_ERRORS"
+        ));
+
+        let group = source_section(
+            "async fn fetch_data_group_indices_streaming(",
+            "#[derive(Clone)]\nstruct TraversalNode",
+        );
+        assert!(group.contains("requested_indices.len() > policy.maximum_requested_children"));
+        assert!(group.contains("recovery_dispatched && policy.erasure_recovery"));
+        assert!(group.contains("|| !policy.erasure_recovery"));
+        assert!(group.contains("let waiter_admission = RetrieveAdmission::new();"));
+        assert!(group.contains("shared_physical_admission"));
+
+        let raw_flights =
+            source_section("struct RawFetchKey", "#[inline]\nfn decryption_segment_key");
+        assert!(raw_flights.contains("conservative_scope: Option<u64>"));
+        assert!(raw_flights.contains("shared_physical_admission"));
+        assert!(raw_flights.contains("admission.clone()"));
+        assert!(raw_flights.contains("key.conservative_scope.is_none()"));
+
+        let conservative = source_section(
+            "pub(crate) async fn retrieve_data_range_from_root_conservative(",
+            "pub(crate) async fn retrieve_data_range_from_root_cancellable(",
+        );
+        assert!(conservative.contains("requested_len > CONSERVATIVE_DEFERRED_RANGE_BYTES"));
+        assert!(conservative.contains("CONSERVATIVE_DATA_RANGE_TRAVERSAL"));
+
+        let traversal = source_section(
+            "async fn retrieve_data_range_from_root_with_prefix_cancellable(",
+            "async fn retrieve_data_joined(",
+        );
+        assert!(traversal.contains("RetrieveAdmission::new_with_attempt_limit("));
+        assert!(traversal.contains("CONSERVATIVE_DEFERRED_MAX_PHYSICAL_ATTEMPTS"));
+        assert!(traversal.contains("admission.close_on_drop()"));
+        assert!(traversal.contains("group_shared_physical_admission"));
+
+        let ordinary = source_section(
+            "pub(crate) async fn retrieve_data_range_from_root_cancellable(",
+            "async fn retrieve_data_range_from_root_with_prefix_cancellable(",
+        );
+        assert!(ordinary.contains("ORDINARY_DATA_RANGE_TRAVERSAL"));
+        assert!(RETRIEVAL_SOURCE.contains("const RETRIEVE_ATTEMPT_TIMEOUT_MS: u64 = 10_000;"));
+        assert!(RETRIEVAL_SOURCE.contains("const RETRIEVE_CHUNK_MAX_ATTEMPT_ERRORS: usize = 20;"));
+        assert!(
+            RETRIEVAL_SOURCE
+                .contains("pub(crate) const CONSERVATIVE_DEFERRED_MAX_PHYSICAL_ATTEMPTS: u64")
         );
     }
 }

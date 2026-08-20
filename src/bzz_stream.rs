@@ -10,18 +10,19 @@ use crate::{
     mpsc,
     retrieval::{
         DecodedJoinChunk, retrieve_data, retrieve_data_range_from_root,
-        retrieve_data_range_from_root_cancellable, retrieve_decoded_data_root,
-        retrieve_decoded_data_root_cancellable, retrieve_feed_update_at_index,
-        retrieve_feed_update_at_index_bounded, retrieve_feed_update_at_index_retained_status,
-        retrieve_feed_update_at_index_status, seek_latest_feed_update,
-        seek_latest_feed_update_indexed_from, seek_latest_feed_update_indexed_observing_positive,
+        retrieve_data_range_from_root_cancellable, retrieve_data_range_from_root_conservative,
+        retrieve_decoded_data_root, retrieve_decoded_data_root_cancellable,
+        retrieve_feed_update_at_index, retrieve_feed_update_at_index_bounded,
+        retrieve_feed_update_at_index_retained_status, retrieve_feed_update_at_index_status,
+        seek_latest_feed_update, seek_latest_feed_update_indexed_from,
+        seek_latest_feed_update_indexed_observing_positive,
         seek_latest_feed_update_indexed_wide_bounded,
     },
     retrieve_cancel_token_current,
 };
 
 use libp2p::futures::{StreamExt, stream};
-use std::{rc::Rc, time::Duration};
+use std::{future::Future, rc::Rc, time::Duration};
 
 const RANGE_RETRIEVE_RETRY_COUNT: usize = 2;
 const RANGE_RETRIEVE_RETRY_WAIT_MS: u64 = 120;
@@ -272,6 +273,31 @@ impl DeferredRawFeedPayload {
     }
 }
 
+fn deferred_raw_feed_payload_root(
+    deferred: &DeferredRawFeedPayload,
+) -> Option<(DecodedJoinChunk, bool)> {
+    [false, true].into_iter().find_map(|encrypted| {
+        let root = embedded_join_root(&deferred.update, encrypted)?;
+        (root.span == deferred.span).then_some((root, encrypted))
+    })
+}
+
+fn conservative_deferred_payload_range(
+    payload_span: u64,
+    start: u64,
+    maximum_len: u64,
+) -> Option<(u64, u64)> {
+    if start >= payload_span
+        || maximum_len == 0
+        || maximum_len > crate::retrieval::CONSERVATIVE_DEFERRED_RANGE_BYTES
+    {
+        return None;
+    }
+    let len = payload_span.checked_sub(start)?.min(maximum_len);
+    let end_inclusive = start.checked_add(len)?.checked_sub(1)?;
+    Some((start, end_inclusive))
+}
+
 #[derive(Clone, Debug)]
 pub(crate) enum RetainedRawFeedPayloadProbe {
     Found(RawFeedPayload),
@@ -430,6 +456,81 @@ pub(crate) async fn acquire_deferred_raw_feed_payload(
     )
     .await?;
     (u64::try_from(bytes.len()).ok()? == deferred.span).then_some(RawFeedPayload {
+        index: deferred.index,
+        bytes,
+    })
+}
+
+pub(crate) async fn probe_deferred_raw_feed_payload_tail_conservative(
+    deferred: &DeferredRawFeedPayload,
+    maximum_tail_bytes: usize,
+    chunk_retrieve_chan: &ChunkRetrieveSender,
+) -> Option<Vec<u8>> {
+    let maximum_tail_bytes = u64::try_from(maximum_tail_bytes)
+        .ok()?
+        .min(crate::retrieval::CONSERVATIVE_DEFERRED_RANGE_BYTES);
+    let (root, encrypted) = deferred_raw_feed_payload_root(deferred)?;
+    if root.span == 0 || !manifest_payload_size_allowed(root.span) {
+        return None;
+    }
+    let tail_start = root.span.saturating_sub(maximum_tail_bytes);
+    let (start, end_inclusive) =
+        conservative_deferred_payload_range(root.span, tail_start, maximum_tail_bytes)?;
+    let expected_len = end_inclusive.checked_sub(start)?.checked_add(1)?;
+    let tail = retrieve_data_range_from_root_conservative(
+        root,
+        start,
+        end_inclusive,
+        encrypted,
+        chunk_retrieve_chan,
+    )
+    .await?;
+    (u64::try_from(tail.len()).ok()? == expected_len).then_some(tail)
+}
+
+pub(crate) async fn acquire_deferred_raw_feed_payload_conservative<F, Fut>(
+    deferred: DeferredRawFeedPayload,
+    maximum_payload_bytes: usize,
+    chunk_retrieve_chan: &ChunkRetrieveSender,
+    mut admit_range: F,
+) -> Option<RawFeedPayload>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = bool>,
+{
+    let maximum_span = u64::try_from(maximum_payload_bytes).ok()?;
+    let (root, encrypted) = deferred_raw_feed_payload_root(&deferred)?;
+    if root.span == 0 || root.span > maximum_span || !manifest_payload_size_allowed(root.span) {
+        return None;
+    }
+    let span = root.span;
+    let mut bytes = Vec::new();
+    bytes.try_reserve_exact(usize::try_from(span).ok()?).ok()?;
+    let mut start = 0u64;
+    while let Some((range_start, range_end)) = conservative_deferred_payload_range(
+        span,
+        start,
+        crate::retrieval::CONSERVATIVE_DEFERRED_RANGE_BYTES,
+    ) {
+        if !admit_range().await {
+            return None;
+        }
+        let range = retrieve_data_range_from_root_conservative(
+            root.clone(),
+            range_start,
+            range_end,
+            encrypted,
+            chunk_retrieve_chan,
+        )
+        .await?;
+        let expected_len = range_end.checked_sub(range_start)?.checked_add(1)?;
+        if u64::try_from(range.len()).ok()? != expected_len {
+            return None;
+        }
+        bytes.extend_from_slice(&range);
+        start = range_end.checked_add(1)?;
+    }
+    (start == span && u64::try_from(bytes.len()).ok()? == span).then_some(RawFeedPayload {
         index: deferred.index,
         bytes,
     })

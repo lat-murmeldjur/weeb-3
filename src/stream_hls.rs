@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::{
     borrow::Cow,
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     sync::Arc,
 };
 
@@ -20,6 +20,7 @@ pub(crate) const HLS_SPARSE_HISTORY_MAX_CANDIDATES: usize =
 pub(crate) const HLS_SPARSE_HISTORY_MAX_WINDOW_BYTES: usize = 64 * 1024;
 pub(crate) const HLS_SPARSE_HISTORY_MAX_AGGREGATE_BYTES: usize = 16 * 1024 * 1024;
 pub(crate) const HLS_SPARSE_HISTORY_MAX_PARALLEL: usize = 64;
+pub(crate) const HLS_SEQUENCE_ZERO_RECOVERY_BATCH: usize = 4;
 const HLS_SPARSE_HISTORY_CAPACITY_REFRESH_MS: f64 = 100.0;
 
 pub(crate) fn hls_sparse_history_parallelism(
@@ -69,6 +70,126 @@ pub(crate) fn plan_hls_sparse_terminal_repairs(head_index: u64) -> Option<Vec<u6
     )
 }
 
+pub(crate) fn plan_hls_sequence_zero_followup_recovery(
+    head_index: u64,
+    recovery_cursor: u64,
+    retry_index: Option<u64>,
+) -> Option<(Vec<u64>, u64)> {
+    let recovery_start = head_index.checked_add(recovery_cursor)?;
+    let mut targets = plan_hls_sparse_terminal_repairs(head_index)?;
+    for offset in 0..HLS_SEQUENCE_ZERO_RECOVERY_BATCH {
+        let index = recovery_start.checked_add(u64::try_from(offset).ok()?)?;
+        if !targets.contains(&index) {
+            targets.push(index);
+        }
+    }
+    if let Some(retry_index) = retry_index
+        && !targets.contains(&retry_index)
+    {
+        targets.push(retry_index);
+    }
+    let next_recovery_cursor =
+        recovery_cursor.checked_add(u64::try_from(HLS_SEQUENCE_ZERO_RECOVERY_BATCH).ok()?)?;
+    Some((targets, next_recovery_cursor))
+}
+
+pub(crate) fn plan_hls_sequence_zero_terminal_confirmation(head_index: u64) -> Option<Vec<u64>> {
+    (1..=HLS_SPARSE_HISTORY_STRIDE.checked_mul(2)?)
+        .map(|offset| head_index.checked_add(offset))
+        .collect()
+}
+
+pub(crate) fn hls_tail_has_terminal_endlist(bytes: &[u8]) -> bool {
+    bytes
+        .split(|byte| *byte == b'\n')
+        .rev()
+        .find(|line| !line.iter().all(u8::is_ascii_whitespace))
+        .map(|line| line.strip_suffix(b"\r").unwrap_or(line))
+        .is_some_and(|line| line == HLS_ENDLIST.as_bytes())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct HlsSequenceZeroRetry {
+    pub(crate) index: u64,
+    pub(crate) authenticated: bool,
+}
+
+pub(crate) fn remember_hls_sequence_zero_retry(
+    retries: &mut VecDeque<HlsSequenceZeroRetry>,
+    index: u64,
+    authenticated: bool,
+    priority: bool,
+    capacity: usize,
+) -> bool {
+    if let Some(position) = retries.iter().position(|current| current.index == index) {
+        let authenticated = retries[position].authenticated || authenticated;
+        if priority && position > 0 {
+            retries.remove(position);
+            retries.push_front(HlsSequenceZeroRetry {
+                index,
+                authenticated,
+            });
+        } else {
+            retries[position].authenticated = authenticated;
+        }
+        return true;
+    }
+    if retries.len() >= capacity {
+        return false;
+    }
+    let retry = HlsSequenceZeroRetry {
+        index,
+        authenticated,
+    };
+    if priority {
+        retries.push_front(retry);
+    } else {
+        retries.push_back(retry);
+    }
+    true
+}
+
+pub(crate) fn retain_hls_sequence_zero_retries_after(
+    retries: &mut VecDeque<HlsSequenceZeroRetry>,
+    head_index: u64,
+) {
+    retries.retain(|retry| retry.index > head_index);
+}
+
+pub(crate) fn hls_sequence_zero_ordinary_retry(
+    retries: &VecDeque<HlsSequenceZeroRetry>,
+    deferred_present: bool,
+) -> Option<HlsSequenceZeroRetry> {
+    if deferred_present {
+        retries.iter().copied().find(|retry| retry.authenticated)
+    } else {
+        retries.front().copied()
+    }
+}
+
+pub(crate) fn select_hls_sequence_zero_retry(
+    deferred_retry_index: Option<u64>,
+    ordinary_retry: Option<HlsSequenceZeroRetry>,
+    deferred_first: bool,
+) -> Option<u64> {
+    match (deferred_retry_index, ordinary_retry) {
+        (Some(_), Some(ordinary)) if ordinary.authenticated && !deferred_first => {
+            Some(ordinary.index)
+        }
+        (Some(deferred), _) => Some(deferred),
+        (None, ordinary) => ordinary.map(|retry| retry.index),
+    }
+}
+
+pub(crate) fn hls_sequence_zero_retry_stays_queued(
+    authenticated: bool,
+    transient: bool,
+    unavailable_or_unsupported: bool,
+    transferred_to_deferred: bool,
+) -> bool {
+    transient || (authenticated && unavailable_or_unsupported && !transferred_to_deferred)
+}
+
 #[cfg(target_arch = "wasm32")]
 thread_local! {
     static HLS_VIDEO_RESOLUTION: std::cell::Cell<Option<(u32, u32)>> = const {
@@ -112,19 +233,306 @@ pub(crate) struct HlsMediaSelection {
     pub(crate) superseded_plan_ids: Vec<u64>,
 }
 
+pub(crate) const HLS_AUTOPLAY_BUFFER_SECONDS: f64 = 2.0;
+const HLS_BUFFER_EDGE_EPSILON_SECONDS: f64 = 0.05;
+
+pub(crate) fn hls_contiguous_buffered_ahead(current_time: f64, ranges: &[(f64, f64)]) -> f64 {
+    if !current_time.is_finite() || current_time < 0.0 {
+        return 0.0;
+    }
+    let mut edge = current_time;
+    for &(start, end) in ranges {
+        if !start.is_finite() || !end.is_finite() || end <= start {
+            continue;
+        }
+        if end + HLS_BUFFER_EDGE_EPSILON_SECONDS < edge {
+            continue;
+        }
+        if start > edge + HLS_BUFFER_EDGE_EPSILON_SECONDS {
+            break;
+        }
+        edge = edge.max(end);
+    }
+    (edge - current_time).max(0.0)
+}
+
+pub(crate) fn hls_autoplay_gate_ready(
+    buffered_ahead: f64,
+    current_time: f64,
+    duration: f64,
+    finalized: bool,
+) -> bool {
+    buffered_ahead >= HLS_AUTOPLAY_BUFFER_SECONDS
+        || (finalized
+            && buffered_ahead > 0.0
+            && current_time.is_finite()
+            && current_time >= 0.0
+            && duration.is_finite()
+            && duration > current_time
+            && current_time + buffered_ahead + HLS_BUFFER_EDGE_EPSILON_SECONDS >= duration)
+}
+
+pub(crate) fn hls_dom_play_is_explicit(autoplay_pending: bool) -> bool {
+    !autoplay_pending
+}
+
+pub(crate) fn hls_dom_pause_is_explicit(autoplay_pending: bool, playback_authorized: bool) -> bool {
+    !autoplay_pending && playback_authorized
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum HlsPrefetchMode {
+    Inactive,
+    StartupOnly,
+    Sustained,
+}
+
+pub(crate) const HLS_PROGRESSIVE_RANGE_WORKERS_PER_PLAN: usize = 3;
+pub(crate) const HLS_BACKGROUND_RANGE_MAX: usize = 4;
+
+pub(crate) fn hls_progressive_startup_window_count(payload_size: u64, window_bytes: u64) -> usize {
+    if payload_size == 0 || window_bytes == 0 {
+        return 0;
+    }
+    usize::try_from(payload_size.saturating_sub(1) / window_bytes + 1)
+        .unwrap_or(usize::MAX)
+        .min(HLS_BACKGROUND_RANGE_MAX)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum HlsProgressiveRangeAdmission {
+    Retire,
+    Park,
+    Admit,
+}
+
+pub(crate) fn hls_progressive_range_admission(
+    structurally_current: bool,
+    mode: HlsPrefetchMode,
+) -> HlsProgressiveRangeAdmission {
+    if !structurally_current {
+        HlsProgressiveRangeAdmission::Retire
+    } else if mode == HlsPrefetchMode::Sustained {
+        HlsProgressiveRangeAdmission::Admit
+    } else {
+        HlsProgressiveRangeAdmission::Park
+    }
+}
+
+pub(crate) fn hls_progressive_range_reservation_fits(
+    occupied_bytes: u64,
+    reserved_bytes: u64,
+    requested_bytes: u64,
+    limit_bytes: u64,
+) -> bool {
+    requested_bytes > 0
+        && occupied_bytes
+            .checked_add(reserved_bytes)
+            .and_then(|used| used.checked_add(requested_bytes))
+            .is_some_and(|used| used <= limit_bytes)
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct HlsProgressiveRangePlanner {
+    completed_position: usize,
+    completed_out_of_order: HashSet<usize>,
+    next_position: usize,
+    reference_count: usize,
+}
+
+impl HlsProgressiveRangePlanner {
+    pub(crate) fn new(current_position: usize, reference_count: usize) -> Self {
+        Self {
+            completed_position: current_position.min(reference_count),
+            completed_out_of_order: HashSet::new(),
+            next_position: current_position.saturating_add(1).min(reference_count),
+            reference_count,
+        }
+    }
+
+    pub(crate) fn worker_count(&self) -> usize {
+        self.reference_count
+            .saturating_sub(self.next_position)
+            .min(HLS_PROGRESSIVE_RANGE_WORKERS_PER_PLAN)
+    }
+
+    pub(crate) fn claim(&mut self) -> Option<usize> {
+        let position = self.next_position;
+        if position >= self.reference_count
+            || position
+                > self
+                    .completed_position
+                    .saturating_add(HLS_PROGRESSIVE_RANGE_WORKERS_PER_PLAN)
+        {
+            return None;
+        }
+        self.next_position = self.next_position.saturating_add(1);
+        Some(position)
+    }
+
+    pub(crate) fn has_unclaimed_references(&self) -> bool {
+        self.next_position < self.reference_count
+    }
+
+    pub(crate) fn complete(&mut self, position: usize) {
+        if position <= self.completed_position || position >= self.next_position {
+            return;
+        }
+        self.completed_out_of_order.insert(position);
+        while let Some(next) = self.completed_position.checked_add(1)
+            && self.completed_out_of_order.remove(&next)
+        {
+            self.completed_position = next;
+        }
+    }
+}
+
+pub(crate) fn hls_progressive_runway_closed_after_mode(
+    closed: bool,
+    mode: HlsPrefetchMode,
+) -> bool {
+    match mode {
+        HlsPrefetchMode::Inactive => true,
+        HlsPrefetchMode::Sustained => false,
+        HlsPrefetchMode::StartupOnly => closed,
+    }
+}
+
+pub(crate) fn touch_hls_cache_lru(order: &mut VecDeque<String>, reference: &str, foreground: bool) {
+    order.retain(|key| key != reference);
+    if foreground {
+        order.push_back(reference.to_string());
+    } else {
+        order.push_front(reference.to_string());
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum HlsProgressiveRunwayTransition {
+    Current,
+    Sequential,
+    Discontinuity,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct HlsProgressiveRunway {
+    current: String,
+    successor: Option<String>,
+}
+
+impl HlsProgressiveRunway {
+    pub(crate) fn new(current: String, successor: Option<String>) -> Self {
+        Self { current, successor }
+    }
+
+    pub(crate) fn current(&self) -> &str {
+        &self.current
+    }
+
+    pub(crate) fn successor(&self) -> Option<&str> {
+        self.successor.as_deref()
+    }
+
+    pub(crate) fn advance(
+        &mut self,
+        reference: &str,
+        successor: Option<String>,
+    ) -> HlsProgressiveRunwayTransition {
+        if self.current == reference {
+            self.successor = successor;
+            return HlsProgressiveRunwayTransition::Current;
+        }
+        let transition = if self.successor.as_deref() == Some(reference) {
+            HlsProgressiveRunwayTransition::Sequential
+        } else {
+            HlsProgressiveRunwayTransition::Discontinuity
+        };
+        self.current = reference.to_string();
+        self.successor = successor;
+        transition
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct HlsProgressiveRunways {
+    startup: Option<HlsProgressiveRunway>,
+    plans: HashMap<u64, HlsProgressiveRunway>,
+}
+
+impl HlsProgressiveRunways {
+    pub(crate) fn set_startup(&mut self, runway: HlsProgressiveRunway) {
+        self.startup = Some(runway);
+    }
+
+    pub(crate) fn startup_contains(&self, reference: &str) -> bool {
+        self.startup.as_ref().is_some_and(|runway| {
+            runway.current() == reference || runway.successor() == Some(reference)
+        })
+    }
+
+    pub(crate) fn advance(
+        &mut self,
+        plan_id: u64,
+        reference: &str,
+        successor: Option<String>,
+    ) -> HlsProgressiveRunwayTransition {
+        if !self.plans.contains_key(&plan_id) {
+            let runway = if self.startup_contains(reference) {
+                self.startup.take().expect("matching startup runway")
+            } else {
+                HlsProgressiveRunway::new(reference.to_string(), successor.clone())
+            };
+            self.plans.insert(plan_id, runway);
+        }
+        self.plans
+            .get_mut(&plan_id)
+            .expect("plan runway inserted above")
+            .advance(reference, successor)
+    }
+
+    pub(crate) fn contains(&self, plan_id: u64, reference: &str) -> bool {
+        self.plans.get(&plan_id).is_some_and(|runway| {
+            runway.current() == reference || runway.successor() == Some(reference)
+        })
+    }
+
+    pub(crate) fn current(&self, plan_id: u64, reference: &str) -> bool {
+        self.plans
+            .get(&plan_id)
+            .is_some_and(|runway| runway.current() == reference)
+    }
+
+    pub(crate) fn remove(&mut self, plan_id: u64) {
+        self.plans.remove(&plan_id);
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.startup = None;
+        self.plans.clear();
+    }
+}
+
 pub(crate) struct HlsMediaPlanRegistry {
     max_references: usize,
     next_plan_id: u64,
-    cursor_count: usize,
+    plan_order: VecDeque<u64>,
     cursors: HashMap<String, Vec<HlsMediaCursor>>,
 }
+
+pub(crate) struct HlsEvictedMediaPlan {
+    id: u64,
+    references: Arc<[String]>,
+}
+
+const HLS_MEDIA_PLAN_REGISTRY_MAX_PLANS: usize = 16;
+const HLS_MEDIA_PLAN_ACTIVE_TRACKS: usize = 4;
 
 impl HlsMediaPlanRegistry {
     pub(crate) fn new(max_references: usize) -> Self {
         Self {
             max_references: max_references.max(1),
             next_plan_id: 0,
-            cursor_count: 0,
+            plan_order: VecDeque::new(),
             cursors: HashMap::new(),
         }
     }
@@ -133,8 +541,6 @@ impl HlsMediaPlanRegistry {
         let max_references = max_references.max(1);
         if self.max_references != max_references {
             self.max_references = max_references;
-            self.cursor_count = 0;
-            self.cursors.clear();
         }
     }
 
@@ -143,7 +549,8 @@ impl HlsMediaPlanRegistry {
         mut references: Vec<String>,
         early_overlap_limit: usize,
         retain_tail: bool,
-    ) {
+        protected_plan_ids: &HashSet<u64>,
+    ) -> Vec<HlsEvictedMediaPlan> {
         if retain_tail && references.len() > self.max_references {
             references.drain(..references.len() - self.max_references);
         } else {
@@ -158,11 +565,34 @@ impl HlsMediaPlanRegistry {
                 })
             })
         {
-            return;
+            return Vec::new();
         }
-        if self.cursor_count.saturating_add(references.len()) > self.max_references {
-            self.cursors.clear();
-            self.cursor_count = 0;
+
+        let compatible = self.compatible_plan_ids(&references);
+        let retained_predecessor = compatible.iter().copied().max();
+        let mut evicted = Vec::new();
+        for plan_id in compatible {
+            if Some(plan_id) != retained_predecessor && !protected_plan_ids.contains(&plan_id) {
+                if let Some(references) = self.remove_plan(plan_id) {
+                    evicted.push(HlsEvictedMediaPlan {
+                        id: plan_id,
+                        references,
+                    });
+                }
+            }
+        }
+        while self.plan_order.len() >= HLS_MEDIA_PLAN_REGISTRY_MAX_PLANS {
+            let Some(plan_id) = self.plan_order.iter().copied().find(|plan_id| {
+                !protected_plan_ids.contains(plan_id) && Some(*plan_id) != retained_predecessor
+            }) else {
+                return evicted;
+            };
+            if let Some(references) = self.remove_plan(plan_id) {
+                evicted.push(HlsEvictedMediaPlan {
+                    id: plan_id,
+                    references,
+                });
+            }
         }
 
         self.next_plan_id = next_nonzero_generation(self.next_plan_id);
@@ -171,6 +601,7 @@ impl HlsMediaPlanRegistry {
             references: references.into(),
             early_overlap_limit,
         });
+        self.plan_order.push_back(plan.id);
         for (position, reference) in plan.references.iter().enumerate() {
             self.cursors
                 .entry(reference.clone())
@@ -179,8 +610,81 @@ impl HlsMediaPlanRegistry {
                     plan: plan.clone(),
                     position,
                 });
-            self.cursor_count += 1;
         }
+        evicted
+    }
+
+    fn compatible_plan_ids(&self, references: &[String]) -> HashSet<u64> {
+        let mut compatible = HashSet::new();
+        for (position, reference) in references.iter().enumerate() {
+            let Some(candidates) = self.cursors.get(reference) else {
+                continue;
+            };
+            for cursor in candidates {
+                let previous_matches = position.checked_sub(1).is_some_and(|position| {
+                    cursor
+                        .position
+                        .checked_sub(1)
+                        .is_some_and(|cursor_position| {
+                            references.get(position) == cursor.plan.references.get(cursor_position)
+                        })
+                });
+                let next_matches = references
+                    .get(position.saturating_add(1))
+                    .is_some_and(|next| {
+                        cursor
+                            .plan
+                            .references
+                            .get(cursor.position.saturating_add(1))
+                            == Some(next)
+                    });
+                if previous_matches || next_matches {
+                    compatible.insert(cursor.plan.id);
+                }
+            }
+        }
+        compatible
+    }
+
+    pub(crate) fn remove_plans(&mut self, plan_ids: &[u64]) {
+        for plan_id in plan_ids {
+            let _ = self.remove_plan(*plan_id);
+        }
+    }
+
+    fn references_for_plans(&self, plan_ids: &[u64]) -> Vec<String> {
+        if plan_ids.is_empty() {
+            return Vec::new();
+        }
+        let wanted = plan_ids.iter().copied().collect::<HashSet<_>>();
+        let mut found = HashSet::new();
+        let mut references = Vec::new();
+        for candidates in self.cursors.values() {
+            for cursor in candidates {
+                if wanted.contains(&cursor.plan.id) && found.insert(cursor.plan.id) {
+                    references.extend(cursor.plan.references.iter().cloned());
+                    if found.len() == wanted.len() {
+                        return references;
+                    }
+                }
+            }
+        }
+        references
+    }
+
+    fn remove_plan(&mut self, plan_id: u64) -> Option<Arc<[String]>> {
+        let references = self
+            .cursors
+            .values()
+            .flat_map(|candidates| candidates.iter())
+            .find(|cursor| cursor.plan.id == plan_id)
+            .map(|cursor| cursor.plan.references.clone());
+        self.plan_order.retain(|current| *current != plan_id);
+        self.cursors.retain(|_, candidates| {
+            candidates.retain(|cursor| cursor.plan.id != plan_id);
+            !candidates.is_empty()
+        });
+        references
     }
 
     pub(crate) fn cursor(
@@ -647,6 +1151,15 @@ pub(crate) fn hls_sequence_zero_covers_head(head: &[u8], candidate: &[u8]) -> bo
     hls_sequence_zero_timeline_covers_head(head, &candidate)
 }
 
+pub(crate) fn hls_sequence_zero_same_index_archive_is_reusable(
+    source: &[u8],
+    archive: &[u8],
+) -> bool {
+    hls_media_sequence(archive) == Some(0)
+        && hls_is_finalized(source) == hls_is_finalized(archive)
+        && hls_sequence_zero_covers_head(source, archive)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum HlsDirectArchiveDisposition {
     Stale,
@@ -690,6 +1203,44 @@ fn hls_sequence_zero_timeline_covers_head(head: &[u8], candidate: &HlsTimeline) 
 pub(crate) fn hls_sequence_zero_sparse_tail(candidate: &[u8]) -> Option<Vec<u8>> {
     let timeline = hls_complete_history_timeline(candidate)?;
     hls_sequence_zero_sparse_tail_from_timeline(candidate, &timeline)
+}
+
+pub(crate) fn hls_verified_sequence_zero_checkpoint_tail<'a>(
+    candidate: &[u8],
+    pinned_windows: impl IntoIterator<Item = &'a [u8]>,
+) -> Result<Option<Vec<u8>>, ()> {
+    let Some(timeline) = hls_complete_history_timeline(candidate) else {
+        return Ok(None);
+    };
+    if timeline.sequence != 0 || hls_is_finalized(candidate) {
+        return Ok(None);
+    }
+    if timeline.segments.len() <= HLS_SPARSE_HISTORY_STRIDE as usize {
+        return Ok(None);
+    }
+    if !pinned_windows
+        .into_iter()
+        .all(|window| hls_sequence_zero_timeline_covers_head(window, &timeline))
+    {
+        return Err(());
+    }
+    Ok(hls_sequence_zero_sparse_tail_from_timeline(
+        candidate, &timeline,
+    ))
+}
+
+pub(crate) fn hls_verified_sequence_zero_checkpoint_tail_at_index<'a>(
+    candidate_index: u64,
+    candidate: &[u8],
+    pinned_windows: impl IntoIterator<Item = (u64, &'a [u8])>,
+) -> Result<Option<Vec<u8>>, ()> {
+    hls_verified_sequence_zero_checkpoint_tail(
+        candidate,
+        pinned_windows
+            .into_iter()
+            .filter(|(index, _)| *index <= candidate_index)
+            .map(|(_, window)| window),
+    )
 }
 
 pub(crate) fn hls_is_long_sequence_zero_checkpoint(candidate: &[u8]) -> bool {
@@ -977,6 +1528,70 @@ impl HlsSparseHistoryArchive {
             && parsed.segments == self.segments)
             .then_some(self.body)
     }
+}
+
+pub(crate) fn assemble_hls_sequence_zero_suffix<'a>(
+    current_index: u64,
+    current: &[u8],
+    head_index: u64,
+    head: &[u8],
+    candidates: impl IntoIterator<Item = (u64, &'a [u8])>,
+) -> Option<Vec<u8>> {
+    if current_index > head_index || hls_is_finalized(current) {
+        return None;
+    }
+    let current_timeline = hls_complete_history_timeline(current)?;
+    let head_timeline = hls_complete_history_timeline(head)?;
+    if current_timeline.sequence != 0 || !hls_sparse_history_head_is_supported(head) {
+        return None;
+    }
+
+    let mut aggregate_bytes = current.len().checked_add(head.len())?;
+    if aggregate_bytes > HLS_SPARSE_HISTORY_MAX_AGGREGATE_BYTES {
+        return None;
+    }
+    let mut parsed = Vec::new();
+    let mut indices = HashSet::new();
+    for (index, bytes) in candidates {
+        if parsed.len() >= HLS_SPARSE_HISTORY_MAX_CANDIDATES
+            || index <= current_index
+            || index >= head_index
+            || !indices.insert(index)
+            || !hls_sparse_history_candidate_is_supported(bytes)
+        {
+            return None;
+        }
+        aggregate_bytes = aggregate_bytes.checked_add(bytes.len())?;
+        if aggregate_bytes > HLS_SPARSE_HISTORY_MAX_AGGREGATE_BYTES {
+            return None;
+        }
+        parsed.push((index, bytes, HlsTimeline::parse(bytes)?));
+    }
+    parsed.sort_by_key(|(index, _, timeline)| {
+        (
+            timeline.sequence,
+            timeline.end().unwrap_or(u64::MAX),
+            *index,
+        )
+    });
+
+    let mut archive = HlsSparseHistoryArchive::new(current, &current_timeline)?;
+    for (_, bytes, timeline) in parsed {
+        archive.admit(bytes, &timeline)?;
+    }
+    archive.admit(head, &head_timeline)?;
+    if hls_is_finalized(head) && !hls_is_finalized(&archive.body) {
+        if !archive.body.ends_with(b"\n") {
+            archive.body.push(b'\n');
+        }
+        archive.body.extend_from_slice(HLS_ENDLIST.as_bytes());
+        archive.body.push(b'\n');
+    }
+    let archive = archive.finish(head_timeline.end()?)?;
+    (hls_is_finalized(&archive) == hls_is_finalized(head)
+        && hls_sequence_zero_covers_head(current, &archive)
+        && hls_sequence_zero_covers_head(head, &archive))
+    .then_some(archive)
 }
 
 fn hls_complete_history_timeline(bytes: &[u8]) -> Option<HlsTimeline> {
@@ -1978,8 +2593,6 @@ pub(crate) fn stream_feed_payload_len_is_supported(length: usize) -> bool {
 }
 
 pub(crate) const FEED_FOLLOWUP_BATCH_LIMIT: usize = 4;
-pub(crate) const HLS_SEQUENCE_ZERO_PRESENTATION_BATCH_LIMIT: usize = 64;
-pub(crate) const HLS_SEQUENCE_ZERO_FOLLOWUP_MAX_PARALLEL: usize = 4;
 pub(crate) const HLS_TERMINAL_CONFIRMATION_MIN_PRICED_PEERS: u64 = 8;
 const FEED_HEAD_REFRESH_INTERVAL_MS: f64 = 15_000.0;
 
@@ -2231,14 +2844,15 @@ mod player {
     use web_sys::{CustomEvent, CustomEventInit, Element, Event, HtmlMediaElement};
 
     use super::{
-        HLS_LIVE_SYNC_SEGMENTS, classify_hls_level_transition, hls_timeline_rebase_position,
-        js_error_message,
+        HLS_LIVE_SYNC_SEGMENTS, classify_hls_level_transition, hls_autoplay_gate_ready,
+        hls_contiguous_buffered_ahead, hls_dom_pause_is_explicit, hls_dom_play_is_explicit,
+        hls_timeline_rebase_position, js_error_message,
     };
 
     const SWARM_REQUEST_TIMEOUT_MS: f64 = 240_000.0;
     const MAX_NETWORK_RECOVERY_ATTEMPTS: u8 = 2;
     const MAX_HARD_RESTART_ATTEMPTS: u8 = 2;
-    const HLS_BEGINNING_AUTOPLAY_HEAD_START: Duration = Duration::from_millis(500);
+    const HLS_AUTOPLAY_GATE_POLL: Duration = Duration::from_millis(50);
     const HLS_WARMUP_STOP_DELAY: Duration = Duration::from_millis(500);
 
     const HLS_CALLBACK_EVENTS: [&str; 5] = [
@@ -2249,7 +2863,7 @@ mod player {
         "hlsManifestParsed",
     ];
     const HLS_DOM_EVENTS: [&str; 3] = ["play", "pause", "resize"];
-    const NATIVE_DOM_EVENTS: [&str; 2] = ["error", "loadedmetadata"];
+    const NATIVE_DOM_EVENTS: [&str; 4] = ["play", "pause", "error", "loadedmetadata"];
     pub(crate) const HLS_AUTOPLAY_AUTHORIZED_EVENT: &str = "weeb3-hls-autoplay-authorized";
     pub(crate) const HLS_EXPLICIT_PAUSE_EVENT: &str = "weeb3-hls-explicit-pause";
     pub(crate) const HLS_TIMELINE_REBASE_EVENT: &str = "weeb3-hls-timeline-rebase";
@@ -2337,6 +2951,8 @@ mod player {
         playback_authorized: bool,
         autoplay_allowed: bool,
         autoplay_pending: bool,
+        autoplay_gate_required: bool,
+        autoplay_gate_pending: bool,
         resume: bool,
         recovery_pending: bool,
         hard_restarts: u8,
@@ -2363,6 +2979,7 @@ mod player {
         timeline_rebased: bool,
         resume: bool,
         autoplay_allowed: bool,
+        autoplay_gate_required: bool,
     }
 
     enum EventKind {
@@ -2478,6 +3095,9 @@ mod player {
                 "HLS playback requires a non-empty source",
             ));
         }
+        let autoplay_allowed = media.autoplay();
+        let autoplay_gate_required = autoplay_allowed;
+        media.set_autoplay(false);
         launch(Launch {
             media,
             source: source.to_string(),
@@ -2487,12 +3107,14 @@ mod player {
             hard_attempts: 0,
             timeline_rebased: false,
             resume: false,
-            autoplay_allowed: true,
+            autoplay_allowed,
+            autoplay_gate_required,
         })
         .await
     }
 
     async fn launch(mut request: Launch) -> Result<&'static str, JsValue> {
+        request.media.set_autoplay(false);
         request.resume |= request
             .media
             .get_attribute(HLS_PLAYBACK_AUTHORIZED_ATTRIBUTE)
@@ -2568,11 +3190,17 @@ mod player {
                     rebase,
                 ),
             )?;
+            if request.autoplay_gate_required {
+                media.set_preload("auto");
+            }
             media.set_src(&source);
             media.load();
-            autoplay(epoch, Autoplay::Policy);
             if resume {
                 autoplay(epoch, Autoplay::Resume);
+            } else if request.autoplay_gate_required {
+                start_autoplay_buffer_gate(epoch);
+            } else {
+                autoplay(epoch, Autoplay::Policy);
             }
             return Ok("native");
         }
@@ -2590,7 +3218,7 @@ mod player {
         if codec.1 {
             let _ = request.media.pause();
         }
-        let config = hls_config(!request.source.contains("start=live"));
+        let config = hls_config(request.source.contains("start=live"));
         let hls = construct_hls(
             hls_class
                 .as_ref()
@@ -2657,6 +3285,8 @@ mod player {
             playback_authorized: false,
             autoplay_allowed: request.autoplay_allowed,
             autoplay_pending: false,
+            autoplay_gate_required: request.autoplay_gate_required,
+            autoplay_gate_pending: false,
             resume,
             recovery_pending: false,
             hard_restarts: request.hard_attempts,
@@ -2840,21 +3470,25 @@ mod player {
         media.set_current_time(target);
         let ready = with_session(epoch, |session| {
             if !session.codec_pending {
-                return false;
+                return None;
             }
+            let resume = session.playback_authorized || session.resume;
             session.source = clean;
             session.codec_required = false;
             session.codec_pending = false;
             session.initial_position = -1.0;
-            true
+            Some(resume)
         })
-        .unwrap_or(false);
-        if ready {
+        .flatten();
+        if let Some(resume) = ready {
             spawn_local(async move {
                 Wait::Microtask.wait().await;
                 if is_current(epoch) {
-                    autoplay(epoch, Autoplay::Resume);
-                    autoplay(epoch, Autoplay::Policy);
+                    if resume {
+                        autoplay(epoch, Autoplay::Resume);
+                    } else {
+                        start_autoplay_buffer_gate(epoch);
+                    }
                 }
             });
         }
@@ -2866,7 +3500,8 @@ mod player {
             session.media_recoveries = 0;
             let stop = matches!(session.load, LoadPhase::Warmup)
                 && session.media.paused()
-                && !session.codec_pending;
+                && !session.codec_pending
+                && !session.autoplay_gate_pending;
             (session.media.clone(), stop)
         });
         let Some((media, stop)) = action else {
@@ -2907,11 +3542,10 @@ mod player {
                 session.load = LoadPhase::Warmup;
                 session.hls().cloned().map(|hls| (hls, resume, position))
             });
-            let head_start =
-                start && !resume && position == 0.0 && !session.source.contains("start=live");
-            (session.media.clone(), load.flatten(), head_start)
+            let gated_start = start && !resume && session.autoplay_gate_required;
+            (session.media.clone(), load.flatten(), gated_start)
         });
-        let Some((media, load, head_start)) = action else {
+        let Some((media, load, gated_start)) = action else {
             return;
         };
         set_state(
@@ -2928,16 +3562,69 @@ mod player {
                 autoplay(epoch, Autoplay::Resume);
             }
         }
-        if head_start {
-            spawn_local(async move {
-                sleep(HLS_BEGINNING_AUTOPLAY_HEAD_START).await;
-                if is_current(epoch) {
-                    autoplay(epoch, Autoplay::Policy);
-                }
-            });
+        if gated_start {
+            start_autoplay_buffer_gate(epoch);
         } else {
             autoplay(epoch, Autoplay::Policy);
         }
+    }
+
+    fn start_autoplay_buffer_gate(epoch: u64) {
+        let start = with_session(epoch, |session| {
+            if !session.autoplay_gate_required
+                || session.playback_authorized
+                || session.autoplay_gate_pending
+            {
+                return false;
+            }
+            session.autoplay_gate_pending = true;
+            true
+        })
+        .unwrap_or(false);
+        if !start {
+            return;
+        }
+        spawn_local(async move {
+            loop {
+                let ready = with_session(epoch, |session| {
+                    if session.playback_authorized {
+                        return true;
+                    }
+                    if session.codec_pending {
+                        return false;
+                    }
+                    let media = &session.media;
+                    let ranges = media.buffered();
+                    let mut buffered = Vec::with_capacity(ranges.length() as usize);
+                    for index in 0..ranges.length() {
+                        if let (Ok(start), Ok(end)) = (ranges.start(index), ranges.end(index)) {
+                            buffered.push((start, end));
+                        }
+                    }
+                    let current_time = media.current_time();
+                    let finalized = session.level_snapshots.values().any(|(_, live, _)| !live);
+                    hls_autoplay_gate_ready(
+                        hls_contiguous_buffered_ahead(current_time, &buffered),
+                        current_time,
+                        media.duration(),
+                        finalized,
+                    )
+                })
+                .unwrap_or(true);
+                if ready || !is_current(epoch) {
+                    break;
+                }
+                sleep(HLS_AUTOPLAY_GATE_POLL).await;
+            }
+            let ready_to_attempt = with_session(epoch, |session| {
+                session.autoplay_gate_pending = false;
+                !session.playback_authorized && !session.codec_pending
+            })
+            .unwrap_or(false);
+            if ready_to_attempt && is_current(epoch) {
+                autoplay(epoch, Autoplay::Policy);
+            }
+        });
     }
 
     fn level_loaded(epoch: u64, data: &JsValue) {
@@ -2985,6 +3672,7 @@ mod player {
                     timeline_rebased: true,
                     resume: session.playback_authorized,
                     autoplay_allowed: session.autoplay_allowed,
+                    autoplay_gate_required: session.autoplay_gate_required,
                 },
                 session.hls().cloned(),
             ))
@@ -3025,20 +3713,21 @@ mod player {
             "play" => {
                 let action = with_session(epoch, |session| {
                     let pending = session.autoplay_pending;
+                    let user = hls_dom_play_is_explicit(pending);
                     let first = matches!(session.load, LoadPhase::Cold);
                     let resume = !first && !matches!(session.load, LoadPhase::Warmup);
                     let position = session.rebase_position.unwrap_or(session.initial_position);
-                    if !pending || first {
+                    if user || first {
                         session.load = LoadPhase::Started;
                     }
-                    if !pending {
+                    if user {
                         session.playback_authorized = true;
                         session.autoplay_allowed = true;
                     }
                     let load = session.hls().cloned().and_then(|hls| {
                         (first || resume).then_some((hls, first.then_some(position)))
                     });
-                    (session.media.clone(), load, !pending)
+                    (session.media.clone(), load, user)
                 });
                 let Some((media, load, user)) = action else {
                     return;
@@ -3067,7 +3756,10 @@ mod player {
             }
             "pause" => {
                 let action = with_session(epoch, |session| {
-                    if !session.playback_authorized {
+                    if !hls_dom_pause_is_explicit(
+                        session.autoplay_pending,
+                        session.playback_authorized,
+                    ) {
                         return None;
                     }
                     session.playback_authorized = false;
@@ -3318,6 +4010,7 @@ mod player {
                         timeline_rebased,
                         resume: session.playback_authorized || session.resume,
                         autoplay_allowed: session.autoplay_allowed,
+                        autoplay_gate_required: session.autoplay_gate_required,
                     });
                     let Some(request) = request else { return };
                     if let Err(error) = launch(request).await {
@@ -3349,8 +4042,7 @@ mod player {
 
     fn autoplay(epoch: u64, intent: Autoplay) {
         let media = with_session(epoch, |session| {
-            let allowed = matches!(intent, Autoplay::Resume)
-                || (session.autoplay_allowed && session.media.autoplay());
+            let allowed = matches!(intent, Autoplay::Resume) || session.autoplay_allowed;
             (allowed
                 && !session.codec_pending
                 && !session.playback_authorized
@@ -3472,12 +4164,12 @@ mod player {
         diagnostic
     }
 
-    fn hls_config(progressive: bool) -> Object {
+    fn hls_config(live_start: bool) -> Object {
         let config = Object::new();
         set_property(&config, "enableWorker", JsValue::TRUE);
         set_property(&config, "autoStartLoad", JsValue::FALSE);
         set_property(&config, "startFragPrefetch", JsValue::FALSE);
-        set_property(&config, "progressive", JsValue::from_bool(progressive));
+        set_property(&config, "progressive", JsValue::TRUE);
         for name in [
             "manifestLoadPolicy",
             "playlistLoadPolicy",
@@ -3487,7 +4179,7 @@ mod player {
             set_property(&config, name, swarm_load_policy().into());
         }
 
-        if !progressive {
+        if live_start {
             set_property(
                 &config,
                 "liveSyncDurationCount",
@@ -3588,7 +4280,7 @@ pub(crate) use player::{
 mod runtime {
     use super::*;
     use std::{
-        cell::RefCell,
+        cell::{Cell, RefCell},
         collections::{BTreeMap, HashMap, HashSet, VecDeque},
         future::Future,
         ops::{Deref, DerefMut},
@@ -3608,13 +4300,15 @@ mod runtime {
     use crate::{
         Weeb3,
         bzz_stream::{
-            DeferredRawFeedPayload, RawFeedPayload, RetainedRawFeedPayloadProbe,
+            BzzMetadata, DeferredRawFeedPayload, RawFeedPayload, RetainedRawFeedPayloadProbe,
             StartupRawFeedPayload, acquire_deferred_raw_feed_payload,
+            acquire_deferred_raw_feed_payload_conservative,
             acquire_latest_raw_feed_payload_bounded_from, acquire_latest_raw_feed_payload_from,
             acquire_latest_raw_feed_payload_startup,
             acquire_latest_raw_feed_payload_startup_observing_deferred,
             acquire_raw_feed_payload_at_index, acquire_raw_feed_payload_at_index_bounded,
             acquire_raw_feed_payload_at_index_retained_status,
+            probe_deferred_raw_feed_payload_tail_conservative,
         },
         feed::FEED_FRONTIER_LOOKAHEAD_TIMEOUT,
         interface::{service_worker_controls_bzz_requests, service_worker_scope_protocol_error},
@@ -3622,15 +4316,16 @@ mod runtime {
         network_profile::active_profile,
         normalize_feed_topic, register_retrieve_cancel_token,
         retrieval::{
-            retrieve_data_payload, retrieve_data_payload_cancellable,
-            retrieve_data_range_join_cancellable, retrieve_decoded_data_root,
+            CONSERVATIVE_DEFERRED_MAX_PHYSICAL_ATTEMPTS, retrieve_data_payload,
+            retrieve_data_payload_cancellable, retrieve_decoded_data_root,
         },
         retrieval_conventions::{PendingGenerationRelation, pending_generation_relation},
         stream::{
-            FetchResponse, begin_result_view_request, clear_completed_bzz_media_ranges,
-            media_cache_max_bytes, next_media_generation, range_cache_body_bytes,
-            replace_stream_result_view, result_view_request_is_current,
-            retain_media_element_callback,
+            FetchResponse, HlsBackgroundRangeFlightGuard, begin_result_view_request,
+            clear_completed_bzz_media_ranges, evict_completed_hls_ranges, hls_aligned_range_cached,
+            hls_range_body_fully_cached, media_cache_max_bytes, next_media_generation,
+            range_cache_body_bytes, read_cached_hls_range, replace_stream_result_view,
+            result_view_request_is_current, retain_media_element_callback,
         },
         stream_conventions::{
             MEDIA_PREFETCH_BATCH_YIELD_MS, MEDIA_PREFETCH_MAX_PARALLEL,
@@ -3722,11 +4417,13 @@ mod runtime {
         }
 
         async fn retrieve_hls_payload_range(
-            &self,
+            self: &Arc<Self>,
             address: String,
+            payload_size: u64,
             start: u64,
             end_inclusive: u64,
             stream_generation: Option<u64>,
+            background: Option<HlsBackgroundRangeRequest>,
         ) -> Vec<u8> {
             let progress_id = self
                 .start_progress(
@@ -3737,31 +4434,48 @@ mod runtime {
                     "starting",
                 )
                 .await;
-            let reference = match hex::decode(&address) {
-                Ok(reference) => reference,
-                Err(_) => {
+            let metadata = match hls_range_metadata(&address, payload_size) {
+                Some(metadata) => metadata,
+                None => {
                     self.finish_progress(&progress_id, "failed", "invalid reference", false)
                         .await;
                     return Vec::new();
                 }
             };
 
-            let cancel = stream_generation.and_then(|generation| {
-                stream_retrieve_cancel_token(HLS_STREAM_KEY.to_string(), generation)
-            });
-            register_retrieve_cancel_token(&self.retrieve_cancel_generations, &cancel).await;
-            let cancel_generations = cancel
-                .as_ref()
-                .map(|_| self.retrieve_cancel_generations.clone());
-            let bytes = retrieve_data_range_join_cancellable(
-                &reference,
+            let background_flight = match background {
+                Some(HlsBackgroundRangeRequest { flight, admit }) => {
+                    // start_progress awaits UI bookkeeping. Recheck the exact
+                    // playback stamp/ticket after that yield and immediately
+                    // before the shared cache chooses Cached/Wait/Lead.
+                    if !admit() {
+                        drop(flight);
+                        self.finish_progress(
+                            &progress_id,
+                            "failed",
+                            "background range admission retired",
+                            false,
+                        )
+                        .await;
+                        return Vec::new();
+                    }
+                    Some(flight)
+                }
+                None => None,
+            };
+
+            let bytes = read_cached_hls_range(
+                self.clone(),
+                address,
+                metadata,
                 start,
                 end_inclusive,
-                &self.chunk_port.0,
-                cancel_generations,
-                cancel,
+                stream_generation,
+                HLS_STREAM_KEY.to_string(),
+                background_flight,
             )
-            .await;
+            .await
+            .unwrap_or_default();
             let expected = end_inclusive
                 .checked_sub(start)
                 .and_then(|length| length.checked_add(1))
@@ -3896,6 +4610,22 @@ mod runtime {
             .await
         }
 
+        async fn hls_feed_payload_at_index_followup_retained_status(
+            &self,
+            owner: String,
+            topic: String,
+            index: u64,
+        ) -> RetainedRawFeedPayloadProbe {
+            acquire_raw_feed_payload_at_index_retained_status(
+                owner,
+                topic,
+                index,
+                crate::erasure_coding::CHUNK_SIZE,
+                &self.chunk_port.0,
+            )
+            .await
+        }
+
         async fn hls_deferred_feed_payload(
             &self,
             deferred: DeferredRawFeedPayload,
@@ -3915,6 +4645,8 @@ mod runtime {
         static HLS_CODEC_BOOTSTRAP_PRESENTATION: RefCell<Option<HlsCodecBootstrapPresentation>> =
             const { RefCell::new(None) };
         static HLS_ASSET_CACHE: RefCell<HlsAssetCache> = RefCell::new(HlsAssetCache::new());
+        static HLS_PROGRESSIVE_RANGE_BACKGROUND: RefCell<HlsProgressiveRangeBackground> =
+            RefCell::new(HlsProgressiveRangeBackground::default());
     }
 
     const FEED_ROUTE_CACHE_MAX_ENTRIES: usize = 64;
@@ -3929,6 +4661,8 @@ mod runtime {
     const HLS_FEED_WAVE_FOREGROUND_MARGIN_CHUNKS: u64 = 64;
     const HLS_FEED_WAVE_RESERVATIONS_PER_PROBE: u64 = 2;
     const HLS_ASSET_METADATA_CACHE_MAX_ENTRIES: usize = 1024;
+    const HLS_PROGRESSIVE_REPLAY_MAX_REFERENCES: usize = 8;
+    const HLS_PROGRESSIVE_ROUTE_MAX_REFERENCES: usize = 16;
     const HLS_ASSET_PROBE_BYTES: u64 = 512;
     const HLS_REPRESENTATION_VERSION: &str = "weeb3-hls-v2";
     const HLS_MEDIA_PLAN_MAX_REFERENCES: usize = 4096;
@@ -3953,12 +4687,14 @@ mod runtime {
     const HLS_EXACT_NEXT_HEAD_START: Duration = Duration::from_secs(1);
     const HLS_NEXT_RESERVE_STAGGER: Duration = Duration::from_secs(1);
     const HLS_SEQUENCE_ZERO_CANONICAL_EXCLUSIVITY: Duration = Duration::from_secs(10);
+    const HLS_SEQUENCE_ZERO_PROVISIONAL_GUARD_WAVES: usize = 4;
+    const HLS_SEQUENCE_ZERO_RETRY_BACKLOG_MAX: usize = 32;
     const HLS_EXACT_OVERLAP_ADMISSION_BUDGET: Duration = Duration::from_secs(30);
     const HLS_INITIAL_RESPONSE_BUDGET_MS: f64 = 15_000.0;
     const HLS_PAYLOAD_RETRY_DELAY_MS: u64 = 75;
     const HLS_PAYLOAD_SIZE_RETRY_DELAY_MS: u64 = 250;
     const HLS_STARTUP_LOOKAHEAD_BYTES: u64 = 2 * MEDIA_STARTUP_RESPONSE_BYTES;
-    const HLS_PROGRESSIVE_SUCCESSOR_PREFIX_BYTES: u64 = MEDIA_STORAGE_WINDOW_BYTES * 3;
+    const HLS_LIVE_PREFIX_WINDOW_COUNT: usize = 3;
 
     fn hls_segment_progress_detail(reference: &str, size: Option<usize>) -> String {
         let mut detail = size.map_or_else(
@@ -4006,6 +4742,11 @@ mod runtime {
         source_endlist_confirmed: bool,
         checking_token: u64,
         confirmed_head_index: Option<u64>,
+        sequence_zero_recovery_cursor: u64,
+        sequence_zero_retry_indices: VecDeque<HlsSequenceZeroRetry>,
+        sequence_zero_deferred_retry_index: Option<u64>,
+        sequence_zero_retry_deferred_first: bool,
+        sequence_zero_positive_ceiling: u64,
         last_head_check: f64,
         last_touch: f64,
     }
@@ -4109,13 +4850,30 @@ mod runtime {
         prefetched_body: Option<Arc<[u8]>>,
     }
 
-    #[derive(Clone, Copy, Eq, PartialEq)]
+    #[derive(Clone, Copy, Eq, Hash, PartialEq)]
     struct PlaybackStamp {
         generation: u64,
         timeline_epoch: u64,
     }
 
-    #[derive(Clone, Copy, Eq, PartialEq)]
+    fn hls_playback_stamp_token(stamp: PlaybackStamp) -> String {
+        format!("{:016x}:{:016x}", stamp.generation, stamp.timeline_epoch)
+    }
+
+    fn parse_hls_playback_stamp_token(token: &str) -> Option<PlaybackStamp> {
+        let (generation, timeline_epoch) = token.split_once(':')?;
+        if generation.len() != 16 || timeline_epoch.len() != 16 || timeline_epoch.contains(':') {
+            return None;
+        }
+        let generation = u64::from_str_radix(generation, 16).ok()?;
+        let timeline_epoch = u64::from_str_radix(timeline_epoch, 16).ok()?;
+        (generation != 0 && timeline_epoch != 0).then_some(PlaybackStamp {
+            generation,
+            timeline_epoch,
+        })
+    }
+
+    #[derive(Clone, Copy, Eq, Hash, PartialEq)]
     struct PrefetchTicket {
         stamp: PlaybackStamp,
         plan_id: u64,
@@ -4125,22 +4883,69 @@ mod runtime {
     struct HlsPrefetchTrack {
         schedule_id: u64,
         last_foreground_position: usize,
+        range_retire_position: usize,
         running: Option<PrefetchTicket>,
         last_touch: u64,
     }
 
-    #[derive(Clone, Copy, PartialEq, Eq)]
-    enum HlsPrefetchMode {
-        Inactive,
-        StartupOnly,
-        Sustained,
+    #[derive(Default)]
+    struct HlsProgressiveRangeBackground {
+        active: usize,
+        reserved_bytes: u64,
+        owned_ranges: HashMap<HlsProgressiveRangeKey, HashSet<HlsProgressiveRangeOwner>>,
+        retired_references: HashMap<String, Option<u64>>,
     }
 
-    struct BeginningRunway {
-        first: String,
-        successor: Option<String>,
-        successor_prefix_started: bool,
-        successor_prefix_ready: bool,
+    #[derive(Clone, Eq, Hash, PartialEq)]
+    struct HlsProgressiveRangeKey {
+        reference: String,
+        payload_size: u64,
+        start: u64,
+        end: u64,
+    }
+
+    #[derive(Clone, Copy, Eq, Hash, PartialEq)]
+    struct HlsProgressiveRangeOwner {
+        ticket: PrefetchTicket,
+        position: usize,
+    }
+
+    struct HlsBackgroundRangeLease {
+        reserved_bytes: u64,
+    }
+
+    struct HlsBackgroundRangeRequest {
+        flight: HlsBackgroundRangeFlightGuard,
+        admit: Box<dyn FnOnce() -> bool>,
+    }
+
+    impl HlsBackgroundRangeRequest {
+        fn new(lease: HlsBackgroundRangeLease, admit: impl FnOnce() -> bool + 'static) -> Self {
+            Self {
+                flight: HlsBackgroundRangeFlightGuard::new(move || drop(lease)),
+                admit: Box::new(admit),
+            }
+        }
+    }
+
+    impl Drop for HlsBackgroundRangeLease {
+        fn drop(&mut self) {
+            HLS_PROGRESSIVE_RANGE_BACKGROUND.with(|background| {
+                let mut background = background.borrow_mut();
+                background.active = background.active.saturating_sub(1);
+                background.reserved_bytes = background
+                    .reserved_bytes
+                    .saturating_sub(self.reserved_bytes);
+            });
+        }
+    }
+
+    enum HlsProgressiveRangeLeaseAttempt {
+        Acquired(HlsBackgroundRangeLease),
+        Busy,
+        Budget,
+        Park,
+        Retire,
     }
 
     struct HlsPrefetchSession {
@@ -4151,7 +4956,9 @@ mod runtime {
         mode: HlsPrefetchMode,
         client: Option<Arc<Weeb3>>,
         feed_identity: Option<(String, String)>,
-        runway: Option<BeginningRunway>,
+        runways: HlsProgressiveRunways,
+        progressive_routes: VecDeque<(String, u64)>,
+        progressive_replays: VecDeque<String>,
         sequence_zero_runway_closed: bool,
         presentation_id: u64,
         live_start: bool,
@@ -4173,7 +4980,9 @@ mod runtime {
                 mode: HlsPrefetchMode::Inactive,
                 client: None,
                 feed_identity: None,
-                runway: None,
+                runways: HlsProgressiveRunways::default(),
+                progressive_routes: VecDeque::new(),
+                progressive_replays: VecDeque::new(),
                 sequence_zero_runway_closed: false,
                 presentation_id: 0,
                 live_start: false,
@@ -4195,7 +5004,9 @@ mod runtime {
 
         fn advance_generation(&mut self) -> u64 {
             self.generation = next_media_generation();
-            self.runway = None;
+            self.runways.clear();
+            self.progressive_routes.clear();
+            self.progressive_replays.clear();
             self.startup_overlap_plans.clear();
             self.completed_media_payloads = if self.live_start {
                 HLS_SERIAL_PREFETCH_COMPLETIONS.saturating_sub(1)
@@ -4210,7 +5021,9 @@ mod runtime {
 
         fn advance_timeline(&mut self) -> u64 {
             self.timeline_epoch = next_nonzero_generation(self.timeline_epoch);
-            self.runway = None;
+            self.runways.clear();
+            self.progressive_routes.clear();
+            self.progressive_replays.clear();
             self.timeline_epoch
         }
 
@@ -4225,17 +5038,49 @@ mod runtime {
         }
 
         fn progressive_current(&self, reference: &str, stamp: PlaybackStamp) -> bool {
+            let plan_id = self.progressive_plan(reference);
             self.stamp() == stamp
-                && !self.live_start
                 && !self.timeline_rebasing
                 && !self.sequence_zero_runway_closed
-                && self.runway.as_ref().is_some_and(|runway| {
-                    runway.first == reference
-                        || runway
-                            .successor
-                            .as_ref()
-                            .is_some_and(|successor| successor == reference)
+                && plan_id.is_some_and(|plan_id| {
+                    self.runways.contains(plan_id, reference)
+                        || self
+                            .progressive_replays
+                            .iter()
+                            .any(|replay| replay == reference)
                 })
+        }
+
+        fn progressive_plan(&self, reference: &str) -> Option<u64> {
+            self.progressive_routes
+                .iter()
+                .rev()
+                .find_map(|(current, plan_id)| (current == reference).then_some(*plan_id))
+        }
+
+        fn remember_progressive_route(&mut self, reference: &str, plan_id: u64) {
+            self.progressive_routes
+                .retain(|(current, _)| current != reference);
+            self.progressive_routes
+                .push_back((reference.to_string(), plan_id));
+            while self.progressive_routes.len() > HLS_PROGRESSIVE_ROUTE_MAX_REFERENCES {
+                self.progressive_routes.pop_front();
+            }
+        }
+
+        fn remember_progressive_replay(&mut self, reference: &str) {
+            self.progressive_replays
+                .retain(|current| current != reference);
+            self.progressive_replays.push_back(reference.to_string());
+            while self.progressive_replays.len() > HLS_PROGRESSIVE_REPLAY_MAX_REFERENCES {
+                self.progressive_replays.pop_front();
+            }
+        }
+
+        fn remove_progressive_plan(&mut self, plan_id: u64) {
+            self.runways.remove(plan_id);
+            self.progressive_routes
+                .retain(|(_, current_plan)| *current_plan != plan_id);
         }
 
         fn body_parallelism(&self, generation: u64) -> usize {
@@ -4255,6 +5100,7 @@ mod runtime {
                 if *plan != selected {
                     self.tracks.remove(plan);
                     self.startup_overlap_plans.remove(plan);
+                    self.remove_progressive_plan(*plan);
                 }
             }
             if self.tracks.len() <= HLS_PREFETCH_TRACK_MAX_ENTRIES {
@@ -4273,6 +5119,7 @@ mod runtime {
                 }
                 self.tracks.remove(&plan);
                 self.startup_overlap_plans.remove(&plan);
+                self.remove_progressive_plan(plan);
             }
         }
     }
@@ -4282,7 +5129,9 @@ mod runtime {
         stamp: PlaybackStamp,
         ticket: Option<PrefetchTicket>,
         cursor: Option<HlsMediaCursor>,
-        progressive_successor_prefix_ready: bool,
+        progressive_plan_id: Option<u64>,
+        progressive_owner_handoff: bool,
+        progressive_retired_references: Vec<String>,
         seek_successor: Option<String>,
     }
 
@@ -4293,6 +5142,7 @@ mod runtime {
         body_order: VecDeque<String>,
         bodies: HashMap<String, Arc<[u8]>>,
         body_pending: HashMap<String, PendingHlsPayload>,
+        retired_body_loads: HashSet<(String, u64, u64)>,
         size_pending: HashMap<String, Vec<mpsc::Sender<Option<u64>>>>,
         next_load_id: u64,
         body_bytes: u64,
@@ -4333,6 +5183,11 @@ mod runtime {
                 .get(reference)
                 .and_then(|body| u64::try_from(body.len()).ok())
                 .or_else(|| self.sizes.get(reference).copied())
+                .or_else(|| {
+                    self.metadata
+                        .get(reference)
+                        .map(|(metadata, _)| metadata.payload_size)
+                })
         }
 
         fn remember_size(&mut self, reference: &str, size: u64) {
@@ -4349,12 +5204,7 @@ mod runtime {
 
         fn body(&mut self, reference: &str, foreground: bool) -> Option<Arc<[u8]>> {
             let body = self.bodies.get(reference).cloned()?;
-            self.body_order.retain(|key| key != reference);
-            if foreground {
-                self.body_order.push_front(reference.to_string());
-            } else {
-                self.body_order.push_back(reference.to_string());
-            }
+            touch_hls_cache_lru(&mut self.body_order, reference, foreground);
             Some(body)
         }
 
@@ -4392,6 +5242,11 @@ mod runtime {
                 }
             }
             if let Some(stale) = self.body_pending.remove(reference) {
+                self.retired_body_loads.remove(&(
+                    reference.to_string(),
+                    stale.generation,
+                    stale.load_id,
+                ));
                 stale.finish(Err(
                     "stale HLS fragment generation was superseded".to_string()
                 ));
@@ -4445,17 +5300,22 @@ mod runtime {
             result: Result<Arc<[u8]>, String>,
             hot: bool,
         ) -> bool {
+            let retired =
+                self.retired_body_loads
+                    .remove(&(reference.to_string(), generation, load_id));
             let owns_pending = self.body_pending.get(reference).is_some_and(|pending| {
                 pending.generation == generation && pending.load_id == load_id
             });
-            if let Ok(body) = &result {
-                self.remember_size(reference, u64::try_from(body.len()).unwrap_or(u64::MAX));
-                if self.retain_completed {
-                    self.remember_body(reference.to_string(), body.clone(), hot);
+            if owns_pending {
+                if !retired && let Ok(body) = &result {
+                    self.remember_size(reference, u64::try_from(body.len()).unwrap_or(u64::MAX));
+                    if self.retain_completed {
+                        self.remember_body(reference.to_string(), body.clone(), hot);
+                    }
                 }
-            }
-            if owns_pending && let Some(pending) = self.body_pending.remove(reference) {
-                pending.finish(result);
+                if let Some(pending) = self.body_pending.remove(reference) {
+                    pending.finish(result);
+                }
             }
             owns_pending
         }
@@ -4469,12 +5329,7 @@ mod runtime {
             if let Some(previous) = self.bodies.remove(&reference) {
                 self.body_bytes = self.body_bytes.saturating_sub(previous.len() as u64);
             }
-            self.body_order.retain(|key| key != &reference);
-            if hot {
-                self.body_order.push_back(reference.clone());
-            } else {
-                self.body_order.push_front(reference.clone());
-            }
+            touch_hls_cache_lru(&mut self.body_order, &reference, hot);
             self.body_bytes = self.body_bytes.saturating_add(body_len);
             self.bodies.insert(reference, body);
 
@@ -4500,6 +5355,31 @@ mod runtime {
             self.body_order.clear();
             self.bodies.clear();
             self.body_bytes = 0;
+        }
+
+        fn evict_completed_body(&mut self, reference: &str) {
+            if let Some(pending) = self.body_pending.get(reference) {
+                self.retired_body_loads.insert((
+                    reference.to_string(),
+                    pending.generation,
+                    pending.load_id,
+                ));
+            }
+            self.body_order.retain(|cached| cached != reference);
+            let Some(body) = self.bodies.remove(reference) else {
+                return;
+            };
+            let removed = body.len() as u64;
+            self.body_bytes = self.body_bytes.saturating_sub(removed);
+        }
+
+        fn retire_pending_bodies(&mut self) {
+            for (_, pending) in self.body_pending.drain() {
+                pending.finish(Err(
+                    "HLS fragment load was retired by a new playback session".to_string(),
+                ));
+            }
+            self.retired_body_loads.clear();
         }
     }
 
@@ -4537,6 +5417,17 @@ mod runtime {
         media_cache_max_bytes().saturating_sub(range_cache_body_bytes())
     }
 
+    fn hls_range_metadata(address: &str, payload_size: u64) -> Option<BzzMetadata> {
+        Some(BzzMetadata {
+            data_reference: hex::decode(address).ok()?,
+            mime: "application/octet-stream".to_string(),
+            size: payload_size,
+            etag: hls_etag(address),
+            path: address.to_string(),
+            target_count: 1,
+        })
+    }
+
     async fn fetch_hls_bytes_response(
         weeb3: Arc<Weeb3>,
         reference: String,
@@ -4544,6 +5435,7 @@ mod runtime {
         mut range: Option<String>,
         if_none_match: Option<String>,
         if_range: Option<String>,
+        stream_token: Option<String>,
         local_bytes_base: String,
     ) -> FetchResponse {
         let etag = hls_etag(&reference);
@@ -4553,28 +5445,90 @@ mod runtime {
         if range.is_some() && !if_range_allows_range(if_range.as_deref(), &etag) {
             range = None;
         }
-        let progressive_stamp = HLS_PLAYBACK.with(|playback| {
-            let playback = playback.borrow();
-            let session = &playback.session;
-            let stamp = session.stamp();
-            (stamp.generation != 0 && session.progressive_current(&reference, stamp))
-                .then_some(stamp)
-        });
-        let progressive_start = progressive_stamp.is_some();
-        if method != "HEAD" && range.is_none() && progressive_start {
-            let Some(resolved) = resolve_hls_asset(weeb3.clone(), reference.clone()).await else {
-                return FetchResponse::error(503, "weeb-3 did not retrieve resource");
-            };
-            if !resolved.metadata.is_manifest && resolved.prefetched_body.is_none() {
-                hls_foreground_context(&reference, false);
-                let mut headers = hls_bytes_headers(&reference, resolved.metadata.mime);
-                headers.push((
-                    "Content-Length".to_string(),
-                    resolved.metadata.payload_size.to_string(),
-                ));
-                headers.push(("X-Weeb3-Stream-Start".to_string(), "1".to_string()));
-                return FetchResponse::stream(200, headers);
+        let explicit_stream_stamp = match stream_token.as_deref() {
+            Some(token) => match parse_hls_playback_stamp_token(token) {
+                Some(stamp) => Some(stamp),
+                None => return FetchResponse::error(400, "invalid HLS stream token"),
+            },
+            None => None,
+        };
+        let progressive_stamp = if let Some(stamp) = explicit_stream_stamp {
+            let current = HLS_PLAYBACK.with(|playback| {
+                let playback = playback.borrow();
+                let session = &playback.session;
+                session.stamp() == stamp
+                    && !session.timeline_rebasing
+                    && !session.sequence_zero_runway_closed
+            });
+            if !current {
+                return FetchResponse::error(503, "stale HLS stream token");
             }
+            Some(stamp)
+        } else {
+            HLS_PLAYBACK.with(|playback| {
+                let playback = playback.borrow();
+                let session = &playback.session;
+                let stamp = session.stamp();
+                (stamp.generation != 0 && session.progressive_current(&reference, stamp))
+                    .then_some(stamp)
+            })
+        };
+        let progressive_start = hls_progressive_media_candidate(&reference);
+        let progressive_context = if method != "HEAD" && range.is_none() && progressive_start {
+            let (body_cached, completed) = HLS_ASSET_CACHE.with(|cache| {
+                let cache = cache.borrow();
+                let body_cached = cache.bodies.contains_key(&reference);
+                let completed = body_cached
+                    || cache.payload_size(&reference).is_some_and(|payload_size| {
+                        hls_range_metadata(&reference, payload_size).is_some_and(|metadata| {
+                            hls_range_body_fully_cached(&reference, &metadata)
+                        })
+                    });
+                (body_cached, completed)
+            });
+            Some((hls_foreground_context(&reference, completed), body_cached))
+        } else {
+            None
+        };
+        if let Some((context, false)) = progressive_context {
+            let Some(plan_id) = context.progressive_plan_id else {
+                return FetchResponse::error(503, "stale HLS progressive plan");
+            };
+            let payload_size = match cached_hls_payload_size(&reference) {
+                Some(size) => Some(size),
+                None => start_hls_payload_size_probe(weeb3.clone(), reference.clone())
+                    .recv()
+                    .await
+                    .ok()
+                    .flatten(),
+            };
+            let Some(payload_size) = payload_size.filter(|size| *size > 0) else {
+                return FetchResponse::error(503, "weeb-3 did not resolve HLS media size");
+            };
+            HLS_ASSET_CACHE.with(|cache| {
+                cache.borrow_mut().remember_metadata(
+                    &reference,
+                    HlsAssetMetadata {
+                        payload_size,
+                        mime: "application/octet-stream",
+                        is_manifest: false,
+                    },
+                );
+            });
+            if !hls_progressive_response_is_current(plan_id, &reference, context.stamp) {
+                return FetchResponse::error(503, "stale HLS progressive request");
+            }
+            if let (Some(ticket), Some(cursor)) = (context.ticket, context.cursor) {
+                spawn_hls_progressive_range_prefetch(weeb3.clone(), cursor, ticket);
+            }
+            let mut headers = hls_bytes_headers(&reference, "application/octet-stream");
+            headers.push(("Content-Length".to_string(), payload_size.to_string()));
+            headers.push(("X-Weeb3-Stream-Start".to_string(), "1".to_string()));
+            headers.push((
+                "X-Weeb3-Stream-Token".to_string(),
+                hls_playback_stamp_token(context.stamp),
+            ));
+            return FetchResponse::stream(200, headers);
         }
         if method != "HEAD" && range.is_none() {
             let Some(bytes) =
@@ -4617,7 +5571,7 @@ mod runtime {
             return FetchResponse::ok_shared(200, headers, bytes);
         }
 
-        if method != "HEAD" && !progressive_start {
+        if method != "HEAD" && progressive_stamp.is_none() {
             let _ = wait_for_pending_hls_payload(&reference).await;
         }
         let Some(resolved) = resolve_hls_asset(weeb3.clone(), reference.clone()).await else {
@@ -4703,65 +5657,19 @@ mod runtime {
             };
             selected.to_vec()
         } else {
-            let mut bytes = Vec::new();
-            for attempt in 0..HLS_FOREGROUND_MAX_ATTEMPTS {
-                bytes = weeb3
-                    .retrieve_hls_payload_range(
-                        reference.clone(),
-                        start,
-                        end,
-                        progressive_stamp.map(|stamp| stamp.generation),
-                    )
-                    .await;
-                if expected_len.is_some_and(|expected| bytes.len() == expected) {
-                    break;
-                }
-                if attempt.saturating_add(1) < HLS_FOREGROUND_MAX_ATTEMPTS {
-                    async_std::task::sleep(Duration::from_millis(
-                        HLS_PAYLOAD_RETRY_DELAY_MS.saturating_mul(attempt.saturating_add(1) as u64),
-                    ))
-                    .await;
-                }
-            }
-            bytes
+            weeb3
+                .retrieve_hls_payload_range(
+                    reference.clone(),
+                    size,
+                    start,
+                    end,
+                    progressive_stamp.map(|stamp| stamp.generation),
+                    None,
+                )
+                .await
         };
         if !is_manifest && !expected_len.is_some_and(|expected| bytes.len() == expected) {
             return FetchResponse::error(502, "weeb-3 returned a short HLS byte range");
-        }
-        if !is_manifest
-            && (end.saturating_add(1) >= MEDIA_STORAGE_WINDOW_BYTES.saturating_mul(2)
-                || end.saturating_add(1) == size)
-            && let Some((successor, stamp)) = take_hls_progressive_successor(&reference)
-        {
-            let successor_client = weeb3.clone();
-            let source_reference = reference.clone();
-            spawn_local(async move {
-                async_std::task::sleep(Duration::from_millis(MEDIA_PREFETCH_BATCH_YIELD_MS)).await;
-                if !hls_progressive_successor_admission_is_current(&source_reference, stamp) {
-                    return;
-                }
-                let size =
-                    start_hls_payload_size_probe(successor_client.clone(), successor.clone())
-                        .recv()
-                        .await
-                        .ok()
-                        .flatten();
-                let Some(size) = size.filter(|size| *size > 0) else {
-                    return;
-                };
-                if !hls_progressive_successor_admission_is_current(&source_reference, stamp) {
-                    return;
-                }
-                let prefix_end = size
-                    .saturating_sub(1)
-                    .min(HLS_PROGRESSIVE_SUCCESSOR_PREFIX_BYTES.saturating_sub(1));
-                let prefix = successor_client
-                    .retrieve_hls_payload_range(successor, 0, prefix_end, Some(stamp.generation))
-                    .await;
-                if u64::try_from(prefix.len()).ok() == Some(prefix_end.saturating_add(1)) {
-                    mark_hls_progressive_successor_prefix_ready(&source_reference, stamp);
-                }
-            });
         }
 
         headers.push(("Content-Length".to_string(), bytes.len().to_string()));
@@ -4807,7 +5715,7 @@ mod runtime {
         let Some(mut segments) = hls_segment_identities(manifest) else {
             return;
         };
-        HLS_PLAYBACK.with(|playback| {
+        let retired_references = HLS_PLAYBACK.with(|playback| {
             let mut playback = playback.borrow_mut();
             let plan_limit = if hls_is_finalized(manifest) {
                 HLS_ARCHIVE_MEDIA_PLAN_MAX_REFERENCES
@@ -4839,10 +5747,34 @@ mod runtime {
                 HLS_EXACT_NEXT_OVERLAP_SEGMENTS
             };
             let live_start = playback.session.live_start;
-            playback
-                .plans
-                .install_with_early_overlap_limit(references, overlap, live_start);
+            let mut recent_tracks = playback
+                .session
+                .tracks
+                .iter()
+                .map(|(plan_id, track)| (*plan_id, track.last_touch, track.running.is_some()))
+                .collect::<Vec<_>>();
+            recent_tracks.sort_by_key(|(_, touch, running)| (!*running, std::cmp::Reverse(*touch)));
+            let protected_plan_ids = recent_tracks
+                .into_iter()
+                .take(HLS_MEDIA_PLAN_ACTIVE_TRACKS)
+                .map(|(plan_id, _, _)| plan_id)
+                .collect();
+            let evicted = playback.plans.install_with_early_overlap_limit(
+                references,
+                overlap,
+                live_start,
+                &protected_plan_ids,
+            );
+            let mut retired_references = Vec::new();
+            for plan in evicted {
+                retired_references.extend(plan.references.iter().cloned());
+                playback.session.tracks.remove(&plan.id);
+                playback.session.startup_overlap_plans.remove(&plan.id);
+                playback.session.remove_progressive_plan(plan.id);
+            }
+            retired_references
         });
+        retire_hls_progressive_range_owners(None, &retired_references);
     }
 
     fn cached_hls_payload(reference: &str) -> Option<Arc<[u8]>> {
@@ -4923,7 +5855,13 @@ mod runtime {
         live_start: bool,
     ) {
         clear_completed_bzz_media_ranges();
-        HLS_ASSET_CACHE.with(|cache| cache.borrow_mut().retain_completed = true);
+        clear_hls_progressive_range_owners();
+        HLS_ASSET_CACHE.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            cache.retire_pending_bodies();
+            cache.clear_completed_bodies();
+            cache.retain_completed = true;
+        });
         let generation = HLS_PLAYBACK.with(|playback| {
             let mut playback = playback.borrow_mut();
             let session = &mut playback.session;
@@ -5014,11 +5952,11 @@ mod runtime {
         }
     }
 
-    fn hls_prefix_generation_for_feed(
+    fn hls_prefix_stamp_for_feed(
         client: &Arc<Weeb3>,
         owner: &str,
         topic: &str,
-    ) -> Option<u64> {
+    ) -> Option<PlaybackStamp> {
         let identity = (owner.to_ascii_lowercase(), topic.to_ascii_lowercase());
         HLS_PLAYBACK.with(|playback| {
             let playback = playback.borrow();
@@ -5029,58 +5967,70 @@ mod runtime {
                     .as_ref()
                     .is_some_and(|active| Arc::ptr_eq(active, client))
                 && session.feed_identity.as_ref() == Some(&identity))
-            .then_some(session.generation)
+            .then_some(session.stamp())
         })
     }
 
-    fn take_hls_progressive_successor(reference: &str) -> Option<(String, PlaybackStamp)> {
+    fn hls_prefix_generation_for_feed(
+        client: &Arc<Weeb3>,
+        owner: &str,
+        topic: &str,
+    ) -> Option<u64> {
+        hls_prefix_stamp_for_feed(client, owner, topic).map(|stamp| stamp.generation)
+    }
+
+    fn hls_prefix_stamp_is_current(stamp: PlaybackStamp) -> bool {
         HLS_PLAYBACK.with(|playback| {
-            let mut playback = playback.borrow_mut();
-            let session = &mut playback.session;
-            let stamp = session.stamp();
-            if stamp.generation == 0
-                || session.live_start
-                || session.timeline_rebasing
-                || !session.progressive_current(reference, stamp)
-            {
-                return None;
-            }
-            let runway = session.runway.as_mut()?;
-            if runway.first != reference || runway.successor_prefix_started {
-                return None;
-            }
-            let successor = runway.successor.clone()?;
-            runway.successor_prefix_started = true;
-            Some((successor, stamp))
+            let playback = playback.borrow();
+            let session = &playback.session;
+            session.stamp() == stamp
+                && !session.timeline_rebasing
+                && !session.sequence_zero_runway_closed
         })
     }
 
-    fn mark_hls_progressive_successor_prefix_ready(reference: &str, stamp: PlaybackStamp) {
+    fn hls_progressive_media_candidate(reference: &str) -> bool {
+        let reference = reference.to_ascii_lowercase();
         HLS_PLAYBACK.with(|playback| {
-            let mut playback = playback.borrow_mut();
-            let session = &mut playback.session;
-            if session.progressive_current(reference, stamp)
-                && let Some(runway) = session.runway.as_mut()
-                && runway.first == reference
-                && runway.successor_prefix_started
-            {
-                runway.successor_prefix_ready = true;
-            }
-        });
+            let playback = playback.borrow();
+            let session = &playback.session;
+            session.generation != 0
+                && session.mode != HlsPrefetchMode::Inactive
+                && !session.timeline_rebasing
+                && !session.sequence_zero_runway_closed
+                && playback.plans.cursors.contains_key(&reference)
+        })
     }
 
-    fn hls_progressive_successor_admission_is_current(
+    fn hls_progressive_response_is_current(
+        plan_id: u64,
         reference: &str,
         stamp: PlaybackStamp,
     ) -> bool {
         HLS_PLAYBACK.with(|playback| {
             let playback = playback.borrow();
             let session = &playback.session;
+            let current = session.runways.current(plan_id, reference);
+            let replay = session
+                .progressive_replays
+                .iter()
+                .any(|replay| replay == reference);
             session.progressive_current(reference, stamp)
-                && session
-                    .runway
-                    .as_ref()
-                    .is_some_and(|runway| runway.first == reference)
+                && session.progressive_plan(reference) == Some(plan_id)
+                && (current || replay)
+        })
+    }
+
+    fn hls_progressive_startup_admission_is_current(reference: &str, stamp: PlaybackStamp) -> bool {
+        HLS_PLAYBACK.with(|playback| {
+            let playback = playback.borrow();
+            let session = &playback.session;
+            session.stamp() == stamp
+                && !session.timeline_rebasing
+                && (session.runways.startup_contains(reference)
+                    || session
+                        .progressive_plan(reference)
+                        .is_some_and(|plan_id| session.runways.current(plan_id, reference)))
         })
     }
 
@@ -5123,9 +6073,10 @@ mod runtime {
     fn set_hls_prefetch_mode(mode: HlsPrefetchMode) {
         HLS_PLAYBACK.with(|playback| {
             let mut playback = playback.borrow_mut();
-            if mode == HlsPrefetchMode::Inactive {
-                playback.session.sequence_zero_runway_closed = true;
-            }
+            playback.session.sequence_zero_runway_closed = hls_progressive_runway_closed_after_mode(
+                playback.session.sequence_zero_runway_closed,
+                mode,
+            );
             playback.session.mode = mode;
         });
     }
@@ -5166,8 +6117,9 @@ mod runtime {
     }
 
     fn retire_hls_prefetch_plan(ticket: PrefetchTicket) {
-        HLS_PLAYBACK.with(|playback| {
+        let retired_references = HLS_PLAYBACK.with(|playback| {
             let mut playback = playback.borrow_mut();
+            let references = playback.plans.references_for_plans(&[ticket.plan_id]);
             let session = &mut playback.session;
             if session.stamp() == ticket.stamp
                 && session
@@ -5177,8 +6129,12 @@ mod runtime {
             {
                 session.tracks.remove(&ticket.plan_id);
                 session.startup_overlap_plans.remove(&ticket.plan_id);
+                session.remove_progressive_plan(ticket.plan_id);
+                return references;
             }
+            Vec::new()
         });
+        retire_hls_progressive_range_owners(None, &retired_references);
     }
 
     fn invalidate_hls_prefetch_session() {
@@ -5195,6 +6151,7 @@ mod runtime {
             session.live_history_active = false;
             client.map(|client| (client, generation))
         });
+        retire_hls_progressive_range_owners(None, &[]);
         if let Some((client, generation)) = publish {
             publish_hls_stream_generation(client, generation);
         }
@@ -5203,121 +6160,182 @@ mod runtime {
     fn hls_foreground_context(reference: &str, cached: bool) -> HlsForegroundContext {
         let reference = reference.to_ascii_lowercase();
         let mut publish = None;
-        let (stamp, ticket, cursor, progressive_ready, seek_successor) =
-            HLS_PLAYBACK.with(|playback| {
-                let mut playback = playback.borrow_mut();
-                let preferred = playback
-                    .session
-                    .tracks
-                    .iter()
-                    .map(|(plan, track)| (*plan, track.last_foreground_position))
-                    .collect::<HashMap<_, _>>();
-                let selection = playback.plans.cursor(&reference, &preferred);
-                let cursor = selection.as_ref().map(|selected| selected.cursor.clone());
-                let superseded = selection
-                    .as_ref()
-                    .map(|selected| selected.superseded_plan_ids.as_slice())
-                    .unwrap_or_default();
-                let session = &mut playback.session;
-                if session.generation == 0 {
-                    session.advance_generation();
-                }
-
-                let mut seek_successor = None;
-                let mut schedule_id = None;
-                if let Some(cursor) = &cursor {
-                    let transition = session.tracks.get(&cursor.plan.id).map(|track| {
-                        if cached && cursor.position < track.last_foreground_position {
-                            (false, track.last_foreground_position)
-                        } else {
-                            (
-                                track.last_foreground_position.abs_diff(cursor.position) > 1,
-                                cursor.position,
-                            )
-                        }
-                    });
-                    if transition.is_some_and(|transition| transition.0) {
-                        let completed_media_payloads = session
-                            .completed_media_payloads
-                            .min(HLS_TWO_BODY_PREFETCH_COMPLETIONS);
-                        let generation = session.advance_generation();
-                        session.completed_media_payloads = completed_media_payloads;
-                        seek_successor = cursor
-                            .plan
-                            .references
-                            .get(cursor.position.saturating_add(1))
-                            .cloned();
-                        publish = session
-                            .client
-                            .as_ref()
-                            .cloned()
-                            .map(|client| (client, generation));
-                    }
-                    if !session.tracks.contains_key(&cursor.plan.id) {
-                        session.schedule_sequence =
-                            next_nonzero_generation(session.schedule_sequence);
-                        session.tracks.insert(
-                            cursor.plan.id,
-                            HlsPrefetchTrack {
-                                schedule_id: session.schedule_sequence,
-                                last_foreground_position: cursor.position,
-                                running: None,
-                                last_touch: 0,
-                            },
-                        );
-                    }
-                    session.track_touch_sequence =
-                        next_nonzero_generation(session.track_touch_sequence);
-                    let touch = session.track_touch_sequence;
-                    if let Some(track) = session.tracks.get_mut(&cursor.plan.id) {
-                        track.last_foreground_position = transition
-                            .map(|transition| transition.1)
-                            .unwrap_or(cursor.position);
-                        track.last_touch = touch;
-                        schedule_id = Some(track.schedule_id);
-                    }
-
-                    session.prune_tracks(cursor.plan.id, superseded);
-                }
-
-                let stamp = session.stamp();
-                let ticket = cursor
-                    .as_ref()
-                    .zip(schedule_id)
-                    .map(|(cursor, schedule_id)| PrefetchTicket {
-                        stamp,
-                        plan_id: cursor.plan.id,
-                        schedule_id,
-                    });
-                let progressive_ready =
-                    cursor.as_ref().is_some_and(|cursor| {
-                        !session.live_start
-                            && !session.timeline_rebasing
-                            && cursor.position == 1
-                            && session.runway.as_ref().is_some_and(|runway| {
-                                runway.successor_prefix_started
-                                    && runway.successor_prefix_ready
-                                    && runway
-                                        .successor
-                                        .as_ref()
-                                        .is_some_and(|successor| successor == &reference)
-                                    && cursor.plan.references.first().is_some_and(|first| {
-                                        first.eq_ignore_ascii_case(&runway.first)
-                                    })
-                            })
-                    });
-                (stamp, ticket, cursor, progressive_ready, seek_successor)
-            });
-        if let Some((client, generation)) = publish {
-            publish_hls_stream_generation(client, generation);
-        }
-        HlsForegroundContext {
+        let (
             stamp,
             ticket,
             cursor,
-            progressive_successor_prefix_ready: progressive_ready,
+            progressive_plan_id,
+            progressive_owner_handoff,
+            progressive_retired_references,
             seek_successor,
+        ) = HLS_PLAYBACK.with(|playback| {
+            let mut playback = playback.borrow_mut();
+            let preferred = playback
+                .session
+                .tracks
+                .iter()
+                .map(|(plan, track)| (*plan, track.last_foreground_position))
+                .collect::<HashMap<_, _>>();
+            let selection = playback.plans.cursor(&reference, &preferred);
+            let cursor = selection.as_ref().map(|selected| selected.cursor.clone());
+            let superseded = selection
+                .as_ref()
+                .map(|selected| selected.superseded_plan_ids.as_slice())
+                .unwrap_or_default();
+            let superseded_references = playback.plans.references_for_plans(superseded);
+            playback.plans.remove_plans(superseded);
+            let session = &mut playback.session;
+            if session.generation == 0 {
+                session.advance_generation();
+            }
+
+            let mut seek_successor = None;
+            let mut progressive_owner_handoff = !superseded.is_empty();
+            let mut progressive_retired_references = superseded_references;
+            let mut schedule_id = None;
+            if let Some(cursor) = &cursor {
+                let cached_backward = session.tracks.get(&cursor.plan.id).is_some_and(|track| {
+                    cached && cursor.position < track.last_foreground_position
+                });
+                let transition = session.tracks.get(&cursor.plan.id).map(|track| {
+                    if cached_backward {
+                        (false, track.last_foreground_position)
+                    } else {
+                        (
+                            track.last_foreground_position.abs_diff(cursor.position) > 1,
+                            cursor.position,
+                        )
+                    }
+                });
+                let runway_discontinuity = !cached_backward
+                    && session.runways.plans.contains_key(&cursor.plan.id)
+                    && !session.runways.contains(cursor.plan.id, &reference);
+                if transition.is_some_and(|transition| transition.0) || runway_discontinuity {
+                    progressive_owner_handoff = true;
+                    let completed_media_payloads = session
+                        .completed_media_payloads
+                        .min(HLS_TWO_BODY_PREFETCH_COMPLETIONS);
+                    let generation = session.advance_generation();
+                    session.completed_media_payloads = completed_media_payloads;
+                    seek_successor = cursor
+                        .plan
+                        .references
+                        .get(cursor.position.saturating_add(1))
+                        .cloned();
+                    publish = session
+                        .client
+                        .as_ref()
+                        .cloned()
+                        .map(|client| (client, generation));
+                }
+                if !session.tracks.contains_key(&cursor.plan.id) {
+                    progressive_owner_handoff = true;
+                    session.schedule_sequence = next_nonzero_generation(session.schedule_sequence);
+                    session.tracks.insert(
+                        cursor.plan.id,
+                        HlsPrefetchTrack {
+                            schedule_id: session.schedule_sequence,
+                            last_foreground_position: cursor.position,
+                            range_retire_position: cursor.position,
+                            running: None,
+                            last_touch: 0,
+                        },
+                    );
+                }
+                session.track_touch_sequence =
+                    next_nonzero_generation(session.track_touch_sequence);
+                let touch = session.track_touch_sequence;
+                if let Some(track) = session.tracks.get_mut(&cursor.plan.id) {
+                    if !cached_backward && cursor.position > track.range_retire_position {
+                        progressive_retired_references.extend(
+                            cursor.plan.references[track.range_retire_position..cursor.position]
+                                .iter()
+                                .cloned(),
+                        );
+                        track.range_retire_position = cursor.position;
+                    } else if !cached_backward && cursor.position < track.last_foreground_position {
+                        track.range_retire_position = cursor.position;
+                    }
+                    track.last_foreground_position = transition
+                        .map(|transition| transition.1)
+                        .unwrap_or(cursor.position);
+                    track.last_touch = touch;
+                    schedule_id = Some(track.schedule_id);
+                }
+
+                session.prune_tracks(cursor.plan.id, superseded);
+
+                if session.mode != HlsPrefetchMode::Inactive
+                    && !session.timeline_rebasing
+                    && !session.sequence_zero_runway_closed
+                {
+                    let successor = cursor
+                        .plan
+                        .references
+                        .get(cursor.position.saturating_add(1))
+                        .cloned();
+                    session.remember_progressive_route(&reference, cursor.plan.id);
+                    if cached_backward {
+                        session.remember_progressive_replay(&reference);
+                    } else {
+                        session
+                            .progressive_replays
+                            .retain(|replay| replay != &reference);
+                        session
+                            .runways
+                            .advance(cursor.plan.id, &reference, successor);
+                    }
+                }
+            }
+
+            let stamp = session.stamp();
+            let ticket = cursor
+                .as_ref()
+                .zip(schedule_id)
+                .map(|(cursor, schedule_id)| PrefetchTicket {
+                    stamp,
+                    plan_id: cursor.plan.id,
+                    schedule_id,
+                });
+            let progressive_plan_id = cursor.as_ref().map(|cursor| cursor.plan.id);
+            (
+                stamp,
+                ticket,
+                cursor,
+                progressive_plan_id,
+                progressive_owner_handoff,
+                progressive_retired_references,
+                seek_successor,
+            )
+        });
+        if let Some((client, generation)) = publish {
+            publish_hls_stream_generation(client, generation);
         }
+        let context = HlsForegroundContext {
+            stamp,
+            ticket,
+            cursor,
+            progressive_plan_id,
+            progressive_owner_handoff,
+            progressive_retired_references,
+            seek_successor,
+        };
+        let forward = context
+            .ticket
+            .zip(context.cursor.as_ref())
+            .and_then(|(ticket, cursor)| {
+                (!context.progressive_retired_references.is_empty())
+                    .then_some((ticket, cursor.position))
+            });
+        if context.progressive_owner_handoff
+            && let (Some(ticket), Some(cursor)) = (context.ticket, context.cursor.as_ref())
+        {
+            adopt_hls_progressive_range_owners(ticket, cursor);
+        }
+        if context.progressive_owner_handoff || !context.progressive_retired_references.is_empty() {
+            retire_hls_progressive_range_owners(forward, &context.progressive_retired_references);
+        }
+        context
     }
 
     fn hls_generation_current(generation: u64) -> bool {
@@ -5366,6 +6384,570 @@ mod runtime {
 
     fn hls_prefetch_ticket_current(ticket: PrefetchTicket, sustained: bool) -> bool {
         HLS_PLAYBACK.with(|playback| playback.borrow().session.ticket_current(ticket, sustained))
+    }
+
+    fn hls_progressive_range_ticket_admission(
+        ticket: PrefetchTicket,
+    ) -> HlsProgressiveRangeAdmission {
+        HLS_PLAYBACK.with(|playback| {
+            let playback = playback.borrow();
+            let session = &playback.session;
+            let structurally_current = session.stamp() == ticket.stamp
+                && !session.timeline_rebasing
+                && session.tracks.get(&ticket.plan_id).is_some_and(|track| {
+                    track.schedule_id == ticket.schedule_id && track.running == Some(ticket)
+                });
+            hls_progressive_range_admission(structurally_current, session.mode)
+        })
+    }
+
+    fn hls_progressive_range_handoff_current(ticket: PrefetchTicket) -> bool {
+        HLS_PLAYBACK.with(|playback| {
+            let playback = playback.borrow();
+            let session = &playback.session;
+            session.stamp() == ticket.stamp
+                && !session.timeline_rebasing
+                && session
+                    .tracks
+                    .get(&ticket.plan_id)
+                    .is_some_and(|track| track.schedule_id == ticket.schedule_id)
+        })
+    }
+
+    async fn await_hls_progressive_range_sustained(
+        ticket: PrefetchTicket,
+        admission_open: &Cell<bool>,
+    ) -> bool {
+        loop {
+            if !admission_open.get() {
+                return false;
+            }
+            match hls_progressive_range_ticket_admission(ticket) {
+                HlsProgressiveRangeAdmission::Admit => return true,
+                HlsProgressiveRangeAdmission::Park => {
+                    async_std::task::sleep(Duration::from_millis(50)).await;
+                }
+                HlsProgressiveRangeAdmission::Retire => return false,
+            }
+        }
+    }
+
+    fn try_hls_background_range_lease(reserved_bytes: u64) -> HlsProgressiveRangeLeaseAttempt {
+        let occupied_bytes =
+            range_cache_body_bytes().saturating_add(hls_payload_cache_body_bytes());
+        let limit_bytes = media_prefetch_ahead_limit_bytes(media_cache_max_bytes());
+        HLS_PROGRESSIVE_RANGE_BACKGROUND.with(|background| {
+            let mut background = background.borrow_mut();
+            if background.active >= HLS_BACKGROUND_RANGE_MAX {
+                return HlsProgressiveRangeLeaseAttempt::Busy;
+            }
+            if reserved_bytes > 0
+                && !hls_progressive_range_reservation_fits(
+                    occupied_bytes,
+                    background.reserved_bytes,
+                    reserved_bytes,
+                    limit_bytes,
+                )
+            {
+                return HlsProgressiveRangeLeaseAttempt::Budget;
+            }
+            background.active = background.active.saturating_add(1);
+            background.reserved_bytes = background.reserved_bytes.saturating_add(reserved_bytes);
+            HlsProgressiveRangeLeaseAttempt::Acquired(HlsBackgroundRangeLease { reserved_bytes })
+        })
+    }
+
+    fn try_hls_progressive_range_lease(
+        ticket: PrefetchTicket,
+        reserved_bytes: u64,
+    ) -> HlsProgressiveRangeLeaseAttempt {
+        match hls_progressive_range_ticket_admission(ticket) {
+            HlsProgressiveRangeAdmission::Retire => HlsProgressiveRangeLeaseAttempt::Retire,
+            HlsProgressiveRangeAdmission::Park => HlsProgressiveRangeLeaseAttempt::Park,
+            HlsProgressiveRangeAdmission::Admit => try_hls_background_range_lease(reserved_bytes),
+        }
+    }
+
+    async fn acquire_hls_background_range_lease(
+        reserved_bytes: u64,
+        is_current: impl Fn() -> bool,
+    ) -> Option<HlsBackgroundRangeLease> {
+        loop {
+            if !is_current() {
+                return None;
+            }
+            match try_hls_background_range_lease(reserved_bytes) {
+                HlsProgressiveRangeLeaseAttempt::Acquired(lease) => return Some(lease),
+                HlsProgressiveRangeLeaseAttempt::Busy => {
+                    async_std::task::sleep(Duration::from_millis(MEDIA_PREFETCH_BATCH_YIELD_MS))
+                        .await;
+                }
+                HlsProgressiveRangeLeaseAttempt::Budget
+                | HlsProgressiveRangeLeaseAttempt::Park
+                | HlsProgressiveRangeLeaseAttempt::Retire => return None,
+            }
+        }
+    }
+
+    async fn acquire_hls_progressive_range_lease(
+        ticket: PrefetchTicket,
+        reserved_bytes: u64,
+        admission_open: &Cell<bool>,
+    ) -> Option<HlsBackgroundRangeLease> {
+        loop {
+            if !admission_open.get() {
+                return None;
+            }
+            match try_hls_progressive_range_lease(ticket, reserved_bytes) {
+                HlsProgressiveRangeLeaseAttempt::Acquired(lease) => return Some(lease),
+                HlsProgressiveRangeLeaseAttempt::Busy => {
+                    async_std::task::sleep(Duration::from_millis(MEDIA_PREFETCH_BATCH_YIELD_MS))
+                        .await;
+                }
+                HlsProgressiveRangeLeaseAttempt::Park => {
+                    async_std::task::sleep(Duration::from_millis(50)).await;
+                }
+                HlsProgressiveRangeLeaseAttempt::Budget
+                | HlsProgressiveRangeLeaseAttempt::Retire => return None,
+            }
+        }
+    }
+
+    fn claim_hls_progressive_range_scheduler(
+        mut cursor: HlsMediaCursor,
+        ticket: PrefetchTicket,
+    ) -> Option<HlsMediaCursor> {
+        HLS_PLAYBACK.with(|playback| {
+            let mut playback = playback.borrow_mut();
+            let session = &mut playback.session;
+            if session.stamp() != ticket.stamp || session.timeline_rebasing {
+                return None;
+            }
+            let track = session.tracks.get_mut(&ticket.plan_id)?;
+            if track.schedule_id != ticket.schedule_id || track.running.is_some() {
+                return None;
+            }
+            cursor.position = cursor.position.max(track.last_foreground_position);
+            track.running = Some(ticket);
+            Some(cursor)
+        })
+    }
+
+    fn finish_hls_progressive_range_scheduler(ticket: PrefetchTicket) {
+        HLS_PLAYBACK.with(|playback| {
+            let mut playback = playback.borrow_mut();
+            let session = &mut playback.session;
+            if session.stamp() == ticket.stamp
+                && let Some(track) = session.tracks.get_mut(&ticket.plan_id)
+                && track.schedule_id == ticket.schedule_id
+                && track.running == Some(ticket)
+            {
+                track.running = None;
+            }
+        });
+    }
+
+    fn adopt_hls_progressive_range_owners(ticket: PrefetchTicket, cursor: &HlsMediaCursor) {
+        if !hls_progressive_range_handoff_current(ticket) {
+            return;
+        }
+        let mut adopted = Vec::new();
+        for (position, reference) in cursor
+            .plan
+            .references
+            .iter()
+            .enumerate()
+            .skip(cursor.position.saturating_add(1))
+            .take(HLS_PROGRESSIVE_RANGE_WORKERS_PER_PLAN)
+        {
+            let Some(payload_size) = cached_hls_payload_size(reference).filter(|size| *size > 0)
+            else {
+                continue;
+            };
+            let Some(metadata) = hls_range_metadata(reference, payload_size) else {
+                continue;
+            };
+            let mut start = 0_u64;
+            while start < payload_size {
+                let end = start
+                    .saturating_add(MEDIA_STORAGE_WINDOW_BYTES)
+                    .saturating_sub(1)
+                    .min(payload_size.saturating_sub(1));
+                if hls_aligned_range_cached(reference, &metadata, start, end) {
+                    adopted.push((
+                        HlsProgressiveRangeKey {
+                            reference: reference.clone(),
+                            payload_size,
+                            start,
+                            end,
+                        },
+                        HlsProgressiveRangeOwner { ticket, position },
+                    ));
+                }
+                start = end.saturating_add(1);
+            }
+        }
+        HLS_PROGRESSIVE_RANGE_BACKGROUND.with(|background| {
+            let mut background = background.borrow_mut();
+            for (key, owner) in adopted {
+                background
+                    .owned_ranges
+                    .entry(key)
+                    .or_default()
+                    .insert(owner);
+            }
+        });
+    }
+
+    fn remember_hls_progressive_range_owner(
+        ticket: PrefetchTicket,
+        position: usize,
+        reference: &str,
+        payload_size: u64,
+        start: u64,
+        end: u64,
+    ) {
+        if hls_progressive_range_ticket_admission(ticket) == HlsProgressiveRangeAdmission::Retire {
+            HLS_PROGRESSIVE_RANGE_BACKGROUND.with(|background| {
+                background
+                    .borrow_mut()
+                    .retired_references
+                    .insert(reference.to_string(), Some(payload_size));
+            });
+            retire_hls_progressive_range_owners(None, &[]);
+            return;
+        }
+        let key = HlsProgressiveRangeKey {
+            reference: reference.to_string(),
+            payload_size,
+            start,
+            end,
+        };
+        let owner = HlsProgressiveRangeOwner { ticket, position };
+        HLS_PROGRESSIVE_RANGE_BACKGROUND.with(|background| {
+            background
+                .borrow_mut()
+                .owned_ranges
+                .entry(key)
+                .or_default()
+                .insert(owner);
+        });
+    }
+
+    fn retire_hls_progressive_range_owners(
+        forward: Option<(PrefetchTicket, usize)>,
+        retired_references: &[String],
+    ) {
+        let (stamp, schedules, protected) = HLS_PLAYBACK.with(|playback| {
+            let playback = playback.borrow();
+            let session = &playback.session;
+            let schedules = session
+                .tracks
+                .iter()
+                .map(|(plan_id, track)| (*plan_id, track.schedule_id))
+                .collect::<HashMap<_, _>>();
+            let mut protected = HashSet::new();
+            if let Some(runway) = session.runways.startup.as_ref() {
+                protected.insert(runway.current().to_string());
+                protected.extend(runway.successor().map(str::to_string));
+            }
+            for runway in session.runways.plans.values() {
+                protected.insert(runway.current().to_string());
+                protected.extend(runway.successor().map(str::to_string));
+            }
+            (session.stamp(), schedules, protected)
+        });
+        let retired_references = retired_references.iter().cloned().collect::<HashSet<_>>();
+        let retired_sizes = retired_references
+            .iter()
+            .map(|reference| (reference.clone(), cached_hls_payload_size(reference)))
+            .collect::<Vec<_>>();
+
+        let retired = HLS_PROGRESSIVE_RANGE_BACKGROUND.with(|background| {
+            let mut background = background.borrow_mut();
+            for (reference, payload_size) in retired_sizes {
+                let remembered = background.retired_references.entry(reference).or_default();
+                if remembered.is_none() {
+                    *remembered = payload_size;
+                }
+            }
+            let mut newly_ownerless = Vec::new();
+            for (key, owners) in &mut background.owned_ranges {
+                owners.retain(|owner| {
+                    let structurally_current = owner.ticket.stamp == stamp
+                        && schedules.get(&owner.ticket.plan_id).copied()
+                            == Some(owner.ticket.schedule_id);
+                    structurally_current
+                        && !forward.is_some_and(|(ticket, position)| {
+                            owner.ticket == ticket && owner.position < position
+                        })
+                });
+                if owners.is_empty() {
+                    newly_ownerless.push((key.reference.clone(), key.payload_size));
+                }
+            }
+            for (reference, payload_size) in newly_ownerless {
+                background
+                    .retired_references
+                    .entry(reference)
+                    .or_insert(Some(payload_size));
+            }
+
+            let owned_references = background
+                .owned_ranges
+                .iter()
+                .filter(|(_, owners)| !owners.is_empty())
+                .map(|(key, _)| key.reference.clone())
+                .collect::<HashSet<_>>();
+            let retired = background
+                .retired_references
+                .iter()
+                .filter(|(reference, _)| {
+                    !protected.contains(*reference) && !owned_references.contains(*reference)
+                })
+                .map(|(reference, payload_size)| (reference.clone(), *payload_size))
+                .collect::<Vec<_>>();
+            let retired_set = retired
+                .iter()
+                .map(|(reference, _)| reference.clone())
+                .collect::<HashSet<_>>();
+            background
+                .owned_ranges
+                .retain(|key, _| !retired_set.contains(&key.reference));
+            background
+                .retired_references
+                .retain(|reference, _| !retired_set.contains(reference));
+            retired
+        });
+
+        for (reference, payload_size) in retired {
+            if let Some(metadata) =
+                payload_size.and_then(|size| hls_range_metadata(&reference, size))
+            {
+                evict_completed_hls_ranges(&reference, &metadata);
+            }
+            HLS_ASSET_CACHE.with(|cache| {
+                cache.borrow_mut().evict_completed_body(&reference);
+            });
+        }
+    }
+
+    fn clear_hls_progressive_range_owners() {
+        HLS_PROGRESSIVE_RANGE_BACKGROUND.with(|background| {
+            let mut background = background.borrow_mut();
+            background.owned_ranges.clear();
+            background.retired_references.clear();
+        });
+    }
+
+    async fn prefetch_hls_progressive_reference(
+        weeb3: Arc<Weeb3>,
+        reference: String,
+        position: usize,
+        ticket: PrefetchTicket,
+        admission_open: Rc<Cell<bool>>,
+    ) -> bool {
+        if !await_hls_progressive_range_sustained(ticket, &admission_open).await {
+            return false;
+        }
+        let payload_size = match cached_hls_payload_size(&reference) {
+            Some(size) => Some(size),
+            None => {
+                let Some(probe_lease) =
+                    acquire_hls_progressive_range_lease(ticket, 0, &admission_open).await
+                else {
+                    return false;
+                };
+                let size = start_hls_payload_size_probe(weeb3.clone(), reference.clone())
+                    .recv()
+                    .await
+                    .ok()
+                    .flatten();
+                drop(probe_lease);
+                size
+            }
+        };
+        let Some(payload_size) = payload_size.filter(|size| *size > 0) else {
+            return false;
+        };
+        let Some(metadata) = hls_range_metadata(&reference, payload_size) else {
+            return false;
+        };
+
+        let mut start = 0_u64;
+        while start < payload_size {
+            if !await_hls_progressive_range_sustained(ticket, &admission_open).await {
+                return false;
+            }
+            let end = start
+                .saturating_add(MEDIA_STORAGE_WINDOW_BYTES)
+                .saturating_sub(1)
+                .min(payload_size.saturating_sub(1));
+            if hls_aligned_range_cached(&reference, &metadata, start, end) {
+                remember_hls_progressive_range_owner(
+                    ticket,
+                    position,
+                    &reference,
+                    payload_size,
+                    start,
+                    end,
+                );
+                start = end.saturating_add(1);
+                continue;
+            }
+            let Some(expected) = end
+                .checked_sub(start)
+                .and_then(|length| length.checked_add(1))
+            else {
+                return false;
+            };
+            let Some(lease) =
+                acquire_hls_progressive_range_lease(ticket, expected, &admission_open).await
+            else {
+                return false;
+            };
+            if !admission_open.get() {
+                drop(lease);
+                return false;
+            }
+            if hls_aligned_range_cached(&reference, &metadata, start, end) {
+                drop(lease);
+                remember_hls_progressive_range_owner(
+                    ticket,
+                    position,
+                    &reference,
+                    payload_size,
+                    start,
+                    end,
+                );
+                start = end.saturating_add(1);
+                continue;
+            }
+            let owner_reference = reference.clone();
+            let owner_admission = admission_open.clone();
+            let dispatch_parked = Rc::new(Cell::new(false));
+            let owner_parked = dispatch_parked.clone();
+            let background = HlsBackgroundRangeRequest::new(lease, move || {
+                if !owner_admission.get() {
+                    return false;
+                }
+                match hls_progressive_range_ticket_admission(ticket) {
+                    HlsProgressiveRangeAdmission::Admit => {}
+                    HlsProgressiveRangeAdmission::Park => {
+                        owner_parked.set(true);
+                        return false;
+                    }
+                    HlsProgressiveRangeAdmission::Retire => return false,
+                }
+                remember_hls_progressive_range_owner(
+                    ticket,
+                    position,
+                    &owner_reference,
+                    payload_size,
+                    start,
+                    end,
+                );
+                true
+            });
+            let bytes = weeb3
+                .retrieve_hls_payload_range(
+                    reference.clone(),
+                    payload_size,
+                    start,
+                    end,
+                    Some(ticket.stamp.generation),
+                    Some(background),
+                )
+                .await;
+            if dispatch_parked.get() {
+                continue;
+            }
+            if usize::try_from(expected).ok() != Some(bytes.len())
+                || !hls_aligned_range_cached(&reference, &metadata, start, end)
+            {
+                admission_open.set(false);
+                return false;
+            }
+            start = end.saturating_add(1);
+        }
+        true
+    }
+
+    async fn prefetch_hls_progressive_ranges(
+        weeb3: Arc<Weeb3>,
+        cursor: HlsMediaCursor,
+        ticket: PrefetchTicket,
+    ) {
+        let planner = Rc::new(RefCell::new(HlsProgressiveRangePlanner::new(
+            cursor.position,
+            cursor.plan.references.len(),
+        )));
+        let worker_count = planner.borrow().worker_count();
+        let admission_open = Rc::new(Cell::new(true));
+        let mut workers = FuturesUnordered::new();
+        for _ in 0..worker_count {
+            let client = weeb3.clone();
+            let plan = cursor.plan.clone();
+            let planner = planner.clone();
+            let admission_open = admission_open.clone();
+            workers.push(async move {
+                loop {
+                    if !await_hls_progressive_range_sustained(ticket, &admission_open).await {
+                        return;
+                    }
+                    let position = loop {
+                        let (claimed, unclaimed) = {
+                            let mut planner = planner.borrow_mut();
+                            (planner.claim(), planner.has_unclaimed_references())
+                        };
+                        if let Some(position) = claimed {
+                            break position;
+                        }
+                        if !unclaimed || !admission_open.get() {
+                            return;
+                        }
+                        async_std::task::sleep(Duration::from_millis(
+                            MEDIA_PREFETCH_BATCH_YIELD_MS,
+                        ))
+                        .await;
+                    };
+                    let reference = plan.references[position].clone();
+                    if !prefetch_hls_progressive_reference(
+                        client.clone(),
+                        reference,
+                        position,
+                        ticket,
+                        admission_open.clone(),
+                    )
+                    .await
+                    {
+                        admission_open.set(false);
+                        return;
+                    }
+                    planner.borrow_mut().complete(position);
+                }
+            });
+        }
+        while workers.next().await.is_some() {}
+    }
+
+    fn spawn_hls_progressive_range_prefetch(
+        weeb3: Arc<Weeb3>,
+        cursor: HlsMediaCursor,
+        ticket: PrefetchTicket,
+    ) -> bool {
+        let Some(cursor) = claim_hls_progressive_range_scheduler(cursor, ticket) else {
+            return false;
+        };
+        if cursor.position.saturating_add(1) >= cursor.plan.references.len() {
+            finish_hls_progressive_range_scheduler(ticket);
+            return false;
+        }
+        spawn_local(async move {
+            prefetch_hls_progressive_ranges(weeb3, cursor, ticket).await;
+            finish_hls_progressive_range_scheduler(ticket);
+        });
+        true
     }
 
     fn start_hls_payload_load(
@@ -5856,7 +7438,7 @@ mod runtime {
         let reference = reference.to_ascii_lowercase();
         let cached = HLS_ASSET_CACHE.with(|cache| cache.borrow().bodies.contains_key(&reference));
         let context = hls_foreground_context(&reference, cached);
-        let head_ready = cached || context.progressive_successor_prefix_ready;
+        let head_ready = cached;
         let foreground = start_hls_payload_load(
             weeb3.clone(),
             reference.clone(),
@@ -6048,7 +7630,7 @@ mod runtime {
             .saturating_sub(1)
             .min(HLS_ASSET_PROBE_BYTES.saturating_sub(1));
         let probe = weeb3
-            .retrieve_hls_payload_range(reference.clone(), 0, probe_end, None)
+            .retrieve_hls_payload_range(reference.clone(), payload_size, 0, probe_end, None, None)
             .await;
         let expected_probe_len = usize::try_from(probe_end.saturating_add(1)).ok()?;
         if probe.len() != expected_probe_len {
@@ -6276,14 +7858,9 @@ mod runtime {
         remember_hls_media_plan(&body);
         if sequence_zero_bootstrap
             && let Some(reference) = hls_media_references(&body).into_iter().next()
-            && let Some(generation) = hls_prefix_generation_for_feed(&weeb3, &owner, &topic)
+            && let Some(stamp) = hls_prefix_stamp_for_feed(&weeb3, &owner, &topic)
         {
-            drop(start_hls_payload_load(
-                weeb3.clone(),
-                reference,
-                false,
-                generation,
-            ));
+            start_hls_shared_prefix_warmup(weeb3.clone(), reference, stamp, 2);
         }
 
         let headers = vec![
@@ -6350,13 +7927,13 @@ mod runtime {
         topic: &str,
         snapshot: &FeedRouteSnapshot,
     ) {
-        let Some(generation) = hls_prefix_generation_for_feed(weeb3, owner, topic) else {
+        let Some(stamp) = hls_prefix_stamp_for_feed(weeb3, owner, topic) else {
             return;
         };
         if !HLS_PLAYBACK.with(|playback| {
             let playback = playback.borrow();
             let session = &playback.session;
-            session.live_start && session.generation == generation
+            session.live_start && session.stamp() == stamp
         }) {
             return;
         }
@@ -6369,23 +7946,18 @@ mod runtime {
             .skip(start)
             .take(HLS_PREFETCH_BODY_MAX_PARALLEL)
         {
-            drop(start_hls_payload_load(
+            start_hls_shared_prefix_warmup(
                 weeb3.clone(),
                 reference.clone(),
-                true,
-                generation,
-            ));
+                stamp,
+                HLS_LIVE_PREFIX_WINDOW_COUNT,
+            );
         }
         if start > 0
             && hls_media_sequence(&snapshot.body) == Some(0)
             && let Some(reference) = references.first()
         {
-            drop(start_hls_payload_load(
-                weeb3.clone(),
-                reference.clone(),
-                false,
-                generation,
-            ));
+            start_hls_shared_prefix_warmup(weeb3.clone(), reference.clone(), stamp, 2);
         }
     }
 
@@ -6423,6 +7995,76 @@ mod runtime {
         }
     }
 
+    fn start_hls_shared_prefix_warmup(
+        weeb3: Arc<Weeb3>,
+        reference: String,
+        stamp: PlaybackStamp,
+        window_count: usize,
+    ) {
+        let size = start_hls_payload_size_probe(weeb3.clone(), reference.clone());
+        spawn_local(async move {
+            let Some(size) = size.recv().await.ok().flatten().filter(|size| *size > 0) else {
+                return;
+            };
+            let Some(metadata) = hls_range_metadata(&reference, size) else {
+                return;
+            };
+            let mut position = 0_u64;
+            for _ in 0..window_count {
+                if position >= size || !hls_prefix_stamp_is_current(stamp) {
+                    return;
+                }
+                let end = position
+                    .saturating_add(MEDIA_STORAGE_WINDOW_BYTES)
+                    .saturating_sub(1)
+                    .min(size.saturating_sub(1));
+                if hls_aligned_range_cached(&reference, &metadata, position, end) {
+                    position = end.saturating_add(1);
+                    continue;
+                }
+                let Some(expected) = end
+                    .checked_sub(position)
+                    .and_then(|length| length.checked_add(1))
+                else {
+                    return;
+                };
+                let lease = match try_hls_background_range_lease(expected) {
+                    HlsProgressiveRangeLeaseAttempt::Acquired(lease) => lease,
+                    HlsProgressiveRangeLeaseAttempt::Busy
+                    | HlsProgressiveRangeLeaseAttempt::Budget
+                    | HlsProgressiveRangeLeaseAttempt::Park
+                    | HlsProgressiveRangeLeaseAttempt::Retire => return,
+                };
+                if !hls_prefix_stamp_is_current(stamp) {
+                    drop(lease);
+                    return;
+                }
+                if hls_aligned_range_cached(&reference, &metadata, position, end) {
+                    drop(lease);
+                    position = end.saturating_add(1);
+                    continue;
+                }
+                let background = HlsBackgroundRangeRequest::new(lease, move || {
+                    hls_prefix_stamp_is_current(stamp)
+                });
+                let bytes = weeb3
+                    .retrieve_hls_payload_range(
+                        reference.clone(),
+                        size,
+                        position,
+                        end,
+                        Some(stamp.generation),
+                        Some(background),
+                    )
+                    .await;
+                if usize::try_from(expected).ok() != Some(bytes.len()) {
+                    return;
+                }
+                position = end.saturating_add(1);
+            }
+        });
+    }
+
     fn start_beginning_snapshot_runway(
         weeb3: &Arc<Weeb3>,
         owner: &str,
@@ -6440,7 +8082,6 @@ mod runtime {
             return;
         };
         let successor = references.next();
-        let successor_probe = successor.clone();
         let stamp = HLS_PLAYBACK.with(|playback| {
             let mut playback = playback.borrow_mut();
             let session = &mut playback.session;
@@ -6451,12 +8092,9 @@ mod runtime {
             {
                 return None;
             }
-            session.runway = Some(BeginningRunway {
-                first: reference.clone(),
-                successor,
-                successor_prefix_started: false,
-                successor_prefix_ready: false,
-            });
+            session
+                .runways
+                .set_startup(HlsProgressiveRunway::new(reference.clone(), successor));
             Some(session.stamp())
         });
         let Some(stamp) = stamp else {
@@ -6464,49 +8102,82 @@ mod runtime {
         };
 
         let warmup_client = weeb3.clone();
-        if let Some(successor) = successor_probe {
-            drop(start_hls_payload_size_probe(
-                warmup_client.clone(),
-                successor,
-            ));
-        }
         let size = start_hls_payload_size_probe(warmup_client.clone(), reference.clone());
         spawn_local(async move {
-            let Some(size) = size.recv().await.ok().flatten() else {
+            let Some(size) = size.recv().await.ok().flatten().filter(|size| *size > 0) else {
                 return;
             };
-            if !hls_progressive_successor_admission_is_current(&reference, stamp) {
+            if !hls_progressive_startup_admission_is_current(&reference, stamp) {
                 return;
             }
-            let prefix_end = size
-                .saturating_sub(1)
-                .min(MEDIA_STORAGE_WINDOW_BYTES.saturating_sub(1));
-            let prefix = warmup_client.retrieve_hls_payload_range(
-                reference.clone(),
-                0,
-                prefix_end,
-                Some(generation),
-            );
-            if size > MEDIA_STORAGE_WINDOW_BYTES {
-                let second_end = size.saturating_sub(1).min(
-                    MEDIA_STORAGE_WINDOW_BYTES
-                        .saturating_mul(2)
-                        .saturating_sub(1),
-                );
-                let second = async {
-                    async_std::task::sleep(Duration::ZERO).await;
-                    warmup_client
+            let Some(metadata) = hls_range_metadata(&reference, size) else {
+                return;
+            };
+            let mut windows = FuturesUnordered::new();
+            let mut position = 0_u64;
+            let window_count =
+                hls_progressive_startup_window_count(size, MEDIA_STORAGE_WINDOW_BYTES);
+            for _ in 0..window_count {
+                if position >= size {
+                    break;
+                }
+                let start = position;
+                let end = start
+                    .saturating_add(MEDIA_STORAGE_WINDOW_BYTES)
+                    .saturating_sub(1)
+                    .min(size.saturating_sub(1));
+                let client = warmup_client.clone();
+                let current = reference.clone();
+                let metadata = metadata.clone();
+                windows.push(async move {
+                    if hls_aligned_range_cached(&current, &metadata, start, end) {
+                        return true;
+                    }
+                    let Some(expected) = end
+                        .checked_sub(start)
+                        .and_then(|length| length.checked_add(1))
+                    else {
+                        return false;
+                    };
+                    let Some(lease) = acquire_hls_background_range_lease(expected, || {
+                        hls_progressive_startup_admission_is_current(&current, stamp)
+                    })
+                    .await
+                    else {
+                        return false;
+                    };
+                    if !hls_progressive_startup_admission_is_current(&current, stamp) {
+                        drop(lease);
+                        return false;
+                    }
+                    if hls_aligned_range_cached(&current, &metadata, start, end) {
+                        drop(lease);
+                        return true;
+                    }
+                    let admission_reference = current.clone();
+                    let background = HlsBackgroundRangeRequest::new(lease, move || {
+                        hls_progressive_startup_admission_is_current(&admission_reference, stamp)
+                    });
+                    let bytes = client
                         .retrieve_hls_payload_range(
-                            reference.clone(),
-                            MEDIA_STORAGE_WINDOW_BYTES,
-                            second_end,
+                            current,
+                            size,
+                            start,
+                            end,
                             Some(generation),
+                            Some(background),
                         )
-                        .await
-                };
-                let _ = join(prefix, second).await;
-            } else {
-                let _ = prefix.await;
+                        .await;
+                    usize::try_from(expected).ok() == Some(bytes.len())
+                });
+                position = end.saturating_add(1);
+            }
+            let mut ready = true;
+            while let Some(window_ready) = windows.next().await {
+                ready &= window_ready;
+            }
+            if !ready || !hls_progressive_startup_admission_is_current(&reference, stamp) {
+                return;
             }
         });
     }
@@ -7511,6 +9182,7 @@ mod runtime {
         InFlight,
         Found,
         Unavailable,
+        Unsupported,
         Transient,
     }
 
@@ -7525,11 +9197,71 @@ mod runtime {
     type LiveHistoryDirectFuture =
         Pin<Box<dyn Future<Output = (u64, Option<RawFeedPayload>)> + 'static>>;
 
+    enum LiveHistoryCollectorScope {
+        Startup {
+            presentation_id: u64,
+        },
+        SequenceZeroFollowup {
+            cache_key: String,
+            checking_token: u64,
+            index: u64,
+            source_body: Arc<[u8]>,
+            snapshot_body: Arc<[u8]>,
+        },
+    }
+
+    #[derive(Clone)]
+    struct SequenceZeroFollowupGate {
+        weeb3: Arc<Weeb3>,
+        cache_key: String,
+        owner: String,
+        topic: String,
+        network_id: u64,
+        checking_token: u64,
+        index: u64,
+        source_body: Arc<[u8]>,
+        snapshot_body: Arc<[u8]>,
+    }
+
+    impl SequenceZeroFollowupGate {
+        fn current(&self) -> bool {
+            active_profile().swarm_network_id == self.network_id
+                && sequence_zero_followup_is_current(
+                    &self.weeb3,
+                    &self.cache_key,
+                    &self.owner,
+                    &self.topic,
+                )
+                && FEED_ROUTE_CACHE.with(|cache| {
+                    cache.borrow().get(&self.cache_key).is_some_and(|state| {
+                        state.checking_token == self.checking_token
+                            && state.snapshot.index == self.index
+                            && Arc::ptr_eq(&state.source_body, &self.source_body)
+                            && Arc::ptr_eq(&state.snapshot.body, &self.snapshot_body)
+                    })
+                })
+        }
+
+        async fn admitted(&self) -> bool {
+            if !self.current() {
+                return false;
+            }
+            let (network_id, available_slots) = join(
+                self.weeb3.get_network_id(),
+                self.weeb3.available_retrieve_slots(),
+            )
+            .await;
+            let required = HLS_FEED_WAVE_FOREGROUND_MARGIN_CHUNKS
+                .saturating_add(CONSERVATIVE_DEFERRED_MAX_PHYSICAL_ATTEMPTS);
+            network_id == self.network_id && available_slots >= required && self.current()
+        }
+    }
+
     struct LiveHistoryCollector {
         weeb3: Arc<Weeb3>,
         owner: String,
         topic: String,
-        presentation_id: u64,
+        scope: LiveHistoryCollectorScope,
         network_id: u64,
         pending: VecDeque<u64>,
         states: HashMap<u64, LiveHistoryProbeState>,
@@ -7543,6 +9275,10 @@ mod runtime {
         direct_reserved_bytes: usize,
         direct_required: bool,
         direct_index: Option<u64>,
+        deferred_candidate: Option<DeferredRawFeedPayload>,
+        deferred_probe_indices: HashSet<u64>,
+        followup_retry_indices: VecDeque<HlsSequenceZeroRetry>,
+        followup_deferred_retry_index: Option<u64>,
         capacity_parallelism: usize,
         capacity_priced_peers: u64,
         capacity_checked_at: f64,
@@ -7558,6 +9294,52 @@ mod runtime {
             network_id: u64,
             initial: RawFeedPayload,
         ) -> Option<Self> {
+            Self::new_with_scope(
+                weeb3,
+                owner,
+                topic,
+                network_id,
+                initial,
+                LiveHistoryCollectorScope::Startup { presentation_id },
+            )
+        }
+
+        fn new_sequence_zero_followup(
+            weeb3: Arc<Weeb3>,
+            owner: String,
+            topic: String,
+            network_id: u64,
+            initial: RawFeedPayload,
+            cache_key: String,
+            checking_token: u64,
+            snapshot_body: Arc<[u8]>,
+            source_body: Arc<[u8]>,
+        ) -> Option<Self> {
+            let index = initial.index;
+            Self::new_with_scope(
+                weeb3,
+                owner,
+                topic,
+                network_id,
+                initial,
+                LiveHistoryCollectorScope::SequenceZeroFollowup {
+                    cache_key,
+                    checking_token,
+                    index,
+                    source_body,
+                    snapshot_body,
+                },
+            )
+        }
+
+        fn new_with_scope(
+            weeb3: Arc<Weeb3>,
+            owner: String,
+            topic: String,
+            network_id: u64,
+            initial: RawFeedPayload,
+            scope: LiveHistoryCollectorScope,
+        ) -> Option<Self> {
             (initial.bytes.len() <= HLS_SPARSE_HISTORY_MAX_WINDOW_BYTES
                 && hls_sparse_history_head_is_supported(&initial.bytes))
             .then_some(())?;
@@ -7570,7 +9352,7 @@ mod runtime {
                 weeb3,
                 owner,
                 topic,
-                presentation_id,
+                scope,
                 network_id,
                 pending: VecDeque::new(),
                 states,
@@ -7584,6 +9366,10 @@ mod runtime {
                 direct_reserved_bytes: 0,
                 direct_required: false,
                 direct_index: None,
+                deferred_candidate: None,
+                deferred_probe_indices: HashSet::new(),
+                followup_retry_indices: VecDeque::new(),
+                followup_deferred_retry_index: None,
                 capacity_parallelism: 0,
                 capacity_priced_peers: 0,
                 capacity_checked_at: 0.0,
@@ -7592,12 +9378,186 @@ mod runtime {
         }
 
         fn current(&self) -> bool {
-            live_history_session_is_current(
-                &self.weeb3,
-                &self.owner,
-                &self.topic,
-                self.presentation_id,
-            ) && active_profile().swarm_network_id == self.network_id
+            let session_current = match &self.scope {
+                LiveHistoryCollectorScope::Startup { presentation_id } => {
+                    live_history_session_is_current(
+                        &self.weeb3,
+                        &self.owner,
+                        &self.topic,
+                        *presentation_id,
+                    )
+                }
+                LiveHistoryCollectorScope::SequenceZeroFollowup {
+                    cache_key,
+                    checking_token,
+                    index,
+                    source_body,
+                    snapshot_body,
+                } => {
+                    sequence_zero_followup_is_current(
+                        &self.weeb3,
+                        cache_key,
+                        &self.owner,
+                        &self.topic,
+                    ) && FEED_ROUTE_CACHE.with(|cache| {
+                        cache.borrow().get(cache_key).is_some_and(|state| {
+                            state.checking_token == *checking_token
+                                && state.snapshot.index == *index
+                                && Arc::ptr_eq(&state.source_body, source_body)
+                                && Arc::ptr_eq(&state.snapshot.body, snapshot_body)
+                        })
+                    })
+                }
+            };
+            session_current && active_profile().swarm_network_id == self.network_id
+        }
+
+        fn is_sequence_zero_followup(&self) -> bool {
+            matches!(
+                &self.scope,
+                LiveHistoryCollectorScope::SequenceZeroFollowup { .. }
+            )
+        }
+
+        fn sequence_zero_followup_gate(&self) -> Option<SequenceZeroFollowupGate> {
+            let LiveHistoryCollectorScope::SequenceZeroFollowup {
+                cache_key,
+                checking_token,
+                index,
+                source_body,
+                snapshot_body,
+            } = &self.scope
+            else {
+                return None;
+            };
+            Some(SequenceZeroFollowupGate {
+                weeb3: self.weeb3.clone(),
+                cache_key: cache_key.clone(),
+                owner: self.owner.clone(),
+                topic: self.topic.clone(),
+                network_id: self.network_id,
+                checking_token: *checking_token,
+                index: *index,
+                source_body: source_body.clone(),
+                snapshot_body: snapshot_body.clone(),
+            })
+        }
+
+        fn park_deferred_followup_candidate(
+            &mut self,
+            deferred: DeferredRawFeedPayload,
+        ) -> Result<(), String> {
+            self.deferred_probe_indices.insert(deferred.index);
+            self.forget_followup_retry_index(deferred.index);
+            if self
+                .deferred_candidate
+                .as_ref()
+                .is_some_and(|current| current.index >= deferred.index)
+            {
+                self.followup_deferred_retry_index = self
+                    .deferred_candidate
+                    .as_ref()
+                    .map(|current| current.index);
+                return Ok(());
+            }
+            if let Some(current) = self.deferred_candidate.take() {
+                self.retained_bytes = self.retained_bytes.saturating_sub(current.retained_bytes());
+            }
+            let total = self
+                .retained_bytes
+                .checked_add(deferred.retained_bytes())
+                .ok_or_else(|| {
+                    "The deferred Live update byte accounting overflowed.".to_string()
+                })?;
+            if total > HLS_SPARSE_HISTORY_MAX_AGGREGATE_BYTES {
+                return Err(
+                    "The deferred Live update exceeded its bounded memory budget.".to_string(),
+                );
+            }
+            self.retained_bytes = total;
+            self.followup_deferred_retry_index = Some(deferred.index);
+            self.deferred_candidate = Some(deferred);
+            Ok(())
+        }
+
+        fn remember_followup_retry_index(
+            &mut self,
+            index: u64,
+            authenticated: bool,
+            priority: bool,
+        ) -> bool {
+            remember_hls_sequence_zero_retry(
+                &mut self.followup_retry_indices,
+                index,
+                authenticated,
+                priority,
+                HLS_SEQUENCE_ZERO_RETRY_BACKLOG_MAX,
+            )
+        }
+
+        fn forget_followup_retry_index(&mut self, index: u64) {
+            self.followup_retry_indices
+                .retain(|current| current.index != index);
+        }
+
+        fn remember_followup_windows_after(&mut self, index: u64) -> bool {
+            let Some(first_later) = index.checked_add(1) else {
+                return true;
+            };
+            let later = self
+                .windows
+                .range(first_later..)
+                .map(|(index, _)| *index)
+                .collect::<Vec<_>>();
+            later.into_iter().all(|later_index| {
+                self.remember_followup_retry_index(
+                    later_index,
+                    true,
+                    later_index == self.highest_authenticated_positive_index,
+                )
+            })
+        }
+
+        fn retry_deferred_followup_candidate(&mut self, index: u64) {
+            self.states.insert(index, LiveHistoryProbeState::Transient);
+            self.followup_deferred_retry_index = Some(index);
+        }
+
+        fn forget_deferred_followup_retry_index(&mut self, index: u64) {
+            if self.followup_deferred_retry_index == Some(index) {
+                self.followup_deferred_retry_index = None;
+            }
+        }
+
+        fn selected_deferred_followup_candidate(&self) -> Option<&DeferredRawFeedPayload> {
+            self.deferred_candidate
+                .as_ref()
+                .filter(|deferred| deferred.index == self.highest_authenticated_positive_index)
+        }
+
+        fn take_selected_deferred_followup_candidate(&mut self) -> Option<DeferredRawFeedPayload> {
+            let deferred = self.deferred_candidate.take()?;
+            self.retained_bytes = self
+                .retained_bytes
+                .saturating_sub(deferred.retained_bytes());
+            (deferred.index == self.highest_authenticated_positive_index).then_some(deferred)
+        }
+
+        fn unusable_probe_state(&self) -> LiveHistoryProbeState {
+            if self.is_sequence_zero_followup() {
+                LiveHistoryProbeState::Unsupported
+            } else {
+                LiveHistoryProbeState::Unavailable
+            }
+        }
+
+        fn sequence_zero_followup_snapshot(&self) -> Option<&[u8]> {
+            match &self.scope {
+                LiveHistoryCollectorScope::SequenceZeroFollowup { snapshot_body, .. } => {
+                    Some(snapshot_body)
+                }
+                LiveHistoryCollectorScope::Startup { .. } => None,
+            }
         }
 
         fn head(&self) -> Option<RawFeedPayload> {
@@ -7614,8 +9574,7 @@ mod runtime {
                 && let Some(index) = self.direct_index
                 && self.state(index) == Some(LiveHistoryProbeState::InFlight)
             {
-                self.states
-                    .insert(index, LiveHistoryProbeState::Unavailable);
+                self.states.insert(index, self.unusable_probe_state());
             }
             self.direct_candidate = None;
             self.direct_in_flight = None;
@@ -7631,6 +9590,7 @@ mod runtime {
             &mut self,
             deferred: DeferredRawFeedPayload,
             required: bool,
+            conservative_gate: Option<SequenceZeroFollowupGate>,
         ) -> Result<(), String> {
             let index = deferred.index;
             self.highest_authenticated_positive_index =
@@ -7660,8 +9620,7 @@ mod runtime {
                     {
                         self.drop_direct_work();
                     } else {
-                        self.states
-                            .insert(index, LiveHistoryProbeState::Unavailable);
+                        self.states.insert(index, self.unusable_probe_state());
                         return Ok(());
                     }
                 } else {
@@ -7693,7 +9652,21 @@ mod runtime {
             self.direct_index = Some(index);
             let client = self.weeb3.clone();
             self.direct_in_flight = Some(Box::pin(async move {
-                let payload = client.hls_deferred_feed_payload(deferred).await;
+                let payload = if let Some(gate) = conservative_gate {
+                    let range_gate = gate.clone();
+                    acquire_deferred_raw_feed_payload_conservative(
+                        deferred,
+                        MAX_STREAM_FEED_PAYLOAD_BYTES,
+                        &client.chunk_port.0,
+                        move || {
+                            let range_gate = range_gate.clone();
+                            async move { range_gate.admitted().await }
+                        },
+                    )
+                    .await
+                } else {
+                    client.hls_deferred_feed_payload(deferred).await
+                };
                 (index, payload)
             }));
             Ok(())
@@ -7701,7 +9674,14 @@ mod runtime {
 
         fn adopt_inline_direct(&mut self, payload: RawFeedPayload) -> Result<(), String> {
             if self.direct_in_flight.is_some() || self.direct_candidate.is_some() {
-                return Ok(());
+                if self
+                    .direct_index
+                    .is_some_and(|current_index| payload.index > current_index)
+                {
+                    self.drop_direct_work();
+                } else {
+                    return Ok(());
+                }
             }
             let total = self
                 .retained_bytes
@@ -7723,7 +9703,14 @@ mod runtime {
         fn take_direct(&mut self) -> Option<RawFeedPayload> {
             let candidate = self.direct_candidate.take()?;
             let candidate_timeline = hls_complete_history_timeline(&candidate.bytes);
-            let valid = hls_is_finalized(&candidate.bytes)
+            let direct_shape_valid = if let Some(snapshot) = self.sequence_zero_followup_snapshot()
+            {
+                hls_media_sequence(&candidate.bytes) == Some(0)
+                    && hls_sequence_zero_covers_head(snapshot, &candidate.bytes)
+            } else {
+                hls_is_finalized(&candidate.bytes)
+            };
+            let valid = direct_shape_valid
                 && self
                     .windows
                     .last_key_value()
@@ -7739,7 +9726,7 @@ mod runtime {
             if !valid {
                 if !self.windows.contains_key(&candidate.index) {
                     self.states
-                        .insert(candidate.index, LiveHistoryProbeState::Unavailable);
+                        .insert(candidate.index, self.unusable_probe_state());
                 }
                 self.retained_bytes = self
                     .retained_bytes
@@ -7813,7 +9800,11 @@ mod runtime {
             targets.iter().all(|index| {
                 matches!(
                     self.state(*index),
-                    Some(LiveHistoryProbeState::Found | LiveHistoryProbeState::Unavailable)
+                    Some(
+                        LiveHistoryProbeState::Found
+                            | LiveHistoryProbeState::Unavailable
+                            | LiveHistoryProbeState::Unsupported
+                    )
                 )
             })
         }
@@ -7825,6 +9816,7 @@ mod runtime {
                     Some(
                         LiveHistoryProbeState::Found
                             | LiveHistoryProbeState::Unavailable
+                            | LiveHistoryProbeState::Unsupported
                             | LiveHistoryProbeState::Transient
                     )
                 )
@@ -7851,27 +9843,26 @@ mod runtime {
 
         fn verified_sequence_zero_checkpoint_tail(
             &self,
+            candidate_index: u64,
             candidate: &[u8],
         ) -> Result<Option<Vec<u8>>, String> {
-            let Some(timeline) = hls_complete_history_timeline(candidate) else {
-                return Ok(None);
+            let verified = if self.is_sequence_zero_followup() {
+                hls_verified_sequence_zero_checkpoint_tail_at_index(
+                    candidate_index,
+                    candidate,
+                    self.windows
+                        .iter()
+                        .map(|(index, window)| (*index, window.as_slice())),
+                )
+            } else {
+                hls_verified_sequence_zero_checkpoint_tail(
+                    candidate,
+                    self.windows.values().map(Vec::as_slice),
+                )
             };
-            if timeline.sequence != 0 || hls_is_finalized(candidate) {
-                return Ok(None);
-            }
-            if !self
-                .windows
-                .values()
-                .all(|window| hls_sequence_zero_timeline_covers_head(window, &timeline))
-            {
-                return Err(
-                    "The authenticated Live checkpoint contradicts the pinned timeline."
-                        .to_string(),
-                );
-            }
-            Ok(hls_sequence_zero_sparse_tail_from_timeline(
-                candidate, &timeline,
-            ))
+            verified.map_err(|()| {
+                "The authenticated Live checkpoint contradicts the pinned timeline.".to_string()
+            })
         }
 
         fn remember_window(&mut self, payload: RawFeedPayload) -> Result<(), String> {
@@ -7922,7 +9913,13 @@ mod runtime {
                 RetainedRawFeedPayloadProbe::Found(payload) => Some(payload),
                 RetainedRawFeedPayloadProbe::Deferred(deferred) => {
                     if deferred.index == index {
-                        self.start_deferred_direct(deferred, true)?;
+                        if self.is_sequence_zero_followup() {
+                            self.park_deferred_followup_candidate(deferred)?;
+                            self.states
+                                .insert(index, LiveHistoryProbeState::Unsupported);
+                        } else {
+                            self.start_deferred_direct(deferred, true, None)?;
+                        }
                     } else {
                         self.states.insert(index, LiveHistoryProbeState::Transient);
                     }
@@ -7960,8 +9957,7 @@ mod runtime {
                         .direct_index
                         .is_some_and(|current_index| current_index >= payload.index)
                     {
-                        self.states
-                            .insert(index, LiveHistoryProbeState::Unavailable);
+                        self.states.insert(index, self.unusable_probe_state());
                         return Ok(());
                     }
                     self.drop_direct_work();
@@ -7973,25 +9969,24 @@ mod runtime {
                         "The direct Live archive byte accounting overflowed.".to_string()
                     })?;
                 if total > HLS_SPARSE_HISTORY_MAX_AGGREGATE_BYTES {
-                    self.states
-                        .insert(index, LiveHistoryProbeState::Unavailable);
+                    self.states.insert(index, self.unusable_probe_state());
                     return Ok(());
                 }
                 self.retained_bytes = total;
                 self.direct_reserved_bytes = payload.bytes.len();
                 self.direct_required = false;
                 self.direct_index = Some(payload.index);
-                self.states
-                    .insert(index, LiveHistoryProbeState::Unavailable);
+                self.states.insert(index, self.unusable_probe_state());
                 self.direct_candidate = Some(payload);
                 return Ok(());
             }
-            if finalized_sequence_zero {
+            if finalized_sequence_zero && !self.is_sequence_zero_followup() {
                 self.states
                     .insert(index, LiveHistoryProbeState::Unavailable);
                 return Ok(());
             }
-            if hls_is_long_sequence_zero_checkpoint(&payload.bytes)
+            if !self.is_sequence_zero_followup()
+                && hls_is_long_sequence_zero_checkpoint(&payload.bytes)
                 && self
                     .windows
                     .last_key_value()
@@ -8001,14 +9996,31 @@ mod runtime {
                     .insert(index, LiveHistoryProbeState::Unavailable);
                 return Ok(());
             }
-            if let Some(sparse_tail) =
-                self.verified_sequence_zero_checkpoint_tail(&payload.bytes)?
-            {
+            let sparse_tail = self.verified_sequence_zero_checkpoint_tail(index, &payload.bytes)?;
+            if let Some(sparse_tail) = sparse_tail {
+                let use_full_checkpoint = self.is_sequence_zero_followup()
+                    && self
+                        .sequence_zero_followup_snapshot()
+                        .is_some_and(|snapshot| {
+                            hls_sequence_zero_covers_head(snapshot, &payload.bytes)
+                                && self.windows.iter().all(|(window_index, window)| {
+                                    *window_index > index
+                                        || hls_sequence_zero_covers_head(window, &payload.bytes)
+                                })
+                        });
                 self.remember_window(RawFeedPayload {
                     index,
                     bytes: sparse_tail,
                 })?;
                 self.states.insert(index, LiveHistoryProbeState::Found);
+                if use_full_checkpoint
+                    && self
+                        .retained_bytes
+                        .checked_add(payload.bytes.len())
+                        .is_some_and(|total| total <= HLS_SPARSE_HISTORY_MAX_AGGREGATE_BYTES)
+                {
+                    self.adopt_inline_direct(payload)?;
+                }
                 return Ok(());
             }
             if payload.bytes.len() <= HLS_SPARSE_HISTORY_MAX_WINDOW_BYTES
@@ -8021,8 +10033,7 @@ mod runtime {
                     "The authenticated Live update is not a supported HLS window.".to_string(),
                 );
             } else {
-                self.states
-                    .insert(index, LiveHistoryProbeState::Unavailable);
+                self.states.insert(index, self.unusable_probe_state());
             }
             Ok(())
         }
@@ -8043,11 +10054,17 @@ mod runtime {
                 )
                 .await;
                 self.capacity_priced_peers = priced_peers;
+                let available_slots = if self.is_sequence_zero_followup() {
+                    available_slots.saturating_sub(HLS_FEED_WAVE_FOREGROUND_MARGIN_CHUNKS)
+                } else {
+                    available_slots
+                };
                 self.capacity_parallelism =
                     hls_sparse_history_parallelism(priced_peers, available_slots);
                 self.capacity_checked_at = now;
             }
             let parallelism = self.capacity_parallelism;
+            let sequence_zero_followup = self.is_sequence_zero_followup();
             while self.in_flight.len() < parallelism {
                 let Some(index) = self.pending.pop_front() else {
                     break;
@@ -8060,9 +10077,15 @@ mod runtime {
                 let owner = self.owner.clone();
                 let topic = self.topic.clone();
                 self.in_flight.push(Box::pin(async move {
-                    let result = client
-                        .hls_feed_payload_at_index_retained_status(owner, topic, index)
-                        .await;
+                    let result = if sequence_zero_followup {
+                        client
+                            .hls_feed_payload_at_index_followup_retained_status(owner, topic, index)
+                            .await
+                    } else {
+                        client
+                            .hls_feed_payload_at_index_retained_status(owner, topic, index)
+                            .await
+                    };
                     (index, result)
                 }));
             }
@@ -8084,14 +10107,21 @@ mod runtime {
                     );
                 }
                 let disposition = payload.as_ref().map(|payload| {
-                    hls_direct_archive_disposition(
-                        index,
-                        self.windows
-                            .last_key_value()
-                            .map_or(index, |(head_index, _)| *head_index),
-                        self.highest_authenticated_positive_index,
-                        &payload.bytes,
-                    )
+                    if self.is_sequence_zero_followup()
+                        && hls_media_sequence(&payload.bytes) == Some(0)
+                        && !hls_is_finalized(&payload.bytes)
+                    {
+                        HlsDirectArchiveDisposition::SequenceZeroCheckpoint
+                    } else {
+                        hls_direct_archive_disposition(
+                            index,
+                            self.windows
+                                .last_key_value()
+                                .map_or(index, |(head_index, _)| *head_index),
+                            self.highest_authenticated_positive_index,
+                            &payload.bytes,
+                        )
+                    }
                 });
                 match disposition {
                     Some(HlsDirectArchiveDisposition::Terminal) => {
@@ -8111,33 +10141,64 @@ mod runtime {
                                     .to_string(),
                             );
                         }
-                        self.states
-                            .insert(index, LiveHistoryProbeState::Unavailable);
+                        self.states.insert(index, self.unusable_probe_state());
                         self.direct_candidate = Some(candidate);
                     }
                     Some(HlsDirectArchiveDisposition::Stale)
                     | Some(HlsDirectArchiveDisposition::Nonterminal)
                     | Some(HlsDirectArchiveDisposition::Unsupported) => {
                         self.drop_direct_work();
+                        if self.is_sequence_zero_followup() {
+                            self.states
+                                .insert(index, LiveHistoryProbeState::Unsupported);
+                        }
                     }
                     Some(HlsDirectArchiveDisposition::SequenceZeroCheckpoint) => {
                         let checkpoint = payload.expect("the disposition requires a payload");
-                        let sparse_tail =
-                            match self.verified_sequence_zero_checkpoint_tail(&checkpoint.bytes) {
-                                Ok(sparse_tail) => sparse_tail,
-                                Err(error) => {
-                                    self.drop_direct_work();
-                                    return Err(error);
-                                }
-                            };
-                        self.drop_direct_work();
+                        let sparse_tail = match self
+                            .verified_sequence_zero_checkpoint_tail(index, &checkpoint.bytes)
+                        {
+                            Ok(sparse_tail) => sparse_tail,
+                            Err(error) => {
+                                self.drop_direct_work();
+                                return Err(error);
+                            }
+                        };
+                        let use_full_checkpoint = self
+                            .sequence_zero_followup_snapshot()
+                            .is_some_and(|snapshot| {
+                                hls_sequence_zero_covers_head(snapshot, &checkpoint.bytes)
+                                    && self.windows.iter().all(|(window_index, window)| {
+                                        *window_index > index
+                                            || hls_sequence_zero_covers_head(
+                                                window,
+                                                &checkpoint.bytes,
+                                            )
+                                    })
+                            });
                         if let Some(sparse_tail) = sparse_tail {
+                            let keep_full_checkpoint = use_full_checkpoint
+                                && self
+                                    .retained_bytes
+                                    .checked_add(sparse_tail.len())
+                                    .is_some_and(|total| {
+                                        total <= HLS_SPARSE_HISTORY_MAX_AGGREGATE_BYTES
+                                    });
+                            if !keep_full_checkpoint {
+                                self.drop_direct_work();
+                            }
                             self.remember_window(RawFeedPayload {
                                 index,
                                 bytes: sparse_tail,
                             })?;
                             self.states.insert(index, LiveHistoryProbeState::Found);
+                            if keep_full_checkpoint {
+                                self.direct_required = false;
+                                self.direct_candidate = Some(checkpoint);
+                            }
+                            return Ok(());
                         }
+                        self.drop_direct_work();
                     }
                     None => {
                         self.drop_direct_work();
@@ -8189,6 +10250,20 @@ mod runtime {
                 self.pump_once().await?;
             }
             Ok(())
+        }
+
+        async fn observe_retained_once(&mut self, targets: &[u64]) -> Result<bool, String> {
+            while !self.targets_observed(targets) {
+                self.pump_once().await?;
+                if self.capacity_parallelism == 0
+                    && self.in_flight.is_empty()
+                    && self.direct_in_flight.is_none()
+                    && !self.targets_observed(targets)
+                {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
         }
 
         async fn observe_forward_wave(
@@ -8537,7 +10612,16 @@ mod runtime {
                 return None;
             }
             let now = js_sys::Date::now();
+            let source_body: Arc<[u8]> = Arc::from(head.bytes.clone());
+            state.source_body = source_body.clone();
+            state.body_tracks_source = source_body.as_ref() == snapshot.body.as_ref();
             state.confirmed_head_index = Some(head.index);
+            state.sequence_zero_recovery_cursor = 20;
+            state.sequence_zero_retry_indices.clear();
+            state.sequence_zero_deferred_retry_index = None;
+            state.sequence_zero_retry_deferred_first = true;
+            state.sequence_zero_positive_ceiling =
+                state.sequence_zero_positive_ceiling.max(head.index);
             state.last_head_check = now;
             state.last_touch = now;
             state.source_endlist_confirmed =
@@ -8631,7 +10715,7 @@ mod runtime {
                 direct_started = true;
             }
             if observed_is_newer && let Some(observed_deferred) = observed_deferred {
-                collector.start_deferred_direct(observed_deferred, true)?;
+                collector.start_deferred_direct(observed_deferred, true, None)?;
                 direct_started = true;
             }
             if direct_started {
@@ -8860,6 +10944,12 @@ mod runtime {
                     candidate.head_confirmed
                 };
                 existing.confirmed_head_index = proof_confirmed.then_some(candidate.index);
+                existing.sequence_zero_recovery_cursor = 20;
+                existing.sequence_zero_retry_indices.clear();
+                existing.sequence_zero_deferred_retry_index = None;
+                existing.sequence_zero_retry_deferred_first = true;
+                existing.sequence_zero_positive_ceiling =
+                    existing.sequence_zero_positive_ceiling.max(candidate.index);
                 existing.last_head_check = if proof_confirmed { now } else { 0.0 };
                 existing.last_touch = now;
                 let stored = existing.snapshot.clone();
@@ -8884,6 +10974,11 @@ mod runtime {
                     source_endlist_confirmed: candidate.head_confirmed,
                     checking_token: 0,
                     confirmed_head_index: candidate.head_confirmed.then_some(candidate.index),
+                    sequence_zero_recovery_cursor: 20,
+                    sequence_zero_retry_indices: VecDeque::new(),
+                    sequence_zero_deferred_retry_index: None,
+                    sequence_zero_retry_deferred_first: true,
+                    sequence_zero_positive_ceiling: candidate.index,
                     last_head_check: if candidate.head_confirmed { now } else { 0.0 },
                     last_touch: now,
                 },
@@ -9000,6 +11095,1087 @@ mod runtime {
         })
     }
 
+    #[derive(Clone)]
+    struct SequenceZeroFollowupSeed {
+        index: u64,
+        source_body: Arc<[u8]>,
+        snapshot_body: Arc<[u8]>,
+        tentative_terminal: bool,
+        scan_initialized: bool,
+        recovery_cursor: u64,
+        retry_indices: VecDeque<HlsSequenceZeroRetry>,
+        deferred_retry_index: Option<u64>,
+        retry_deferred_first: bool,
+        positive_ceiling: u64,
+    }
+
+    enum SequenceZeroFollowupHead {
+        Sparse {
+            payload: RawFeedPayload,
+            continue_catchup: bool,
+        },
+        Direct(RawFeedPayload),
+        WarmScan {
+            next_recovery_cursor: u64,
+            retry_indices: VecDeque<HlsSequenceZeroRetry>,
+            deferred_retry_index: Option<u64>,
+        },
+    }
+
+    fn sequence_zero_followup_seed(
+        cache_key: &str,
+        checking_token: u64,
+        expected_index: u64,
+    ) -> Option<SequenceZeroFollowupSeed> {
+        FEED_ROUTE_CACHE.with(|cache| {
+            let cache = cache.borrow();
+            let state = cache.get(cache_key)?;
+            if state.checking_token != checking_token
+                || state.snapshot.index != expected_index
+                || state.snapshot.finalized
+                || hls_media_sequence(&state.snapshot.body) != Some(0)
+            {
+                return None;
+            }
+            Some(SequenceZeroFollowupSeed {
+                index: expected_index,
+                source_body: state.source_body.clone(),
+                snapshot_body: state.snapshot.body.clone(),
+                tentative_terminal: !state.source_endlist_confirmed
+                    && hls_is_finalized(&state.source_body)
+                    && hls_is_finalized(&state.snapshot.body),
+                scan_initialized: state.last_head_check.is_finite() && state.last_head_check > 0.0,
+                recovery_cursor: state.sequence_zero_recovery_cursor.max(20),
+                retry_indices: state.sequence_zero_retry_indices.clone(),
+                deferred_retry_index: state.sequence_zero_deferred_retry_index,
+                retry_deferred_first: state.sequence_zero_retry_deferred_first,
+                positive_ceiling: state.sequence_zero_positive_ceiling.max(expected_index),
+            })
+        })
+    }
+
+    fn initialize_sequence_zero_followup_scan(
+        cache_key: &str,
+        checking_token: u64,
+        seed: &SequenceZeroFollowupSeed,
+    ) {
+        FEED_ROUTE_CACHE.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            let Some(state) = cache.get_mut(cache_key) else {
+                return;
+            };
+            if state.checking_token == checking_token
+                && state.snapshot.index == seed.index
+                && Arc::ptr_eq(&state.source_body, &seed.source_body)
+                && Arc::ptr_eq(&state.snapshot.body, &seed.snapshot_body)
+                && (!state.last_head_check.is_finite() || state.last_head_check <= 0.0)
+            {
+                let now = js_sys::Date::now();
+                state.last_head_check = now;
+                state.last_touch = now;
+            }
+        });
+    }
+
+    fn warm_sequence_zero_followup_scan(
+        cache_key: &str,
+        checking_token: u64,
+        seed: &SequenceZeroFollowupSeed,
+        next_recovery_cursor: u64,
+        retry_indices: VecDeque<HlsSequenceZeroRetry>,
+        deferred_retry_index: Option<u64>,
+        positive_ceiling: u64,
+    ) {
+        FEED_ROUTE_CACHE.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            let Some(state) = cache.get_mut(cache_key) else {
+                return;
+            };
+            if state.checking_token == checking_token
+                && state.snapshot.index == seed.index
+                && Arc::ptr_eq(&state.source_body, &seed.source_body)
+                && Arc::ptr_eq(&state.snapshot.body, &seed.snapshot_body)
+            {
+                let now = js_sys::Date::now();
+                state.sequence_zero_recovery_cursor = next_recovery_cursor;
+                state.sequence_zero_retry_indices = retry_indices;
+                state.sequence_zero_deferred_retry_index = deferred_retry_index;
+                if state.sequence_zero_deferred_retry_index.is_none()
+                    || !state
+                        .sequence_zero_retry_indices
+                        .iter()
+                        .any(|retry| retry.authenticated)
+                {
+                    state.sequence_zero_retry_deferred_first = true;
+                }
+                state.sequence_zero_positive_ceiling =
+                    state.sequence_zero_positive_ceiling.max(positive_ceiling);
+                state.last_head_check = now;
+                state.last_touch = now;
+            }
+        });
+    }
+
+    fn persist_sequence_zero_followup_observation(
+        cache_key: &str,
+        checking_token: u64,
+        seed: &SequenceZeroFollowupSeed,
+        collector: &LiveHistoryCollector,
+    ) {
+        FEED_ROUTE_CACHE.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            let Some(state) = cache.get_mut(cache_key) else {
+                return;
+            };
+            if state.checking_token == checking_token
+                && state.snapshot.index == seed.index
+                && Arc::ptr_eq(&state.source_body, &seed.source_body)
+                && Arc::ptr_eq(&state.snapshot.body, &seed.snapshot_body)
+            {
+                state.sequence_zero_retry_indices = collector.followup_retry_indices.clone();
+                state.sequence_zero_deferred_retry_index = collector.followup_deferred_retry_index;
+                if state.sequence_zero_deferred_retry_index.is_none()
+                    || !state
+                        .sequence_zero_retry_indices
+                        .iter()
+                        .any(|retry| retry.authenticated)
+                {
+                    state.sequence_zero_retry_deferred_first = true;
+                }
+                state.sequence_zero_positive_ceiling = state
+                    .sequence_zero_positive_ceiling
+                    .max(collector.highest_authenticated_positive_index);
+                state.last_touch = js_sys::Date::now();
+            }
+        });
+    }
+
+    fn advance_sequence_zero_retry_turn(
+        cache_key: &str,
+        checking_token: u64,
+        seed: &SequenceZeroFollowupSeed,
+    ) {
+        if seed.deferred_retry_index.is_none()
+            || !seed.retry_indices.iter().any(|retry| retry.authenticated)
+        {
+            return;
+        }
+        FEED_ROUTE_CACHE.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            let Some(state) = cache.get_mut(cache_key) else {
+                return;
+            };
+            if state.checking_token == checking_token
+                && state.snapshot.index == seed.index
+                && Arc::ptr_eq(&state.source_body, &seed.source_body)
+                && Arc::ptr_eq(&state.snapshot.body, &seed.snapshot_body)
+            {
+                state.sequence_zero_retry_deferred_first = !seed.retry_deferred_first;
+            }
+        });
+    }
+
+    fn finish_sequence_zero_terminal_confirmation(
+        weeb3: &Arc<Weeb3>,
+        cache_key: &str,
+        owner: &str,
+        topic: &str,
+        network_id: u64,
+        checking_token: u64,
+        seed: &SequenceZeroFollowupSeed,
+        positive_indices: &[u64],
+        promote: bool,
+    ) -> Option<bool> {
+        if active_profile().swarm_network_id != network_id
+            || !sequence_zero_followup_is_current(weeb3, cache_key, owner, topic)
+        {
+            return None;
+        }
+        FEED_ROUTE_CACHE.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            let promoted = {
+                let state = cache.get_mut(cache_key)?;
+                if state.checking_token != checking_token
+                    || state.snapshot.index != seed.index
+                    || !Arc::ptr_eq(&state.source_body, &seed.source_body)
+                    || !Arc::ptr_eq(&state.snapshot.body, &seed.snapshot_body)
+                    || state.snapshot.finalized
+                    || state.source_endlist_confirmed
+                    || !hls_is_finalized(&state.source_body)
+                    || !hls_is_finalized(&state.snapshot.body)
+                {
+                    return None;
+                }
+                let now = js_sys::Date::now();
+                let prior_positive = state.sequence_zero_positive_ceiling > seed.index
+                    || state
+                        .sequence_zero_deferred_retry_index
+                        .is_some_and(|index| index > seed.index)
+                    || state
+                        .sequence_zero_retry_indices
+                        .iter()
+                        .any(|retry| retry.authenticated && retry.index > seed.index);
+                let promote = promote && positive_indices.is_empty() && !prior_positive;
+                if promote {
+                    state.snapshot.finalized = true;
+                    state.source_endlist_confirmed = true;
+                    state.confirmed_head_index = Some(seed.index);
+                    state.sequence_zero_recovery_cursor = 20;
+                    state.sequence_zero_retry_indices.clear();
+                    state.sequence_zero_deferred_retry_index = None;
+                    state.sequence_zero_retry_deferred_first = true;
+                    state.sequence_zero_positive_ceiling =
+                        state.sequence_zero_positive_ceiling.max(seed.index);
+                } else {
+                    let highest = positive_indices.iter().copied().max();
+                    for index in positive_indices.iter().copied() {
+                        let _ = remember_hls_sequence_zero_retry(
+                            &mut state.sequence_zero_retry_indices,
+                            index,
+                            true,
+                            Some(index) == highest,
+                            HLS_SEQUENCE_ZERO_RETRY_BACKLOG_MAX,
+                        );
+                    }
+                    if let Some(highest) = highest {
+                        state.sequence_zero_positive_ceiling =
+                            state.sequence_zero_positive_ceiling.max(highest);
+                    }
+                }
+                state.last_head_check = now;
+                state.last_touch = now;
+                promote
+            };
+            trim_feed_route_cache(&mut cache, cache_key);
+            Some(promoted)
+        })
+    }
+
+    async fn confirm_tentative_sequence_zero_terminal(
+        weeb3: Arc<Weeb3>,
+        cache_key: &str,
+        owner: &str,
+        topic: &str,
+        network_id: u64,
+        checking_token: u64,
+        seed: &SequenceZeroFollowupSeed,
+    ) {
+        let Some(targets) = plan_hls_sequence_zero_terminal_confirmation(seed.index) else {
+            let _ = finish_sequence_zero_terminal_confirmation(
+                &weeb3,
+                cache_key,
+                owner,
+                topic,
+                network_id,
+                checking_token,
+                seed,
+                &[],
+                false,
+            );
+            return;
+        };
+        let gate = SequenceZeroFollowupGate {
+            weeb3: weeb3.clone(),
+            cache_key: cache_key.to_string(),
+            owner: owner.to_string(),
+            topic: topic.to_string(),
+            network_id,
+            checking_token,
+            index: seed.index,
+            source_body: seed.source_body.clone(),
+            snapshot_body: seed.snapshot_body.clone(),
+        };
+        if !gate.admitted().await {
+            let _ = finish_sequence_zero_terminal_confirmation(
+                &weeb3,
+                cache_key,
+                owner,
+                topic,
+                network_id,
+                checking_token,
+                seed,
+                &[],
+                false,
+            );
+            return;
+        }
+
+        let mut probes = FuturesUnordered::new();
+        for index in targets {
+            let client = weeb3.clone();
+            let owner = owner.to_string();
+            let topic = topic.to_string();
+            probes.push(async move {
+                let result = client
+                    .hls_feed_payload_at_index_followup_retained_status(owner, topic, index)
+                    .await;
+                (index, result)
+            });
+        }
+        let mut positive_indices = Vec::new();
+        let mut all_missing = true;
+        while let Some((index, result)) = probes.next().await {
+            match result {
+                RetainedRawFeedPayloadProbe::Found(_)
+                | RetainedRawFeedPayloadProbe::Deferred(_) => {
+                    positive_indices.push(index);
+                    all_missing = false;
+                }
+                RetainedRawFeedPayloadProbe::Missing => {}
+                RetainedRawFeedPayloadProbe::Transient => all_missing = false,
+            }
+        }
+        if weeb3.get_network_id().await != network_id || !gate.current() {
+            return;
+        }
+        let promoted = finish_sequence_zero_terminal_confirmation(
+            &weeb3,
+            cache_key,
+            owner,
+            topic,
+            network_id,
+            checking_token,
+            seed,
+            &positive_indices,
+            all_missing,
+        )
+        .unwrap_or(false);
+        if promoted {
+            remember_authenticated_endlist_index(network_id, owner, topic, seed.index);
+        }
+    }
+
+    fn take_sequence_zero_followup_direct(
+        collector: &mut LiveHistoryCollector,
+        initial_index: u64,
+        initial_archive: &[u8],
+    ) -> Result<Option<RawFeedPayload>, String> {
+        let had_direct = collector.direct_candidate.is_some();
+        let direct = collector.take_direct();
+        if !had_direct {
+            return Ok(None);
+        }
+        let Some(direct) = direct else {
+            return Ok(None);
+        };
+        if direct.index < initial_index
+            || hls_media_sequence(&direct.bytes) != Some(0)
+            || !hls_sequence_zero_covers_head(initial_archive, &direct.bytes)
+        {
+            return Err(
+                "The authenticated terminal Live archive contradicts the active timeline."
+                    .to_string(),
+            );
+        }
+        collector.forget_followup_retry_index(direct.index);
+        collector.forget_deferred_followup_retry_index(direct.index);
+        Ok(Some(direct))
+    }
+
+    async fn decode_selected_sequence_zero_terminal(
+        collector: &mut LiveHistoryCollector,
+    ) -> Result<(), String> {
+        let Some(gate) = collector.sequence_zero_followup_gate() else {
+            return Ok(());
+        };
+        let Some(deferred) = collector.selected_deferred_followup_candidate().cloned() else {
+            return Ok(());
+        };
+        let deferred_index = deferred.index;
+        if !gate.admitted().await {
+            collector.retry_deferred_followup_candidate(deferred_index);
+            return Ok(());
+        }
+
+        let chunk_port = collector.weeb3.chunk_port.0.clone();
+        let mut tail = Box::pin(probe_deferred_raw_feed_payload_tail_conservative(
+            &deferred,
+            crate::erasure_coding::CHUNK_SIZE,
+            &chunk_port,
+        ));
+        let tail = loop {
+            if !gate.current() {
+                collector.retry_deferred_followup_candidate(deferred_index);
+                return Ok(());
+            }
+            if let Some(tail) = tail.as_mut().now_or_never() {
+                break tail;
+            }
+            async_std::task::sleep(Duration::from_millis(25)).await;
+        };
+        let Some(tail) = tail else {
+            collector.retry_deferred_followup_candidate(deferred_index);
+            return Ok(());
+        };
+        if !hls_tail_has_terminal_endlist(&tail) {
+            collector.take_selected_deferred_followup_candidate();
+            collector
+                .states
+                .insert(deferred_index, LiveHistoryProbeState::Unsupported);
+            collector.forget_deferred_followup_retry_index(deferred_index);
+            return Ok(());
+        }
+        if !gate.admitted().await {
+            collector.retry_deferred_followup_candidate(deferred_index);
+            return Ok(());
+        }
+        let Some(deferred) = collector.take_selected_deferred_followup_candidate() else {
+            return Ok(());
+        };
+        collector.start_deferred_direct(deferred, true, Some(gate))?;
+        collector.finish_direct().await?;
+        if collector.state(deferred_index) == Some(LiveHistoryProbeState::Transient) {
+            collector.retry_deferred_followup_candidate(deferred_index);
+        } else {
+            collector.forget_deferred_followup_retry_index(deferred_index);
+        }
+        Ok(())
+    }
+
+    fn highest_appendable_sequence_zero_followup_head(
+        collector: &LiveHistoryCollector,
+        initial_index: u64,
+        initial_archive: &[u8],
+    ) -> Option<RawFeedPayload> {
+        let initial_timeline = hls_complete_history_timeline(initial_archive)?;
+        if initial_timeline.sequence != 0 {
+            return None;
+        }
+        let mut segments = initial_timeline.segments;
+        let mut candidates = collector
+            .windows
+            .iter()
+            .filter(|(index, _)| **index > initial_index)
+            .filter_map(|(index, bytes)| {
+                hls_sparse_history_timeline(bytes).map(|timeline| (*index, bytes, timeline))
+            })
+            .collect::<Vec<_>>();
+        candidates.sort_by_key(|(index, _, timeline)| {
+            (
+                timeline.sequence,
+                timeline.end().unwrap_or(u64::MAX),
+                *index,
+            )
+        });
+        let mut highest = None;
+        for (index, bytes, timeline) in candidates {
+            let current_end = u64::try_from(segments.len()).ok()?;
+            let candidate_end = timeline.end()?;
+            if timeline.sequence > current_end {
+                break;
+            }
+            let overlap_end = current_end.min(candidate_end);
+            if (timeline.sequence..overlap_end).any(|sequence| {
+                let current = usize::try_from(sequence).ok();
+                let incoming = usize::try_from(sequence - timeline.sequence).ok();
+                current.zip(incoming).is_none_or(|(current, incoming)| {
+                    segments.get(current) != timeline.segments.get(incoming)
+                })
+            }) {
+                break;
+            }
+            if candidate_end > current_end {
+                let position = usize::try_from(current_end - timeline.sequence).ok()?;
+                segments.extend_from_slice(timeline.segments.get(position..)?);
+            }
+            if highest
+                .as_ref()
+                .is_none_or(|payload: &RawFeedPayload| index > payload.index)
+            {
+                highest = Some(RawFeedPayload {
+                    index,
+                    bytes: bytes.clone(),
+                });
+            }
+            if hls_is_finalized(bytes) {
+                break;
+            }
+        }
+        highest
+    }
+
+    async fn discover_sequence_zero_followup_head(
+        collector: &mut LiveHistoryCollector,
+        initial_index: u64,
+        initial_archive: &[u8],
+        refresh_head: bool,
+        scan_initialized: bool,
+        recovery_cursor: u64,
+        deferred_retry_index: Option<u64>,
+        ordinary_retry: Option<HlsSequenceZeroRetry>,
+        retry_deferred_first: bool,
+    ) -> Result<Option<SequenceZeroFollowupHead>, String> {
+        let mut probe_index = initial_index;
+        let mut guard_waves = 0usize;
+        if let Some(bytes) = collector
+            .windows
+            .get(&initial_index)
+            .filter(|bytes| hls_is_finalized(bytes))
+            .filter(|_| initial_index >= collector.highest_authenticated_positive_index)
+            .cloned()
+        {
+            return Ok(Some(SequenceZeroFollowupHead::Sparse {
+                payload: RawFeedPayload {
+                    index: initial_index,
+                    bytes,
+                },
+                continue_catchup: false,
+            }));
+        }
+        if let Some(direct) =
+            take_sequence_zero_followup_direct(collector, initial_index, initial_archive)?
+        {
+            return Ok(Some(SequenceZeroFollowupHead::Direct(direct)));
+        }
+        loop {
+            let first_guard = probe_index
+                .checked_add(HLS_SPARSE_HISTORY_STRIDE)
+                .ok_or_else(|| "The Live follow-up guard index overflowed.".to_string())?;
+            let second_guard = first_guard
+                .checked_add(HLS_SPARSE_HISTORY_STRIDE)
+                .ok_or_else(|| "The Live follow-up guard index overflowed.".to_string())?;
+            let guard = [first_guard, second_guard];
+            collector.enqueue(guard, LiveHistoryProbeClass::Primary, true)?;
+            if !collector.observe_retained_once(&guard).await? {
+                return Ok(None);
+            }
+            if let Some(direct) =
+                take_sequence_zero_followup_direct(collector, initial_index, initial_archive)?
+            {
+                return Ok(Some(SequenceZeroFollowupHead::Direct(direct)));
+            }
+
+            let found = guard
+                .iter()
+                .filter(|index| collector.state(**index) == Some(LiveHistoryProbeState::Found))
+                .filter_map(|index| {
+                    collector
+                        .windows
+                        .get(index)
+                        .map(|bytes| (*index, hls_is_finalized(bytes)))
+                })
+                .max_by_key(|(index, _)| *index);
+            if let Some((found_index, _)) = found {
+                probe_index = found_index;
+                guard_waves = guard_waves.saturating_add(1);
+            }
+            if found.as_ref().is_some_and(|(_, finalized)| *finalized)
+                && let Some(head) = highest_appendable_sequence_zero_followup_head(
+                    collector,
+                    initial_index,
+                    initial_archive,
+                )
+                && hls_is_finalized(&head.bytes)
+                && head.index >= collector.highest_authenticated_positive_index
+            {
+                return Ok(Some(SequenceZeroFollowupHead::Sparse {
+                    payload: head,
+                    continue_catchup: false,
+                }));
+            }
+            let guard_blocked = guard.iter().any(|index| {
+                matches!(
+                    collector.state(*index),
+                    Some(LiveHistoryProbeState::Transient | LiveHistoryProbeState::Unsupported)
+                )
+            });
+            if guard_blocked {
+                let appendable = (guard_waves > 0)
+                    .then(|| {
+                        highest_appendable_sequence_zero_followup_head(
+                            collector,
+                            initial_index,
+                            initial_archive,
+                        )
+                    })
+                    .flatten();
+                if let Some(payload) = appendable.filter(|payload| {
+                    !hls_is_finalized(&payload.bytes)
+                        || payload.index >= collector.highest_authenticated_positive_index
+                }) {
+                    let remembered_later = collector.remember_followup_windows_after(payload.index);
+                    return Ok(Some(SequenceZeroFollowupHead::Sparse {
+                        continue_catchup: collector.highest_authenticated_positive_index
+                            > payload.index
+                            || !remembered_later,
+                        payload,
+                    }));
+                }
+                if scan_initialized && refresh_head {
+                    break;
+                }
+                return Ok(None);
+            }
+            if found.is_some() {
+                if guard.iter().any(|index| {
+                    collector.state(*index) == Some(LiveHistoryProbeState::Unavailable)
+                }) {
+                    if let Some(payload) = highest_appendable_sequence_zero_followup_head(
+                        collector,
+                        initial_index,
+                        initial_archive,
+                    ) && (!hls_is_finalized(&payload.bytes)
+                        || payload.index >= collector.highest_authenticated_positive_index)
+                    {
+                        let remembered_later =
+                            collector.remember_followup_windows_after(payload.index);
+                        let continue_catchup = collector.highest_authenticated_positive_index
+                            > payload.index
+                            || found.is_some_and(|(index, _)| index == second_guard)
+                            || !remembered_later;
+                        return Ok(Some(SequenceZeroFollowupHead::Sparse {
+                            payload,
+                            continue_catchup,
+                        }));
+                    }
+                    break;
+                }
+                if guard_waves >= HLS_SEQUENCE_ZERO_PROVISIONAL_GUARD_WAVES {
+                    if let Some(payload) = highest_appendable_sequence_zero_followup_head(
+                        collector,
+                        initial_index,
+                        initial_archive,
+                    ) && (!hls_is_finalized(&payload.bytes)
+                        || payload.index >= collector.highest_authenticated_positive_index)
+                    {
+                        collector.remember_followup_windows_after(payload.index);
+                        return Ok(Some(SequenceZeroFollowupHead::Sparse {
+                            payload,
+                            continue_catchup: true,
+                        }));
+                    }
+                    break;
+                }
+                continue;
+            }
+            if !guard
+                .iter()
+                .all(|index| collector.state(*index) == Some(LiveHistoryProbeState::Unavailable))
+            {
+                return Ok(None);
+            }
+            if guard_waves > 0
+                && let Some(payload) = highest_appendable_sequence_zero_followup_head(
+                    collector,
+                    initial_index,
+                    initial_archive,
+                )
+                && (!hls_is_finalized(&payload.bytes)
+                    || payload.index >= collector.highest_authenticated_positive_index)
+            {
+                let remembered_later = collector.remember_followup_windows_after(payload.index);
+                let continue_catchup = collector.highest_authenticated_positive_index
+                    > payload.index
+                    || !remembered_later;
+                return Ok(Some(SequenceZeroFollowupHead::Sparse {
+                    payload,
+                    continue_catchup,
+                }));
+            }
+            break;
+        }
+        if !scan_initialized || !refresh_head {
+            return Ok(None);
+        }
+
+        let planned_retry_index = select_hls_sequence_zero_retry(
+            deferred_retry_index,
+            ordinary_retry,
+            retry_deferred_first,
+        );
+        let (proof_targets, mut next_recovery_cursor) = plan_hls_sequence_zero_followup_recovery(
+            initial_index,
+            recovery_cursor,
+            planned_retry_index,
+        )
+        .ok_or_else(|| "The Live follow-up recovery index overflowed.".to_string())?;
+        collector.enqueue(
+            proof_targets.iter().copied(),
+            LiveHistoryProbeClass::Primary,
+            true,
+        )?;
+        if !collector.observe_retained_once(&proof_targets).await? {
+            return Ok(None);
+        }
+        if let Some(direct) =
+            take_sequence_zero_followup_direct(collector, initial_index, initial_archive)?
+        {
+            return Ok(Some(SequenceZeroFollowupHead::Direct(direct)));
+        }
+        decode_selected_sequence_zero_terminal(collector).await?;
+        if let Some(direct) =
+            take_sequence_zero_followup_direct(collector, initial_index, initial_archive)?
+        {
+            return Ok(Some(SequenceZeroFollowupHead::Direct(direct)));
+        }
+        if let Some(planned_retry) = ordinary_retry
+            && planned_retry_index == Some(planned_retry.index)
+        {
+            let planned_retry_index = planned_retry.index;
+            let priority = planned_retry.authenticated
+                && planned_retry_index == collector.highest_authenticated_positive_index;
+            let state = collector.state(planned_retry_index);
+            let retry = hls_sequence_zero_retry_stays_queued(
+                planned_retry.authenticated,
+                state == Some(LiveHistoryProbeState::Transient),
+                matches!(
+                    state,
+                    Some(LiveHistoryProbeState::Unavailable | LiveHistoryProbeState::Unsupported)
+                ),
+                collector
+                    .deferred_probe_indices
+                    .contains(&planned_retry_index),
+            );
+            collector.forget_followup_retry_index(planned_retry_index);
+            if retry {
+                collector.remember_followup_retry_index(
+                    planned_retry_index,
+                    planned_retry.authenticated,
+                    priority,
+                );
+            }
+        }
+        for offset in 0..HLS_SEQUENCE_ZERO_RECOVERY_BATCH {
+            let offset = u64::try_from(offset)
+                .map_err(|_| "The Live follow-up recovery offset overflowed.".to_string())?;
+            let cursor = recovery_cursor
+                .checked_add(offset)
+                .ok_or_else(|| "The Live follow-up recovery cursor overflowed.".to_string())?;
+            let index = initial_index
+                .checked_add(cursor)
+                .ok_or_else(|| "The Live follow-up recovery index overflowed.".to_string())?;
+            if collector.state(index) == Some(LiveHistoryProbeState::Transient)
+                && !collector.remember_followup_retry_index(index, false, false)
+            {
+                next_recovery_cursor = cursor;
+                break;
+            }
+        }
+        let appendable = highest_appendable_sequence_zero_followup_head(
+            collector,
+            initial_index,
+            initial_archive,
+        );
+        let remembered_later_windows = collector.remember_followup_windows_after(
+            appendable
+                .as_ref()
+                .map_or(initial_index, |payload| payload.index),
+        );
+        if !remembered_later_windows {
+            return Ok(Some(SequenceZeroFollowupHead::WarmScan {
+                next_recovery_cursor: recovery_cursor,
+                retry_indices: collector.followup_retry_indices.clone(),
+                deferred_retry_index: collector.followup_deferred_retry_index,
+            }));
+        }
+        if let Some(payload) = appendable.filter(|payload| {
+            !hls_is_finalized(&payload.bytes)
+                || payload.index >= collector.highest_authenticated_positive_index
+        }) {
+            return Ok(Some(SequenceZeroFollowupHead::Sparse {
+                continue_catchup: !hls_is_finalized(&payload.bytes),
+                payload,
+            }));
+        }
+        Ok(Some(SequenceZeroFollowupHead::WarmScan {
+            next_recovery_cursor,
+            retry_indices: collector.followup_retry_indices.clone(),
+            deferred_retry_index: collector.followup_deferred_retry_index,
+        }))
+    }
+
+    fn commit_sequence_zero_followup(
+        weeb3: &Arc<Weeb3>,
+        cache_key: &str,
+        owner: &str,
+        topic: &str,
+        network_id: u64,
+        checking_token: u64,
+        seed: &SequenceZeroFollowupSeed,
+        head: &RawFeedPayload,
+        archive: Vec<u8>,
+        positive_ceiling: u64,
+        mut retry_indices: VecDeque<HlsSequenceZeroRetry>,
+        deferred_retry_index: Option<u64>,
+    ) -> Option<(FeedRouteSnapshot, bool)> {
+        if active_profile().swarm_network_id != network_id
+            || !sequence_zero_followup_is_current(weeb3, cache_key, owner, topic)
+            || head.index < seed.index
+            || hls_media_sequence(&archive) != Some(0)
+            || !hls_sequence_zero_covers_head(&seed.snapshot_body, &archive)
+            || !hls_sequence_zero_covers_head(&head.bytes, &archive)
+            || hls_is_finalized(&archive) != hls_is_finalized(&head.bytes)
+        {
+            return None;
+        }
+        retain_hls_sequence_zero_retries_after(&mut retry_indices, head.index);
+        let deferred_retry_index = deferred_retry_index.filter(|index| *index > head.index);
+        FEED_ROUTE_CACHE.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            let stored = {
+                let state = cache.get_mut(cache_key)?;
+                if state.checking_token != checking_token
+                    || state.snapshot.index != seed.index
+                    || !Arc::ptr_eq(&state.source_body, &seed.source_body)
+                    || !Arc::ptr_eq(&state.snapshot.body, &seed.snapshot_body)
+                {
+                    return None;
+                }
+                let source_body: Arc<[u8]> = Arc::from(
+                    (!hls_is_finalized(&head.bytes))
+                        .then(|| hls_sequence_zero_sparse_tail(&head.bytes))
+                        .flatten()
+                        .unwrap_or_else(|| head.bytes.clone()),
+                );
+                let body: Arc<[u8]> = Arc::from(archive);
+                let finalized = false;
+                let changed = head.index != seed.index
+                    || body.as_ref() != seed.snapshot_body.as_ref()
+                    || finalized != state.snapshot.finalized;
+                state.source_body = source_body.clone();
+                state.body_tracks_source = body.as_ref() == source_body.as_ref();
+                state.source_endlist_confirmed = false;
+                state.snapshot = FeedRouteSnapshot {
+                    index: head.index,
+                    body,
+                    finalized,
+                };
+                let now = js_sys::Date::now();
+                state.confirmed_head_index = None;
+                state.sequence_zero_recovery_cursor = 20;
+                state.sequence_zero_retry_indices = retry_indices;
+                state.sequence_zero_deferred_retry_index = deferred_retry_index;
+                if state.sequence_zero_deferred_retry_index.is_none()
+                    || !state
+                        .sequence_zero_retry_indices
+                        .iter()
+                        .any(|retry| retry.authenticated)
+                {
+                    state.sequence_zero_retry_deferred_first = true;
+                }
+                state.sequence_zero_positive_ceiling = state
+                    .sequence_zero_positive_ceiling
+                    .max(positive_ceiling)
+                    .max(head.index);
+                state.last_head_check = now;
+                state.last_touch = now;
+                (state.snapshot.clone(), changed)
+            };
+            trim_feed_route_cache(&mut cache, cache_key);
+            Some(stored)
+        })
+    }
+
+    async fn catch_up_sequence_zero_followup(
+        weeb3: Arc<Weeb3>,
+        cache_key: &str,
+        owner: &str,
+        topic: &str,
+        network_id: u64,
+        checking_token: u64,
+        initial_index: u64,
+        refresh_head: bool,
+        continuation_invocation: bool,
+    ) -> bool {
+        let Some(seed) = sequence_zero_followup_seed(cache_key, checking_token, initial_index)
+        else {
+            return false;
+        };
+        if seed.tentative_terminal {
+            if refresh_head {
+                confirm_tentative_sequence_zero_terminal(
+                    weeb3,
+                    cache_key,
+                    owner,
+                    topic,
+                    network_id,
+                    checking_token,
+                    &seed,
+                )
+                .await;
+            }
+            return false;
+        }
+        let blocked_authenticated_evidence = seed.deferred_retry_index.is_some()
+            || seed.retry_indices.iter().any(|retry| retry.authenticated)
+            || seed.positive_ceiling > seed.index;
+        if !refresh_head && !continuation_invocation && blocked_authenticated_evidence {
+            return false;
+        }
+        if seed.scan_initialized && refresh_head {
+            advance_sequence_zero_retry_turn(cache_key, checking_token, &seed);
+        }
+        let source_bytes = seed.source_body.as_ref();
+        let (initial_bytes, source_was_normalized) = if hls_media_sequence(source_bytes) == Some(0)
+        {
+            if let Some(tail) = hls_sequence_zero_sparse_tail(source_bytes) {
+                (tail, true)
+            } else if hls_sparse_history_head_is_supported(source_bytes) {
+                (source_bytes.to_vec(), false)
+            } else {
+                return false;
+            }
+        } else if hls_sparse_history_head_is_supported(source_bytes) {
+            (source_bytes.to_vec(), false)
+        } else {
+            return false;
+        };
+        let initial = RawFeedPayload {
+            index: seed.index,
+            bytes: initial_bytes,
+        };
+        let Some(mut collector) = LiveHistoryCollector::new_sequence_zero_followup(
+            weeb3.clone(),
+            owner.to_string(),
+            topic.to_string(),
+            network_id,
+            initial,
+            cache_key.to_string(),
+            checking_token,
+            seed.snapshot_body.clone(),
+            seed.source_body.clone(),
+        ) else {
+            return false;
+        };
+        collector.highest_authenticated_positive_index = collector
+            .highest_authenticated_positive_index
+            .max(seed.positive_ceiling);
+        collector.followup_retry_indices = seed.retry_indices.clone();
+        collector.followup_deferred_retry_index = seed.deferred_retry_index;
+        let prefetch_seed = |collector: &LiveHistoryCollector| {
+            if continuation_invocation && collector.current() {
+                prefetch_live_snapshot_start(
+                    &weeb3,
+                    owner,
+                    topic,
+                    &FeedRouteSnapshot {
+                        index: seed.index,
+                        body: seed.snapshot_body.clone(),
+                        finalized: false,
+                    },
+                );
+            }
+        };
+        if source_was_normalized
+            && hls_is_finalized(source_bytes)
+            && collector
+                .adopt_inline_direct(RawFeedPayload {
+                    index: seed.index,
+                    bytes: source_bytes.to_vec(),
+                })
+                .is_err()
+        {
+            return false;
+        }
+        let discovered = discover_sequence_zero_followup_head(
+            &mut collector,
+            seed.index,
+            &seed.snapshot_body,
+            refresh_head,
+            seed.scan_initialized,
+            seed.recovery_cursor,
+            seed.deferred_retry_index,
+            hls_sequence_zero_ordinary_retry(
+                &seed.retry_indices,
+                seed.deferred_retry_index.is_some(),
+            ),
+            seed.retry_deferred_first,
+        )
+        .await;
+        let discovered = match discovered {
+            Ok(Some(discovered)) => discovered,
+            Ok(None) => {
+                let _ = collector.remember_followup_windows_after(seed.index);
+                persist_sequence_zero_followup_observation(
+                    cache_key,
+                    checking_token,
+                    &seed,
+                    &collector,
+                );
+                if !seed.scan_initialized {
+                    initialize_sequence_zero_followup_scan(cache_key, checking_token, &seed);
+                }
+                prefetch_seed(&collector);
+                return false;
+            }
+            Err(_) => {
+                prefetch_seed(&collector);
+                return false;
+            }
+        };
+        let (head, direct, continue_catchup) = match discovered {
+            SequenceZeroFollowupHead::Direct(head) => {
+                let terminal = hls_is_finalized(&head.bytes);
+                (head, true, !terminal)
+            }
+            SequenceZeroFollowupHead::Sparse {
+                payload,
+                continue_catchup,
+            } => (payload, false, continue_catchup),
+            SequenceZeroFollowupHead::WarmScan {
+                next_recovery_cursor,
+                retry_indices,
+                deferred_retry_index,
+            } => {
+                warm_sequence_zero_followup_scan(
+                    cache_key,
+                    checking_token,
+                    &seed,
+                    next_recovery_cursor,
+                    retry_indices,
+                    deferred_retry_index,
+                    collector.highest_authenticated_positive_index,
+                );
+                prefetch_seed(&collector);
+                return false;
+            }
+        };
+        let archive = if direct {
+            head.bytes.clone()
+        } else if head.index == seed.index
+            && hls_sequence_zero_same_index_archive_is_reusable(&head.bytes, &seed.snapshot_body)
+        {
+            seed.snapshot_body.to_vec()
+        } else {
+            let Some(archive) = assemble_hls_sequence_zero_suffix(
+                seed.index,
+                &seed.snapshot_body,
+                head.index,
+                &head.bytes,
+                collector
+                    .successful_entries_before(head.index)
+                    .filter(|(index, _)| *index > seed.index),
+            ) else {
+                prefetch_seed(&collector);
+                return false;
+            };
+            archive
+        };
+        if weeb3.get_network_id().await != network_id {
+            return false;
+        }
+        let Some((snapshot, changed)) = commit_sequence_zero_followup(
+            &weeb3,
+            cache_key,
+            owner,
+            topic,
+            network_id,
+            checking_token,
+            &seed,
+            &head,
+            archive,
+            collector.highest_authenticated_positive_index,
+            collector.followup_retry_indices.clone(),
+            collector.followup_deferred_retry_index,
+        ) else {
+            return false;
+        };
+        if changed && !continue_catchup {
+            prefetch_live_snapshot_start(&weeb3, owner, topic, &snapshot);
+        }
+        changed && continue_catchup
+    }
+
     async fn refresh_live_feed_head(
         weeb3: Arc<Weeb3>,
         cache_key: &str,
@@ -9007,7 +12183,6 @@ mod runtime {
         topic: &str,
         checking_token: u64,
         network_id: u64,
-        followup_mode: FeedFollowupMode,
     ) -> Option<(u64, bool)> {
         let Some((initial, force_coarse)) = FEED_ROUTE_CACHE.with(|cache| {
             let cache = cache.borrow();
@@ -9032,10 +12207,7 @@ mod runtime {
         let (latest, verified) = if hls_is_finalized(&initial.bytes) {
             (initial, true)
         } else {
-            let admission_client = weeb3.clone();
-            let admission_cache_key = cache_key.to_string();
-            let admission_owner = owner.to_string();
-            let admission_topic = topic.to_string();
+            let credit_client = weeb3.clone();
             let admission_deadline =
                 js_sys::Date::now() + HLS_FEED_WAVE_CREDIT_WAIT.as_millis() as f64;
             let Some(latest) = acquire_latest_raw_feed_payload_bounded_from(
@@ -9045,38 +12217,12 @@ mod runtime {
                 force_coarse,
                 &weeb3.chunk_port.0,
                 move |probe_count| {
-                    let still_current = followup_mode != FeedFollowupMode::SequenceZeroPresentation
-                        || sequence_zero_followup_is_current(
-                            &admission_client,
-                            &admission_cache_key,
-                            &admission_owner,
-                            &admission_topic,
-                        );
-                    let credit_client = admission_client.clone();
-                    let current_client = admission_client.clone();
-                    let current_cache_key = admission_cache_key.clone();
-                    let current_owner = admission_owner.clone();
-                    let current_topic = admission_topic.clone();
-                    async move {
-                        if !still_current
-                            || !await_feed_probe_wave_credit(
-                                credit_client,
-                                network_id,
-                                probe_count,
-                                admission_deadline,
-                            )
-                            .await
-                        {
-                            return false;
-                        }
-                        followup_mode != FeedFollowupMode::SequenceZeroPresentation
-                            || sequence_zero_followup_is_current(
-                                &current_client,
-                                &current_cache_key,
-                                &current_owner,
-                                &current_topic,
-                            )
-                    }
+                    await_feed_probe_wave_credit(
+                        credit_client.clone(),
+                        network_id,
+                        probe_count,
+                        admission_deadline,
+                    )
                 },
                 None,
             )
@@ -9096,8 +12242,6 @@ mod runtime {
         };
         if weeb3.get_network_id().await != network_id
             || active_profile().swarm_network_id != network_id
-            || (followup_mode == FeedFollowupMode::SequenceZeroPresentation
-                && !sequence_zero_followup_is_current(&weeb3, cache_key, owner, topic))
         {
             return None;
         }
@@ -9114,7 +12258,7 @@ mod runtime {
                 ),
                 source: Arc::from(latest.bytes),
                 head_confirmed,
-                mode: followup_mode,
+                mode: FeedFollowupMode::Canonical,
                 admission: FeedCandidateAdmission::Task {
                     token: checking_token,
                     expected_index: None,
@@ -9163,6 +12307,26 @@ mod runtime {
         refresh_head: bool,
         followup_mode: FeedFollowupMode,
     ) {
+        schedule_feed_followup_task(
+            weeb3,
+            cache_key,
+            owner,
+            topic,
+            refresh_head,
+            followup_mode,
+            false,
+        );
+    }
+
+    fn schedule_feed_followup_task(
+        weeb3: Arc<Weeb3>,
+        cache_key: String,
+        owner: String,
+        topic: String,
+        refresh_head: bool,
+        followup_mode: FeedFollowupMode,
+        continuation_invocation: bool,
+    ) {
         let network_id = active_profile().swarm_network_id;
         let Some((mut current_index, checking_token)) = claim_feed_route_check(&cache_key, None)
         else {
@@ -9178,6 +12342,33 @@ mod runtime {
                 let _ = release_feed_route_check(&cache_key, checking_token);
                 return;
             }
+            if followup_mode == FeedFollowupMode::SequenceZeroPresentation {
+                let resume = catch_up_sequence_zero_followup(
+                    weeb3.clone(),
+                    &cache_key,
+                    &owner,
+                    &topic,
+                    network_id,
+                    checking_token,
+                    current_index,
+                    refresh_head,
+                    continuation_invocation,
+                )
+                .await;
+                let released = release_feed_route_check(&cache_key, checking_token);
+                if resume && released.is_some() {
+                    schedule_feed_followup_task(
+                        weeb3,
+                        cache_key,
+                        owner,
+                        topic,
+                        false,
+                        followup_mode,
+                        true,
+                    );
+                }
+                return;
+            }
             if refresh_head {
                 match refresh_live_feed_head(
                     weeb3.clone(),
@@ -9186,7 +12377,6 @@ mod runtime {
                     &topic,
                     checking_token,
                     network_id,
-                    followup_mode,
                 )
                 .await
                 {
@@ -9202,7 +12392,6 @@ mod runtime {
             let mut successful_followups = 0usize;
             let mut skipped_missing_index = false;
             let mut recovered_missing_index = false;
-            let mut consecutive_sequence_zero_missing = 0usize;
             let mut saw_tentative_endlist = FEED_ROUTE_CACHE.with(|cache| {
                 cache.borrow().get(&cache_key).is_some_and(|state| {
                     !state.snapshot.finalized
@@ -9219,23 +12408,16 @@ mod runtime {
                         &topic,
                         checking_token,
                         network_id,
-                        followup_mode,
                     )
                     .await;
                 }
                 let _ = release_feed_route_check(&cache_key, checking_token);
                 return;
             }
-            let exact_followup_limit = match followup_mode {
-                FeedFollowupMode::Canonical => FEED_FOLLOWUP_BATCH_LIMIT,
-                FeedFollowupMode::SequenceZeroPresentation => {
-                    HLS_SEQUENCE_ZERO_PRESENTATION_BATCH_LIMIT
-                }
-            };
             let exact_indices =
                 std::iter::successors(Some(current_index), |index| index.checked_add(1))
                     .skip(1)
-                    .take(exact_followup_limit);
+                    .take(FEED_FOLLOWUP_BATCH_LIMIT);
             let mut exact_followups = stream::iter(exact_indices)
                 .map(|next_index| {
                     let weeb3 = weeb3.clone();
@@ -9250,34 +12432,18 @@ mod runtime {
                         )
                     }
                 })
-                .buffered(match followup_mode {
-                    FeedFollowupMode::Canonical => 1,
-                    FeedFollowupMode::SequenceZeroPresentation => {
-                        HLS_SEQUENCE_ZERO_FOLLOWUP_MAX_PARALLEL
-                    }
-                });
+                .buffered(1);
             while let Some((next_index, next)) = exact_followups.next().await {
                 if weeb3.get_network_id().await != network_id
                     || active_profile().swarm_network_id != network_id
-                    || (followup_mode == FeedFollowupMode::SequenceZeroPresentation
-                        && !sequence_zero_followup_is_current(&weeb3, &cache_key, &owner, &topic))
                 {
                     break;
                 }
                 let Some(next) = next else {
-                    let can_skip = match followup_mode {
-                        FeedFollowupMode::Canonical => !skipped_missing_index,
-                        FeedFollowupMode::SequenceZeroPresentation => {
-                            consecutive_sequence_zero_missing
-                                < HLS_SEQUENCE_ZERO_FOLLOWUP_MAX_PARALLEL
-                        }
-                    };
-                    if !can_skip {
+                    if skipped_missing_index {
                         break;
                     }
                     skipped_missing_index = true;
-                    consecutive_sequence_zero_missing =
-                        consecutive_sequence_zero_missing.saturating_add(1);
                     continue;
                 };
                 if next.index != next_index || next.bytes.len() > MAX_STREAM_FEED_PAYLOAD_BYTES {
@@ -9294,7 +12460,7 @@ mod runtime {
                         source: source_body.clone(),
                         terminal: false,
                         head_confirmed: false,
-                        mode: followup_mode,
+                        mode: FeedFollowupMode::Canonical,
                         admission: FeedCandidateAdmission::Task {
                             token: checking_token,
                             expected_index: Some(current_index),
@@ -9317,9 +12483,6 @@ mod runtime {
                 );
                 saw_tentative_endlist |= has_endlist;
                 recovered_missing_index |= skipped_missing_index;
-                if followup_mode == FeedFollowupMode::SequenceZeroPresentation {
-                    consecutive_sequence_zero_missing = 0;
-                }
                 successful_followups = successful_followups.saturating_add(1);
                 current_index = next_index;
                 if has_endlist {
@@ -9331,8 +12494,6 @@ mod runtime {
 
             if weeb3.get_network_id().await != network_id
                 || active_profile().swarm_network_id != network_id
-                || (followup_mode == FeedFollowupMode::SequenceZeroPresentation
-                    && !sequence_zero_followup_is_current(&weeb3, &cache_key, &owner, &topic))
             {
                 let _ = release_feed_route_check(&cache_key, checking_token);
                 return;
@@ -9340,12 +12501,8 @@ mod runtime {
 
             if !refresh_head
                 && (saw_tentative_endlist
-                    || (followup_mode == FeedFollowupMode::SequenceZeroPresentation
-                        && successful_followups == 0
-                        && skipped_missing_index)
-                    || (followup_mode == FeedFollowupMode::Canonical
-                        && (successful_followups >= FEED_FOLLOWUP_BATCH_LIMIT
-                            || recovered_missing_index)))
+                    || successful_followups >= FEED_FOLLOWUP_BATCH_LIMIT
+                    || recovered_missing_index)
             {
                 let _ = refresh_live_feed_head(
                     weeb3,
@@ -9354,7 +12511,6 @@ mod runtime {
                     &topic,
                     checking_token,
                     network_id,
-                    followup_mode,
                 )
                 .await;
             }
@@ -9371,6 +12527,7 @@ mod runtime {
         range: Option<&str>,
         if_none_match: Option<&str>,
         if_range: Option<&str>,
+        stream_token: Option<&str>,
     ) -> Option<FetchResponse> {
         if let Some(reference) = canonical_hls_bytes_resource(pathname) {
             let reference = match reference {
@@ -9385,6 +12542,7 @@ mod runtime {
                     range.map(str::to_owned),
                     if_none_match.map(str::to_owned),
                     if_range.map(str::to_owned),
+                    stream_token.map(str::to_owned),
                     local_hls_bytes_base(pathname),
                 )
                 .await,
@@ -9765,7 +12923,8 @@ mod runtime {
 
         let play_player = player.clone();
         let play_callback = Closure::<dyn FnMut()>::new(move || {
-            if play_player.get_attribute("data-weeb3-hls-mode").as_deref() == Some("hls.js") {
+            if play_player.get_attribute("data-weeb3-hls-mode").is_some() {
+                // Once either backend is attached, its Session owns playback intent.
                 return;
             }
             if play_player
@@ -9785,8 +12944,8 @@ mod runtime {
 
         let pause_player = player.clone();
         let pause_callback = Closure::<dyn FnMut()>::new(move || {
-            if pause_player.get_attribute("data-weeb3-hls-mode").as_deref() == Some("hls.js") {
-                // hls.js reports authorized pauses through HLS_EXPLICIT_PAUSE_EVENT.
+            if pause_player.get_attribute("data-weeb3-hls-mode").is_some() {
+                // Attached player Sessions report pauses through the explicit event.
                 return;
             }
             if pause_player

@@ -24,7 +24,11 @@ use crate::{
 use alloy::primitives::keccak256;
 use async_std::sync::Arc;
 use std::{
-    cell::RefCell, collections::VecDeque, future::Future, pin::Pin, rc::Rc,
+    cell::{Cell, RefCell},
+    collections::VecDeque,
+    future::Future,
+    pin::Pin,
+    rc::Rc,
     sync::atomic::AtomicBool,
 };
 
@@ -41,6 +45,30 @@ const RETRIEVE_DATA_GROUP_CONCURRENCY: usize = 8;
 const RETRIEVE_DECODED_CHUNK_CACHE_ENTRIES: usize = 2048;
 const RETRIEVE_FEED_HEDGE_ADMISSION_MS: u64 = 1_950;
 const RETRIEVE_FEED_MAX_PHYSICAL_ATTEMPTS: usize = 2;
+
+pub(crate) const CONSERVATIVE_DEFERRED_RANGE_BYTES: u64 = CHUNK_SIZE as u64;
+const CONSERVATIVE_DEFERRED_MAX_RANGE_CHILDREN: usize = 2;
+pub(crate) const CONSERVATIVE_DEFERRED_MAX_PHYSICAL_ATTEMPTS: u64 =
+    (CONSERVATIVE_DEFERRED_MAX_RANGE_CHILDREN * RETRIEVE_CHUNK_MAX_ATTEMPT_ERRORS) as u64;
+
+#[derive(Clone, Copy)]
+struct DataRangeTraversalPolicy {
+    group_concurrency: usize,
+    erasure_recovery: bool,
+    maximum_requested_children: usize,
+}
+
+const ORDINARY_DATA_RANGE_TRAVERSAL: DataRangeTraversalPolicy = DataRangeTraversalPolicy {
+    group_concurrency: RETRIEVE_DATA_GROUP_CONCURRENCY,
+    erasure_recovery: true,
+    maximum_requested_children: usize::MAX,
+};
+
+const CONSERVATIVE_DATA_RANGE_TRAVERSAL: DataRangeTraversalPolicy = DataRangeTraversalPolicy {
+    group_concurrency: 1,
+    erasure_recovery: false,
+    maximum_requested_children: CONSERVATIVE_DEFERRED_MAX_RANGE_CHILDREN,
+};
 
 #[derive(Clone, Copy)]
 struct RetainedFeedProbePolicy {
@@ -497,6 +525,7 @@ struct RawFetchKey {
     request_address: Vec<u8>,
     expected_cac: Vec<u8>,
     cancel_scope: Option<(String, u64)>,
+    conservative_scope: Option<u64>,
 }
 
 impl RawFetchKey {
@@ -505,6 +534,7 @@ impl RawFetchKey {
         request_address: Vec<u8>,
         expected_cac: Vec<u8>,
         cancel: &Option<RetrieveCancelToken>,
+        conservative_scope: Option<u64>,
     ) -> Self {
         Self {
             runtime_scope,
@@ -513,6 +543,7 @@ impl RawFetchKey {
             cancel_scope: cancel
                 .as_ref()
                 .map(|cancel| (cancel.stream_key.clone(), cancel.generation)),
+            conservative_scope,
         }
     }
 }
@@ -529,6 +560,15 @@ type RawFetchFlights = SingleflightRegistry<RawFetchKey, RawFetchWaiter, Retriev
 thread_local! {
     static RAW_FETCH_FLIGHTS: RefCell<RawFetchFlights> =
         RefCell::new(RawFetchFlights::default());
+    static NEXT_CONSERVATIVE_RAW_FETCH_SCOPE: Cell<u64> = const { Cell::new(0) };
+}
+
+fn next_conservative_raw_fetch_scope() -> u64 {
+    NEXT_CONSERVATIVE_RAW_FETCH_SCOPE.with(|next| {
+        let scope = next.get().wrapping_add(1).max(1);
+        next.set(scope);
+        scope
+    })
 }
 
 fn remove_raw_fetch_waiter(key: &RawFetchKey, flight_id: u64, waiter_id: u64) {
@@ -537,7 +577,9 @@ fn remove_raw_fetch_waiter(key: &RawFetchKey, flight_id: u64, waiter_id: u64) {
             .borrow_mut()
             .remove_waiter(key, flight_id, waiter_id)
     });
-    if let Some(admission) = admission {
+    if let Some(admission) = admission
+        && key.conservative_scope.is_none()
+    {
         // Keep the flight registered while dispatched accounting work drains.
         admission.close();
     }
@@ -548,7 +590,9 @@ fn complete_raw_fetch(key: &RawFetchKey, flight_id: u64, chunk: Vec<u8>) {
     let Some(flight) = flight else {
         return;
     };
-    flight.shared.close();
+    if key.conservative_scope.is_none() {
+        flight.shared.close();
+    }
 
     let usable = (erasure_coding::SPAN_SIZE..=CHUNK_WITH_SPAN_SIZE).contains(&chunk.len());
     let canonical_cac = usable && valid_cac(&chunk, &key.expected_cac);
@@ -584,6 +628,7 @@ fn queue_drained_raw_chunk(
     result_chan: &mpsc::Sender<RawFetchResult>,
     admission: &RetrieveAdmission,
     cancel: &Option<RetrieveCancelToken>,
+    shared_physical_admission: Option<(u64, &RetrieveAdmission)>,
 ) {
     if let Some(reference) = cache_reference.as_ref() {
         if let Some(chunk) = cached_raw_chunk(reference) {
@@ -601,6 +646,7 @@ fn queue_drained_raw_chunk(
         request_address,
         expected_cac,
         cancel,
+        shared_physical_admission.map(|(scope, _)| scope),
     );
     let registration = RAW_FETCH_FLIGHTS.with(|flights| {
         flights.borrow_mut().register(
@@ -611,7 +657,10 @@ fn queue_drained_raw_chunk(
                 cache_reference,
                 admission: admission.clone(),
             },
-            RetrieveAdmission::new,
+            || {
+                shared_physical_admission
+                    .map_or_else(RetrieveAdmission::new, |(_, admission)| admission.clone())
+            },
         )
     });
 
@@ -763,6 +812,7 @@ async fn retrieve_raw_root_cancellable(
             &result_out,
             &admission,
             cancel,
+            None,
         );
         next += 1;
         dispatched += 1;
@@ -791,6 +841,7 @@ async fn retrieve_raw_root_cancellable(
                     &result_out,
                     &admission,
                     cancel,
+                    None,
                 );
                 next += 1;
                 dispatched += 1;
@@ -821,6 +872,7 @@ async fn retrieve_raw_root_cancellable(
                             &result_out,
                             &admission,
                             cancel,
+                            None,
                         );
                         next += 1;
                         dispatched += 1;
@@ -942,6 +994,7 @@ fn dispatch_group_recovery(
                 result_out,
                 admission,
                 cancel,
+                None,
             );
         }
         dispatched_shards[index] = true;
@@ -988,6 +1041,7 @@ fn dispatch_group_parity(
             result_out,
             admission,
             cancel,
+            None,
         );
         dispatched_shards[index] = true;
         count += 1;
@@ -1012,9 +1066,11 @@ async fn fetch_data_group_indices_streaming(
     parity_references: Vec<Vec<u8>>,
     encrypted: bool,
     mut requested_indices: Vec<usize>,
+    policy: DataRangeTraversalPolicy,
     chunk_retrieve_chan: &ChunkRetrieveSender,
     cancel_generations: Option<RetrieveGenerationMap>,
     cancel: Option<RetrieveCancelToken>,
+    shared_physical_admission: Option<(u64, RetrieveAdmission)>,
     child_emitter: GroupChildEmitter,
 ) -> Option<()> {
     let data_count = data_references.len();
@@ -1040,7 +1096,9 @@ async fn fetch_data_group_indices_streaming(
     if requested_indices.is_empty() {
         return Some(());
     }
-    if requested_indices.iter().any(|&index| index >= data_count) {
+    if requested_indices.len() > policy.maximum_requested_children
+        || requested_indices.iter().any(|&index| index >= data_count)
+    {
         return None;
     }
     if !join_cancel_token_current(&cancel_generations, &cancel).await {
@@ -1053,8 +1111,10 @@ async fn fetch_data_group_indices_streaming(
         requested_mask[index] = true;
     }
 
-    let admission = RetrieveAdmission::new();
-    let _admission_guard = admission.close_on_drop();
+    // Group waiters close independently; conservative physical attempts use the traversal-wide
+    // admission passed below and are never closed by a group terminal.
+    let waiter_admission = RetrieveAdmission::new();
+    let _waiter_admission_guard = waiter_admission.close_on_drop();
 
     let (result_out, result_in) = mpsc::unbounded::<RawFetchResult>();
     let mut dispatched_shards = vec![false; total_count];
@@ -1075,8 +1135,11 @@ async fn fetch_data_group_indices_streaming(
             Some(reference.clone()),
             chunk_retrieve_chan,
             &result_out,
-            &admission,
+            &waiter_admission,
             &cancel,
+            shared_physical_admission
+                .as_ref()
+                .map(|(scope, admission)| (*scope, admission)),
         );
         dispatched_shards[index] = true;
         dispatched += 1;
@@ -1094,7 +1157,7 @@ async fn fetch_data_group_indices_streaming(
             .iter()
             .all(|&index| requested_ready[index]);
         if all_requested_ready || (recovery_dispatched && successes >= data_count) {
-            admission.close();
+            waiter_admission.close();
             if !join_cancel_token_current(&cancel_generations, &cancel).await {
                 return None;
             }
@@ -1104,7 +1167,7 @@ async fn fetch_data_group_indices_streaming(
             return None;
         }
 
-        if recovery_dispatched {
+        if recovery_dispatched && policy.erasure_recovery {
             let top_up = recovery_top_up_count(data_count, successes, dispatched, completed);
             if top_up > 0 {
                 dispatched += dispatch_group_recovery(
@@ -1114,14 +1177,14 @@ async fn fetch_data_group_indices_streaming(
                     chunk_retrieve_chan,
                     &result_out,
                     top_up,
-                    &admission,
+                    &waiter_admission,
                     &cancel,
                 );
             }
         }
 
         if completed == dispatched {
-            if recovery_dispatched || parity_references.is_empty() {
+            if recovery_dispatched || parity_references.is_empty() || !policy.erasure_recovery {
                 return None;
             }
             if !join_cancel_token_current(&cancel_generations, &cancel).await {
@@ -1131,63 +1194,64 @@ async fn fetch_data_group_indices_streaming(
             continue;
         }
 
-        let result = if !recovery_dispatched && parity_references.is_empty() {
-            recv_raw_result_cancellable(&result_in, &cancel_generations, &cancel).await
-        } else if !recovery_dispatched {
-            let elapsed = (Date::now() - started).max(0.0) as u64;
-            let remaining = RETRIEVE_RS_HEDGE_AFTER_MS.saturating_sub(elapsed).max(1);
-            match async_std::future::timeout(Duration::from_millis(remaining), result_in.recv())
-                .await
-            {
-                Ok(result) => result.ok(),
-                Err(_) => {
-                    if !join_cancel_token_current(&cancel_generations, &cancel).await {
-                        return None;
+        let result =
+            if !policy.erasure_recovery || (!recovery_dispatched && parity_references.is_empty()) {
+                recv_raw_result_cancellable(&result_in, &cancel_generations, &cancel).await
+            } else if !recovery_dispatched {
+                let elapsed = (Date::now() - started).max(0.0) as u64;
+                let remaining = RETRIEVE_RS_HEDGE_AFTER_MS.saturating_sub(elapsed).max(1);
+                match async_std::future::timeout(Duration::from_millis(remaining), result_in.recv())
+                    .await
+                {
+                    Ok(result) => result.ok(),
+                    Err(_) => {
+                        if !join_cancel_token_current(&cancel_generations, &cancel).await {
+                            return None;
+                        }
+                        if requested_count == data_count {
+                            dispatched += dispatch_group_parity(
+                                data_count,
+                                &parity_references,
+                                &mut dispatched_shards,
+                                chunk_retrieve_chan,
+                                &result_out,
+                                usize::MAX,
+                                &waiter_admission,
+                                &cancel,
+                            );
+                        }
+                        recovery_dispatched = true;
+                        continue;
                     }
-                    if requested_count == data_count {
-                        dispatched += dispatch_group_parity(
-                            data_count,
+                }
+            } else if dispatched_shards.iter().any(|dispatched| !*dispatched) {
+                match async_std::future::timeout(
+                    Duration::from_millis(RETRIEVE_RS_HEDGE_AFTER_MS),
+                    result_in.recv(),
+                )
+                .await
+                {
+                    Ok(result) => result.ok(),
+                    Err(_) => {
+                        if !join_cancel_token_current(&cancel_generations, &cancel).await {
+                            return None;
+                        }
+                        dispatched += dispatch_group_recovery(
+                            &data_references,
                             &parity_references,
                             &mut dispatched_shards,
                             chunk_retrieve_chan,
                             &result_out,
-                            usize::MAX,
-                            &admission,
+                            RETRIEVE_RECOVERY_PROGRESSIVE_BATCH,
+                            &waiter_admission,
                             &cancel,
                         );
+                        continue;
                     }
-                    recovery_dispatched = true;
-                    continue;
                 }
-            }
-        } else if dispatched_shards.iter().any(|dispatched| !*dispatched) {
-            match async_std::future::timeout(
-                Duration::from_millis(RETRIEVE_RS_HEDGE_AFTER_MS),
-                result_in.recv(),
-            )
-            .await
-            {
-                Ok(result) => result.ok(),
-                Err(_) => {
-                    if !join_cancel_token_current(&cancel_generations, &cancel).await {
-                        return None;
-                    }
-                    dispatched += dispatch_group_recovery(
-                        &data_references,
-                        &parity_references,
-                        &mut dispatched_shards,
-                        chunk_retrieve_chan,
-                        &result_out,
-                        RETRIEVE_RECOVERY_PROGRESSIVE_BATCH,
-                        &admission,
-                        &cancel,
-                    );
-                    continue;
-                }
-            }
-        } else {
-            recv_raw_result_cancellable(&result_in, &cancel_generations, &cancel).await
-        };
+            } else {
+                recv_raw_result_cancellable(&result_in, &cancel_generations, &cancel).await
+            };
 
         let result = result?;
         completed += 1;
@@ -1222,7 +1286,7 @@ async fn fetch_data_group_indices_streaming(
                 requested_ready[result_index] = true;
             }
         } else if !recovery_dispatched {
-            if parity_references.is_empty() {
+            if parity_references.is_empty() || !policy.erasure_recovery {
                 return None;
             }
             if !join_cancel_token_current(&cancel_generations, &cancel).await {
@@ -1348,6 +1412,33 @@ pub(crate) async fn retrieve_data_range_from_root(
     .await
 }
 
+pub(crate) async fn retrieve_data_range_from_root_conservative(
+    root: DecodedJoinChunk,
+    payload_start: u64,
+    payload_end_inclusive: u64,
+    encrypted: bool,
+    chunk_retrieve_chan: &ChunkRetrieveSender,
+) -> Option<Vec<u8>> {
+    let requested_len = payload_end_inclusive
+        .checked_sub(payload_start)?
+        .checked_add(1)?;
+    if requested_len > CONSERVATIVE_DEFERRED_RANGE_BYTES {
+        return None;
+    }
+    retrieve_data_range_from_root_with_prefix_cancellable(
+        root,
+        payload_start,
+        payload_end_inclusive,
+        encrypted,
+        chunk_retrieve_chan,
+        &[],
+        None,
+        None,
+        CONSERVATIVE_DATA_RANGE_TRAVERSAL,
+    )
+    .await
+}
+
 pub(crate) async fn retrieve_data_range_from_root_cancellable(
     root: DecodedJoinChunk,
     payload_start: u64,
@@ -1366,6 +1457,7 @@ pub(crate) async fn retrieve_data_range_from_root_cancellable(
         &[],
         cancel_generations,
         cancel,
+        ORDINARY_DATA_RANGE_TRAVERSAL,
     )
     .await
 }
@@ -1379,6 +1471,7 @@ async fn retrieve_data_range_from_root_with_prefix_cancellable(
     output_prefix: &[u8],
     cancel_generations: Option<RetrieveGenerationMap>,
     cancel: Option<RetrieveCancelToken>,
+    policy: DataRangeTraversalPolicy,
 ) -> Option<Vec<u8>> {
     if !join_cancel_token_current(&cancel_generations, &cancel).await {
         return None;
@@ -1400,12 +1493,25 @@ async fn retrieve_data_range_from_root_with_prefix_cancellable(
     let mut groups: GroupJoiner = FuturesUnordered::new();
     let (group_event_out, group_event_in) = mpsc::unbounded::<GroupFetchEvent>();
     let mut active_groups = 0usize;
+    let shared_physical_admission = if policy.erasure_recovery {
+        None
+    } else {
+        Some((
+            next_conservative_raw_fetch_scope(),
+            RetrieveAdmission::new_with_attempt_limit(
+                usize::try_from(CONSERVATIVE_DEFERRED_MAX_PHYSICAL_ATTEMPTS).ok()?,
+            ),
+        ))
+    };
+    let _shared_physical_admission_guard = shared_physical_admission
+        .as_ref()
+        .map(|(_, admission)| admission.close_on_drop());
 
     while !pending.is_empty() || active_groups > 0 {
         if !join_cancel_token_current(&cancel_generations, &cancel).await {
             return None;
         }
-        while groups.len() < RETRIEVE_DATA_GROUP_CONCURRENCY {
+        while groups.len() < policy.group_concurrency {
             let Some(node) = pending.pop_front() else {
                 break;
             };
@@ -1468,6 +1574,7 @@ async fn retrieve_data_range_from_root_with_prefix_cancellable(
             let sender = chunk_retrieve_chan.clone();
             let group_cancel_generations = cancel_generations.clone();
             let group_cancel = cancel.clone();
+            let group_shared_physical_admission = shared_physical_admission.clone();
             let emitter = GroupChildEmitter {
                 context: GroupTraversalContext {
                     parent_start: node.start,
@@ -1485,9 +1592,11 @@ async fn retrieve_data_range_from_root_with_prefix_cancellable(
                     parity_references,
                     encrypted,
                     requested_indices,
+                    policy,
                     &sender,
                     group_cancel_generations,
                     group_cancel,
+                    group_shared_physical_admission,
                     emitter,
                 )
                 .await
@@ -1554,38 +1663,6 @@ async fn retrieve_data_range_from_root_with_prefix_cancellable(
     (written == requested_len).then_some(output)
 }
 
-pub(crate) async fn retrieve_data_range_join_cancellable(
-    data_address: &Vec<u8>,
-    payload_start: u64,
-    payload_end_inclusive: u64,
-    chunk_retrieve_chan: &ChunkRetrieveSender,
-    cancel_generations: Option<RetrieveGenerationMap>,
-    cancel: Option<RetrieveCancelToken>,
-) -> Vec<u8> {
-    let encrypted = data_address.len() == erasure_coding::ENCRYPTED_REFERENCE_SIZE;
-    let Some(root) = retrieve_decoded_data_root_cancellable(
-        data_address,
-        chunk_retrieve_chan,
-        cancel_generations.clone(),
-        cancel.clone(),
-    )
-    .await
-    else {
-        return vec![];
-    };
-    retrieve_data_range_from_root_cancellable(
-        root,
-        payload_start,
-        payload_end_inclusive,
-        encrypted,
-        chunk_retrieve_chan,
-        cancel_generations,
-        cancel,
-    )
-    .await
-    .unwrap_or_default()
-}
-
 async fn retrieve_data_joined(
     data_address: &Vec<u8>,
     chunk_retrieve_chan: &ChunkRetrieveSender,
@@ -1641,6 +1718,7 @@ async fn retrieve_data_joined_cancellable(
             output_prefix,
             cancel_generations,
             cancel,
+            ORDINARY_DATA_RANGE_TRAVERSAL,
         )
         .await
         else {

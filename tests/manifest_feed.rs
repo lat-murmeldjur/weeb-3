@@ -1319,7 +1319,16 @@ mod feed_frontier {
         let authenticated_body = raw_payload
             .find("raw_feed_payload_from_update_bounded(")
             .expect("authenticated update body decoding");
+        let deferred_above_limit = raw_payload
+            .find("if span > maximum_span")
+            .expect("oversized retained payload classification");
         assert!(exact_update < authenticated_body);
+        assert!(exact_update < deferred_above_limit);
+        assert!(deferred_above_limit < authenticated_body);
+        assert!(
+            raw_payload[deferred_above_limit..authenticated_body]
+                .contains("return RetainedRawFeedPayloadProbe::Deferred(")
+        );
         assert!(raw_payload.contains("maximum_payload_bytes: usize"));
         assert!(raw_payload.contains("Some(maximum_span)"));
         assert!(raw_payload.contains("FeedProbe::Missing"));
@@ -1367,6 +1376,86 @@ mod feed_frontier {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn deferred_terminal_decoder_probes_a_bounded_tail_then_admits_serial_ranges() {
+        let bzz_stream = include_str!("../src/bzz_stream.rs");
+        let bounds = bzz_stream
+            .split("fn conservative_deferred_payload_range(")
+            .nth(1)
+            .and_then(|source| {
+                source
+                    .split("pub(crate) enum RetainedRawFeedPayloadProbe")
+                    .next()
+            })
+            .expect("conservative deferred range bounds");
+        assert!(
+            bounds.contains("maximum_len > crate::retrieval::CONSERVATIVE_DEFERRED_RANGE_BYTES")
+        );
+        assert!(bounds.contains("payload_span.checked_sub(start)?.min(maximum_len)"));
+        assert!(bounds.contains("start.checked_add(len)?.checked_sub(1)?"));
+
+        for span in [1_u64, 4_095, 4_096, 4_097, 8_191, 8_192, 65_537] {
+            let mut cursor = 0_u64;
+            let mut covered = 0_u64;
+            while cursor < span {
+                let len = (span - cursor).min(4_096);
+                let end = cursor + len - 1;
+                assert!((1..=4_096).contains(&len));
+                covered += end - cursor + 1;
+                cursor = end + 1;
+            }
+            assert_eq!(cursor, span);
+            assert_eq!(covered, span);
+        }
+
+        let tail = bzz_stream
+            .split("pub(crate) async fn probe_deferred_raw_feed_payload_tail_conservative(")
+            .nth(1)
+            .and_then(|source| {
+                source
+                    .split("pub(crate) async fn acquire_deferred_raw_feed_payload_conservative")
+                    .next()
+            })
+            .expect("conservative deferred tail decoder");
+        assert!(tail.contains("deferred_raw_feed_payload_root(deferred)"));
+        assert!(tail.contains("CONSERVATIVE_DEFERRED_RANGE_BYTES"));
+        assert!(tail.contains("retrieve_data_range_from_root_conservative("));
+        assert!(tail.contains("tail.len()).ok()? == expected_len"));
+
+        let full = bzz_stream
+            .split("pub(crate) async fn acquire_deferred_raw_feed_payload_conservative")
+            .nth(1)
+            .and_then(|source| {
+                source
+                    .split("pub(crate) async fn acquire_raw_feed_payload_at_index_bounded(")
+                    .next()
+            })
+            .expect("conservative deferred full decoder");
+        let admission = full
+            .find("if !admit_range().await")
+            .expect("range admission");
+        let retrieval = full[admission..]
+            .find("retrieve_data_range_from_root_conservative(")
+            .map(|offset| admission + offset)
+            .expect("serial conservative range retrieval");
+        assert!(admission < retrieval);
+        assert!(full.contains("CONSERVATIVE_DEFERRED_RANGE_BYTES"));
+        assert!(full.contains("range.len()).ok()? != expected_len"));
+        assert!(full.contains("start == span && u64::try_from(bytes.len()).ok()? == span"));
+
+        let ordinary = bzz_stream
+            .split("pub(crate) async fn acquire_deferred_raw_feed_payload(")
+            .nth(1)
+            .and_then(|source| {
+                source
+                    .split("probe_deferred_raw_feed_payload_tail_conservative")
+                    .next()
+            })
+            .expect("ordinary deferred startup decoder");
+        assert!(ordinary.contains("raw_feed_payload_from_update_bounded("));
+        assert!(!ordinary.contains("retrieve_data_range_from_root_conservative("));
     }
 }
 mod manifest_format_contracts {

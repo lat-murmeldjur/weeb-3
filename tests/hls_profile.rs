@@ -14,7 +14,7 @@ use std::{
 };
 
 const DEFAULT_SERVICE_WORKER_SCOPE: &str = "/weeb-3/";
-const SERVICE_WORKER_PROTOCOL: u64 = 5;
+const SERVICE_WORKER_PROTOCOL: u64 = 7;
 
 const HLS_PROFILE_SCRIPT: &str = r#"
 (() => {
@@ -1414,7 +1414,7 @@ mod metric_tests {
                 "controlled": true,
                 "protocol": {
                     "type": "WEEB3_PONG",
-                    "protocol": 5,
+                    "protocol": 7,
                     "scope": "/weeb-3/"
                 }
             }

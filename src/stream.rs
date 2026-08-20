@@ -238,6 +238,19 @@ impl FetchCache {
         self.range_order.clear();
         self.ranges.clear();
         self.range_bytes = 0;
+        for state in self.media_states.values_mut() {
+            state.generation = next_media_generation();
+            state.anchor_start = None;
+            state.high_water_end = -1;
+            state.scheduled_high_water_end = -1;
+            state.completed_ranges.clear();
+            state.consecutive_failures = 0;
+            state.last_range_was_seek = false;
+            state.last_range_was_startup = false;
+            state.prefetch_running = false;
+            state.prefetch_generation = 0;
+            state.last_touch = js_sys::Date::now();
+        }
     }
 
     fn range_load_role(
@@ -365,6 +378,32 @@ impl FetchCache {
             .expect("media state inserted above")
     }
 
+    fn activate_external_media_generation(&mut self, key: &str, generation: u64) -> bool {
+        if generation == 0 {
+            return true;
+        }
+
+        let current = self.media_states.get(key).map(|state| state.generation);
+        match current.map(|current| pending_generation_relation(current, generation)) {
+            Some(PendingGenerationRelation::RejectStale) => return false,
+            Some(PendingGenerationRelation::Join) => {
+                if let Some(state) = self.media_states.get_mut(key) {
+                    state.last_touch = js_sys::Date::now();
+                }
+            }
+            Some(PendingGenerationRelation::Replace) => {
+                self.media_states
+                    .insert(key.to_string(), MediaState::new(generation));
+            }
+            None => {
+                self.media_states
+                    .insert(key.to_string(), MediaState::new(generation));
+            }
+        }
+        self.trim_media_states(key);
+        true
+    }
+
     fn trim_media_states(&mut self, active_key: &str) {
         if self.media_states.len() <= MEDIA_STREAM_STATE_MAX_ENTRIES {
             return;
@@ -423,6 +462,26 @@ enum RangeLoadRole {
     Wait(mpsc::Receiver<Result<Vec<u8>, String>>),
     Lead(mpsc::Receiver<Result<Vec<u8>, String>>, u64),
     Reject(String),
+}
+
+pub(crate) struct HlsBackgroundRangeFlightGuard {
+    on_settled: Option<Box<dyn FnOnce()>>,
+}
+
+impl HlsBackgroundRangeFlightGuard {
+    pub(crate) fn new(on_settled: impl FnOnce() + 'static) -> Self {
+        Self {
+            on_settled: Some(Box::new(on_settled)),
+        }
+    }
+}
+
+impl Drop for HlsBackgroundRangeFlightGuard {
+    fn drop(&mut self) {
+        if let Some(on_settled) = self.on_settled.take() {
+            on_settled();
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -685,12 +744,21 @@ fn handle_fetch_request_message(obj: &js_sys::Object, event: &MessageEvent, weeb
     let if_none_match =
         js_string_property(obj, "ifNoneMatch").filter(|value| !value.trim().is_empty());
     let if_range = js_string_property(obj, "ifRange").filter(|value| !value.trim().is_empty());
+    let stream_token =
+        js_string_property(obj, "streamToken").filter(|value| !value.trim().is_empty());
     let port = message_port(event);
 
     spawn_local(async move {
-        let resp =
-            fetch_request_response(weeb3.clone(), url, method, range, if_none_match, if_range)
-                .await;
+        let resp = fetch_request_response(
+            weeb3.clone(),
+            url,
+            method,
+            range,
+            if_none_match,
+            if_range,
+            stream_token,
+        )
+        .await;
         let (resp, transferable) = resp.into_js();
 
         if let Some(port) = port {
@@ -712,6 +780,7 @@ async fn fetch_request_response(
     range: Option<String>,
     if_none_match: Option<String>,
     if_range: Option<String>,
+    stream_token: Option<String>,
 ) -> FetchResponse {
     if method != "GET" && method != "HEAD" {
         return FetchResponse::error(405, "method not allowed");
@@ -735,6 +804,7 @@ async fn fetch_request_response(
         range.as_deref(),
         if_none_match.as_deref(),
         if_range.as_deref(),
+        stream_token.as_deref(),
     )
     .await
     {
@@ -1247,6 +1317,8 @@ async fn read_cached_range_with_retry(
             start,
             end,
             generation,
+            None,
+            None,
         )
         .await
         {
@@ -1279,6 +1351,8 @@ async fn read_cached_range(
     start: u64,
     end: u64,
     generation: u64,
+    cancel_stream_key: Option<String>,
+    background_flight: Option<HlsBackgroundRangeFlightGuard>,
 ) -> Result<Vec<u8>, RangeReadError> {
     if metadata.size == 0 || start > end || start >= metadata.size || end >= metadata.size {
         return Err("range lies outside the resolved resource".into());
@@ -1287,8 +1361,21 @@ async fn read_cached_range(
     if windows.is_empty() {
         return Err("range did not produce storage windows".into());
     }
+    if background_flight.is_some() && (windows.len() != 1 || windows[0] != (start, end)) {
+        return Err("background HLS range must be one aligned storage window".into());
+    }
     if windows.len() == 1 && windows[0] == (start, end) {
-        return read_range_window(weeb3, resource, metadata, start, end, generation).await;
+        return read_range_window(
+            weeb3,
+            resource,
+            metadata,
+            start,
+            end,
+            generation,
+            cancel_stream_key,
+            background_flight,
+        )
+        .await;
     }
 
     let body_len = end
@@ -1307,6 +1394,8 @@ async fn read_cached_range(
                 *window_start,
                 *window_end,
                 generation,
+                cancel_stream_key.clone(),
+                None,
             )
         });
         let responses = join_all(loads).await;
@@ -1351,6 +1440,8 @@ async fn read_range_window(
     start: u64,
     end: u64,
     generation: u64,
+    cancel_stream_key: Option<String>,
+    mut background_flight: Option<HlsBackgroundRangeFlightGuard>,
 ) -> Result<Vec<u8>, RangeReadError> {
     if metadata.size == 0 || start > end || start >= metadata.size || end >= metadata.size {
         return Err("range window lies outside the resolved resource".into());
@@ -1363,7 +1454,10 @@ async fn read_range_window(
             .range_load_role(&cache_key, &pending_key, generation)
     }) {
         RangeLoadRole::Cached(body) => return Ok(body),
-        RangeLoadRole::Wait(receiver) => (receiver, None),
+        RangeLoadRole::Wait(receiver) => {
+            drop(background_flight.take());
+            (receiver, None)
+        }
         RangeLoadRole::Lead(receiver, load_id) => (receiver, Some(load_id)),
         RangeLoadRole::Reject(error) => return Err(error.into()),
     };
@@ -1376,10 +1470,18 @@ async fn read_range_window(
     if let Some(load_id) = leader_load_id {
         let weeb3 = weeb3.clone();
         let metadata = metadata.clone();
-        let stream_key = media_state_key(&resource, &metadata);
+        let media_key = media_state_key(&resource, &metadata);
+        let stream_key = cancel_stream_key.unwrap_or_else(|| media_key.clone());
         let leader_cache_key = cache_key.clone();
         let leader_pending_key = pending_key.clone();
+        let background_flight = background_flight.take();
         spawn_local(async move {
+            // A background capacity/reservation lease follows only the physical
+            // singleflight leader. Logical HLS timeouts, generation replacement,
+            // and pending-slot retirement cannot release it before this dispatched
+            // range traversal releases its physical range slot. Lower-level
+            // dispatched attempts retain their own detached accounting ownership.
+            let _background_flight = background_flight;
             let result = if generation > 0 {
                 weeb3
                     .acquire_resolved_stream_range(
@@ -1415,7 +1517,7 @@ async fn read_range_window(
                     cache.borrow_mut().remember_range(
                         leader_cache_key.clone(),
                         body.clone(),
-                        &stream_key,
+                        &media_key,
                         generation,
                     );
                 });
@@ -1444,6 +1546,106 @@ async fn read_range_window(
             Err(RangeReadError::waiter_timeout(error))
         }
     }
+}
+
+pub(crate) async fn read_cached_hls_range(
+    weeb3: Arc<Weeb3>,
+    reference: String,
+    metadata: BzzMetadata,
+    start: u64,
+    end: u64,
+    generation: Option<u64>,
+    cancel_stream_key: String,
+    background_flight: Option<HlsBackgroundRangeFlightGuard>,
+) -> Result<Vec<u8>, String> {
+    let resource = format!("hls:{reference}");
+    let generation = generation.unwrap_or(0);
+    let media_key = media_state_key(&resource, &metadata);
+    if !FETCH_CACHE.with(|cache| {
+        cache
+            .borrow_mut()
+            .activate_external_media_generation(&media_key, generation)
+    }) {
+        return Err("stale HLS range generation".to_string());
+    }
+    // Bound the logical HLS request once. Any cache-window leader already
+    // dispatched by read_cached_range remains registered and drains to its
+    // normal completion, so late Bee responses still settle their accounting.
+    match async_std::future::timeout(
+        Duration::from_millis(STREAM_RANGE_REQUEST_TIMEOUT_MS),
+        read_cached_range(
+            weeb3,
+            resource,
+            metadata,
+            start,
+            end,
+            generation,
+            (generation > 0).then_some(cancel_stream_key),
+            background_flight,
+        ),
+    )
+    .await
+    {
+        Ok(result) => result.map_err(|error| error.message),
+        Err(_) => Err(format!("timed out retrieving HLS range {start}-{end}")),
+    }
+}
+
+pub(crate) fn hls_aligned_range_cached(
+    reference: &str,
+    metadata: &BzzMetadata,
+    start: u64,
+    end: u64,
+) -> bool {
+    if metadata.size == 0
+        || start > end
+        || end >= metadata.size
+        || range_storage_window_for_start(start, metadata.size) != (start, end)
+    {
+        return false;
+    }
+    let resource = format!("hls:{reference}");
+    let key = range_cache_key(&resource, metadata, start, end);
+    FETCH_CACHE.with(|cache| cache.borrow().ranges.contains_key(&key))
+}
+
+pub(crate) fn evict_completed_hls_ranges(reference: &str, metadata: &BzzMetadata) {
+    let resource = format!("hls:{reference}");
+    let prefix = range_cache_prefix(&resource, metadata);
+    let media_key = media_state_key(&resource, metadata);
+    FETCH_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        let keys = cache
+            .range_order
+            .iter()
+            .filter(|key| key.starts_with(&prefix))
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut removed_bytes = 0_u64;
+        cache.range_order.retain(|key| !key.starts_with(&prefix));
+        for key in keys {
+            if let Some(range) = cache.ranges.remove(&key) {
+                removed_bytes = removed_bytes.saturating_add(range.body.len() as u64);
+            }
+        }
+        cache.range_bytes = cache.range_bytes.saturating_sub(removed_bytes);
+        cache.media_states.remove(&media_key);
+    })
+}
+
+pub(crate) fn hls_range_body_fully_cached(reference: &str, metadata: &BzzMetadata) -> bool {
+    if metadata.size == 0 {
+        return true;
+    }
+    let resource = format!("hls:{reference}");
+    let windows = range_storage_windows_for_span(0, metadata.size - 1, metadata.size);
+    FETCH_CACHE.with(|cache| {
+        let cache = cache.borrow();
+        windows.into_iter().all(|(start, end)| {
+            let key = range_cache_key(&resource, metadata, start, end);
+            cache.ranges.contains_key(&key)
+        })
+    })
 }
 
 fn spawn_prefetch_media_stages(
