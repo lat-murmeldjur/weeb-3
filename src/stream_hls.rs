@@ -14,7 +14,7 @@ const HLS_HEADER: &str = "#EXTM3U";
 const HLS_ENDLIST: &str = "#EXT-X-ENDLIST";
 const HLS_GAP: &str = "#EXT-X-GAP";
 const HLS_SERVER_CONTROL: &str = "#EXT-X-SERVER-CONTROL";
-pub(crate) const HLS_LIVE_SYNC_SEGMENTS: usize = 8;
+pub(crate) const HLS_LIVE_SYNC_SEGMENTS: usize = 3;
 const HLS_LIVE_TAIL_FAILURE_THRESHOLD: u8 = 2;
 const HLS_LIVE_STARTUP_PREROLL_SEGMENTS: usize = 2;
 
@@ -222,6 +222,12 @@ pub(crate) fn plan_hls_sequence_zero_followup_recovery(
     let next_recovery_cursor =
         recovery_cursor.checked_add(u64::try_from(HLS_SEQUENCE_ZERO_RECOVERY_BATCH).ok()?)?;
     Some((targets, next_recovery_cursor))
+}
+
+pub(crate) fn plan_hls_sequence_zero_live_followup(head_index: u64) -> Option<Vec<u64>> {
+    (1..=HLS_LIVE_SYNC_SEGMENTS)
+        .map(|offset| head_index.checked_add(u64::try_from(offset).ok()?))
+        .collect()
 }
 
 pub(crate) fn plan_hls_sequence_zero_terminal_confirmation(head_index: u64) -> Option<Vec<u64>> {
@@ -481,6 +487,39 @@ pub(crate) fn hls_buffered_interval_covers(
         })
 }
 
+pub(crate) fn hls_live_autoplay_runway(fragments: &[(f64, f64, bool)]) -> Option<Vec<(f64, f64)>> {
+    let mut runway = fragments
+        .iter()
+        .rev()
+        .filter(|(_, _, gap)| !gap)
+        .take(HLS_LIVE_SYNC_SEGMENTS)
+        .map(|(start, duration, _)| (*start, *duration))
+        .collect::<Vec<_>>();
+    if runway.len() != HLS_LIVE_SYNC_SEGMENTS
+        || runway.iter().any(|(start, duration)| {
+            !start.is_finite()
+                || *start < 0.0
+                || !duration.is_finite()
+                || *duration <= 0.0
+                || !(start + duration).is_finite()
+        })
+    {
+        return None;
+    }
+    runway.reverse();
+    runway
+        .windows(2)
+        .all(|pair| pair[0].0 < pair[1].0)
+        .then_some(runway)
+}
+
+pub(crate) fn hls_live_autoplay_runway_ready(runway: &[(f64, f64)], ranges: &[(f64, f64)]) -> bool {
+    runway.len() == HLS_LIVE_SYNC_SEGMENTS
+        && runway
+            .iter()
+            .all(|(start, duration)| hls_buffered_interval_covers(*start, *duration, ranges))
+}
+
 pub(crate) fn hls_contiguous_buffered_ahead(current_time: f64, ranges: &[(f64, f64)]) -> f64 {
     if !current_time.is_finite() || current_time < 0.0 {
         return 0.0;
@@ -591,6 +630,15 @@ pub(crate) enum HlsPrefetchMode {
     Inactive,
     StartupOnly,
     Sustained,
+}
+
+pub(crate) fn hls_live_startup_holds_generation(
+    live_start: bool,
+    body_admission_open: bool,
+    mode: HlsPrefetchMode,
+    timeline_rebasing: bool,
+) -> bool {
+    live_start && body_admission_open && mode != HlsPrefetchMode::Sustained && !timeline_rebasing
 }
 
 pub(crate) const HLS_BACKGROUND_RANGE_MAX: usize = 4;
@@ -2960,6 +3008,46 @@ pub(crate) fn hls_media_references(bytes: &[u8]) -> Vec<String> {
     references
 }
 
+pub(crate) fn hls_live_prefetch_references(
+    bytes: &[u8],
+    foreground_reference: Option<&str>,
+) -> Vec<String> {
+    let Some(timeline) = HlsTimeline::parse(bytes) else {
+        return Vec::new();
+    };
+    let playable = timeline
+        .segments
+        .iter()
+        .filter(|segment| !segment.gap && f64::from_bits(segment.duration_bits) > 0.0)
+        .map(|segment| segment.reference.clone())
+        .collect::<Vec<_>>();
+    let foreground_reference = foreground_reference.map(str::to_ascii_lowercase);
+    let start = foreground_reference
+        .as_ref()
+        .and_then(|reference| {
+            playable
+                .iter()
+                .rposition(|candidate| candidate == reference)
+        })
+        .unwrap_or_else(|| playable.len().saturating_sub(HLS_LIVE_SYNC_SEGMENTS));
+    playable
+        .into_iter()
+        .skip(start)
+        .take(HLS_LIVE_SYNC_SEGMENTS)
+        .collect()
+}
+
+pub(crate) fn hls_live_body_schedule_should_spawn(
+    current_runway: &[String],
+    candidate_runway: &[String],
+    schedule_running: bool,
+    candidate_ready: bool,
+) -> bool {
+    !candidate_runway.is_empty()
+        && !candidate_ready
+        && (current_runway != candidate_runway || !schedule_running)
+}
+
 fn push_distinct_reference(references: &mut Vec<String>, reference: &str) {
     let reference = reference.to_ascii_lowercase();
     if references.last() != Some(&reference) {
@@ -3950,9 +4038,10 @@ mod player {
         HlsMediaKind, HlsPlayAttemptPhase, HlsPlayAttemptSettlement, HlsStart,
         classify_hls_level_transition, hls_autoplay_gate_ready, hls_autoplay_start_target,
         hls_buffered_interval_covers, hls_contiguous_buffered_ahead, hls_dom_pause_is_explicit,
-        hls_dom_play_is_explicit, hls_finalized_edge_load_target, hls_live_retarget_target,
-        hls_live_tail_fallback_segment, hls_play_attempt_settlement, hls_timeline_rebase_position,
-        js_error_message, swarm_bytes_reference,
+        hls_dom_play_is_explicit, hls_finalized_edge_load_target, hls_live_autoplay_runway,
+        hls_live_autoplay_runway_ready, hls_live_retarget_target, hls_live_tail_fallback_segment,
+        hls_play_attempt_settlement, hls_timeline_rebase_position, js_error_message,
+        swarm_bytes_reference,
     };
 
     const SWARM_REQUEST_TIMEOUT_MS: f64 = 240_000.0;
@@ -4066,6 +4155,13 @@ mod player {
                 Self::Edge(position) | Self::Resume(position) => position,
             }
         }
+
+        fn startup_position(self, runway: Option<&LiveAutoplayRunway>) -> f64 {
+            match (self, runway) {
+                (Self::Edge(_), Some(runway)) => runway.target,
+                (Self::Edge(position) | Self::Resume(position), _) => position,
+            }
+        }
     }
 
     #[derive(Clone, Copy, PartialEq)]
@@ -4080,15 +4176,6 @@ mod player {
         fn pending(self) -> bool {
             !matches!(self, Self::Inactive)
         }
-
-        fn load_position(self) -> Option<f64> {
-            match self {
-                Self::AwaitingContinuation(target)
-                | Self::AwaitingFallback(target)
-                | Self::AwaitingTarget(target) => Some(target.position()),
-                Self::Inactive => None,
-            }
-        }
     }
 
     #[derive(Clone)]
@@ -4096,6 +4183,13 @@ mod player {
         identity: (u64, String),
         start: f64,
         duration: f64,
+    }
+
+    #[derive(Clone)]
+    struct LiveAutoplayRunway {
+        target: f64,
+        fragments: Vec<(f64, f64)>,
+        references: Vec<String>,
     }
 
     impl BufferedMainFragment {
@@ -4136,6 +4230,7 @@ mod player {
     struct Session {
         media: HtmlMediaElement,
         source: String,
+        presentation_id: u64,
         backend: Backend,
         hls_listener: Option<HlsListener>,
         dom_listener: Option<DomListener>,
@@ -4170,6 +4265,8 @@ mod player {
         live_retarget: LiveRetarget,
         start: HlsStart,
         beginning_prefix_stamp: Option<super::runtime::PlaybackStamp>,
+        live_startup_runway_required: bool,
+        live_startup_runway: Option<LiveAutoplayRunway>,
         level_snapshots: HashMap<u64, (u64, bool, Option<f64>, Option<(f64, f64)>)>,
     }
 
@@ -4181,6 +4278,7 @@ mod player {
     struct Launch {
         media: HtmlMediaElement,
         source: String,
+        presentation_id: u64,
         loader: Option<JsFuture>,
         initial_position: f64,
         rebase_position: Option<f64>,
@@ -4195,6 +4293,8 @@ mod player {
         live_retarget: LiveRetarget,
         start: HlsStart,
         beginning_prefix_stamp: Option<super::runtime::PlaybackStamp>,
+        live_startup_runway_required: bool,
+        live_startup_runway: Option<LiveAutoplayRunway>,
     }
 
     enum EventKind {
@@ -4266,8 +4366,18 @@ mod player {
             if self.codec_pending {
                 return 0.0;
             }
-            if let Some(position) = self.live_retarget.load_position() {
-                return position;
+            match self.live_retarget {
+                LiveRetarget::AwaitingContinuation(target)
+                | LiveRetarget::AwaitingFallback(target)
+                | LiveRetarget::AwaitingTarget(target) => {
+                    return target.startup_position(self.live_startup_runway.as_ref());
+                }
+                LiveRetarget::Inactive => {}
+            }
+            if self.live_startup_runway_required
+                && let Some(runway) = &self.live_startup_runway
+            {
+                return runway.target;
             }
             if let Some(position) = self.rebase_position {
                 return position;
@@ -4362,6 +4472,7 @@ mod player {
         hls_loader: JsFuture,
         start: HlsStart,
         beginning_prefix_stamp: Option<super::runtime::PlaybackStamp>,
+        presentation_id: u64,
     ) -> Result<&'static str, JsValue> {
         let media = player
             .clone()
@@ -4378,6 +4489,7 @@ mod player {
         launch(Launch {
             media,
             source: source.to_string(),
+            presentation_id,
             loader: Some(hls_loader),
             initial_position: match start {
                 HlsStart::Beginning => 0.0,
@@ -4395,6 +4507,8 @@ mod player {
             live_retarget: LiveRetarget::Inactive,
             start,
             beginning_prefix_stamp,
+            live_startup_runway_required: start == HlsStart::Live,
+            live_startup_runway: None,
         })
         .await
     }
@@ -4558,14 +4672,20 @@ mod player {
         resume: bool,
         rebase_position: Option<f64>,
     ) -> Session {
-        let live_retarget = if matches!(&backend, Backend::Hls(_)) {
+        let hls_backend = matches!(&backend, Backend::Hls(_));
+        let live_retarget = if hls_backend {
             request.live_retarget
         } else {
             LiveRetarget::Inactive
         };
+        let live_startup_runway_required = hls_backend && request.live_startup_runway_required;
+        let live_startup_runway = live_startup_runway_required
+            .then(|| request.live_startup_runway.clone())
+            .flatten();
         Session {
             media: request.media.clone(),
             source: request.source.clone(),
+            presentation_id: request.presentation_id,
             backend,
             hls_listener: listeners.0,
             dom_listener: listeners.1,
@@ -4600,6 +4720,8 @@ mod player {
             live_retarget,
             start: request.start,
             beginning_prefix_stamp: request.beginning_prefix_stamp,
+            live_startup_runway_required,
+            live_startup_runway,
             level_snapshots: HashMap::new(),
         }
     }
@@ -4883,6 +5005,49 @@ mod player {
             });
         }
         None
+    }
+
+    fn live_level_autoplay_runway(details: &JsValue) -> Option<LiveAutoplayRunway> {
+        let fragments = js_property(details, "fragments")?;
+        Array::is_array(&fragments).then_some(())?;
+        let fragments = Array::from(&fragments);
+        let mut intervals = Vec::with_capacity(fragments.length() as usize);
+        let mut references = Vec::with_capacity(fragments.length() as usize);
+        for index in 0..fragments.length() {
+            let fragment = fragments.get(index);
+            if js_string_property(&fragment, "type").is_some_and(|kind| kind != "main") {
+                continue;
+            }
+            let gap = js_bool_property(&fragment, "gap").unwrap_or(false);
+            intervals.push((
+                js_finite_nonnegative_property(&fragment, "start")?,
+                js_finite_positive_property(&fragment, "duration")?,
+                gap,
+            ));
+            if !gap {
+                references
+                    .push(js_string_property(&fragment, "url").and_then(|url| {
+                        swarm_bytes_reference(&url).map(str::to_ascii_lowercase)
+                    })?);
+            }
+        }
+        let fragments = hls_live_autoplay_runway(&intervals)?;
+        let references = references
+            .into_iter()
+            .rev()
+            .take(HLS_LIVE_SYNC_SEGMENTS)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect::<Vec<_>>();
+        if references.len() != HLS_LIVE_SYNC_SEGMENTS {
+            return None;
+        }
+        Some(LiveAutoplayRunway {
+            target: fragments.first()?.0,
+            fragments,
+            references,
+        })
     }
 
     fn media_buffered_ranges(media: &HtmlMediaElement) -> Vec<(f64, f64)> {
@@ -5256,6 +5421,16 @@ mod player {
                                 current
                             }
                         });
+                    let live_startup_requested =
+                        session.live_startup_runway_required && session.start == HlsStart::Live;
+                    let live_startup_runway = live_startup_requested
+                        .then(|| session.live_startup_runway.as_ref())
+                        .flatten();
+                    let live_startup_runway_required =
+                        live_startup_requested && (!finalized || live_startup_runway.is_some());
+                    if live_startup_runway_required && live_startup_runway.is_none() {
+                        return AutoplayGatePoll::Wait;
+                    }
                     let requested_position = session
                         .rebase_position
                         .or(session.resume_position)
@@ -5264,28 +5439,45 @@ mod player {
                         LiveRetarget::AwaitingContinuation(_)
                         | LiveRetarget::AwaitingFallback(_) => None,
                         LiveRetarget::AwaitingTarget(retarget) => hls_live_retarget_target(
-                            Some(retarget.position()),
+                            Some(retarget.startup_position(live_startup_runway)),
                             None,
                             None,
                             &buffered,
                         ),
-                        LiveRetarget::Inactive => hls_autoplay_start_target(
-                            session.start,
-                            requested_position,
-                            current_time,
-                            live_sync_position,
-                            &buffered,
-                        ),
+                        LiveRetarget::Inactive => {
+                            if let Some(runway) = live_startup_runway {
+                                hls_autoplay_start_target(
+                                    HlsStart::Beginning,
+                                    runway.target,
+                                    current_time,
+                                    None,
+                                    &buffered,
+                                )
+                            } else {
+                                hls_autoplay_start_target(
+                                    session.start,
+                                    requested_position,
+                                    current_time,
+                                    live_sync_position,
+                                    &buffered,
+                                )
+                            }
+                        }
                     };
                     let Some(target) = target else {
                         return AutoplayGatePoll::Wait;
                     };
-                    let ready = hls_autoplay_gate_ready(
-                        hls_contiguous_buffered_ahead(target, &buffered),
-                        target,
-                        finalized_playable_interval
-                            .map_or_else(|| media.duration(), |(_, end)| end),
-                        finalized,
+                    let ready = live_startup_runway.map_or_else(
+                        || {
+                            hls_autoplay_gate_ready(
+                                hls_contiguous_buffered_ahead(target, &buffered),
+                                target,
+                                finalized_playable_interval
+                                    .map_or_else(|| media.duration(), |(_, end)| end),
+                                finalized,
+                            )
+                        },
+                        |runway| hls_live_autoplay_runway_ready(&runway.fragments, &buffered),
                     );
                     if ready {
                         AutoplayGatePoll::Ready(target)
@@ -5331,6 +5523,7 @@ mod player {
         let edge = js_property(&details, "edge")
             .and_then(|value| value.as_f64())
             .filter(|value| value.is_finite() && *value >= 0.0);
+        let live_startup_runway = live.then(|| live_level_autoplay_runway(&details)).flatten();
         let continuation_open = with_session(epoch, |session| {
             session.codec_continuation_open && !session.codec_pending
         })
@@ -5356,6 +5549,8 @@ mod player {
             let mut settlement = None;
             let mut gate = None;
             let mut fallback_restart = None;
+            let mut startup_restart = None;
+            let mut startup_body_runway_lock = None;
             let accepted_edge = accepted_edge.clone().filter(|fragment| {
                 !matches!(session.live_retarget, LiveRetarget::AwaitingFallback(_))
                     || finalized_playable_edge.as_ref().is_some_and(|presented| {
@@ -5426,6 +5621,38 @@ mod player {
                     settlement = Some((session.source.clone(), revision));
                 }
             }
+            if session.live_startup_runway_required
+                && session.start == HlsStart::Live
+                && live
+                && !session.codec_pending
+                && session.live_startup_runway.is_none()
+                && session.play_attempt.is_none()
+                && matches!(
+                    session.live_retarget,
+                    LiveRetarget::Inactive | LiveRetarget::AwaitingTarget(_)
+                )
+                && let Some(candidate) = live_startup_runway.clone()
+            {
+                let target = candidate.target;
+                startup_body_runway_lock =
+                    Some((session.presentation_id, candidate.references.clone()));
+                session.live_startup_runway = Some(candidate);
+                if fallback_restart.is_none()
+                    && session.manifest_parsed
+                    && matches!(
+                        session.live_retarget,
+                        LiveRetarget::Inactive
+                            | LiveRetarget::AwaitingTarget(LiveRetargetTarget::Edge(_))
+                    )
+                    && (session.media.current_time() - target).abs()
+                        > HLS_BUFFER_EDGE_EPSILON_SECONDS
+                {
+                    startup_restart = session
+                        .hls()
+                        .cloned()
+                        .map(|hls| (session.media.clone(), hls, target));
+                }
+            }
             if !classify_hls_level_transition(
                 previous.map(|(start, live, _, _)| (start, live)),
                 session.timeline_rebased,
@@ -5433,7 +5660,14 @@ mod player {
             )
             .rebase
             {
-                return (settlement, gate, fallback_restart, None);
+                return (
+                    settlement,
+                    gate,
+                    fallback_restart,
+                    startup_restart,
+                    startup_body_runway_lock,
+                    None,
+                );
             }
             session.timeline_rebased = true;
             session.recovery_pending = true;
@@ -5454,6 +5688,7 @@ mod player {
                 Launch {
                     media: session.media.clone(),
                     source,
+                    presentation_id: session.presentation_id,
                     loader: None,
                     initial_position: session.initial_position,
                     rebase_position: rebase,
@@ -5472,18 +5707,51 @@ mod player {
                     },
                     start: session.start,
                     beginning_prefix_stamp: session.beginning_prefix_stamp,
+                    live_startup_runway_required: session.live_startup_runway_required,
+                    live_startup_runway: None,
                 },
                 session.hls().cloned(),
             ));
-            (settlement, gate, fallback_restart, request)
+            (
+                settlement,
+                gate,
+                fallback_restart,
+                startup_restart,
+                startup_body_runway_lock,
+                request,
+            )
         });
-        let Some((settlement, gate, fallback_restart, request)) = action else {
+        let Some((
+            settlement,
+            gate,
+            fallback_restart,
+            startup_restart,
+            startup_body_runway_lock,
+            request,
+        )) = action
+        else {
             return;
         };
         if let Some((source, revision)) = settlement {
             settle_codec_continuation(epoch, &source, revision);
         }
+        if let Some((presentation_id, references)) = startup_body_runway_lock {
+            super::runtime::lock_hls_live_startup_body_runway(presentation_id, references);
+        }
         if let Some((media, hls, target)) = fallback_restart {
+            if let Err(error) = hls.stop_load() {
+                hard_recovery(epoch, error);
+                return;
+            }
+            media.set_current_time(target);
+            spawn_local(async move {
+                Wait::Microtask.wait().await;
+                if is_current(epoch) {
+                    start_at(epoch, &hls, target);
+                }
+            });
+        }
+        if let Some((media, hls, target)) = startup_restart {
             if let Err(error) = hls.stop_load() {
                 hard_recovery(epoch, error);
                 return;
@@ -5544,10 +5812,27 @@ mod player {
                     let first = matches!(session.load, LoadPhase::Cold);
                     let resume = !first && !matches!(session.load, LoadPhase::Warmup);
                     let position = session.rebase_position.unwrap_or(session.initial_position);
-                    if user && (session.codec_pending || session.live_retarget.pending()) {
+                    if user
+                        && (session.codec_pending
+                            || session.live_retarget.pending()
+                            || session.live_startup_runway_required)
+                    {
                         session.autoplay_allowed = true;
                         session.resume = true;
-                        return (session.media.clone(), None, false, true);
+                        let restart_runway = session.live_startup_runway_required
+                            && session.manifest_parsed
+                            && !matches!(session.load, LoadPhase::Warmup)
+                            && !session.codec_pending
+                            && !session.live_retarget.pending();
+                        let load = restart_runway.then(|| {
+                            let position = session
+                                .live_startup_runway
+                                .as_ref()
+                                .map_or_else(|| session.restart_position(), |runway| runway.target);
+                            session.load = LoadPhase::Warmup;
+                            session.hls().cloned().map(|hls| (hls, Some(position)))
+                        });
+                        return (session.media.clone(), load.flatten(), false, true);
                     }
                     if user || first {
                         session.load = LoadPhase::Started;
@@ -5566,6 +5851,11 @@ mod player {
                 };
                 if deferred_live {
                     let _ = media.pause();
+                    if let Some((hls, Some(position))) = load
+                        && !start_at(epoch, &hls, position)
+                    {
+                        return;
+                    }
                     start_autoplay_buffer_gate(epoch, Autoplay::Resume);
                     return;
                 }
@@ -5726,6 +6016,7 @@ mod player {
         );
         with_session(epoch, |session| {
             session.live_tail_failures.clear();
+            session.live_startup_runway = None;
             session.network_recoveries = 0;
             session.media_recoveries = 0;
             let Some(target) = target else {
@@ -5789,10 +6080,20 @@ mod player {
                 session.codec_required = true;
                 session.codec_pending = true;
                 session.codec_edge_position = codec_edge_position;
+                if session.live_startup_runway_required {
+                    session.live_startup_runway = None;
+                }
                 true
             })
             .unwrap_or(false);
         if fallback_hard || codec_bootstrap {
+            if codec_bootstrap {
+                if let Some(presentation_id) =
+                    with_session(epoch, |session| session.presentation_id)
+                {
+                    super::runtime::unlock_hls_live_startup_body_runway(presentation_id);
+                }
+            }
             hard_recovery(epoch, data);
             return;
         }
@@ -5855,6 +6156,7 @@ mod player {
     }
 
     fn hard_recovery(epoch: u64, data: JsValue) {
+        let mut reset_live_startup_body_runway = None;
         let decision = with_session(epoch, |session| {
             if session.hard_restarts >= MAX_HARD_RESTART_ATTEMPTS {
                 return Err(());
@@ -5873,6 +6175,10 @@ mod player {
                 session.codec_continuation_edge = None;
                 session.codec_continuation_candidate = None;
                 session.codec_continuation_loading_fragments.clear();
+                if session.live_startup_runway_required {
+                    session.live_startup_runway = None;
+                    reset_live_startup_body_runway = Some(session.presentation_id);
+                }
             }
             let source = if session.codec_required && session.start == HlsStart::Live {
                 with_hls_codec_bootstrap(&session.source, epoch)
@@ -5892,6 +6198,9 @@ mod player {
                 session.timeline_rebased,
             )))
         });
+        if let Some(presentation_id) = reset_live_startup_body_runway {
+            super::runtime::unlock_hls_live_startup_body_runway(presentation_id);
+        }
         match decision {
             Some(Ok(Some(recovery))) => run_recovery(epoch, recovery),
             Some(Err(())) => run_recovery(
@@ -5972,6 +6281,7 @@ mod player {
                     let request = with_session(epoch, |session| Launch {
                         media: media.clone(),
                         source,
+                        presentation_id: session.presentation_id,
                         loader: None,
                         initial_position: session.restart_position(),
                         rebase_position: session.rebase_position.filter(|_| !session.codec_pending),
@@ -5990,6 +6300,8 @@ mod player {
                         },
                         start: session.start,
                         beginning_prefix_stamp: session.beginning_prefix_stamp,
+                        live_startup_runway_required: session.live_startup_runway_required,
+                        live_startup_runway: session.live_startup_runway.clone(),
                     });
                     let Some(request) = request else { return };
                     if let Err(error) = launch(request).await {
@@ -6080,6 +6392,8 @@ mod player {
                         session.resume = false;
                         session.resume_position = None;
                         session.playback_authorized = true;
+                        session.live_startup_runway_required = false;
+                        session.live_startup_runway = None;
                         if !matches!(session.load, LoadPhase::Started) {
                             session.load = LoadPhase::Started;
                         }
@@ -6838,7 +7152,7 @@ mod runtime {
     const HLS_STREAM_KEY: &str = "weeb3:hls-playback";
     const HLS_PAYLOAD_SINGLEFLIGHT_MAX_WAITERS: usize = 64;
     const HLS_STARTUP_BODY_MAX_PARALLEL: usize = 1;
-    const HLS_EXACT_NEXT_OVERLAP_SEGMENTS: usize = 2;
+    const HLS_EXACT_NEXT_OVERLAP_SEGMENTS: usize = HLS_LIVE_SYNC_SEGMENTS - 1;
     const HLS_ROLLING_EARLY_OVERLAP_SEGMENTS: usize = 1;
     const HLS_PREFETCH_BODY_MAX_PARALLEL: usize = 3;
     const HLS_SERIAL_PREFETCH_COMPLETIONS: usize = 6;
@@ -6862,7 +7176,6 @@ mod runtime {
     const HLS_PAYLOAD_RETRY_DELAY_MS: u64 = 75;
     const HLS_PAYLOAD_SIZE_RETRY_DELAY_MS: u64 = 250;
     const HLS_STARTUP_LOOKAHEAD_BYTES: u64 = 2 * MEDIA_STARTUP_RESPONSE_BYTES;
-    const HLS_LIVE_PREFIX_WINDOW_COUNT: usize = 3;
     const HLS_LIVE_TAIL_FALLBACK_MAX_RETREATS: u8 = 4;
     const HLS_LIVE_TAIL_FALLBACK_MAX_HIDDEN_SECONDS: f64 = 300.0;
 
@@ -7241,6 +7554,11 @@ mod runtime {
         live_start: bool,
         live_history_active: bool,
         live_tail_fallback: Option<HlsLiveTailFallback>,
+        live_body_runway: Vec<String>,
+        live_startup_body_runway: Option<Vec<String>>,
+        live_body_admission_open: bool,
+        live_body_schedule_id: u64,
+        live_body_schedule_running: bool,
         timeline_rebasing: bool,
         startup_deadline_ms: f64,
         beginning_prefix: HlsBeginningPrefixGate,
@@ -7279,6 +7597,11 @@ mod runtime {
                 live_start: false,
                 live_history_active: false,
                 live_tail_fallback: None,
+                live_body_runway: Vec::new(),
+                live_startup_body_runway: None,
+                live_body_admission_open: false,
+                live_body_schedule_id: 0,
+                live_body_schedule_running: false,
                 timeline_rebasing: false,
                 startup_deadline_ms: 0.0,
                 beginning_prefix: HlsBeginningPrefixGate::disabled(),
@@ -7309,8 +7632,9 @@ mod runtime {
             self.startup_runway_kinds.clear();
             self.fragment_kinds.clear();
             self.retired_startup_plans.clear();
+            self.clear_live_startup_body_runway();
             self.completed_media_payloads = if self.live_start {
-                HLS_SERIAL_PREFETCH_COMPLETIONS.saturating_sub(1)
+                HLS_TWO_BODY_PREFETCH_COMPLETIONS
             } else {
                 0
             };
@@ -7330,7 +7654,69 @@ mod runtime {
             self.startup_runway_kinds.clear();
             self.fragment_kinds.clear();
             self.retired_startup_plans.clear();
+            self.clear_live_startup_body_runway();
             self.timeline_epoch
+        }
+
+        fn invalidate_live_body_schedule(&mut self) {
+            self.live_body_schedule_id = next_nonzero_generation(self.live_body_schedule_id);
+            self.live_body_schedule_running = false;
+            self.live_body_runway.clear();
+        }
+
+        fn clear_live_startup_body_runway(&mut self) {
+            self.live_startup_body_runway = None;
+            self.invalidate_live_body_schedule();
+        }
+
+        fn claim_live_body_schedule(
+            &mut self,
+            stamp: PlaybackStamp,
+            candidate_runway: &[String],
+            candidate_ready: bool,
+        ) -> Option<u64> {
+            if !self.live_start || !self.live_body_admission_open || self.stamp() != stamp {
+                return None;
+            }
+            let spawn = hls_live_body_schedule_should_spawn(
+                &self.live_body_runway,
+                candidate_runway,
+                self.live_body_schedule_running,
+                candidate_ready,
+            );
+            let runway_changed = self.live_body_runway != candidate_runway;
+            if runway_changed {
+                self.live_body_schedule_id = next_nonzero_generation(self.live_body_schedule_id);
+                self.live_body_schedule_running = false;
+                self.live_body_runway = candidate_runway.to_vec();
+            }
+            if !spawn {
+                return None;
+            }
+            if !runway_changed {
+                self.live_body_schedule_id = next_nonzero_generation(self.live_body_schedule_id);
+            }
+            self.live_body_schedule_running = true;
+            Some(self.live_body_schedule_id)
+        }
+
+        fn live_body_schedule_current(
+            &self,
+            stamp: PlaybackStamp,
+            schedule_id: u64,
+            runway: &[String],
+        ) -> bool {
+            self.live_start
+                && self.stamp() == stamp
+                && self.live_body_schedule_running
+                && self.live_body_schedule_id == schedule_id
+                && self.live_body_runway == runway
+        }
+
+        fn finish_live_body_schedule(&mut self, stamp: PlaybackStamp, schedule_id: u64) {
+            if self.stamp() == stamp && self.live_body_schedule_id == schedule_id {
+                self.live_body_schedule_running = false;
+            }
         }
 
         fn ticket_current(&self, ticket: PrefetchTicket, sustained: bool) -> bool {
@@ -7548,6 +7934,7 @@ mod runtime {
             &mut self,
             reference: &str,
             prefetch: bool,
+            enforce_capacity: bool,
             generation: u64,
             prefetch_limit: usize,
         ) -> HlsPayloadLoadRole {
@@ -7575,7 +7962,7 @@ mod runtime {
                     "stale HLS fragment generation was superseded".to_string()
                 ));
             }
-            if prefetch
+            if enforce_capacity
                 && self
                     .body_pending
                     .values()
@@ -7752,6 +8139,35 @@ mod runtime {
         })
     }
 
+    fn hls_payload_body_ready_or_joinable(reference: &str, generation: u64) -> bool {
+        let reference = reference.to_ascii_lowercase();
+        HLS_ASSET_CACHE.with(|cache| {
+            let cache = cache.borrow();
+            cache.bodies.contains_key(&reference)
+                || cache.body_pending.get(&reference).is_some_and(|pending| {
+                    pending_generation_relation(pending.generation, generation)
+                        == PendingGenerationRelation::Join
+                })
+        })
+    }
+
+    fn hls_payload_body_cached(reference: &str) -> bool {
+        let reference = reference.to_ascii_lowercase();
+        HLS_ASSET_CACHE.with(|cache| cache.borrow().bodies.contains_key(&reference))
+    }
+
+    fn hls_live_body_admission_mode(generation: u64) -> Option<HlsPrefetchMode> {
+        HLS_PLAYBACK.with(|playback| {
+            let playback = playback.borrow();
+            let session = &playback.session;
+            (session.live_start
+                && session.live_body_admission_open
+                && session.generation == generation
+                && !session.timeline_rebasing)
+                .then_some(session.mode)
+        })
+    }
+
     async fn fetch_hls_bytes_response(
         weeb3: Arc<Weeb3>,
         reference: String,
@@ -7804,32 +8220,18 @@ mod runtime {
         {
             bypass_hls_beginning_prefix_for_direct_range(&reference, stamp);
         }
-        let progressive_start = hls_progressive_media_candidate(&reference);
-        let progressive_context = if method != "HEAD" && range.is_none() && progressive_start {
-            let (body_cached, completed) = HLS_ASSET_CACHE.with(|cache| {
-                let cache = cache.borrow();
-                let body_cached = cache.bodies.contains_key(&reference);
-                let completed = body_cached
-                    || cache.payload_size(&reference).is_some_and(|payload_size| {
-                        hls_range_metadata(&reference, payload_size).is_some_and(|metadata| {
-                            hls_range_body_fully_cached(&reference, &metadata)
-                        })
-                    });
-                (body_cached, completed)
-            });
-            Some((hls_foreground_context(&reference, completed), body_cached))
-        } else {
-            None
-        };
-        if let Some((context, true)) = progressive_context.as_ref()
-            && let (Some(ticket), Some(cursor)) = (context.ticket, context.cursor.clone())
+        // Live playback requires complete fragments for its three-body runway. Letting a live
+        // media GET enter the tokenized range protocol would duplicate any runway/foreground
+        // body load and can consume the safety cushion before that body becomes reusable.
+        let progressive_start = hls_progressive_media_candidate(&reference)
+            && !hls_live_complete_body_candidate(&reference);
+        let progressive_generation = progressive_start
+            .then(|| HLS_PLAYBACK.with(|playback| playback.borrow().session.generation));
+        if method != "HEAD"
+            && range.is_none()
+            && let Some(generation) = progressive_generation
+            && !hls_payload_body_ready_or_joinable(&reference, generation)
         {
-            spawn_hls_progressive_range_prefetch(weeb3.clone(), cursor, ticket);
-        }
-        if let Some((context, false)) = progressive_context {
-            let Some(plan_id) = context.progressive_plan_id else {
-                return FetchResponse::error(503, "stale HLS progressive plan");
-            };
             let payload_size = match cached_hls_payload_size(&reference) {
                 Some(size) => Some(size),
                 None => start_hls_payload_size_probe(weeb3.clone(), reference.clone())
@@ -7841,42 +8243,53 @@ mod runtime {
             let Some(payload_size) = payload_size.filter(|size| *size > 0) else {
                 return FetchResponse::error(503, "weeb-3 did not resolve HLS media size");
             };
-            HLS_ASSET_CACHE.with(|cache| {
-                cache.borrow_mut().remember_metadata(
+            // The size probe yields to the browser. If a live runway prefetch claimed the body
+            // in the meantime, fall through to the complete-body path so it can join that
+            // singleflight instead of issuing a tokenized range cascade.
+            if !hls_payload_body_ready_or_joinable(&reference, generation) {
+                let completed = hls_range_metadata(&reference, payload_size)
+                    .is_some_and(|metadata| hls_range_body_fully_cached(&reference, &metadata));
+                let context = hls_foreground_context(&reference, completed);
+                let Some(plan_id) = context.progressive_plan_id else {
+                    return FetchResponse::error(503, "stale HLS progressive plan");
+                };
+                HLS_ASSET_CACHE.with(|cache| {
+                    cache.borrow_mut().remember_metadata(
+                        &reference,
+                        HlsAssetMetadata {
+                            payload_size,
+                            mime: "application/octet-stream",
+                            is_manifest: false,
+                        },
+                    );
+                });
+                let critical_prefix_windows = ensure_hls_beginning_prefix_configured(
+                    weeb3.clone(),
                     &reference,
-                    HlsAssetMetadata {
-                        payload_size,
-                        mime: "application/octet-stream",
-                        is_manifest: false,
-                    },
+                    context.stamp,
+                    payload_size,
                 );
-            });
-            let critical_prefix_windows = ensure_hls_beginning_prefix_configured(
-                weeb3.clone(),
-                &reference,
-                context.stamp,
-                payload_size,
-            );
-            if !hls_progressive_response_is_current(plan_id, &reference, context.stamp) {
-                return FetchResponse::error(503, "stale HLS progressive request");
-            }
-            if let (Some(ticket), Some(cursor)) = (context.ticket, context.cursor) {
-                spawn_hls_progressive_range_prefetch(weeb3.clone(), cursor, ticket);
-            }
-            let mut headers = hls_bytes_headers(&reference, "application/octet-stream");
-            headers.push(("Content-Length".to_string(), payload_size.to_string()));
-            headers.push(("X-Weeb3-Stream-Start".to_string(), "1".to_string()));
-            headers.push((
-                "X-Weeb3-Stream-Token".to_string(),
-                hls_playback_stamp_token(context.stamp),
-            ));
-            if let Some(windows) = critical_prefix_windows {
+                if !hls_progressive_response_is_current(plan_id, &reference, context.stamp) {
+                    return FetchResponse::error(503, "stale HLS progressive request");
+                }
+                if let (Some(ticket), Some(cursor)) = (context.ticket, context.cursor) {
+                    spawn_hls_progressive_range_prefetch(weeb3.clone(), cursor, ticket);
+                }
+                let mut headers = hls_bytes_headers(&reference, "application/octet-stream");
+                headers.push(("Content-Length".to_string(), payload_size.to_string()));
+                headers.push(("X-Weeb3-Stream-Start".to_string(), "1".to_string()));
                 headers.push((
-                    "X-Weeb3-HLS-Critical-Prefix-Windows".to_string(),
-                    windows.to_string(),
+                    "X-Weeb3-Stream-Token".to_string(),
+                    hls_playback_stamp_token(context.stamp),
                 ));
+                if let Some(windows) = critical_prefix_windows {
+                    headers.push((
+                        "X-Weeb3-HLS-Critical-Prefix-Windows".to_string(),
+                        windows.to_string(),
+                    ));
+                }
+                return FetchResponse::stream(200, headers);
             }
-            return FetchResponse::stream(200, headers);
         }
         if method != "HEAD" && range.is_none() {
             let Some(bytes) =
@@ -8264,6 +8677,7 @@ mod runtime {
             session.sequence_zero_runway_closed = false;
             session.presentation_id = presentation_id;
             session.live_start = live_start;
+            session.live_body_admission_open = live_start;
             session.live_history_active = false;
             session.live_tail_fallback = None;
             let startup_deadline_ms = hls_monotonic_now_ms()
@@ -9297,6 +9711,18 @@ mod runtime {
         })
     }
 
+    fn hls_live_complete_body_candidate(reference: &str) -> bool {
+        let reference = reference.to_ascii_lowercase();
+        HLS_PLAYBACK.with(|playback| {
+            let playback = playback.borrow();
+            let session = &playback.session;
+            session.live_start
+                && session.generation != 0
+                && !session.timeline_rebasing
+                && playback.plans.cursors.contains_key(&reference)
+        })
+    }
+
     fn hls_progressive_response_is_current(
         plan_id: u64,
         reference: &str,
@@ -9369,11 +9795,72 @@ mod runtime {
     fn set_hls_prefetch_mode(mode: HlsPrefetchMode) {
         HLS_PLAYBACK.with(|playback| {
             let mut playback = playback.borrow_mut();
-            playback.session.sequence_zero_runway_closed = hls_progressive_runway_closed_after_mode(
-                playback.session.sequence_zero_runway_closed,
-                mode,
-            );
-            playback.session.mode = mode;
+            let session = &mut playback.session;
+            session.sequence_zero_runway_closed =
+                hls_progressive_runway_closed_after_mode(session.sequence_zero_runway_closed, mode);
+            session.mode = mode;
+            session.live_body_admission_open = mode != HlsPrefetchMode::Inactive;
+            if matches!(mode, HlsPrefetchMode::Inactive | HlsPrefetchMode::Sustained) {
+                session.live_startup_body_runway = None;
+            }
+            if mode == HlsPrefetchMode::Inactive {
+                session.invalidate_live_body_schedule();
+            }
+        });
+    }
+
+    pub(super) fn lock_hls_live_startup_body_runway(
+        expected_presentation_id: u64,
+        references: Vec<String>,
+    ) {
+        let references = references
+            .into_iter()
+            .map(|reference| reference.to_ascii_lowercase())
+            .collect::<Vec<_>>();
+        if references.len() != HLS_LIVE_SYNC_SEGMENTS
+            || references
+                .iter()
+                .any(|reference| !is_hex_reference(reference))
+        {
+            return;
+        }
+        let launch = HLS_PLAYBACK.with(|playback| {
+            let mut playback = playback.borrow_mut();
+            let session = &mut playback.session;
+            if expected_presentation_id == 0
+                || session.presentation_id != expected_presentation_id
+                || !session.live_start
+                || !session.live_body_admission_open
+                || session.mode == HlsPrefetchMode::Sustained
+                || session.timeline_rebasing
+            {
+                return None;
+            }
+            if session.live_body_runway != references {
+                session.invalidate_live_body_schedule();
+            }
+            session.live_startup_body_runway = Some(references.clone());
+            session
+                .client
+                .clone()
+                .map(|client| (client, session.stamp(), references))
+        });
+        if let Some((client, stamp, references)) = launch {
+            start_hls_live_body_runway_schedule(client, stamp, references);
+        }
+    }
+
+    pub(super) fn unlock_hls_live_startup_body_runway(expected_presentation_id: u64) {
+        HLS_PLAYBACK.with(|playback| {
+            let mut playback = playback.borrow_mut();
+            let session = &mut playback.session;
+            if expected_presentation_id == 0 || session.presentation_id != expected_presentation_id
+            {
+                return;
+            }
+            if session.live_startup_body_runway.take().is_some() {
+                session.invalidate_live_body_schedule();
+            }
         });
     }
 
@@ -9438,6 +9925,7 @@ mod runtime {
             let mut playback = playback.borrow_mut();
             let session = &mut playback.session;
             session.mode = HlsPrefetchMode::Inactive;
+            session.live_body_admission_open = false;
             let generation = session.advance_generation();
             session.tracks.clear();
             let client = session.client.take();
@@ -9508,21 +9996,38 @@ mod runtime {
                     && !session.runways.contains(cursor.plan.id, &reference);
                 if transition.is_some_and(|transition| transition.0) || runway_discontinuity {
                     progressive_owner_handoff = true;
-                    let completed_media_payloads = session
-                        .completed_media_payloads
-                        .min(HLS_TWO_BODY_PREFETCH_COMPLETIONS);
-                    let generation = session.advance_generation();
-                    session.completed_media_payloads = completed_media_payloads;
-                    seek_successor = cursor
-                        .plan
-                        .references
-                        .get(cursor.position.saturating_add(1))
-                        .cloned();
-                    publish = session
-                        .client
-                        .as_ref()
-                        .cloned()
-                        .map(|client| (client, generation));
+                    let hold_generation = hls_live_startup_holds_generation(
+                        session.live_start,
+                        session.live_body_admission_open,
+                        session.mode,
+                        session.timeline_rebasing,
+                    );
+                    if hold_generation {
+                        session.schedule_sequence =
+                            next_nonzero_generation(session.schedule_sequence);
+                        let schedule_id = session.schedule_sequence;
+                        if let Some(track) = session.tracks.get_mut(&cursor.plan.id) {
+                            track.schedule_id = schedule_id;
+                            track.running = None;
+                        }
+                        session.startup_overlap_plans.remove(&cursor.plan.id);
+                    } else {
+                        seek_successor = cursor
+                            .plan
+                            .references
+                            .get(cursor.position.saturating_add(1))
+                            .cloned();
+                        let completed_media_payloads = session
+                            .completed_media_payloads
+                            .min(HLS_TWO_BODY_PREFETCH_COMPLETIONS);
+                        let generation = session.advance_generation();
+                        session.completed_media_payloads = completed_media_payloads;
+                        publish = session
+                            .client
+                            .as_ref()
+                            .cloned()
+                            .map(|client| (client, generation));
+                    }
                 }
                 if !session.tracks.contains_key(&cursor.plan.id) {
                     progressive_owner_handoff = true;
@@ -9665,7 +10170,8 @@ mod runtime {
             let session = &playback.session;
             session.stamp() == stamp
                 && !session.timeline_rebasing
-                && session.mode != HlsPrefetchMode::Inactive
+                && (session.mode != HlsPrefetchMode::Inactive
+                    || (session.live_start && session.live_body_admission_open))
         })
     }
 
@@ -9951,6 +10457,10 @@ mod runtime {
                 }
                 protected.insert(runway.current().to_string());
                 protected.extend(runway.successor().map(str::to_string));
+            }
+            protected.extend(session.live_body_runway.iter().cloned());
+            if let Some(runway) = &session.live_startup_body_runway {
+                protected.extend(runway.iter().cloned());
             }
             (
                 session.stamp(),
@@ -10936,17 +11446,24 @@ mod runtime {
         generation: u64,
     ) -> HlsPayloadLoadRole {
         let reference = reference.to_ascii_lowercase();
-        let (limit, timeline_epoch) = HLS_PLAYBACK.with(|playback| {
+        let (limit, timeline_epoch, enforce_capacity) = HLS_PLAYBACK.with(|playback| {
             let playback = playback.borrow();
-            (
-                playback.session.body_parallelism(generation),
-                playback.session.timeline_epoch,
-            )
+            let session = &playback.session;
+            let live_startup = session.live_start
+                && session.live_body_admission_open
+                && session.mode != HlsPrefetchMode::Sustained
+                && session.generation == generation
+                && !session.timeline_rebasing;
+            let mut limit = session.body_parallelism(generation);
+            if prefetch && live_startup {
+                limit = limit.min(HLS_PREFETCH_BODY_MAX_PARALLEL.saturating_sub(1));
+            }
+            (limit, session.timeline_epoch, prefetch || live_startup)
         });
         let role = HLS_ASSET_CACHE.with(|cache| {
             cache
                 .borrow_mut()
-                .load_role(&reference, prefetch, generation, limit)
+                .load_role(&reference, prefetch, enforce_capacity, generation, limit)
         });
         if let HlsPayloadLoadRole::Lead(_, load_id) = &role {
             let load_id = *load_id;
@@ -11410,6 +11927,28 @@ mod runtime {
         }
     }
 
+    async fn admit_hls_foreground_payload_load(
+        weeb3: &Arc<Weeb3>,
+        reference: &str,
+        generation: u64,
+    ) -> Option<HlsPayloadLoadRole> {
+        loop {
+            let role =
+                start_hls_payload_load(weeb3.clone(), reference.to_string(), false, generation);
+            if !matches!(&role, HlsPayloadLoadRole::AtCapacity) {
+                return Some(role);
+            }
+            drop(role);
+            match hls_live_body_admission_mode(generation) {
+                Some(HlsPrefetchMode::Inactive | HlsPrefetchMode::StartupOnly) => {
+                    async_std::task::sleep(Duration::from_millis(25)).await;
+                }
+                Some(HlsPrefetchMode::Sustained) => {}
+                None => return None,
+            }
+        }
+    }
+
     async fn retrieve_hls_payload_for_playback(
         weeb3: Arc<Weeb3>,
         reference: String,
@@ -11418,12 +11957,8 @@ mod runtime {
         let cached = HLS_ASSET_CACHE.with(|cache| cache.borrow().bodies.contains_key(&reference));
         let context = hls_foreground_context(&reference, cached);
         let head_ready = cached;
-        let foreground = start_hls_payload_load(
-            weeb3.clone(),
-            reference.clone(),
-            false,
-            context.stamp.generation,
-        );
+        let foreground =
+            admit_hls_foreground_payload_load(&weeb3, &reference, context.stamp.generation).await?;
 
         if let (Some(ticket), Some(cursor)) = (context.ticket, context.cursor.as_ref())
             && let Some(successors) = {
@@ -11521,13 +12056,13 @@ mod runtime {
             if !hls_foreground_retry_is_current(context.stamp) {
                 break;
             }
-            body = wait_hls_payload_load(start_hls_payload_load(
-                weeb3.clone(),
-                reference.clone(),
-                false,
-                context.stamp.generation,
-            ))
-            .await;
+            let Some(foreground) =
+                admit_hls_foreground_payload_load(&weeb3, &reference, context.stamp.generation)
+                    .await
+            else {
+                break;
+            };
+            body = wait_hls_payload_load(foreground).await;
             attempts += 1;
         }
 
@@ -11938,6 +12473,96 @@ mod runtime {
         }
     }
 
+    fn start_hls_live_body_runway_schedule(
+        weeb3: Arc<Weeb3>,
+        stamp: PlaybackStamp,
+        body_runway: Vec<String>,
+    ) {
+        let body_runway_ready = !body_runway.is_empty()
+            && body_runway
+                .iter()
+                .all(|reference| hls_payload_body_cached(reference));
+        let schedule_id = HLS_PLAYBACK.with(|playback| {
+            playback.borrow_mut().session.claim_live_body_schedule(
+                stamp,
+                &body_runway,
+                body_runway_ready,
+            )
+        });
+        let Some(schedule_id) = schedule_id else {
+            return;
+        };
+        spawn_local(async move {
+            let mut stagger_next_leader = false;
+            'runway: loop {
+                let current = HLS_PLAYBACK.with(|playback| {
+                    playback.borrow().session.live_body_schedule_current(
+                        stamp,
+                        schedule_id,
+                        &body_runway,
+                    )
+                });
+                if !current
+                    || body_runway
+                        .iter()
+                        .all(|reference| hls_payload_body_cached(reference))
+                {
+                    break;
+                }
+
+                for reference in body_runway.iter().cloned() {
+                    if hls_payload_body_ready_or_joinable(&reference, stamp.generation) {
+                        continue;
+                    }
+                    if stagger_next_leader {
+                        async_std::task::sleep(HLS_NEXT_RESERVE_STAGGER).await;
+                        stagger_next_leader = false;
+                    }
+                    loop {
+                        let current = HLS_PLAYBACK.with(|playback| {
+                            playback.borrow().session.live_body_schedule_current(
+                                stamp,
+                                schedule_id,
+                                &body_runway,
+                            )
+                        });
+                        if !current {
+                            break 'runway;
+                        }
+                        if hls_payload_body_ready_or_joinable(&reference, stamp.generation) {
+                            break;
+                        }
+                        let role = start_hls_payload_load(
+                            weeb3.clone(),
+                            reference.clone(),
+                            true,
+                            stamp.generation,
+                        );
+                        match role {
+                            HlsPayloadLoadRole::AtCapacity => {
+                                async_std::task::sleep(Duration::from_millis(25)).await;
+                            }
+                            HlsPayloadLoadRole::Reject(_) => break 'runway,
+                            role => {
+                                stagger_next_leader =
+                                    matches!(&role, HlsPayloadLoadRole::Lead(_, _));
+                                drop(role);
+                                break;
+                            }
+                        }
+                    }
+                }
+                async_std::task::sleep(Duration::from_millis(25)).await;
+            }
+            HLS_PLAYBACK.with(|playback| {
+                playback
+                    .borrow_mut()
+                    .session
+                    .finish_live_body_schedule(stamp, schedule_id);
+            });
+        });
+    }
+
     fn prefetch_live_snapshot_start(
         weeb3: &Arc<Weeb3>,
         owner: &str,
@@ -11947,29 +12572,37 @@ mod runtime {
         let Some(stamp) = hls_prefix_stamp_for_feed(weeb3, owner, topic) else {
             return;
         };
-        if !HLS_PLAYBACK.with(|playback| {
+        let Some((foreground_reference, locked_body_runway)) = HLS_PLAYBACK.with(|playback| {
             let playback = playback.borrow();
             let session = &playback.session;
-            session.live_start && session.stamp() == stamp
-        }) {
+            (session.live_start && session.stamp() == stamp).then(|| {
+                let foreground_reference = (session.mode == HlsPrefetchMode::Sustained)
+                    .then(|| {
+                        session
+                            .tracks
+                            .iter()
+                            .filter(|(plan_id, _)| !session.retired_startup_plans.contains(plan_id))
+                            .max_by_key(|(_, track)| track.last_touch)
+                            .and_then(|(plan_id, _)| session.runways.plans.get(plan_id))
+                            .map(|runway| runway.current().to_string())
+                    })
+                    .flatten();
+                let locked_body_runway = (session.mode != HlsPrefetchMode::Sustained)
+                    .then(|| session.live_startup_body_runway.clone())
+                    .flatten();
+                (foreground_reference, locked_body_runway)
+            })
+        }) else {
             return;
-        }
+        };
         let references = hls_media_references(&snapshot.body);
         let start = hls_live_tail(&snapshot.body)
             .map(|(start, _)| start)
             .unwrap_or_default();
-        for reference in references
-            .iter()
-            .skip(start)
-            .take(HLS_PREFETCH_BODY_MAX_PARALLEL)
-        {
-            start_hls_shared_prefix_warmup(
-                weeb3.clone(),
-                reference.clone(),
-                stamp,
-                HLS_LIVE_PREFIX_WINDOW_COUNT,
-            );
-        }
+        let body_runway = locked_body_runway.unwrap_or_else(|| {
+            hls_live_prefetch_references(&snapshot.body, foreground_reference.as_deref())
+        });
+        start_hls_live_body_runway_schedule(weeb3.clone(), stamp, body_runway);
         if start > 0
             && hls_media_sequence(&snapshot.body) == Some(0)
             && let Some(reference) = references.first()
@@ -15421,12 +16054,13 @@ mod runtime {
         }
         let client = HLS_PLAYBACK.with(|playback| {
             let mut playback = playback.borrow_mut();
-            let session = &playback.session;
+            let session = &mut playback.session;
             if !session.live_start || !session.live_history_active {
                 return None;
             }
             let client = session.client.clone();
-            playback.session.live_tail_fallback = Some(HlsLiveTailFallback {
+            session.clear_live_startup_body_runway();
+            session.live_tail_fallback = Some(HlsLiveTailFallback {
                 snapshot_index: snapshot.index,
                 sequence: cutoff_sequence,
                 reference: cutoff_reference.clone(),
@@ -16258,6 +16892,45 @@ mod runtime {
         {
             return Ok(Some(SequenceZeroFollowupHead::Direct(direct)));
         }
+        let live_targets = plan_hls_sequence_zero_live_followup(initial_index)
+            .ok_or_else(|| "The Live follow-up index overflowed.".to_string())?;
+        collector.enqueue(
+            live_targets.iter().copied(),
+            LiveHistoryProbeClass::Primary,
+            true,
+        )?;
+        if !collector.observe_retained_once(&live_targets).await? {
+            return Ok(None);
+        }
+        if let Some(direct) =
+            take_sequence_zero_followup_direct(collector, initial_index, initial_archive)?
+        {
+            return Ok(Some(SequenceZeroFollowupHead::Direct(direct)));
+        }
+        let live_frontier_found = live_targets
+            .last()
+            .is_some_and(|index| collector.state(*index) == Some(LiveHistoryProbeState::Found));
+        if let Some(payload) = highest_appendable_sequence_zero_followup_head(
+            collector,
+            initial_index,
+            initial_archive,
+        )
+        .filter(|payload| {
+            payload.index > initial_index
+                && (!hls_is_finalized(&payload.bytes)
+                    || payload.index >= collector.highest_authenticated_positive_index)
+        }) {
+            let remembered_later = collector.remember_followup_windows_after(payload.index);
+            return Ok(Some(SequenceZeroFollowupHead::Sparse {
+                continue_catchup: live_frontier_found
+                    || collector.highest_authenticated_positive_index > payload.index
+                    || !remembered_later,
+                payload,
+            }));
+        }
+        if !refresh_head {
+            return Ok(None);
+        }
         loop {
             let first_guard = probe_index
                 .checked_add(HLS_SPARSE_HISTORY_STRIDE)
@@ -16405,7 +17078,7 @@ mod runtime {
             }
             break;
         }
-        if !scan_initialized || !refresh_head {
+        if !scan_initialized {
             return Ok(None);
         }
 
@@ -16641,15 +17314,6 @@ mod runtime {
                 return false;
             }
             seed = refreshed_seed;
-        }
-        let blocked_authenticated_evidence = hls_sequence_zero_has_newer_authenticated_evidence(
-            seed.index,
-            seed.positive_ceiling,
-            seed.deferred_retry_index,
-            &seed.retry_indices,
-        );
-        if !refresh_head && !continuation_invocation && blocked_authenticated_evidence {
-            return false;
         }
         if seed.scan_initialized && refresh_head {
             advance_sequence_zero_retry_turn(cache_key, checking_token, &seed);
@@ -17478,9 +18142,16 @@ mod runtime {
         let beginning_prefix_stamp = (start == HlsStart::Beginning)
             .then(|| hls_prefix_stamp_for_feed(&weeb3, &owner, &topic))
             .flatten();
-        let mode = play_hls(player, &source, hls_loader, start, beginning_prefix_stamp)
-            .await
-            .map_err(|error| format!("Could not initialize HLS: {}", js_error_message(&error)))?;
+        let mode = play_hls(
+            player,
+            &source,
+            hls_loader,
+            start,
+            beginning_prefix_stamp,
+            presentation_id,
+        )
+        .await
+        .map_err(|error| format!("Could not initialize HLS: {}", js_error_message(&error)))?;
         if !result_view_request_is_current(view_generation) {
             return Err("HLS open was superseded".to_string());
         }

@@ -47,27 +47,30 @@ mod hls {
         hls_deferred_feed_completion_matches, hls_direct_archive_disposition,
         hls_dom_pause_is_explicit, hls_dom_play_is_explicit, hls_finalized_edge_load_target,
         hls_is_finalized, hls_is_long_sequence_zero_checkpoint, hls_last_playable_segment,
-        hls_live_frontier_is_ready, hls_live_retarget_target, hls_live_retreat_boundary,
-        hls_live_tail, hls_live_tail_fallback_segment, hls_manifest_reload_is_continuous,
-        hls_manifest_reload_is_forward, hls_media_references, hls_media_sequence,
-        hls_ordered_window_admissions, hls_payload_mime, hls_play_attempt_settlement,
-        hls_progressive_foreground_transition, hls_progressive_frontier_decision,
-        hls_progressive_frontier_width, hls_progressive_range_admission,
-        hls_progressive_range_reservation_fits, hls_progressive_rolling_boundary_width,
-        hls_progressive_rolling_lane_width, hls_progressive_runway_closed_after_mode,
-        hls_select_startup_runway_plan, hls_sequence_zero_body_from_deferred_prefix,
-        hls_sequence_zero_canonical_is_supported, hls_sequence_zero_covers_head,
-        hls_sequence_zero_ordinary_retry, hls_sequence_zero_retry_stays_queued,
-        hls_sequence_zero_same_index_archive_is_reusable, hls_sequence_zero_sparse_tail,
-        hls_startup_prefix_is_preferred, hls_startup_retry_delay_ms, hls_tail_has_terminal_endlist,
-        hls_target_duration, hls_timeline_rebase_position, hls_timeline_rebase_required,
-        hls_verified_sequence_zero_checkpoint_tail,
+        hls_live_autoplay_runway, hls_live_autoplay_runway_ready,
+        hls_live_body_schedule_should_spawn, hls_live_frontier_is_ready,
+        hls_live_prefetch_references, hls_live_retarget_target, hls_live_retreat_boundary,
+        hls_live_startup_holds_generation, hls_live_tail, hls_live_tail_fallback_segment,
+        hls_manifest_reload_is_continuous, hls_manifest_reload_is_forward, hls_media_references,
+        hls_media_sequence, hls_ordered_window_admissions, hls_payload_mime,
+        hls_play_attempt_settlement, hls_progressive_foreground_transition,
+        hls_progressive_frontier_decision, hls_progressive_frontier_width,
+        hls_progressive_range_admission, hls_progressive_range_reservation_fits,
+        hls_progressive_rolling_boundary_width, hls_progressive_rolling_lane_width,
+        hls_progressive_runway_closed_after_mode, hls_select_startup_runway_plan,
+        hls_sequence_zero_body_from_deferred_prefix, hls_sequence_zero_canonical_is_supported,
+        hls_sequence_zero_covers_head, hls_sequence_zero_ordinary_retry,
+        hls_sequence_zero_retry_stays_queued, hls_sequence_zero_same_index_archive_is_reusable,
+        hls_sequence_zero_sparse_tail, hls_startup_prefix_is_preferred, hls_startup_retry_delay_ms,
+        hls_tail_has_terminal_endlist, hls_target_duration, hls_timeline_rebase_position,
+        hls_timeline_rebase_required, hls_verified_sequence_zero_checkpoint_tail,
         hls_verified_sequence_zero_checkpoint_tail_at_index, is_hls_manifest,
         open_hls_codec_continuation, plan_hls_sequence_zero_followup_recovery,
-        plan_hls_sequence_zero_terminal_confirmation, plan_hls_sparse_forward_wave,
-        plan_hls_sparse_history_from_lattice, plan_hls_sparse_history_repairs_for_attempts,
-        plan_hls_sparse_terminal_repairs, prepend_hls_codec_bootstrap, present_hls_live_fallback,
-        probe_hls_manifest, raise_hls_target_duration, remember_hls_sequence_zero_retry,
+        plan_hls_sequence_zero_live_followup, plan_hls_sequence_zero_terminal_confirmation,
+        plan_hls_sparse_forward_wave, plan_hls_sparse_history_from_lattice,
+        plan_hls_sparse_history_repairs_for_attempts, plan_hls_sparse_terminal_repairs,
+        prepend_hls_codec_bootstrap, present_hls_live_fallback, probe_hls_manifest,
+        raise_hls_target_duration, remember_hls_sequence_zero_retry,
         retain_hls_sequence_zero_retries_after, rewrite_hls_manifest,
         rewrite_hls_manifest_for_live_reload, select_hls_sequence_zero_retry,
         stream_feed_payload_len_is_supported, touch_hls_cache_lru,
@@ -867,6 +870,107 @@ mod hls {
     }
 
     #[test]
+    fn live_autoplay_pins_and_requires_three_playable_tail_fragments() {
+        let fragments = (0..10)
+            .map(|index| (index as f64 * 4.0, 4.0, false))
+            .collect::<Vec<_>>();
+        let runway = hls_live_autoplay_runway(&fragments).unwrap();
+        assert_eq!(runway, vec![(28.0, 4.0), (32.0, 4.0), (36.0, 4.0)]);
+        assert!(!hls_live_autoplay_runway_ready(&runway, &[(28.0, 36.0)]));
+        assert!(hls_live_autoplay_runway_ready(&runway, &[(28.0, 40.0)]));
+
+        let mut gapped = fragments;
+        gapped[8].2 = true;
+        assert_eq!(
+            hls_live_autoplay_runway(&gapped),
+            Some(vec![(24.0, 4.0), (28.0, 4.0), (36.0, 4.0)]),
+            "a GAP slot is not an impossible MediaSource-buffer requirement"
+        );
+        assert_eq!(hls_live_autoplay_runway(&gapped[..2]), None);
+    }
+
+    #[test]
+    fn live_prefetch_selects_the_last_three_playable_fragment_bodies() {
+        let fifth = format!("{:064x}", 5);
+        let live = format!(
+            "#EXTM3U\n#EXT-X-TARGETDURATION:4\n#EXT-X-MEDIA-SEQUENCE:40\n\
+             #EXTINF:4.0,\n{REF}\n#EXTINF:4.0,\n{REF2}\n\
+             #EXT-X-GAP\n#EXTINF:4.0,\n{REF3}\n\
+             #EXTINF:4.0,\n{REF4}\n#EXTINF:4.0,\n{fifth}\n"
+        );
+
+        assert_eq!(
+            hls_live_prefetch_references(live.as_bytes(), None),
+            [REF2.to_string(), REF4.to_string(), fifth],
+            "a missing GAP body must not consume one of the three live prefetch slots"
+        );
+        assert_eq!(
+            hls_live_prefetch_references(live.as_bytes(), Some(REF)),
+            [REF.to_string(), REF2.to_string(), REF4.to_string()],
+            "once playback has a foreground cursor, prefetch must follow it instead of the edge"
+        );
+        assert!(hls_live_prefetch_references(b"not a manifest", None).is_empty());
+    }
+
+    #[test]
+    fn live_body_schedule_deduplicates_active_runways_and_retries_incomplete_ones() {
+        let old = [REF.to_string(), REF2.to_string(), REF3.to_string()];
+        let next = [REF2.to_string(), REF3.to_string(), REF4.to_string()];
+
+        assert!(!hls_live_body_schedule_should_spawn(
+            &old,
+            &[],
+            false,
+            false
+        ));
+        assert!(!hls_live_body_schedule_should_spawn(
+            &old, &old, true, false
+        ));
+        assert!(!hls_live_body_schedule_should_spawn(
+            &old, &old, false, true
+        ));
+        assert!(hls_live_body_schedule_should_spawn(
+            &old, &old, false, false
+        ));
+        assert!(hls_live_body_schedule_should_spawn(
+            &old, &next, true, false
+        ));
+        assert!(!hls_live_body_schedule_should_spawn(
+            &old, &next, true, true
+        ));
+    }
+
+    #[test]
+    fn live_startup_holds_generation_only_during_open_pre_sustained_admission() {
+        for live_start in [false, true] {
+            for body_admission_open in [false, true] {
+                for mode in [
+                    HlsPrefetchMode::Inactive,
+                    HlsPrefetchMode::StartupOnly,
+                    HlsPrefetchMode::Sustained,
+                ] {
+                    for timeline_rebasing in [false, true] {
+                        assert_eq!(
+                            hls_live_startup_holds_generation(
+                                live_start,
+                                body_admission_open,
+                                mode,
+                                timeline_rebasing,
+                            ),
+                            live_start
+                                && body_admission_open
+                                && mode != HlsPrefetchMode::Sustained
+                                && !timeline_rebasing,
+                            "live={live_start}, admission_open={body_admission_open}, \
+                             mode={mode:?}, rebasing={timeline_rebasing}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn startup_runway_replaces_only_the_owner_for_the_same_media_kind() {
         let mut active = HashMap::new();
 
@@ -1049,7 +1153,7 @@ mod hls {
     fn stopped_live_fallback_cuts_the_exact_failed_sn_and_remains_reloadable() {
         let repeated = format!("{:064x}", 99);
         let reference = |position: u64| {
-            if matches!(position, 2 | 10 | 18) {
+            if matches!(position, 2 | 16 | 18) {
                 repeated.clone()
             } else {
                 format!("{:064x}", position.saturating_add(1))
@@ -1065,12 +1169,12 @@ mod hls {
 
         let (boundary_sequence, boundary_reference) =
             hls_live_retreat_boundary(manifest.as_bytes(), 18, &repeated).unwrap();
-        assert_eq!(boundary_sequence, 14);
-        assert_eq!(boundary_reference, reference(14));
+        assert_eq!(boundary_sequence, 18);
+        assert_eq!(boundary_reference, reference(18));
         assert_eq!(
             hls_live_retreat_boundary(manifest.as_bytes(), 21, &reference(21)),
-            Some((14, reference(14))),
-            "seven playable 4s tail segments must not exclude a missing final segment"
+            Some((19, reference(19))),
+            "the three-segment tail retains its two-segment startup preroll"
         );
         let first_retreat = truncate_hls_live_before_segment(
             manifest.as_bytes(),
@@ -1079,12 +1183,12 @@ mod hls {
         )
         .unwrap();
         assert_eq!(hls_media_sequence(&first_retreat), Some(0));
-        assert_eq!(hls_media_references(&first_retreat).len(), 14);
+        assert_eq!(hls_media_references(&first_retreat).len(), 18);
         assert_eq!(hls_media_references(&first_retreat)[2], repeated);
 
         let (boundary_sequence, boundary_reference) =
-            hls_live_retreat_boundary(&first_retreat, 10, &repeated).unwrap();
-        assert_eq!(boundary_sequence, 6);
+            hls_live_retreat_boundary(&first_retreat, 16, &repeated).unwrap();
+        assert_eq!(boundary_sequence, 15);
         let second_retreat = present_hls_live_fallback(
             manifest.as_bytes(),
             boundary_sequence,
@@ -1092,8 +1196,8 @@ mod hls {
             22,
         )
         .unwrap();
-        assert_eq!(hls_media_references(&second_retreat).len(), 6);
-        let last_retained = reference(5);
+        assert_eq!(hls_media_references(&second_retreat).len(), 15);
+        let last_retained = reference(14);
         assert_eq!(
             hls_media_references(&second_retreat)
                 .last()
@@ -1117,7 +1221,7 @@ mod hls {
         )
         .unwrap();
         assert!(rewritten.contains("#EXT-X-PLAYLIST-TYPE:EVENT"));
-        assert!(rewritten.contains("#EXT-X-START:TIME-OFFSET=-24"));
+        assert!(rewritten.contains("#EXT-X-START:TIME-OFFSET=-12"));
         assert!(!rewritten.contains("#EXT-X-ENDLIST"));
 
         let advanced_source = format!(
@@ -1143,27 +1247,27 @@ mod hls {
             .unwrap()
         );
         let advanced_text = String::from_utf8(advanced.clone()).unwrap();
-        assert_eq!(advanced_text.matches("#EXT-X-GAP").count(), 16);
+        assert_eq!(advanced_text.matches("#EXT-X-GAP").count(), 7);
         assert_eq!(advanced_text.matches("#EXT-X-VERSION:").count(), 1);
         assert!(advanced_text.contains("#EXT-X-VERSION:8\n"));
         assert_eq!(
             hls_media_references(&advanced),
-            (0..6).chain(22..24).map(reference).collect::<Vec<_>>()
+            (0..15).chain(22..24).map(reference).collect::<Vec<_>>()
         );
         assert!(!hls_is_finalized(&advanced));
 
         let finalized_source = format!("{manifest}#EXT-X-ENDLIST\n");
         assert_eq!(
-            hls_live_retreat_boundary(finalized_source.as_bytes(), 13, &reference(13)),
-            Some((13, reference(13))),
+            hls_live_retreat_boundary(finalized_source.as_bytes(), 18, &reference(18)),
+            Some((18, reference(18))),
             "a settled hls.js priming-fragment failure just before the nominal tail is exact evidence"
         );
         assert_eq!(
-            hls_live_retreat_boundary(finalized_source.as_bytes(), 12, &reference(12)),
-            Some((12, reference(12)))
+            hls_live_retreat_boundary(finalized_source.as_bytes(), 17, &reference(17)),
+            Some((17, reference(17)))
         );
         assert_eq!(
-            hls_live_retreat_boundary(finalized_source.as_bytes(), 11, &reference(11)),
+            hls_live_retreat_boundary(finalized_source.as_bytes(), 16, &reference(16)),
             None,
             "a finalized fallback must remain bounded to the tail plus its startup preroll"
         );
@@ -1180,7 +1284,7 @@ mod hls {
                 .unwrap()
                 .matches("#EXT-X-GAP")
                 .count(),
-            16
+            7
         );
         let rewritten_finalized = rewrite_hls_manifest_for_live_reload(
             &finalized,
@@ -2258,7 +2362,7 @@ mod hls {
 
     #[test]
     fn provisional_historical_endlist_stays_reloadable_until_the_head_is_confirmed() {
-        assert_eq!(HLS_LIVE_SYNC_SEGMENTS, 8);
+        assert_eq!(HLS_LIVE_SYNC_SEGMENTS, 3);
         let historical = format!(
             "#EXTM3U\r\n#EXT-X-PLAYLIST-TYPE: VOD  \r\n#EXT-X-MEDIA-SEQUENCE:35\r\n\
              #EXTINF:2.0,\r\nhttps://swarm.beebridge.buzz/read/bytes/{REF}\r\n\
@@ -2338,7 +2442,7 @@ mod hls {
     }
 
     #[test]
-    fn live_reload_starts_eight_segments_behind_the_current_edge() {
+    fn live_reload_starts_three_segments_behind_the_current_edge() {
         let segments = [1.0, 1.5, 2.0, 2.5, 1.0, 1.5, 2.0, 2.5, 1.0, 1.5]
             .into_iter()
             .enumerate()
@@ -2363,8 +2467,8 @@ mod hls {
         assert!(rewritten.contains("#EXT-X-PLAYLIST-TYPE:EVENT"));
         assert!(rewritten.contains("#EXT-X-MEDIA-SEQUENCE:35"));
         assert_eq!(rewritten.matches("#EXT-X-START:").count(), 1);
-        assert!(rewritten.contains("#EXT-X-START:TIME-OFFSET=-14,PRECISE=NO"));
-        assert_eq!(hls_live_tail(live.as_bytes()), Some((2, 14.0)));
+        assert!(rewritten.contains("#EXT-X-START:TIME-OFFSET=-5,PRECISE=NO"));
+        assert_eq!(hls_live_tail(live.as_bytes()), Some((7, 5.0)));
         assert!(!rewritten.contains("TIME-OFFSET=42"));
         assert!(!rewritten.contains("TIME-OFFSET=-6"));
         assert!(!rewritten.contains("#EXT-X-ENDLIST"));
@@ -2442,7 +2546,7 @@ mod hls {
             .unwrap(),
         )
         .unwrap();
-        assert!(live.contains("#EXT-X-START:TIME-OFFSET=-16,PRECISE=NO"));
+        assert!(live.contains("#EXT-X-START:TIME-OFFSET=-6,PRECISE=NO"));
         assert!(!live.contains("TIME-OFFSET=0"));
         assert!(hls_is_finalized(live.as_bytes()));
 
@@ -2901,6 +3005,19 @@ mod hls {
         assert_eq!(dense.last(), Some(&3_816));
         assert!(!dense.contains(&3_807));
         assert!(!dense.contains(&3_817));
+    }
+
+    #[test]
+    fn sequence_zero_live_followup_probes_the_three_segment_frontier() {
+        assert_eq!(
+            plan_hls_sequence_zero_live_followup(40),
+            Some(vec![41, 42, 43])
+        );
+        assert_eq!(plan_hls_sequence_zero_live_followup(u64::MAX), None);
+        assert_eq!(
+            plan_hls_sequence_zero_live_followup(u64::MAX - 3),
+            Some(vec![u64::MAX - 2, u64::MAX - 1, u64::MAX])
+        );
     }
 
     #[test]
@@ -4462,9 +4579,17 @@ mod service_worker {
         assert!(loader_start < worker_ready);
         assert!(lifecycle < worker_ready && lifecycle < snapshot);
         assert!(worker_ready < overlap && snapshot < overlap && overlap < play);
-        assert!(
-            attach.contains("play_hls(player, &source, hls_loader, start, beginning_prefix_stamp)")
-        );
+        let play_call = &attach[play..attach[play..].find(".await").unwrap() + play];
+        for argument in [
+            "player",
+            "&source",
+            "hls_loader",
+            "start",
+            "beginning_prefix_stamp",
+            "presentation_id",
+        ] {
+            assert!(play_call.contains(argument), "missing {argument}");
+        }
         assert!(!attach.contains("autoplay_deadline"));
         assert!(!attach.contains("hls_feed_payload_at_index_bounded("));
         assert!(!attach.contains("join(current, bootstrap).await"));
@@ -4924,6 +5049,7 @@ mod service_worker {
         assert!(evidence.contains("active_hls_live_snapshot_index()"));
         assert!(evidence.contains("hls_live_tail_fallback_segment"));
         assert!(evidence.contains("session.live_tail_failures"));
+        assert!(evidence.contains("session.live_startup_runway = None"));
         assert!(evidence.contains("hls_finalized_edge_load_target("));
         assert!(evidence.contains("if !session.codec_bootstrap_completed"));
         assert!(!evidence.contains("!session.codec_continuation_open"));
@@ -4999,13 +5125,14 @@ mod service_worker {
         assert!(install.contains("HLS_LIVE_TAIL_FALLBACK_MAX_HIDDEN_SECONDS"));
         assert!(install.contains("snapshot.index != expected_snapshot_index"));
         assert!(!install.contains("|| snapshot.finalized"));
-        let fallback_state = install
-            .find("playback.session.live_tail_fallback = Some")
+        let clear_startup_runway = install
+            .find("session.clear_live_startup_body_runway()")
             .unwrap();
+        let fallback_state = install.find("session.live_tail_fallback = Some").unwrap();
         let reopen = install
             .find("current.phase = HlsCodecBootstrapPhase::ContinuationOpen")
             .unwrap();
-        assert!(fallback_state < reopen);
+        assert!(clear_startup_runway < fallback_state && fallback_state < reopen);
         assert!(!install.contains("reset_hls_codec_bootstrap"));
         assert!(!install.contains("reset_hls_prefetch_timeline_plans"));
         assert!(!install.contains("clear_hls_progressive_range_owners"));
@@ -5581,14 +5708,19 @@ mod service_worker {
             "fn restart_position(&self)",
             "fn remember_current_position",
         );
-        let live = restart
-            .find("if let Some(position) = self.live_retarget.load_position()")
+        let live = restart.find("match self.live_retarget").unwrap();
+        let edge = restart[live..]
+            .find("target.startup_position(self.live_startup_runway.as_ref())")
+            .unwrap()
+            + live;
+        let runway = restart
+            .find("if self.live_startup_runway_required")
             .unwrap();
-        let edge = restart[live..].find("return position").unwrap() + live;
+        let runway_target = restart[runway..].find("return runway.target").unwrap() + runway;
         let saved = restart
             .find("if let Some(position) = self.resume_position")
             .unwrap();
-        assert!(live < edge && edge < saved);
+        assert!(live < edge && edge < runway && runway < runway_target && runway_target < saved);
 
         let manifest = source_between(
             HLS_PLAYER,
@@ -5609,8 +5741,15 @@ mod service_worker {
         assert!(autoplay_gate.contains("LiveRetarget::AwaitingFallback(_)"));
         assert!(autoplay_gate.contains("LiveRetarget::AwaitingTarget(retarget)"));
         assert!(autoplay_gate.contains("hls_live_retarget_target("));
-        assert!(autoplay_gate.contains("Some(retarget.position())"));
-        assert!(autoplay_gate.contains("None,\n                            None,"));
+        assert!(autoplay_gate.contains("retarget.startup_position(live_startup_runway)"));
+        let edge_target = source_between(
+            autoplay_gate,
+            "LiveRetarget::AwaitingTarget(retarget)",
+            "LiveRetarget::Inactive",
+        );
+        assert_eq!(edge_target.matches("None,").count(), 2);
+        assert!(autoplay_gate.contains("session.live_startup_runway_required"));
+        assert!(autoplay_gate.contains("hls_live_autoplay_runway_ready("));
         assert!(!autoplay_gate.contains("session.live_retarget = LiveRetarget::Inactive"));
         assert!(
             autoplay_gate
@@ -5621,26 +5760,117 @@ mod service_worker {
                     .unwrap()
         );
 
-        let dom = source_between(HLS_PLAYER, "fn dom_event(", "fn handle_error(");
-        assert!(
-            dom.contains("if user && (session.codec_pending || session.live_retarget.pending())")
+        let level = source_between(HLS_PLAYER, "fn level_loaded(", "fn dom_event(");
+        assert!(level.contains("live_level_autoplay_runway(&details)"));
+        let runway_lock = source_between(
+            level,
+            "let mut startup_restart = None",
+            "if !classify_hls_level_transition(",
         );
+        let continuation = runway_lock
+            .find("session.live_retarget = LiveRetarget::AwaitingTarget(target)")
+            .unwrap();
+        let lock = runway_lock
+            .find("if session.live_startup_runway_required")
+            .unwrap();
+        assert!(continuation < lock);
+        assert!(runway_lock.contains("session.live_startup_runway.is_none()"));
+        assert!(runway_lock.contains("session.play_attempt.is_none()"));
+        assert!(runway_lock.contains("LiveRetarget::Inactive | LiveRetarget::AwaitingTarget(_)"));
+        assert!(runway_lock.contains("session.live_startup_runway = Some(candidate)"));
+        assert!(
+            runway_lock.contains("Some((session.presentation_id, candidate.references.clone()))")
+        );
+        assert!(runway_lock.contains("LiveRetargetTarget::Edge(_)"));
+        assert!(runway_lock.contains("session.manifest_parsed"));
+        assert!(runway_lock.contains("startup_restart = session"));
+        let startup_restart = source_between(
+            level,
+            "if let Some((media, hls, target)) = startup_restart",
+            "if let Some(intent) = gate",
+        );
+        assert!(startup_restart.contains("hls.stop_load()"));
+        assert!(startup_restart.contains("media.set_current_time(target)"));
+        assert!(startup_restart.contains("start_at(epoch, &hls, target)"));
+        assert!(level.contains("live_startup_runway: None"));
+
+        let retarget = source_between(
+            HLS_PLAYER,
+            "impl LiveRetargetTarget {",
+            "enum LiveRetarget {",
+        );
+        assert!(retarget.contains("(Self::Edge(_), Some(runway)) => runway.target"));
+        assert!(retarget.contains("Self::Resume(position)"));
+
+        let dom = source_between(HLS_PLAYER, "fn dom_event(", "fn handle_error(");
+        assert!(dom.contains("|| session.live_startup_runway_required"));
         assert!(dom.contains("start_autoplay_buffer_gate(epoch, Autoplay::Resume)"));
 
         let recovery = source_between(HLS_PLAYER, "Recovery::Hard(wait", "Recovery::Stop(");
         assert!(recovery.contains("live_retarget: if session.codec_required"));
         assert!(recovery.contains("LiveRetarget::Inactive"));
+        assert!(
+            recovery.contains("live_startup_runway_required: session.live_startup_runway_required")
+        );
+        assert!(recovery.contains("live_startup_runway: session.live_startup_runway.clone()"));
         let session = source_between(HLS_PLAYER, "fn session_from(", "fn install_session(");
         assert!(session.contains("request.live_retarget"));
-        assert!(session.contains("matches!(&backend, Backend::Hls(_))"));
+        assert!(session.contains("let hls_backend = matches!(&backend, Backend::Hls(_))"));
+        assert!(session.contains("hls_backend && request.live_startup_runway_required"));
+        assert!(session.contains("request.live_startup_runway_required"));
+        assert!(session.contains("request.live_startup_runway.clone()"));
+        assert!(session.contains("presentation_id: request.presentation_id"));
+
+        let player_session = source_between(HLS_PLAYER, "struct Session {", "struct Player {");
+        let launch = source_between(HLS_PLAYER, "struct Launch {", "enum EventKind {");
+        assert!(player_session.contains("presentation_id: u64"));
+        assert!(launch.contains("presentation_id: u64"));
+        assert_eq!(
+            HLS_PLAYER
+                .matches("presentation_id: session.presentation_id")
+                .count(),
+            2,
+            "timeline and hard relaunches must retain the presentation owner"
+        );
+        assert!(level.contains("lock_hls_live_startup_body_runway(presentation_id, references)"));
+
+        let runtime_lock = source_between(
+            HLS_PLAYER,
+            "pub(super) fn lock_hls_live_startup_body_runway(",
+            "pub(super) fn unlock_hls_live_startup_body_runway(",
+        );
+        let runtime_unlock = source_between(
+            HLS_PLAYER,
+            "pub(super) fn unlock_hls_live_startup_body_runway(",
+            "fn activate_hls_prefetch_warmup(",
+        );
+        for contract in [runtime_lock, runtime_unlock] {
+            assert!(contract.contains("expected_presentation_id: u64"));
+            let nonzero = contract.find("expected_presentation_id == 0").unwrap();
+            let owner = contract
+                .find("session.presentation_id != expected_presentation_id")
+                .unwrap();
+            let mutation = contract.find("session.live_startup_body_runway").unwrap();
+            assert!(nonzero < owner && owner < mutation);
+        }
+        let errors = source_between(HLS_PLAYER, "fn handle_error(", "fn hard_recovery(");
+        let hard = source_between(HLS_PLAYER, "fn hard_recovery(", "fn start_at(");
+        assert!(errors.contains("unlock_hls_live_startup_body_runway(presentation_id)"));
+        assert!(hard.contains("unlock_hls_live_startup_body_runway(presentation_id)"));
+
+        let autoplay = source_between(HLS_PLAYER, "fn autoplay(", "fn set_state(");
+        let authorize = autoplay.find("session.playback_authorized = true").unwrap();
+        let release = autoplay
+            .find("session.live_startup_runway_required = false")
+            .unwrap();
+        assert!(authorize < release);
+        assert!(autoplay.contains("session.live_startup_runway = None"));
     }
 
     #[test]
     fn codec_bootstrap_defers_explicit_play_until_same_token_level_barrier() {
         let dom = source_between(HLS_PLAYER, "fn dom_event(", "fn handle_error(");
-        let defer = dom
-            .find("if user && (session.codec_pending || session.live_retarget.pending())")
-            .unwrap();
+        let defer = dom.find("&& (session.codec_pending").unwrap();
         let remember = dom[defer..].find("session.resume = true").unwrap() + defer;
         let pause = dom.find("let _ = media.pause()").unwrap();
         let gate = dom
@@ -5819,7 +6049,23 @@ mod service_worker {
         assert!(generation_advance.contains("self.startup_overlap_plans.clear();"));
         assert!(!generation_advance.contains("startup_runway_ready"));
         assert!(!timeline_advance.contains("startup_runway_ready"));
-        assert!(generation_advance.contains("HLS_SERIAL_PREFETCH_COMPLETIONS.saturating_sub(1)"));
+        assert!(generation_advance.contains("self.clear_live_startup_body_runway();"));
+        assert!(timeline_advance.contains("self.clear_live_startup_body_runway();"));
+        assert!(timeline_advance.contains("fn clear_live_startup_body_runway("));
+        assert!(timeline_advance.contains("self.live_startup_body_runway = None;"));
+        assert!(timeline_advance.contains("self.invalidate_live_body_schedule();"));
+        assert!(timeline_advance.contains(
+            "self.live_body_schedule_id = next_nonzero_generation(self.live_body_schedule_id);"
+        ));
+        assert!(timeline_advance.contains("self.live_body_schedule_running = false;"));
+        assert!(timeline_advance.contains("self.live_body_runway.clear();"));
+        assert!(timeline_advance.contains("fn claim_live_body_schedule("));
+        assert!(timeline_advance.contains("hls_live_body_schedule_should_spawn("));
+        assert!(timeline_advance.contains("fn live_body_schedule_current("));
+        assert!(timeline_advance.contains("&& self.live_body_runway == runway"));
+        assert!(timeline_advance.contains("fn finish_live_body_schedule("));
+        assert!(timeline_advance.contains("self.live_body_schedule_id == schedule_id"));
+        assert!(generation_advance.contains("HLS_TWO_BODY_PREFETCH_COMPLETIONS"));
         assert!(!timeline_advance.contains("self.completed_media_payloads = 0;"));
         let session_start = source_between(
             HLS_PLAYER,
@@ -5830,11 +6076,13 @@ mod service_worker {
         assert!(!HLS_PLAYER.contains("hls_startup_runway_ready"));
         assert!(!HLS_PLAYER.contains("startup_runway_ready_plans"));
         assert!(!HLS_PLAYER.contains("startup_runway_plans"));
-        assert!(HLS_PLAYER.contains("const HLS_EXACT_NEXT_OVERLAP_SEGMENTS: usize = 2;"));
+        assert!(HLS_PLAYER.contains(
+            "const HLS_EXACT_NEXT_OVERLAP_SEGMENTS: usize = HLS_LIVE_SYNC_SEGMENTS - 1;"
+        ));
 
         let cache = source_between(HLS_PLAYER, "fn load_role(", "fn finish_load(");
         assert!(cache.contains(".filter(|pending| pending.generation == generation)"));
-        assert!(cache.contains("if prefetch"));
+        assert!(cache.contains("if enforce_capacity"));
         assert!(cache.contains(">= prefetch_limit"));
         assert!(!cache.contains("pending.speculative"));
 
@@ -5896,6 +6144,17 @@ mod service_worker {
         assert!(buffered.contains("!session.media.paused()"));
         assert!(buffered.contains("!session.autoplay_gate_pending"));
 
+        let level_loaded = source_between(HLS_PLAYER, "fn level_loaded(", "fn dom_event(");
+        let startup_runway_lock = source_between(
+            level_loaded,
+            "if session.live_startup_runway_required",
+            "if !classify_hls_level_transition(",
+        );
+        assert!(
+            startup_runway_lock.contains("&& !session.codec_pending"),
+            "live runway retargeting must not abort an in-flight codec bootstrap"
+        );
+
         let plans = source_between(
             HLS_PLAYER,
             "fn remember_hls_media_plan(",
@@ -5943,6 +6202,249 @@ mod service_worker {
             "fn activate_hls_prefetch_warmup(",
         );
         assert!(mode_transition.contains("hls_progressive_runway_closed_after_mode("));
+    }
+
+    #[test]
+    fn live_foreground_generation_hold_invalidates_only_the_selected_plan() {
+        let foreground = source_between(
+            HLS_PLAYER,
+            "fn hls_foreground_context(",
+            "fn hls_generation_current(",
+        );
+        let discontinuity = source_between(
+            foreground,
+            "if transition.is_some_and(|transition| transition.0) || runway_discontinuity {",
+            "if !session.tracks.contains_key(&cursor.plan.id)",
+        );
+        let owner_handoff = discontinuity
+            .find("progressive_owner_handoff = true")
+            .unwrap();
+        let hold_predicate = discontinuity
+            .find("let hold_generation = hls_live_startup_holds_generation(")
+            .unwrap();
+        let held = source_between(discontinuity, "if hold_generation {", "} else {");
+        let normal = discontinuity.split_once("} else {").unwrap().1;
+        let bump = held
+            .find("session.schedule_sequence =\n                            next_nonzero_generation(session.schedule_sequence)")
+            .unwrap();
+        let replacement = held.find("track.schedule_id = schedule_id").unwrap();
+        let cancel = held.find("track.running = None").unwrap();
+        let overlap = held
+            .find("session.startup_overlap_plans.remove(&cursor.plan.id)")
+            .unwrap();
+        let seek_successor = normal.find("seek_successor = cursor").unwrap();
+        let advance = normal
+            .find("let generation = session.advance_generation()")
+            .unwrap();
+        let publish_capture = normal.find("publish = session").unwrap();
+        assert!(owner_handoff < hold_predicate);
+        assert!(bump < replacement && replacement < cancel && cancel < overlap);
+        assert!(seek_successor < advance && advance < publish_capture);
+        for argument in [
+            "session.live_start",
+            "session.live_body_admission_open",
+            "session.mode",
+            "session.timeline_rebasing",
+        ] {
+            assert!(
+                discontinuity[hold_predicate..].contains(argument),
+                "generation hold is missing {argument}"
+            );
+        }
+        assert!(!held.contains("seek_successor ="));
+        assert!(!held.contains("session.advance_generation()"));
+        assert!(!held.contains("publish ="));
+        assert!(!normal.contains("session.schedule_sequence"));
+        assert!(!normal.contains("track.running = None"));
+        assert!(!normal.contains("startup_overlap_plans.remove"));
+        assert_eq!(normal.matches("session.advance_generation()").count(), 1);
+        assert_eq!(normal.matches("publish = session").count(), 1);
+        assert_eq!(
+            foreground.matches("publish_hls_stream_generation(").count(),
+            1
+        );
+
+        let payload_start = source_between(
+            HLS_PLAYER,
+            "fn start_hls_payload_load(",
+            "async fn wait_hls_payload_load(",
+        );
+        let live_startup = payload_start.find("let live_startup =").unwrap();
+        let base_limit = payload_start[live_startup..]
+            .find("let mut limit = session.body_parallelism(generation)")
+            .unwrap()
+            + live_startup;
+        let foreground_reservation = payload_start[base_limit..]
+            .find("if prefetch && live_startup {")
+            .unwrap()
+            + base_limit;
+        let capacity = payload_start[foreground_reservation..]
+            .find("prefetch || live_startup")
+            .unwrap()
+            + foreground_reservation;
+        let cache_admission = payload_start[capacity..]
+            .find(".load_role(&reference, prefetch, enforce_capacity, generation, limit)")
+            .unwrap()
+            + capacity;
+        assert!(live_startup < base_limit && base_limit < foreground_reservation);
+        assert!(foreground_reservation < capacity && capacity < cache_admission);
+        assert!(payload_start.contains("session.mode != HlsPrefetchMode::Sustained"));
+        assert!(
+            payload_start.contains("limit.min(HLS_PREFETCH_BODY_MAX_PARALLEL.saturating_sub(1))")
+        );
+        assert!(HLS_PLAYER.contains("const HLS_PREFETCH_BODY_MAX_PARALLEL: usize = 3;"));
+
+        let lock = source_between(
+            HLS_PLAYER,
+            "pub(super) fn lock_hls_live_startup_body_runway(",
+            "pub(super) fn unlock_hls_live_startup_body_runway(",
+        );
+        let exact_pin = lock
+            .find("session.live_startup_body_runway = Some(references.clone())")
+            .unwrap();
+        let exact_schedule = lock
+            .find("start_hls_live_body_runway_schedule(client, stamp, references)")
+            .unwrap();
+        assert!(exact_pin < exact_schedule);
+
+        let admission_mode = source_between(
+            HLS_PLAYER,
+            "fn hls_live_body_admission_mode(",
+            "async fn fetch_hls_bytes_response(",
+        );
+        for guard in [
+            "session.live_start",
+            "session.live_body_admission_open",
+            "session.generation == generation",
+            "!session.timeline_rebasing",
+        ] {
+            assert!(admission_mode.contains(guard), "missing {guard}");
+        }
+        assert!(admission_mode.contains(".then_some(session.mode)"));
+
+        let foreground_admission = source_between(
+            HLS_PLAYER,
+            "async fn admit_hls_foreground_payload_load(",
+            "async fn retrieve_hls_payload_for_playback(",
+        );
+        let at_capacity = foreground_admission
+            .find("if !matches!(&role, HlsPayloadLoadRole::AtCapacity)")
+            .unwrap();
+        let recheck = foreground_admission
+            .find("hls_live_body_admission_mode(generation)")
+            .unwrap();
+        let wait = foreground_admission
+            .find("Some(HlsPrefetchMode::Inactive | HlsPrefetchMode::StartupOnly)")
+            .unwrap();
+        let sleep = foreground_admission[wait..]
+            .find("async_std::task::sleep(Duration::from_millis(25)).await")
+            .unwrap()
+            + wait;
+        let sustained = foreground_admission
+            .find("Some(HlsPrefetchMode::Sustained) => {}")
+            .unwrap();
+        let stale = foreground_admission.find("None => return None").unwrap();
+        assert!(at_capacity < recheck && recheck < wait && wait < sleep);
+        assert!(sleep < sustained && sustained < stale);
+        assert!(!foreground_admission[sustained..stale].contains("sleep"));
+        assert!(!foreground_admission[sustained..stale].contains("break"));
+        assert_eq!(foreground_admission.matches("return None").count(), 1);
+        assert!(!foreground_admission.contains("HLS_FOREGROUND_MAX_ATTEMPTS"));
+        assert!(!foreground_admission.contains("attempts"));
+        assert!(!foreground_admission.contains("retry_limit"));
+        assert!(!foreground_admission.contains("deadline"));
+
+        let retrieve = source_between(
+            HLS_PLAYER,
+            "async fn retrieve_hls_payload_for_playback(",
+            "async fn resolve_hls_asset(",
+        );
+        assert_eq!(
+            retrieve
+                .matches("admit_hls_foreground_payload_load(")
+                .count(),
+            2,
+            "initial and every post-error foreground admission must share the capacity gate"
+        );
+        let initial_admission = retrieve.find("admit_hls_foreground_payload_load(").unwrap();
+        let initial_wait = retrieve[initial_admission..]
+            .find("let mut body = wait_hls_payload_load(foreground).await")
+            .unwrap()
+            + initial_admission;
+        let attempts = retrieve[initial_wait..]
+            .find("let mut attempts = 1")
+            .unwrap()
+            + initial_wait;
+        let retry_loop = retrieve[attempts..].find("while body.is_err()").unwrap() + attempts;
+        let retry_admission = retrieve[retry_loop..]
+            .find("admit_hls_foreground_payload_load(")
+            .unwrap()
+            + retry_loop;
+        let retry_wait = retrieve[retry_admission..]
+            .find("body = wait_hls_payload_load(foreground).await")
+            .unwrap()
+            + retry_admission;
+        let consume_attempt = retrieve[retry_wait..].find("attempts += 1").unwrap() + retry_wait;
+        assert!(initial_admission < initial_wait && initial_wait < attempts);
+        assert!(attempts < retry_loop && retry_loop < retry_admission);
+        assert!(retry_admission < retry_wait && retry_wait < consume_attempt);
+        assert_eq!(retrieve.matches("attempts += 1").count(), 1);
+        assert!(retrieve.contains("attempts < HLS_FOREGROUND_MAX_ATTEMPTS"));
+
+        let retry_current = source_between(
+            HLS_PLAYER,
+            "fn hls_foreground_retry_is_current(",
+            "fn hls_monotonic_now_ms(",
+        );
+        assert!(retry_current.contains("session.stamp() == stamp"));
+        assert!(retry_current.contains("!session.timeline_rebasing"));
+        assert!(retry_current.contains("session.mode != HlsPrefetchMode::Inactive"));
+        assert!(retry_current.contains("session.live_start && session.live_body_admission_open"));
+
+        let session_start = source_between(
+            HLS_PLAYER,
+            "fn begin_hls_prefetch_session(",
+            "fn remember_authenticated_hls_startup_prefix(",
+        );
+        let live = session_start
+            .find("session.live_start = live_start")
+            .unwrap();
+        let prewarmup_admission = session_start[live..]
+            .find("session.live_body_admission_open = live_start")
+            .unwrap()
+            + live;
+        let prewarmup_inactive = session_start[prewarmup_admission..]
+            .find("session.mode = HlsPrefetchMode::Inactive")
+            .unwrap()
+            + prewarmup_admission;
+        assert!(live < prewarmup_admission && prewarmup_admission < prewarmup_inactive);
+
+        let mode_transition = source_between(
+            HLS_PLAYER,
+            "fn set_hls_prefetch_mode(",
+            "fn activate_hls_prefetch_warmup(",
+        );
+        assert!(
+            mode_transition
+                .contains("session.live_body_admission_open = mode != HlsPrefetchMode::Inactive")
+        );
+        let set_mode = mode_transition.find("session.mode = mode").unwrap();
+        let set_admission = mode_transition
+            .find("session.live_body_admission_open = mode != HlsPrefetchMode::Inactive")
+            .unwrap();
+        assert!(set_mode < set_admission);
+
+        let lifecycle = source_between(
+            HLS_PLAYER,
+            "fn install_hls_prefetch_lifecycle(",
+            "pub(crate) fn release_hls_view(",
+        );
+        let explicit_pause =
+            source_between(lifecycle, "let explicit_pause_callback", "let play_player");
+        let detached_pause =
+            source_between(lifecycle, "let pause_callback", "// Ignore generic seeking");
+        assert!(explicit_pause.contains("set_hls_prefetch_mode(HlsPrefetchMode::Inactive)"));
+        assert!(detached_pause.contains("set_hls_prefetch_mode(HlsPrefetchMode::Inactive)"));
     }
 
     #[test]
@@ -6099,22 +6601,57 @@ mod service_worker {
             "fn prefetch_live_snapshot_start(",
             "async fn await_live_frontier_snapshot(",
         );
+        let live_body_scheduler = source_between(
+            HLS_PLAYER,
+            "fn start_hls_live_body_runway_schedule(",
+            "fn prefetch_live_snapshot_start(",
+        );
         assert!(live_prefetch.contains("hls_live_tail(&snapshot.body)"));
         assert!(live_prefetch.contains("session.live_start && session.stamp() == stamp"));
+        assert!(live_prefetch.contains("session.mode == HlsPrefetchMode::Sustained"));
         assert_eq!(
             live_prefetch
                 .matches("start_hls_shared_prefix_warmup(")
                 .count(),
-            2
+            1
         );
-        assert!(!live_prefetch.contains("start_hls_payload_load("));
-        assert!(live_prefetch.contains(".take(HLS_PREFETCH_BODY_MAX_PARALLEL)"));
-        let tail_prefetch = live_prefetch.find(".skip(start)").unwrap();
+        assert!(live_prefetch.contains(
+            "hls_live_prefetch_references(&snapshot.body, foreground_reference.as_deref())"
+        ));
+        assert!(live_prefetch.contains("session.live_startup_body_runway.clone()"));
+        assert!(live_prefetch.contains("locked_body_runway.unwrap_or_else"));
+        assert!(live_prefetch.contains("start_hls_live_body_runway_schedule("));
+        assert!(live_body_scheduler.contains("let body_runway_ready = !body_runway.is_empty()"));
+        assert!(live_body_scheduler.contains("claim_live_body_schedule("));
+        assert!(live_body_scheduler.contains("let Some(schedule_id) = schedule_id"));
+        assert!(live_body_scheduler.contains("spawn_local(async move"));
+        assert!(live_body_scheduler.contains("let mut stagger_next_leader = false"));
+        assert!(live_body_scheduler.contains("HLS_NEXT_RESERVE_STAGGER"));
+        assert!(live_body_scheduler.contains("live_body_schedule_current("));
+        assert!(live_body_scheduler.contains("finish_live_body_schedule(stamp, schedule_id)"));
+        assert!(live_body_scheduler.contains("hls_payload_body_cached(reference)"));
+        assert!(live_body_scheduler.contains("'runway: loop"));
+        assert!(
+            live_body_scheduler
+                .matches("hls_payload_body_ready_or_joinable(&reference, stamp.generation)")
+                .count()
+                >= 2,
+            "a failed pending runway body must become eligible for admission again"
+        );
+        assert!(!live_prefetch.contains("session.live_body_runway.contains(&reference)"));
+        assert!(live_body_scheduler.contains("start_hls_payload_load("));
+        assert!(live_body_scheduler.contains("weeb3.clone()"));
+        assert!(live_body_scheduler.contains("matches!(&role, HlsPayloadLoadRole::Lead(_, _))"));
+        assert!(live_body_scheduler.contains("HlsPayloadLoadRole::AtCapacity =>"));
+        assert!(live_body_scheduler.contains("Duration::from_millis(25)"));
+        assert!(live_body_scheduler.contains("HlsPayloadLoadRole::Reject(_) => break 'runway"));
+        assert!(live_prefetch.contains(".max_by_key(|(_, track)| track.last_touch)"));
+        assert!(live_prefetch.contains("runway.current().to_string()"));
+        let tail_prefetch = live_prefetch.find("let body_runway =").unwrap();
         let codec_prefetch = live_prefetch
             .find("hls_media_sequence(&snapshot.body) == Some(0)")
             .unwrap();
         assert!(tail_prefetch < codec_prefetch);
-        assert!(live_prefetch.contains("HLS_LIVE_PREFIX_WINDOW_COUNT"));
         assert!(live_prefetch[codec_prefetch..].contains("reference.clone(), stamp, 2"));
         let live_frontier = source_between(
             HLS_PLAYER,
@@ -6791,6 +7328,15 @@ mod service_worker {
             "async fn discover_sequence_zero_followup_head(",
             "fn commit_sequence_zero_followup(",
         );
+        let live_wave = sequence_zero_catchup
+            .find("plan_hls_sequence_zero_live_followup(initial_index)")
+            .unwrap();
+        let ordinary_return = sequence_zero_catchup.find("if !refresh_head {").unwrap();
+        let sparse_guard = sequence_zero_catchup
+            .find("checked_add(HLS_SPARSE_HISTORY_STRIDE)")
+            .unwrap();
+        assert!(live_wave < ordinary_return && ordinary_return < sparse_guard);
+        assert!(sequence_zero_catchup.contains("live_frontier_found"));
         assert!(sequence_zero_catchup.contains("plan_hls_sequence_zero_followup_recovery("));
         assert!(sequence_zero_catchup.contains("highest_appendable_sequence_zero_followup_head"));
         assert!(
@@ -6984,7 +7530,7 @@ mod service_worker {
         let tentative = source_between(
             catchup,
             "if seed.tentative_terminal {",
-            "let blocked_authenticated_evidence",
+            "if seed.scan_initialized && refresh_head {",
         );
         let confirm = tentative
             .find("confirm_tentative_sequence_zero_terminal(")
@@ -7019,9 +7565,7 @@ mod service_worker {
                     .unwrap()
         );
         assert!(tentative.contains("if !refresh_head"));
-        assert!(catchup.contains(
-            "if !refresh_head && !continuation_invocation && blocked_authenticated_evidence"
-        ));
+        assert!(!catchup.contains("blocked_authenticated_evidence"));
         assert!(catchup.contains("persist_sequence_zero_followup_observation("));
         assert!(catchup.contains(".max(seed.positive_ceiling)"));
 
@@ -7363,12 +7907,34 @@ mod hls_payload_cancellation {
         assert!(STREAM.contains("js_string_property(obj, \"streamToken\")"));
         assert!(STREAM.contains("stream_token.as_deref()"));
         assert!(response.contains("hls_range_body_fully_cached(&reference, &metadata)"));
+        let progressive_candidate = response
+            .find("let progressive_start = hls_progressive_media_candidate(&reference)")
+            .unwrap();
+        assert!(
+            response[progressive_candidate..]
+                .contains("&& !hls_live_complete_body_candidate(&reference)")
+        );
+        let pending_body_gate = response[progressive_candidate..]
+            .find("hls_payload_body_ready_or_joinable(&reference, generation)")
+            .unwrap()
+            + progressive_candidate;
+        let progressive_plan = response
+            .find("let context = hls_foreground_context")
+            .unwrap();
+        assert!(progressive_candidate < pending_body_gate && pending_body_gate < progressive_plan);
+        assert_eq!(
+            response
+                .matches("hls_payload_body_ready_or_joinable(&reference, generation)")
+                .count(),
+            2,
+            "the stream-open path must recheck after yielding to its size probe"
+        );
         assert!(HLS_STREAM.contains("let cached_backward ="));
         assert!(HLS_STREAM.contains("session.remember_progressive_replay(&reference)"));
 
         let planned = source_section(
             response,
-            "let progressive_context =",
+            "let progressive_generation =",
             "if method != \"HEAD\" && range.is_none() {",
         );
         assert!(planned.contains("start_hls_payload_size_probe("));
@@ -7563,6 +8129,7 @@ mod hls_payload_cancellation {
         assert!(ownership.contains(".take(1)"));
         assert!(ownership.contains("hls_aligned_range_cached("));
         assert!(ownership.contains("session.retired_startup_plans.clone()"));
+        assert!(ownership.contains("protected.extend(session.live_body_runway.iter().cloned())"));
         assert!(ownership.contains("HlsProgressiveRangeOwner { ticket, position }"));
         assert!(ownership.contains("owners.retain(|owner|"));
         assert!(ownership.contains("!protected.contains(*reference)"));
@@ -7942,9 +8509,11 @@ mod hls_payload_cancellation {
             "async fn open_hls_feed_view_generation(",
         );
         assert!(attach.contains("hls_prefix_stamp_for_feed(&weeb3, &owner, &topic)"));
-        assert!(
-            attach.contains("play_hls(player, &source, hls_loader, start, beginning_prefix_stamp)")
-        );
+        let play = attach.find("let mode = play_hls(").unwrap();
+        let play_call = &attach[play..attach[play..].find(".await").unwrap() + play];
+        for argument in ["beginning_prefix_stamp", "presentation_id"] {
+            assert!(play_call.contains(argument), "missing {argument}");
+        }
 
         let response = source_section(
             HLS_STREAM,
