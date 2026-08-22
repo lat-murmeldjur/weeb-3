@@ -41,8 +41,9 @@ mod hls {
         classify_hls_level_transition, classify_hls_sequence_zero_discovery,
         continue_hls_codec_bootstrap, extend_hls_sequence_zero_archive, gap_hls_segment_range,
         hls_autoplay_gate_ready, hls_autoplay_start_target, hls_beginning_prefix_admission,
-        hls_beginning_prefix_window_count, hls_beginning_raw_supply_admission,
-        hls_buffered_interval_covers, hls_codec_bootstrap_token, hls_contiguous_buffered_ahead,
+        hls_beginning_prefix_barrier_admission, hls_beginning_prefix_window_count,
+        hls_beginning_raw_supply_admission, hls_buffered_interval_covers,
+        hls_codec_bootstrap_token, hls_contiguous_buffered_ahead,
         hls_deferred_feed_completion_matches, hls_direct_archive_disposition,
         hls_dom_pause_is_explicit, hls_dom_play_is_explicit, hls_finalized_edge_load_target,
         hls_is_finalized, hls_is_long_sequence_zero_checkpoint, hls_last_playable_segment,
@@ -755,6 +756,24 @@ mod hls {
         assert_eq!(
             hls_beginning_prefix_admission(HlsBeginningPrefixPhase::Retired),
             HlsProgressiveRangeAdmission::Retire
+        );
+
+        assert_eq!(
+            hls_beginning_prefix_barrier_admission(true, false, HlsBeginningPrefixPhase::Retired,),
+            HlsProgressiveRangeAdmission::Admit,
+            "a Live follow-up must not inherit a retired beginning-only gate after rebasing",
+        );
+        assert_eq!(
+            hls_beginning_prefix_barrier_admission(false, false, HlsBeginningPrefixPhase::Ready,),
+            HlsProgressiveRangeAdmission::Retire,
+        );
+        assert_eq!(
+            hls_beginning_prefix_barrier_admission(
+                false,
+                true,
+                HlsBeginningPrefixPhase::AwaitForegroundZero,
+            ),
+            HlsProgressiveRangeAdmission::Park,
         );
     }
 
@@ -4067,8 +4086,8 @@ mod feed_followup {
 
     use stream_hls::{
         FEED_FOLLOWUP_BATCH_LIMIT, HLS_TERMINAL_CONFIRMATION_MIN_PRICED_PEERS,
-        cached_feed_should_refresh_head, hls_snapshot_is_terminal,
-        hls_terminal_peer_view_is_mature,
+        cached_feed_should_refresh_head, hls_prepared_live_history_is_terminal,
+        hls_snapshot_is_terminal, hls_terminal_peer_view_is_mature,
     };
 
     #[test]
@@ -4102,12 +4121,61 @@ mod feed_followup {
     }
 
     #[test]
+    fn prepared_live_history_only_finalizes_the_same_confirmed_head() {
+        assert!(!hls_prepared_live_history_is_terminal(true, false, 41, 41,));
+        assert!(!hls_prepared_live_history_is_terminal(true, true, 41, 42,));
+        assert!(!hls_prepared_live_history_is_terminal(false, true, 41, 41,));
+        assert!(hls_prepared_live_history_is_terminal(true, true, 41, 41,));
+    }
+
+    #[test]
     fn terminal_confirmation_matures_before_the_population_cap() {
         assert_eq!(HLS_TERMINAL_CONFIRMATION_MIN_PRICED_PEERS, 8);
         assert!(!hls_terminal_peer_view_is_mature(1));
         assert!(!hls_terminal_peer_view_is_mature(7));
         assert!(hls_terminal_peer_view_is_mature(8));
         assert!(hls_terminal_peer_view_is_mature(200));
+    }
+
+    #[test]
+    fn tentative_terminal_followup_only_resumes_for_newer_authenticated_evidence() {
+        use std::collections::VecDeque;
+
+        use stream_hls::{
+            HlsSequenceZeroRetry, hls_sequence_zero_has_newer_authenticated_evidence,
+        };
+
+        let mut retries = VecDeque::new();
+        assert!(!hls_sequence_zero_has_newer_authenticated_evidence(
+            41, 41, None, &retries,
+        ));
+
+        retries.push_back(HlsSequenceZeroRetry {
+            index: 42,
+            authenticated: false,
+        });
+        assert!(!hls_sequence_zero_has_newer_authenticated_evidence(
+            41, 41, None, &retries,
+        ));
+        retries.push_back(HlsSequenceZeroRetry {
+            index: 43,
+            authenticated: true,
+        });
+        assert!(hls_sequence_zero_has_newer_authenticated_evidence(
+            41, 41, None, &retries,
+        ));
+        assert!(hls_sequence_zero_has_newer_authenticated_evidence(
+            41,
+            41,
+            Some(44),
+            &VecDeque::new(),
+        ));
+        assert!(hls_sequence_zero_has_newer_authenticated_evidence(
+            41,
+            45,
+            None,
+            &VecDeque::new(),
+        ));
     }
 }
 
@@ -6223,6 +6291,22 @@ mod service_worker {
 
         assert!(initial_stabilization.contains("await_hls_beginning_prefix_barrier("));
         assert!(follower.contains("await_hls_beginning_prefix_barrier("));
+        let prefix_barrier = source_between(
+            HLS_PLAYER,
+            "async fn await_hls_beginning_prefix_barrier(",
+            "pub(super) fn remember_hls_fragment_kind(",
+        );
+        assert!(prefix_barrier.contains("hls_beginning_prefix_barrier_admission("));
+        assert!(prefix_barrier.contains("session.live_start"));
+        assert!(
+            prefix_barrier
+                .find("session.stamp() != expected_stamp")
+                .unwrap()
+                < prefix_barrier
+                    .find("hls_beginning_prefix_barrier_admission(")
+                    .unwrap(),
+            "the Live bypass must not keep work from a stale playback timeline",
+        );
 
         let feed_response = source_between(
             HLS_PLAYER,
@@ -6896,6 +6980,31 @@ mod service_worker {
             "async fn catch_up_sequence_zero_followup(",
             "async fn refresh_live_feed_head(",
         );
+        assert!(catchup.contains("let Some(mut seed) = sequence_zero_followup_seed("));
+        let tentative = source_between(
+            catchup,
+            "if seed.tentative_terminal {",
+            "let blocked_authenticated_evidence",
+        );
+        let confirm = tentative
+            .find("confirm_tentative_sequence_zero_terminal(")
+            .unwrap();
+        let confirm_end = tentative[confirm..].find(".await;").unwrap() + confirm + ".await;".len();
+        let reseed = tentative.find("let Some(refreshed_seed) =").unwrap();
+        let evidence = tentative
+            .find("hls_sequence_zero_has_newer_authenticated_evidence(")
+            .unwrap();
+        let install = tentative.find("seed = refreshed_seed;").unwrap();
+        assert!(confirm < reseed && reseed < evidence && evidence < install);
+        assert!(tentative[confirm..reseed].contains("weeb3.clone()"));
+        assert!(tentative[reseed..].contains("sequence_zero_followup_seed("));
+        assert!(!tentative[confirm_end..reseed].contains("return false;"));
+        assert!(
+            install
+                < catchup
+                    .find("let source_bytes = seed.source_body.as_ref()")
+                    .unwrap(),
+        );
         assert!(catchup.contains("collector.followup_retry_indices = seed.retry_indices.clone()"));
         assert!(
             catchup.contains("collector.followup_deferred_retry_index = seed.deferred_retry_index")
@@ -6909,11 +7018,12 @@ mod service_worker {
                     .find("let source_bytes = seed.source_body.as_ref()")
                     .unwrap()
         );
-        assert!(catchup.contains("if refresh_head"));
+        assert!(tentative.contains("if !refresh_head"));
         assert!(catchup.contains(
             "if !refresh_head && !continuation_invocation && blocked_authenticated_evidence"
         ));
         assert!(catchup.contains("persist_sequence_zero_followup_observation("));
+        assert!(catchup.contains(".max(seed.positive_ceiling)"));
 
         let prepare = source_between(
             HLS_PLAYER,
@@ -6950,9 +7060,14 @@ mod service_worker {
             "fn install_prepared_live_history(",
             "async fn prepare_live_history(",
         );
+        assert!(install.contains("finalized: prepared_finalized"));
+        assert!(install.contains(
+            "state.source_endlist_confirmed = prepared_finalized && hls_is_finalized(&head.bytes)"
+        ));
         assert!(install.contains("state.confirmed_head_index = Some(head.index)"));
         assert!(install.contains("state.last_head_check = now"));
         assert!(install.contains("session.live_history_active = true"));
+        assert!(prepare.contains("hls_prepared_live_history_is_terminal("));
 
         let trimming = source_between(
             HLS_PLAYER,

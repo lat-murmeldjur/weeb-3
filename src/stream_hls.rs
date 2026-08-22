@@ -681,6 +681,20 @@ pub(crate) fn hls_beginning_prefix_admission(
     }
 }
 
+pub(crate) fn hls_beginning_prefix_barrier_admission(
+    live_start: bool,
+    stamp_matches: bool,
+    phase: HlsBeginningPrefixPhase,
+) -> HlsProgressiveRangeAdmission {
+    if live_start {
+        HlsProgressiveRangeAdmission::Admit
+    } else if !stamp_matches {
+        HlsProgressiveRangeAdmission::Retire
+    } else {
+        hls_beginning_prefix_admission(phase)
+    }
+}
+
 pub(crate) fn hls_beginning_raw_supply_admission(
     phase: HlsBeginningPrefixPhase,
     foreground_zero_requested: bool,
@@ -3666,6 +3680,32 @@ pub(crate) fn hls_snapshot_is_terminal(
     head_confirmed: bool,
 ) -> bool {
     has_endlist && (explicit_index || head_confirmed)
+}
+
+pub(crate) fn hls_prepared_live_history_is_terminal(
+    archive_has_endlist: bool,
+    initial_head_was_confirmed_terminal: bool,
+    initial_index: u64,
+    prepared_head_index: u64,
+) -> bool {
+    hls_snapshot_is_terminal(
+        archive_has_endlist,
+        false,
+        initial_head_was_confirmed_terminal && initial_index == prepared_head_index,
+    )
+}
+
+pub(crate) fn hls_sequence_zero_has_newer_authenticated_evidence(
+    current_index: u64,
+    positive_ceiling: u64,
+    deferred_retry_index: Option<u64>,
+    retry_indices: &VecDeque<HlsSequenceZeroRetry>,
+) -> bool {
+    positive_ceiling > current_index
+        || deferred_retry_index.is_some_and(|index| index > current_index)
+        || retry_indices
+            .iter()
+            .any(|retry| retry.authenticated && retry.index > current_index)
 }
 
 pub(crate) fn hls_terminal_peer_view_is_mature(priced_peer_count: u64) -> bool {
@@ -9213,11 +9253,11 @@ mod runtime {
                 session
                     .beginning_prefix
                     .bypass_if_expired(expected_stamp, hls_monotonic_now_ms());
-                if session.beginning_prefix.stamp != expected_stamp {
-                    HlsProgressiveRangeAdmission::Retire
-                } else {
-                    hls_beginning_prefix_admission(session.beginning_prefix.phase)
-                }
+                hls_beginning_prefix_barrier_admission(
+                    session.live_start,
+                    session.beginning_prefix.stamp == expected_stamp,
+                    session.beginning_prefix.phase,
+                )
             });
             match admission {
                 HlsProgressiveRangeAdmission::Park => {
@@ -14686,6 +14726,7 @@ mod runtime {
         topic: &str,
         presentation_id: u64,
         head: &RawFeedPayload,
+        prepared_finalized: bool,
         archive: Vec<u8>,
     ) -> Option<FeedRouteSnapshot> {
         if !live_history_session_is_current(weeb3, owner, topic, presentation_id)
@@ -14699,7 +14740,7 @@ mod runtime {
             &cache_key,
             FeedRouteSnapshot {
                 index: head.index,
-                finalized: hls_is_finalized(&archive),
+                finalized: prepared_finalized,
                 body: Arc::from(archive),
             },
             true,
@@ -14733,8 +14774,7 @@ mod runtime {
                 state.sequence_zero_positive_ceiling.max(head.index);
             state.last_head_check = now;
             state.last_touch = now;
-            state.source_endlist_confirmed =
-                hls_is_finalized(&head.bytes) && hls_is_finalized(&snapshot.body);
+            state.source_endlist_confirmed = prepared_finalized && hls_is_finalized(&head.bytes);
             Some(())
         });
         cache_stamped?;
@@ -14765,6 +14805,7 @@ mod runtime {
     ) -> Result<FeedRouteSnapshot, String> {
         let network_id = active_profile().swarm_network_id;
         let initial_is_confirmed_terminal = initial.finalized;
+        let initial_index = initial.index;
         let initial = RawFeedPayload {
             index: initial.index,
             bytes: initial.body.to_vec(),
@@ -14859,9 +14900,22 @@ mod runtime {
                 },
             );
         }
-        let snapshot =
-            install_prepared_live_history(&weeb3, &owner, &topic, presentation_id, &head, archive)
-                .ok_or_else(|| "The Live history preparation was superseded.".to_string())?;
+        let prepared_finalized = hls_prepared_live_history_is_terminal(
+            hls_is_finalized(&archive),
+            initial_is_confirmed_terminal,
+            initial_index,
+            head.index,
+        );
+        let snapshot = install_prepared_live_history(
+            &weeb3,
+            &owner,
+            &topic,
+            presentation_id,
+            &head,
+            prepared_finalized,
+            archive,
+        )
+        .ok_or_else(|| "The Live history preparation was superseded.".to_string())?;
         prefetch_live_snapshot_start(&weeb3, &owner, &topic, &snapshot);
         Ok(snapshot)
     }
@@ -16555,28 +16609,45 @@ mod runtime {
         refresh_head: bool,
         continuation_invocation: bool,
     ) -> bool {
-        let Some(seed) = sequence_zero_followup_seed(cache_key, checking_token, initial_index)
+        let Some(mut seed) = sequence_zero_followup_seed(cache_key, checking_token, initial_index)
         else {
             return false;
         };
         if seed.tentative_terminal {
-            if refresh_head {
-                confirm_tentative_sequence_zero_terminal(
-                    weeb3,
-                    cache_key,
-                    owner,
-                    topic,
-                    network_id,
-                    checking_token,
-                    &seed,
-                )
-                .await;
+            if !refresh_head {
+                return false;
             }
-            return false;
+            confirm_tentative_sequence_zero_terminal(
+                weeb3.clone(),
+                cache_key,
+                owner,
+                topic,
+                network_id,
+                checking_token,
+                &seed,
+            )
+            .await;
+            let Some(refreshed_seed) =
+                sequence_zero_followup_seed(cache_key, checking_token, initial_index)
+            else {
+                return false;
+            };
+            if !hls_sequence_zero_has_newer_authenticated_evidence(
+                refreshed_seed.index,
+                refreshed_seed.positive_ceiling,
+                refreshed_seed.deferred_retry_index,
+                &refreshed_seed.retry_indices,
+            ) {
+                return false;
+            }
+            seed = refreshed_seed;
         }
-        let blocked_authenticated_evidence = seed.deferred_retry_index.is_some()
-            || seed.retry_indices.iter().any(|retry| retry.authenticated)
-            || seed.positive_ceiling > seed.index;
+        let blocked_authenticated_evidence = hls_sequence_zero_has_newer_authenticated_evidence(
+            seed.index,
+            seed.positive_ceiling,
+            seed.deferred_retry_index,
+            &seed.retry_indices,
+        );
         if !refresh_head && !continuation_invocation && blocked_authenticated_evidence {
             return false;
         }
