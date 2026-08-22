@@ -17,6 +17,7 @@ use crate::{
     interface::service_worker_controls_bzz_requests,
     mpsc,
     network_profile::{NetworkMode, active_profile},
+    retrieval::RawFetchLifecycleFactory,
     retrieval_conventions::{
         PendingGenerationRelation, next_nonzero_generation, pending_generation_relation,
     },
@@ -1319,6 +1320,7 @@ async fn read_cached_range_with_retry(
             generation,
             None,
             None,
+            None,
         )
         .await
         {
@@ -1353,6 +1355,7 @@ async fn read_cached_range(
     generation: u64,
     cancel_stream_key: Option<String>,
     background_flight: Option<HlsBackgroundRangeFlightGuard>,
+    raw_fetch_lifecycle_factory: Option<RawFetchLifecycleFactory>,
 ) -> Result<Vec<u8>, RangeReadError> {
     if metadata.size == 0 || start > end || start >= metadata.size || end >= metadata.size {
         return Err("range lies outside the resolved resource".into());
@@ -1374,6 +1377,7 @@ async fn read_cached_range(
             generation,
             cancel_stream_key,
             background_flight,
+            raw_fetch_lifecycle_factory,
         )
         .await;
     }
@@ -1395,6 +1399,7 @@ async fn read_cached_range(
                 *window_end,
                 generation,
                 cancel_stream_key.clone(),
+                None,
                 None,
             )
         });
@@ -1442,6 +1447,7 @@ async fn read_range_window(
     generation: u64,
     cancel_stream_key: Option<String>,
     mut background_flight: Option<HlsBackgroundRangeFlightGuard>,
+    raw_fetch_lifecycle_factory: Option<RawFetchLifecycleFactory>,
 ) -> Result<Vec<u8>, RangeReadError> {
     if metadata.size == 0 || start > end || start >= metadata.size || end >= metadata.size {
         return Err("range window lies outside the resolved resource".into());
@@ -1490,6 +1496,7 @@ async fn read_range_window(
                         end,
                         stream_key.clone(),
                         generation,
+                        raw_fetch_lifecycle_factory,
                     )
                     .await
             } else {
@@ -1557,6 +1564,7 @@ pub(crate) async fn read_cached_hls_range(
     generation: Option<u64>,
     cancel_stream_key: String,
     background_flight: Option<HlsBackgroundRangeFlightGuard>,
+    raw_fetch_lifecycle_factory: Option<RawFetchLifecycleFactory>,
 ) -> Result<Vec<u8>, String> {
     let resource = format!("hls:{reference}");
     let generation = generation.unwrap_or(0);
@@ -1582,6 +1590,7 @@ pub(crate) async fn read_cached_hls_range(
             generation,
             (generation > 0).then_some(cancel_stream_key),
             background_flight,
+            raw_fetch_lifecycle_factory,
         ),
     )
     .await
@@ -1607,6 +1616,72 @@ pub(crate) fn hls_aligned_range_cached(
     let resource = format!("hls:{reference}");
     let key = range_cache_key(&resource, metadata, start, end);
     FETCH_CACHE.with(|cache| cache.borrow().ranges.contains_key(&key))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RangeCacheState {
+    Cached,
+    Pending,
+    Absent,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct RangeCacheObservation {
+    pub(crate) cached: bool,
+    pub(crate) pending_generation: Option<u64>,
+}
+
+fn range_cache_state_from_presence(completed: bool, pending: bool) -> RangeCacheState {
+    if completed {
+        RangeCacheState::Cached
+    } else if pending {
+        RangeCacheState::Pending
+    } else {
+        RangeCacheState::Absent
+    }
+}
+
+pub(crate) fn range_cache_state(
+    resource: &str,
+    metadata: &BzzMetadata,
+    start: u64,
+    end: u64,
+    generation: u64,
+) -> RangeCacheState {
+    let observation = range_cache_observation(resource, metadata, start, end, generation);
+    range_cache_state_from_presence(observation.cached, observation.pending_generation.is_some())
+}
+
+pub(crate) fn range_cache_observation(
+    resource: &str,
+    metadata: &BzzMetadata,
+    start: u64,
+    end: u64,
+    generation: u64,
+) -> RangeCacheObservation {
+    if generation == 0
+        || metadata.size == 0
+        || start > end
+        || end >= metadata.size
+        || range_storage_window_for_start(start, metadata.size) != (start, end)
+    {
+        return RangeCacheObservation::default();
+    }
+
+    let cache_key = range_cache_key(resource, metadata, start, end);
+    // Every nonzero generation shares this cache slot. Inspecting only its
+    // occupancy keeps an older physical leader pending until it settles.
+    let pending_key = pending_range_key(&cache_key, generation);
+    FETCH_CACHE.with(|cache| {
+        let cache = cache.borrow();
+        RangeCacheObservation {
+            cached: cache.ranges.contains_key(&cache_key),
+            pending_generation: cache
+                .pending_ranges
+                .get(&pending_key)
+                .map(|pending| pending.generation),
+        }
+    })
 }
 
 pub(crate) fn evict_completed_hls_ranges(reference: &str, metadata: &BzzMetadata) {

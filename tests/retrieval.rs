@@ -10,9 +10,8 @@ mod retrieval_conventions;
 mod connection {
     use crate::accounting::{
         CONNECTION_BUILDUP_LIMIT, REFRESH_RATE, bee_reconnect_delay_seconds,
-        connection_dial_capacity_available, refreshment_due,
+        connection_dial_capacity_available, connection_population_deficit, refreshment_due,
     };
-
     #[test]
     fn first_usable_connections_do_not_wait_for_the_population_target() {
         assert_eq!(CONNECTION_BUILDUP_LIMIT, 200);
@@ -89,7 +88,7 @@ mod connection {
             feeder
                 .contains("take_eligible(&mut new_peers).or_else(|| take_eligible(&mut retries))")
         );
-        assert!(feeder.contains("spawn_local(queue_peer_dial_retry("));
+        assert!(feeder.contains("queue_peer_dial_retry("));
         assert!(runtime.contains("mpsc::bounded::<PeerDialInstruction>(MAX_QUEUED_PEER_DIALS)"));
         assert!(
             runtime.contains("remove_connection_attempt_for_dial(&wings, &peer_id, connection_id)")
@@ -105,7 +104,10 @@ mod connection {
         let release = failed_dial
             .find("decrement_counter(&ongoing_connections)")
             .expect("dial capacity release");
-        assert!(removal < release);
+        let retry = failed_dial
+            .find("queue_peer_dial_retry(")
+            .expect("retry registration before capacity release");
+        assert!(removal < retry && retry < release);
         assert!(runtime.contains("self.swarm.next_event().await"));
         assert!(!runtime.contains("CONNECTION_BUILDUP_SWARM_POLL_MS"));
         assert!(
@@ -116,6 +118,175 @@ mod connection {
         assert!(runtime.contains("const OUTBOUND_CONNECTION_TIMEOUT_MS: u64 = 8_000;"));
         assert!(!runtime.contains("FRESH_GOSSIP_DIAL_TIMEOUT_MS"));
         assert!(!feeder.contains("disconnect_peer_id"));
+    }
+
+    #[test]
+    fn drained_reload_reservations_expose_the_exact_population_deficit() {
+        assert_eq!(connection_population_deficit(55, 145), 0);
+        let mut ongoing = 145_u64;
+        for _ in 0..145 {
+            ongoing = ongoing.saturating_sub(1);
+        }
+        assert_eq!(ongoing, 0);
+        assert_eq!(connection_population_deficit(55, ongoing), 145);
+        assert_eq!(connection_population_deficit(199, 0), 1);
+        assert_eq!(connection_population_deficit(200, 0), 0);
+        assert_eq!(connection_population_deficit(u64::MAX, u64::MAX), 0);
+    }
+
+    #[test]
+    fn delayed_retry_backoff_is_registered_and_released_around_enqueue() {
+        let runtime = include_str!("../src/lib.rs");
+        let retry = runtime
+            .split("async fn queue_peer_dial_retry(")
+            .nth(1)
+            .and_then(|source| source.split("fn failed_peer_retry_delay_ms(").next())
+            .expect("delayed retry scheduler");
+        let register = retry
+            .find(".insert(peer, (expected_generation, retry_id))")
+            .expect("retry not-before registration");
+        let sleep = retry
+            .find("failed_peer_retry_delay_ms(&address)")
+            .expect("configured retry backoff");
+        let ownership = retry
+            .find("delayed.get(&peer) == Some(&(expected_generation, retry_id))")
+            .expect("exact delayed retry ownership");
+        let enqueue = retry
+            .find(".send(PeerDialInstruction {")
+            .expect("retry enqueue after backoff");
+        let release = retry[enqueue..]
+            .find("delayed.get(&peer) == Some(&(expected_generation, retry_id))")
+            .map(|offset| enqueue + offset)
+            .expect("retry exclusion release after enqueue");
+        assert!(register < sleep && sleep < ownership && ownership < enqueue && enqueue < release);
+
+        let feeder = runtime
+            .split("let swarm_event_handle_0 = async")
+            .nth(1)
+            .and_then(|source| source.split("let swarm_event_handle_1 = async").next())
+            .expect("peer dial feeder");
+        assert!(feeder.contains("wings.delayed_peer_retries"));
+        assert!(feeder.contains("*generation == queue_generation"));
+        assert!(feeder.contains("retry.0 == queue_generation"));
+    }
+
+    #[test]
+    fn stalled_pre_handshake_reservations_expire_and_known_peers_are_rescanned() {
+        let runtime = include_str!("../src/lib.rs");
+        assert!(runtime.contains("const PRE_HANDSHAKE_CONNECTION_TIMEOUT_MS: u64 = 60_000;"));
+        assert!(runtime.contains("const PEER_POPULATION_RESCAN_MS: u64 = 2_000;"));
+
+        let joiner = runtime
+            .split("let hive_joiner = async")
+            .nth(1)
+            .and_then(|source| source.split("join!(").next())
+            .expect("connection handshake joiner");
+        let ready_timeout = joiner
+            .find("Duration::from_millis(PRE_HANDSHAKE_CONNECTION_TIMEOUT_MS)")
+            .expect("pre-handshake reservation timeout");
+        let ready_wait = joiner
+            .find("ready_connection.recv().await")
+            .expect("identify-ready wait");
+        let ownership = joiner[ready_timeout..]
+            .find("connection_attempt_is_current(")
+            .map(|offset| ready_timeout + offset)
+            .expect("exact attempt ownership check");
+        let removal = joiner[ready_wait..]
+            .find("remove_connection_attempt(&wings, &id, connection_attempt_id)")
+            .map(|offset| ready_wait + offset)
+            .expect("timed-out reservation release");
+        let retry = joiner[removal..]
+            .find("queue_peer_dial_retry(")
+            .map(|offset| removal + offset)
+            .expect("timed-out retry registration");
+        let release = joiner[retry..]
+            .find("decrement_counter(&ongoing_connections)")
+            .map(|offset| retry + offset)
+            .expect("single ongoing-counter release");
+        assert!(ready_timeout < ownership && ownership < ready_wait);
+        assert!(ready_wait < removal && removal < retry && retry < release);
+
+        let feeder = runtime
+            .split("let swarm_event_handle_0 = async")
+            .nth(1)
+            .and_then(|source| source.split("let swarm_event_handle_1 = async").next())
+            .expect("peer dial feeder");
+        assert!(feeder.contains("current_connection_population_deficit("));
+        assert!(feeder.contains("peers_instructions_chan_incoming.recv()"));
+        assert!(feeder.contains("last_population_rescan_ms"));
+        assert!(feeder.contains("wings.known_peer_underlays.lock().await"));
+        assert!(feeder.contains("wings.known_peer_generations.lock().await.clone()"));
+        assert!(feeder.contains("!connected.contains(*peer)"));
+        assert!(feeder.contains("!attempts.contains(*peer)"));
+        assert!(feeder.contains("!cooldowns.contains(*peer)"));
+        assert!(feeder.contains("eligible.shuffle(&mut rand::thread_rng())"));
+        assert!(feeder.contains("eligible.truncate(deficit)"));
+        assert!(feeder.contains("retry: true"));
+
+        let timeout_cleanup = &joiner[ready_wait..];
+        let disconnect = timeout_cleanup
+            .find("swarm.disconnect_peer_id(id).is_err()")
+            .expect("pending transport abort");
+        let removal = timeout_cleanup
+            .find("remove_connection_attempt(&wings, &id, connection_attempt_id)")
+            .expect("exact reservation removal");
+        let release = timeout_cleanup
+            .find("decrement_counter(&ongoing_connections)")
+            .expect("reservation counter release");
+        assert!(disconnect < removal && removal < release);
+
+        let outgoing_error = runtime
+            .split("let retryable = !matches!(")
+            .nth(1)
+            .and_then(|source| source.split("SwarmEvent::ConnectionClosed {").next())
+            .expect("late outgoing dial failure");
+        let late_removal = outgoing_error
+            .find("if !remove_connection_attempt_for_dial(")
+            .expect("late event ownership guard");
+        let late_return = outgoing_error[late_removal..]
+            .find("return;")
+            .map(|offset| late_removal + offset)
+            .expect("stale event return");
+        let late_release = outgoing_error
+            .find("decrement_counter(&ongoing_connections)")
+            .expect("owned dial failure release");
+        assert!(late_removal < late_return && late_return < late_release);
+    }
+
+    #[test]
+    fn duplicate_overlay_peers_are_suppressed_until_the_owner_disconnects() {
+        let runtime = include_str!("../src/lib.rs");
+        let promotion = runtime
+            .split("async fn promote_priced_peer(")
+            .nth(1)
+            .and_then(|source| {
+                source
+                    .split("pub async fn post_upload_with_redundancy(")
+                    .next()
+            })
+            .expect("priced peer promotion");
+        let duplicate = promotion
+            .split("} else if let Some(owner) = duplicate_owner {")
+            .nth(1)
+            .expect("duplicate overlay rejection");
+        let reject = duplicate
+            .find(".insert(peer, owner)")
+            .expect("owner-bound duplicate suppression");
+        let disconnect = duplicate
+            .find("swarm.disconnect_peer_id(peer.clone())")
+            .expect("duplicate disconnect");
+        assert!(reject < disconnect);
+
+        let feeder = runtime
+            .split("let swarm_event_handle_0 = async")
+            .nth(1)
+            .and_then(|source| source.split("let swarm_event_handle_1 = async").next())
+            .expect("peer dial feeder");
+        assert!(feeder.contains("!rejected.contains_key(*peer)"));
+        assert!(feeder.contains("rejected.contains_key(&candidate.peer)"));
+        assert!(feeder.contains("rejected_peers.contains_key(&candidate.peer)"));
+        assert!(runtime.contains("wings.rejected_duplicate_peers.lock().await.clear()"));
+        assert!(runtime.contains(".retain(|_, owner| owner != &peer_id)"));
     }
 
     #[test]
@@ -913,12 +1084,16 @@ mod retrieve_group_stream {
             "async fn fetch_data_group_indices_streaming(",
             "#[derive(Clone)]\nstruct TraversalNode",
         );
-        assert_eq!(group.matches("child_emitter.emit(").count(), 3);
+        assert_eq!(
+            group.matches("child_emitter.emit(").count(),
+            4,
+            "rolling cache variants, the legacy cache fast path, and reconstruction all publish"
+        );
         assert!(
             group.contains("if requested_count == data_count")
                 && group.contains("dispatch_group_parity(")
                 && group.contains("usize::MAX"),
-            "a full-group hedge must race all Bee parity without widening subset-of-child groups"
+            "the conservative legacy fallback must retain its full-group parity hedge"
         );
 
         let traversal = source_section(
@@ -1039,6 +1214,355 @@ mod retrieve_group_stream {
         );
     }
 }
+
+mod rolling_erasure_tail {
+    use crate::retrieval_conventions::{
+        RetrieveHedgeDemand, SharedRetrieveHedgeDemand, retrieve_attempt_start_allowed,
+        rolling_full_group_eligible, rolling_full_group_static_candidate,
+        rolling_next_parity_index, rolling_parity_admission_count,
+    };
+
+    const GATE_MS: u64 = 1_000;
+    const RETRIEVAL_SOURCE: &str = include_str!("../src/retrieval.rs");
+    const RUNTIME_SOURCE: &str = include_str!("../src/lib.rs");
+
+    fn group_source() -> &'static str {
+        let start = RETRIEVAL_SOURCE
+            .find("async fn fetch_data_group_indices_streaming(")
+            .expect("group fetch start");
+        let end = RETRIEVAL_SOURCE[start..]
+            .find("#[derive(Clone)]\nstruct TraversalNode")
+            .map(|offset| start + offset)
+            .expect("group fetch end");
+        &RETRIEVAL_SOURCE[start..end]
+    }
+
+    #[test]
+    fn rolling_requires_a_full_recoverable_mixed_cache_group() {
+        // A production Medium full group is 119 data + 9 parity. Eight decoded-only
+        // hits leave one parity beyond the cache-basis deficit; nine do not.
+        assert!(rolling_full_group_eligible(true, 119, 119, 9, 0, 119));
+        assert!(rolling_full_group_eligible(true, 119, 119, 9, 8, 1));
+
+        assert!(!rolling_full_group_eligible(false, 119, 119, 9, 0, 119));
+        assert!(!rolling_full_group_eligible(true, 118, 119, 9, 0, 118));
+        assert!(!rolling_full_group_eligible(true, 119, 119, 0, 0, 119));
+        assert!(!rolling_full_group_eligible(true, 119, 119, 9, 9, 1));
+        assert!(!rolling_full_group_eligible(true, 119, 119, 9, 0, 0));
+    }
+
+    #[test]
+    fn partial_and_conservative_groups_never_pay_for_a_raw_basis_scan() {
+        assert!(rolling_full_group_static_candidate(true, 119, 119, 9));
+        assert!(!rolling_full_group_static_candidate(true, 118, 119, 9));
+        assert!(!rolling_full_group_static_candidate(false, 119, 119, 9));
+        assert!(!rolling_full_group_static_candidate(true, 119, 119, 0));
+
+        let group = group_source();
+        let candidate = group
+            .find("if static_rolling_candidate {")
+            .expect("static candidate branch");
+        let legacy = group[candidate..]
+            .find("} else {\n        // Preserve the legacy fast path")
+            .map(|offset| candidate + offset)
+            .expect("legacy fast path");
+        assert!(group[candidate..legacy].contains("requested_shard_cache("));
+        assert!(!group[legacy..].contains("requested_shard_cache("));
+        let legacy_source = &group[legacy..];
+        let reference = legacy_source
+            .find("let reference = &data_references[index];")
+            .expect("legacy child reference");
+        let cache_hit = legacy_source
+            .find("cached_decoded_chunk(reference)")
+            .expect("legacy decoded cache lookup");
+        let queue = legacy_source
+            .find("queue_initial_data_shard(index, RetrieveHedgeDemand::Ordinary)")
+            .expect("legacy raw registration");
+        assert!(reference < cache_hit && cache_hit < queue);
+
+        let cache = RETRIEVAL_SOURCE
+            .split("impl DecodedChunkCache {")
+            .nth(1)
+            .and_then(|source| source.split("fn get_decoded_and_raw(").next())
+            .expect("ordinary decoded cache accessor");
+        assert!(!cache.contains("get_decoded_and_raw(reference)"));
+        assert!(cache.contains("let raw = decoded.is_none()"));
+    }
+
+    #[test]
+    fn rolling_parity_waits_for_the_existing_gate_and_never_exceeds_width() {
+        assert_eq!(
+            rolling_parity_admission_count(GATE_MS - 1, GATE_MS, false, 4, 0, 4),
+            0
+        );
+        assert_eq!(
+            rolling_parity_admission_count(GATE_MS, GATE_MS, false, 4, 4, 4),
+            0
+        );
+
+        let mut dispatched = vec![true, true, true, true, false, false, false];
+        let mut rolling_active = 1usize;
+        let mut admitted = Vec::new();
+        while rolling_active < 4 {
+            assert_eq!(
+                rolling_parity_admission_count(
+                    GATE_MS,
+                    GATE_MS,
+                    false,
+                    4,
+                    rolling_active,
+                    dispatched[4..].iter().filter(|sent| !**sent).count(),
+                ),
+                1,
+                "one pre-completed structural slot admits one replacement per turn"
+            );
+            let index = rolling_next_parity_index(4, &dispatched).expect("unique parity");
+            assert!(!admitted.contains(&index));
+            dispatched[index] = true;
+            admitted.push(index);
+            rolling_active += 1;
+            assert!(rolling_active <= 4);
+        }
+        assert_eq!(admitted, vec![4, 5, 6]);
+        assert_eq!(rolling_next_parity_index(4, &dispatched), None);
+    }
+
+    #[test]
+    fn a_ready_terminal_result_wins_the_freed_slot_before_parity() {
+        let mut requested_ready = [false];
+        let rolling_active_before_result = 1usize;
+
+        // Settle the simultaneously ready requested result first: it both frees the active slot
+        // and proves terminal. The admission function must then reject the apparent free slot.
+        requested_ready[0] = true;
+        let rolling_active = rolling_active_before_result - 1;
+        let terminal = requested_ready.iter().all(|ready| *ready);
+        assert_eq!(
+            rolling_parity_admission_count(GATE_MS, GATE_MS, terminal, 1, rolling_active, 1,),
+            0
+        );
+
+        let group = group_source();
+        let loop_start = group.find("loop {").expect("coordinator loop");
+        let ready = group[loop_start..]
+            .find("result_in.try_recv()")
+            .map(|offset| loop_start + offset)
+            .expect("ready result poll");
+        let terminal_check = group[loop_start..]
+            .find("let terminal =")
+            .map(|offset| loop_start + offset)
+            .expect("terminal check");
+        let parity_admission = group[loop_start..]
+            .find("rolling_parity_admission_count(")
+            .map(|offset| loop_start + offset)
+            .expect("parity admission");
+        assert!(ready < terminal_check && terminal_check < parity_admission);
+        assert!(group.contains("while let Ok(result) = result_in.try_recv()"));
+        assert!(group.contains("Re-evaluate terminal state before any replacement admission."));
+    }
+
+    #[test]
+    fn managed_attempts_serialize_but_retry_and_ordinary_hedging_are_preserved() {
+        assert!(retrieve_attempt_start_allowed(
+            RetrieveHedgeDemand::DistinctShardManaged,
+            0,
+            false,
+        ));
+        assert!(!retrieve_attempt_start_allowed(
+            RetrieveHedgeDemand::DistinctShardManaged,
+            1,
+            true,
+        ));
+        assert!(retrieve_attempt_start_allowed(
+            RetrieveHedgeDemand::DistinctShardManaged,
+            0,
+            true,
+        ));
+        assert!(!retrieve_attempt_start_allowed(
+            RetrieveHedgeDemand::Ordinary,
+            1,
+            false,
+        ));
+        assert!(retrieve_attempt_start_allowed(
+            RetrieveHedgeDemand::Ordinary,
+            1,
+            true,
+        ));
+    }
+
+    #[test]
+    fn an_ordinary_follower_monotonically_promotes_a_managed_flight() {
+        let demand = SharedRetrieveHedgeDemand::new(RetrieveHedgeDemand::DistinctShardManaged);
+        assert_eq!(demand.current(), RetrieveHedgeDemand::DistinctShardManaged);
+        demand.promote(RetrieveHedgeDemand::Ordinary);
+        assert_eq!(demand.current(), RetrieveHedgeDemand::Ordinary);
+        demand.promote(RetrieveHedgeDemand::DistinctShardManaged);
+        assert_eq!(demand.current(), RetrieveHedgeDemand::Ordinary);
+    }
+
+    #[test]
+    fn rolling_and_legacy_paths_keep_their_required_boundaries() {
+        let group = group_source();
+        let rolling_start = group.find("if rolling {").expect("rolling branch");
+        let legacy_start = group[rolling_start..]
+            .find("} else if recovery_dispatched && policy.erasure_recovery {")
+            .map(|offset| rolling_start + offset)
+            .expect("legacy branch");
+        let rolling_branch = &group[rolling_start..legacy_start];
+        let legacy_branch = &group[legacy_start..];
+
+        assert!(rolling_branch.contains("dispatch_one_rolling_group_parity("));
+        assert!(!rolling_branch.contains("dispatch_group_parity("));
+        assert!(!rolling_branch.contains("RETRIEVE_RS_HEDGE_AFTER_MS"));
+        assert!(legacy_branch.contains("dispatch_group_parity("));
+        assert!(legacy_branch.contains("RETRIEVE_RS_HEDGE_AFTER_MS"));
+        assert!(group.contains("requested_count == data_count"));
+        assert!(group.contains("let started = Date::now();"));
+
+        let raw_queue = RETRIEVAL_SOURCE
+            .split("fn queue_drained_raw_chunk(")
+            .nth(1)
+            .and_then(|source| source.split("#[inline]\nfn decryption_segment_key").next())
+            .expect("raw singleflight queue");
+        let promote = raw_queue
+            .find("shared_demand.promote(hedge_demand)")
+            .unwrap();
+        let follower_return = raw_queue
+            .find("return RawFetchRegistration::Joined")
+            .unwrap();
+        let detached = raw_queue.find("The detached producer").unwrap();
+        assert!(promote < follower_return && follower_return < detached);
+        assert!(raw_queue.contains("hedge_demand: registration.shared.hedge_demand.clone()"));
+
+        let retrieve_chunk = RETRIEVAL_SOURCE
+            .split("pub async fn retrieve_chunk(")
+            .nth(1)
+            .and_then(|source| source.split("pub async fn retrieve_check_chunk(").next())
+            .expect("retrieve chunk");
+        assert!(retrieve_chunk.contains("map(SharedRetrieveHedgeDemand::current)"));
+        assert!(retrieve_chunk.contains("unwrap_or(RetrieveHedgeDemand::Ordinary)"));
+        assert!(RETRIEVAL_SOURCE.contains("const RETRIEVE_ATTEMPT_TIMEOUT_MS: u64 = 10_000;"));
+        assert!(RUNTIME_SOURCE.contains("hedge_demand: None"));
+    }
+
+    #[test]
+    fn rolling_telemetry_observes_without_reordering_admission_or_settlement() {
+        let group = group_source();
+        let initial_registration = group
+            .find("let registration = queue_initial_data_shard(index, initial_hedge_demand);")
+            .expect("initial rolling registration");
+        let gate_anchor = group
+            .find("let started = Date::now();")
+            .expect("existing post-registration anchor");
+        let profile_start = group
+            .find("let mut rolling_profile = rolling")
+            .expect("actual rolling-only profile handle");
+        assert!(initial_registration < gate_anchor && gate_anchor < profile_start);
+        assert!(!group.contains("let mut rolling_profile = static_rolling_candidate"));
+
+        let parity_dispatch = group
+            .find("dispatch_one_rolling_group_parity(")
+            .expect("rolling parity dispatch");
+        let active_update = group[parity_dispatch..]
+            .find("rolling_active += 1;")
+            .map(|offset| parity_dispatch + offset)
+            .expect("rolling active update");
+        let parity_profile = group[active_update..]
+            .find("profile.parity_admitted(")
+            .map(|offset| active_update + offset)
+            .expect("parity admission observation");
+        let coordinator_continue = group[parity_profile..]
+            .find("continue;")
+            .map(|offset| parity_profile + offset)
+            .expect("coordinator re-check");
+        assert!(parity_dispatch < active_update);
+        assert!(active_update < parity_profile && parity_profile < coordinator_continue);
+
+        let result_profile = group
+            .find("record_rolling_group_result(")
+            .expect("parity result observation");
+        let settlement = group[result_profile..]
+            .find("settle_data_group_result(")
+            .map(|offset| result_profile + offset)
+            .expect("production settlement");
+        let progress = group[settlement..]
+            .find("update_rolling_group_progress(")
+            .map(|offset| settlement + offset)
+            .expect("post-settlement progress mirror");
+        let settlement_exit = group[progress..]
+            .find("settled?;")
+            .map(|offset| progress + offset)
+            .expect("settlement error propagation");
+        assert!(result_profile < settlement && settlement < progress && progress < settlement_exit);
+
+        let close = group
+            .find("waiter_admission.close();")
+            .expect("production synchronous close");
+        let close_profile = group[close..]
+            .find("profile.close_now(")
+            .map(|offset| close + offset)
+            .expect("close observation");
+        let post_close_currentness = group[close_profile..]
+            .find("join_cancel_token_current(&cancel_generations, &cancel).await")
+            .map(|offset| close_profile + offset)
+            .expect("existing post-close currentness check");
+        assert!(close < close_profile && close_profile < post_close_currentness);
+        assert!(group.contains("profile.finish_success_now(false)"));
+        assert!(group.contains("profile.finish_success_now(true)"));
+
+        let receive_match = group
+            .split_once("let result = match result {")
+            .map(|(_, source)| source)
+            .expect("typed receive terminal mapping");
+        let receive_match = receive_match
+            .split_once("completed = completed.checked_add(1)?;")
+            .map(|(source, _)| source)
+            .expect("receive match end");
+        assert!(receive_match.contains("RawFetchReceive::Stale"));
+        assert!(receive_match.contains("RawFetchReceive::ChannelClosed"));
+        assert!(!receive_match.contains("join_cancel_token_current"));
+
+        let receive = RETRIEVAL_SOURCE
+            .split("async fn recv_raw_result_cancellable(")
+            .nth(1)
+            .and_then(|source| source.split("struct RawFetchResult").next())
+            .expect("typed cancellable receive helper");
+        assert!(receive.contains("RawFetchReceive::Stale"));
+        assert!(receive.contains("RawFetchReceive::ChannelClosed"));
+        assert_eq!(receive.matches("receiver.recv()").count(), 2);
+    }
+
+    #[test]
+    fn managed_promotion_is_counted_only_for_the_monotone_transition() {
+        let raw_queue = RETRIEVAL_SOURCE
+            .split("fn queue_drained_raw_chunk(")
+            .nth(1)
+            .and_then(|source| source.split("#[inline]\nfn decryption_segment_key").next())
+            .expect("raw singleflight queue");
+        let before = raw_queue
+            .find("let before = shared_demand.current();")
+            .expect("pre-promotion demand");
+        let promote = raw_queue[before..]
+            .find("shared_demand.promote(hedge_demand);")
+            .map(|offset| before + offset)
+            .expect("monotone promotion");
+        let actual_transition = raw_queue[promote..]
+            .find("shared_demand.current() == RetrieveHedgeDemand::Ordinary")
+            .map(|offset| promote + offset)
+            .expect("post-promotion state check");
+        let record = raw_queue[actual_transition..]
+            .find("record_managed_to_ordinary_promotion();")
+            .map(|offset| actual_transition + offset)
+            .expect("promotion telemetry");
+        let follower_return = raw_queue[record..]
+            .find("return RawFetchRegistration::Joined")
+            .map(|offset| record + offset)
+            .expect("follower return");
+        assert!(before < promote && promote < actual_transition);
+        assert!(actual_transition < record && record < follower_return);
+    }
+}
+
 mod progress_events {
     use crate::events::ProgressStore;
 

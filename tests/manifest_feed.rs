@@ -1358,16 +1358,17 @@ mod feed_frontier {
         let latest = startup
             .find("seek_latest_feed_update_indexed_wide_bounded(")
             .expect("wide authenticated startup lookup");
-        let predecessor = startup[latest..]
-            .find("retrieve_feed_update_at_index_bounded(")
+        let deferred = startup[latest..]
+            .find("defer_large_raw_feed_update(index, update.clone())")
             .map(|offset| latest + offset)
-            .expect("rolling predecessor lookup");
-        let deferred = startup[predecessor..]
-            .find("defer_large_raw_feed_update(index, update)")
-            .map(|offset| predecessor + offset)
             .expect("already observed large update retained without another exact lookup");
+        let predecessor = startup[deferred..]
+            .find("retrieve_feed_update_at_index_bounded(")
+            .map(|offset| deferred + offset)
+            .expect("rolling predecessor lookup");
 
-        assert!(latest < predecessor && predecessor < deferred);
+        assert!(latest < deferred && deferred < predecessor);
+        assert!(startup[deferred..predecessor].contains("output.try_send(deferred.clone())"));
         assert!(startup.contains("playable: RawFeedPayload"));
         assert!(startup.contains("observed_deferred: None"));
         assert_eq!(
@@ -1376,6 +1377,124 @@ mod feed_frontier {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn large_positive_updates_use_a_distinct_bounded_deferred_observer() {
+        let bzz_stream = include_str!("../src/bzz_stream.rs");
+        let decoder = bzz_stream
+            .split("fn decode_observed_feed_updates(")
+            .nth(1)
+            .and_then(|source| {
+                source
+                    .split("pub(crate) async fn acquire_raw_feed_payload_at_index(")
+                    .next()
+            })
+            .expect("observed feed update classifier");
+
+        let large = decoder
+            .find("span > CHUNK_SIZE as u64")
+            .expect("large update classification");
+        let maximum_index = decoder
+            .find("maximum_index.is_some_and")
+            .expect("complete-payload index bound");
+        let complete_decode = decoder
+            .find("raw_feed_payload_from_update(")
+            .expect("complete payload decoder");
+        assert!(large < maximum_index && maximum_index < complete_decode);
+        assert!(decoder.contains("ObservedRawFeedPayload::Deferred"));
+        assert!(decoder.contains("defer_large_raw_feed_update(index, update)"));
+        assert!(decoder.contains("output.try_send(payload)"));
+        assert!(decoder.contains("mpsc::bounded::<(u64, Vec<u8>)>(16)"));
+
+        let startup = bzz_stream
+            .split(
+                "pub(crate) async fn acquire_latest_raw_feed_payload_startup_observing_deferred(",
+            )
+            .nth(1)
+            .and_then(|source| {
+                source
+                    .split("pub(crate) async fn acquire_latest_raw_feed_payload_bounded_from")
+                    .next()
+            })
+            .expect("startup deferred-observer adapter");
+        assert!(startup.contains("acquire_latest_raw_feed_payload_startup_observing_updates("));
+        assert!(startup.contains("observed_deferred.clone()"));
+
+        let bounded = bzz_stream
+            .split("pub(crate) async fn acquire_latest_raw_feed_payload_bounded_from<")
+            .nth(1)
+            .and_then(|source| {
+                source
+                    .split("pub(crate) async fn acquire_latest_raw_feed_payload_from(")
+                    .next()
+            })
+            .expect("bounded frontier deferred-observer adapter");
+        assert!(
+            bounded.contains("acquire_latest_raw_feed_payload_bounded_from_observing_deferred(")
+        );
+        assert!(
+            bounded.contains("observed_deferred: Option<mpsc::Sender<DeferredRawFeedPayload>>")
+        );
+        assert!(bounded.contains("observed_updates.try_send((index, update.clone()))"));
+    }
+
+    #[test]
+    fn deferred_prefix_retrieval_is_one_authenticated_byte_zero_range() {
+        let bzz_stream = include_str!("../src/bzz_stream.rs");
+        let prefix_type = bzz_stream
+            .split("pub(crate) struct DeferredRawFeedPayloadPrefix")
+            .nth(1)
+            .and_then(|source| source.split("fn deferred_raw_feed_payload_root").next())
+            .expect("distinct deferred payload prefix type");
+        assert!(prefix_type.contains("payload_span: u64"));
+        assert!(prefix_type.contains("bytes: Vec<u8>"));
+
+        let prefix = bzz_stream
+            .split("pub(crate) async fn acquire_deferred_raw_feed_payload_prefix_conservative(")
+            .nth(1)
+            .and_then(|source| {
+                source
+                    .split("pub(crate) async fn acquire_deferred_raw_feed_payload_conservative")
+                    .next()
+            })
+            .expect("conservative deferred prefix retrieval");
+        let root = prefix
+            .find("deferred_raw_feed_payload_root(deferred)")
+            .expect("authenticated deferred root");
+        let bounds = prefix
+            .find("conservative_deferred_payload_range(root.span, 0, maximum_prefix_bytes)")
+            .expect("byte-zero conservative bounds");
+        let retrieve = prefix
+            .find("retrieve_data_range_from_root_conservative(")
+            .expect("authenticated conservative range retrieval");
+        assert!(root < bounds && bounds < retrieve);
+        assert!(prefix.contains(".min(crate::retrieval::CONSERVATIVE_DEFERRED_RANGE_BYTES)"));
+        assert!(
+            prefix.contains("root.span <= crate::retrieval::CONSERVATIVE_DEFERRED_RANGE_BYTES")
+        );
+        assert!(prefix.contains("bytes.len()).ok()? == expected_len"));
+        assert_eq!(
+            prefix
+                .matches("retrieve_data_range_from_root_conservative(")
+                .count(),
+            1
+        );
+        assert!(!prefix.contains("raw_feed_payload_from_update"));
+        assert!(!prefix.contains("async_std::future::timeout"));
+        assert!(!prefix.contains("RetrieveCancelToken"));
+
+        for span in [4_097_u64, 8_192, 65_537] {
+            for requested in [1_u64, 4_095, 4_096, 8_192] {
+                let maximum = requested.min(4_096);
+                let length = span.min(maximum);
+                let start = 0_u64;
+                let end_inclusive = start + length - 1;
+                assert_eq!(start, 0);
+                assert!((1..=4_096).contains(&(end_inclusive - start + 1)));
+                assert_eq!(end_inclusive + 1, length);
+            }
+        }
     }
 
     #[test]

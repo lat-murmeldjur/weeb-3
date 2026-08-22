@@ -9,13 +9,13 @@ use crate::{
     },
     mpsc,
     retrieval::{
-        DecodedJoinChunk, retrieve_data, retrieve_data_range_from_root,
-        retrieve_data_range_from_root_cancellable, retrieve_data_range_from_root_conservative,
-        retrieve_decoded_data_root, retrieve_decoded_data_root_cancellable,
-        retrieve_feed_update_at_index, retrieve_feed_update_at_index_bounded,
-        retrieve_feed_update_at_index_retained_status, retrieve_feed_update_at_index_status,
-        seek_latest_feed_update, seek_latest_feed_update_indexed_from,
-        seek_latest_feed_update_indexed_observing_positive,
+        DecodedJoinChunk, RawFetchLifecycleFactory, retrieve_data, retrieve_data_range_from_root,
+        retrieve_data_range_from_root_cancellable_with_lifecycle_factory,
+        retrieve_data_range_from_root_conservative, retrieve_decoded_data_root,
+        retrieve_decoded_data_root_cancellable, retrieve_feed_update_at_index,
+        retrieve_feed_update_at_index_bounded, retrieve_feed_update_at_index_retained_status,
+        retrieve_feed_update_at_index_status, seek_latest_feed_update,
+        seek_latest_feed_update_indexed_from, seek_latest_feed_update_indexed_observing_positive,
         seek_latest_feed_update_indexed_wide_bounded,
     },
     retrieve_cancel_token_current,
@@ -273,6 +273,18 @@ impl DeferredRawFeedPayload {
     }
 }
 
+/// An authenticated leading range of a deferred feed payload.
+///
+/// `bytes` is shorter than `payload_span`; keeping this distinct from
+/// [`RawFeedPayload`] prevents a bounded startup range from being mistaken for
+/// a completely retrieved feed payload.
+#[derive(Clone, Debug)]
+pub(crate) struct DeferredRawFeedPayloadPrefix {
+    pub(crate) index: u64,
+    pub(crate) payload_span: u64,
+    pub(crate) bytes: Vec<u8>,
+}
+
 fn deferred_raw_feed_payload_root(
     deferred: &DeferredRawFeedPayload,
 ) -> Option<(DecodedJoinChunk, bool)> {
@@ -353,36 +365,63 @@ async fn raw_feed_payload_from_update_bounded(
     None
 }
 
+enum ObservedRawFeedPayload {
+    Complete(RawFeedPayload),
+    Deferred(DeferredRawFeedPayload),
+}
+
 fn decode_observed_feed_updates(
-    payloads: mpsc::Sender<RawFeedPayload>,
+    payloads: Option<mpsc::Sender<RawFeedPayload>>,
+    deferred_payloads: Option<mpsc::Sender<DeferredRawFeedPayload>>,
     maximum_index: Option<u64>,
     chunk_retrieve_chan: &ChunkRetrieveSender,
-) -> mpsc::Sender<(u64, Vec<u8>)> {
+) -> Option<mpsc::Sender<(u64, Vec<u8>)>> {
+    if payloads.is_none() && deferred_payloads.is_none() {
+        return None;
+    }
     let (updates_out, updates_in) = mpsc::bounded::<(u64, Vec<u8>)>(16);
     let chunk_retrieve_chan = chunk_retrieve_chan.clone();
+    let decode_complete = payloads.is_some();
     wasm_bindgen_futures::spawn_local(async move {
+        let mut payloads = payloads;
         let mut decoded = updates_in
             .map(move |(index, update)| {
                 let chunk_retrieve_chan = chunk_retrieve_chan.clone();
                 async move {
-                    if maximum_index.is_some_and(|maximum| index > maximum)
-                        || decode_span(&update).is_some_and(|(_, span)| span > CHUNK_SIZE as u64)
-                    {
+                    if decode_span(&update).is_some_and(|(_, span)| span > CHUNK_SIZE as u64) {
+                        return defer_large_raw_feed_update(index, update)
+                            .map(ObservedRawFeedPayload::Deferred);
+                    }
+                    if maximum_index.is_some_and(|maximum| index > maximum) || !decode_complete {
                         return None;
                     }
                     raw_feed_payload_from_update(&update, &chunk_retrieve_chan)
                         .await
-                        .map(|bytes| RawFeedPayload { index, bytes })
+                        .map(|bytes| {
+                            ObservedRawFeedPayload::Complete(RawFeedPayload { index, bytes })
+                        })
                 }
             })
             .buffer_unordered(OBSERVED_FEED_PAYLOAD_DECODES);
-        while let Some(Some(payload)) = decoded.next().await {
-            if payloads.send(payload).await.is_err() {
-                return;
+        while let Some(Some(observed)) = decoded.next().await {
+            match observed {
+                ObservedRawFeedPayload::Complete(payload) => {
+                    let Some(output) = payloads.as_ref() else {
+                        continue;
+                    };
+                    if output.send(payload).await.is_err() {
+                        payloads = None;
+                    }
+                }
+                ObservedRawFeedPayload::Deferred(payload) => {
+                    if let Some(output) = deferred_payloads.as_ref() {
+                        let _ = output.try_send(payload);
+                    }
+                }
             }
         }
     });
-    updates_out
+    Some(updates_out)
 }
 
 pub(crate) async fn acquire_raw_feed_payload_at_index(
@@ -488,6 +527,38 @@ pub(crate) async fn probe_deferred_raw_feed_payload_tail_conservative(
     (u64::try_from(tail.len()).ok()? == expected_len).then_some(tail)
 }
 
+pub(crate) async fn acquire_deferred_raw_feed_payload_prefix_conservative(
+    deferred: &DeferredRawFeedPayload,
+    maximum_prefix_bytes: usize,
+    chunk_retrieve_chan: &ChunkRetrieveSender,
+) -> Option<DeferredRawFeedPayloadPrefix> {
+    let maximum_prefix_bytes = u64::try_from(maximum_prefix_bytes)
+        .ok()?
+        .min(crate::retrieval::CONSERVATIVE_DEFERRED_RANGE_BYTES);
+    let (root, encrypted) = deferred_raw_feed_payload_root(deferred)?;
+    if root.span <= crate::retrieval::CONSERVATIVE_DEFERRED_RANGE_BYTES
+        || !manifest_payload_size_allowed(root.span)
+    {
+        return None;
+    }
+    let (start, end_inclusive) =
+        conservative_deferred_payload_range(root.span, 0, maximum_prefix_bytes)?;
+    let expected_len = end_inclusive.checked_sub(start)?.checked_add(1)?;
+    let bytes = retrieve_data_range_from_root_conservative(
+        root,
+        start,
+        end_inclusive,
+        encrypted,
+        chunk_retrieve_chan,
+    )
+    .await?;
+    (u64::try_from(bytes.len()).ok()? == expected_len).then_some(DeferredRawFeedPayloadPrefix {
+        index: deferred.index,
+        payload_span: deferred.span,
+        bytes,
+    })
+}
+
 pub(crate) async fn acquire_deferred_raw_feed_payload_conservative<F, Fut>(
     deferred: DeferredRawFeedPayload,
     maximum_payload_bytes: usize,
@@ -548,24 +619,6 @@ pub(crate) async fn acquire_raw_feed_payload_at_index_bounded(
     Some(RawFeedPayload { index, bytes })
 }
 
-pub(crate) async fn acquire_latest_raw_feed_payload_startup(
-    owner: String,
-    topic: String,
-    chunk_retrieve_chan: &ChunkRetrieveSender,
-    early_payloads: Option<mpsc::Sender<RawFeedPayload>>,
-    early_payload_max_index: Option<u64>,
-) -> Option<RawFeedPayload> {
-    acquire_latest_raw_feed_payload_startup_observing_deferred(
-        owner,
-        topic,
-        chunk_retrieve_chan,
-        early_payloads,
-        early_payload_max_index,
-    )
-    .await
-    .map(|resolved| resolved.playable)
-}
-
 pub(crate) async fn acquire_latest_raw_feed_payload_startup_observing_deferred(
     owner: String,
     topic: String,
@@ -573,8 +626,36 @@ pub(crate) async fn acquire_latest_raw_feed_payload_startup_observing_deferred(
     early_payloads: Option<mpsc::Sender<RawFeedPayload>>,
     early_payload_max_index: Option<u64>,
 ) -> Option<StartupRawFeedPayload> {
-    let early_updates = early_payloads.map(|payloads| {
-        decode_observed_feed_updates(payloads, early_payload_max_index, chunk_retrieve_chan)
+    acquire_latest_raw_feed_payload_startup_observing_updates(
+        owner,
+        topic,
+        chunk_retrieve_chan,
+        early_payloads,
+        early_payload_max_index,
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn acquire_latest_raw_feed_payload_startup_observing_updates(
+    owner: String,
+    topic: String,
+    chunk_retrieve_chan: &ChunkRetrieveSender,
+    early_payloads: Option<mpsc::Sender<RawFeedPayload>>,
+    early_payload_max_index: Option<u64>,
+    observed_deferred: Option<mpsc::Sender<DeferredRawFeedPayload>>,
+) -> Option<StartupRawFeedPayload> {
+    // Keep the wide startup search when there is no progressive complete-payload
+    // observer. The bounded positive-observation frontier is selected only by
+    // the same condition as before; a deferred observer alone must not narrow
+    // the search.
+    let early_updates = early_payloads.and_then(|payloads| {
+        decode_observed_feed_updates(
+            Some(payloads),
+            observed_deferred.clone(),
+            early_payload_max_index,
+            chunk_retrieve_chan,
+        )
     });
     let (index, update) = match early_updates {
         Some(early_updates) => {
@@ -593,7 +674,16 @@ pub(crate) async fn acquire_latest_raw_feed_payload_startup_observing_deferred(
                 chunk_retrieve_chan,
             )
             .await?;
-            if decode_span(&update).is_some_and(|(_, span)| span > CHUNK_SIZE as u64)
+            let large_update =
+                decode_span(&update).is_some_and(|(_, span)| span > CHUNK_SIZE as u64);
+            let deferred = large_update
+                .then(|| defer_large_raw_feed_update(index, update.clone()))
+                .flatten();
+            if let (Some(output), Some(deferred)) = (observed_deferred.as_ref(), deferred.as_ref())
+            {
+                let _ = output.try_send(deferred.clone());
+            }
+            if large_update
                 && let Some(previous_index) = index.checked_sub(1)
                 && let Some(previous) = retrieve_feed_update_at_index_bounded(
                     owner,
@@ -610,7 +700,7 @@ pub(crate) async fn acquire_latest_raw_feed_payload_startup_observing_deferred(
                         index: previous_index,
                         bytes,
                     },
-                    observed_deferred: defer_large_raw_feed_update(index, update),
+                    observed_deferred: deferred,
                 });
             }
             (index, update)
@@ -636,8 +726,42 @@ where
     AdmitWave: Fn(usize) -> AdmitFuture,
     AdmitFuture: std::future::Future<Output = bool>,
 {
-    let observed_updates = observed_payloads
-        .map(|payloads| decode_observed_feed_updates(payloads, None, chunk_retrieve_chan));
+    acquire_latest_raw_feed_payload_bounded_from_observing_deferred(
+        owner,
+        topic,
+        initial,
+        force_coarse,
+        chunk_retrieve_chan,
+        admit_wave,
+        observed_payloads,
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn acquire_latest_raw_feed_payload_bounded_from_observing_deferred<
+    AdmitWave,
+    AdmitFuture,
+>(
+    owner: String,
+    topic: String,
+    initial: RawFeedPayload,
+    force_coarse: bool,
+    chunk_retrieve_chan: &ChunkRetrieveSender,
+    admit_wave: AdmitWave,
+    observed_payloads: Option<mpsc::Sender<RawFeedPayload>>,
+    observed_deferred: Option<mpsc::Sender<DeferredRawFeedPayload>>,
+) -> Option<(RawFeedPayload, bool)>
+where
+    AdmitWave: Fn(usize) -> AdmitFuture,
+    AdmitFuture: std::future::Future<Output = bool>,
+{
+    let observed_updates = decode_observed_feed_updates(
+        observed_payloads,
+        observed_deferred,
+        None,
+        chunk_retrieve_chan,
+    );
     let ((index, update), verified) = overscan_sequence_feed_candidate(
         (initial.index, Vec::new()),
         force_coarse,
@@ -1356,6 +1480,7 @@ pub async fn acquire_resolved_range(
         chunk_retrieve_chan,
         None,
         None,
+        None,
     )
     .await
 }
@@ -1367,6 +1492,7 @@ pub async fn acquire_resolved_range_cancellable(
     chunk_retrieve_chan: &ChunkRetrieveSender,
     cancel: Option<RetrieveCancelToken>,
     cancel_generations: Option<RetrieveGenerationMap>,
+    raw_fetch_lifecycle_factory: Option<RawFetchLifecycleFactory>,
 ) -> Option<(Vec<u8>, BzzMetadata)> {
     if start > end_inclusive || start >= metadata.size {
         return None;
@@ -1390,6 +1516,7 @@ pub async fn acquire_resolved_range_cancellable(
             chunk_retrieve_chan,
             cancel.clone(),
             cancel_generations.clone(),
+            raw_fetch_lifecycle_factory.clone(),
         )
         .await;
 
@@ -1430,6 +1557,7 @@ pub async fn retrieve_data_range_cancellable(
     chunk_retrieve_chan: &ChunkRetrieveSender,
     cancel: Option<RetrieveCancelToken>,
     cancel_generations: Option<RetrieveGenerationMap>,
+    raw_fetch_lifecycle_factory: Option<RawFetchLifecycleFactory>,
 ) -> Vec<u8> {
     if start > end_inclusive {
         return vec![];
@@ -1476,7 +1604,7 @@ pub async fn retrieve_data_range_cancellable(
     let payload_start = start.max(8) - 8;
     let payload_end = end_inclusive - 8;
     let encrypted = data_address.len() == 64;
-    let Some(payload) = retrieve_data_range_from_root_cancellable(
+    let Some(payload) = retrieve_data_range_from_root_cancellable_with_lifecycle_factory(
         root,
         payload_start,
         payload_end,
@@ -1484,6 +1612,7 @@ pub async fn retrieve_data_range_cancellable(
         chunk_retrieve_chan,
         cancel_generations.clone(),
         cancel.clone(),
+        raw_fetch_lifecycle_factory,
     )
     .await
     else {

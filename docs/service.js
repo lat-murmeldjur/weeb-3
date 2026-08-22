@@ -10,11 +10,14 @@ const RAW_ROUTE_KINDS = [
 ];
 const FETCH_TIMEOUT_MS = 240000;
 const SERVICE_WORKER_MARKER = "forwarder-default20";
-const SERVICE_WORKER_PROTOCOL = 7;
+const SERVICE_WORKER_PROTOCOL = 8;
 const MIB_BYTES = 1024 * 1024;
 const STREAM_STORAGE_WINDOW_BYTES = MIB_BYTES / 2;
 const STREAM_LOOKAHEAD_CHUNKS = 8;
 const HLS_STREAM_LOOKAHEAD_CHUNKS = 4;
+const HLS_STREAM_READY_ADMISSION_THRESHOLD = HLS_STREAM_LOOKAHEAD_CHUNKS - 1;
+const HLS_STREAM_MAX_OUTSTANDING =
+  HLS_STREAM_LOOKAHEAD_CHUNKS + HLS_STREAM_READY_ADMISSION_THRESHOLD - 1;
 const HLS_REQUEST_FLIGHTS = new Map();
 const CLIENT_RUNTIME_PROBES = new Map();
 const CLIENT_RUNTIME_PROBE_TIMEOUT_MS = 1_500;
@@ -632,50 +635,158 @@ function requestRustRange(clients, url, start, end, networkId, streamToken = "")
   });
 }
 
-function createRustRangeStream(clients, url, size, networkId, stagedStart, streamToken = "") {
+function parseCriticalPrefixWindows(value, size) {
+  if (!/^[1-9][0-9]*$/.test(value || "") || !Number.isSafeInteger(size) || size <= 0) {
+    return null;
+  }
+  const requested = Number(value);
+  const total = Math.ceil(size / STREAM_STORAGE_WINDOW_BYTES);
+  return Number.isSafeInteger(requested) && requested > 0
+    ? Math.min(requested, total)
+    : null;
+}
+
+function createRustRangeStream(
+  clients,
+  url,
+  size,
+  networkId,
+  stagedStart,
+  streamToken = "",
+  criticalPrefixWindows = null
+) {
   let position = 0;
   let schedulePosition = 0;
   const lookahead = stagedStart ? HLS_STREAM_LOOKAHEAD_CHUNKS : STREAM_LOOKAHEAD_CHUNKS;
+  const managedPrefixEnd = stagedStart && Number.isSafeInteger(criticalPrefixWindows)
+    ? Math.min(size, criticalPrefixWindows * STREAM_STORAGE_WINDOW_BYTES)
+    : 0;
   let schedulingAdmissionOpen = true;
   let lookaheadAdmitted = !stagedStart;
+  let knownRangeFailure = false;
   const scheduled = new Map();
+  const activeRequests = new Map();
+  const retainedResponses = new Map();
 
-  const admitNextRange = () => {
+  const nextRangeBounds = () => {
     if (!schedulingAdmissionOpen || schedulePosition >= size) {
       return null;
     }
 
     const start = schedulePosition;
     const end = Math.min(start + STREAM_STORAGE_WINDOW_BYTES - 1, size - 1);
+    schedulePosition = end + 1;
+    return { start, end };
+  };
+
+  const admitOrdinaryRange = () => {
+    const range = nextRangeBounds();
+    if (!range) {
+      return null;
+    }
+    const { start, end } = range;
     const request = requestRustRange(clients, url, start, end, networkId, streamToken);
     scheduled.set(start, request);
-    schedulePosition = end + 1;
+    return { start, request };
+  };
+
+  const admitStagedRange = () => {
+    const range = nextRangeBounds();
+    if (!range) {
+      return null;
+    }
+    const { start, end } = range;
+    const pending = requestRustRange(clients, url, start, end, networkId, streamToken);
+    let request;
+    request = pending.then(
+      (response) => {
+        activeRequests.delete(start);
+        const result = { response };
+        retainedResponses.set(start, result);
+        if (!response || !response.ok) {
+          knownRangeFailure = true;
+        } else if (schedulingAdmissionOpen && position >= managedPrefixEnd) {
+          scheduleMore();
+        }
+        return result;
+      },
+      (error) => {
+        activeRequests.delete(start);
+        const result = { error };
+        retainedResponses.set(start, result);
+        knownRangeFailure = true;
+        return result;
+      }
+    );
+    activeRequests.set(start, request);
     return { start, request };
   };
 
   const scheduleMore = () => {
-    if (!schedulingAdmissionOpen || !lookaheadAdmitted) {
+    if (!schedulingAdmissionOpen || !lookaheadAdmitted || knownRangeFailure) {
       return;
     }
-    while (schedulePosition < size && scheduled.size < lookahead) {
-      if (!admitNextRange()) {
+
+    if (!stagedStart) {
+      while (schedulePosition < size && scheduled.size < lookahead) {
+        if (!admitOrdinaryRange()) {
+          break;
+        }
+      }
+      return;
+    }
+
+    if (position < managedPrefixEnd) {
+      if (activeRequests.size + retainedResponses.size < 1) {
+        admitStagedRange();
+      }
+      return;
+    }
+
+    while (
+      schedulePosition < size
+      && activeRequests.size < HLS_STREAM_LOOKAHEAD_CHUNKS
+      && retainedResponses.size < HLS_STREAM_READY_ADMISSION_THRESHOLD
+      && activeRequests.size + retainedResponses.size < HLS_STREAM_MAX_OUTSTANDING
+    ) {
+      if (!admitStagedRange()) {
         break;
       }
     }
   };
 
   const drainScheduledRanges = () => {
-    const dispatched = Array.from(scheduled.values());
+    const dispatched = stagedStart
+      ? Array.from(activeRequests.values())
+      : Array.from(scheduled.values());
     return Promise.allSettled(dispatched).then(() => {
+      activeRequests.clear();
+      retainedResponses.clear();
       scheduled.clear();
     });
+  };
+
+  const closeAdmission = () => {
+    schedulingAdmissionOpen = false;
+    lookaheadAdmitted = false;
+  };
+
+  const failStream = async (controller, error) => {
+    if (!schedulingAdmissionOpen) {
+      return;
+    }
+    closeAdmission();
+    controller.error(error);
+    await drainScheduledRanges();
   };
 
   return new ReadableStream({
     async pull(controller) {
       try {
         if (position >= size) {
+          closeAdmission();
           controller.close();
+          await drainScheduledRanges();
           return;
         }
 
@@ -683,23 +794,61 @@ function createRustRangeStream(clients, url, size, networkId, stagedStart, strea
           scheduleMore();
         }
         const start = Math.floor(position / STREAM_STORAGE_WINDOW_BYTES) * STREAM_STORAGE_WINDOW_BYTES;
-        let request = scheduled.get(start);
-        if (!request) {
-          const foreground = admitNextRange();
-          if (!foreground || foreground.start !== start) {
-            controller.error(new Error("weeb-3 foreground stream window was not admitted"));
+        let response;
+        if (stagedStart) {
+          let result = retainedResponses.get(start);
+          if (!result) {
+            let request = activeRequests.get(start);
+            if (!request) {
+              const foreground = admitStagedRange();
+              if (!foreground || foreground.start !== start) {
+                await failStream(
+                  controller,
+                  new Error("weeb-3 foreground stream window was not admitted")
+                );
+                return;
+              }
+              request = foreground.request;
+            }
+            result = await request;
+          }
+          retainedResponses.delete(start);
+          if (!schedulingAdmissionOpen) {
             return;
           }
-          request = foreground.request;
+          if (result.error) {
+            await failStream(
+              controller,
+              result.error instanceof Error ? result.error : new Error(String(result.error))
+            );
+            return;
+          }
+          response = result.response;
+        } else {
+          let request = scheduled.get(start);
+          if (!request) {
+            const foreground = admitOrdinaryRange();
+            if (!foreground || foreground.start !== start) {
+              await failStream(
+                controller,
+                new Error("weeb-3 foreground stream window was not admitted")
+              );
+              return;
+            }
+            request = foreground.request;
+          }
+          response = await request;
+          scheduled.delete(start);
         }
 
-        const response = await request;
-        scheduled.delete(start);
         if (!schedulingAdmissionOpen) {
           return;
         }
         if (!response || !response.ok) {
-          controller.error(new Error(response && response.error ? response.error : "weeb-3 range request failed"));
+          await failStream(
+            controller,
+            new Error(response && response.error ? response.error : "weeb-3 range request failed")
+          );
           return;
         }
 
@@ -710,13 +859,12 @@ function createRustRangeStream(clients, url, size, networkId, stagedStart, strea
         scheduleMore();
       } catch (error) {
         if (schedulingAdmissionOpen) {
-          controller.error(error);
+          await failStream(controller, error);
         }
       }
     },
     cancel() {
-      schedulingAdmissionOpen = false;
-      lookaheadAdmitted = false;
+      closeAdmission();
       return drainScheduledRanges();
     }
   });
@@ -754,13 +902,20 @@ async function forwardRequestToRust(request, event) {
       const size = Number(headers.get("Content-Length") || "0");
       const stagedStart = headers.get("X-Weeb3-Stream-Start") === "1";
       const streamToken = headers.get("X-Weeb3-Stream-Token") || "";
+      const criticalPrefixWindows = stagedStart
+        ? parseCriticalPrefixWindows(
+            headers.get("X-Weeb3-HLS-Critical-Prefix-Windows"),
+            size
+          )
+        : null;
       return new Response(createRustRangeStream(
         clients,
         request.url,
         size,
         networkId,
         stagedStart,
-        streamToken
+        streamToken,
+        criticalPrefixWindows
       ), {
         status,
         headers

@@ -83,6 +83,8 @@ thread_local! {
         const { RefCell::new(None) };
     static SERVICE_WORKER_BRIDGE_LISTENER: RefCell<Option<Closure<dyn FnMut(MessageEvent)>>> =
         const { RefCell::new(None) };
+    static BFCACHE_PAGESHOW_LISTENER: RefCell<Option<Closure<dyn FnMut(Event)>>> =
+        const { RefCell::new(None) };
 }
 
 pub(crate) fn begin_interface_mount() -> u64 {
@@ -295,7 +297,43 @@ fn handle_service_worker_bridge_event(event: MessageEvent) {
     }
 }
 
+fn pageshow_event_is_persisted(event: &Event) -> bool {
+    Reflect::get(event.as_ref(), &JsValue::from_str("persisted"))
+        .ok()
+        .and_then(|persisted| persisted.as_bool())
+        .unwrap_or(false)
+}
+
+fn install_bfcache_restore_guard() {
+    BFCACHE_PAGESHOW_LISTENER.with(|listener| {
+        if listener.borrow().is_some() {
+            return;
+        }
+
+        let Some(window) = web_sys::window() else {
+            return;
+        };
+        let mut reload_requested = false;
+        let callback = Closure::<dyn FnMut(Event)>::new(move |event| {
+            if reload_requested || !pageshow_event_is_persisted(&event) {
+                return;
+            }
+            reload_requested = true;
+            if let Some(window) = web_sys::window() {
+                let _ = window.location().reload();
+            }
+        });
+        if window
+            .add_event_listener_with_callback("pageshow", callback.as_ref().unchecked_ref())
+            .is_ok()
+        {
+            *listener.borrow_mut() = Some(callback);
+        }
+    });
+}
+
 pub(crate) fn install_service_worker_message_bridge(weeb3: Arc<Weeb3>) {
+    install_bfcache_restore_guard();
     SERVICE_WORKER_BRIDGE_CLIENT.with(|client| {
         *client.borrow_mut() = Some(weeb3);
     });

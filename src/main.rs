@@ -1,5 +1,6 @@
 use anyhow::Result;
 
+use std::borrow::Cow;
 use std::net::IpAddr;
 use std::net::Ipv4Addr;
 use std::net::SocketAddr;
@@ -8,11 +9,18 @@ use tower_http::cors::{Any, CorsLayer};
 
 use axum::extract::OriginalUri;
 use axum::extract::Path;
+use axum::http::HeaderMap;
+use axum::http::HeaderName;
 use axum::http::StatusCode;
-use axum::http::header::CONTENT_TYPE;
-use axum::response::{Html, IntoResponse};
+use axum::http::header::{CACHE_CONTROL, CONTENT_TYPE, ETAG, IF_NONE_MATCH};
+use axum::response::{Html, IntoResponse, Response};
 use axum::{Router, http::Method, routing::get};
 use axum_server::tls_rustls::RustlsConfig;
+
+const EMBEDDED_ASSET_BUILD_VERSION: &str = env!("WEEB3_ASSET_VERSION");
+const EMBEDDED_ASSET_ETAG: &str = concat!("\"", env!("WEEB3_ASSET_VERSION"), "\"");
+const WEEB3_BUILD_VERSION_HEADER: HeaderName = HeaderName::from_static("x-weeb3-build-version");
+const REVALIDATE_EMBEDDED_ASSET: &str = "private, no-cache";
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> anyhow::Result<()> {
@@ -71,7 +79,7 @@ pub(crate) async fn serve(listen_addr: Ipv4Addr) {
         .unwrap();
 }
 
-async fn get_index() -> Result<Html<String>, StatusCode> {
+async fn get_index() -> Result<impl IntoResponse, StatusCode> {
     let content = StaticFiles::get("index.html")
         .ok_or(StatusCode::NOT_FOUND)?
         .data;
@@ -80,10 +88,16 @@ async fn get_index() -> Result<Html<String>, StatusCode> {
         .expect("index.html to be valid utf8")
         .to_string();
 
-    Ok(Html(html))
+    Ok((
+        [
+            (CACHE_CONTROL, "no-store"),
+            (WEEB3_BUILD_VERSION_HEADER, EMBEDDED_ASSET_BUILD_VERSION),
+        ],
+        Html(html),
+    ))
 }
 
-async fn get_example(uri: OriginalUri) -> Result<Html<String>, StatusCode> {
+async fn get_example(uri: OriginalUri) -> Result<impl IntoResponse, StatusCode> {
     let path = match uri.path() {
         "/example.html" => "example.html",
         "/weeb-3/hls-stream-example.html" => "hls-stream-example.html",
@@ -95,12 +109,18 @@ async fn get_example(uri: OriginalUri) -> Result<Html<String>, StatusCode> {
         .expect("embedded HTML example to be valid utf8")
         .to_string();
 
-    Ok(Html(html))
+    Ok((
+        [
+            (CACHE_CONTROL, "no-store"),
+            (WEEB3_BUILD_VERSION_HEADER, EMBEDDED_ASSET_BUILD_VERSION),
+        ],
+        Html(html),
+    ))
 }
 
 async fn get_stream(
     Path((owner, topic)): Path<(String, String)>,
-) -> Result<Html<String>, StatusCode> {
+) -> Result<impl IntoResponse, StatusCode> {
     if owner.len() != 40
         || !owner.bytes().all(|byte| byte.is_ascii_hexdigit())
         || topic.is_empty()
@@ -113,7 +133,36 @@ async fn get_stream(
     get_index().await
 }
 
-async fn get_static_file(uri: OriginalUri) -> Result<impl IntoResponse, StatusCode> {
+fn embedded_asset_is_current(headers: &HeaderMap) -> bool {
+    headers
+        .get_all(IF_NONE_MATCH)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .any(|values| {
+            values.split(',').map(str::trim).any(|value| {
+                value == "*" || value.strip_prefix("W/").unwrap_or(value) == EMBEDDED_ASSET_ETAG
+            })
+        })
+}
+
+fn embedded_asset_response(
+    request_headers: &HeaderMap,
+    content: Cow<'static, [u8]>,
+    content_type: &'static str,
+) -> Response {
+    let response_headers = [
+        (CONTENT_TYPE, content_type),
+        (CACHE_CONTROL, REVALIDATE_EMBEDDED_ASSET),
+        (ETAG, EMBEDDED_ASSET_ETAG),
+        (WEEB3_BUILD_VERSION_HEADER, EMBEDDED_ASSET_BUILD_VERSION),
+    ];
+    if embedded_asset_is_current(request_headers) {
+        return (StatusCode::NOT_MODIFIED, response_headers).into_response();
+    }
+    (response_headers, content).into_response()
+}
+
+async fn get_static_file(headers: HeaderMap, uri: OriginalUri) -> Result<Response, StatusCode> {
     let (path, content_type) = match uri.path() {
         "/weeb-3/weeb_3.js" => ("weeb_3.js", "text/javascript"),
         "/weeb-3/weeb_3_bg.wasm" => ("weeb_3_bg.wasm", "application/wasm"),
@@ -121,10 +170,24 @@ async fn get_static_file(uri: OriginalUri) -> Result<impl IntoResponse, StatusCo
         _ => return Err(StatusCode::NOT_FOUND),
     };
     let content = StaticFiles::get(path).ok_or(StatusCode::NOT_FOUND)?.data;
-    Ok(([(CONTENT_TYPE, content_type)], content))
+    if path == "service.js" {
+        return Ok((
+            [
+                (CONTENT_TYPE, content_type),
+                (CACHE_CONTROL, "no-store"),
+                (WEEB3_BUILD_VERSION_HEADER, EMBEDDED_ASSET_BUILD_VERSION),
+            ],
+            content,
+        )
+            .into_response());
+    }
+    Ok(embedded_asset_response(&headers, content, content_type))
 }
 
-async fn get_static_snippet(Path(path): Path<String>) -> Result<impl IntoResponse, StatusCode> {
+async fn get_static_snippet(
+    headers: HeaderMap,
+    Path(path): Path<String>,
+) -> Result<Response, StatusCode> {
     if !path.ends_with(".js")
         || path
             .split('/')
@@ -138,10 +201,14 @@ async fn get_static_snippet(Path(path): Path<String>) -> Result<impl IntoRespons
         .ok_or(StatusCode::NOT_FOUND)?
         .data;
 
-    Ok(([(CONTENT_TYPE, "text/javascript")], content))
+    Ok(embedded_asset_response(
+        &headers,
+        content,
+        "text/javascript",
+    ))
 }
 
-async fn get_404() -> Result<Html<String>, StatusCode> {
+async fn get_404() -> Result<impl IntoResponse, StatusCode> {
     let content = StaticFiles::get("404.html")
         .ok_or(StatusCode::NOT_FOUND)?
         .data;
@@ -150,5 +217,11 @@ async fn get_404() -> Result<Html<String>, StatusCode> {
         .expect("404.html to be valid utf8")
         .to_string();
 
-    Ok(Html(html))
+    Ok((
+        [
+            (CACHE_CONTROL, "no-store"),
+            (WEEB3_BUILD_VERSION_HEADER, EMBEDDED_ASSET_BUILD_VERSION),
+        ],
+        Html(html),
+    ))
 }

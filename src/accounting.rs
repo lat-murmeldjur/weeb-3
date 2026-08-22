@@ -18,7 +18,11 @@ pub(crate) fn refreshment_due(balance: u64, last_refreshment: f64, payment_thres
 }
 
 pub(crate) fn connection_dial_capacity_available(connected: u64, ongoing: u64) -> bool {
-    connected.saturating_add(ongoing) < CONNECTION_BUILDUP_LIMIT
+    connection_population_deficit(connected, ongoing) > 0
+}
+
+pub(crate) fn connection_population_deficit(connected: u64, ongoing: u64) -> u64 {
+    CONNECTION_BUILDUP_LIMIT.saturating_sub(connected.saturating_add(ongoing))
 }
 
 pub(crate) fn bee_reconnect_delay_seconds(

@@ -16,7 +16,16 @@ use crate::{
     get_feed_address, get_proximity, mpsc, price, reserve,
     retrieval_conventions::SingleflightRegistry,
     retrieval_conventions::{
-        RetrieveAdmission, retained_feed_probe_empty_is_missing, retrieve_admission_current,
+        RetrieveAdmission, RetrieveHedgeDemand, SharedRetrieveHedgeDemand,
+        retained_feed_probe_empty_is_missing, retrieve_admission_current,
+        retrieve_attempt_start_allowed, rolling_full_group_eligible,
+        rolling_full_group_static_candidate, rolling_next_parity_index,
+        rolling_parity_admission_count,
+    },
+    retrieval_profile::{
+        RetrieveAttemptOutcome, RetrieveAttemptProfile, RetrieveProfileRequest,
+        RollingGroupProfile, RollingGroupProfileInit, RollingGroupRegistration,
+        RollingGroupTerminalReason,
     },
     retrieve_cancel_token_current, retrieve_handler, transfer_pause_enabled, valid_cac, valid_soc,
 };
@@ -221,6 +230,7 @@ async fn retrieve_attempt(
     refresh_chan: mpsc::Sender<RefreshmentInstruction>,
     result_chan: mpsc::Sender<RetrieveAttemptResult>,
     admission: Option<RetrieveAdmission>,
+    mut profile: Option<RetrieveAttemptProfile>,
 ) {
     let ReservedRetrievePeer {
         peer,
@@ -243,6 +253,7 @@ async fn retrieve_attempt(
 
     match retrieve_result {
         Ok(retrieve_result) => {
+            let response_kind = retrieve_attempt_response_kind(&retrieve_result);
             if matches!(retrieve_result.as_ref(), Ok(chunk) if chunk.is_empty())
                 && let Some(admission) = admission.as_ref()
             {
@@ -257,7 +268,13 @@ async fn retrieve_attempt(
                 retrieve_result,
             )
             .await;
-            let _ = result_chan.try_send(result);
+            if let Some(profile) = profile.as_mut() {
+                profile.complete_immediate(retrieve_attempt_outcome(response_kind, &result));
+            }
+            let result_send_succeeded = result_chan.try_send(result).is_ok();
+            if let Some(profile) = profile.as_ref() {
+                profile.immediate_result_send(result_send_succeeded);
+            }
         }
         Err(_) => {
             if let Some(admission) = admission.as_ref() {
@@ -266,21 +283,63 @@ async fn retrieve_attempt(
             // Ten seconds is terminal for the logical retrieval, so its in-flight slot and
             // dispatcher permit can be released. The dispatched exchange still owns a reserve;
             // keep its response receiver alive in a detached accounting-only settlement task.
-            let _ = result_chan.try_send(failed_retrieve_attempt(&peer));
+            let detached_profile = profile.map(RetrieveAttemptProfile::timed_out);
+            let result_send_succeeded =
+                result_chan.try_send(failed_retrieve_attempt(&peer)).is_ok();
+            if let Some(profile) = detached_profile.as_ref() {
+                profile.timeout_result_send(result_send_succeeded);
+            }
 
             // A timed-out dispatched request must still settle its accounting reserve.
             wasm_bindgen_futures::spawn_local(async move {
-                let _ = settle_retrieve_attempt(
+                let retrieve_result = chunk_in.recv().await;
+                let response_kind = retrieve_attempt_response_kind(&retrieve_result);
+                let result = settle_retrieve_attempt(
                     peer,
                     caddr,
                     req_price,
                     accounting_peer,
                     refresh_chan,
-                    chunk_in.recv().await,
+                    retrieve_result,
                 )
                 .await;
+                if let Some(profile) = detached_profile {
+                    profile.complete(retrieve_attempt_outcome(response_kind, &result));
+                }
             });
         }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum RetrieveAttemptResponseKind {
+    Empty,
+    Nonempty,
+    ChannelClosed,
+}
+
+fn retrieve_attempt_response_kind(
+    retrieve_result: &Result<Vec<u8>, mpsc::RecvError>,
+) -> RetrieveAttemptResponseKind {
+    match retrieve_result {
+        Ok(chunk) if chunk.is_empty() => RetrieveAttemptResponseKind::Empty,
+        Ok(_) => RetrieveAttemptResponseKind::Nonempty,
+        Err(_) => RetrieveAttemptResponseKind::ChannelClosed,
+    }
+}
+
+fn retrieve_attempt_outcome(
+    response_kind: RetrieveAttemptResponseKind,
+    result: &RetrieveAttemptResult,
+) -> RetrieveAttemptOutcome {
+    match response_kind {
+        RetrieveAttemptResponseKind::Empty => RetrieveAttemptOutcome::ConfirmedEmpty,
+        RetrieveAttemptResponseKind::ChannelClosed => RetrieveAttemptOutcome::ChannelClosed,
+        RetrieveAttemptResponseKind::Nonempty if result.valid && result.soc => {
+            RetrieveAttemptOutcome::ValidSoc
+        }
+        RetrieveAttemptResponseKind::Nonempty if result.valid => RetrieveAttemptOutcome::ValidCac,
+        RetrieveAttemptResponseKind::Nonempty => RetrieveAttemptOutcome::InvalidNonempty,
     }
 }
 
@@ -348,6 +407,8 @@ impl DecodedChunkCache {
         let entry = self.chunks.get_mut(reference)?;
         entry.generation = generation;
         let decoded = entry.decoded.clone();
+        // The ordinary fast path needs raw only when it must decode it. In particular, a decoded
+        // cache hit must not clone and touch the raw cache value merely to discard it.
         let raw = decoded.is_none().then(|| entry.raw.clone()).flatten();
         self.finish_touch(reference.to_vec(), generation);
 
@@ -355,11 +416,34 @@ impl DecodedChunkCache {
             return Some(decoded);
         }
 
-        let decoded = decode_raw_join_chunk(raw?.as_ref(), reference)?;
+        let decoded = decode_raw_join_chunk(raw.as_ref()?.as_ref(), reference)?;
         if let Some(entry) = self.chunks.get_mut(reference) {
             entry.decoded = Some(decoded.clone());
         }
         Some(decoded)
+    }
+
+    fn get_decoded_and_raw(
+        &mut self,
+        reference: &[u8],
+    ) -> Option<(DecodedJoinChunk, Option<Rc<[u8]>>)> {
+        self.generation = self.generation.wrapping_add(1);
+        let generation = self.generation;
+        let entry = self.chunks.get_mut(reference)?;
+        entry.generation = generation;
+        let decoded = entry.decoded.clone();
+        let raw = entry.raw.clone();
+        self.finish_touch(reference.to_vec(), generation);
+
+        if let Some(decoded) = decoded {
+            return Some((decoded, raw));
+        }
+
+        let decoded = decode_raw_join_chunk(raw.as_ref()?.as_ref(), reference)?;
+        if let Some(entry) = self.chunks.get_mut(reference) {
+            entry.decoded = Some(decoded.clone());
+        }
+        Some((decoded, raw))
     }
 
     fn get_raw(&mut self, reference: &[u8]) -> Option<Rc<[u8]>> {
@@ -449,8 +533,12 @@ thread_local! {
         RefCell::new(DecodedChunkCache::default());
 }
 
-fn cached_decoded_chunk(reference: &[u8]) -> Option<DecodedJoinChunk> {
+pub(crate) fn cached_decoded_chunk(reference: &[u8]) -> Option<DecodedJoinChunk> {
     RETRIEVE_DECODED_CHUNK_CACHE.with(|cache| cache.borrow_mut().get_decoded(reference))
+}
+
+fn cached_decoded_and_raw_chunk(reference: &[u8]) -> Option<(DecodedJoinChunk, Option<Rc<[u8]>>)> {
+    RETRIEVE_DECODED_CHUNK_CACHE.with(|cache| cache.borrow_mut().get_decoded_and_raw(reference))
 }
 
 fn cached_raw_chunk(reference: &[u8]) -> Option<Rc<[u8]>> {
@@ -492,14 +580,17 @@ async fn recv_raw_result_cancellable(
     receiver: &mpsc::Receiver<RawFetchResult>,
     cancel_generations: &Option<RetrieveGenerationMap>,
     cancel: &Option<RetrieveCancelToken>,
-) -> Option<RawFetchResult> {
+) -> RawFetchReceive {
     if cancel_generations.is_none() || cancel.is_none() {
-        return receiver.recv().await.ok();
+        return match receiver.recv().await {
+            Ok(result) => RawFetchReceive::Result(result),
+            Err(_) => RawFetchReceive::ChannelClosed,
+        };
     }
 
     loop {
         if !join_cancel_token_current(cancel_generations, cancel).await {
-            return None;
+            return RawFetchReceive::Stale;
         }
         match async_std::future::timeout(
             Duration::from_millis(RETRIEVE_CANCEL_POLL_MS),
@@ -507,16 +598,54 @@ async fn recv_raw_result_cancellable(
         )
         .await
         {
-            Ok(result) => return result.ok(),
+            Ok(Ok(result)) => return RawFetchReceive::Result(result),
+            Ok(Err(_)) => return RawFetchReceive::ChannelClosed,
             Err(_) => continue,
         }
     }
+}
+
+enum RawFetchReceive {
+    Result(RawFetchResult),
+    Stale,
+    ChannelClosed,
 }
 
 struct RawFetchResult {
     index: usize,
     chunk: Rc<[u8]>,
     canonical_cac: bool,
+}
+
+pub(crate) trait RawFetchLifecycle {
+    fn finish_registration(
+        self: Box<Self>,
+        registration: RawFetchRegistration,
+        raw_flight_id: Option<u64>,
+    );
+
+    fn leader_selected(&mut self);
+
+    fn leader_registered(&self, raw_flight_id: u64, dispatch_accepted: bool);
+
+    fn complete(self: Box<Self>, raw_flight_id: u64, canonical_cac: bool);
+}
+
+#[derive(Clone)]
+pub(crate) struct RawFetchLifecycleFactory {
+    create: Rc<dyn Fn() -> Box<dyn RawFetchLifecycle>>,
+}
+
+impl RawFetchLifecycleFactory {
+    pub(crate) fn new(create: impl Fn() -> Box<dyn RawFetchLifecycle> + 'static) -> Self {
+        Self {
+            create: Rc::new(create),
+        }
+    }
+
+    fn create(&self) -> Box<dyn RawFetchLifecycle> {
+        (self.create)()
+    }
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -551,11 +680,98 @@ impl RawFetchKey {
 struct RawFetchWaiter {
     index: usize,
     result_chan: mpsc::Sender<RawFetchResult>,
-    cache_reference: Option<Vec<u8>>,
     admission: RetrieveAdmission,
 }
 
-type RawFetchFlights = SingleflightRegistry<RawFetchKey, RawFetchWaiter, RetrieveAdmission>;
+#[derive(Clone)]
+struct RawFetchShared {
+    admission: RetrieveAdmission,
+    hedge_demand: Option<SharedRetrieveHedgeDemand>,
+    cache_references: Rc<RefCell<HashSet<Vec<u8>>>>,
+}
+
+impl RawFetchShared {
+    fn new(hedge_demand: RetrieveHedgeDemand) -> Self {
+        Self {
+            admission: RetrieveAdmission::new(),
+            hedge_demand: (hedge_demand == RetrieveHedgeDemand::DistinctShardManaged)
+                .then(|| SharedRetrieveHedgeDemand::new(hedge_demand)),
+            cache_references: Rc::new(RefCell::new(HashSet::new())),
+        }
+    }
+
+    fn remember_cache_reference(&self, reference: Option<&Vec<u8>>) {
+        if let Some(reference) = reference {
+            self.cache_references.borrow_mut().insert(reference.clone());
+        }
+    }
+}
+
+type RawFetchFlights = SingleflightRegistry<RawFetchKey, RawFetchWaiter, RawFetchShared>;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RawFetchRegistration {
+    Cached,
+    Joined,
+    Led,
+}
+
+fn rolling_group_registration(registration: RawFetchRegistration) -> RollingGroupRegistration {
+    match registration {
+        RawFetchRegistration::Cached => RollingGroupRegistration::Cached,
+        RawFetchRegistration::Joined => RollingGroupRegistration::Joined,
+        RawFetchRegistration::Led => RollingGroupRegistration::Led,
+    }
+}
+
+fn finish_rolling_group_stale(profile: &mut Option<RollingGroupProfile>) {
+    if let Some(profile) = profile.as_mut() {
+        profile.finish_stale_now();
+    }
+}
+
+fn record_rolling_group_result(
+    profile: &mut Option<RollingGroupProfile>,
+    result: &RawFetchResult,
+    data_count: usize,
+    rolling_active_shards: &[bool],
+    rolling_active: usize,
+    successes: usize,
+    completed: usize,
+) {
+    if result.index >= data_count
+        && let Some(profile) = profile.as_mut()
+    {
+        let valid = !result.chunk.is_empty() && result.canonical_cac;
+        let active_after = rolling_active.saturating_sub(usize::from(
+            rolling_active_shards
+                .get(result.index)
+                .copied()
+                .unwrap_or(false),
+        ));
+        profile.parity_result_now(
+            result.index,
+            result.index.saturating_sub(data_count),
+            valid,
+            rolling_active,
+            active_after,
+            successes,
+            successes.saturating_add(usize::from(valid)),
+            completed,
+        );
+    }
+}
+
+fn update_rolling_group_progress(
+    profile: &mut Option<RollingGroupProfile>,
+    successes: usize,
+    completed: usize,
+    active: usize,
+) {
+    if let Some(profile) = profile.as_mut() {
+        profile.progress(successes, completed, active);
+    }
+}
 
 thread_local! {
     static RAW_FETCH_FLIGHTS: RefCell<RawFetchFlights> =
@@ -572,44 +788,45 @@ fn next_conservative_raw_fetch_scope() -> u64 {
 }
 
 fn remove_raw_fetch_waiter(key: &RawFetchKey, flight_id: u64, waiter_id: u64) {
-    let admission = RAW_FETCH_FLIGHTS.with(|flights| {
+    let shared = RAW_FETCH_FLIGHTS.with(|flights| {
         flights
             .borrow_mut()
             .remove_waiter(key, flight_id, waiter_id)
     });
-    if let Some(admission) = admission
+    if let Some(shared) = shared
         && key.conservative_scope.is_none()
     {
         // Keep the flight registered while dispatched accounting work drains.
-        admission.close();
+        shared.admission.close();
     }
 }
 
-fn complete_raw_fetch(key: &RawFetchKey, flight_id: u64, chunk: Vec<u8>) {
+fn complete_raw_fetch(key: &RawFetchKey, flight_id: u64, chunk: Vec<u8>) -> bool {
     let flight = RAW_FETCH_FLIGHTS.with(|flights| flights.borrow_mut().take(key, flight_id));
     let Some(flight) = flight else {
-        return;
+        return false;
     };
     if key.conservative_scope.is_none() {
-        flight.shared.close();
+        flight.shared.admission.close();
     }
 
     let usable = (erasure_coding::SPAN_SIZE..=CHUNK_WITH_SPAN_SIZE).contains(&chunk.len());
     let canonical_cac = usable && valid_cac(&chunk, &key.expected_cac);
     let chunk: Rc<[u8]> = chunk.into();
     let delivered = if usable { chunk } else { Rc::from([]) };
-    let mut cached_references = HashSet::new();
+
+    // Cache ownership belongs to the physical flight, not to its current
+    // logical waiters. A retired caller may have zero waiters when a canonical
+    // late result arrives, and that result must still benefit a later caller.
+    if canonical_cac {
+        for reference in flight.shared.cache_references.borrow().iter() {
+            remember_raw_chunk(reference.clone(), Rc::clone(&delivered));
+        }
+    }
 
     for waiter in flight.waiters {
         if !waiter.admission.is_open() {
             continue;
-        }
-        if canonical_cac {
-            if let Some(reference) = waiter.cache_reference {
-                if cached_references.insert(reference.clone()) {
-                    remember_raw_chunk(reference, Rc::clone(&delivered));
-                }
-            }
         }
         let _ = waiter.result_chan.try_send(RawFetchResult {
             index: waiter.index,
@@ -617,6 +834,7 @@ fn complete_raw_fetch(key: &RawFetchKey, flight_id: u64, chunk: Vec<u8>) {
             canonical_cac,
         });
     }
+    canonical_cac
 }
 
 fn queue_drained_raw_chunk(
@@ -629,7 +847,9 @@ fn queue_drained_raw_chunk(
     admission: &RetrieveAdmission,
     cancel: &Option<RetrieveCancelToken>,
     shared_physical_admission: Option<(u64, &RetrieveAdmission)>,
-) {
+    hedge_demand: RetrieveHedgeDemand,
+    mut lifecycle: Option<Box<dyn RawFetchLifecycle>>,
+) -> RawFetchRegistration {
     if let Some(reference) = cache_reference.as_ref() {
         if let Some(chunk) = cached_raw_chunk(reference) {
             let _ = result_chan.try_send(RawFetchResult {
@@ -637,7 +857,10 @@ fn queue_drained_raw_chunk(
                 chunk,
                 canonical_cac: true,
             });
-            return;
+            if let Some(lifecycle) = lifecycle.take() {
+                lifecycle.finish_registration(RawFetchRegistration::Cached, None);
+            }
+            return RawFetchRegistration::Cached;
         }
     }
 
@@ -654,15 +877,32 @@ fn queue_drained_raw_chunk(
             RawFetchWaiter {
                 index,
                 result_chan: result_chan.clone(),
-                cache_reference,
                 admission: admission.clone(),
             },
             || {
-                shared_physical_admission
-                    .map_or_else(RetrieveAdmission::new, |(_, admission)| admission.clone())
+                let shared = RawFetchShared::new(hedge_demand);
+                if let Some((_, admission)) = shared_physical_admission {
+                    return RawFetchShared {
+                        admission: admission.clone(),
+                        ..shared
+                    };
+                }
+                shared
             },
         )
     });
+    registration
+        .shared
+        .remember_cache_reference(cache_reference.as_ref());
+    if let Some(shared_demand) = registration.shared.hedge_demand.as_ref() {
+        let before = shared_demand.current();
+        shared_demand.promote(hedge_demand);
+        if before == RetrieveHedgeDemand::DistinctShardManaged
+            && shared_demand.current() == RetrieveHedgeDemand::Ordinary
+        {
+            crate::retrieval_profile::record_managed_to_ordinary_promotion();
+        }
+    }
 
     let waiter_key = registration.key.clone();
     let flight_id = registration.flight_id;
@@ -674,23 +914,94 @@ fn queue_drained_raw_chunk(
     });
 
     if !registration.leader {
-        return;
+        if let Some(lifecycle) = lifecycle.take() {
+            lifecycle.finish_registration(RawFetchRegistration::Joined, Some(flight_id));
+        }
+        return RawFetchRegistration::Joined;
+    }
+
+    if let Some(lifecycle) = lifecycle.as_mut() {
+        lifecycle.leader_selected();
     }
 
     let (chan_out, chan_in) = mpsc::unbounded::<Vec<u8>>();
-    let _ = chunk_retrieve_chan.try_send(crate::ChunkRetrieveRequest {
-        address: registration.key.request_address.clone(),
-        chan: chan_out,
-        cancel: cancel.clone(),
-        admission: Some(registration.shared),
-    });
     let completion_key = registration.key;
+    if chunk_retrieve_chan
+        .try_send(crate::ChunkRetrieveRequest {
+            address: completion_key.request_address.clone(),
+            chan: chan_out,
+            cancel: cancel.clone(),
+            admission: Some(registration.shared.admission.clone()),
+            hedge_demand: registration.shared.hedge_demand.clone(),
+            profile: None,
+        })
+        .is_err()
+    {
+        if let Some(lifecycle) = lifecycle.as_ref() {
+            lifecycle.leader_registered(flight_id, false);
+        }
+        let canonical_cac = complete_raw_fetch(&completion_key, flight_id, Vec::new());
+        if let Some(lifecycle) = lifecycle {
+            lifecycle.complete(flight_id, canonical_cac);
+        }
+        return RawFetchRegistration::Led;
+    }
+
+    if let Some(lifecycle) = lifecycle.as_ref() {
+        lifecycle.leader_registered(flight_id, true);
+    }
 
     // The detached producer lets dispatched exchanges settle after callers leave.
     wasm_bindgen_futures::spawn_local(async move {
         let chunk = chan_in.recv().await.unwrap_or_default();
-        complete_raw_fetch(&completion_key, flight_id, chunk);
+        let canonical_cac = complete_raw_fetch(&completion_key, flight_id, chunk);
+        if let Some(lifecycle) = lifecycle {
+            lifecycle.complete(flight_id, canonical_cac);
+        }
     });
+    RawFetchRegistration::Led
+}
+
+/// Synchronously registers one ordinary raw child retrieval and returns only
+/// the future that decodes its eventual canonical result. Endpoint-specific
+/// schedulers may attach a lifecycle without gaining access to raw registry or
+/// waiter internals.
+pub(crate) fn queue_decoded_join_child_cancellable(
+    reference: Vec<u8>,
+    chunk_retrieve_chan: ChunkRetrieveSender,
+    cancel: Option<RetrieveCancelToken>,
+    lifecycle: Box<dyn RawFetchLifecycle>,
+) -> Pin<Box<dyn Future<Output = Option<DecodedJoinChunk>>>> {
+    let Some(address) = reference.get(..HASH_SIZE).map(<[u8]>::to_vec) else {
+        return Box::pin(async { None });
+    };
+    let waiter_admission = RetrieveAdmission::new();
+    let waiter_guard = waiter_admission.close_on_drop();
+    let (result_out, result_in) = mpsc::unbounded::<RawFetchResult>();
+    queue_drained_raw_chunk(
+        0,
+        address.clone(),
+        address,
+        Some(reference.clone()),
+        &chunk_retrieve_chan,
+        &result_out,
+        &waiter_admission,
+        &cancel,
+        None,
+        RetrieveHedgeDemand::Ordinary,
+        Some(lifecycle),
+    );
+
+    Box::pin(async move {
+        // The waiter remains live through raw completion even if its controller
+        // has stopped creating additional work.
+        let _waiter_guard = waiter_guard;
+        let result = result_in.recv().await.ok()?;
+        if result.chunk.is_empty() || !result.canonical_cac {
+            return None;
+        }
+        cached_decoded_chunk(&reference)
+    })
 }
 
 #[inline]
@@ -813,6 +1124,8 @@ async fn retrieve_raw_root_cancellable(
             &admission,
             cancel,
             None,
+            RetrieveHedgeDemand::Ordinary,
+            None,
         );
         next += 1;
         dispatched += 1;
@@ -842,6 +1155,8 @@ async fn retrieve_raw_root_cancellable(
                     &admission,
                     cancel,
                     None,
+                    RetrieveHedgeDemand::Ordinary,
+                    None,
                 );
                 next += 1;
                 dispatched += 1;
@@ -856,7 +1171,8 @@ async fn retrieve_raw_root_cancellable(
             match async_std::future::timeout(Duration::from_millis(remaining), result_in.recv())
                 .await
             {
-                Ok(result) => result.ok(),
+                Ok(Ok(result)) => RawFetchReceive::Result(result),
+                Ok(Err(_)) => RawFetchReceive::ChannelClosed,
                 Err(_) => {
                     if !join_cancel_token_current(cancel_generations, cancel).await {
                         return None;
@@ -873,6 +1189,8 @@ async fn retrieve_raw_root_cancellable(
                             &admission,
                             cancel,
                             None,
+                            RetrieveHedgeDemand::Ordinary,
+                            None,
                         );
                         next += 1;
                         dispatched += 1;
@@ -886,8 +1204,9 @@ async fn retrieve_raw_root_cancellable(
             recv_raw_result_cancellable(&result_in, cancel_generations, cancel).await
         };
 
-        let Some(result) = result else {
-            return None;
+        let result = match result {
+            RawFetchReceive::Result(result) => result,
+            RawFetchReceive::Stale | RawFetchReceive::ChannelClosed => return None,
         };
         completed += 1;
         let accepted = !result.chunk.is_empty() && (result.index == 0 || result.canonical_cac);
@@ -908,6 +1227,15 @@ pub(crate) async fn retrieve_decoded_data_root(
     chunk_retrieve_chan: &ChunkRetrieveSender,
 ) -> Option<DecodedJoinChunk> {
     retrieve_decoded_data_root_cancellable(data_address, chunk_retrieve_chan, None, None).await
+}
+
+pub(crate) fn cached_decoded_data_root(data_address: &[u8]) -> Option<DecodedJoinChunk> {
+    if data_address.len() != HASH_SIZE
+        && data_address.len() != erasure_coding::ENCRYPTED_REFERENCE_SIZE
+    {
+        return None;
+    }
+    cached_decoded_chunk(data_address)
 }
 
 pub(crate) async fn retrieve_decoded_data_root_cancellable(
@@ -958,6 +1286,29 @@ fn padded_rs_shard(chunk: &[u8]) -> Option<Vec<u8>> {
     Some(chunk)
 }
 
+pub(crate) enum RequestedShardCache {
+    DecodedAndRaw {
+        decoded: DecodedJoinChunk,
+        raw: Rc<[u8]>,
+    },
+    DecodedOnly(DecodedJoinChunk),
+    Miss,
+}
+
+pub(crate) fn requested_shard_cache(reference: &[u8]) -> RequestedShardCache {
+    let Some((decoded, raw)) = cached_decoded_and_raw_chunk(reference) else {
+        return RequestedShardCache::Miss;
+    };
+    let canonical_raw = raw.filter(|raw| {
+        (erasure_coding::SPAN_SIZE..=CHUNK_WITH_SPAN_SIZE).contains(&raw.len())
+            && valid_cac(raw, &reference[..HASH_SIZE])
+    });
+    match canonical_raw {
+        Some(raw) => RequestedShardCache::DecodedAndRaw { decoded, raw },
+        None => RequestedShardCache::DecodedOnly(decoded),
+    }
+}
+
 fn dispatch_group_recovery(
     data_references: &[Vec<u8>],
     parity_references: &[Vec<u8>],
@@ -994,6 +1345,8 @@ fn dispatch_group_recovery(
                 result_out,
                 admission,
                 cancel,
+                None,
+                RetrieveHedgeDemand::Ordinary,
                 None,
             );
         }
@@ -1042,11 +1395,41 @@ fn dispatch_group_parity(
             admission,
             cancel,
             None,
+            RetrieveHedgeDemand::Ordinary,
+            None,
         );
         dispatched_shards[index] = true;
         count += 1;
     }
     count
+}
+
+fn dispatch_one_rolling_group_parity(
+    data_count: usize,
+    parity_references: &[Vec<u8>],
+    dispatched_shards: &mut [bool],
+    chunk_retrieve_chan: &ChunkRetrieveSender,
+    result_out: &mpsc::Sender<RawFetchResult>,
+    admission: &RetrieveAdmission,
+    cancel: &Option<RetrieveCancelToken>,
+) -> Option<(usize, RawFetchRegistration)> {
+    let index = rolling_next_parity_index(data_count, dispatched_shards)?;
+    let reference = parity_references.get(index.checked_sub(data_count)?)?;
+    let registration = queue_drained_raw_chunk(
+        index,
+        reference.clone(),
+        reference.clone(),
+        None,
+        chunk_retrieve_chan,
+        result_out,
+        admission,
+        cancel,
+        None,
+        RetrieveHedgeDemand::DistinctShardManaged,
+        None,
+    );
+    dispatched_shards[index] = true;
+    Some((index, registration))
 }
 
 fn recovery_top_up_count(
@@ -1061,6 +1444,61 @@ fn recovery_top_up_count(
         .saturating_sub(successes.saturating_add(active))
 }
 
+#[allow(clippy::too_many_arguments)]
+fn settle_data_group_result(
+    result: RawFetchResult,
+    rolling: bool,
+    data_count: usize,
+    data_references: &[Vec<u8>],
+    parity_present: bool,
+    requested_mask: &[bool],
+    requested_ready: &mut [bool],
+    received_shards: &mut [Option<Rc<[u8]>>],
+    authenticated_shards: &mut [bool],
+    rolling_active_shards: &mut [bool],
+    rolling_active: &mut usize,
+    successes: &mut usize,
+    child_emitter: &GroupChildEmitter,
+) -> Option<bool> {
+    if rolling && *rolling_active_shards.get(result.index)? {
+        rolling_active_shards[result.index] = false;
+        *rolling_active = rolling_active.checked_sub(1)?;
+    }
+
+    let canonical_for_group = result.canonical_cac || !parity_present;
+    if result.chunk.is_empty() || !canonical_for_group {
+        return Some(false);
+    }
+
+    let result_index = result.index;
+    let result_chunk = Rc::clone(&result.chunk);
+    *received_shards.get_mut(result_index)? = Some(result.chunk);
+    *authenticated_shards.get_mut(result_index)? = result.canonical_cac;
+    *successes = successes.checked_add(1)?;
+
+    if result_index < data_count
+        && *requested_mask.get(result_index)?
+        && !*requested_ready.get(result_index)?
+    {
+        let reference = data_references.get(result_index)?;
+        let chunk = if result.canonical_cac {
+            cached_decoded_chunk(reference).or_else(|| {
+                remember_raw_chunk(reference.clone(), Rc::clone(&result_chunk));
+                cached_decoded_chunk(reference)
+            })?
+        } else {
+            if parity_present {
+                return None;
+            }
+            decode_raw_join_chunk(result_chunk.as_ref(), reference)?
+        };
+        child_emitter.emit(result_index, chunk);
+        requested_ready[result_index] = true;
+    }
+
+    Some(true)
+}
+
 async fn fetch_data_group_indices_streaming(
     data_references: Vec<Vec<u8>>,
     parity_references: Vec<Vec<u8>>,
@@ -1071,6 +1509,7 @@ async fn fetch_data_group_indices_streaming(
     cancel_generations: Option<RetrieveGenerationMap>,
     cancel: Option<RetrieveCancelToken>,
     shared_physical_admission: Option<(u64, RetrieveAdmission)>,
+    terminal_lifecycle_factory: Option<RawFetchLifecycleFactory>,
     child_emitter: GroupChildEmitter,
 ) -> Option<()> {
     let data_count = data_references.len();
@@ -1119,14 +1558,56 @@ async fn fetch_data_group_indices_streaming(
     let (result_out, result_in) = mpsc::unbounded::<RawFetchResult>();
     let mut dispatched_shards = vec![false; total_count];
     let mut requested_ready = vec![false; data_count];
-    let mut dispatched = 0usize;
-    for &index in &requested_indices {
-        let reference = &data_references[index];
-        if let Some(chunk) = cached_decoded_chunk(reference) {
-            child_emitter.emit(index, chunk);
-            requested_ready[index] = true;
-            continue;
+    let mut received_shards: Vec<Option<Rc<[u8]>>> = vec![None; total_count];
+    let mut authenticated_shards = vec![false; total_count];
+    let static_rolling_candidate = rolling_full_group_static_candidate(
+        policy.erasure_recovery,
+        requested_count,
+        data_count,
+        parity_references.len(),
+    );
+    let mut cached_requested = Vec::new();
+    let mut decoded_only_count = 0usize;
+    let mut unresolved_count = 0usize;
+    if static_rolling_candidate {
+        cached_requested.reserve(requested_count);
+        for &index in &requested_indices {
+            let cached = requested_shard_cache(&data_references[index]);
+            match &cached {
+                RequestedShardCache::DecodedAndRaw { .. } => {}
+                RequestedShardCache::DecodedOnly(_) => decoded_only_count += 1,
+                RequestedShardCache::Miss => unresolved_count += 1,
+            }
+            cached_requested.push((index, cached));
         }
+    }
+    let rolling = static_rolling_candidate
+        && rolling_full_group_eligible(
+            policy.erasure_recovery,
+            requested_count,
+            data_count,
+            parity_references.len(),
+            decoded_only_count,
+            unresolved_count,
+        );
+    let initial_hedge_demand = if rolling {
+        RetrieveHedgeDemand::DistinctShardManaged
+    } else {
+        RetrieveHedgeDemand::Ordinary
+    };
+    let mut rolling_active_shards = if rolling {
+        vec![false; total_count]
+    } else {
+        Vec::new()
+    };
+    let mut rolling_active = 0usize;
+    let mut successes = 0usize;
+    let mut dispatched = 0usize;
+    let mut initial_cached = 0usize;
+    let mut initial_joined = 0usize;
+    let mut initial_led = 0usize;
+    let queue_initial_data_shard = |index: usize, hedge_demand: RetrieveHedgeDemand| {
+        let reference = &data_references[index];
         let address = reference[..HASH_SIZE].to_vec();
         queue_drained_raw_chunk(
             index,
@@ -1140,34 +1621,262 @@ async fn fetch_data_group_indices_streaming(
             shared_physical_admission
                 .as_ref()
                 .map(|(scope, admission)| (*scope, admission)),
-        );
-        dispatched_shards[index] = true;
-        dispatched += 1;
+            hedge_demand,
+            terminal_lifecycle_factory
+                .as_ref()
+                .map(RawFetchLifecycleFactory::create),
+        )
+    };
+    if static_rolling_candidate {
+        for (index, cached) in cached_requested {
+            match cached {
+                RequestedShardCache::DecodedAndRaw { decoded, raw } => {
+                    child_emitter.emit(index, decoded);
+                    requested_ready[index] = true;
+                    if rolling {
+                        received_shards[index] = Some(raw);
+                        authenticated_shards[index] = true;
+                        dispatched_shards[index] = true;
+                        successes += 1;
+                    }
+                    continue;
+                }
+                RequestedShardCache::DecodedOnly(decoded) => {
+                    child_emitter.emit(index, decoded);
+                    requested_ready[index] = true;
+                    continue;
+                }
+                RequestedShardCache::Miss => {}
+            }
+            let registration = queue_initial_data_shard(index, initial_hedge_demand);
+            match registration {
+                RawFetchRegistration::Cached => initial_cached += 1,
+                RawFetchRegistration::Joined => initial_joined += 1,
+                RawFetchRegistration::Led => initial_led += 1,
+            }
+            dispatched_shards[index] = true;
+            dispatched += 1;
+            if rolling && registration != RawFetchRegistration::Cached {
+                rolling_active_shards[index] = true;
+                rolling_active += 1;
+            }
+        }
+    } else {
+        // Preserve the legacy fast path for partial and conservative groups: inspect, emit, and
+        // dispatch each requested child in order without cloning/validating a cached raw basis.
+        for &index in &requested_indices {
+            let reference = &data_references[index];
+            if let Some(chunk) = cached_decoded_chunk(reference) {
+                child_emitter.emit(index, chunk);
+                requested_ready[index] = true;
+                continue;
+            }
+            let _registration = queue_initial_data_shard(index, RetrieveHedgeDemand::Ordinary);
+            dispatched_shards[index] = true;
+            dispatched += 1;
+        }
     }
+    // Anchor both hedge policies after all initial registrations. This preserves the legacy
+    // deadline and gives the rolling set a full hedge interval before parity can replace it.
+    let started = Date::now();
+    let mut rolling_profile = rolling
+        .then(|| {
+            crate::retrieval_profile::rolling_group_started(RollingGroupProfileInit {
+                anchor_at_ms: started,
+                requested_count,
+                data_count,
+                parity_count: parity_references.len(),
+                decoded_raw_count: requested_count
+                    .saturating_sub(decoded_only_count)
+                    .saturating_sub(unresolved_count),
+                decoded_only_count,
+                miss_count: unresolved_count,
+                static_candidate: static_rolling_candidate,
+                dynamic_eligible: rolling,
+                initial_cached,
+                initial_joined,
+                initial_led,
+                initial_active: rolling_active,
+                initial_successes: successes,
+            })
+        })
+        .flatten();
 
-    let mut received_shards: Vec<Option<Rc<[u8]>>> = vec![None; total_count];
-    let mut authenticated_shards = vec![false; total_count];
-    let mut successes = 0usize;
     let mut completed = 0usize;
     let mut recovery_dispatched = false;
-    let started = Date::now();
 
     loop {
+        if rolling {
+            let mut ready_results = Vec::new();
+            while let Ok(result) = result_in.try_recv() {
+                ready_results.push(result);
+            }
+            if !ready_results.is_empty() {
+                if !join_cancel_token_current(&cancel_generations, &cancel).await {
+                    finish_rolling_group_stale(&mut rolling_profile);
+                    return None;
+                }
+                for result in ready_results {
+                    completed = completed.checked_add(1)?;
+                    record_rolling_group_result(
+                        &mut rolling_profile,
+                        &result,
+                        data_count,
+                        &rolling_active_shards,
+                        rolling_active,
+                        successes,
+                        completed,
+                    );
+                    let settled = settle_data_group_result(
+                        result,
+                        rolling,
+                        data_count,
+                        &data_references,
+                        !parity_references.is_empty(),
+                        &requested_mask,
+                        &mut requested_ready,
+                        &mut received_shards,
+                        &mut authenticated_shards,
+                        &mut rolling_active_shards,
+                        &mut rolling_active,
+                        &mut successes,
+                        &child_emitter,
+                    );
+                    update_rolling_group_progress(
+                        &mut rolling_profile,
+                        successes,
+                        completed,
+                        rolling_active,
+                    );
+                    settled?;
+                }
+                // Re-evaluate terminal state before any replacement admission.
+                continue;
+            }
+        }
+
         let all_requested_ready = requested_indices
             .iter()
             .all(|&index| requested_ready[index]);
-        if all_requested_ready || (recovery_dispatched && successes >= data_count) {
+        let terminal = all_requested_ready || (recovery_dispatched && successes >= data_count);
+        if terminal {
             waiter_admission.close();
+            if let Some(profile) = rolling_profile.as_mut() {
+                profile.close_now(
+                    if all_requested_ready {
+                        RollingGroupTerminalReason::DirectAllReady
+                    } else {
+                        RollingGroupTerminalReason::ReconstructThreshold
+                    },
+                    successes,
+                    completed,
+                    rolling_active,
+                );
+            }
             if !join_cancel_token_current(&cancel_generations, &cancel).await {
+                finish_rolling_group_stale(&mut rolling_profile);
                 return None;
             }
             break;
         }
         if !join_cancel_token_current(&cancel_generations, &cancel).await {
+            finish_rolling_group_stale(&mut rolling_profile);
             return None;
         }
 
-        if recovery_dispatched && policy.erasure_recovery {
+        if rolling {
+            let mut settled_ready = false;
+            while let Ok(result) = result_in.try_recv() {
+                completed = completed.checked_add(1)?;
+                record_rolling_group_result(
+                    &mut rolling_profile,
+                    &result,
+                    data_count,
+                    &rolling_active_shards,
+                    rolling_active,
+                    successes,
+                    completed,
+                );
+                let settled = settle_data_group_result(
+                    result,
+                    rolling,
+                    data_count,
+                    &data_references,
+                    !parity_references.is_empty(),
+                    &requested_mask,
+                    &mut requested_ready,
+                    &mut received_shards,
+                    &mut authenticated_shards,
+                    &mut rolling_active_shards,
+                    &mut rolling_active,
+                    &mut successes,
+                    &child_emitter,
+                );
+                update_rolling_group_progress(
+                    &mut rolling_profile,
+                    successes,
+                    completed,
+                    rolling_active,
+                );
+                settled?;
+                settled_ready = true;
+            }
+            if settled_ready {
+                // Currentness was checked immediately before this synchronous drain. Re-run the
+                // terminal test before spending a replacement credit.
+                continue;
+            }
+        }
+
+        if rolling {
+            let decision_at_ms = Date::now();
+            let elapsed = (decision_at_ms - started).max(0.0) as u64;
+            let remaining_parity = (data_count..total_count)
+                .filter(|&index| !dispatched_shards[index])
+                .count();
+            if rolling_parity_admission_count(
+                elapsed,
+                RETRIEVE_HEDGE_AFTER_MS,
+                terminal,
+                data_count,
+                rolling_active,
+                remaining_parity,
+            ) != 0
+            {
+                let active_before = rolling_active;
+                let (index, registration) = dispatch_one_rolling_group_parity(
+                    data_count,
+                    &parity_references,
+                    &mut dispatched_shards,
+                    chunk_retrieve_chan,
+                    &result_out,
+                    &waiter_admission,
+                    &cancel,
+                )?;
+                dispatched += 1;
+                recovery_dispatched = true;
+                if registration != RawFetchRegistration::Cached {
+                    rolling_active_shards[index] = true;
+                    rolling_active += 1;
+                }
+                if let Some(profile) = rolling_profile.as_mut() {
+                    profile.parity_admitted(
+                        decision_at_ms,
+                        elapsed,
+                        index,
+                        index.saturating_sub(data_count),
+                        rolling_group_registration(registration),
+                        active_before,
+                        rolling_active,
+                        successes,
+                        completed,
+                    );
+                }
+                // Admit at most one replacement per coordinator turn, then settle any immediately
+                // ready Cached/completed result and re-check terminal state before another.
+                continue;
+            }
+        } else if recovery_dispatched && policy.erasure_recovery {
             let top_up = recovery_top_up_count(data_count, successes, dispatched, completed);
             if top_up > 0 {
                 dispatched += dispatch_group_recovery(
@@ -1183,113 +1892,151 @@ async fn fetch_data_group_indices_streaming(
             }
         }
 
-        if completed == dispatched {
+        if !rolling && completed == dispatched {
             if recovery_dispatched || parity_references.is_empty() || !policy.erasure_recovery {
                 return None;
             }
             if !join_cancel_token_current(&cancel_generations, &cancel).await {
+                finish_rolling_group_stale(&mut rolling_profile);
                 return None;
             }
             recovery_dispatched = true;
             continue;
         }
 
-        let result =
-            if !policy.erasure_recovery || (!recovery_dispatched && parity_references.is_empty()) {
-                recv_raw_result_cancellable(&result_in, &cancel_generations, &cancel).await
-            } else if !recovery_dispatched {
-                let elapsed = (Date::now() - started).max(0.0) as u64;
-                let remaining = RETRIEVE_RS_HEDGE_AFTER_MS.saturating_sub(elapsed).max(1);
+        let result = if rolling {
+            let elapsed = (Date::now() - started).max(0.0) as u64;
+            if completed == dispatched
+                && elapsed >= RETRIEVE_HEDGE_AFTER_MS
+                && (data_count..total_count).all(|index| dispatched_shards[index])
+            {
+                return None;
+            }
+            if elapsed < RETRIEVE_HEDGE_AFTER_MS {
+                let remaining = RETRIEVE_HEDGE_AFTER_MS.saturating_sub(elapsed).max(1);
                 match async_std::future::timeout(Duration::from_millis(remaining), result_in.recv())
                     .await
                 {
-                    Ok(result) => result.ok(),
-                    Err(_) => {
-                        if !join_cancel_token_current(&cancel_generations, &cancel).await {
-                            return None;
-                        }
-                        if requested_count == data_count {
-                            dispatched += dispatch_group_parity(
-                                data_count,
-                                &parity_references,
-                                &mut dispatched_shards,
-                                chunk_retrieve_chan,
-                                &result_out,
-                                usize::MAX,
-                                &waiter_admission,
-                                &cancel,
-                            );
-                        }
-                        recovery_dispatched = true;
-                        continue;
-                    }
+                    Ok(Ok(result)) => RawFetchReceive::Result(result),
+                    Ok(Err(_)) => RawFetchReceive::ChannelClosed,
+                    Err(_) => continue,
                 }
-            } else if dispatched_shards.iter().any(|dispatched| !*dispatched) {
-                match async_std::future::timeout(
-                    Duration::from_millis(RETRIEVE_RS_HEDGE_AFTER_MS),
-                    result_in.recv(),
-                )
+            } else {
+                recv_raw_result_cancellable(&result_in, &cancel_generations, &cancel).await
+            }
+        } else if !policy.erasure_recovery || (!recovery_dispatched && parity_references.is_empty())
+        {
+            recv_raw_result_cancellable(&result_in, &cancel_generations, &cancel).await
+        } else if !recovery_dispatched {
+            let elapsed = (Date::now() - started).max(0.0) as u64;
+            let remaining = RETRIEVE_RS_HEDGE_AFTER_MS.saturating_sub(elapsed).max(1);
+            match async_std::future::timeout(Duration::from_millis(remaining), result_in.recv())
                 .await
-                {
-                    Ok(result) => result.ok(),
-                    Err(_) => {
-                        if !join_cancel_token_current(&cancel_generations, &cancel).await {
-                            return None;
-                        }
-                        dispatched += dispatch_group_recovery(
-                            &data_references,
+            {
+                Ok(Ok(result)) => RawFetchReceive::Result(result),
+                Ok(Err(_)) => RawFetchReceive::ChannelClosed,
+                Err(_) => {
+                    if !join_cancel_token_current(&cancel_generations, &cancel).await {
+                        finish_rolling_group_stale(&mut rolling_profile);
+                        return None;
+                    }
+                    if requested_count == data_count {
+                        dispatched += dispatch_group_parity(
+                            data_count,
                             &parity_references,
                             &mut dispatched_shards,
                             chunk_retrieve_chan,
                             &result_out,
-                            RETRIEVE_RECOVERY_PROGRESSIVE_BATCH,
+                            usize::MAX,
                             &waiter_admission,
                             &cancel,
                         );
-                        continue;
                     }
+                    recovery_dispatched = true;
+                    continue;
                 }
-            } else {
-                recv_raw_result_cancellable(&result_in, &cancel_generations, &cancel).await
-            };
-
-        let result = result?;
-        completed += 1;
-        if !join_cancel_token_current(&cancel_generations, &cancel).await {
-            return None;
-        }
-        let canonical_for_group = result.canonical_cac || parity_references.is_empty();
-        if !result.chunk.is_empty() && canonical_for_group {
-            let result_index = result.index;
-            let result_chunk = Rc::clone(&result.chunk);
-            received_shards[result_index] = Some(result.chunk);
-            authenticated_shards[result_index] = result.canonical_cac;
-            successes += 1;
-
-            if result_index < data_count
-                && requested_mask[result_index]
-                && !requested_ready[result_index]
+            }
+        } else if dispatched_shards.iter().any(|dispatched| !*dispatched) {
+            match async_std::future::timeout(
+                Duration::from_millis(RETRIEVE_RS_HEDGE_AFTER_MS),
+                result_in.recv(),
+            )
+            .await
             {
-                let reference = &data_references[result_index];
-                let chunk = if result.canonical_cac {
-                    cached_decoded_chunk(reference).or_else(|| {
-                        remember_raw_chunk(reference.clone(), Rc::clone(&result_chunk));
-                        cached_decoded_chunk(reference)
-                    })?
-                } else {
-                    if !parity_references.is_empty() {
+                Ok(Ok(result)) => RawFetchReceive::Result(result),
+                Ok(Err(_)) => RawFetchReceive::ChannelClosed,
+                Err(_) => {
+                    if !join_cancel_token_current(&cancel_generations, &cancel).await {
+                        finish_rolling_group_stale(&mut rolling_profile);
                         return None;
                     }
-                    decode_raw_join_chunk(result_chunk.as_ref(), reference)?
-                };
-                child_emitter.emit(result_index, chunk);
-                requested_ready[result_index] = true;
+                    dispatched += dispatch_group_recovery(
+                        &data_references,
+                        &parity_references,
+                        &mut dispatched_shards,
+                        chunk_retrieve_chan,
+                        &result_out,
+                        RETRIEVE_RECOVERY_PROGRESSIVE_BATCH,
+                        &waiter_admission,
+                        &cancel,
+                    );
+                    continue;
+                }
             }
-        } else if !recovery_dispatched {
+        } else {
+            recv_raw_result_cancellable(&result_in, &cancel_generations, &cancel).await
+        };
+
+        let result = match result {
+            RawFetchReceive::Result(result) => result,
+            RawFetchReceive::Stale => {
+                finish_rolling_group_stale(&mut rolling_profile);
+                return None;
+            }
+            RawFetchReceive::ChannelClosed => {
+                if let Some(profile) = rolling_profile.as_mut() {
+                    profile.finish_channel_closed_now();
+                }
+                return None;
+            }
+        };
+        completed = completed.checked_add(1)?;
+        if !join_cancel_token_current(&cancel_generations, &cancel).await {
+            finish_rolling_group_stale(&mut rolling_profile);
+            return None;
+        }
+        record_rolling_group_result(
+            &mut rolling_profile,
+            &result,
+            data_count,
+            &rolling_active_shards,
+            rolling_active,
+            successes,
+            completed,
+        );
+        let usable = settle_data_group_result(
+            result,
+            rolling,
+            data_count,
+            &data_references,
+            !parity_references.is_empty(),
+            &requested_mask,
+            &mut requested_ready,
+            &mut received_shards,
+            &mut authenticated_shards,
+            &mut rolling_active_shards,
+            &mut rolling_active,
+            &mut successes,
+            &child_emitter,
+        );
+        update_rolling_group_progress(&mut rolling_profile, successes, completed, rolling_active);
+        let usable = usable?;
+        if !usable && !rolling && !recovery_dispatched {
             if parity_references.is_empty() || !policy.erasure_recovery {
                 return None;
             }
             if !join_cancel_token_current(&cancel_generations, &cancel).await {
+                finish_rolling_group_stale(&mut rolling_profile);
                 return None;
             }
             recovery_dispatched = true;
@@ -1311,9 +2058,13 @@ async fn fetch_data_group_indices_streaming(
         .filter(|&index| !requested_ready[index])
         .collect::<Vec<_>>();
     if missing_indices.is_empty() {
+        if let Some(profile) = rolling_profile.as_mut() {
+            profile.finish_success_now(false);
+        }
         return Some(());
     }
     if !join_cancel_token_current(&cancel_generations, &cancel).await {
+        finish_rolling_group_stale(&mut rolling_profile);
         return None;
     }
     let mut reconstructed_shards = received_shards
@@ -1330,6 +2081,9 @@ async fn fetch_data_group_indices_streaming(
         }
         remember_raw_chunk(reference.clone(), raw.into());
         child_emitter.emit(index, cached_decoded_chunk(reference)?);
+    }
+    if let Some(profile) = rolling_profile.as_mut() {
+        profile.finish_success_now(true);
     }
     Some(())
 }
@@ -1435,6 +2189,7 @@ pub(crate) async fn retrieve_data_range_from_root_conservative(
         None,
         None,
         CONSERVATIVE_DATA_RANGE_TRAVERSAL,
+        None,
     )
     .await
 }
@@ -1448,6 +2203,29 @@ pub(crate) async fn retrieve_data_range_from_root_cancellable(
     cancel_generations: Option<RetrieveGenerationMap>,
     cancel: Option<RetrieveCancelToken>,
 ) -> Option<Vec<u8>> {
+    retrieve_data_range_from_root_cancellable_with_lifecycle_factory(
+        root,
+        payload_start,
+        payload_end_inclusive,
+        encrypted,
+        chunk_retrieve_chan,
+        cancel_generations,
+        cancel,
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn retrieve_data_range_from_root_cancellable_with_lifecycle_factory(
+    root: DecodedJoinChunk,
+    payload_start: u64,
+    payload_end_inclusive: u64,
+    encrypted: bool,
+    chunk_retrieve_chan: &ChunkRetrieveSender,
+    cancel_generations: Option<RetrieveGenerationMap>,
+    cancel: Option<RetrieveCancelToken>,
+    terminal_lifecycle_factory: Option<RawFetchLifecycleFactory>,
+) -> Option<Vec<u8>> {
     retrieve_data_range_from_root_with_prefix_cancellable(
         root,
         payload_start,
@@ -1458,6 +2236,7 @@ pub(crate) async fn retrieve_data_range_from_root_cancellable(
         cancel_generations,
         cancel,
         ORDINARY_DATA_RANGE_TRAVERSAL,
+        terminal_lifecycle_factory,
     )
     .await
 }
@@ -1472,6 +2251,7 @@ async fn retrieve_data_range_from_root_with_prefix_cancellable(
     cancel_generations: Option<RetrieveGenerationMap>,
     cancel: Option<RetrieveCancelToken>,
     policy: DataRangeTraversalPolicy,
+    terminal_lifecycle_factory: Option<RawFetchLifecycleFactory>,
 ) -> Option<Vec<u8>> {
     if !join_cancel_token_current(&cancel_generations, &cancel).await {
         return None;
@@ -1575,6 +2355,9 @@ async fn retrieve_data_range_from_root_with_prefix_cancellable(
             let group_cancel_generations = cancel_generations.clone();
             let group_cancel = cancel.clone();
             let group_shared_physical_admission = shared_physical_admission.clone();
+            let group_terminal_lifecycle_factory = (layout.child_capacity <= CHUNK_SIZE as u64)
+                .then(|| terminal_lifecycle_factory.clone())
+                .flatten();
             let emitter = GroupChildEmitter {
                 context: GroupTraversalContext {
                     parent_start: node.start,
@@ -1597,6 +2380,7 @@ async fn retrieve_data_range_from_root_with_prefix_cancellable(
                     group_cancel_generations,
                     group_cancel,
                     group_shared_physical_admission,
+                    group_terminal_lifecycle_factory,
                     emitter,
                 )
                 .await
@@ -1719,6 +2503,7 @@ async fn retrieve_data_joined_cancellable(
             cancel_generations,
             cancel,
             ORDINARY_DATA_RANGE_TRAVERSAL,
+            None,
         )
         .await
         else {
@@ -1771,7 +2556,9 @@ pub async fn retrieve_chunk(
     cancel_generations: Option<RetrieveGenerationMap>,
     cancel: Option<RetrieveCancelToken>,
     admission: Option<RetrieveAdmission>,
+    hedge_demand: Option<SharedRetrieveHedgeDemand>,
     transfer_paused: Option<Arc<AtomicBool>>,
+    profile: Option<RetrieveProfileRequest>,
 ) -> Vec<u8> {
     let (caddr, encrey, encred) = chunk_address_parts(chunk_address);
 
@@ -1829,10 +2616,17 @@ pub async fn retrieve_chunk(
             && admission
                 .as_ref()
                 .is_none_or(RetrieveAdmission::physical_attempt_available);
+        // Read the shared demand on every admission loop. An ordinary follower
+        // can promote an already-running managed leader after dispatcher delay.
+        let current_hedge_demand = hedge_demand
+            .as_ref()
+            .map(SharedRetrieveHedgeDemand::current)
+            .unwrap_or(RetrieveHedgeDemand::Ordinary);
+        let ordinary_hedge_due = now - last_attempt_started >= RETRIEVE_HEDGE_AFTER_MS as f64;
         let due = can_start_attempt
             && !paused
             && !cancelled
-            && (in_flight == 0 || now - last_attempt_started >= RETRIEVE_HEDGE_AFTER_MS as f64);
+            && retrieve_attempt_start_allowed(current_hedge_demand, in_flight, ordinary_hedge_due);
 
         if due {
             if let Some(selected) = select_retrieve_peer(
@@ -1885,6 +2679,9 @@ pub async fn retrieve_chunk(
                 let attempt_out = attempt_out.clone();
                 let caddr = caddr.clone();
                 let attempt_admission = admission.clone();
+                let attempt_profile = profile
+                    .as_ref()
+                    .map(RetrieveProfileRequest::physical_attempt);
                 wasm_bindgen_futures::spawn_local(async move {
                     retrieve_attempt(
                         selected,
@@ -1893,6 +2690,7 @@ pub async fn retrieve_chunk(
                         refresh_chan,
                         attempt_out,
                         attempt_admission,
+                        attempt_profile,
                     )
                     .await;
                 });
@@ -1917,11 +2715,14 @@ pub async fn retrieve_chunk(
         }
 
         let elapsed = Date::now() - last_attempt_started;
-        let wait_ms = if !can_start_attempt || cancelled || paused {
-            250
-        } else {
-            (RETRIEVE_HEDGE_AFTER_MS as f64 - elapsed).max(0.0).round() as u64
-        };
+        let wait_ms =
+            if current_hedge_demand == RetrieveHedgeDemand::DistinctShardManaged && in_flight > 0 {
+                RETRIEVE_CANCEL_POLL_MS
+            } else if !can_start_attempt || cancelled || paused {
+                250
+            } else {
+                (RETRIEVE_HEDGE_AFTER_MS as f64 - elapsed).max(0.0).round() as u64
+            };
         if wait_ms == 0 {
             async_std::task::sleep(Duration::from_millis(RETRIEVE_HOT_LOOP_GUARD_MS)).await;
             continue;
@@ -2033,6 +2834,7 @@ pub async fn retrieve_check_chunk(
             refresh_chan.clone(),
             attempt_out.clone(),
             None,
+            None,
         )
         .await;
     }
@@ -2142,6 +2944,8 @@ async fn get_feed_probe_chunk_with_hedge_admission(
             chan: chan_out,
             cancel: None,
             admission: Some(admission.clone()),
+            hedge_demand: None,
+            profile: None,
         })
         .is_err()
     {
@@ -2373,4 +3177,60 @@ pub async fn seek_next_feed_update_index(
 ) -> u64 {
     let (_latest, next_index) = seek_feed_frontier(owner, topic, chunk_retrieve_chan, None).await;
     next_index
+}
+
+#[cfg(test)]
+mod raw_fetch_tests {
+    use super::*;
+
+    #[test]
+    fn zero_waiter_late_success_caches_every_full_reference_owned_by_the_flight() {
+        let mut raw = 29_u64.to_le_bytes().to_vec();
+        raw.extend_from_slice(b"late raw cache payload");
+        let expected_cac = keccak256(&raw).to_vec();
+        let plain_reference = expected_cac.clone();
+        let mut encrypted_reference = expected_cac.clone();
+        encrypted_reference.extend_from_slice(&[0x5a; HASH_SIZE]);
+        let key = RawFetchKey::new(
+            usize::MAX - 17,
+            expected_cac.clone(),
+            expected_cac,
+            &None,
+            None,
+        );
+        let admission = RetrieveAdmission::new();
+        let (result_chan, _result_in) = mpsc::unbounded();
+        let registration = RAW_FETCH_FLIGHTS.with(|flights| {
+            flights.borrow_mut().register(
+                key.clone(),
+                RawFetchWaiter {
+                    index: 0,
+                    result_chan,
+                    admission: admission.clone(),
+                },
+                || RawFetchShared::new(RetrieveHedgeDemand::Ordinary),
+            )
+        });
+        registration
+            .shared
+            .remember_cache_reference(Some(&plain_reference));
+        registration
+            .shared
+            .remember_cache_reference(Some(&encrypted_reference));
+        remove_raw_fetch_waiter(&key, registration.flight_id, registration.waiter_id);
+
+        assert!(complete_raw_fetch(
+            &key,
+            registration.flight_id,
+            raw.clone()
+        ));
+        assert_eq!(
+            cached_raw_chunk(&plain_reference).as_deref(),
+            Some(raw.as_slice())
+        );
+        assert_eq!(
+            cached_raw_chunk(&encrypted_reference).as_deref(),
+            Some(raw.as_slice())
+        );
+    }
 }

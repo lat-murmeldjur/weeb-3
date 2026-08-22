@@ -56,9 +56,98 @@ use std::{
     future::pending,
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering},
     },
 };
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub(crate) enum RetrieveHedgeDemand {
+    DistinctShardManaged = 0,
+    Ordinary = 1,
+}
+
+/// Shared monotone demand for one raw singleflight. An ordinary waiter may
+/// promote a managed leader, but a later managed waiter can never demote it.
+#[derive(Clone, Debug)]
+pub(crate) struct SharedRetrieveHedgeDemand {
+    demand: Arc<AtomicU8>,
+}
+
+impl SharedRetrieveHedgeDemand {
+    pub(crate) fn new(demand: RetrieveHedgeDemand) -> Self {
+        Self {
+            demand: Arc::new(AtomicU8::new(demand as u8)),
+        }
+    }
+
+    pub(crate) fn current(&self) -> RetrieveHedgeDemand {
+        match self.demand.load(Ordering::SeqCst) {
+            0 => RetrieveHedgeDemand::DistinctShardManaged,
+            _ => RetrieveHedgeDemand::Ordinary,
+        }
+    }
+
+    pub(crate) fn promote(&self, demand: RetrieveHedgeDemand) {
+        self.demand.fetch_max(demand as u8, Ordering::SeqCst);
+    }
+}
+
+pub(crate) fn retrieve_attempt_start_allowed(
+    demand: RetrieveHedgeDemand,
+    in_flight: usize,
+    ordinary_hedge_due: bool,
+) -> bool {
+    in_flight == 0 || (demand == RetrieveHedgeDemand::Ordinary && ordinary_hedge_due)
+}
+
+pub(crate) fn rolling_full_group_eligible(
+    erasure_recovery: bool,
+    requested_count: usize,
+    data_count: usize,
+    parity_count: usize,
+    decoded_only_count: usize,
+    unresolved_count: usize,
+) -> bool {
+    rolling_full_group_static_candidate(erasure_recovery, requested_count, data_count, parity_count)
+        && unresolved_count > 0
+        && decoded_only_count < parity_count
+}
+
+pub(crate) fn rolling_full_group_static_candidate(
+    erasure_recovery: bool,
+    requested_count: usize,
+    data_count: usize,
+    parity_count: usize,
+) -> bool {
+    erasure_recovery && data_count > 0 && requested_count == data_count && parity_count > 0
+}
+
+/// One admission per coordinator turn makes the terminal check precede every
+/// replacement while never exceeding the structural data-group active width.
+pub(crate) fn rolling_parity_admission_count(
+    elapsed_ms: u64,
+    gate_ms: u64,
+    terminal: bool,
+    active_width: usize,
+    rolling_active: usize,
+    remaining_parity: usize,
+) -> usize {
+    if terminal || elapsed_ms < gate_ms {
+        return 0;
+    }
+    active_width
+        .saturating_sub(rolling_active)
+        .min(remaining_parity)
+        .min(1)
+}
+
+pub(crate) fn rolling_next_parity_index(
+    data_count: usize,
+    dispatched_shards: &[bool],
+) -> Option<usize> {
+    (data_count..dispatched_shards.len()).find(|&index| !dispatched_shards[index])
+}
 
 #[derive(Debug)]
 struct RetrieveAdmissionInner {

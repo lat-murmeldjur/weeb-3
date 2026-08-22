@@ -27,33 +27,50 @@ mod hls {
         sync::Arc,
     };
     use stream_hls::{
-        HLS_BACKGROUND_RANGE_MAX, HLS_LIVE_SYNC_SEGMENTS, HLS_SPARSE_HISTORY_MAX_PARALLEL,
-        HlsDirectArchiveDisposition, HlsLevelTransition, HlsManifestProbe, HlsMediaPlanRegistry,
-        HlsPrefetchMode, HlsProgressiveRangeAdmission, HlsProgressiveRangePlanner,
+        HLS_BACKGROUND_RANGE_MAX, HLS_BEGINNING_PREFIX_MAX_WINDOWS, HLS_LIVE_SYNC_SEGMENTS,
+        HLS_PROGRESSIVE_BOUNDARY_RANGE_MAX, HLS_PROGRESSIVE_TAIL_WITH_BOUNDARY_MAX,
+        HLS_SEQUENCE_ZERO_DISCOVERY_MAX_PROBES, HLS_SPARSE_HISTORY_MAX_PARALLEL,
+        HlsBeginningPrefixPhase, HlsCriticalPrefixPlan, HlsDirectArchiveDisposition,
+        HlsLevelTransition, HlsManifestProbe, HlsMediaKind, HlsMediaPlanRegistry,
+        HlsOrderedWindowState, HlsPlayAttemptPhase, HlsPlayAttemptSettlement, HlsPrefetchMode,
+        HlsProgressiveFrontierDecision, HlsProgressiveRangeAdmission, HlsProgressiveRangePurpose,
         HlsProgressiveRunway, HlsProgressiveRunwayTransition, HlsProgressiveRunways,
-        HlsSequenceZeroRetry, MAX_STREAM_FEED_PAYLOAD_BYTES,
-        append_hls_sequence_zero_archive_suffix, assemble_hls_sequence_zero_suffix,
-        assemble_hls_sparse_history, classify_hls_level_transition, continue_hls_codec_bootstrap,
-        extend_hls_sequence_zero_archive, hls_autoplay_gate_ready, hls_contiguous_buffered_ahead,
-        hls_direct_archive_disposition, hls_dom_pause_is_explicit, hls_dom_play_is_explicit,
-        hls_is_finalized, hls_is_long_sequence_zero_checkpoint, hls_live_frontier_is_ready,
-        hls_live_tail, hls_manifest_reload_is_continuous, hls_manifest_reload_is_forward,
-        hls_media_references, hls_media_sequence, hls_payload_mime,
-        hls_progressive_range_admission, hls_progressive_range_reservation_fits,
-        hls_progressive_runway_closed_after_mode, hls_progressive_startup_window_count,
-        hls_sequence_zero_covers_head, hls_sequence_zero_ordinary_retry,
-        hls_sequence_zero_retry_stays_queued, hls_sequence_zero_same_index_archive_is_reusable,
-        hls_sequence_zero_sparse_tail, hls_startup_prefix_is_preferred,
-        hls_tail_has_terminal_endlist, hls_target_duration, hls_timeline_rebase_position,
-        hls_timeline_rebase_required, hls_verified_sequence_zero_checkpoint_tail,
+        HlsSequenceZeroDiscoveryObservation, HlsSequenceZeroDiscoveryPlanner, HlsSequenceZeroRetry,
+        MAX_STREAM_FEED_PAYLOAD_BYTES, append_hls_sequence_zero_archive_suffix,
+        assemble_hls_sequence_zero_suffix, assemble_hls_sparse_history,
+        classify_hls_level_transition, classify_hls_sequence_zero_discovery,
+        continue_hls_codec_bootstrap, extend_hls_sequence_zero_archive, gap_hls_segment_range,
+        hls_autoplay_gate_ready, hls_autoplay_start_target, hls_beginning_prefix_admission,
+        hls_beginning_prefix_window_count, hls_beginning_raw_supply_admission,
+        hls_buffered_interval_covers, hls_codec_bootstrap_token, hls_contiguous_buffered_ahead,
+        hls_deferred_feed_completion_matches, hls_direct_archive_disposition,
+        hls_dom_pause_is_explicit, hls_dom_play_is_explicit, hls_finalized_edge_load_target,
+        hls_is_finalized, hls_is_long_sequence_zero_checkpoint, hls_last_playable_segment,
+        hls_live_frontier_is_ready, hls_live_retarget_target, hls_live_retreat_boundary,
+        hls_live_tail, hls_live_tail_fallback_segment, hls_manifest_reload_is_continuous,
+        hls_manifest_reload_is_forward, hls_media_references, hls_media_sequence,
+        hls_ordered_window_admissions, hls_payload_mime, hls_play_attempt_settlement,
+        hls_progressive_foreground_transition, hls_progressive_frontier_decision,
+        hls_progressive_frontier_width, hls_progressive_range_admission,
+        hls_progressive_range_reservation_fits, hls_progressive_rolling_boundary_width,
+        hls_progressive_rolling_lane_width, hls_progressive_runway_closed_after_mode,
+        hls_select_startup_runway_plan, hls_sequence_zero_body_from_deferred_prefix,
+        hls_sequence_zero_canonical_is_supported, hls_sequence_zero_covers_head,
+        hls_sequence_zero_ordinary_retry, hls_sequence_zero_retry_stays_queued,
+        hls_sequence_zero_same_index_archive_is_reusable, hls_sequence_zero_sparse_tail,
+        hls_startup_prefix_is_preferred, hls_startup_retry_delay_ms, hls_tail_has_terminal_endlist,
+        hls_target_duration, hls_timeline_rebase_position, hls_timeline_rebase_required,
+        hls_verified_sequence_zero_checkpoint_tail,
         hls_verified_sequence_zero_checkpoint_tail_at_index, is_hls_manifest,
-        plan_hls_sequence_zero_followup_recovery, plan_hls_sequence_zero_terminal_confirmation,
-        plan_hls_sparse_forward_wave, plan_hls_sparse_history_from_lattice,
-        plan_hls_sparse_history_repairs_for_attempts, plan_hls_sparse_terminal_repairs,
-        prepend_hls_codec_bootstrap, probe_hls_manifest, raise_hls_target_duration,
-        remember_hls_sequence_zero_retry, retain_hls_sequence_zero_retries_after,
-        rewrite_hls_manifest, rewrite_hls_manifest_for_live_reload, select_hls_sequence_zero_retry,
+        open_hls_codec_continuation, plan_hls_sequence_zero_followup_recovery,
+        plan_hls_sequence_zero_terminal_confirmation, plan_hls_sparse_forward_wave,
+        plan_hls_sparse_history_from_lattice, plan_hls_sparse_history_repairs_for_attempts,
+        plan_hls_sparse_terminal_repairs, prepend_hls_codec_bootstrap, present_hls_live_fallback,
+        probe_hls_manifest, raise_hls_target_duration, remember_hls_sequence_zero_retry,
+        retain_hls_sequence_zero_retries_after, rewrite_hls_manifest,
+        rewrite_hls_manifest_for_live_reload, select_hls_sequence_zero_retry,
         stream_feed_payload_len_is_supported, touch_hls_cache_lru,
+        truncate_hls_live_before_segment,
     };
 
     const REF: &str = "919b5395bf7a59cbb3b365769de09a2b15ac5d897823dda9270259a3c038d574";
@@ -62,6 +79,10 @@ mod hls {
     const REF4: &str = "68d3d40b39d5f17532e928a4b62f2a58ea1b63e20da0eb4b8a7da78d45d45812";
     const OWNER: &str = "352eabdea9cb05e984a8828d2a6df3d3b5023260";
     const TOPIC: &str = "cfbbc155d709547b198638d0fb11d733359561538d8bd606a9ab257354d13bcc";
+
+    fn hls_last_playable_interval(bytes: &[u8]) -> Option<(f64, f64)> {
+        hls_last_playable_segment(bytes).map(|(_, _, start, duration)| (start, start + duration))
+    }
 
     fn sparse_manifest(sequence: u64, count: u64, finalized: bool) -> Vec<u8> {
         let mut manifest =
@@ -76,6 +97,62 @@ mod hls {
             manifest.push_str("#EXT-X-ENDLIST\n");
         }
         manifest.into_bytes()
+    }
+
+    struct RollingAdmissions {
+        current_tail: Vec<usize>,
+        next_boundary: Vec<usize>,
+    }
+
+    fn rolling_admissions(
+        frontier_width: usize,
+        current_states: &[HlsOrderedWindowState],
+        current_retry_floor: Option<usize>,
+        next_boundary_states: Option<&[HlsOrderedWindowState]>,
+        next_boundary_retry_floor: Option<usize>,
+        boundary_is_exact_foreground: bool,
+    ) -> RollingAdmissions {
+        let frontier_width = frontier_width.min(HLS_BACKGROUND_RANGE_MAX);
+        let current_complete = current_states
+            .iter()
+            .all(|state| *state == HlsOrderedWindowState::Cached);
+        let reserve_next_boundary = frontier_width == HLS_BACKGROUND_RANGE_MAX
+            && next_boundary_states.is_some_and(|states| {
+                states
+                    .iter()
+                    .any(|state| *state != HlsOrderedWindowState::Cached)
+            });
+        let first_boundary_window_cached = next_boundary_states
+            .and_then(|states| states.first())
+            .is_some_and(|state| *state == HlsOrderedWindowState::Cached);
+        let current_width = if boundary_is_exact_foreground {
+            0
+        } else if reserve_next_boundary && !current_complete && !first_boundary_window_cached {
+            frontier_width.saturating_sub(HLS_PROGRESSIVE_BOUNDARY_RANGE_MAX)
+        } else {
+            frontier_width
+        };
+        RollingAdmissions {
+            current_tail: hls_ordered_window_admissions(
+                current_states,
+                current_width,
+                current_retry_floor,
+            ),
+            next_boundary: if reserve_next_boundary {
+                hls_ordered_window_admissions(
+                    next_boundary_states.unwrap_or_default(),
+                    hls_progressive_rolling_boundary_width(
+                        frontier_width,
+                        first_boundary_window_cached,
+                        current_complete,
+                        boundary_is_exact_foreground,
+                    ),
+                    next_boundary_retry_floor,
+                )
+            } else {
+                Vec::new()
+            },
+        }
     }
 
     #[test]
@@ -115,44 +192,487 @@ mod hls {
     }
 
     #[test]
-    fn progressive_range_planner_claims_nearest_future_references_with_three_workers() {
-        let mut planner = HlsProgressiveRangePlanner::new(4, 10);
-        assert_eq!(planner.worker_count(), 3);
-        assert_eq!(planner.claim(), Some(5));
-        assert_eq!(planner.claim(), Some(6));
-        assert_eq!(planner.claim(), Some(7));
-        assert_eq!(planner.claim(), None);
-        assert!(planner.has_unclaimed_references());
+    fn progressive_window_frontier_is_nearest_first_and_preserves_the_cold_ramp() {
+        assert_eq!(hls_progressive_frontier_width(4, 4, false), 1);
+        assert_eq!(hls_progressive_frontier_width(4, 5, false), 4);
+        assert_eq!(hls_progressive_frontier_width(4, 4, true), 4);
+        assert_eq!(
+            hls_progressive_frontier_decision(5, 5, false),
+            HlsProgressiveFrontierDecision::Continue,
+            "foreground catch-up equality keeps filling the current reference tail"
+        );
+        assert_eq!(
+            hls_progressive_frontier_decision(5, 8, false),
+            HlsProgressiveFrontierDecision::Rebase(8),
+            "a multi-reference catch-up rebases to the exact foreground reference"
+        );
+        assert_eq!(
+            hls_progressive_frontier_decision(5, 5, true),
+            HlsProgressiveFrontierDecision::Advance(6),
+            "only completion permits a claim in the next reference"
+        );
+        assert_eq!(
+            hls_progressive_foreground_transition(5, 4, false),
+            (true, 4),
+            "an uncached adjacent backward request retires the old ticket at ref 4"
+        );
+        assert_eq!(
+            hls_progressive_foreground_transition(5, 4, true),
+            (false, 5),
+            "cached backward replay preserves the current runway and monotonic floor"
+        );
+        assert_eq!(
+            hls_progressive_foreground_transition(5, 6, false),
+            (false, 6)
+        );
+        assert_eq!(
+            hls_progressive_foreground_transition(5, 7, false),
+            (true, 7)
+        );
 
-        planner.complete(6);
-        assert_eq!(planner.claim(), None);
-        planner.complete(5);
-        assert_eq!(planner.claim(), Some(8));
-        assert_eq!(planner.claim(), Some(9));
-        assert_eq!(planner.claim(), None);
-        assert!(!planner.has_unclaimed_references());
+        let states = [
+            HlsOrderedWindowState::Cached,
+            HlsOrderedWindowState::Pending,
+            HlsOrderedWindowState::Absent,
+            HlsOrderedWindowState::Absent,
+            HlsOrderedWindowState::Absent,
+            HlsOrderedWindowState::Absent,
+        ];
+        assert_eq!(
+            hls_ordered_window_admissions(&states, 1, None),
+            Vec::<usize>::new()
+        );
+        assert_eq!(
+            hls_ordered_window_admissions(&states, HLS_BACKGROUND_RANGE_MAX, None),
+            vec![2, 3, 4]
+        );
+        assert_eq!(
+            hls_ordered_window_admissions(
+                &[
+                    HlsOrderedWindowState::Cached,
+                    HlsOrderedWindowState::Backoff,
+                    HlsOrderedWindowState::Absent,
+                ],
+                HLS_BACKGROUND_RANGE_MAX,
+                Some(1),
+            ),
+            Vec::<usize>::new(),
+            "a terminally absent retry blocks every later window"
+        );
+        assert_eq!(
+            hls_ordered_window_admissions(
+                &[
+                    HlsOrderedWindowState::Cached,
+                    HlsOrderedWindowState::Cached,
+                    HlsOrderedWindowState::Absent,
+                    HlsOrderedWindowState::Absent,
+                ],
+                HLS_BACKGROUND_RANGE_MAX,
+                Some(2),
+            ),
+            vec![2],
+            "a due retry is the only new admission until it succeeds"
+        );
+        let simultaneous_ready = [
+            HlsOrderedWindowState::Cached,
+            HlsOrderedWindowState::Active,
+            HlsOrderedWindowState::Backoff,
+            HlsOrderedWindowState::Active,
+            HlsOrderedWindowState::Absent,
+        ];
+        assert_eq!(
+            hls_ordered_window_admissions(&simultaneous_ready, HLS_BACKGROUND_RANGE_MAX, Some(2),),
+            Vec::<usize>::new(),
+            "a ready success cannot return capacity past a simultaneously ready failure"
+        );
+    }
 
-        assert_eq!(HlsProgressiveRangePlanner::new(8, 10).worker_count(), 1);
-        assert_eq!(HlsProgressiveRangePlanner::new(10, 10).worker_count(), 0);
+    #[test]
+    fn rolling_boundary_uses_future_w0_then_parks_or_promotes() {
+        assert_eq!(
+            hls_progressive_rolling_boundary_width(HLS_BACKGROUND_RANGE_MAX, false, false, false,),
+            HLS_PROGRESSIVE_BOUNDARY_RANGE_MAX,
+            "a future boundary admits only W0"
+        );
+        assert_eq!(
+            hls_progressive_rolling_boundary_width(HLS_BACKGROUND_RANGE_MAX, true, false, false,),
+            0,
+            "after W0 is cached, a future boundary parks without admitting W1"
+        );
+        assert_eq!(
+            hls_progressive_rolling_boundary_width(HLS_BACKGROUND_RANGE_MAX, true, false, true,),
+            HLS_BACKGROUND_RANGE_MAX,
+            "the exact foreground boundary fills the remaining critical prefix"
+        );
+        assert_eq!(
+            hls_progressive_rolling_boundary_width(HLS_BACKGROUND_RANGE_MAX, true, true, false,),
+            HLS_BACKGROUND_RANGE_MAX,
+            "a wholly complete current reference releases the boundary remainder"
+        );
+        assert_eq!(
+            hls_progressive_rolling_boundary_width(1, false, false, true),
+            1,
+            "foreground promotion cannot bypass the cold width-one frontier"
+        );
+        assert_eq!(
+            hls_progressive_rolling_lane_width(
+                HLS_BACKGROUND_RANGE_MAX,
+                HLS_PROGRESSIVE_TAIL_WITH_BOUNDARY_MAX,
+                false,
+            ),
+            HLS_PROGRESSIVE_TAIL_WITH_BOUNDARY_MAX
+        );
+        assert_eq!(
+            hls_progressive_rolling_lane_width(
+                HLS_BACKGROUND_RANGE_MAX,
+                HLS_PROGRESSIVE_TAIL_WITH_BOUNDARY_MAX,
+                true,
+            ),
+            HLS_BACKGROUND_RANGE_MAX,
+            "W0 completion returns the reserved slot to the current tail"
+        );
+
+        let old_tail_active = HLS_PROGRESSIVE_TAIL_WITH_BOUNDARY_MAX;
+        let globally_available = HLS_BACKGROUND_RANGE_MAX.saturating_sub(old_tail_active);
+        assert_eq!(globally_available, HLS_PROGRESSIVE_BOUNDARY_RANGE_MAX);
+        assert_eq!(
+            old_tail_active + globally_available,
+            HLS_BACKGROUND_RANGE_MAX,
+            "promotion consumes only slots released under the existing global lease cap"
+        );
+    }
+
+    #[test]
+    fn rolling_progressive_supply_reserves_one_nearest_boundary_lane_after_handoff() {
+        assert_eq!(HLS_PROGRESSIVE_BOUNDARY_RANGE_MAX, 1);
+        assert_eq!(HLS_PROGRESSIVE_TAIL_WITH_BOUNDARY_MAX, 3);
+        assert_eq!(
+            HLS_PROGRESSIVE_BOUNDARY_RANGE_MAX + HLS_PROGRESSIVE_TAIL_WITH_BOUNDARY_MAX,
+            HLS_BACKGROUND_RANGE_MAX
+        );
+
+        let delayed_tail = [
+            HlsOrderedWindowState::Active,
+            HlsOrderedWindowState::Active,
+            HlsOrderedWindowState::Active,
+            HlsOrderedWindowState::Absent,
+            HlsOrderedWindowState::Absent,
+        ];
+        let mut next_prefix = [
+            HlsOrderedWindowState::Absent,
+            HlsOrderedWindowState::Absent,
+            HlsOrderedWindowState::Absent,
+        ];
+
+        let cold_tail = [HlsOrderedWindowState::Absent, HlsOrderedWindowState::Absent];
+        let cold = rolling_admissions(1, &cold_tail, None, Some(&next_prefix), None, false);
+        assert_eq!(cold.current_tail, vec![0]);
+        assert!(
+            cold.next_boundary.is_empty(),
+            "the reserved boundary lane is disabled while the cold frontier is width one"
+        );
+
+        let future = rolling_admissions(
+            HLS_BACKGROUND_RANGE_MAX,
+            &delayed_tail,
+            None,
+            Some(&next_prefix),
+            None,
+            false,
+        );
+        assert!(future.current_tail.is_empty());
+        assert_eq!(future.next_boundary, vec![0]);
+        assert_eq!(
+            delayed_tail
+                .iter()
+                .filter(|state| **state == HlsOrderedWindowState::Active)
+                .count()
+                + future.current_tail.len()
+                + future.next_boundary.len(),
+            HLS_BACKGROUND_RANGE_MAX,
+            "three delayed tail flights plus future W0 stay within cap four"
+        );
+        next_prefix[0] = HlsOrderedWindowState::Cached;
+
+        let released = rolling_admissions(
+            HLS_BACKGROUND_RANGE_MAX,
+            &delayed_tail,
+            None,
+            Some(&next_prefix),
+            None,
+            false,
+        );
+        assert_eq!(released.current_tail, vec![3]);
+        assert!(
+            released.next_boundary.is_empty(),
+            "future W1 and later remain parked after W0 returns the fourth tail slot"
+        );
+
+        let caught = rolling_admissions(
+            HLS_BACKGROUND_RANGE_MAX,
+            &delayed_tail,
+            None,
+            Some(&next_prefix),
+            None,
+            true,
+        );
+        assert!(caught.current_tail.is_empty());
+        assert_eq!(caught.next_boundary, vec![1, 2]);
+        assert_eq!(
+            HLS_BACKGROUND_RANGE_MAX.saturating_sub(
+                delayed_tail
+                    .iter()
+                    .filter(|state| **state == HlsOrderedWindowState::Active)
+                    .count(),
+            ),
+            1,
+            "the global lease admits only one promoted boundary flight until an old-tail receiver drains"
+        );
+
+        let current_complete = [HlsOrderedWindowState::Cached; 5];
+        let boundary_after_handoff = [
+            HlsOrderedWindowState::Absent,
+            HlsOrderedWindowState::Absent,
+            HlsOrderedWindowState::Absent,
+        ];
+        let handed_off = rolling_admissions(
+            HLS_BACKGROUND_RANGE_MAX,
+            &current_complete,
+            None,
+            Some(&boundary_after_handoff),
+            None,
+            false,
+        );
+        assert!(handed_off.current_tail.is_empty());
+        assert_eq!(
+            handed_off.next_boundary,
+            vec![0, 1, 2],
+            "once the current tail is wholly cached, its three slots transfer to the boundary"
+        );
+    }
+
+    #[test]
+    fn rolling_boundary_pending_and_failure_block_duplicates_and_farther_fanout() {
+        let current = [
+            HlsOrderedWindowState::Active,
+            HlsOrderedWindowState::Active,
+            HlsOrderedWindowState::Absent,
+            HlsOrderedWindowState::Absent,
+        ];
+        let pending_boundary = [
+            HlsOrderedWindowState::Cached,
+            HlsOrderedWindowState::Pending,
+            HlsOrderedWindowState::Absent,
+        ];
+        let pending = rolling_admissions(
+            HLS_BACKGROUND_RANGE_MAX,
+            &current,
+            None,
+            Some(&pending_boundary),
+            None,
+            false,
+        );
+        assert_eq!(pending.current_tail, vec![2, 3]);
+        assert!(
+            pending.next_boundary.is_empty(),
+            "a shared Pending boundary flight occupies the reserved lane without redispatch"
+        );
+
+        let failed_boundary = [
+            HlsOrderedWindowState::Cached,
+            HlsOrderedWindowState::Backoff,
+            HlsOrderedWindowState::Absent,
+        ];
+        let failed = rolling_admissions(
+            HLS_BACKGROUND_RANGE_MAX,
+            &current,
+            None,
+            Some(&failed_boundary),
+            Some(1),
+            false,
+        );
+        assert_eq!(failed.current_tail, vec![2, 3]);
+        assert!(
+            failed.next_boundary.is_empty(),
+            "a failed nearest boundary remains a serial blocker; the result has no farther lane"
+        );
+        let promoted_failure = rolling_admissions(
+            HLS_BACKGROUND_RANGE_MAX,
+            &current,
+            None,
+            Some(&failed_boundary),
+            Some(1),
+            true,
+        );
+        assert!(promoted_failure.current_tail.is_empty());
+        assert!(
+            promoted_failure.next_boundary.is_empty(),
+            "promotion preserves the terminal backoff blocker instead of fanning out later windows"
+        );
+        assert_eq!(
+            hls_progressive_range_admission(
+                false,
+                HlsPrefetchMode::Sustained,
+                HlsProgressiveRangePurpose::Sustained,
+            ),
+            HlsProgressiveRangeAdmission::Retire,
+            "both rolling lanes share the ticket currentness gate"
+        );
     }
 
     #[test]
     fn progressive_range_admission_parks_pause_and_startup_but_retires_stale_work() {
         assert_eq!(
-            hls_progressive_range_admission(true, HlsPrefetchMode::Inactive),
+            hls_progressive_range_admission(
+                true,
+                HlsPrefetchMode::Inactive,
+                HlsProgressiveRangePurpose::StartupExactNext,
+            ),
             HlsProgressiveRangeAdmission::Park
         );
         assert_eq!(
-            hls_progressive_range_admission(true, HlsPrefetchMode::StartupOnly),
-            HlsProgressiveRangeAdmission::Park
-        );
-        assert_eq!(
-            hls_progressive_range_admission(true, HlsPrefetchMode::Sustained),
+            hls_progressive_range_admission(
+                true,
+                HlsPrefetchMode::StartupOnly,
+                HlsProgressiveRangePurpose::StartupExactNext,
+            ),
             HlsProgressiveRangeAdmission::Admit
         );
         assert_eq!(
-            hls_progressive_range_admission(false, HlsPrefetchMode::Sustained),
+            hls_progressive_range_admission(
+                true,
+                HlsPrefetchMode::StartupOnly,
+                HlsProgressiveRangePurpose::Sustained,
+            ),
+            HlsProgressiveRangeAdmission::Park
+        );
+        assert_eq!(
+            hls_progressive_range_admission(
+                true,
+                HlsPrefetchMode::Sustained,
+                HlsProgressiveRangePurpose::Sustained,
+            ),
+            HlsProgressiveRangeAdmission::Admit
+        );
+        assert_eq!(
+            hls_progressive_range_admission(
+                false,
+                HlsPrefetchMode::Sustained,
+                HlsProgressiveRangePurpose::Sustained,
+            ),
             HlsProgressiveRangeAdmission::Retire
+        );
+    }
+
+    #[test]
+    fn startup_exact_next_admission_is_independent_of_the_speed_deadline() {
+        assert_eq!(
+            hls_progressive_range_admission(
+                true,
+                HlsPrefetchMode::StartupOnly,
+                HlsProgressiveRangePurpose::StartupExactNext,
+            ),
+            HlsProgressiveRangeAdmission::Admit
+        );
+    }
+
+    #[test]
+    fn autoplay_start_target_tracks_the_requested_timeline_instead_of_zero() {
+        assert_eq!(
+            hls_autoplay_start_target(HlsStart::Beginning, 0.0, 0.0, None, &[(0.067, 4.2)],),
+            Some(0.067)
+        );
+        assert_eq!(
+            hls_autoplay_start_target(HlsStart::Live, -1.0, 0.0, Some(3120.0), &[(3116.0, 3125.0)],),
+            Some(3120.0)
+        );
+        assert_eq!(
+            hls_autoplay_start_target(
+                HlsStart::Live,
+                -1.0,
+                0.0,
+                None,
+                &[(3000.0, 3004.0), (3116.0, 3125.0)],
+            ),
+            Some(3116.0)
+        );
+        assert_eq!(
+            hls_autoplay_start_target(
+                HlsStart::Live,
+                -1.0,
+                3002.0,
+                Some(3130.0),
+                &[(3000.0, 3004.0), (3116.0, 3125.0)],
+            ),
+            Some(3116.0),
+            "an obsolete island and an out-of-range liveSync must not pull Live backward"
+        );
+        assert_eq!(
+            hls_autoplay_start_target(
+                HlsStart::Live,
+                -1.0,
+                3121.0,
+                Some(3130.0),
+                &[(3000.0, 3004.0), (3116.0, 3125.0)],
+            ),
+            Some(3121.0),
+            "currentTime is usable only when it is already in the newest island"
+        );
+        assert_eq!(
+            hls_autoplay_start_target(HlsStart::Beginning, 0.0, 0.0, None, &[]),
+            None
+        );
+    }
+
+    #[test]
+    fn live_codec_retarget_never_accepts_the_bootstrap_island_as_the_live_edge() {
+        assert_eq!(
+            hls_live_retarget_target(None, Some(100.0), None, &[(0.0, 4.0)]),
+            None
+        );
+        assert_eq!(
+            hls_live_retarget_target(None, Some(100.0), None, &[(0.0, 4.0), (96.0, 104.0)],),
+            Some(100.0)
+        );
+        assert_eq!(
+            hls_live_retarget_target(None, None, Some((96.0, 100.0)), &[(0.0, 4.0)]),
+            None
+        );
+        assert_eq!(
+            hls_live_retarget_target(None, None, Some((96.0, 100.0)), &[(0.0, 100.0)]),
+            Some(98.0),
+            "a stopped stream may use only a fully buffered authoritative tail"
+        );
+        assert_eq!(
+            hls_live_retarget_target(
+                Some(50.0),
+                Some(100.0),
+                None,
+                &[(0.0, 4.0), (48.0, 60.0), (96.0, 104.0)],
+            ),
+            Some(50.0),
+            "an established Live recovery resumes its buffered DVR position"
+        );
+    }
+
+    #[test]
+    fn finalized_live_retarget_uses_the_last_non_gap_interval_for_short_tail_readiness() {
+        let manifest = format!(
+            "#EXTM3U\n#EXT-X-VERSION:8\n#EXT-X-TARGETDURATION:4\n\
+             #EXT-X-MEDIA-SEQUENCE:0\n#EXTINF:4.0,\n{REF}\n\
+             #EXTINF:1.0,\n{REF2}\n#EXT-X-GAP\n#EXTINF:4.0,\n{REF3}\n\
+             #EXT-X-GAP\n#EXTINF:4.0,\n{REF4}\n#EXT-X-ENDLIST\n"
+        );
+        let playable = hls_last_playable_interval(manifest.as_bytes()).unwrap();
+        assert_eq!(playable, (4.0, 5.0));
+        let target = hls_live_retarget_target(None, None, Some(playable), &[(0.0, 5.0)])
+            .expect("the final playable second is buffered");
+        assert_eq!(target, 4.0);
+        let buffered = hls_contiguous_buffered_ahead(target, &[(0.0, 5.0)]);
+        assert!(hls_autoplay_gate_ready(buffered, target, playable.1, true));
+        assert!(
+            !hls_autoplay_gate_ready(buffered, target, 13.0, true),
+            "canonical GAP duration is not the playable readiness edge"
         );
     }
 
@@ -171,16 +691,106 @@ mod hls {
     }
 
     #[test]
-    fn beginning_warmup_bounds_one_two_four_and_larger_assets_to_four_windows() {
+    fn beginning_prefix_targets_two_seconds_plus_safety_and_stays_bounded() {
         const WINDOW: u64 = 512 * 1024;
-        assert_eq!(hls_progressive_startup_window_count(1, WINDOW), 1);
-        assert_eq!(hls_progressive_startup_window_count(WINDOW, WINDOW), 1);
-        assert_eq!(hls_progressive_startup_window_count(WINDOW + 1, WINDOW), 2);
-        assert_eq!(hls_progressive_startup_window_count(2 * WINDOW, WINDOW), 2);
-        assert_eq!(hls_progressive_startup_window_count(4 * WINDOW, WINDOW), 4);
-        assert_eq!(hls_progressive_startup_window_count(5 * WINDOW, WINDOW), 4);
-        assert_eq!(hls_progressive_startup_window_count(0, WINDOW), 0);
-        assert_eq!(hls_progressive_startup_window_count(WINDOW, 0), 0);
+        assert_eq!(
+            hls_beginning_prefix_window_count(4_426_084, 4.166_667, WINDOW),
+            5,
+            "the profiled first segment needs five windows for 2s plus safety"
+        );
+        assert_eq!(hls_beginning_prefix_window_count(1, 4.0, WINDOW), 1);
+        assert_eq!(
+            hls_beginning_prefix_window_count(100 * WINDOW, 2.0, WINDOW),
+            HLS_BEGINNING_PREFIX_MAX_WINDOWS
+        );
+        assert_eq!(hls_beginning_prefix_window_count(0, 4.0, WINDOW), 0);
+        assert_eq!(hls_beginning_prefix_window_count(WINDOW, 0.0, WINDOW), 0);
+        assert_eq!(
+            hls_beginning_prefix_window_count(WINDOW, f64::NAN, WINDOW),
+            0
+        );
+        assert_eq!(hls_beginning_prefix_window_count(WINDOW, 4.0, 0), 0);
+        let plan = HlsCriticalPrefixPlan::new(4_426_084, 4.166_667, WINDOW).unwrap();
+        assert_eq!(plan.critical_windows(), 5);
+        assert_eq!(plan.total_windows(), 9);
+    }
+
+    #[test]
+    fn pending_and_active_windows_occupy_frontier_slots_without_redispatch() {
+        let states = [
+            HlsOrderedWindowState::Pending,
+            HlsOrderedWindowState::Active,
+            HlsOrderedWindowState::Absent,
+            HlsOrderedWindowState::Absent,
+            HlsOrderedWindowState::Absent,
+        ];
+        assert_eq!(
+            hls_ordered_window_admissions(&states, HLS_BACKGROUND_RANGE_MAX, None),
+            vec![2, 3]
+        );
+    }
+
+    #[test]
+    fn beginning_prefix_barrier_releases_only_ready_bypass_or_live_disabled() {
+        for phase in [
+            HlsBeginningPrefixPhase::AwaitManifest,
+            HlsBeginningPrefixPhase::AwaitForegroundZero,
+            HlsBeginningPrefixPhase::Supplying,
+        ] {
+            assert_eq!(
+                hls_beginning_prefix_admission(phase),
+                HlsProgressiveRangeAdmission::Park
+            );
+        }
+        for phase in [
+            HlsBeginningPrefixPhase::Disabled,
+            HlsBeginningPrefixPhase::Ready,
+            HlsBeginningPrefixPhase::Bypass,
+        ] {
+            assert_eq!(
+                hls_beginning_prefix_admission(phase),
+                HlsProgressiveRangeAdmission::Admit
+            );
+        }
+        assert_eq!(
+            hls_beginning_prefix_admission(HlsBeginningPrefixPhase::Retired),
+            HlsProgressiveRangeAdmission::Retire
+        );
+    }
+
+    #[test]
+    fn beginning_raw_supply_opens_after_exact_foreground_zero_is_requested() {
+        use HlsProgressiveRangeAdmission::{Admit, Park, Retire};
+
+        assert_eq!(
+            hls_beginning_raw_supply_admission(HlsBeginningPrefixPhase::AwaitForegroundZero, false,),
+            Park,
+            "the raw scout cannot run before the foreground W0 request",
+        );
+        assert_eq!(
+            hls_beginning_raw_supply_admission(HlsBeginningPrefixPhase::Supplying, true,),
+            Admit,
+            "credit-gated raw work opens while W0 is still settling",
+        );
+        assert_eq!(
+            hls_beginning_raw_supply_admission(HlsBeginningPrefixPhase::Supplying, true,),
+            Admit,
+            "credited raw work remains open after W0 settles",
+        );
+        for phase in [
+            HlsBeginningPrefixPhase::Disabled,
+            HlsBeginningPrefixPhase::AwaitManifest,
+            HlsBeginningPrefixPhase::Ready,
+            HlsBeginningPrefixPhase::Bypass,
+            HlsBeginningPrefixPhase::Retired,
+        ] {
+            assert_eq!(hls_beginning_raw_supply_admission(phase, true), Retire,);
+        }
+        assert_eq!(
+            hls_beginning_raw_supply_admission(HlsBeginningPrefixPhase::Supplying, false,),
+            Retire,
+            "an impossible settled-without-request state cannot admit work",
+        );
     }
 
     #[test]
@@ -238,13 +848,113 @@ mod hls {
     }
 
     #[test]
+    fn startup_runway_replaces_only_the_owner_for_the_same_media_kind() {
+        let mut active = HashMap::new();
+
+        assert_eq!(
+            hls_select_startup_runway_plan(&mut active, HlsMediaKind::Main, Some(11),),
+            None
+        );
+        assert_eq!(
+            hls_select_startup_runway_plan(&mut active, HlsMediaKind::Audio, Some(22),),
+            None
+        );
+        assert_eq!(
+            hls_select_startup_runway_plan(&mut active, HlsMediaKind::Main, Some(33),),
+            Some(11)
+        );
+        assert_eq!(active.get(&HlsMediaKind::Main), Some(&33));
+        assert_eq!(active.get(&HlsMediaKind::Audio), Some(&22));
+
+        assert_eq!(
+            hls_select_startup_runway_plan(&mut active, HlsMediaKind::Main, None,),
+            Some(33)
+        );
+
+        hls_select_startup_runway_plan(&mut active, HlsMediaKind::Main, Some(44));
+        hls_select_startup_runway_plan(&mut active, HlsMediaKind::Audio, Some(44));
+        assert_eq!(
+            hls_select_startup_runway_plan(&mut active, HlsMediaKind::Main, None,),
+            None,
+            "a plan shared by audio must not retire when main stops using it"
+        );
+        assert_eq!(active.get(&HlsMediaKind::Audio), Some(&44));
+
+        hls_select_startup_runway_plan(&mut active, HlsMediaKind::Main, Some(44));
+        assert_eq!(
+            hls_select_startup_runway_plan(&mut active, HlsMediaKind::Main, Some(55),),
+            None,
+            "audio still keeps the former shared plan active"
+        );
+        assert_eq!(active.get(&HlsMediaKind::Main), Some(&55));
+        assert_eq!(active.get(&HlsMediaKind::Audio), Some(&44));
+    }
+
+    #[test]
+    fn startup_retry_backoff_is_bounded() {
+        assert_eq!(
+            (0..7).map(hls_startup_retry_delay_ms).collect::<Vec<_>>(),
+            [75, 150, 300, 600, 1_000, 1_000, 1_000]
+        );
+    }
+
+    #[test]
     fn dom_playback_intent_ignores_autoplay_events_and_preserves_explicit_pause() {
-        assert!(!hls_dom_play_is_explicit(true));
-        assert!(hls_dom_play_is_explicit(false));
-        assert!(!hls_dom_pause_is_explicit(true, false));
-        assert!(!hls_dom_pause_is_explicit(true, true));
-        assert!(!hls_dom_pause_is_explicit(false, false));
-        assert!(hls_dom_pause_is_explicit(false, true));
+        for phase in [HlsPlayAttemptPhase::Pending, HlsPlayAttemptPhase::Rejecting] {
+            assert!(!hls_dom_play_is_explicit(Some(phase), false, false));
+            assert!(!hls_dom_play_is_explicit(Some(phase), true, false));
+            assert!(!hls_dom_pause_is_explicit(Some(phase), false));
+            assert!(!hls_dom_pause_is_explicit(Some(phase), true));
+        }
+        assert!(
+            hls_dom_play_is_explicit(None, false, false),
+            "a real manual play after an explicit pause remains authorized"
+        );
+        assert!(
+            !hls_dom_play_is_explicit(None, false, true),
+            "a delayed internal play after promise success is not a second authorization"
+        );
+        assert!(
+            !hls_dom_play_is_explicit(None, true, false),
+            "a queued play event observed after rollback paused the media is internal"
+        );
+        assert!(!hls_dom_pause_is_explicit(None, false));
+        assert!(hls_dom_pause_is_explicit(None, true));
+    }
+
+    #[test]
+    fn autoplay_transaction_commits_or_rolls_back_only_the_matching_pending_token() {
+        let pending = Some((41, HlsPlayAttemptPhase::Pending));
+        assert_eq!(
+            hls_play_attempt_settlement(pending, 41, true, true),
+            HlsPlayAttemptSettlement::Commit
+        );
+        assert_eq!(
+            hls_play_attempt_settlement(pending, 41, false, true),
+            HlsPlayAttemptSettlement::Rollback
+        );
+        assert_eq!(
+            hls_play_attempt_settlement(pending, 40, true, true),
+            HlsPlayAttemptSettlement::Stale,
+            "a late promise cannot settle the current attempt"
+        );
+        assert_eq!(
+            hls_play_attempt_settlement(Some((41, HlsPlayAttemptPhase::Rejecting)), 41, true, true,),
+            HlsPlayAttemptSettlement::Stale,
+            "a promise cannot commit after rollback has begun"
+        );
+        assert_eq!(
+            hls_play_attempt_settlement(None, 41, false, true),
+            HlsPlayAttemptSettlement::Stale
+        );
+
+        let retarget_a = 3120_u64;
+        let retarget_b = 3130_u64;
+        assert_eq!(
+            hls_play_attempt_settlement(pending, 41, true, retarget_a == retarget_b),
+            HlsPlayAttemptSettlement::Superseded,
+            "promise A cannot authorize after the session retargets to B"
+        );
     }
 
     #[test]
@@ -280,6 +990,322 @@ mod hls {
         assert!(!hls_live_frontier_is_ready(49, Some(48), 20.0, 10.0));
         assert!(!hls_live_frontier_is_ready(48, None, 20.0, 10.0));
         assert!(!hls_live_frontier_is_ready(48, Some(48), 10.0, 10.0));
+    }
+
+    #[test]
+    fn stopped_live_fallback_requires_consecutive_evidence_from_the_newest_snapshot() {
+        let first = format!("{:064x}", 101);
+        let second = format!("{:064x}", 102);
+        let next = format!("{:064x}", 103);
+        let mut replayed = vec![(517, 760, first.clone())];
+        assert_eq!(hls_live_tail_fallback_segment(&replayed), None);
+        replayed.push((517, 760, first.clone()));
+        assert_eq!(
+            hls_live_tail_fallback_segment(&replayed),
+            Some((517, 760, first.clone())),
+            "replaying earlier good media must not erase the first settled tail failure"
+        );
+
+        let failures = vec![(517, 760, first.clone()), (517, 761, second)];
+        assert_eq!(
+            hls_live_tail_fallback_segment(&failures),
+            Some((517, 760, first))
+        );
+
+        let mut advanced = failures;
+        advanced.push((518, 762, next.clone()));
+        assert_eq!(
+            hls_live_tail_fallback_segment(&advanced),
+            None,
+            "an older snapshot failure must not authenticate a new snapshot fallback"
+        );
+        advanced.push((518, 763, format!("{:064x}", 104)));
+        assert_eq!(
+            hls_live_tail_fallback_segment(&advanced),
+            Some((518, 762, next))
+        );
+    }
+
+    #[test]
+    fn stopped_live_fallback_cuts_the_exact_failed_sn_and_remains_reloadable() {
+        let repeated = format!("{:064x}", 99);
+        let reference = |position: u64| {
+            if matches!(position, 2 | 10 | 18) {
+                repeated.clone()
+            } else {
+                format!("{:064x}", position.saturating_add(1))
+            }
+        };
+        let manifest = format!(
+            "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:4\n\
+             #EXT-X-PLAYLIST-TYPE:VOD\n#EXT-X-MEDIA-SEQUENCE:0\n{}",
+            (0..22)
+                .map(|position| format!("#EXTINF:4.0,\n{}\n", reference(position)))
+                .collect::<String>()
+        );
+
+        let (boundary_sequence, boundary_reference) =
+            hls_live_retreat_boundary(manifest.as_bytes(), 18, &repeated).unwrap();
+        assert_eq!(boundary_sequence, 14);
+        assert_eq!(boundary_reference, reference(14));
+        assert_eq!(
+            hls_live_retreat_boundary(manifest.as_bytes(), 21, &reference(21)),
+            Some((14, reference(14))),
+            "seven playable 4s tail segments must not exclude a missing final segment"
+        );
+        let first_retreat = truncate_hls_live_before_segment(
+            manifest.as_bytes(),
+            boundary_sequence,
+            &boundary_reference,
+        )
+        .unwrap();
+        assert_eq!(hls_media_sequence(&first_retreat), Some(0));
+        assert_eq!(hls_media_references(&first_retreat).len(), 14);
+        assert_eq!(hls_media_references(&first_retreat)[2], repeated);
+
+        let (boundary_sequence, boundary_reference) =
+            hls_live_retreat_boundary(&first_retreat, 10, &repeated).unwrap();
+        assert_eq!(boundary_sequence, 6);
+        let second_retreat = present_hls_live_fallback(
+            manifest.as_bytes(),
+            boundary_sequence,
+            &boundary_reference,
+            22,
+        )
+        .unwrap();
+        assert_eq!(hls_media_references(&second_retreat).len(), 6);
+        let last_retained = reference(5);
+        assert_eq!(
+            hls_media_references(&second_retreat)
+                .last()
+                .map(String::as_str),
+            Some(last_retained.as_str())
+        );
+        assert!(!hls_is_finalized(&second_retreat));
+        assert!(
+            hls_live_retreat_boundary(manifest.as_bytes(), 9, &repeated).is_none(),
+            "the fragment sequence and reference must identify the same exact segment"
+        );
+
+        let rewritten = String::from_utf8(
+            rewrite_hls_manifest_for_live_reload(
+                &second_retreat,
+                "/weeb-3/hls/bytes",
+                false,
+                HlsStart::Live,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(rewritten.contains("#EXT-X-PLAYLIST-TYPE:EVENT"));
+        assert!(rewritten.contains("#EXT-X-START:TIME-OFFSET=-24"));
+        assert!(!rewritten.contains("#EXT-X-ENDLIST"));
+
+        let advanced_source = format!(
+            "{manifest}#EXTINF:4.0,\n{}\n#EXTINF:4.0,\n{}\n",
+            reference(22),
+            reference(23)
+        );
+        let advanced = present_hls_live_fallback(
+            advanced_source.as_bytes(),
+            boundary_sequence,
+            &boundary_reference,
+            22,
+        )
+        .unwrap();
+        assert_eq!(
+            advanced,
+            gap_hls_segment_range(
+                advanced_source.as_bytes(),
+                boundary_sequence,
+                &boundary_reference,
+                22,
+            )
+            .unwrap()
+        );
+        let advanced_text = String::from_utf8(advanced.clone()).unwrap();
+        assert_eq!(advanced_text.matches("#EXT-X-GAP").count(), 16);
+        assert_eq!(advanced_text.matches("#EXT-X-VERSION:").count(), 1);
+        assert!(advanced_text.contains("#EXT-X-VERSION:8\n"));
+        assert_eq!(
+            hls_media_references(&advanced),
+            (0..6).chain(22..24).map(reference).collect::<Vec<_>>()
+        );
+        assert!(!hls_is_finalized(&advanced));
+
+        let finalized_source = format!("{manifest}#EXT-X-ENDLIST\n");
+        assert_eq!(
+            hls_live_retreat_boundary(finalized_source.as_bytes(), 13, &reference(13)),
+            Some((13, reference(13))),
+            "a settled hls.js priming-fragment failure just before the nominal tail is exact evidence"
+        );
+        assert_eq!(
+            hls_live_retreat_boundary(finalized_source.as_bytes(), 12, &reference(12)),
+            Some((12, reference(12)))
+        );
+        assert_eq!(
+            hls_live_retreat_boundary(finalized_source.as_bytes(), 11, &reference(11)),
+            None,
+            "a finalized fallback must remain bounded to the tail plus its startup preroll"
+        );
+        let finalized = present_hls_live_fallback(
+            finalized_source.as_bytes(),
+            boundary_sequence,
+            &boundary_reference,
+            22,
+        )
+        .unwrap();
+        assert!(hls_is_finalized(&finalized));
+        assert_eq!(
+            String::from_utf8(finalized.clone())
+                .unwrap()
+                .matches("#EXT-X-GAP")
+                .count(),
+            16
+        );
+        let rewritten_finalized = rewrite_hls_manifest_for_live_reload(
+            &finalized,
+            "/weeb-3/hls/bytes",
+            true,
+            HlsStart::Live,
+        )
+        .unwrap();
+        assert!(hls_is_finalized(&rewritten_finalized));
+        assert!(!finalized_source.contains("#EXT-X-GAP"));
+
+        let pre_tail =
+            present_hls_live_fallback(finalized_source.as_bytes(), 12, &reference(12), 22).unwrap();
+        assert!(hls_is_finalized(&pre_tail));
+        assert_eq!(hls_last_playable_interval(&pre_tail), Some((44.0, 48.0)));
+
+        let replaced_cutoff = advanced_source.replacen(&boundary_reference, &reference(60), 1);
+        assert!(
+            present_hls_live_fallback(
+                replaced_cutoff.as_bytes(),
+                boundary_sequence,
+                &boundary_reference,
+                22,
+            )
+            .is_none()
+        );
+
+        let without_version = advanced_source.replacen("#EXT-X-VERSION:3\n", "", 1);
+        let inserted = gap_hls_segment_range(
+            without_version.as_bytes(),
+            boundary_sequence,
+            &boundary_reference,
+            22,
+        )
+        .unwrap();
+        assert!(
+            String::from_utf8(inserted)
+                .unwrap()
+                .starts_with("#EXTM3U\n#EXT-X-VERSION:8\n")
+        );
+
+        let bom_without_version = ["\u{feff}".as_bytes(), without_version.as_bytes()].concat();
+        let bom_inserted = gap_hls_segment_range(
+            &bom_without_version,
+            boundary_sequence,
+            &boundary_reference,
+            22,
+        )
+        .unwrap();
+        assert!(
+            String::from_utf8(bom_inserted)
+                .unwrap()
+                .starts_with("\u{feff}#EXTM3U\n#EXT-X-VERSION:8\n")
+        );
+
+        let crlf = advanced_source.replace('\n', "\r\n");
+        let crlf_gapped =
+            gap_hls_segment_range(crlf.as_bytes(), boundary_sequence, &boundary_reference, 22)
+                .unwrap();
+        let crlf_gapped = String::from_utf8(crlf_gapped).unwrap();
+        assert!(crlf_gapped.contains("#EXT-X-VERSION:8\r\n"));
+        assert!(!crlf_gapped.contains("#EXT-X-VERSION:8\n"));
+
+        let duplicate_version = advanced_source.replacen(
+            "#EXT-X-VERSION:3\n",
+            "#EXT-X-VERSION:3\n#EXT-X-VERSION:4\n",
+            1,
+        );
+        assert!(
+            gap_hls_segment_range(
+                duplicate_version.as_bytes(),
+                boundary_sequence,
+                &boundary_reference,
+                22,
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn finalized_trailing_gap_rewrite_starts_at_the_last_playable_segment() {
+        let manifest = format!(
+            "#EXTM3U\n#EXT-X-VERSION:8\n#EXT-X-TARGETDURATION:4\n\
+             #EXT-X-MEDIA-SEQUENCE:0\n#EXTINF:4.0,\n{REF}\n\
+             #EXTINF:1.0,\n{REF2}\n#EXT-X-GAP\n#EXTINF:4.0,\n{REF3}\n\
+             #EXT-X-GAP\n#EXTINF:4.0,\n{REF4}\n#EXT-X-ENDLIST\n"
+        );
+        let rewritten = String::from_utf8(
+            rewrite_hls_manifest_for_live_reload(
+                manifest.as_bytes(),
+                "/weeb-3/hls/bytes",
+                true,
+                HlsStart::Live,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(rewritten.contains("#EXT-X-START:TIME-OFFSET=-9,PRECISE=NO"));
+        assert!(rewritten.contains("#EXT-X-ENDLIST"));
+
+        let healthy = format!(
+            "#EXTM3U\n#EXT-X-VERSION:8\n#EXT-X-TARGETDURATION:4\n\
+             #EXT-X-MEDIA-SEQUENCE:0\n#EXTINF:4.0,\n{REF}\n\
+             #EXTINF:1.0,\n{REF2}\n#EXT-X-ENDLIST\n"
+        );
+        let healthy = String::from_utf8(
+            rewrite_hls_manifest_for_live_reload(
+                healthy.as_bytes(),
+                "/weeb-3/hls/bytes",
+                true,
+                HlsStart::Live,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(healthy.contains("#EXT-X-START:TIME-OFFSET=-5,PRECISE=NO"));
+    }
+
+    #[test]
+    fn hls_gap_ordering_skips_absent_media_and_rejects_ambiguous_tags() {
+        let first = format!("{:064x}", 1);
+        let second = format!("{:064x}", 2);
+        let third = format!("{:064x}", 3);
+        let both_orders = format!(
+            "#EXTM3U\n#EXT-X-VERSION:8\n#EXT-X-TARGETDURATION:4\n\
+             #EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-GAP\n#EXTINF:4.0,\n{first}\n\
+             #EXTINF:4.0,\n#EXT-X-GAP\n{second}\n#EXTINF:4.0,\n{third}\n"
+        );
+        assert_eq!(hls_media_references(both_orders.as_bytes()), [third]);
+        assert_eq!(hls_live_tail(both_orders.as_bytes()), Some((0, 12.0)));
+        assert_eq!(
+            hls_last_playable_interval(both_orders.as_bytes()),
+            Some((8.0, 12.0))
+        );
+
+        let duplicate = both_orders.replacen(
+            "#EXT-X-GAP\n#EXTINF:4.0,",
+            "#EXT-X-GAP\n#EXTINF:4.0,\n#EXT-X-GAP",
+            1,
+        );
+        assert_eq!(hls_live_tail(duplicate.as_bytes()), None);
+
+        let dangling = format!("{both_orders}#EXT-X-GAP\n");
+        assert_eq!(hls_live_tail(dangling.as_bytes()), None);
     }
 
     #[test]
@@ -379,6 +1405,76 @@ mod hls {
         );
         assert!(hls_manifest_reload_is_continuous(&bootstrap, &continuation));
         assert!(!classify_hls_level_transition(Some((0, true)), false, 0).rebase);
+    }
+
+    #[test]
+    fn open_codec_continuation_preserves_finalized_gap_start_and_only_defers_endlist() {
+        let finalized = format!(
+            "#EXTM3U\n#EXT-X-VERSION:8\n#EXT-X-TARGETDURATION:4\n\
+             #EXT-X-PLAYLIST-TYPE:VOD\n#EXT-X-MEDIA-SEQUENCE:0\n\
+             #EXTINF:4.0,\n{REF}\n#EXTINF:1.0,\n{REF2}\n\
+             #EXT-X-GAP\n#EXTINF:4.0,\n{REF3}\n\
+             #EXT-X-GAP\n#EXTINF:4.0,\n{REF4}\n#EXT-X-ENDLIST\n"
+        );
+        let continuation = continue_hls_codec_bootstrap(finalized.as_bytes()).unwrap();
+        let settled = rewrite_hls_manifest_for_live_reload(
+            &continuation,
+            "/weeb-3/hls/bytes/",
+            true,
+            HlsStart::Live,
+        )
+        .unwrap();
+        let open = open_hls_codec_continuation(&settled).unwrap();
+        let settled = String::from_utf8(settled).unwrap();
+        let open = String::from_utf8(open).unwrap();
+
+        assert!(settled.contains("#EXT-X-PLAYLIST-TYPE:EVENT"));
+        assert!(settled.contains("#EXT-X-ENDLIST"));
+        assert!(open.contains("#EXT-X-PLAYLIST-TYPE:EVENT"));
+        assert!(!open.contains("#EXT-X-ENDLIST"));
+        let settled_start = settled
+            .lines()
+            .find(|line| line.starts_with("#EXT-X-START:"))
+            .unwrap();
+        let open_start = open
+            .lines()
+            .find(|line| line.starts_with("#EXT-X-START:"))
+            .unwrap();
+        assert_eq!(open_start, settled_start);
+        assert_eq!(open.matches("#EXT-X-GAP").count(), 2);
+        assert_eq!(hls_media_references(open.as_bytes()).len(), 2);
+
+        let nonzero = format!(
+            "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:751\n#EXTINF:4.0,\n{REF}\n\
+             #EXTINF:6.0,\n{REF2}\n#EXT-X-ENDLIST\n"
+        );
+        assert_eq!(
+            hls_last_playable_segment(nonzero.as_bytes()),
+            Some((752, REF2.to_string(), 4.0, 6.0))
+        );
+    }
+
+    #[test]
+    fn codec_handoff_targets_and_buffer_acknowledgement_fail_closed() {
+        assert_eq!(
+            hls_codec_bootstrap_token("/feed?start=live&codec-bootstrap=73"),
+            Some(73)
+        );
+        assert_eq!(hls_codec_bootstrap_token("/feed?start=live"), None);
+        assert_eq!(hls_codec_bootstrap_token("/feed?codec-bootstrap=old"), None);
+
+        assert_eq!(
+            hls_finalized_edge_load_target(Some((96.0, 100.0))),
+            Some(98.0)
+        );
+        assert_eq!(hls_finalized_edge_load_target(Some((4.0, 5.0))), Some(4.0));
+        assert_eq!(hls_finalized_edge_load_target(None), None);
+        assert_eq!(hls_finalized_edge_load_target(Some((5.0, 4.0))), None);
+
+        assert!(hls_buffered_interval_covers(96.0, 4.0, &[(96.067, 100.0)]));
+        assert!(!hls_buffered_interval_covers(96.0, 4.0, &[(96.0, 99.0)]));
+        assert!(!hls_buffered_interval_covers(96.0, 4.0, &[(0.0, 4.0)]));
+        assert!(!hls_buffered_interval_covers(f64::NAN, 4.0, &[(0.0, 4.0)]));
     }
 
     #[test]
@@ -571,6 +1667,235 @@ mod hls {
             !hls_startup_prefix_is_preferred(rolling_vod.as_bytes(), master_prefix.as_bytes(), 4,),
             "a multivariant manifest is not an authenticated media prefix"
         );
+    }
+
+    #[test]
+    fn adaptive_sequence_zero_discovery_classifies_only_complete_media_checkpoints() {
+        let malformed_segments = format!(
+            "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:0\n{}",
+            (0_u64..4)
+                .map(|position| format!(
+                    "#EXTINF:not-a-duration,\n{:064x}\n",
+                    position.saturating_add(1)
+                ))
+                .collect::<String>()
+        );
+        assert_eq!(hls_media_references(malformed_segments.as_bytes()).len(), 4);
+        assert_eq!(
+            classify_hls_sequence_zero_discovery(b"not an HLS manifest", 4),
+            HlsSequenceZeroDiscoveryObservation::Unusable
+        );
+        assert_eq!(
+            classify_hls_sequence_zero_discovery(malformed_segments.as_bytes(), 4),
+            HlsSequenceZeroDiscoveryObservation::Unusable
+        );
+        assert_eq!(
+            classify_hls_sequence_zero_discovery(
+                b"#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:0\n#EXTINF:2.0,\n",
+                4,
+            ),
+            HlsSequenceZeroDiscoveryObservation::Unusable
+        );
+        let master = format!("#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1\n{REF}.m3u8\n");
+        assert_eq!(
+            classify_hls_sequence_zero_discovery(master.as_bytes(), 4),
+            HlsSequenceZeroDiscoveryObservation::Unusable
+        );
+        assert_eq!(
+            classify_hls_sequence_zero_discovery(&sparse_manifest(0, 3, false), 4),
+            HlsSequenceZeroDiscoveryObservation::Underfilled
+        );
+        assert_eq!(
+            classify_hls_sequence_zero_discovery(&sparse_manifest(0, 4, false), 4),
+            HlsSequenceZeroDiscoveryObservation::Ready
+        );
+        assert_eq!(
+            classify_hls_sequence_zero_discovery(&sparse_manifest(1, 4, false), 4),
+            HlsSequenceZeroDiscoveryObservation::Overshoot
+        );
+    }
+
+    #[test]
+    fn sequence_zero_canonical_arbitration_rejects_non_hls_and_malformed_bodies() {
+        let master = format!("#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1\n{REF}.m3u8\n");
+        assert!(hls_sequence_zero_canonical_is_supported(master.as_bytes()));
+        assert!(!hls_sequence_zero_canonical_is_supported(
+            b"#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1\n"
+        ));
+        assert!(!hls_sequence_zero_canonical_is_supported(
+            b"ordinary UTF-8 without an HLS header"
+        ));
+        assert!(!hls_sequence_zero_canonical_is_supported(&[
+            0xff, 0xfe, 0xfd
+        ]));
+        assert!(!hls_sequence_zero_canonical_is_supported(
+            b"#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:not-a-number\n"
+        ));
+        assert!(!hls_sequence_zero_canonical_is_supported(
+            b"#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:0\n#EXTINF:not-a-duration,\n"
+        ));
+        assert!(!hls_sequence_zero_canonical_is_supported(
+            b"#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:0\n#EXTINF:2.0,\n"
+        ));
+        assert!(hls_sequence_zero_canonical_is_supported(&sparse_manifest(
+            0, 1, false
+        )));
+        assert!(hls_sequence_zero_canonical_is_supported(&sparse_manifest(
+            9, 1, false
+        )));
+    }
+
+    #[test]
+    fn adaptive_sequence_zero_discovery_reaches_the_e81_checkpoint_without_rate_assumptions() {
+        let mut planner = HlsSequenceZeroDiscoveryPlanner::new();
+        assert_eq!(planner.next_probe(), Some(3));
+        planner.observe(3, HlsSequenceZeroDiscoveryObservation::Underfilled);
+        assert_eq!(planner.next_probe(), Some(7));
+        planner.observe(7, HlsSequenceZeroDiscoveryObservation::Underfilled);
+        assert_eq!(planner.next_probe(), Some(15));
+        assert_eq!(
+            classify_hls_sequence_zero_discovery(&sparse_manifest(0, 5, false), 4),
+            HlsSequenceZeroDiscoveryObservation::Ready
+        );
+    }
+
+    #[test]
+    fn adaptive_sequence_zero_discovery_reserves_half_its_budget_for_refinement() {
+        let mut planner = HlsSequenceZeroDiscoveryPlanner::new();
+        let geometric = std::iter::from_fn(|| planner.next_probe()).collect::<Vec<_>>();
+        assert_eq!(geometric, vec![3, 7, 15, 31]);
+        assert!(planner.next_probe().is_none());
+
+        planner.observe(31, HlsSequenceZeroDiscoveryObservation::Overshoot);
+        let refinement = std::iter::from_fn(|| planner.next_probe()).collect::<Vec<_>>();
+        assert_eq!(refinement.len(), 4);
+        assert!(refinement.iter().all(|index| *index < 31));
+
+        let all = geometric
+            .into_iter()
+            .chain(refinement)
+            .collect::<HashSet<_>>();
+        assert_eq!(all.len(), HLS_SEQUENCE_ZERO_DISCOVERY_MAX_PROBES);
+    }
+
+    #[test]
+    fn adaptive_sequence_zero_discovery_refines_the_full_unknown_overshoot_interval() {
+        let mut planner = HlsSequenceZeroDiscoveryPlanner::new();
+        assert_eq!(planner.next_probe(), Some(3));
+        planner.observe(3, HlsSequenceZeroDiscoveryObservation::Unusable);
+        assert_eq!(planner.next_probe(), Some(7));
+        planner.observe(7, HlsSequenceZeroDiscoveryObservation::Overshoot);
+
+        let mut probes = vec![3, 7];
+        while let Some(index) = planner.next_probe() {
+            probes.push(index);
+            planner.observe(index, HlsSequenceZeroDiscoveryObservation::Unusable);
+        }
+        assert_eq!(probes.len(), HLS_SEQUENCE_ZERO_DISCOVERY_MAX_PROBES);
+        assert_eq!(
+            probes.iter().copied().collect::<HashSet<_>>().len(),
+            probes.len()
+        );
+        assert!(probes.iter().all(|index| *index < 8));
+        assert!(probes.contains(&0) && probes.contains(&1) && probes.contains(&2));
+    }
+
+    #[test]
+    fn adaptive_sequence_zero_discovery_uses_real_bounds_and_ignores_missing_probes() {
+        let mut missing = HlsSequenceZeroDiscoveryPlanner::new();
+        assert_eq!(missing.next_probe(), Some(3));
+        missing.observe(3, HlsSequenceZeroDiscoveryObservation::Unusable);
+        assert_eq!(missing.next_probe(), Some(7));
+        missing.observe(7, HlsSequenceZeroDiscoveryObservation::Unusable);
+        assert_eq!(missing.next_probe(), Some(15));
+
+        let mut bracketed = HlsSequenceZeroDiscoveryPlanner::new();
+        for index in [3, 7, 15] {
+            assert_eq!(bracketed.next_probe(), Some(index));
+            bracketed.observe(index, HlsSequenceZeroDiscoveryObservation::Underfilled);
+        }
+        assert_eq!(bracketed.next_probe(), Some(31));
+        bracketed.observe(31, HlsSequenceZeroDiscoveryObservation::Overshoot);
+        assert_eq!(bracketed.next_probe(), Some(23));
+    }
+
+    #[test]
+    fn authenticated_deferred_prefix_presents_only_complete_sequence_zero_segments() {
+        let complete = sparse_manifest(0, 5, false);
+        let mut authenticated_prefix = complete.clone();
+        authenticated_prefix.extend_from_slice(b"#EXTINF:2.0,\npartial-reference");
+        let payload_span = u64::try_from(authenticated_prefix.len()).unwrap() + 512;
+
+        assert_eq!(
+            hls_sequence_zero_body_from_deferred_prefix(&authenticated_prefix, payload_span, 4),
+            Some(complete.clone())
+        );
+        assert!(
+            hls_sequence_zero_body_from_deferred_prefix(
+                &authenticated_prefix,
+                u64::try_from(authenticated_prefix.len()).unwrap(),
+                4,
+            )
+            .is_none(),
+            "a complete body must stay on the RawFeedPayload path"
+        );
+        assert!(
+            hls_sequence_zero_body_from_deferred_prefix(
+                &sparse_manifest(0, 3, false),
+                payload_span,
+                4,
+            )
+            .is_none()
+        );
+        assert!(
+            hls_sequence_zero_body_from_deferred_prefix(
+                &sparse_manifest(1, 5, false),
+                payload_span,
+                4,
+            )
+            .is_none()
+        );
+
+        let mut terminal_prefix = sparse_manifest(0, 5, true);
+        terminal_prefix.extend_from_slice(b"trailing-partial");
+        assert!(
+            hls_sequence_zero_body_from_deferred_prefix(
+                &terminal_prefix,
+                u64::try_from(terminal_prefix.len()).unwrap() + 1,
+                4,
+            )
+            .is_none(),
+            "a bounded prefix must not erase an authenticated ENDLIST"
+        );
+    }
+
+    #[test]
+    fn deferred_feed_completion_requires_exact_span_and_entire_authenticated_prefix() {
+        let prefix = b"#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:0\n";
+        let mut complete = prefix.to_vec();
+        complete.extend_from_slice(b"#EXTINF:2.0,\nsegment\n");
+        let span = u64::try_from(complete.len()).unwrap();
+        assert!(hls_deferred_feed_completion_matches(
+            span, prefix, &complete
+        ));
+
+        let mut mismatched = complete.clone();
+        mismatched[prefix.len() - 1] ^= 1;
+        assert!(!hls_deferred_feed_completion_matches(
+            span,
+            prefix,
+            &mismatched
+        ));
+        assert!(!hls_deferred_feed_completion_matches(
+            span + 1,
+            prefix,
+            &complete
+        ));
+        assert!(!hls_deferred_feed_completion_matches(
+            u64::try_from(prefix.len()).unwrap(),
+            prefix,
+            prefix
+        ));
     }
 
     #[test]
@@ -1348,6 +2673,149 @@ mod hls {
                 .and_then(|merged| hls_target_duration(&merged)),
             Some(3),
             "steady-state sequence-zero reloads must retain a later maximum target duration"
+        );
+    }
+
+    #[test]
+    fn adjacent_archive_append_preserves_gap_before_extinf() {
+        let prefix = sparse_manifest(0, 2, false);
+        let missing = format!("{:064x}", 3);
+        let available = format!("{:064x}", 4);
+        let adjacent = format!(
+            "#EXTM3U\n#EXT-X-VERSION:8\n#EXT-X-TARGETDURATION:2\n\
+             #EXT-X-MEDIA-SEQUENCE:2\n#EXT-X-GAP\n#EXTINF:2.0,\n{missing}\n\
+             #EXTINF:2.0,\n{available}\n"
+        );
+        let extended = extend_hls_sequence_zero_archive(&prefix, adjacent.as_bytes())
+            .expect("an adjacent merge must retain the GAP and its required protocol version");
+        let mut archive = prefix.clone();
+        let mut segment_count = 2;
+        let mut media_end = archive.len();
+        append_hls_sequence_zero_archive_suffix(
+            &mut archive,
+            &mut segment_count,
+            &mut media_end,
+            &prefix,
+            adjacent.as_bytes(),
+        )
+        .expect("an adjacent suffix must retain a GAP that precedes its first EXTINF");
+
+        assert_eq!(segment_count, 4);
+        for merged in [&extended, &archive] {
+            let text = String::from_utf8(merged.clone()).unwrap();
+            assert!(text.contains("#EXT-X-GAP\n#EXTINF:2.0,"));
+            assert_eq!(text.matches("#EXT-X-VERSION:").count(), 1);
+            assert!(text.contains("#EXT-X-VERSION:8\n"));
+            assert_eq!(
+                hls_media_references(merged),
+                [
+                    format!("{:064x}", 1),
+                    format!("{:064x}", 2),
+                    available.clone()
+                ]
+            );
+        }
+
+        let replacement_without_version =
+            String::from_utf8(extended.clone())
+                .unwrap()
+                .replacen("#EXT-X-VERSION:8\n", "", 1);
+        let replacement = extend_hls_sequence_zero_archive(
+            replacement_without_version.as_bytes(),
+            replacement_without_version.as_bytes(),
+        )
+        .expect("a sequence-zero GAP replacement must insert its own required version");
+        assert!(
+            String::from_utf8(replacement)
+                .unwrap()
+                .starts_with("#EXTM3U\n#EXT-X-VERSION:8\n")
+        );
+
+        let followup = sparse_manifest(4, 1, false);
+        append_hls_sequence_zero_archive_suffix(
+            &mut archive,
+            &mut segment_count,
+            &mut media_end,
+            adjacent.as_bytes(),
+            &followup,
+        )
+        .expect("the normalized media cursor must permit a later ordinary in-place append");
+        assert_eq!(segment_count, 5);
+        assert_eq!(
+            hls_media_references(&archive),
+            [
+                format!("{:064x}", 1),
+                format!("{:064x}", 2),
+                available,
+                format!("{:064x}", 5)
+            ]
+        );
+    }
+
+    #[test]
+    fn overlapping_archive_append_elevates_gap_version_failure_atomically() {
+        let prefix = String::from_utf8(sparse_manifest(0, 3, false))
+            .unwrap()
+            .replacen("#EXTM3U\n", "#EXTM3U\n#EXT-X-VERSION:3\n", 1);
+        let overlap = format!(
+            "#EXTM3U\n#EXT-X-VERSION:8\n#EXT-X-TARGETDURATION:2\n\
+             #EXT-X-MEDIA-SEQUENCE:2\n#EXTINF:2.0,\n{:064x}\n\
+             #EXT-X-GAP\n#EXTINF:2.0,\n{:064x}\n#EXTINF:2.0,\n{:064x}\n",
+            3, 4, 5
+        );
+        let extended = extend_hls_sequence_zero_archive(prefix.as_bytes(), overlap.as_bytes())
+            .expect("an overlapping merge must elevate the retained header version");
+        let mut archive = prefix.as_bytes().to_vec();
+        let mut segment_count = 3;
+        let mut media_end = archive.len();
+        append_hls_sequence_zero_archive_suffix(
+            &mut archive,
+            &mut segment_count,
+            &mut media_end,
+            prefix.as_bytes(),
+            overlap.as_bytes(),
+        )
+        .expect("an overlapping append must elevate the retained header version");
+
+        assert_eq!(segment_count, 5);
+        for merged in [&extended, &archive] {
+            let text = String::from_utf8(merged.clone()).unwrap();
+            assert_eq!(text.matches("#EXT-X-VERSION:").count(), 1);
+            assert!(text.contains("#EXT-X-VERSION:8\n"));
+            assert_eq!(
+                hls_media_references(merged),
+                [
+                    format!("{:064x}", 1),
+                    format!("{:064x}", 2),
+                    format!("{:064x}", 3),
+                    format!("{:064x}", 5)
+                ]
+            );
+        }
+
+        let duplicate_version = prefix.replacen(
+            "#EXT-X-VERSION:3\n",
+            "#EXT-X-VERSION:3\n#EXT-X-VERSION:4\n",
+            1,
+        );
+        let mut rejected_archive = duplicate_version.as_bytes().to_vec();
+        let mut rejected_count = 3;
+        let mut rejected_media_end = rejected_archive.len();
+        let before = (rejected_archive.clone(), rejected_count, rejected_media_end);
+        assert!(
+            append_hls_sequence_zero_archive_suffix(
+                &mut rejected_archive,
+                &mut rejected_count,
+                &mut rejected_media_end,
+                duplicate_version.as_bytes(),
+                overlap.as_bytes(),
+            )
+            .is_none(),
+            "ambiguous retained version state must reject before committing the append"
+        );
+        assert_eq!(
+            (rejected_archive, rejected_count, rejected_media_end),
+            before
         );
     }
 
@@ -2926,8 +4394,9 @@ mod service_worker {
         assert!(loader_start < worker_ready);
         assert!(lifecycle < worker_ready && lifecycle < snapshot);
         assert!(worker_ready < overlap && snapshot < overlap && overlap < play);
-        assert!(attach.contains("HlsStart::Beginning => 0.0"));
-        assert!(attach.contains("HlsStart::Live => -1.0"));
+        assert!(
+            attach.contains("play_hls(player, &source, hls_loader, start, beginning_prefix_stamp)")
+        );
         assert!(!attach.contains("autoplay_deadline"));
         assert!(!attach.contains("hls_feed_payload_at_index_bounded("));
         assert!(!attach.contains("join(current, bootstrap).await"));
@@ -2955,7 +4424,9 @@ mod service_worker {
         let explicit_policy = play_hls.find("autoplay_allowed,").unwrap();
         assert!(capture_autoplay < disable_native && disable_native < explicit_policy);
         assert!(!play_hls.contains("autoplay_allowed: true"));
-        assert!(play_hls.contains("let autoplay_gate_required = autoplay_allowed;"));
+        assert!(play_hls.contains("HlsStart::Beginning => 0.0"));
+        assert!(play_hls.contains("HlsStart::Live => -1.0"));
+        assert!(!play_hls.contains("autoplay_gate_required"));
         assert!(!play_hls.contains("source.contains(\"start=live\")"));
 
         let launch = source_between(player, "async fn launch(", "fn session_from(");
@@ -2969,11 +4440,14 @@ mod service_worker {
         assert!(authorization < epoch && epoch < clear_authorization);
         assert!(launch.contains("request.media.set_autoplay(false);"));
         assert!(launch.contains("let _ = request.media.pause();"));
-        assert!(launch.contains("hls_config(request.source.contains(\"start=live\"))"));
+        assert!(launch.contains("hls_config(request.start == HlsStart::Live)"));
         let native_preload = launch.find("media.set_preload(\"auto\")").unwrap();
         let native_load = launch.find("media.load();").unwrap();
-        let native_gate = launch.find("start_autoplay_buffer_gate(epoch)").unwrap();
-        assert!(native_preload < native_load && native_load < native_gate);
+        let native_play = launch
+            .find("autoplay(epoch, Autoplay::Policy, None)")
+            .unwrap();
+        assert!(native_preload < native_load && native_load < native_play);
+        assert!(!launch.contains("start_autoplay_buffer_gate(epoch)"));
         let hls_listener = launch
             .find("let hls_listener = install_hls_listener")
             .unwrap();
@@ -3012,16 +4486,50 @@ mod service_worker {
         assert!(dom_dispose.contains("remove_event_listener_with_callback"));
         assert!(dom_dispose.contains("std::mem::forget(listener)"));
 
-        let bootstrap = source_between(player, "fn buffer_created(", "fn fragment_buffered(");
-        let seek = bootstrap.find("media.set_current_time(target)").unwrap();
+        let buffer_created =
+            source_between(player, "fn buffer_created(", "fn main_swarm_fragment(");
+        assert!(buffer_created.contains("session.codec_video_buffer_ready = true"));
+        assert!(!buffer_created.contains("finish_hls_codec_bootstrap"));
+        assert!(!buffer_created.contains("restore_hls_progressive_loader"));
+        let bootstrap = source_between(
+            player,
+            "fn complete_hls_codec_bootstrap(",
+            "fn fragment_buffered(",
+        );
+        let matched = bootstrap
+            .find("codec_loading_fragments.contains(&fragment_identity)")
+            .unwrap();
         let release = bootstrap.find("session.codec_pending = false").unwrap();
-        let resume = bootstrap.find("autoplay(epoch, Autoplay::Resume)").unwrap();
+        let finish = bootstrap
+            .find("finish_hls_codec_bootstrap(&source)")
+            .unwrap();
+        let restore = bootstrap
+            .find("restore_hls_progressive_loader(&hls)")
+            .unwrap();
+        let handoff = bootstrap
+            .find("handoff_hls_codec_bootstrap_prefetch_timeline()")
+            .unwrap();
+        let stop = bootstrap.find("let Err(error) = hls.stop_load()").unwrap();
+        let seek = bootstrap
+            .find("media.set_current_time(target.position())")
+            .unwrap();
+        let microtask = bootstrap.find("Wait::Microtask.wait().await").unwrap();
+        let restart = bootstrap
+            .find("start_at(epoch, &hls, target.position())")
+            .unwrap();
         assert!(bootstrap.contains("finish_hls_codec_bootstrap(&source)"));
-        assert!(bootstrap.contains(".split(\"&codec-bootstrap=\")"));
+        assert!(!bootstrap.contains("strip_hls_codec_bootstrap"));
+        assert!(!bootstrap.contains("load_source"));
+        assert!(!bootstrap.contains("session.source ="));
+        assert!(bootstrap.contains("start == HlsStart::Beginning"));
+        assert!(bootstrap.contains("resume_position.filter(|target| target.is_finite())"));
+        assert!(!bootstrap.contains("Reflect::get"));
         assert!(bootstrap.contains("session.playback_authorized || session.resume"));
         assert!(bootstrap.contains("if resume"));
-        assert!(bootstrap.contains("start_autoplay_buffer_gate(epoch)"));
-        assert!(seek < release && release < resume);
+        assert!(bootstrap.contains("start_autoplay_buffer_gate(epoch, Autoplay::Policy)"));
+        assert!(!bootstrap.contains("autoplay(epoch,"));
+        assert!(matched < stop && stop < release && release < finish && finish < restore);
+        assert!(restore < handoff && handoff < seek && seek < microtask && microtask < restart);
 
         let manifest = source_between(player, "fn manifest_parsed(", "fn level_loaded(");
         assert!(manifest.contains("session.load = LoadPhase::Warmup"));
@@ -3030,16 +4538,29 @@ mod service_worker {
                 < manifest.find("hls_autoplay_gate_ready(").unwrap()
         );
         assert!(manifest.contains("hls_contiguous_buffered_ahead("));
-        assert!(manifest.contains(".any(|(_, live, _)| !live)"));
-        assert!(manifest.contains("media.duration()"));
+        assert!(manifest.contains("hls_autoplay_start_target("));
+        assert!(manifest.contains("hls_live_sync_position"));
+        assert!(!manifest.contains("hls_startup_runway_ready"));
+        assert!(manifest.contains(".any(|(_, live, _, playable)| !live || playable.is_some())"));
+        assert!(manifest.contains("let finalized_playable_interval ="));
+        assert!(manifest.contains(".filter_map(|(_, _, _, playable)| *playable)"));
+        assert!(!manifest.contains(".filter(|(_, live, _, _)| !*live)"));
+        assert!(manifest.contains(".map_or_else(|| media.duration(), |(_, end)| end)"));
         assert!(!manifest.contains("autoplay_deadline"));
-        assert!(manifest.contains("if session.playback_authorized"));
-        assert!(manifest.contains("!session.playback_authorized"));
+        assert!(manifest.contains("let position = session.restart_position()"));
+        assert!(manifest.contains("intent.allowed(session)"));
+        assert!(manifest.contains("session.playback_authorized || !intent.allowed(session)"));
         assert!(manifest.contains("if session.codec_pending"));
         assert!(manifest.contains("sleep(HLS_AUTOPLAY_GATE_POLL).await"));
         assert!(manifest.contains("session.autoplay_gate_pending = true"));
-        assert!(manifest.contains("start && !resume && session.autoplay_gate_required"));
+        assert!(manifest.contains("start_autoplay_buffer_gate(epoch, intent)"));
         assert!(manifest.contains("session.autoplay_gate_pending = false"));
+        assert!(
+            manifest.find("AutoplayGatePoll::Ready(target)").unwrap()
+                < manifest
+                    .rfind("autoplay(epoch, intent, Some(target))")
+                    .unwrap()
+        );
         assert!(!manifest.contains("Backend::Native) && media.duration().is_finite()"));
         assert!(!manifest.contains("sleep(Duration::from_millis(500))"));
         let attach = source_between(
@@ -3052,27 +4573,39 @@ mod service_worker {
         let rebase_event = rebase
             .find("emit(&media, HLS_TIMELINE_REBASE_EVENT)")
             .unwrap();
-        let stop = rebase.find("hls.stop_load()").unwrap();
-        let defer = rebase.find("Wait::Microtask.wait().await").unwrap();
-        let relaunch = rebase.find("launch(request).await").unwrap();
+        let stop = rebase[rebase_event..].find("hls.stop_load()").unwrap() + rebase_event;
+        let defer = rebase[stop..].find("Wait::Microtask.wait().await").unwrap() + stop;
+        let relaunch = rebase[defer..].find("launch(request).await").unwrap() + defer;
         assert!(rebase.contains("hls_timeline_rebase_position("));
         assert!(rebase.contains("autoplay_allowed: session.autoplay_allowed"));
-        assert!(rebase.contains("autoplay_gate_required: session.autoplay_gate_required"));
+        assert!(rebase.contains("let codec_bootstrap = session.codec_required"));
+        assert!(rebase.contains("codec_bootstrap,"));
+        assert!(rebase.contains("start: session.start"));
+        assert!(rebase.contains("resume_position: rebase.or(session.resume_position)"));
+        assert!(rebase.contains("resume: session.playback_authorized"));
         assert!(rebase_event < stop && stop < defer && defer < relaunch);
 
         let dom = source_between(player, "fn dom_event(", "fn handle_error(");
-        assert!(dom.contains("let user = hls_dom_play_is_explicit(pending)"));
+        assert!(dom.contains("hls_dom_play_is_explicit("));
         assert!(dom.contains("hls_dom_pause_is_explicit("));
-        assert!(dom.contains("session.autoplay_pending,"));
+        assert!(dom.contains("session.play_attempt_phase(),"));
+        assert!(dom.contains("session.media.paused(),"));
+        assert!(dom.contains("session.playback_authorized,"));
         assert!(dom.contains("session.playback_authorized,"));
         assert!(dom.contains("session.playback_authorized = true"));
         assert!(dom.contains("session.playback_authorized = false"));
         assert!(dom.contains("session.autoplay_allowed = false"));
+        assert!(
+            dom.find("session.remember_current_position()").unwrap()
+                < dom.find("session.playback_authorized = false").unwrap()
+        );
         assert!(dom.contains("emit(&media, HLS_AUTOPLAY_AUTHORIZED_EVENT)"));
         assert!(dom.contains("emit(&media, HLS_EXPLICIT_PAUSE_EVENT)"));
 
         let errors = source_between(player, "fn handle_error(", "fn hard_recovery(");
-        assert!(errors.contains("sourceBufferName"));
+        assert!(errors.contains("missing_video_source_buffer_error(&data)"));
+        assert!(!errors.contains("source.contains(\"start=live\")"));
+        assert!(!errors.contains("session.initial_position = 0.0"));
         assert!(
             errors.find("let codec_bootstrap").unwrap()
                 < errors
@@ -3087,16 +4620,42 @@ mod service_worker {
                 < hard_recovery.find("session.restart_position()").unwrap()
         );
         assert!(hard_recovery.contains("autoplay_allowed: session.autoplay_allowed"));
-        assert!(hard_recovery.contains("autoplay_gate_required: session.autoplay_gate_required"));
+        assert!(hard_recovery.contains("codec_bootstrap: session.codec_required"));
+        assert!(hard_recovery.contains("start: session.start"));
+        assert!(hard_recovery.contains("resume_position: session.resume_position"));
+
+        let restart = source_between(
+            player,
+            "fn restart_position(&self)",
+            "fn remember_current_position",
+        );
+        assert!(
+            restart.find("if self.codec_pending").unwrap()
+                < restart
+                    .find("if let Some(position) = self.rebase_position")
+                    .unwrap()
+        );
+        assert!(
+            restart
+                .find("if let Some(position) = self.resume_position")
+                .unwrap()
+                < restart
+                    .find("let current = self.media.current_time()")
+                    .unwrap()
+        );
+        assert!(!restart.contains("self.playback_authorized"));
+        assert!(restart.contains("self.start == HlsStart::Beginning || current > 0.0"));
         let autoplay = source_between(player, "fn autoplay(", "fn playback_error(");
         assert!(
             autoplay.contains("matches!(intent, Autoplay::Resume) || session.autoplay_allowed")
         );
         assert!(!autoplay.contains("media.autoplay()"));
         assert!(autoplay.contains("&& !session.codec_pending"));
-        assert!(autoplay.contains("if matches!(session.load, LoadPhase::Warmup)"));
+        assert!(autoplay.contains("if !matches!(session.load, LoadPhase::Started)"));
         assert!(
-            autoplay.find("session.autoplay_pending = true").unwrap()
+            autoplay
+                .find("session.play_attempt = Some(PlayAttempt")
+                .unwrap()
                 < autoplay.find("media.play()").unwrap()
         );
 
@@ -3108,6 +4667,326 @@ mod service_worker {
         ] {
             assert!(!STATIC_HLS_LOADER.contains(policy));
         }
+    }
+
+    #[test]
+    fn autoplay_attempt_is_transactional_across_dom_events_and_promise_settlement() {
+        let session = source_between(HLS_PLAYER, "struct Session {", "struct Player {");
+        assert!(session.contains("play_attempt_serial: u64"));
+        assert!(session.contains("play_attempt: Option<PlayAttempt>"));
+        assert!(!session.contains("autoplay_pending"));
+
+        let gate = source_between(
+            HLS_PLAYER,
+            "fn start_autoplay_buffer_gate(",
+            "fn level_loaded(",
+        );
+        assert!(gate.contains("autoplay(epoch, intent, Some(target))"));
+        assert!(!gate.contains("session.live_retarget = LiveRetarget::Inactive"));
+        let wait_for_attempt = gate
+            .find("session.codec_pending || session.play_attempt.is_some()")
+            .unwrap();
+        let target_snapshot = gate
+            .find("let target = match session.live_retarget")
+            .unwrap();
+        assert!(wait_for_attempt < target_snapshot);
+
+        let dom = source_between(HLS_PLAYER, "fn dom_event(", "fn handle_error(");
+        let guard = dom.find("if !user {").unwrap();
+        let cold = dom
+            .find("let first = matches!(session.load, LoadPhase::Cold)")
+            .unwrap();
+        assert!(
+            guard < cold,
+            "an internal play event must not mutate load state"
+        );
+        assert!(dom.contains("return (session.media.clone(), None, false, false)"));
+        assert!(dom.contains("session.play_attempt_phase()"));
+
+        let autoplay = source_between(HLS_PLAYER, "fn autoplay(", "fn playback_error(");
+        let stage = autoplay
+            .find("session.play_attempt = Some(PlayAttempt")
+            .unwrap();
+        let seek = autoplay.find("media.set_current_time(target)").unwrap();
+        let play = autoplay.find("media.play()").unwrap();
+        assert!(stage < seek && seek < play);
+
+        let snapshot = source_between(
+            HLS_PLAYER,
+            "fn play_attempt_snapshot_current(",
+            "fn hls(&self)",
+        );
+        for exact in [
+            "self.live_retarget == attempt.live_retarget",
+            "self.resume == attempt.resume",
+            "self.resume_position == attempt.resume_position",
+            "self.initial_position == attempt.initial_position",
+            "self.rebase_position == attempt.rebase_position",
+            "attempt.intent.allowed(self)",
+            "!self.playback_authorized",
+            "!self.codec_pending",
+        ] {
+            assert!(
+                snapshot.contains(exact),
+                "missing transaction match: {exact}"
+            );
+        }
+
+        let snapshot_check = autoplay
+            .find("let snapshot_current = session.play_attempt_snapshot_current(attempt)")
+            .unwrap();
+        let settlement = autoplay.find("hls_play_attempt_settlement(").unwrap();
+        let commit = autoplay.find("HlsPlayAttemptSettlement::Commit").unwrap();
+        let consume = autoplay[commit..]
+            .find("session.play_attempt = None")
+            .unwrap()
+            + commit;
+        let retarget = autoplay[consume..]
+            .find("session.live_retarget = LiveRetarget::Inactive")
+            .unwrap()
+            + consume;
+        let authorize = autoplay[retarget..]
+            .find("session.playback_authorized = true")
+            .unwrap()
+            + retarget;
+        assert!(snapshot_check < settlement && settlement < commit);
+        assert!(commit < consume && consume < retarget && retarget < authorize);
+
+        let rollback = autoplay.find("HlsPlayAttemptSettlement::Rollback").unwrap();
+        let rejecting = autoplay[rollback..]
+            .find("rejecting.phase = HlsPlayAttemptPhase::Rejecting")
+            .unwrap()
+            + rollback;
+        let preserve_current = autoplay[rejecting..].find("if !superseded {").unwrap() + rejecting;
+        let restore_retarget = autoplay[preserve_current..]
+            .find("session.live_retarget = attempt.live_retarget")
+            .unwrap()
+            + preserve_current;
+        let restore_resume = autoplay[restore_retarget..]
+            .find("session.resume = attempt.resume")
+            .unwrap()
+            + restore_retarget;
+        let pause = autoplay[restore_resume..]
+            .find("let _ = media.pause()")
+            .unwrap()
+            + restore_resume;
+        let restore_target = autoplay[pause..]
+            .find("media.set_current_time(target)")
+            .unwrap()
+            + pause;
+        let drain = autoplay[restore_target..]
+            .find("Wait::Millis(1).wait().await")
+            .unwrap()
+            + restore_target;
+        let exact_rejection = autoplay[drain..]
+            .find("Some((token, HlsPlayAttemptPhase::Rejecting))")
+            .unwrap()
+            + drain;
+        let clear = autoplay[exact_rejection..]
+            .find("session.play_attempt = None")
+            .unwrap()
+            + exact_rejection;
+        let resume_current_gate = autoplay[clear..]
+            .find("start_autoplay_buffer_gate(epoch, intent)")
+            .unwrap()
+            + clear;
+        assert!(autoplay.contains("HlsPlayAttemptSettlement::Superseded"));
+        assert!(autoplay.contains("target: if superseded { None } else { attempt.target }"));
+        assert!(rollback < rejecting && rejecting < preserve_current);
+        assert!(preserve_current < restore_retarget);
+        assert!(restore_retarget < restore_resume && restore_resume < pause);
+        assert!(pause < restore_target && restore_target < drain);
+        assert!(drain < exact_rejection && exact_rejection < clear);
+        assert!(clear < resume_current_gate);
+    }
+
+    #[test]
+    fn stopped_live_recovery_is_snapshot_local_and_ignores_codec_bootstrap_buffering() {
+        let codec_evidence = source_between(
+            HLS_PLAYER,
+            "fn missing_video_source_buffer_error(",
+            "fn install_live_tail_fallback(",
+        );
+        for exact in [
+            "js_bool_property(data, \"fatal\")",
+            "Some(\"mediaError\")",
+            "Some(\"bufferAppendError\")",
+            "Some(\"video\")",
+            "HLS_TRACK_REMOVED_ERROR_NAME",
+            "HLS_MISSING_VIDEO_SOURCE_BUFFER_MESSAGE",
+        ] {
+            assert!(codec_evidence.contains(exact), "missing {exact}");
+        }
+        let exact_main = source_between(
+            HLS_PLAYER,
+            "fn main_swarm_fragment(",
+            "fn complete_hls_codec_bootstrap(",
+        );
+        for exact in [
+            "Some(\"main\")",
+            "js_safe_u64_property(&fragment, \"sn\")",
+            "js_string_property(&fragment, \"url\")",
+            "swarm_bytes_reference(&url)",
+        ] {
+            assert!(exact_main.contains(exact), "missing {exact}");
+        }
+        assert!(
+            HLS_PLAYER
+                .contains("const HLS_TRACK_REMOVED_ERROR_NAME: &str = \"HlsJsTrackRemovedError\";")
+        );
+        assert!(
+            HLS_PLAYER.contains(
+                "\"Attempting to append to the video SourceBuffer, but it does not exist\""
+            )
+        );
+        assert!(!codec_evidence.contains("contains(\"video SourceBuffer\")"));
+
+        let evidence = source_between(
+            HLS_PLAYER,
+            "fn install_live_tail_fallback(",
+            "fn handle_error(",
+        );
+        assert!(evidence.contains("js_bool_property(data, \"fatal\")"));
+        assert!(evidence.contains("fragLoadError"));
+        assert!(evidence.contains("fragLoadTimeOut"));
+        assert!(evidence.contains("fragParsingError"));
+        assert!(!evidence.contains("bufferAppendError"));
+        assert!(evidence.contains("js_safe_u64_property(&fragment, \"sn\")"));
+        assert!(evidence.contains("js_string_property(&fragment, \"url\")"));
+        assert!(evidence.contains("active_hls_live_snapshot_index()"));
+        assert!(evidence.contains("hls_live_tail_fallback_segment"));
+        assert!(evidence.contains("session.live_tail_failures"));
+        assert!(evidence.contains("hls_finalized_edge_load_target("));
+        assert!(evidence.contains("if !session.codec_bootstrap_completed"));
+        assert!(!evidence.contains("!session.codec_continuation_open"));
+        assert!(evidence.contains("session.codec_continuation_open = true"));
+        assert!(evidence.contains(".wrapping_add(1)"));
+        assert!(evidence.contains("LiveRetarget::AwaitingFallback"));
+        assert!(evidence.contains("LiveTailFallbackAction::SameInstance(hls, target, intent)"));
+        assert!(!evidence.contains("media_started"));
+        assert!(!evidence.contains("bufferAppendError"));
+
+        let errors = source_between(HLS_PLAYER, "fn handle_error(", "fn hard_recovery(");
+        assert!(errors.contains("session.codec_bootstrap_completed"));
+        assert!(errors.contains("hls.start_load_at(target)"));
+        assert!(!errors.contains("start_load_at(-1"));
+        assert!(!errors.contains("recover_media_error"));
+
+        let presented_edge = source_between(
+            HLS_PLAYER,
+            "fn fragment_matches_presented_edge(",
+            "fn hls_live_sync_position(",
+        );
+        assert!(presented_edge.contains("fragment.identity.0 == presented.0"));
+        assert!(presented_edge.contains("fragment.identity.1 == presented.1"));
+        assert!(presented_edge.contains("fragment.duration - presented.3"));
+        assert!(!presented_edge.contains("fragment.start - presented.2"));
+
+        let level = source_between(HLS_PLAYER, "fn level_loaded(", "fn dom_event(");
+        let runtime_edge = level
+            .find("active_hls_finalized_playable_presentation")
+            .unwrap();
+        let validate = level
+            .find("fragment_matches_presented_edge(fragment, presented)")
+            .unwrap();
+        let barrier = level
+            .find("LiveRetarget::AwaitingFallback(target) =>")
+            .unwrap();
+        let target = level[barrier..]
+            .find("session.live_retarget = LiveRetarget::AwaitingTarget(target)")
+            .unwrap()
+            + barrier;
+        let stop = level[target..].find("hls.stop_load()").unwrap() + target;
+        let seek = level[stop..]
+            .find("media.set_current_time(target)")
+            .unwrap()
+            + stop;
+        let microtask = level[seek..].find("Wait::Microtask.wait().await").unwrap() + seek;
+        let restart = level[microtask..]
+            .find("start_at(epoch, &hls, target)")
+            .unwrap()
+            + microtask;
+        assert!(runtime_edge < validate && validate < barrier && barrier < target);
+        assert!(target < stop && stop < seek && seek < microtask && microtask < restart);
+
+        let buffered = source_between(HLS_PLAYER, "fn fragment_buffered(", "fn manifest_parsed(");
+        assert!(!buffered.contains("media_started"));
+        assert!(!buffered.contains("live_tail_failures"));
+        let hard_restart = source_between(
+            HLS_PLAYER,
+            "Recovery::Hard(wait, media, source, attempt, timeline_rebased) =>",
+            "Recovery::Stop(message, detail) =>",
+        );
+        assert!(hard_restart.contains("live_tail_failures: session.live_tail_failures.clone()"));
+
+        let install = source_between(
+            HLS_PLAYER,
+            "pub(super) fn install_hls_live_tail_fallback(",
+            "fn apply_hls_live_tail_fallback(",
+        );
+        assert!(install.contains("present_hls_live_fallback("));
+        assert!(install.contains("hls_live_retreat_boundary(&current"));
+        assert!(install.contains("sequence >= fallback.hidden_end_sequence"));
+        assert!(install.contains("HLS_LIVE_TAIL_FALLBACK_MAX_RETREATS"));
+        assert!(install.contains("HLS_LIVE_TAIL_FALLBACK_MAX_HIDDEN_SECONDS"));
+        assert!(install.contains("snapshot.index != expected_snapshot_index"));
+        assert!(!install.contains("|| snapshot.finalized"));
+        let fallback_state = install
+            .find("playback.session.live_tail_fallback = Some")
+            .unwrap();
+        let reopen = install
+            .find("current.phase = HlsCodecBootstrapPhase::ContinuationOpen")
+            .unwrap();
+        assert!(fallback_state < reopen);
+        assert!(!install.contains("reset_hls_codec_bootstrap"));
+        assert!(!install.contains("reset_hls_prefetch_timeline_plans"));
+        assert!(!install.contains("clear_hls_progressive_range_owners"));
+
+        let playable = source_between(
+            HLS_PLAYER,
+            "pub(super) fn active_hls_finalized_playable_presentation(",
+            "pub(super) fn handoff_hls_codec_bootstrap_prefetch_timeline(",
+        );
+        assert!(playable.contains("present_hls_live_fallback("));
+        assert!(playable.contains("hls_is_finalized(&presented)"));
+        assert!(playable.contains("hls_last_playable_segment(&presented)"));
+        assert!(playable.contains("active_hls_finalized_playable_interval"));
+        assert!(playable.contains(".map(|(interval, _)| interval)"));
+
+        let apply = source_between(
+            HLS_PLAYER,
+            "fn apply_hls_live_tail_fallback(",
+            "fn trim_feed_route_cache(",
+        );
+        assert!(apply.contains("present_hls_live_fallback("));
+        assert!(apply.contains("current.snapshot_index = snapshot.index"));
+        assert!(apply.contains("playback.session.live_tail_fallback = None"));
+        assert!(apply.contains("return snapshot"));
+        assert!(!apply.contains("snapshot.finalized = false"));
+        assert!(!apply.contains("snapshot.index > fallback.snapshot_index"));
+        assert!(!apply.contains("#EXT-X-ENDLIST"));
+        assert!(!apply.contains("reset_hls_prefetch_timeline_plans"));
+        assert!(!apply.contains("clear_hls_progressive_range_owners"));
+        assert!(!apply.contains("playback.plans.clear"));
+
+        let fetch = source_between(
+            HLS_PLAYER,
+            "async fn fetch_feed_response(",
+            "async fn load_feed_snapshot(",
+        );
+        assert!(
+            fetch.find("apply_hls_live_tail_fallback").unwrap()
+                < fetch.find("if !is_hls_manifest").unwrap()
+        );
+        assert!(fetch.contains(
+            "cached_bootstrap.is_none() && index_hint.is_none() && start == HlsStart::Live"
+        ));
+        assert!(
+            fetch.find("apply_hls_live_tail_fallback").unwrap()
+                < fetch
+                    .find("current.snapshot = Some(FeedRouteSnapshot")
+                    .unwrap()
+        );
     }
 
     #[test]
@@ -3294,6 +5173,520 @@ mod service_worker {
     }
 
     #[test]
+    fn codec_bootstrap_temporarily_uses_the_complete_fragment_loader() {
+        let launch = source_between(
+            HLS_PLAYER,
+            "async fn launch(mut request: Launch)",
+            "fn session_from(",
+        );
+        let codec = launch.find("let codec_bootstrap =").unwrap();
+        let config = launch
+            .find("hls_config(request.start == HlsStart::Live)")
+            .unwrap();
+        let construct = launch.find("let hls = construct_hls(").unwrap();
+        let install = launch
+            .find("install_hls_codec_bootstrap_loader(hls_class, &hls)")
+            .unwrap();
+        let load = launch.find(".load_source(&source)").unwrap();
+        assert!(codec < config && config < construct && construct < install && install < load);
+
+        let loaders = source_between(
+            HLS_PLAYER,
+            "fn install_hls_codec_bootstrap_loader(",
+            "fn supports_native_hls(",
+        );
+        assert!(loaders.contains("js_property(config.as_ref(), \"loader\")"));
+        assert!(loaders.contains("js_property(hls_class, \"DefaultConfig\")"));
+        assert!(loaders.contains("Object::is(&progressive_loader, &bootstrap_loader)"));
+        assert!(loaders.contains("JsValue::from_str(\"fLoader\")"));
+        assert!(loaders.contains("Reflect::delete_property"));
+        assert!(loaders.contains("fn with_hls_codec_bootstrap("));
+        assert!(loaders.contains("if source.contains('?') { '&' } else { '?' }"));
+        assert!(!loaders.contains("JsValue::from_bool"));
+
+        let buffer_created =
+            source_between(HLS_PLAYER, "fn buffer_created(", "fn main_swarm_fragment(");
+        assert!(buffer_created.contains("session.codec_video_buffer_ready = true"));
+        assert!(!buffer_created.contains("restore_hls_progressive_loader"));
+        assert!(!buffer_created.contains("load_source"));
+
+        let buffered = source_between(
+            HLS_PLAYER,
+            "fn complete_hls_codec_bootstrap(",
+            "fn fragment_buffered(",
+        );
+        let restore = buffered
+            .find("restore_hls_progressive_loader(&hls)")
+            .unwrap();
+        let seek = buffered
+            .find("media.set_current_time(target.max(0.0))")
+            .unwrap();
+        let release = buffered.find("session.codec_pending = false").unwrap();
+        assert!(release < restore && restore < seek);
+        assert!(buffered.contains("main_swarm_fragment(data)"));
+        assert!(buffered.contains("codec_loading_fragments.contains(&fragment_identity)"));
+        assert!(buffered.contains("session.codec_bootstrap_completed = true"));
+        assert!(HLS_PLAYER.contains("\"hlsFragBuffered\" => fragment_buffered(epoch, &data)"));
+        assert!(
+            !source_between(HLS_PLAYER, "fn handle_error(", "fn hard_recovery(")
+                .contains("!session.source.contains(\"start=live\")")
+        );
+    }
+
+    #[test]
+    fn codec_readiness_is_per_hls_mse_and_every_destructive_relaunch_reboots() {
+        assert_eq!(
+            HLS_PLAYER.matches("Launch {").count(),
+            4,
+            "one declaration and exactly three construction sites must carry codec state"
+        );
+        let initial = source_between(
+            HLS_PLAYER,
+            "pub(crate) async fn play_hls(",
+            "async fn launch(mut request: Launch)",
+        );
+        assert!(initial.contains("codec_bootstrap: false"));
+        assert!(initial.contains("codec_edge_position: None"));
+        assert!(!initial.contains("codec_bootstrap_completed:"));
+
+        let session = source_between(HLS_PLAYER, "fn session_from(", "fn install_session(");
+        assert!(session.contains("codec_required: codec.0"));
+        assert!(session.contains("codec_pending: codec.1"));
+        assert!(session.contains("codec_bootstrap_completed: false"));
+        assert!(!session.contains("request.codec_bootstrap_completed"));
+
+        let current_token = source_between(
+            HLS_PLAYER,
+            "pub(super) fn hls_codec_bootstrap_token_is_current(",
+            "fn next_epoch()",
+        );
+        assert!(current_token.contains("matches!(&session.backend, Backend::Hls(_))"));
+        assert!(
+            current_token.contains("hls_codec_bootstrap_token(&session.source) == Some(token)")
+        );
+
+        let route = source_between(
+            HLS_PLAYER,
+            "pub(crate) async fn try_fetch_response(",
+            "fn canonical_hls_bytes_resource(",
+        );
+        let parsed_token = route.find("let Ok(token) = token.parse::<u64>()").unwrap();
+        let active_guard = route
+            .find("hls_codec_bootstrap_token_is_current(token)")
+            .unwrap();
+        let stale = route.find("stale HLS codec bootstrap").unwrap();
+        let mutate = route.find("hls_codec_bootstrap_manifest(token)").unwrap();
+        let retrieve = route.find("fetch_feed_response(").unwrap();
+        assert!(parsed_token < active_guard && active_guard < stale && stale < mutate);
+        assert!(mutate < retrieve);
+
+        let rebase = source_between(HLS_PLAYER, "fn level_loaded(", "fn dom_event(");
+        assert!(rebase.contains("let codec_bootstrap = session.codec_required"));
+        assert!(rebase.contains("with_hls_codec_bootstrap(&session.source, epoch)"));
+        assert!(rebase.contains("codec_bootstrap,"));
+        assert!(rebase.contains("LiveRetarget::Inactive"));
+        assert!(!rebase.contains("codec_bootstrap_completed:"));
+
+        let recovery = source_between(HLS_PLAYER, "Recovery::Hard(wait", "Recovery::Stop(");
+        assert!(recovery.contains("codec_bootstrap: session.codec_required"));
+        assert!(recovery.contains("LiveRetarget::Inactive"));
+        assert!(recovery.contains("codec_edge_position: session.codec_edge_position"));
+        assert!(!recovery.contains("codec_bootstrap_completed:"));
+
+        let completion = source_between(
+            HLS_PLAYER,
+            "fn complete_hls_codec_bootstrap(",
+            "fn fragment_buffered(",
+        );
+        let exact_match = completion
+            .find("codec_loading_fragments.contains(&fragment_identity)")
+            .unwrap();
+        let completed_guard = completion
+            .find("|| session.codec_bootstrap_completed")
+            .unwrap();
+        let stop = completion.find("let Err(error) = hls.stop_load()").unwrap();
+        let pending_flip = completion.find("session.codec_pending = false").unwrap();
+        let completed_flip = completion
+            .find("session.codec_bootstrap_completed = true")
+            .unwrap();
+        let finish = completion
+            .find("finish_hls_codec_bootstrap(&source)")
+            .unwrap();
+        let restore = completion
+            .find("restore_hls_progressive_loader(&hls)")
+            .unwrap();
+        let same_token_restart = completion
+            .find("start_at(epoch, &hls, target.position())")
+            .unwrap();
+        assert!(exact_match < completed_guard);
+        assert!(completed_guard < stop && stop < pending_flip);
+        assert!(pending_flip < completed_flip && completed_flip < finish);
+        assert!(finish < restore && restore < same_token_restart);
+        assert!(completion.contains("session.codec_loading_fragments.clear()"));
+        assert!(!completion.contains("strip_hls_codec_bootstrap"));
+        assert!(!completion.contains("load_source"));
+        assert!(!completion.contains("session.source ="));
+
+        let errors = source_between(HLS_PLAYER, "fn handle_error(", "fn hard_recovery(");
+        let completed_rejection = errors.find("|| session.codec_bootstrap_completed").unwrap();
+        let rearm = errors.find("session.codec_required = true").unwrap();
+        let edge = errors
+            .find("session.codec_edge_position = codec_edge_position")
+            .unwrap();
+        let ordinary_media = errors.find("Some(\"mediaError\") =>").unwrap();
+        assert!(completed_rejection < rearm && rearm < edge && edge < ordinary_media);
+        let codec_hard = errors[ordinary_media..]
+            .find("if with_session(epoch, |session| session.codec_required)")
+            .unwrap()
+            + ordinary_media;
+        let hard = errors[codec_hard..]
+            .find("hard_recovery(epoch, data)")
+            .unwrap()
+            + codec_hard;
+        let ordinary_recover = errors[hard..].find("Recovery::Media(hls)").unwrap() + hard;
+        assert!(ordinary_media < codec_hard && codec_hard < hard && hard < ordinary_recover);
+        assert!(errors[ordinary_media..].contains("hard_recovery(epoch, data)"));
+
+        let hard = source_between(HLS_PLAYER, "fn hard_recovery(", "fn start_at(");
+        assert!(hard.contains("if session.codec_required"));
+        assert!(hard.contains("session.codec_pending = true"));
+        assert!(hard.contains("session.codec_bootstrap_completed = false"));
+        assert!(hard.contains("with_hls_codec_bootstrap(&session.source, epoch)"));
+    }
+
+    #[test]
+    fn codec_bootstrap_loads_sequence_zero_before_restoring_the_saved_position() {
+        let restart = source_between(
+            HLS_PLAYER,
+            "fn restart_position(&self)",
+            "fn remember_current_position",
+        );
+        let pending = restart.find("if self.codec_pending").unwrap();
+        let zero = restart[pending..].find("return 0.0").unwrap() + pending;
+        let retained = restart
+            .find("if let Some(position) = self.resume_position")
+            .unwrap();
+        assert!(pending < zero && zero < retained);
+
+        let manifest = source_between(
+            HLS_PLAYER,
+            "fn manifest_parsed(",
+            "fn start_autoplay_buffer_gate(",
+        );
+        assert!(manifest.contains("let position = session.restart_position()"));
+        assert!(!manifest.contains(".or(session.resume_position)"));
+        assert!(manifest.contains("start_at(epoch, &hls, position)"));
+
+        let buffer = source_between(
+            HLS_PLAYER,
+            "fn complete_hls_codec_bootstrap(",
+            "fn fragment_buffered(",
+        );
+        let saved = buffer.find("session.resume_position").unwrap();
+        let restore = buffer
+            .find("media.set_current_time(target.max(0.0))")
+            .unwrap();
+        let release = buffer.find("session.codec_pending = false").unwrap();
+        assert!(saved < release && release < restore);
+
+        let recovery = source_between(HLS_PLAYER, "Recovery::Hard(wait", "Recovery::Stop(");
+        assert!(recovery.contains("initial_position: session.restart_position()"));
+        assert!(recovery.contains("resume_position: session.resume_position"));
+        assert!(recovery.contains("codec_bootstrap: session.codec_required"));
+        assert!(recovery.contains("codec_edge_position: session.codec_edge_position"));
+        assert!(!recovery.contains("codec_bootstrap_completed:"));
+    }
+
+    #[test]
+    fn live_codec_bootstrap_continues_the_same_token_and_mse_before_playback_gate() {
+        let buffer = source_between(
+            HLS_PLAYER,
+            "fn complete_hls_codec_bootstrap(",
+            "fn fragment_buffered(",
+        );
+        let stop = buffer.find("let Err(error) = hls.stop_load()").unwrap();
+        let pending = buffer
+            .find("session.live_retarget = LiveRetarget::AwaitingContinuation(target)")
+            .unwrap();
+        let finish = buffer.find("finish_hls_codec_bootstrap(&source)").unwrap();
+        let handoff = buffer
+            .find("handoff_hls_codec_bootstrap_prefetch_timeline()")
+            .unwrap();
+        let seek = buffer
+            .find("media.set_current_time(target.position())")
+            .unwrap();
+        let microtask = buffer.find("Wait::Microtask.wait().await").unwrap();
+        let transition = buffer
+            .find("start_at(epoch, &hls, target.position())")
+            .unwrap();
+        let gate = buffer
+            .find("start_autoplay_buffer_gate(epoch, Autoplay::Resume)")
+            .unwrap();
+        assert!(stop < pending && pending < finish && finish < handoff);
+        assert!(handoff < seek && seek < microtask && microtask < transition && transition < gate);
+        assert!(!buffer.contains("strip_hls_codec_bootstrap"));
+        assert!(!buffer.contains("load_source"));
+        assert!(!buffer.contains("session.source ="));
+        assert!(
+            buffer.contains(
+                "live_codec_retarget(resume, resume_position, session.codec_edge_position)"
+            )
+        );
+        assert!(buffer.contains("session.level_snapshots.clear()"));
+        assert!(buffer.contains("session.load = LoadPhase::Warmup"));
+        assert!(buffer.contains("session.codec_bootstrap_completed = true"));
+        assert!(buffer.contains("session.codec_continuation_open = true"));
+        assert!(buffer.contains("session.codec_continuation_revision = 1"));
+        assert!(!buffer.contains("autoplay(epoch,"));
+
+        let warmup_stop =
+            source_between(HLS_PLAYER, "fn fragment_buffered(", "fn manifest_parsed(");
+        assert!(
+            warmup_stop
+                .matches("session.live_retarget.pending()")
+                .count()
+                >= 2
+        );
+        assert!(
+            warmup_stop
+                .matches("session.codec_continuation_open")
+                .count()
+                >= 2
+        );
+        assert!(warmup_stop.matches("session.autoplay_gate_pending").count() >= 2);
+        assert!(warmup_stop.matches("session.play_attempt").count() >= 2);
+        assert!(warmup_stop.contains("&& !session.codec_pending"));
+        assert!(warmup_stop.contains("|| session.codec_pending"));
+
+        let logical_handoff = source_between(
+            HLS_PLAYER,
+            "pub(super) fn handoff_hls_codec_bootstrap_prefetch_timeline(",
+            "pub(super) fn install_hls_live_tail_fallback(",
+        );
+        assert!(logical_handoff.contains("session.startup_deadline_ms = now"));
+        assert!(logical_handoff.contains("session.mode = HlsPrefetchMode::StartupOnly"));
+        assert!(!logical_handoff.contains("reset_hls_prefetch_timeline_plans"));
+        assert!(!logical_handoff.contains("clear_hls_progressive_range_owners"));
+        assert!(!logical_handoff.contains("playback.plans.clear"));
+        assert!(!logical_handoff.contains("session.tracks.clear"));
+        assert!(!logical_handoff.contains("advance_generation"));
+
+        let phases = source_between(
+            HLS_PLAYER,
+            "enum HlsCodecBootstrapPhase {",
+            "struct HlsCodecBootstrapPresentation",
+        );
+        assert!(phases.contains("Bootstrap"));
+        assert!(phases.contains("ContinuationOpen"));
+        assert!(phases.contains("Settled"));
+
+        let finish = source_between(
+            HLS_PLAYER,
+            "pub(super) fn finish_hls_codec_bootstrap(",
+            "pub(super) fn settle_hls_codec_continuation(",
+        );
+        assert!(finish.contains("current.phase == HlsCodecBootstrapPhase::Bootstrap"));
+        assert!(finish.contains("current.phase = HlsCodecBootstrapPhase::ContinuationOpen"));
+        assert!(finish.contains("current.snapshot = None"));
+        let settle = source_between(
+            HLS_PLAYER,
+            "pub(super) fn settle_hls_codec_continuation(",
+            "fn reset_hls_codec_bootstrap(",
+        );
+        assert!(settle.contains("current.phase != HlsCodecBootstrapPhase::ContinuationOpen"));
+        assert!(settle.contains("current.phase = HlsCodecBootstrapPhase::Settled"));
+
+        let response = source_between(
+            HLS_PLAYER,
+            "async fn fetch_feed_response(",
+            "async fn load_feed_snapshot(",
+        );
+        let normal_rewrite = response
+            .find("rewrite_hls_manifest_for_live_reload(")
+            .unwrap();
+        let open = response.find("open_hls_codec_continuation(&body)").unwrap();
+        assert!(normal_rewrite < open);
+        assert!(response.contains("current.phase == HlsCodecBootstrapPhase::Bootstrap"));
+
+        let restart = source_between(
+            HLS_PLAYER,
+            "fn restart_position(&self)",
+            "fn remember_current_position",
+        );
+        let live = restart
+            .find("if let Some(position) = self.live_retarget.load_position()")
+            .unwrap();
+        let edge = restart[live..].find("return position").unwrap() + live;
+        let saved = restart
+            .find("if let Some(position) = self.resume_position")
+            .unwrap();
+        assert!(live < edge && edge < saved);
+
+        let manifest = source_between(
+            HLS_PLAYER,
+            "fn manifest_parsed(",
+            "fn start_autoplay_buffer_gate(",
+        );
+        assert!(manifest.contains("let position = session.restart_position()"));
+        assert!(manifest.contains("start_at(epoch, &hls, position)"));
+        assert!(!manifest.contains("LiveRetarget::AwaitingContinuation"));
+
+        let autoplay_gate = source_between(
+            HLS_PLAYER,
+            "fn start_autoplay_buffer_gate(",
+            "fn level_loaded(",
+        );
+        assert!(autoplay_gate.contains("match session.live_retarget"));
+        assert!(autoplay_gate.contains("LiveRetarget::AwaitingContinuation(_)"));
+        assert!(autoplay_gate.contains("LiveRetarget::AwaitingFallback(_)"));
+        assert!(autoplay_gate.contains("LiveRetarget::AwaitingTarget(retarget)"));
+        assert!(autoplay_gate.contains("hls_live_retarget_target("));
+        assert!(autoplay_gate.contains("Some(retarget.position())"));
+        assert!(autoplay_gate.contains("None,\n                            None,"));
+        assert!(!autoplay_gate.contains("session.live_retarget = LiveRetarget::Inactive"));
+        assert!(
+            autoplay_gate
+                .find("AutoplayGatePoll::Ready(target)")
+                .unwrap()
+                < autoplay_gate
+                    .find("autoplay(epoch, intent, Some(target))")
+                    .unwrap()
+        );
+
+        let dom = source_between(HLS_PLAYER, "fn dom_event(", "fn handle_error(");
+        assert!(
+            dom.contains("if user && (session.codec_pending || session.live_retarget.pending())")
+        );
+        assert!(dom.contains("start_autoplay_buffer_gate(epoch, Autoplay::Resume)"));
+
+        let recovery = source_between(HLS_PLAYER, "Recovery::Hard(wait", "Recovery::Stop(");
+        assert!(recovery.contains("live_retarget: if session.codec_required"));
+        assert!(recovery.contains("LiveRetarget::Inactive"));
+        let session = source_between(HLS_PLAYER, "fn session_from(", "fn install_session(");
+        assert!(session.contains("request.live_retarget"));
+        assert!(session.contains("matches!(&backend, Backend::Hls(_))"));
+    }
+
+    #[test]
+    fn codec_bootstrap_defers_explicit_play_until_same_token_level_barrier() {
+        let dom = source_between(HLS_PLAYER, "fn dom_event(", "fn handle_error(");
+        let defer = dom
+            .find("if user && (session.codec_pending || session.live_retarget.pending())")
+            .unwrap();
+        let remember = dom[defer..].find("session.resume = true").unwrap() + defer;
+        let pause = dom.find("let _ = media.pause()").unwrap();
+        let gate = dom
+            .find("start_autoplay_buffer_gate(epoch, Autoplay::Resume)")
+            .unwrap();
+        assert!(defer < remember && remember < pause && pause < gate);
+
+        let manifest = source_between(
+            HLS_PLAYER,
+            "fn manifest_parsed(",
+            "fn start_autoplay_buffer_gate(",
+        );
+        let pending = manifest.find("session.live_retarget.pending()").unwrap();
+        let load = manifest.find("session.load = LoadPhase::Warmup").unwrap();
+        let start = manifest.find("start_at(epoch, &hls, position)").unwrap();
+        assert!(pending < load && load < start);
+        assert!(!manifest.contains("LiveRetarget::AwaitingContinuation(target)"));
+        assert!(!manifest.contains("LiveRetarget::AwaitingTarget(target)"));
+
+        let level = source_between(HLS_PLAYER, "fn level_loaded(", "fn dom_event(");
+        assert!(level.contains("let playable_interval = ((!live || continuation)"));
+        assert!(level.contains("let finalized_playable = (!live || continuation_open)"));
+        assert!(level.contains("let accepted_edge = continuation_open"));
+        assert!(level.contains(".then(|| accepted_continuation_edge(&details))"));
+        let details = level.find("accepted_continuation_edge(&details)").unwrap();
+        let latched_revision = level.find("codec_continuation_loading_fragments").unwrap();
+        let barrier = level
+            .find("LiveRetarget::AwaitingContinuation(target) =>")
+            .unwrap();
+        let crossed = level
+            .find("session.live_retarget = LiveRetarget::AwaitingTarget(target)")
+            .unwrap();
+        let gate = level
+            .find("gate = intent.allowed(session).then_some(intent)")
+            .unwrap();
+        assert!(details < latched_revision && latched_revision < barrier);
+        assert!(barrier < crossed && crossed < gate);
+        assert!(level.contains(".get(&fragment.identity)"));
+        assert!(level.contains(".map(|current| current.revision)"));
+
+        let loading = source_between(HLS_PLAYER, "fn fragment_loading(", "fn buffer_created(");
+        assert!(loading.contains("session.codec_continuation_revision"));
+        assert!(loading.contains("codec_continuation_loading_fragments"));
+        assert!(loading.contains("Fallback reserves a fresh revision"));
+
+        let buffered = source_between(
+            HLS_PLAYER,
+            "fn settle_buffered_codec_continuation(",
+            "fn fragment_buffered(",
+        );
+        let consume = buffered
+            .find("codec_continuation_loading_fragments")
+            .unwrap();
+        let candidate = buffered
+            .find("session.codec_continuation_candidate = Some(CodecContinuationEdge")
+            .unwrap();
+        let revision_match = buffered.find("edge.revision != revision").unwrap();
+        let exact_match = buffered.find("!edge.fragment.matches(&fragment)").unwrap();
+        assert!(consume < candidate && candidate < revision_match && revision_match < exact_match);
+        assert!(buffered.contains("media_buffers_fragment(&session.media, &fragment)"));
+    }
+
+    #[test]
+    fn hls_fragment_kind_replaces_only_the_matching_startup_obligation() {
+        let callbacks = source_between(
+            HLS_PLAYER,
+            "const HLS_CALLBACK_EVENTS:",
+            "const HLS_DOM_EVENTS:",
+        );
+        assert!(callbacks.contains("\"hlsFragLoading\""));
+
+        let fragment = source_between(HLS_PLAYER, "fn fragment_loading(", "fn buffer_created(");
+        assert!(fragment.contains("Some(\"main\") => Some(HlsMediaKind::Main)"));
+        assert!(fragment.contains("Some(\"audio\") => Some(HlsMediaKind::Audio)"));
+        assert!(fragment.contains("swarm_bytes_reference(&url)"));
+        assert!(fragment.contains("remember_hls_fragment_kind(&reference, kind)"));
+
+        let foreground = source_between(
+            HLS_PLAYER,
+            "fn hls_foreground_context(",
+            "fn hls_generation_current(",
+        );
+        let selection = foreground
+            .find("playback.plans.cursor(&reference, &preferred)")
+            .unwrap();
+        let kind = foreground
+            .find("session.fragment_kinds.remove(&reference)")
+            .unwrap();
+        assert!(
+            selection < kind,
+            "kind must apply to the cursor selected for this request"
+        );
+        assert!(foreground.contains("Some(Some(kind)) =>"));
+        assert!(foreground.contains("session.select_startup_runway_plan("));
+        assert!(foreground.contains("Some(None) =>"));
+        assert!(!foreground.contains("startup_runway_ready"));
+        assert!(foreground.contains("session.retired_startup_plans.insert(cursor.plan.id)"));
+        assert!(foreground.contains("session.retired_startup_plans.remove(&cursor.plan.id)"));
+        assert!(foreground.contains("progressive_owner_handoff |="));
+        assert!(foreground.contains(
+            "retire_hls_progressive_range_owners(forward, &context.progressive_retired_references)"
+        ));
+
+        let replacement = source_between(
+            HLS_PLAYER,
+            "fn select_startup_runway_plan(",
+            "fn body_parallelism(",
+        );
+        assert!(replacement.contains("self.retired_startup_plans.insert(previous)"));
+        assert!(replacement.contains("-> bool"));
+        assert!(!replacement.contains("remove_progressive_plan(previous)"));
+    }
+
+    #[test]
     fn hls_segment_progress_reports_media_details() {
         let detail = source_between(
             HLS_PLAYER,
@@ -3309,6 +5702,16 @@ mod service_worker {
             HLS_PLAYER
                 .contains(r#"const HLS_DOM_EVENTS: [&str; 3] = ["play", "pause", "resize"];"#)
         );
+
+        let range = source_between(
+            HLS_PLAYER,
+            "async fn retrieve_hls_payload_range(",
+            "async fn latest_hls_feed_payload_startup(",
+        );
+        assert_eq!(range.matches("hls_segment_progress_detail(").count(), 2);
+        assert_eq!(range.matches("&address, Some(payload_size)").count(), 2);
+        assert!(range.contains("address.clone()"));
+        assert!(range.contains("\"{} bytes, {}\""));
     }
 
     #[test]
@@ -3346,6 +5749,8 @@ mod service_worker {
         );
         assert!(generation_advance.contains("if self.live_start"));
         assert!(generation_advance.contains("self.startup_overlap_plans.clear();"));
+        assert!(!generation_advance.contains("startup_runway_ready"));
+        assert!(!timeline_advance.contains("startup_runway_ready"));
         assert!(generation_advance.contains("HLS_SERIAL_PREFETCH_COMPLETIONS.saturating_sub(1)"));
         assert!(!timeline_advance.contains("self.completed_media_payloads = 0;"));
         let session_start = source_between(
@@ -3354,6 +5759,9 @@ mod service_worker {
             "fn remember_authenticated_hls_startup_prefix(",
         );
         assert!(session_start.contains("session.live_start = live_start;"));
+        assert!(!HLS_PLAYER.contains("hls_startup_runway_ready"));
+        assert!(!HLS_PLAYER.contains("startup_runway_ready_plans"));
+        assert!(!HLS_PLAYER.contains("startup_runway_plans"));
         assert!(HLS_PLAYER.contains("const HLS_EXACT_NEXT_OVERLAP_SEGMENTS: usize = 2;"));
 
         let cache = source_between(HLS_PLAYER, "fn load_role(", "fn finish_load(");
@@ -3544,24 +5952,32 @@ mod service_worker {
         assert!(canonical_startup.contains("(None, None)"));
         assert!(canonical_startup.contains("early_payloads,\n"));
         assert!(canonical_startup.contains("early_payload_max_index,"));
-        assert!(
-            load.contains("std::iter::once(HLS_EARLY_FEED_PREFIX_INDEX)")
-                && load.contains(".chain(persisted_index.is_some().then_some(0))")
-        );
+        assert!(load.contains("discover_sequence_zero_startup_prefix("));
+        assert!(load.contains("prefix_admissions_open.clone()"));
+        assert!(!load.contains("HLS_EARLY_FEED_PREFIX_TARGET_INDEX"));
+        assert!(!load.contains("reliable_indices"));
         assert!(load.contains("Some(HLS_EARLY_FEED_PREFIX_INDEX)"));
         assert!(HLS_PLAYER.contains("const HLS_EARLY_FEED_PREFIX_INDEX: u64 = 7;"));
-        assert!(HLS_PLAYER.contains("const HLS_EARLY_FEED_PREFIX_PREFERRED_SEGMENTS: usize = 8;"));
+        assert!(HLS_PLAYER.contains("const HLS_SEQUENCE_ZERO_DISCOVERY_MAX_IN_FLIGHT: usize = 3;"));
         let prefix_fanout = source_between(
             HLS_PLAYER,
             "async fn fan_out_authenticated_hls_prefixes(",
             "fn hls_prefix_stamp_for_feed(",
         );
-        assert!(prefix_fanout.contains(">= HLS_EARLY_FEED_PREFIX_PREFERRED_SEGMENTS"));
-        assert!(
-            load.matches(">= HLS_EARLY_FEED_PREFIX_PREFERRED_SEGMENTS")
-                .count()
-                >= 1
+        let prefix_memory = source_between(
+            HLS_PLAYER,
+            "fn remember_authenticated_hls_startup_prefix(",
+            "fn deferred_sequence_zero_presentation(",
         );
+        assert!(prefix_memory.contains("HlsTimeline::parse(&candidate.bytes)"));
+        assert!(prefix_memory.contains("timeline.sequence != 0"));
+        assert!(
+            prefix_memory
+                .contains("timeline.segments.len() < HLS_EARLY_FEED_PREFIX_TARGET_SEGMENTS")
+        );
+        assert!(prefix_fanout.contains("if accepted_prefix"));
+        assert!(prefix_fanout.contains("offer_sequence_zero_startup_prefix("));
+        assert!(load.contains("sequence_zero_startup_prefix_is_preferred("));
         assert!(load.matches("HLS_STARTUP_PREFIX_RESULT_GRACE").count() >= 2);
         let canonical_first = source_between(
             load,
@@ -3571,10 +5987,23 @@ mod service_worker {
         assert!(canonical_first.contains("let canonical_starts_late ="));
         assert!(canonical_first.contains("if preferred.is_none()"));
         assert!(canonical_first.contains("&& canonical_starts_late"));
-        assert_eq!(canonical_first.matches("prefix_ready_in.recv()").count(), 1);
-        assert!(canonical_first.contains(
-            "if canonical_starts_late {\n                                        return None;"
-        ));
+        assert_eq!(canonical_first.matches("prefix_ready_in.recv()").count(), 2);
+        assert!(canonical_first.contains("if canonical_starts_late {"));
+        assert!(canonical_first.contains("return None;"));
+        let invalid_canonical = source_between(
+            canonical_first,
+            "if !hls_sequence_zero_canonical_is_supported(&canonical.bytes)",
+            "let canonical_starts_late =",
+        );
+        assert!(invalid_canonical.contains("HLS_STARTUP_PREFIX_RESULT_GRACE"));
+        assert!(invalid_canonical.contains("prefix_ready_in.recv()"));
+        assert!(invalid_canonical.contains("best_prefix.borrow().clone()"));
+        assert!(invalid_canonical.contains("InitialCanonicalFeedResolution::Unavailable"));
+        assert!(
+            canonical_startup.contains("hls_sequence_zero_canonical_is_supported(&payload.bytes)")
+        );
+        assert!(canonical_startup.contains("hls_media_sequence(&payload.bytes) == Some(0)"));
+        assert!(canonical_startup.contains("canonical_prefix_admissions_open.set(false)"));
         assert!(load.contains("Some(index) if !sequence_zero_start_requested"));
         assert!(load.contains("load_persisted_vod_payload("));
         assert!(load.contains("index_hint.is_none() && !provisional_hls"));
@@ -3754,38 +6183,46 @@ mod service_worker {
             "fn start_beginning_snapshot_runway(",
             "async fn load_feed_snapshot(",
         );
-        assert!(beginning_wait.contains("hls_media_references(&snapshot.body).into_iter()"));
-        assert!(beginning_wait.contains("let Some(reference) = references.next()"));
+        assert!(beginning_wait.contains("hls_segment_identities(&snapshot.body)"));
+        assert!(beginning_wait.contains("segments.retain(|segment| !segment.gap)"));
+        assert!(beginning_wait.contains("configure_hls_beginning_prefix_manifest("));
+        assert!(beginning_wait.contains("start_hls_payload_size_probe("));
+        assert!(beginning_wait.contains("ensure_hls_beginning_prefix_configured("));
+        assert!(beginning_wait.contains("hls_progressive_startup_admission_is_current("));
+        assert!(!beginning_wait.contains("retrieve_hls_payload_range("));
+        assert!(!beginning_wait.contains("FuturesUnordered"));
+
+        let critical_supply = source_between(
+            HLS_PLAYER,
+            "fn ensure_hls_beginning_prefix_configured(",
+            "async fn await_hls_beginning_prefix_barrier(",
+        );
+        assert!(critical_supply.contains("let payload_ranges = (1..target_windows)"));
+        assert!(critical_supply.contains("scout_data_ranges_cache_only_cancellable("));
+        assert!(critical_supply.contains("if !foreground"));
+        assert!(critical_supply.contains("start == 0 && end == expected_end"));
+        assert!(critical_supply.contains("gate.foreground_zero_settled = true"));
+        assert!(critical_supply.contains("let ready = (0..gate.target_windows).all"));
+        assert!(!critical_supply.contains("hls_beginning_adjacent_range"));
+        assert!(!critical_supply.contains("try_hls_background_range_lease("));
+        assert!(!critical_supply.contains("HlsBackgroundRangeRequest"));
+        let raw_scout = source_between(
+            critical_supply,
+            "fn start_hls_beginning_raw_scout(",
+            "fn hls_beginning_raw_seed(",
+        );
         assert!(
-            beginning_wait
-                .contains("hls_progressive_startup_window_count(size, MEDIA_STORAGE_WINDOW_BYTES)")
+            raw_scout
+                .find("hls_beginning_raw_supply_admission_for(")
+                .unwrap()
+                < raw_scout
+                    .find("let payload_ranges = (1..target_windows)")
+                    .unwrap()
         );
-        assert!(beginning_wait.contains("let mut windows = FuturesUnordered::new();"));
-        assert!(beginning_wait.contains("for _ in 0..window_count"));
-        assert!(beginning_wait.contains("if position >= size"));
-        assert_eq!(
-            beginning_wait
-                .matches("retrieve_hls_payload_range(")
-                .count(),
-            1
-        );
-        let dispatch = beginning_wait.find("windows.push(async move").unwrap();
-        let settle = beginning_wait
-            .find("while let Some(window_ready) = windows.next().await")
-            .unwrap();
-        let publish = beginning_wait
-            .rfind("hls_progressive_startup_admission_is_current")
-            .unwrap();
-        assert!(dispatch < settle && settle < publish);
-        assert_eq!(
-            beginning_wait
-                .matches("hls_progressive_startup_admission_is_current")
-                .count(),
-            5
-        );
-        assert!(beginning_wait.contains("Some(generation)"));
-        assert!(!beginning_wait.contains("start_hls_payload_size_probe(\n                warmup_client.clone(),\n                successor"));
-        assert!(!beginning_wait.contains("prefix_len"));
+        assert!(!critical_supply.contains("FuturesUnordered"));
+
+        assert!(initial_stabilization.contains("await_hls_beginning_prefix_barrier("));
+        assert!(follower.contains("await_hls_beginning_prefix_barrier("));
 
         let feed_response = source_between(
             HLS_PLAYER,
@@ -3812,7 +6249,7 @@ mod service_worker {
 
         let early_decode = source_between(
             BZZ_STREAM,
-            "pub(crate) async fn acquire_latest_raw_feed_payload_startup(",
+            "pub(crate) async fn acquire_latest_raw_feed_payload_startup_observing_deferred(",
             "pub(crate) async fn acquire_latest_raw_feed_payload_bounded_from",
         );
         assert!(early_decode.contains("seek_latest_feed_update_indexed_wide_bounded("));
@@ -3920,8 +6357,10 @@ mod service_worker {
             .unwrap();
         let play = attach.find("play_hls(").unwrap();
         let prepare = attach.find("prepare_live_history(").unwrap();
+        let live_edge_warmup = attach.find("prefetch_live_snapshot_start(").unwrap();
         assert!(beginning_runway < overlap && overlap < play);
-        assert!(prepare < overlap && overlap < play);
+        assert!(live_edge_warmup < prepare && prepare < overlap && overlap < play);
+        assert_eq!(attach.matches("prefetch_live_snapshot_start(").count(), 1);
         assert!(attach.contains("if start == HlsStart::Live"));
         assert!(attach.contains("mpsc::bounded::<DeferredRawFeedPayload>(1)"));
         assert!(attach.contains("(None, None)"));
@@ -3949,6 +6388,193 @@ mod service_worker {
         assert!(fetch.contains("None => HlsStart::Beginning"));
         assert!(fetch.contains(r#"Some("live") => HlsStart::Live"#));
         assert!(fetch.contains("invalid HLS start"));
+    }
+
+    #[test]
+    fn adaptive_beginning_discovery_preserves_accounting_and_closes_new_admissions_on_a_winner() {
+        let shared_gate = source_between(
+            HLS_PLAYER,
+            "fn sequence_zero_startup_admissions_are_open(",
+            "fn offer_sequence_zero_startup_prefix(",
+        );
+        assert!(shared_gate.contains("admissions_open.get()"));
+        assert!(shared_gate.contains("!ready.is_closed()"));
+        let offer = source_between(
+            HLS_PLAYER,
+            "fn offer_sequence_zero_startup_prefix(",
+            "async fn probe_sequence_zero_startup_prefix(",
+        );
+        let publish = offer.find("ready.try_send(prefix)").unwrap();
+        let close = offer.find("admissions_open.set(false)").unwrap();
+        assert!(publish < close);
+        assert!(offer.contains("sequence_zero_startup_admissions_are_open("));
+
+        let probe = source_between(
+            HLS_PLAYER,
+            "async fn probe_sequence_zero_startup_prefix(",
+            "fn start_sequence_zero_discovery_probe(",
+        );
+        assert!(probe.contains("hls_feed_payload_at_index_followup_retained_status("));
+        assert!(probe.contains("payload.index != index"));
+        assert!(probe.contains("deferred.index != index"));
+        let deferred = source_between(
+            probe,
+            "RetainedRawFeedPayloadProbe::Deferred(deferred) =>",
+            "RetainedRawFeedPayloadProbe::Missing",
+        );
+        let current = deferred
+            .find("sequence_zero_discovery_is_current(")
+            .unwrap();
+        let second_open = deferred[current..]
+            .find("sequence_zero_startup_admissions_are_open(")
+            .unwrap()
+            + current;
+        let range = deferred
+            .find("hls_deferred_feed_payload_prefix(&deferred)")
+            .unwrap();
+        assert!(current < second_open && second_open < range);
+
+        let worker = source_between(
+            HLS_PLAYER,
+            "fn start_sequence_zero_discovery_probe(",
+            "async fn admit_sequence_zero_discovery_probe(",
+        );
+        assert!(worker.contains("spawn_local(async move"));
+        assert!(worker.contains("probe_sequence_zero_startup_prefix("));
+        assert!(worker.contains(".await;"));
+        assert!(worker.contains("completed.try_send((index, result))"));
+        assert!(!worker.contains("abort("));
+        assert!(!worker.contains("cancel("));
+
+        let admission = source_between(
+            HLS_PLAYER,
+            "async fn admit_sequence_zero_discovery_probe(",
+            "async fn discover_sequence_zero_startup_prefix(",
+        );
+        let first_open = admission
+            .find("sequence_zero_startup_admissions_are_open(")
+            .unwrap();
+        let current = admission
+            .find("sequence_zero_discovery_is_current(")
+            .unwrap();
+        let second_open = admission[current..]
+            .find("sequence_zero_startup_admissions_are_open(")
+            .unwrap()
+            + current;
+        let dispatch = admission
+            .find("start_sequence_zero_discovery_probe(")
+            .unwrap();
+        assert!(first_open < current && current < second_open && second_open < dispatch);
+
+        let manager = source_between(
+            HLS_PLAYER,
+            "async fn discover_sequence_zero_startup_prefix(",
+            "fn sequence_zero_startup_prefix_is_preferred(",
+        );
+        assert!(manager.contains("for _ in 0..HLS_SEQUENCE_ZERO_DISCOVERY_MAX_IN_FLIGHT"));
+        assert!(manager.contains("pending.len() < HLS_SEQUENCE_ZERO_DISCOVERY_MAX_IN_FLIGHT"));
+        assert!(manager.contains("HLS_SEQUENCE_ZERO_DISCOVERY_HEDGE"));
+        assert!(manager.contains("planner.observe(index, observation)"));
+        assert!(manager.contains("offer_sequence_zero_startup_prefix("));
+        assert!(manager.contains("get_connections().await == 0"));
+        let post_connections = manager.find("// `get_connections()` yields").unwrap();
+        let first_dispatch = manager
+            .find("for _ in 0..HLS_SEQUENCE_ZERO_DISCOVERY_MAX_IN_FLIGHT")
+            .unwrap();
+        assert!(
+            manager[post_connections..first_dispatch]
+                .contains("sequence_zero_discovery_is_current(")
+        );
+    }
+
+    #[test]
+    fn deferred_beginning_prefix_cannot_enter_complete_feed_state_or_normal_followup() {
+        let store = source_between(
+            HLS_PLAYER,
+            "fn store_deferred_sequence_zero_snapshot(",
+            "fn active_live_history_feed_cache_key()",
+        );
+        assert!(store.contains("source_body: Arc::from(Vec::<u8>::new())"));
+        assert!(store.contains("deferred_source: Some(presentation.source)"));
+        assert!(!store.contains("RawFeedPayload"));
+
+        let reducer = source_between(
+            HLS_PLAYER,
+            "fn apply_feed_candidate(",
+            "fn store_feed_snapshot(",
+        );
+        let deferred_admission = reducer.find("let completing_deferred_same_index").unwrap();
+        let equality_exception = reducer
+            .find("candidate.index == index && !completing_deferred_same_index")
+            .unwrap();
+        let proof = reducer
+            .find("hls_deferred_feed_completion_matches(")
+            .unwrap();
+        let clear = reducer.find("existing.deferred_source = None;").unwrap();
+        let ordinary_same_index = reducer[clear + 1..]
+            .find("if existing.snapshot.index == candidate.index {")
+            .map(|position| position + clear + 1)
+            .unwrap();
+        assert!(deferred_admission < equality_exception && equality_exception < proof);
+        assert!(proof < clear && clear < ordinary_same_index);
+        assert!(reducer.contains("existing.checking_token != token"));
+        assert!(reducer.contains("deferred.payload_span"));
+        assert!(reducer.contains("&deferred.authenticated_prefix"));
+
+        let completion = source_between(
+            HLS_PLAYER,
+            "async fn complete_deferred_feed_route(",
+            "#[derive(Clone)]\n    struct SequenceZeroFollowupSeed",
+        );
+        assert!(completion.contains("acquire_deferred_raw_feed_payload_conservative("));
+        assert!(completion.contains("payload.index == source_index"));
+        assert!(completion.contains("task.publish(&payload, false)"));
+        assert!(completion.contains("CONSERVATIVE_DEFERRED_MAX_PHYSICAL_ATTEMPTS"));
+        assert!(!completion.contains("timeout("));
+
+        let publication = source_between(
+            HLS_PLAYER,
+            "fn publish_sequence_zero_startup_snapshot(",
+            "#[derive(Clone, Copy, Eq, PartialEq)]",
+        );
+        let unavailable = &publication[publication
+            .find("InitialCanonicalFeedResolution::Unavailable")
+            .unwrap()..];
+        assert!(unavailable.contains("complete_deferred_feed_route("));
+        assert!(unavailable.contains("discard_deferred_feed_route("));
+        let completion = unavailable.find("complete_deferred_feed_route(").unwrap();
+        let normal_release = unavailable[completion..]
+            .find("release_feed_route_check(")
+            .map(|position| position + completion)
+            .unwrap();
+        assert!(completion < normal_release);
+        let exclusivity = source_between(
+            publication,
+            "async_std::task::sleep(HLS_SEQUENCE_ZERO_CANONICAL_EXCLUSIVITY).await",
+            "let initial = match canonical",
+        );
+        assert!(exclusivity.contains("if deferred_prefix"));
+        assert!(exclusivity.contains("return;"));
+
+        let seed = source_between(
+            HLS_PLAYER,
+            "fn sequence_zero_followup_seed(",
+            "fn initialize_sequence_zero_followup_scan(",
+        );
+        let refresh = source_between(
+            HLS_PLAYER,
+            "async fn refresh_live_feed_head(",
+            "fn sequence_zero_followup_is_current(",
+        );
+        let scheduler = source_between(
+            HLS_PLAYER,
+            "fn schedule_feed_followup_task(",
+            "pub(crate) async fn try_fetch_response(",
+        );
+        assert!(seed.contains("state.deferred_source.is_some()"));
+        assert!(refresh.contains("state.deferred_source.is_some()"));
+        assert!(scheduler.contains("discard_deferred_feed_route(&cache_key, checking_token)"));
+        assert!(scheduler.contains("state.deferred_source.is_none()"));
     }
 
     #[test]
@@ -4345,6 +6971,11 @@ mod service_worker {
         assert!(attach.contains("(None, None)"));
         assert!(attach.contains("(HlsStart::Beginning, snapshot)"));
         assert!(attach.contains("start_beginning_snapshot_runway("));
+        assert!(attach.contains("prefetch_live_snapshot_start("));
+        assert!(
+            attach.find("prefetch_live_snapshot_start(").unwrap()
+                < attach.find("prepare_live_history(").unwrap()
+        );
         assert!(attach.contains("start == HlsStart::Live && snapshot.is_none()"));
     }
 
@@ -4443,8 +7074,8 @@ mod service_worker {
     #[test]
     fn first_visit_claims_worker_control_without_reloading() {
         assert!(STATIC_WORKER.contains(r#"const SERVICE_WORKER_MARKER = "forwarder-default20";"#));
-        assert!(STATIC_WORKER.contains("const SERVICE_WORKER_PROTOCOL = 7;"));
-        assert!(INTERFACE_RUNTIME.contains("const SERVICE_WORKER_PROTOCOL: f64 = 7.0;"));
+        assert!(STATIC_WORKER.contains("const SERVICE_WORKER_PROTOCOL = 8;"));
+        assert!(INTERFACE_RUNTIME.contains("const SERVICE_WORKER_PROTOCOL: f64 = 8.0;"));
         assert!(STATIC_WORKER.contains("event.data?.type === \"WEEB3_CLAIM\""));
         assert!(STATIC_WORKER.contains("type: \"WEEB3_CLAIMED\""));
         assert!(INTERFACE_RUNTIME.contains("request_service_worker_claim(&active).await"));
@@ -4617,9 +7248,6 @@ mod hls_payload_cancellation {
         assert!(STREAM.contains("js_string_property(obj, \"streamToken\")"));
         assert!(STREAM.contains("stream_token.as_deref()"));
         assert!(response.contains("hls_range_body_fully_cached(&reference, &metadata)"));
-        assert!(!response.contains("await_hls_progressive_successor_admission("));
-        assert!(!HLS_STREAM.contains("runways.claim_successor(plan_id, reference)"));
-        assert!(!response.contains("release_hls_progressive_successor_claim("));
         assert!(HLS_STREAM.contains("let cached_backward ="));
         assert!(HLS_STREAM.contains("session.remember_progressive_replay(&reference)"));
 
@@ -4655,59 +7283,161 @@ mod hls_payload_cancellation {
         assert!(scheduler.contains("background.active >= HLS_BACKGROUND_RANGE_MAX"));
         assert!(scheduler.contains("range_cache_body_bytes()"));
         assert!(scheduler.contains("hls_payload_cache_body_bytes()"));
-        assert!(scheduler.contains("media_prefetch_ahead_limit_bytes(media_cache_max_bytes())"));
         assert!(scheduler.contains("hls_progressive_range_reservation_fits("));
-        assert!(scheduler.contains("HlsProgressiveRangePlanner::new("));
-        assert!(scheduler.contains("let mut workers = FuturesUnordered::new();"));
-        assert!(scheduler.contains("for _ in 0..worker_count"));
-        assert!(scheduler.contains("let admission_open = Rc::new(Cell::new(true));"));
-        assert!(scheduler.matches("if !admission_open.get()").count() >= 3);
-        assert!(scheduler.contains("planner.has_unclaimed_references()"));
-        assert!(scheduler.contains("planner.borrow_mut().complete(position)"));
-        assert!(scheduler.contains("admission_open.set(false)"));
-        assert!(scheduler.contains("hls_aligned_range_cached("));
-        assert!(scheduler.contains("remember_hls_progressive_range_owner("));
-        assert!(scheduler.contains("HlsBackgroundRangeRequest::new("));
-        assert!(scheduler.contains("start = end.saturating_add(1)"));
-        assert!(scheduler.contains("Some(ticket.stamp.generation)"));
+        assert!(scheduler.contains("HlsProgressiveRangePurpose::StartupExactNext"));
+        assert!(
+            scheduler
+                .contains("media_cache_max_bytes().saturating_sub(MEDIA_STARTUP_RESPONSE_BYTES)")
+        );
         assert!(scheduler.contains("track.running = Some(ticket)"));
         assert!(scheduler.contains("track.running = None"));
-        assert!(!scheduler.contains("start_hls_payload_load("));
+        assert!(!scheduler.contains("HlsProgressiveRangePlanner"));
+        assert!(!scheduler.contains("admission_open"));
+        assert!(!scheduler.contains("HLS_STARTUP_EXACT_NEXT_WINDOWS"));
 
-        let reference_worker = source_section(
+        let ticket_admission = source_section(
             scheduler,
-            "async fn prefetch_hls_progressive_reference(",
+            "fn hls_progressive_range_ticket_admission(",
+            "fn hls_progressive_range_handoff_current(",
+        );
+        assert!(ticket_admission.contains("hls_progressive_range_admission("));
+        assert!(ticket_admission.contains("beginning_prefix"));
+        assert!(ticket_admission.contains("bypass_if_expired"));
+        assert!(ticket_admission.contains("hls_beginning_prefix_admission("));
+
+        let size_resolver = source_section(
+            scheduler,
+            "async fn resolve_hls_progressive_payload_size(",
+            "async fn prefetch_hls_progressive_reference_windows(",
+        );
+        assert!(size_resolver.contains("hls_progressive_range_floor(ticket)"));
+        assert_eq!(
+            size_resolver
+                .matches("hls_progressive_frontier_decision(position, foreground_position, false)")
+                .count(),
+            2,
+            "size resolution rechecks the exact foreground after every network await"
+        );
+        assert!(size_resolver.contains("start_hls_payload_size_probe("));
+        assert!(size_resolver.contains("HlsProgressiveRangeLeaseAttempt::Budget"));
+        assert!(size_resolver.contains("hls_startup_retry_delay_ms("));
+        assert!(size_resolver.contains("HlsProgressiveRangeAdmission::Park"));
+        assert!(!size_resolver.contains("return None"));
+
+        let queue = source_section(
+            scheduler,
+            "fn queue_hls_progressive_window(",
+            "fn settle_hls_progressive_window_outcome(",
+        );
+        let admission = queue
+            .find("hls_progressive_range_ticket_admission(ticket, purpose)")
+            .unwrap();
+        let exact_state = queue.find("hls_aligned_range_state(").unwrap();
+        let owner = queue.find("remember_hls_progressive_range_owner(").unwrap();
+        let dispatched = queue
+            .find("HlsProgressiveWindowDispatch::Dispatched")
+            .unwrap();
+        let retrieve = queue.find(".retrieve_hls_payload_range(").unwrap();
+        assert!(admission < exact_state && exact_state < owner);
+        assert!(owner < dispatched && dispatched < retrieve);
+        assert!(queue.contains("HlsBackgroundRangeRequest::new(lease, move ||"));
+        assert!(queue.contains("!= HlsAlignedRangeState::Absent"));
+        assert!(queue.contains("Some(ticket.stamp.generation)"));
+        assert!(queue.contains("Some(background)"));
+
+        let settlement = source_section(
+            scheduler,
+            "fn settle_hls_progressive_window_outcome(",
+            "async fn drain_hls_progressive_windows(",
+        );
+        assert!(settlement.contains("active_windows.remove(&outcome.window)"));
+        assert!(settlement.contains("HlsAlignedRangeState::Cached"));
+        assert!(settlement.contains("HlsAlignedRangeState::Pending"));
+        assert!(settlement.contains("awaiting_terminal.insert(outcome.window)"));
+        assert!(settlement.contains("HlsAlignedRangeState::Absent"));
+        assert!(settlement.contains("hls_startup_retry_delay_ms(*retry_attempt)"));
+        assert!(settlement.contains("retry_attempt.saturating_add(1)"));
+
+        let reference = source_section(
+            scheduler,
+            "async fn prefetch_hls_progressive_reference_windows(",
             "async fn prefetch_hls_progressive_ranges(",
         );
-        assert!(
-            reference_worker
-                .matches("await_hls_progressive_range_sustained(ticket, &admission_open)")
-                .count()
-                >= 2
-        );
-        let dispatch = reference_worker
-            .find(".retrieve_hls_payload_range(")
+        let ready = reference
+            .find("while let Some(Some(outcome)) = active.next().now_or_never()")
             .unwrap();
-        let owner = reference_worker[..dispatch]
-            .rfind("remember_hls_progressive_range_owner(")
-            .unwrap();
-        let stop = reference_worker[..owner]
-            .rfind("if !admission_open.get()")
-            .unwrap();
-        let drain = reference_worker[dispatch..].find(".await;").unwrap() + dispatch;
-        let next_window = reference_worker[drain..]
-            .find("start = end.saturating_add(1)")
+        let floor = reference[ready..]
+            .find("hls_progressive_range_floor(ticket)")
             .unwrap()
-            + drain;
-        assert!(stop < owner && owner < dispatch && dispatch < drain && drain < next_window);
-        assert!(
-            !reference_worker[drain..next_window].contains("remember_hls_progressive_range_owner(")
+            + ready;
+        let states = reference[floor..].find("let mut states").unwrap() + floor;
+        let ordered = reference[states..]
+            .find("hls_ordered_window_admissions(&states, width, retry_floor)")
+            .unwrap()
+            + states;
+        let lease = reference[ordered..]
+            .find("try_hls_progressive_range_lease(ticket, purpose, expected)")
+            .unwrap()
+            + ordered;
+        assert!(ready < floor && floor < states && states < ordered && ordered < lease);
+        assert!(reference.contains("hls_progressive_frontier_width("));
+        assert!(reference.contains("let retry_floor = retry_attempts"));
+        assert!(reference.contains("HlsOrderedWindowState::Backoff"));
+        assert!(reference.contains("HlsAlignedRangeState::Pending"));
+        assert!(reference.contains("awaiting_terminal.remove(&window)"));
+        assert!(reference.contains("drain_hls_progressive_windows(&mut active).await"));
+        assert!(reference.contains("HlsProgressiveRangeLeaseAttempt::Budget"));
+        assert!(reference.contains("HlsProgressiveRangeLeaseAttempt::Park"));
+        assert!(!reference.contains("abort("));
+        assert!(!reference.contains("cancel("));
+
+        let range_plan = source_section(
+            scheduler,
+            "async fn prefetch_hls_progressive_ranges(",
+            "fn spawn_hls_progressive_range_prefetch(",
         );
-        assert!(!reference_worker.contains("abort("));
-        assert!(!reference_worker.contains("cancel("));
-        assert!(
-            !reference_worker.contains("drop(lease);\n            if usize::try_from(expected)")
+        assert!(range_plan.contains("let initial_successor = launch_position.saturating_add(1)"));
+        assert!(range_plan.contains(
+            "hls_progressive_frontier_decision(next_position, foreground_position, false)"
+        ));
+        assert!(range_plan.contains("next_position = position;"));
+        assert!(range_plan.contains("hls_critical_prefix_plan_for_reference("));
+        let startup = range_plan
+            .find("HlsProgressiveRangePurpose::StartupExactNext")
+            .unwrap();
+        let critical = range_plan[startup..]
+            .find("prefix.critical_windows()")
+            .unwrap()
+            + startup;
+        let sustained = range_plan[critical..]
+            .find("HlsProgressiveRangePurpose::Sustained")
+            .unwrap()
+            + critical;
+        let completion = range_plan[sustained..]
+            .find("HlsProgressiveReferenceProgress::Complete =>")
+            .unwrap()
+            + sustained;
+        let advance = range_plan[completion..]
+            .find("hls_progressive_frontier_decision(position, position, true)")
+            .unwrap()
+            + completion;
+        assert!(startup < critical && critical < sustained);
+        assert!(sustained < completion && completion < advance);
+        assert!(range_plan.contains("HlsCriticalPrefixPlan::total_windows"));
+        assert!(range_plan.contains("initial_successor_complete = true"));
+        assert!(!range_plan.contains("saturating_add(1).max(foreground_position)"));
+        assert!(!range_plan.contains("HLS_STARTUP_EXACT_NEXT_WINDOWS"));
+        assert!(!range_plan.contains("HlsProgressiveRangePlanner"));
+
+        let range_retrieve = source_section(
+            HLS_STREAM,
+            "async fn retrieve_hls_payload_range(",
+            "async fn latest_hls_feed_payload_startup(",
         );
+        let ui = range_retrieve.find(".start_progress(").unwrap();
+        let admit = range_retrieve.find("if !admit()").unwrap();
+        let cache_role = range_retrieve.find("read_cached_hls_range(").unwrap();
+        assert!(ui < admit && admit < cache_role);
 
         let ownership = source_section(
             scheduler,
@@ -4715,45 +7445,15 @@ mod hls_payload_cancellation {
             "fn clear_hls_progressive_range_owners(",
         );
         assert!(ownership.contains("hls_progressive_range_handoff_current(ticket)"));
-        assert!(ownership.contains(".take(HLS_PROGRESSIVE_RANGE_WORKERS_PER_PLAN)"));
+        assert!(ownership.contains(".take(1)"));
         assert!(ownership.contains("hls_aligned_range_cached("));
+        assert!(ownership.contains("session.retired_startup_plans.clone()"));
         assert!(ownership.contains("HlsProgressiveRangeOwner { ticket, position }"));
         assert!(ownership.contains("owners.retain(|owner|"));
         assert!(ownership.contains("!protected.contains(*reference)"));
         assert!(ownership.contains("!owned_references.contains(*reference)"));
         assert!(ownership.contains("evict_completed_hls_ranges(&reference, &metadata)"));
         assert!(ownership.contains("evict_completed_body(&reference)"));
-        let retired_after_read = ownership
-            .find("HlsProgressiveRangeAdmission::Retire")
-            .unwrap();
-        let defer_reference = ownership[retired_after_read..]
-            .find(".retired_references")
-            .unwrap()
-            + retired_after_read;
-        let cleanup = ownership[defer_reference..]
-            .find("retire_hls_progressive_range_owners(None, &[])")
-            .unwrap()
-            + defer_reference;
-        assert!(retired_after_read < defer_reference && defer_reference < cleanup);
-
-        let body_eviction = source_section(
-            HLS_STREAM,
-            "fn evict_completed_body(",
-            "fn retire_pending_bodies(",
-        );
-        assert!(body_eviction.contains("self.body_pending.get(reference)"));
-        assert!(body_eviction.contains("self.retired_body_loads.insert("));
-        assert!(body_eviction.contains("self.body_order.retain("));
-        assert!(body_eviction.contains("self.bodies.remove(reference)"));
-        assert!(body_eviction.contains("self.body_bytes ="));
-        assert!(!body_eviction.contains("self.body_pending.remove("));
-
-        let body_completion = source_section(HLS_STREAM, "fn finish_load(", "fn remember_body(");
-        assert!(body_completion.contains("let retired ="));
-        assert!(body_completion.contains("self.retired_body_loads"));
-        assert!(body_completion.contains(".remove(&(reference.to_string(), generation, load_id))"));
-        assert!(body_completion.contains("if !retired && let Ok(body) = &result"));
-        assert!(body_completion.contains("pending.finish(result)"));
 
         let foreground = source_section(
             HLS_STREAM,
@@ -4761,30 +7461,23 @@ mod hls_payload_cancellation {
             "fn hls_generation_current(",
         );
         assert!(foreground.contains("let cached_backward ="));
-        assert!(foreground.contains("if !cached_backward"));
+        let transition = foreground
+            .find("hls_progressive_foreground_transition(")
+            .unwrap();
+        let invalidate = foreground[transition..]
+            .find("session.advance_generation()")
+            .unwrap()
+            + transition;
+        let update_floor = foreground[invalidate..]
+            .find("track.last_foreground_position = transition")
+            .unwrap()
+            + invalidate;
+        assert!(transition < invalidate && invalidate < update_floor);
         assert!(foreground.contains("range_retire_position..cursor.position"));
-        assert!(foreground.contains("let superseded_references ="));
-        let adopt = foreground
-            .find("adopt_hls_progressive_range_owners(ticket, cursor)")
-            .unwrap();
-        let retire = foreground
-            .find("retire_hls_progressive_range_owners(")
-            .unwrap();
-        assert!(adopt < retire);
-
-        let plan_retirement = source_section(
-            HLS_STREAM,
-            "fn retire_hls_prefetch_plan(",
-            "fn invalidate_hls_prefetch_session(",
-        );
-        let remove_runway = plan_retirement
-            .find("session.remove_progressive_plan(ticket.plan_id)")
-            .unwrap();
-        let cleanup = plan_retirement
-            .find("retire_hls_progressive_range_owners(None, &retired_references)")
-            .unwrap();
-        assert!(plan_retirement.contains(".references_for_plans(&[ticket.plan_id])"));
-        assert!(remove_runway < cleanup);
+        assert!(foreground.contains("adopt_hls_progressive_range_owners(ticket, cursor)"));
+        assert!(foreground.contains("retire_hls_progressive_range_owners("));
+        assert!(foreground.contains("if cached_backward"));
+        assert!(foreground.contains("session.remember_progressive_replay(&reference)"));
 
         let explicit_range = source_section(
             response,
@@ -4798,16 +7491,6 @@ mod hls_payload_cancellation {
             1
         );
         assert!(!explicit_range.contains("for attempt in"));
-        assert!(!explicit_range.contains("HLS_FOREGROUND_MAX_ATTEMPTS"));
-
-        let resolver = source_section(
-            HLS_STREAM,
-            "async fn resolve_hls_asset(",
-            "fn hls_codec_bootstrap_manifest(",
-        );
-        assert!(resolver.contains(
-            "retrieve_hls_payload_range(reference.clone(), payload_size, 0, probe_end, None, None)"
-        ));
 
         let stamp_guard = source_section(
             HLS_STREAM,
@@ -4816,19 +7499,88 @@ mod hls_payload_cancellation {
         );
         assert!(stamp_guard.contains("session.stamp() == stamp"));
         assert!(stamp_guard.contains("!session.timeline_rebasing"));
-        let warmer = source_section(
+    }
+
+    #[test]
+    fn sustained_rolling_pair_is_adjacent_bounded_current_and_drain_safe() {
+        let boundary = source_section(
             HLS_STREAM,
-            "fn start_hls_shared_prefix_warmup(",
-            "fn start_beginning_snapshot_runway(",
+            "async fn await_hls_progressive_rolling_boundary_admission(",
+            "async fn prefetch_hls_progressive_ranges(",
         );
-        let epoch_check = warmer
-            .find("!hls_prefix_stamp_is_current(stamp)")
-            .expect("full generation and timeline stamp guard");
-        let range = warmer
-            .find("retrieve_hls_payload_range(")
-            .expect("shared range admission");
-        assert!(epoch_check < range);
-        assert!(warmer.contains("Some(stamp.generation)"));
+        assert!(boundary.contains("HlsProgressiveRangePurpose::Sustained"));
+        assert!(boundary.contains("map_or(1, HlsCriticalPrefixPlan::critical_windows)"));
+        assert!(boundary.contains("HLS_PROGRESSIVE_BOUNDARY_RANGE_MAX"));
+        assert!(boundary.contains("HLS_PROGRESSIVE_TAIL_WITH_BOUNDARY_MAX"));
+        assert!(boundary.contains("Some(release_tail_width)"));
+        assert!(boundary.contains("Some(HlsProgressiveRollingBoundaryState {"));
+        assert!(boundary.contains("Some(release_tail_width),\n                None,"));
+        assert!(boundary.contains("current_complete_on_success.set(true)"));
+        let authorization = boundary
+            .find("await_hls_progressive_rolling_boundary_admission(")
+            .unwrap();
+        let size_probe = boundary
+            .find("resolve_hls_progressive_payload_size(")
+            .unwrap();
+        assert!(authorization < size_probe);
+        assert!(boundary.contains("current_reference_complete.get()"));
+        assert!(boundary.contains("== HLS_BACKGROUND_RANGE_MAX"));
+        let next_future = boundary.find("let next_boundary = async move").unwrap();
+        let current_future = boundary.find("let current_tail =").unwrap();
+        let joined = boundary
+            .find("join(next_boundary, current_tail).await")
+            .unwrap();
+        assert!(next_future < current_future && current_future < joined);
+        assert!(!boundary.contains("select(next_boundary"));
+        assert!(!boundary.contains("abort("));
+        assert!(!boundary.contains("cancel("));
+
+        let range_plan = source_section(
+            HLS_STREAM,
+            "async fn prefetch_hls_progressive_ranges(",
+            "fn spawn_hls_progressive_range_prefetch(",
+        );
+        let adjacent = range_plan
+            .find("let next_boundary_position = position.saturating_add(1)")
+            .unwrap();
+        let pair = range_plan
+            .find("prefetch_hls_progressive_rolling_pair(")
+            .unwrap();
+        assert!(adjacent < pair);
+        assert!(range_plan.contains(".get(next_boundary_position)"));
+        assert!(!range_plan.contains("saturating_add(2)"));
+        assert!(range_plan.contains("HlsProgressiveReferenceProgress::Retired"));
+        assert!(range_plan.contains("ForegroundAdvanced(position)"));
+
+        let reference = source_section(
+            HLS_STREAM,
+            "async fn prefetch_hls_progressive_reference_windows(",
+            "async fn prefetch_hls_progressive_boundary_prefix(",
+        );
+        assert!(reference.contains("hls_progressive_range_ticket_admission(ticket, purpose)"));
+        assert!(reference.contains("HlsOrderedWindowState::Pending"));
+        assert!(reference.contains("HlsOrderedWindowState::Backoff"));
+        assert!(reference.contains("let retry_floor = retry_attempts"));
+        assert!(reference.contains("drain_hls_progressive_windows(&mut active).await"));
+        assert!(reference.contains("hls_progressive_range_floor(ticket)"));
+        assert!(reference.contains("hls_progressive_frontier_decision("));
+        assert!(reference.contains("hls_progressive_rolling_lane_width("));
+        assert!(reference.contains("hls_progressive_rolling_boundary_width("));
+        assert!(reference.contains("first_window_cached"));
+        assert!(reference.contains("boundary.first_window_complete.set(true)"));
+        let release_tail = reference
+            .find("boundary.first_window_complete.set(true)")
+            .unwrap();
+        let complete_return = reference[release_tail..]
+            .find("return HlsProgressiveReferenceProgress::Complete")
+            .unwrap()
+            + release_tail;
+        assert!(
+            release_tail < complete_return,
+            "W0 releases the tail even when it is the boundary's only required window"
+        );
+        assert!(reference.contains("foreground_position == position"));
+        assert!(reference.contains("needs_width_transition_poll"));
     }
 
     #[test]
@@ -4914,38 +7666,112 @@ mod hls_payload_cancellation {
         assert!(limiter.contains("range_cache_body_bytes()"));
         assert!(limiter.contains("hls_payload_cache_body_bytes()"));
 
+        let queue = source_section(
+            HLS_STREAM,
+            "fn queue_hls_progressive_window(",
+            "fn settle_hls_progressive_window_outcome(",
+        );
+        assert!(queue.contains("HlsBackgroundRangeRequest::new(lease, move ||"));
+        assert!(queue.contains("hls_progressive_range_ticket_admission("));
+        assert!(queue.contains("remember_hls_progressive_range_owner("));
+        assert!(queue.contains("Some(background)"));
+        assert!(queue.contains("!= HlsAlignedRangeState::Absent"));
+
         let progressive = source_section(
             HLS_STREAM,
-            "async fn prefetch_hls_progressive_reference(",
+            "async fn prefetch_hls_progressive_reference_windows(",
             "async fn prefetch_hls_progressive_ranges(",
         );
-        assert!(progressive.contains("HlsBackgroundRangeRequest::new(lease, move ||"));
-        assert!(progressive.contains("hls_progressive_range_ticket_admission(ticket)"));
-        assert!(progressive.contains("remember_hls_progressive_range_owner("));
-        assert!(progressive.contains("Some(background),"));
-        assert!(progressive.contains("admission_open.set(false);"));
+        let ready = progressive
+            .find("while let Some(Some(outcome)) = active.next().now_or_never()")
+            .unwrap();
+        let states = progressive[ready..].find("let mut states").unwrap() + ready;
+        let admission = progressive[states..]
+            .find("hls_ordered_window_admissions(&states, width, retry_floor)")
+            .unwrap()
+            + states;
+        let lease = progressive[admission..]
+            .find("try_hls_progressive_range_lease(ticket, purpose, expected)")
+            .unwrap()
+            + admission;
+        assert!(ready < states && states < admission && admission < lease);
+        assert!(progressive.contains("HlsAlignedRangeState::Pending"));
+        assert!(progressive.contains("HlsOrderedWindowState::Pending"));
+        assert!(progressive.contains("active_windows.contains(&window)"));
+        assert!(progressive.contains("HlsOrderedWindowState::Backoff"));
+        assert!(progressive.contains("let retry_floor = retry_attempts"));
+        assert!(progressive.contains("drain_hls_progressive_windows(&mut active).await"));
 
         let live_prefix = source_section(
             HLS_STREAM,
             "fn start_hls_shared_prefix_warmup(",
-            "fn start_beginning_snapshot_runway(",
+            "fn hls_beginning_prefix_window_bounds(",
         );
         assert!(live_prefix.contains("match try_hls_background_range_lease(expected)"));
         assert!(!live_prefix.contains("acquire_hls_background_range_lease("));
         assert!(!live_prefix.contains("task::sleep"));
         assert!(live_prefix.contains("hls_prefix_stamp_is_current(stamp)"));
         assert!(live_prefix.contains("HlsBackgroundRangeRequest::new(lease, move ||"));
-        assert!(live_prefix.contains("Some(background),"));
+        assert!(live_prefix.contains("Some(background)"));
 
         let cold = source_section(
             HLS_STREAM,
             "fn start_beginning_snapshot_runway(",
             "async fn load_feed_snapshot(",
         );
-        assert!(cold.contains("acquire_hls_background_range_lease(expected, ||"));
-        assert!(cold.contains("hls_progressive_startup_admission_is_current("));
-        assert!(cold.contains("HlsBackgroundRangeRequest::new(lease, move ||"));
-        assert!(cold.contains("Some(background),"));
+        assert!(cold.contains("hls_segment_identities(&snapshot.body)"));
+        assert!(cold.contains("configure_hls_beginning_prefix_manifest("));
+        assert!(cold.contains("ensure_hls_beginning_prefix_configured("));
+        assert!(!cold.contains("retrieve_hls_payload_range("));
+        assert!(HLS_STREAM.contains("pub(crate) const HLS_BACKGROUND_RANGE_MAX: usize = 4;"));
+
+        let supply = source_section(
+            HLS_STREAM,
+            "fn ensure_hls_beginning_prefix_configured(",
+            "async fn await_hls_beginning_prefix_barrier(",
+        );
+        assert!(supply.contains("let payload_ranges = (1..target_windows)"));
+        assert!(supply.contains("payload_ranges.len() != target_windows.saturating_sub(1)"));
+        assert!(supply.contains("scout_data_ranges_cache_only_cancellable("));
+        assert!(supply.contains("if !foreground"));
+        assert!(supply.contains("start == 0 && end == expected_end"));
+        assert!(supply.contains("gate.foreground_zero_requested = true"));
+        assert!(supply.contains("gate.foreground_zero_settled = true"));
+        assert!(supply.contains("(0..gate.target_windows).all"));
+        let ready_check = supply
+            .find("let ready = (0..gate.target_windows).all")
+            .unwrap();
+        let close = supply[ready_check..]
+            .find("gate.close_raw_scout()")
+            .unwrap()
+            + ready_check;
+        let ready_phase = supply[close..]
+            .find("gate.phase = HlsBeginningPrefixPhase::Ready")
+            .unwrap()
+            + close;
+        assert!(ready_check < close && close < ready_phase);
+        assert!(!supply.contains("hls_beginning_adjacent_range"));
+        assert!(!supply.contains("start_hls_beginning_adjacent_range"));
+        assert!(!supply.contains("try_hls_background_range_lease("));
+        assert!(!supply.contains("HlsBackgroundRangeRequest"));
+        let raw_scout = source_section(
+            supply,
+            "fn start_hls_beginning_raw_scout(",
+            "fn hls_beginning_raw_seed(",
+        );
+        assert!(
+            raw_scout
+                .find("hls_beginning_raw_supply_admission_for(")
+                .unwrap()
+                < raw_scout
+                    .find("let payload_ranges = (1..target_windows)")
+                    .unwrap()
+        );
+        assert!(raw_scout.contains("HlsProgressiveRangeAdmission::Park"));
+        assert!(raw_scout.contains("HlsProgressiveRangeAdmission::Admit => break"));
+        assert!(!supply.contains("speculative_occupancy"));
+        assert!(!supply.contains("supervisor"));
+        assert!(!supply.contains("get_connections().await /"));
 
         let response = source_section(
             HLS_STREAM,
@@ -4960,16 +7786,136 @@ mod hls_payload_cancellation {
         assert!(foreground_range.contains(
             "progressive_stamp.map(|stamp| stamp.generation),\n                    None,"
         ));
-        let resolver = source_section(
+        assert!(response.contains("mark_hls_beginning_foreground_zero_requested("));
+        assert!(response.contains("mark_hls_beginning_foreground_range_settled("));
+        assert!(response.contains("X-Weeb3-HLS-Critical-Prefix-Windows"));
+        assert!(response.contains("let streamed_range_asset ="));
+    }
+    #[test]
+    fn beginning_prefix_bypasses_routes_without_a_tokenized_whole_response() {
+        let cold = source_section(
             HLS_STREAM,
-            "async fn resolve_hls_asset(",
-            "fn hls_codec_bootstrap_manifest(",
+            "fn start_beginning_snapshot_runway(",
+            "async fn load_feed_snapshot(",
         );
-        assert!(resolver.contains(
-            "retrieve_hls_payload_range(reference.clone(), payload_size, 0, probe_end, None, None)"
-        ));
+        let ranged = cold
+            .find("let managed_prefix_eligible = first.byte_range.is_none();")
+            .unwrap();
+        let bypass = cold[ranged..]
+            .find("if !managed_prefix_eligible {")
+            .unwrap()
+            + ranged;
+        let configure = cold
+            .find("configure_hls_beginning_prefix_manifest(")
+            .unwrap();
+        let size_probe = cold.find("start_hls_payload_size_probe(").unwrap();
+        assert!(ranged < bypass && bypass < configure && configure < size_probe);
+        assert!(cold.contains("if !managed_prefix_eligible {\n            return;\n        }"));
+
+        let launch = source_section(HLS_STREAM, "async fn launch(", "fn session_from(");
+        let native = launch.find("if !mse_supported {").unwrap();
+        let native_bypass = launch[native..]
+            .find("super::runtime::bypass_hls_beginning_prefix(stamp);")
+            .unwrap()
+            + native;
+        let set_src = launch[native..].find("media.set_src(&source);").unwrap() + native;
+        assert!(native < native_bypass && native_bypass < set_src);
+
+        let attach = source_section(
+            HLS_STREAM,
+            "pub(crate) async fn attach_hls_feed_player(",
+            "async fn open_hls_feed_view_generation(",
+        );
+        assert!(attach.contains("hls_prefix_stamp_for_feed(&weeb3, &owner, &topic)"));
+        assert!(
+            attach.contains("play_hls(player, &source, hls_loader, start, beginning_prefix_stamp)")
+        );
+
+        let response = source_section(
+            HLS_STREAM,
+            "async fn fetch_hls_bytes_response(",
+            "fn hls_bytes_headers(",
+        );
+        let direct_range = response.find("explicit_stream_stamp.is_none()").unwrap();
+        let direct_bypass = response[direct_range..]
+            .find("bypass_hls_beginning_prefix_for_direct_range(&reference, stamp);")
+            .unwrap()
+            + direct_range;
+        assert!(direct_range < direct_bypass);
     }
 
+    #[test]
+    fn startup_exact_next_waits_for_terminal_singleflight_state_before_retrying() {
+        let progressive = source_section(
+            HLS_STREAM,
+            "async fn prefetch_hls_progressive_reference_windows(",
+            "async fn prefetch_hls_progressive_ranges(",
+        );
+        assert!(progressive.contains("HlsAlignedRangeState::Pending"));
+        assert!(progressive.contains("HlsOrderedWindowState::Pending"));
+        assert!(progressive.contains("active_windows.contains(&window)"));
+        assert!(progressive.contains("awaiting_terminal.remove(&window)"));
+        assert!(progressive.contains("HlsOrderedWindowState::Backoff"));
+        assert!(progressive.contains("let retry_floor = retry_attempts"));
+        assert!(progressive.contains("hls_ordered_window_admissions(&states, width, retry_floor)"));
+
+        let settlement = source_section(
+            HLS_STREAM,
+            "fn settle_hls_progressive_window_outcome(",
+            "async fn drain_hls_progressive_windows(",
+        );
+        let pending = settlement.find("HlsAlignedRangeState::Pending").unwrap();
+        let await_terminal = settlement[pending..]
+            .find("awaiting_terminal.insert(outcome.window)")
+            .unwrap()
+            + pending;
+        let absent = settlement[await_terminal..]
+            .find("HlsAlignedRangeState::Absent")
+            .unwrap()
+            + await_terminal;
+        let retry = settlement[absent..]
+            .find("hls_startup_retry_delay_ms(*retry_attempt)")
+            .unwrap()
+            + absent;
+        assert!(pending < await_terminal && await_terminal < absent && absent < retry);
+
+        let ready = progressive
+            .find("while let Some(Some(outcome)) = active.next().now_or_never()")
+            .unwrap();
+        let states = progressive[ready..].find("let mut states").unwrap() + ready;
+        let admission = progressive[states..]
+            .find("hls_ordered_window_admissions(&states, width, retry_floor)")
+            .unwrap()
+            + states;
+        assert!(
+            ready < states && states < admission,
+            "terminal outcomes are latched before a returned slot can admit later work"
+        );
+
+        let range_state = source_section(
+            STREAM,
+            "pub(crate) enum RangeCacheState",
+            "pub(crate) fn evict_completed_hls_ranges(",
+        );
+        assert!(range_state.contains("RangeCacheState::Cached"));
+        assert!(range_state.contains("RangeCacheState::Pending"));
+        assert!(range_state.contains("RangeCacheState::Absent"));
+        assert!(range_state.contains("Every nonzero generation shares this cache slot"));
+        assert!(range_state.contains("pub(crate) fn range_cache_state("));
+        assert!(range_state.contains("pub(crate) fn range_cache_observation("));
+        assert!(range_state.contains("resource: &str"));
+        assert!(range_state.contains("pending_ranges"));
+        assert!(range_state.contains(".get(&pending_key)"));
+        assert!(range_state.contains(".map(|pending| pending.generation)"));
+
+        let singleflight = source_section(
+            STREAM,
+            "async fn read_cached_range(",
+            "pub(crate) async fn read_cached_hls_range(",
+        );
+        assert!(singleflight.contains("Keep the shared slot while its detached transport drains"));
+        assert!(singleflight.contains("finish_pending_range("));
+    }
     #[test]
     fn hls_chunk_timeouts_release_logical_work_but_keep_accounting_draining() {
         let attempt = source_section(
@@ -4980,8 +7926,13 @@ mod hls_payload_cancellation {
         assert!(attempt.contains("failed_retrieve_attempt(&peer)"));
         assert!(!attempt.contains("result_chan.try_send(terminal_result)"));
         let detached = attempt
-            .find("let _ = settle_retrieve_attempt(")
+            .rfind("let result = settle_retrieve_attempt(")
             .expect("detached accounting-only settlement");
+        let detached_completion = attempt[detached..]
+            .find("profile.complete(")
+            .map(|index| detached + index)
+            .expect("detached telemetry completes after accounting settlement");
+        assert!(detached < detached_completion);
         assert!(!attempt[detached..].contains("result_chan.try_send("));
 
         let chunk = source_section(
