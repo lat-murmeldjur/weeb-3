@@ -45,7 +45,7 @@ fn hls_range_cache_is_bounded_without_a_policy_engine() {
 }
 
 #[test]
-fn hls_media_is_demand_driven_and_feed_catchup_does_not_prefetch_fragments() {
+fn hls_feed_catchup_warms_only_new_authenticated_live_fragments() {
     assert!(!HLS_RUNTIME.contains("fn prefetch("));
     let follower = section(
         HLS_RUNTIME,
@@ -53,11 +53,23 @@ fn hls_media_is_demand_driven_and_feed_catchup_does_not_prefetch_fragments() {
         "async fn fetch_hls_body_response(",
     );
     assert!(follower.contains("head.checked_add(1)"));
+    assert!(follower.contains("warm_appended(id, appended, start)"));
+    let warm = section(HLS_RUNTIME, "fn warm_appended(", "fn spawn_follower(");
+    assert!(warm.contains("start != HlsStart::Live"));
+    let first_new = warm.find("saturating_sub(appended)").unwrap();
+    let oldest_first = warm.find(".skip(first_new)").unwrap();
+    let skip_gaps = warm.find(".filter(|segment| !segment.gap)").unwrap();
+    let runway = warm.find(".take(HLS_LIVE_SYNC_SEGMENTS)").unwrap();
+    assert!(first_new < oldest_first && oldest_first < skip_gaps && skip_gaps < runway);
+    assert!(warm.contains("warm_startup_reference(&reference, start)"));
+    assert!(!follower.contains("discover_latest_once("));
+    assert!(!follower.contains("last_progress"));
+    assert!(!follower.contains("offset"));
     assert!(!follower.contains("FuturesUnordered"));
 }
 
 #[test]
-fn beginning_warms_the_early_runway_but_attaches_only_the_full_edge() {
+fn beginning_attaches_the_warmed_prefix_while_history_grows_in_background() {
     const PLAYER: &str = include_str!("../src/stream_hls/player.rs");
     let attach = section(
         HLS_RUNTIME,
@@ -65,32 +77,47 @@ fn beginning_warms_the_early_runway_but_attaches_only_the_full_edge() {
         "pub(crate) async fn open_hls_feed_view(",
     );
     let beginning = section(attach, "HlsStart::Beginning => {", "HlsStart::Live => {");
-    let early = beginning.find("let early = discover_for_view(").unwrap();
-    let edge = beginning.find("let edge = discover_for_view(").unwrap();
-    let worker_ready = beginning.find("join(worker, early).await").unwrap();
-    let warmup = beginning
-        .find("player::warm_startup_runway(&plan.references, HlsStart::Beginning)")
-        .unwrap();
+    let early = beginning.find("let early =").unwrap();
+    let history = beginning.find("spawn_beginning_history(").unwrap();
+    assert!(beginning.contains("discover_beginning(client.clone(), owner.clone(), topic.clone())"));
     let overlap = beginning
-        .find("join(warmup, join(loader, edge)).await")
+        .find("join(loader, join(worker, early)).await")
         .unwrap();
-    assert!(early < worker_ready && worker_ready < warmup && warmup < overlap);
-    assert!(edge < overlap);
-    assert!(beginning.contains("(worker, loader, edge)"));
+    assert!(early < history && history < overlap);
+    assert!(!beginning.contains("warm_live_runway"));
+    assert!(beginning.contains("(worker, loader, prefix)"));
+    assert!(!beginning.contains("join(loader, full)"));
 
-    let full_edge_ready = attach
-        .find("join(warmup, join(loader, edge)).await")
+    let prefix_parse = attach
+        .find("let playlist = match payload.history.take()")
         .unwrap();
-    let full_parse = attach
-        .find("let playlist = HlsPlaylist::parse(&payload.bytes)")
-        .unwrap();
-    let install = attach
-        .find("install_snapshot(id, index, playlist)")
-        .unwrap();
+    let install = attach.find("install_snapshot(").unwrap();
     let playback = attach.find("player::play_hls(").unwrap();
-    assert!(full_edge_ready < full_parse && full_parse < install && install < playback);
-    assert!(!attach.contains("spawn_edge_upgrade"));
+    assert!(prefix_parse < install && install < playback);
+    assert!(!attach.contains("spawn_follower(id)"));
     assert!(PLAYER.contains("duration + BUFFER_EPSILON_SECONDS >= plan.duration"));
+
+    let background = section(
+        HLS_RUNTIME,
+        "fn spawn_beginning_history(",
+        "fn spawn_follower(",
+    );
+    assert!(background.contains("discover_for_view("));
+    assert!(background.contains("!BEGINNING_MEDIA_READY.with(Cell::get)"));
+    assert!(background.contains("payload.history.take()"));
+    assert!(background.contains("apply_full_update(id, payload.index, history)"));
+    assert!(background.contains("result_view_request_is_current(view_generation)"));
+    let history_gate = section(
+        PLAYER,
+        "fn start_beginning_history_when_safe(",
+        "fn begin_playback(",
+    );
+    assert!(history_gate.contains("!live"));
+    assert!(history_gate.contains("buffered_covers(media, plan.play_position, plan.runway_end)"));
+    assert!(history_gate.contains("super::runtime::start_beginning_history()"));
+    assert!(!background.contains("warm_startup_batch"));
+    assert!(!HLS_RUNTIME.contains("BEGINNING_WARM_SEGMENTS"));
+    assert!(!PLAYER.contains("warm_startup_batch"));
 }
 
 #[test]
@@ -101,11 +128,22 @@ fn active_manifest_refresh_renders_without_cloning_the_full_timeline() {
         "fn apply_full_update(",
     );
     assert!(render.contains("playlist.as_ref()?.render("));
+    assert!(render.contains("(!feed.following).then_some(feed.id)"));
+    assert!(render.contains("feed.following = true"));
     assert!(!render.contains("playlist.clone()"));
+
+    let response = section(
+        HLS_RUNTIME,
+        "async fn fetch_feed_response(",
+        "pub(crate) async fn try_fetch_response(",
+    );
+    let frozen = response.find("render_active_feed(").unwrap();
+    let follower = response.find("spawn_follower(id)").unwrap();
+    assert!(frozen < follower);
 }
 
 #[test]
-fn edge_snapshot_revalidates_only_when_confirmation_predates_cold_setup() {
+fn edge_snapshot_reuses_bounded_boundary_and_revalidates_stale_setup() {
     let discovery = section(
         HLS_RUNTIME,
         "async fn discover_latest_once(",
@@ -130,16 +168,26 @@ fn edge_snapshot_revalidates_only_when_confirmation_predates_cold_setup() {
         "pub(crate) async fn open_hls_feed_view(",
     );
     let joined = attach
-        .find("join3(worker, loader, discovery).await")
+        .find("join(worker, join(loader, discovery)).await")
         .unwrap();
     let freshness = attach.find("let confirmed_after_setup").unwrap();
-    let revalidated = attach.find("catch_up_current_payload(").unwrap();
+    let revalidated = attach
+        .match_indices("catch_up_current_payload(")
+        .map(|(position, _)| position)
+        .collect::<Vec<_>>();
     let parsed = attach
-        .find("let playlist = HlsPlaylist::parse(&payload.bytes)")
+        .find("let playlist = match payload.history.take()")
         .unwrap();
-    assert!(joined < freshness && freshness < revalidated && revalidated < parsed);
+    let installed = attach.find("install_snapshot(").unwrap();
+    assert_eq!(revalidated.len(), 1);
+    assert!(
+        joined < freshness
+            && freshness < revalidated[0]
+            && revalidated[0] < parsed
+            && parsed < installed
+    );
     assert!(attach.contains("confirmed > worker_at && confirmed > loader_at"));
-    assert!(attach.contains("if !confirmed_after_setup"));
+    assert!(attach.contains("if live && !confirmed_after_setup"));
     assert!(attach.contains("(result, prerequisite_timestamp())"));
     assert!(attach.contains("(ready, prerequisite_timestamp())"));
 }
@@ -154,6 +202,15 @@ fn hls_service_responses_stream_exact_windows() {
     assert!(response.contains("FetchResponse::stream(200, headers)"));
     assert!(response.contains("Content-Range"));
     assert!(response.contains("parse_hls_range(range, span)"));
+
+    let feed = section(
+        HLS_RUNTIME,
+        "async fn fetch_feed_response(",
+        "pub(crate) async fn try_fetch_response(",
+    );
+    assert!(feed.contains("Cache-Control"));
+    assert!(feed.contains("no-store"));
+    assert!(!feed.contains("if_none_match_matches"));
 
     let routing = section(
         HLS_RUNTIME,

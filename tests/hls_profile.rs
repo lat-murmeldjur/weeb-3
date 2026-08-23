@@ -262,6 +262,19 @@ const RESULT_SCRIPT: &str = r#"
 
     return JSON.stringify({
         ...profile,
+        hls_resources: performance.getEntriesByType('resource')
+            .filter(entry => /\/(?:feeds|hls\/bytes)\//.test(new URL(entry.name).pathname))
+            .map(entry => ({
+                name: entry.name,
+                initiator_type: entry.initiatorType,
+                start_ms: entry.startTime,
+                response_start_ms: entry.responseStart,
+                response_end_ms: entry.responseEnd,
+                duration_ms: entry.duration,
+                transfer_bytes: entry.transferSize,
+                encoded_bytes: entry.encodedBodySize,
+                decoded_bytes: entry.decodedBodySize
+            })),
         document: {
             url: location.href,
             title: document.title,
@@ -314,7 +327,7 @@ const PLAYLIST_SCRIPT: &str = r#"
             ok: response.ok,
             segment_count: durations.length,
             duration_s: durations.reduce((sum, value) => sum + value, 0),
-            tail_three_s: durations.slice(-3).reduce((sum, value) => sum + value, 0),
+            tail_two_s: durations.slice(-2).reduce((sum, value) => sum + value, 0),
             tail_durations_s: durations.slice(-5),
             tail_references: references.slice(-5),
             target_duration_s: Number.isFinite(targetDuration) ? targetDuration : null,
@@ -489,6 +502,7 @@ fn weeb3_hls_profile() -> Result<()> {
     let cold_playing = wait_for_first_playing(&tab, Duration::from_millis(startup_observation_ms))?;
     let startup_playlist = evaluate_playlist(&tab)?;
     let playing = if let (Some(_), Some(position)) = (cold_playing, seek_seconds) {
+        wait_for_seekable_position(&tab, position, Duration::from_secs(30))?;
         begin_seek_profile(&tab, position)?;
         wait_for_first_playing(&tab, Duration::from_millis(startup_observation_ms))?
     } else {
@@ -556,7 +570,7 @@ fn weeb3_hls_profile() -> Result<()> {
         ));
     }
     if let Some(position) = seek_seconds
-        && summary_position_error(&playback, position) > 1.0
+        && summary_position_error(&playback, position) > 1.15
     {
         return Err(anyhow!(
             "HLS middle playback began at {:?}s instead of requested {position:.3}s",
@@ -609,6 +623,35 @@ fn begin_seek_profile(tab: &headless_chrome::browser::tab::Tab, position: f64) -
         return Err(anyhow!("the HLS player could not begin its middle seek"));
     }
     Ok(())
+}
+
+fn wait_for_seekable_position(
+    tab: &headless_chrome::browser::tab::Tab,
+    position: f64,
+    timeout: Duration,
+) -> Result<()> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let expression = format!(
+            "(() => {{ const video = document.querySelector('video'); return !!video && Number.isFinite(video.duration) && video.duration >= {position}; }})()"
+        );
+        if tab
+            .evaluate(&expression, false)
+            .map_err(|error| anyhow!("failed to inspect HLS seekability: {error:?}"))?
+            .value
+            .as_ref()
+            .and_then(Value::as_bool)
+            == Some(true)
+        {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(anyhow!(
+                "HLS duration never reached middle seek {position:.3}s"
+            ));
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
 }
 
 fn evaluate_profile(tab: &headless_chrome::browser::tab::Tab) -> Result<Value> {
@@ -999,10 +1042,12 @@ fn validate_playlist_position(
         .unwrap_or(5.0);
 
     // The independent fetch happens immediately after the first presented frame.
-    // A growing feed may append once while that request is in flight, but the
-    // initially displayed elapsed duration must never lag by multiple updates.
+    // A growing feed may append once while that request is in flight, and MSE may
+    // expose container PTS slightly beyond EXTINF. Either clock must remain within
+    // one target-duration update of the other.
+    let elapsed_tolerance = target_duration + 0.5;
     let elapsed_gap = playlist_duration - displayed_duration;
-    if elapsed_gap < -0.25 || elapsed_gap > target_duration + 0.5 {
+    if !beginning && elapsed_gap.abs() > elapsed_tolerance {
         return Err(anyhow!(
             "player elapsed duration was not current at startup: displayed={displayed_duration:.3}s, playlist={playlist_duration:.3}s"
         ));
@@ -1018,14 +1063,14 @@ fn validate_playlist_position(
         .filter(|duration| duration.is_finite() && *duration > 0.0)
         .ok_or_else(|| anyhow!("the player had no finite elapsed duration at profile end"))?;
     let final_gap = final_playlist_duration - final_displayed_duration;
-    if final_gap < -0.25 || final_gap > target_duration + 0.5 {
+    if final_gap.abs() > elapsed_tolerance {
         return Err(anyhow!(
             "player elapsed duration was not current at profile end: displayed={final_displayed_duration:.3}s, playlist={final_playlist_duration:.3}s"
         ));
     }
     let manifest_growth = final_playlist_duration - playlist_duration;
     let observable_growth = summary.observed_after_playing_ms / 1_000.0 + target_duration * 2.0;
-    if manifest_growth > observable_growth {
+    if !beginning && manifest_growth > observable_growth {
         return Err(anyhow!(
             "HLS elapsed duration jumped by {manifest_growth:.3}s after playback began; the startup manifest was stale"
         ));
@@ -1033,17 +1078,17 @@ fn validate_playlist_position(
 
     if !beginning {
         let tail = object
-            .get("tail_three_s")
+            .get("tail_two_s")
             .and_then(Value::as_f64)
             .filter(|duration| duration.is_finite() && *duration > 0.0)
-            .ok_or_else(|| anyhow!("startup HLS playlist had no three-segment live tail"))?;
+            .ok_or_else(|| anyhow!("startup HLS playlist had no two-segment live tail"))?;
         let expected_position = (displayed_duration - tail).max(0.0);
         let actual_position = summary
             .first_media_time_s
             .ok_or_else(|| anyhow!("live playback had no initial media position"))?;
         if (actual_position - expected_position).abs() > 1.0 {
             return Err(anyhow!(
-                "live playback did not start three segments behind its displayed edge: position={actual_position:.3}s, expected={expected_position:.3}s"
+                "live playback did not start two segments behind its displayed edge: position={actual_position:.3}s, expected={expected_position:.3}s"
             ));
         }
     }

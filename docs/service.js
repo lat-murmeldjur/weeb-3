@@ -9,15 +9,17 @@ const RAW_ROUTE_KINDS = [
   ["chunks", "chunk"]
 ];
 const FETCH_TIMEOUT_MS = 240000;
-const SERVICE_WORKER_MARKER = "forwarder-default24";
+const SERVICE_WORKER_MARKER = "forwarder-default28";
 const SERVICE_WORKER_PROTOCOL = 10;
 const MIB_BYTES = 1024 * 1024;
 const STREAM_STORAGE_WINDOW_BYTES = MIB_BYTES / 2;
 const STREAM_LOOKAHEAD_CHUNKS = 8;
-const HLS_STREAM_WINDOW_BYTES = MIB_BYTES / 2;
-const HLS_STREAM_LOOKAHEAD_CHUNKS = 8;
-const HLS_LIVE_STREAM_WINDOW_BYTES = 64 * 1024;
-const HLS_LIVE_STREAM_LOOKAHEAD_CHUNKS = 32;
+const HLS_STREAM_WINDOW_BYTES = MIB_BYTES;
+const HLS_STREAM_INITIAL_LOOKAHEAD_CHUNKS = 2;
+const HLS_STREAM_LOOKAHEAD_CHUNKS = 5;
+const HLS_LIVE_STREAM_WINDOW_BYTES = MIB_BYTES;
+const HLS_LIVE_STREAM_LOOKAHEAD_CHUNKS = 5;
+const RANGE_REQUEST_FLIGHTS = new Map();
 const CLIENT_RUNTIME_PROBES = new Map();
 const CLIENT_RUNTIME_PROBE_TIMEOUT_MS = 1_500;
 
@@ -556,7 +558,12 @@ function responseHeaders(headerRows) {
 }
 
 function requestRustRange(clients, url, start, end, networkId) {
-  return messageFirstClient(clients, {
+  const key = `${clients[0]?.id || ""}|${networkId}|${url}|${start}|${end}`;
+  const existing = RANGE_REQUEST_FLIGHTS.get(key);
+  if (existing) {
+    return existing;
+  }
+  const request = messageFirstClient(clients, {
     type: "WEEB3_FETCH_REQUEST",
     url,
     method: "GET",
@@ -579,9 +586,24 @@ function requestRustRange(clients, url, start, end, networkId) {
 
     return { ok: true, body };
   });
+  RANGE_REQUEST_FLIGHTS.set(key, request);
+  request.finally(() => {
+    if (RANGE_REQUEST_FLIGHTS.get(key) === request) {
+      RANGE_REQUEST_FLIGHTS.delete(key);
+    }
+  }).catch(() => {});
+  return request;
 }
 
-function createRustRangeStream(clients, url, size, networkId, windowBytes, lookahead) {
+function createRustRangeStream(
+  clients,
+  url,
+  size,
+  networkId,
+  windowBytes,
+  initialLookahead,
+  lookahead
+) {
   let position = 0;
   let schedulePosition = 0;
   let admissionOpen = true;
@@ -610,7 +632,8 @@ function createRustRangeStream(clients, url, size, networkId, windowBytes, looka
   };
 
   const scheduleMore = () => {
-    while (admissionOpen && schedulePosition < size && scheduled.size < lookahead) {
+    const limit = position < initialLookahead * windowBytes ? initialLookahead : lookahead;
+    while (admissionOpen && schedulePosition < size && scheduled.size < limit) {
       if (!admitRange()) {
         break;
       }
@@ -726,18 +749,23 @@ async function forwardRequestToRust(request, event) {
         return new Response("weeb-3 stream response has an invalid length", { status: 502 });
       }
       const liveHlsResource = hlsResource && url.searchParams.get("start") === "live";
+      const startupHlsResource = hlsResource && url.searchParams.get("startup") === "1";
       const windowBytes = liveHlsResource
         ? HLS_LIVE_STREAM_WINDOW_BYTES
         : hlsResource ? HLS_STREAM_WINDOW_BYTES : STREAM_STORAGE_WINDOW_BYTES;
       const lookahead = liveHlsResource
         ? HLS_LIVE_STREAM_LOOKAHEAD_CHUNKS
         : hlsResource ? HLS_STREAM_LOOKAHEAD_CHUNKS : STREAM_LOOKAHEAD_CHUNKS;
+      const initialLookahead = startupHlsResource
+        ? HLS_STREAM_INITIAL_LOOKAHEAD_CHUNKS
+        : lookahead;
       return new Response(createRustRangeStream(
         clients,
         request.url,
         size,
         networkId,
         windowBytes,
+        initialLookahead,
         lookahead
       ), {
         status,

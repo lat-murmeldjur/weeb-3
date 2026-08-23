@@ -1,6 +1,6 @@
-use std::cell::RefCell;
-
+use futures::future::join;
 use js_sys::{Array, Function, Object, Promise, Reflect};
+use std::cell::RefCell;
 use wasm_bindgen::{JsCast, JsValue, closure::Closure, prelude::wasm_bindgen};
 use wasm_bindgen_futures::{JsFuture, spawn_local};
 use web_sys::{Element, Event, HtmlMediaElement};
@@ -8,25 +8,16 @@ use web_sys::{Element, Event, HtmlMediaElement};
 use super::{HLS_LIVE_SYNC_SEGMENTS, HlsStart, HlsStartupPlan};
 use crate::stream_conventions::streaming_route_path;
 
-const HLS_EVENTS: [&str; 4] = [
-    "hlsManifestParsed",
-    "hlsBufferCreated",
-    "hlsFragBuffered",
-    "hlsError",
-];
-const NATIVE_EVENTS: [&str; 6] = [
-    "loadedmetadata",
-    "durationchange",
-    "progress",
-    "canplay",
-    "canplaythrough",
-    "error",
-];
+#[rustfmt::skip]
+const HLS_EVENTS: [&str; 6] = ["hlsManifestParsed", "hlsFragLoading", "hlsBufferCreated", "hlsBufferAppended", "hlsFragBuffered", "hlsError"];
+#[rustfmt::skip]
+const NATIVE_EVENTS: [&str; 6] = ["loadedmetadata", "durationchange", "progress", "canplay", "canplaythrough", "error"];
 const MEDIA_LIFECYCLE_EVENTS: [&str; 4] = ["play", "seeking", "seeked", "timeupdate"];
 const BUFFER_EPSILON_SECONDS: f64 = 0.15;
+const SEEK_ALIGNMENT_SECONDS: f64 = 1.0;
 const CLOCK_ADVANCE_EPSILON_SECONDS: f64 = 0.01;
-const LIVE_RUNWAY_BUFFER: (f64, f64) = (45.0, 90.0);
-const LIVE_BOOTSTRAP_BUFFER: (f64, f64) = (0.5, 0.5);
+const LIVE_RUNWAY_BUFFER: (f64, f64) = (90.0, 120.0);
+const MAX_CONSECUTIVE_MEDIA_RECOVERIES: u8 = 1;
 
 #[wasm_bindgen(module = "/static/hls_loader.js")]
 extern "C" {
@@ -34,42 +25,42 @@ extern "C" {
     pub(super) fn load_hls() -> Promise;
 }
 
-pub(super) fn warm_startup_runway(references: &[String; HLS_LIVE_SYNC_SEGMENTS], start: HlsStart) {
-    let Some(window) = web_sys::window() else {
-        return;
-    };
-    let Ok(fetch) = Reflect::get(&window, &JsValue::from_str("fetch"))
-        .and_then(|value| value.dyn_into::<Function>())
-    else {
-        return;
-    };
+pub(super) fn warm_live_runway(plan: &HlsStartupPlan) {
+    let first = startup_request(&plan.references[0], HlsStart::Live);
+    let second = startup_request(&plan.references[1], HlsStart::Live);
+    spawn_local(async move {
+        join(drain_startup_request(first), drain_startup_request(second)).await;
+    });
+}
+
+pub(super) fn warm_startup_reference(reference: &str, start: HlsStart) {
+    spawn_local(drain_startup_request(startup_request(reference, start)));
+}
+
+fn startup_request(reference: &str, start: HlsStart) -> Option<Promise> {
+    let window = web_sys::window()?;
+    let fetch = Reflect::get(&window, &JsValue::from_str("fetch"))
+        .ok()?
+        .dyn_into::<Function>()
+        .ok()?;
     let base = streaming_route_path("hls/bytes");
-    let mode = if start == HlsStart::Live {
-        "live"
-    } else {
-        "beginning"
+    let mode = match start {
+        HlsStart::Beginning => "beginning",
+        HlsStart::Live => "live",
     };
-    for reference in references {
-        let url = JsValue::from_str(&format!("{base}/{reference}?start={mode}"));
-        let Ok(request) = fetch
-            .call1(&window, &url)
+    let url = JsValue::from_str(&format!("{base}/{reference}?start={mode}"));
+    fetch.call1(&window, &url).ok()?.dyn_into::<Promise>().ok()
+}
+
+async fn drain_startup_request(request: Option<Promise>) {
+    if let Some(request) = request
+        && let Ok(response) = JsFuture::from(request).await
+        && let Ok(body) = Reflect::get(&response, &JsValue::from_str("arrayBuffer"))
+            .and_then(|value| value.dyn_into::<Function>())
+            .and_then(|array_buffer| array_buffer.call0(&response))
             .and_then(|value| value.dyn_into::<Promise>())
-        else {
-            continue;
-        };
-        spawn_local(async move {
-            let Ok(response) = JsFuture::from(request).await else {
-                return;
-            };
-            let Ok(body) = Reflect::get(&response, &JsValue::from_str("arrayBuffer"))
-                .and_then(|value| value.dyn_into::<Function>())
-                .and_then(|array_buffer| array_buffer.call0(&response))
-                .and_then(|value| value.dyn_into::<Promise>())
-            else {
-                return;
-            };
-            let _ = JsFuture::from(body).await;
-        });
+    {
+        let _ = JsFuture::from(body).await;
     }
 }
 
@@ -89,9 +80,6 @@ extern "C" {
 
     #[wasm_bindgen(catch, method, js_name = attachMedia)]
     fn attach_media(this: &Hls, media: &HtmlMediaElement) -> Result<(), JsValue>;
-
-    #[wasm_bindgen(method, getter)]
-    fn config(this: &Hls) -> Object;
 
     #[wasm_bindgen(catch, method, js_name = startLoad)]
     fn start_load_at(this: &Hls, position: f64) -> Result<(), JsValue>;
@@ -121,9 +109,10 @@ struct Player {
     plan: HlsStartupPlan,
     restore_autoplay: bool,
     live: bool,
-    live_tail_started: bool,
-    video_initialized: bool,
+    live_bootstrap_pending: bool,
+    beginning_prefetch_ready: bool,
     ready: bool,
+    consecutive_media_recoveries: u8,
     clock_started: bool,
     clock_origin: f64,
     seek: Option<SeekGate>,
@@ -234,8 +223,8 @@ pub(super) fn play_hls(
     );
 
     let live = start == HlsStart::Live;
+    let live_bootstrap_pending = live && plan.codec_bootstrap;
     let clock_origin = plan.play_position;
-    let live_tail_started = !live || plan.play_position <= BUFFER_EPSILON_SECONDS;
     ACTIVE.with(|active| {
         *active.borrow_mut() = Some(Player {
             id,
@@ -246,9 +235,10 @@ pub(super) fn play_hls(
             plan,
             restore_autoplay,
             live,
-            live_tail_started,
-            video_initialized: false,
+            live_bootstrap_pending,
+            beginning_prefetch_ready: false,
             ready: false,
+            consecutive_media_recoveries: 0,
             clock_started: false,
             clock_origin,
             seek: None,
@@ -385,6 +375,9 @@ fn handle_media_event(id: u64, media: &HtmlMediaElement, event: &str, native: bo
             };
             let ready = player.ready;
             let runway = player.plan.runway_end - player.plan.play_position;
+            if event == "seeking" && !player.live {
+                super::runtime::start_beginning_history();
+            }
             media_action(
                 media,
                 event,
@@ -403,6 +396,9 @@ fn handle_media_event(id: u64, media: &HtmlMediaElement, event: &str, native: bo
             };
             let ready = player.ready;
             let runway = player.plan.runway_end - player.plan.play_position;
+            if event == "seeking" && !player.live {
+                super::runtime::start_beginning_history();
+            }
             media_action(
                 media,
                 event,
@@ -444,7 +440,7 @@ fn media_action(
             set_state(
                 media,
                 "buffering",
-                "Buffering three HLS segments after seek...",
+                "Buffering two HLS segments after seek...",
             );
             return MediaAction::Pause;
         }
@@ -507,6 +503,7 @@ fn handle_native_event(id: u64, event: &str) {
             player.media.set_current_time(player.plan.play_position);
             player.positioned = true;
         }
+        let _ = start_beginning_history_when_safe(&player.media, &player.plan, player.live);
         if player.ready {
             let runway = player.plan.runway_end - player.plan.play_position;
             return (settle_seek(&player.media, runway, &mut player.seek) == Some(true))
@@ -519,7 +516,7 @@ fn handle_native_event(id: u64, event: &str) {
             set_state(
                 &player.media,
                 "buffering",
-                "Buffering three complete HLS segments...",
+                "Buffering the HLS startup runway...",
             );
             None
         }
@@ -539,6 +536,11 @@ fn handle_event(id: u64, event: &str, data: &JsValue) {
         let Some(player) = active.as_mut().filter(|player| player.id == id) else {
             return Action::None;
         };
+        if matches!(event, "hlsBufferAppended" | "hlsFragBuffered")
+            && start_beginning_history_when_safe(&player.media, &player.plan, player.live)
+        {
+            player.beginning_prefetch_ready = true;
+        }
         match event {
             "hlsManifestParsed" => {
                 set_state(
@@ -548,34 +550,42 @@ fn handle_event(id: u64, event: &str, data: &JsValue) {
                 );
                 Action::Start(
                     player.hls.clone(),
-                    if player.live_tail_started {
+                    if player.live_bootstrap_pending {
+                        player.plan.bootstrap_position
+                    } else {
                         player.plan.play_position
+                    } + if player.live {
+                        BUFFER_EPSILON_SECONDS
                     } else {
                         0.0
                     },
                 )
             }
-            "hlsBufferCreated" if !player.live_tail_started => {
-                player.video_initialized |= has_video_track(data);
-                Action::None
-            }
-            "hlsFragBuffered" if player.live && !player.live_tail_started => {
-                if !player.video_initialized {
+            "hlsBufferCreated" | "hlsFragBuffered"
+                if player.live && player.live_bootstrap_pending =>
+            {
+                let initialized = if event == "hlsBufferCreated" {
+                    has_video_track(data)
+                } else {
+                    is_main_fragment(data)
+                };
+                if !initialized {
                     return Action::None;
                 }
-                player.live_tail_started = true;
-                set_state(
-                    &player.media,
-                    "buffering",
-                    "HLS decoder initialized; buffering the live runway...",
-                );
+                player.live_bootstrap_pending = false;
                 Action::Retarget(
                     player.hls.clone(),
                     player.media.clone(),
                     player.plan.play_position,
                 )
             }
-            "hlsFragBuffered" if !player.ready => {
+            "hlsFragLoading" if !player.live && player.beginning_prefetch_ready => {
+                if let Some(reference) = fragment_reference(data) {
+                    super::runtime::warm_beginning_successor(&reference);
+                }
+                Action::None
+            }
+            "hlsBufferAppended" | "hlsFragBuffered" if !player.ready => {
                 if playback_ready(&player.media, &player.plan, player.live, false) {
                     player.ready = true;
                     Action::Play(player.media.clone(), player.plan.play_position)
@@ -583,12 +593,13 @@ fn handle_event(id: u64, event: &str, data: &JsValue) {
                     set_state(
                         &player.media,
                         "buffering",
-                        "Buffering three complete HLS segments...",
+                        "Buffering the HLS startup runway...",
                     );
                     Action::None
                 }
             }
-            "hlsFragBuffered" => {
+            "hlsBufferAppended" | "hlsFragBuffered" => {
+                player.consecutive_media_recoveries = 0;
                 let runway = player.plan.runway_end - player.plan.play_position;
                 if settle_seek(&player.media, runway, &mut player.seek) == Some(true) {
                     Action::Resume(player.media.clone())
@@ -606,15 +617,27 @@ fn handle_event(id: u64, event: &str, data: &JsValue) {
                 match js_string(data, "type").as_deref() {
                     Some("networkError") => Action::RecoverNetwork(
                         player.hls.clone(),
-                        if !player.live_tail_started {
-                            0.0
-                        } else if player.ready {
+                        if player.ready {
                             player.media.current_time()
+                        } else if player.live_bootstrap_pending {
+                            player.plan.bootstrap_position + BUFFER_EPSILON_SECONDS
                         } else {
                             player.plan.play_position
+                                + if player.live {
+                                    BUFFER_EPSILON_SECONDS
+                                } else {
+                                    0.0
+                                }
                         },
                     ),
-                    Some("mediaError") => Action::RecoverMedia(player.hls.clone()),
+                    Some("mediaError")
+                        if player.consecutive_media_recoveries
+                            < MAX_CONSECUTIVE_MEDIA_RECOVERIES =>
+                    {
+                        player.consecutive_media_recoveries += 1;
+                        Action::RecoverMedia(player.hls.clone())
+                    }
+                    Some("mediaError") => Action::Fail(player.media.clone(), details),
                     _ => Action::Fail(player.media.clone(), details),
                 }
             }
@@ -632,14 +655,11 @@ fn handle_event(id: u64, event: &str, data: &JsValue) {
         }
         Action::Resume(media) => resume_playback(media),
         Action::Retarget(hls, media, position) => {
-            let config = hls.config();
-            let (buffer, maximum) = LIVE_RUNWAY_BUFFER;
-            set_number(&config, "maxBufferLength", buffer);
-            set_number(&config, "maxMaxBufferLength", maximum);
-            let _ = hls.stop_load();
-            media.set_current_time(position);
             spawn_local(async move {
-                let _ = hls.start_load_at(position);
+                let _ = hls.stop_load();
+                let target = position + BUFFER_EPSILON_SECONDS;
+                media.set_current_time(target);
+                let _ = hls.start_load_at(target);
             });
         }
         Action::RecoverNetwork(hls, position) => {
@@ -652,8 +672,25 @@ fn handle_event(id: u64, event: &str, data: &JsValue) {
     }
 }
 
+fn start_beginning_history_when_safe(
+    media: &HtmlMediaElement,
+    plan: &HlsStartupPlan,
+    live: bool,
+) -> bool {
+    let ready = !live && buffered_covers(media, plan.play_position, plan.runway_end);
+    if ready {
+        super::runtime::start_beginning_history();
+    }
+    ready
+}
+
 fn begin_playback(media: HtmlMediaElement, position: f64) {
-    media.set_current_time(position);
+    let current = media.current_time();
+    if !current.is_finite()
+        || (current - position).abs() > BUFFER_EPSILON_SECONDS + CLOCK_ADVANCE_EPSILON_SECONDS
+    {
+        media.set_current_time(position);
+    }
     resume_playback(media);
 }
 
@@ -661,7 +698,7 @@ fn resume_playback(media: HtmlMediaElement) {
     set_state(
         &media,
         "starting",
-        "Three HLS segments buffered; waiting for the media clock...",
+        "HLS startup runway buffered; waiting for the media clock...",
     );
     match media.play() {
         Ok(promise) => {
@@ -685,15 +722,16 @@ fn resume_playback(media: HtmlMediaElement) {
 
 fn settle_seek(media: &HtmlMediaElement, runway: f64, seek: &mut Option<SeekGate>) -> Option<bool> {
     let pending = *seek.as_ref()?;
-    let mut end = pending.target + runway;
+    let aligned_target = pending.target + SEEK_ALIGNMENT_SECONDS;
+    let mut end = aligned_target + runway;
     let duration = media.duration();
     if duration.is_finite() {
         end = end.min(duration);
     }
     if !runway.is_finite()
         || runway <= 0.0
-        || (!buffered_covers(media, pending.target, end)
-            && end > pending.target + BUFFER_EPSILON_SECONDS)
+        || (!buffered_covers(media, aligned_target, end)
+            && end > aligned_target + BUFFER_EPSILON_SECONDS)
     {
         return None;
     }
@@ -756,11 +794,8 @@ fn suspend_autoplay(media: &HtmlMediaElement) -> bool {
 fn restore_autoplay(media: &HtmlMediaElement, restore: bool) {
     if restore {
         media.set_attribute("autoplay", "").ok();
-        let _ = Reflect::set(
-            media.as_ref(),
-            &JsValue::from_str("autoplay"),
-            &JsValue::TRUE,
-        );
+        let autoplay = JsValue::from_str("autoplay");
+        let _ = Reflect::set(media.as_ref(), &autoplay, &JsValue::TRUE);
     }
 }
 
@@ -813,7 +848,7 @@ fn hls_config(start: HlsStart) -> Object {
     set(&config, "startFragPrefetch", JsValue::TRUE);
     set(&config, "progressive", JsValue::TRUE);
     let (buffer, maximum) = if start == HlsStart::Live {
-        LIVE_BOOTSTRAP_BUFFER
+        LIVE_RUNWAY_BUFFER
     } else {
         (180.0, 600.0)
     };
@@ -864,21 +899,39 @@ fn set_number(target: &Object, name: &str, value: f64) {
 }
 
 fn js_string(value: &JsValue, name: &str) -> Option<String> {
-    Reflect::get(value, &JsValue::from_str(name))
-        .ok()
-        .and_then(|value| value.as_string())
+    js_property(value, name).and_then(|value| value.as_string())
 }
 
 fn js_bool(value: &JsValue, name: &str) -> Option<bool> {
-    Reflect::get(value, &JsValue::from_str(name))
-        .ok()
-        .and_then(|value| value.as_bool())
+    js_property(value, name).and_then(|value| value.as_bool())
+}
+
+fn js_property(value: &JsValue, name: &str) -> Option<JsValue> {
+    Reflect::get(value, &JsValue::from_str(name)).ok()
+}
+
+fn fragment_reference(value: &JsValue) -> Option<String> {
+    let fragment = js_property(value, "frag")?;
+    let url = js_string(&fragment, "url")?;
+    let path = url.split_once('?').map_or(url.as_str(), |(path, _)| path);
+    let reference = path.rsplit('/').next()?;
+    (matches!(reference.len(), 64 | 128) && reference.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .then(|| reference.to_ascii_lowercase())
 }
 
 fn has_video_track(value: &JsValue) -> bool {
-    Reflect::get(value, &JsValue::from_str("tracks"))
-        .and_then(|tracks| Reflect::get(&tracks, &JsValue::from_str("video")))
-        .is_ok_and(|video| !video.is_null() && !video.is_undefined())
+    let Some(tracks) = js_property(value, "tracks") else {
+        return false;
+    };
+    ["video", "audiovideo"].into_iter().any(|kind| {
+        js_property(&tracks, kind).is_some_and(|track| !track.is_null() && !track.is_undefined())
+    })
+}
+
+fn is_main_fragment(value: &JsValue) -> bool {
+    js_property(value, "frag")
+        .and_then(|fragment| js_string(&fragment, "type"))
+        .is_some_and(|kind| kind == "main")
 }
 
 fn set_state(media: &HtmlMediaElement, state: &str, message: &str) {

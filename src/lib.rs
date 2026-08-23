@@ -1,6 +1,6 @@
 #![cfg(target_arch = "wasm32")]
 use alloy::signers::local::PrivateKeySigner;
-use async_lock::{Semaphore, SemaphoreGuardArc};
+use async_lock::Semaphore;
 use async_std::sync::{Arc, Mutex, MutexGuard};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use wasm_bindgen_futures::spawn_local;
@@ -309,8 +309,6 @@ const PEER_DIAL_INGEST_BATCH: usize = 256;
 const MAX_QUEUED_PEER_DIALS: usize = 4_096;
 const FRESH_PEER_DIALS_PER_RETRY: usize = 128;
 const OUTBOUND_CONNECTION_TIMEOUT_MS: u64 = 8_000;
-const IDENTIFY_PUSH_CONCURRENCY: usize = 32;
-const IDENTIFY_PUSH_TIMEOUT_MS: u64 = 5_000;
 const PRE_HANDSHAKE_CONNECTION_TIMEOUT_MS: u64 = 60_000;
 const PEER_POPULATION_RESCAN_MS: u64 = 2_000;
 const SWARM_EVENTS_PER_BROWSER_YIELD: usize = 32;
@@ -747,11 +745,6 @@ struct ConnectionAttempt {
     handshake_ready: mpsc::Sender<ConnectionId>,
 }
 
-struct PendingIdentifyAddress {
-    address: Multiaddr,
-    _permit: SemaphoreGuardArc,
-}
-
 pub(crate) struct PeerDialInstruction {
     pub(crate) underlay: Vec<u8>,
     pub(crate) generation: u64,
@@ -954,9 +947,7 @@ pub(crate) struct Wings {
     connection_cooldowns: Arc<Mutex<HashSet<PeerId>>>,
     physical_connections: PhysicalConnectionMap,
     handshake_ready_connections: Arc<std::sync::Mutex<HashSet<(PeerId, ConnectionId)>>>,
-    pending_identify_addresses:
-        Arc<std::sync::Mutex<HashMap<(PeerId, ConnectionId), PendingIdentifyAddress>>>,
-    identify_push_capacity: Arc<Semaphore>,
+    canonical_identify_address: Arc<std::sync::Mutex<Option<Multiaddr>>>,
     known_peer_underlays: PeerAddrMap,
     known_peer_generations: PeerGenerationMap,
     delayed_peer_retries: DelayedPeerRetryMap,
@@ -1030,65 +1021,6 @@ async fn mark_handshake_ready_connection(
     drop(physical);
     if exclusive_connection {
         let _ = attempt.handshake_ready.try_send(connection_id);
-    }
-}
-
-fn take_pending_identify_address(
-    wings: &Arc<Wings>,
-    peer: &PeerId,
-    connection_id: ConnectionId,
-    expected_listen_addrs: Option<&[Multiaddr]>,
-) -> Option<Option<Multiaddr>> {
-    let mut pending = wings
-        .pending_identify_addresses
-        .lock()
-        .unwrap_or_else(|error| error.into_inner());
-    let key = (peer.clone(), connection_id);
-    if expected_listen_addrs.is_some_and(|addresses| {
-        !pending
-            .get(&key)
-            .is_some_and(|pending| addresses.contains(&pending.address))
-    }) {
-        return None;
-    }
-    let pending_address = pending.remove(&key)?;
-    Some(
-        (!pending
-            .values()
-            .any(|pending| pending.address == pending_address.address))
-        .then_some(pending_address.address),
-    )
-}
-
-async fn remove_pending_identify_address(
-    wings: &Arc<Wings>,
-    swarm: &Arc<SharedSwarm>,
-    peer: &PeerId,
-    connection_id: ConnectionId,
-) -> bool {
-    let Some(removable) = take_pending_identify_address(wings, peer, connection_id, None) else {
-        return false;
-    };
-    if let Some(address) = removable {
-        remove_unreferenced_identify_address(wings, swarm, &address).await;
-    }
-    true
-}
-
-async fn remove_unreferenced_identify_address(
-    wings: &Arc<Wings>,
-    swarm: &Arc<SharedSwarm>,
-    address: &Multiaddr,
-) {
-    let mut swarm = swarm.lock().await;
-    let referenced = wings
-        .pending_identify_addresses
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .values()
-        .any(|pending| &pending.address == address);
-    if !referenced {
-        swarm.remove_external_address(address);
     }
 }
 
@@ -1404,11 +1336,10 @@ impl Weeb3 {
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .clear();
-        wings
-            .pending_identify_addresses
+        *wings
+            .canonical_identify_address
             .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .clear();
+            .unwrap_or_else(|error| error.into_inner()) = None;
 
         {
             let mut swarm = self.swarm.lock().await;
@@ -1928,8 +1859,7 @@ impl Weeb3 {
         let physical_connections: PhysicalConnectionMap =
             Arc::new(std::sync::Mutex::new(HashMap::new()));
         let handshake_ready_connections = Arc::new(std::sync::Mutex::new(HashSet::new()));
-        let pending_identify_addresses = Arc::new(std::sync::Mutex::new(HashMap::new()));
-        let identify_push_capacity = Arc::new(Semaphore::new(IDENTIFY_PUSH_CONCURRENCY));
+        let canonical_identify_address = Arc::new(std::sync::Mutex::new(None));
         let known_peer_underlays: PeerAddrMap = Arc::new(Mutex::new(HashMap::new()));
         let known_peer_generations: PeerGenerationMap = Arc::new(Mutex::new(HashMap::new()));
         let delayed_peer_retries: DelayedPeerRetryMap = Arc::new(Mutex::new(HashMap::new()));
@@ -1979,8 +1909,7 @@ impl Weeb3 {
                 connection_cooldowns: connection_cooldowns,
                 physical_connections: physical_connections,
                 handshake_ready_connections,
-                pending_identify_addresses,
-                identify_push_capacity,
+                canonical_identify_address,
                 known_peer_underlays: known_peer_underlays,
                 known_peer_generations: known_peer_generations,
                 delayed_peer_retries,
@@ -2608,6 +2537,7 @@ impl Weeb3 {
                 let ongoing_connections = self.ongoing_connections.clone();
                 let log_port = self.log_port.0.clone();
                 let log_start_ms = self.log_start_ms;
+                let identify_local_peer_id = local_peer_id;
 
                 spawn_local(async move {
                     let interface_log = |log0: String| {
@@ -2679,7 +2609,10 @@ impl Weeb3 {
                                     {
                                         return;
                                     }
-                                    if info.observed_addr.is_empty() {
+                                    if info.observed_addr.is_empty()
+                                        || try_from_multiaddr(&info.observed_addr)
+                                            .is_some_and(|peer| peer != identify_local_peer_id)
+                                    {
                                         let _ = close_failed_identify_connection(
                                             &wings,
                                             &swarm,
@@ -2689,7 +2622,6 @@ impl Weeb3 {
                                         .await;
                                         return;
                                     }
-                                    let permit = wings.identify_push_capacity.acquire_arc().await;
                                     let physical = wings
                                         .physical_connections
                                         .lock()
@@ -2708,78 +2640,28 @@ impl Weeb3 {
                                     {
                                         return;
                                     }
-                                    let timeout_wings = wings.clone();
-                                    let timeout_swarm = swarm.clone();
-                                    let timeout_peer = peer_id.clone();
                                     let mut swarm = swarm.lock().await;
-                                    {
-                                        let mut pending = wings
-                                            .pending_identify_addresses
+                                    let (canonical, first) = {
+                                        let mut canonical = wings
+                                            .canonical_identify_address
                                             .lock()
                                             .unwrap_or_else(|error| error.into_inner());
-                                        let std::collections::hash_map::Entry::Vacant(entry) =
-                                            pending.entry((peer_id.clone(), connection_id))
-                                        else {
-                                            return;
-                                        };
-                                        entry.insert(PendingIdentifyAddress {
-                                            address: info.observed_addr.clone(),
-                                            _permit: permit,
-                                        });
+                                        let first = canonical.is_none();
+                                        let address = canonical
+                                            .get_or_insert_with(|| info.observed_addr.clone())
+                                            .clone();
+                                        (address, first)
+                                    };
+                                    if first {
+                                        swarm.add_external_address(canonical);
                                     }
-                                    swarm.add_external_address(info.observed_addr);
                                     swarm
                                         .behaviour_mut()
                                         .identify
                                         .push(std::iter::once(peer_id.clone()));
                                     drop(swarm);
-                                    spawn_local(async move {
-                                        async_std::task::sleep(Duration::from_millis(
-                                            IDENTIFY_PUSH_TIMEOUT_MS,
-                                        ))
-                                        .await;
-                                        if remove_pending_identify_address(
-                                            &timeout_wings,
-                                            &timeout_swarm,
-                                            &timeout_peer,
-                                            connection_id,
-                                        )
-                                        .await
-                                        {
-                                            let _ = timeout_swarm
-                                                .lock()
-                                                .await
-                                                .close_connection(connection_id);
-                                        }
-                                    });
-                                }
-                                identify::Event::Pushed {
-                                    peer_id,
-                                    connection_id,
-                                    info,
-                                } => {
-                                    let Some(cleanup_address) = take_pending_identify_address(
-                                        &wings,
-                                        &peer_id,
-                                        connection_id,
-                                        Some(&info.listen_addrs),
-                                    ) else {
-                                        return;
-                                    };
                                     mark_handshake_ready_connection(&wings, peer_id, connection_id)
                                         .await;
-                                    if let Some(address) = cleanup_address {
-                                        let cleanup_wings = wings.clone();
-                                        spawn_local(async move {
-                                            async_std::task::yield_now().await;
-                                            remove_unreferenced_identify_address(
-                                                &cleanup_wings,
-                                                &swarm,
-                                                &address,
-                                            )
-                                            .await;
-                                        });
-                                    }
                                 }
                                 identify::Event::Error {
                                     peer_id,
@@ -2787,13 +2669,6 @@ impl Weeb3 {
                                     ..
                                 } => {
                                     let _ = close_failed_identify_connection(
-                                        &wings,
-                                        &swarm,
-                                        &peer_id,
-                                        connection_id,
-                                    )
-                                    .await;
-                                    let _ = remove_pending_identify_address(
                                         &wings,
                                         &swarm,
                                         &peer_id,
@@ -2884,13 +2759,6 @@ impl Weeb3 {
                             num_established: _,
                             cause,
                         } => {
-                            let _ = remove_pending_identify_address(
-                                &wings,
-                                &swarm,
-                                &peer_id,
-                                connection_id,
-                            )
-                            .await;
                             let mut connected_peers = wings.connected_peers.lock().await;
                             let expected_peer_connection = connected_peers
                                 .get(&peer_id)

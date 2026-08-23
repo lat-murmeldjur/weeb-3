@@ -576,12 +576,12 @@ mod feed_frontier {
 
         assert!(payload.contains("pub(crate) fn decode_feed_payload_root("));
         assert!(payload.contains("pub(crate) async fn retrieve_feed_payload("));
-        assert!(payload.contains("pub(crate) async fn retrieve_feed_payload_tail_conservative("));
+        assert!(payload.contains("pub(crate) async fn retrieve_feed_payload_tail("));
         assert!(payload.contains("manifest_payload_size_allowed(root.span)"));
         assert!(payload.contains("if span > maximum_span"));
         assert!(payload.contains("retrieve_data_range_from_root("));
-        assert!(payload.contains("retrieve_data_range_from_root_conservative("));
-        assert!(payload.contains("CONSERVATIVE_RANGE_BYTES"));
+        assert!(payload.contains(".min(CHUNK_SIZE as u64)"));
+        assert!(!payload.contains("conservative"));
         assert!(!payload.to_ascii_lowercase().contains("hls"));
         assert!(!payload.contains("RawFeedPayload"));
         assert!(!payload.contains("DeferredRawFeedPayload"));

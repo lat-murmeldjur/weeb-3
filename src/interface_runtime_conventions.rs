@@ -1,7 +1,7 @@
 use super::*;
 
 const SERVICE_WORKER_PROTOCOL: f64 = 10.0;
-const SERVICE_WORKER_MARKER: &str = "forwarder-default24";
+const SERVICE_WORKER_MARKER: &str = "forwarder-default28";
 const SERVICE_WORKER_CONTROL_TOTAL_TIMEOUT_MS: u64 = 30_000;
 const SERVICE_WORKER_SETUP_RETRY_MS: f64 = 1_500.0;
 

@@ -11,28 +11,24 @@ fn section<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
 }
 
 fn edge_anchors() -> Vec<u64> {
-    section(
-        HLS_RUNTIME,
-        "const EDGE_ANCHORS: [u64; EDGE_PROBE_WIDTH] = [",
-        "];",
-    )
-    .split(',')
-    .filter_map(|value| {
-        let value = value.trim();
-        if value.is_empty() {
-            None
-        } else if value == "u64::MAX" {
-            Some(u64::MAX)
-        } else {
-            Some(
-                value
-                    .replace('_', "")
-                    .parse()
-                    .expect("numeric HLS edge anchor"),
-            )
-        }
-    })
-    .collect()
+    section(HLS_RUNTIME, "const EDGE_ANCHORS: [u64; 49] = [", "];")
+        .split(',')
+        .filter_map(|value| {
+            let value = value.trim();
+            if value.is_empty() {
+                None
+            } else if value == "u64::MAX" {
+                Some(u64::MAX)
+            } else {
+                Some(
+                    value
+                        .replace('_', "")
+                        .parse()
+                        .expect("numeric HLS edge anchor"),
+                )
+            }
+        })
+        .collect()
 }
 
 fn refinement_indices(lower: u64, upper: u64, width: usize) -> Vec<u64> {
@@ -123,21 +119,35 @@ fn cold_discovery_is_bounded_and_edge_search_is_hls_owned() {
     );
     assert!(beginning.contains("for index in 0..BEGINNING_DISCOVERY_WIDTH"));
     assert!(beginning.contains("probe_feed_payload("));
+    assert!(beginning.contains("spawn_local(async move"));
+    assert!(beginning.contains("results.try_send(result)"));
     assert!(beginning.contains("async_std::future::timeout(FEED_DISCOVERY_TIMEOUT"));
     assert!(beginning.contains("async_std::future::timeout(BEGINNING_WAVE_TIMEOUT"));
+    assert!(
+        HLS_RUNTIME
+            .contains("const BEGINNING_PREFIX_SEGMENTS: usize = HLS_LIVE_SYNC_SEGMENTS * 2;")
+    );
+    assert!(beginning.contains(">= BEGINNING_PREFIX_SEGMENTS"));
+    assert!(beginning.contains("playlist.sequence == 0"));
+    assert!(beginning.contains("if prefix_ready {"));
+    assert!(beginning.contains("payload.index > best.index"));
 
     let edge = section(
         HLS_RUNTIME,
         "async fn discover_edge_update(",
         "async fn discover_latest_once(",
     );
-    assert!(HLS_RUNTIME.contains("const EDGE_ANCHORS: [u64; EDGE_PROBE_WIDTH]"));
-    assert!(HLS_RUNTIME.contains("const EDGE_PROBE_WIDTH: usize = 32;"));
-    assert!(edge.contains("edge_probe_wave(client, owner, topic, &EDGE_ANCHORS, false)"));
-    assert!(edge.contains("interior.min((EDGE_PROBE_WIDTH - 1) as u64)"));
+    assert!(HLS_RUNTIME.contains("const EDGE_ANCHORS: [u64; 49]"));
+    assert!(HLS_RUNTIME.contains("const EDGE_REFINEMENT_WIDTH: usize = 32;"));
+    assert!(edge.contains("edge_probe_wave(client, owner, topic, &EDGE_ANCHORS, false, fast)"));
+    assert!(edge.contains("interior.min((EDGE_REFINEMENT_WIDTH - 1) as u64)"));
     assert!(edge.contains("let first = latest.0 + 1;"));
     assert!(edge.contains("indices.push(upper);"));
-    assert!(edge.contains("edge_probe_wave(client, owner, topic, &indices, true)"));
+    assert!(edge.contains("edge_probe_wave(client, owner, topic, &indices, true, fast)"));
+    assert!(edge.contains("if latest.0.saturating_add(1) == upper"));
+    assert!(edge.contains("return Some(latest);"));
+    assert!(!edge.contains("probe_feed_update("));
+    assert!(!edge.contains("EDGE_RECOVERY_ANCHORS"));
     assert!(edge.contains("if (latest.0, upper) == previous"));
     assert!(edge.contains("return None;"));
 
@@ -148,34 +158,79 @@ fn cold_discovery_is_bounded_and_edge_search_is_hls_owned() {
     );
     assert!(wave.contains("let mut completed = vec![false; indices.len()];"));
     assert!(wave.contains("completed[first_unsettled..=upper]"));
+    assert!(wave.contains("spawn_local(async move"));
+    assert!(wave.contains("probe_feed_update("));
+    assert!(wave.contains("attempt_limit"));
+    assert!(wave.contains("results.try_send((slot, result))"));
+    assert!(wave.contains("collect.await"));
+    assert!(wave.contains("EDGE_COLD_WAVE_TIMEOUT"));
+    assert!(wave.contains("EDGE_WAVE_TIMEOUT"));
+    assert!(wave.contains("lower_is_known || first_unsettled > 0"));
+    assert!(wave.contains("let Some(upper)"));
     assert!(wave.contains("break;"));
 
-    let latest = section(
+    assert!(HLS_RUNTIME.contains("const EDGE_PROBE_ATTEMPTS: usize = 2;"));
+    let shared_probe = section(
+        HLS_RUNTIME,
+        "async fn probe_feed_update(",
+        "async fn probe_feed_payload(",
+    );
+    assert!(shared_probe.contains("attempt_limit: Option<usize>"));
+    assert!(shared_probe.contains("map_or_else(RetrieveAdmission::new"));
+    assert!(shared_probe.contains("RetrieveAdmission::new_with_attempt_limit"));
+
+    let initial = section(
         HLS_RUNTIME,
         "async fn discover_latest_once(",
-        "async fn discover_for_view(",
+        "async fn retrieve_confirmed_payload(",
     );
-    assert!(latest.contains("retrieve_feed_payload("));
-    assert!(latest.contains("probe_feed_update(client, owner, topic, next)"));
-    assert!(latest.contains("FeedProbe::Found(next_update)"));
-    assert!(latest.contains("FeedProbe::Missing => {"));
-    assert!(latest.contains("confirmed_at: Some(prerequisite_timestamp())"));
-    assert!(!latest.contains("async_std::future::timeout"));
+    assert!(initial.contains("discover_edge_update(client, owner, topic).await?"));
+    assert!(initial.contains("Some(FEED_PROBE_ATTEMPTS)"));
+
+    let confirmation = section(
+        HLS_RUNTIME,
+        "async fn retrieve_confirmed_payload(",
+        "async fn catch_up_current_payload(",
+    );
+    let payload = confirmation.find("retrieve_feed_payload(").unwrap();
+    let successor = confirmation.find("probe_feed_update(").unwrap();
+    assert!(payload < successor);
+    assert!(confirmation.contains("next, attempt_limit"));
+    assert!(confirmation.contains("FeedProbe::Found(next_update)"));
+    assert!(confirmation.contains("FeedProbe::Missing => {"));
+    assert!(confirmation.contains("confirmed_at: Some(prerequisite_timestamp())"));
+    assert!(!confirmation.contains("probe_followup_wave("));
+    assert!(!confirmation.contains("FEED_HOLE_TOLERANCE"));
+    assert!(!confirmation.contains("async_std::future::timeout"));
+
+    let catch_up = section(
+        HLS_RUNTIME,
+        "async fn catch_up_current_payload(",
+        "async fn history_snapshots(",
+    );
+    assert!(catch_up.contains("probe_feed_update(client, owner, topic, next, None)"));
+    assert!(
+        catch_up.contains("retrieve_confirmed_payload(client, owner, topic, next, update, None)")
+    );
+    assert!(!HLS_RUNTIME.contains("probe_followup_wave("));
+    assert!(!HLS_RUNTIME.contains("FollowupWave"));
 }
 
 #[test]
 fn captured_hls_heads_resolve_in_at_most_three_probe_waves() {
-    assert_eq!(edge_anchors().len(), 32);
+    assert_eq!(edge_anchors().len(), 49);
     for head in [217, 511, 1_687, 2_047, 3_798, 6_179, 6_256] {
         let (waves, probes) = contiguous_edge_waves(head);
         assert!(waves <= 3, "head {head} took {waves} waves");
-        assert!(probes <= 96, "head {head} took {probes} probes");
+        assert!(probes <= 113, "head {head} took {probes} probes");
     }
-    assert_eq!(contiguous_edge_waves(4_481), (3, 82));
+    assert_eq!(contiguous_edge_waves(35), (2, 81));
+    assert_eq!(contiguous_edge_waves(255), (2, 81));
+    assert!(contiguous_edge_waves(4_481).0 <= 3);
 }
 
 #[test]
-fn live_follower_probes_only_the_contiguous_next_update_without_media_prefetch() {
+fn live_follower_retries_the_exact_next_index_and_warms_each_authenticated_append() {
     assert!(HLS_RUNTIME.contains("const FEED_TAIL_PROBE_BYTES: usize = 4 * 1024;"));
     assert!(
         HLS_RUNTIME.contains("const FEED_POLL_INTERVAL: Duration = Duration::from_millis(400);")
@@ -183,19 +238,31 @@ fn live_follower_probes_only_the_contiguous_next_update_without_media_prefetch()
 
     let follower = section(
         HLS_RUNTIME,
-        "fn spawn_follower(id: u64)",
+        "async fn apply_deferred_update(",
         "async fn fetch_hls_body_response(",
     );
     assert!(follower.contains("let Some(index) = head.checked_add(1)"));
     assert!(follower.contains("probe_feed_payload("));
+    assert!(follower.contains("FEED_TAIL_PROBE_BYTES"));
+    assert!(follower.contains("None,"));
     assert!(follower.contains("FeedPayloadProbe::Found(payload)"));
     assert!(follower.contains("FeedPayloadProbe::Deferred(root)"));
-    assert!(follower.contains("retrieve_feed_payload_tail_conservative("));
+    assert!(follower.contains("retrieve_feed_payload_tail("));
     assert!(follower.contains("apply_full_update(id, payload.index, playlist)"));
     assert!(follower.contains("playlist.merge_tail(&tail)"));
+    assert!(follower.contains("MAX_STREAM_FEED_PAYLOAD_BYTES"));
+    assert!(follower.contains("start != HlsStart::Live"));
+    assert!(follower.contains("saturating_sub(appended)"));
+    assert!(
+        follower.find(".filter(|segment| !segment.gap)")
+            < follower.find(".take(HLS_LIVE_SYNC_SEGMENTS)")
+    );
+    assert!(follower.contains("player::warm_startup_reference(&reference, start)"));
     assert!(follower.contains("async_std::task::sleep(FEED_POLL_INTERVAL)"));
+    assert!(!follower.contains("last_progress"));
+    assert!(!follower.contains("offset"));
     assert!(!follower.contains("FuturesUnordered"));
-    assert!(!follower.contains("prefetch"));
+    assert!(!follower.contains("discover_latest_once("));
 }
 
 #[test]
@@ -205,13 +272,35 @@ fn authenticated_tail_growth_requires_a_reference_overlap() {
         "pub(crate) fn merge_tail",
         "pub(crate) fn merge_playlist",
     );
-    assert!(merge.contains("parse_segment_lines(text)"));
+    assert!(merge.contains("parse_segment_lines(text, 0)"));
     assert!(merge.contains(".or_else(||"));
     assert!(merge.contains("self.merge_segments(candidates"));
 
     let segments = section(HLS_CORE, "fn merge_segments(", "pub(crate) fn render(");
-    assert!(segments.contains("rposition(|candidate| &candidate.reference == current_tail)"));
+    assert!(segments.contains("rposition(|candidate| candidate.same_payload(current_tail))"));
+    assert!(segments.contains("checked_sub(candidates[overlap].discontinuity_sequence)"));
+    assert!(segments.contains("candidates[overlap].same_media(current_tail)"));
     assert!(segments.contains("candidates.into_iter().skip(overlap + 1)"));
+}
+
+#[test]
+fn active_feed_treats_snapshot_endlist_as_tentative() {
+    let install = section(
+        HLS_RUNTIME,
+        "fn install_snapshot(",
+        "async fn discover_beginning(",
+    );
+    assert!(install.contains("playlist.keep_growing()"));
+
+    let apply = section(HLS_RUNTIME, "fn apply_update(", "fn apply_full_update(");
+    assert!(apply.contains("playlist.keep_growing()"));
+
+    let follow = section(
+        HLS_RUNTIME,
+        "fn feed_follow_context(",
+        "async fn apply_deferred_update(",
+    );
+    assert!(!follow.contains("finalized"));
 }
 
 #[test]

@@ -227,9 +227,9 @@ fn busy_or_failed_setup_remains_retryable_without_overlap() {
 
 #[test]
 fn readiness_requires_a_controlling_protocol_worker() {
-    assert!(WORKER.contains(r#"const SERVICE_WORKER_MARKER = "forwarder-default24";"#));
+    assert!(WORKER.contains(r#"const SERVICE_WORKER_MARKER = "forwarder-default28";"#));
     assert!(WORKER.contains("const SERVICE_WORKER_PROTOCOL = 10;"));
-    assert!(RUNTIME.contains(r#"const SERVICE_WORKER_MARKER: &str = "forwarder-default24";"#));
+    assert!(RUNTIME.contains(r#"const SERVICE_WORKER_MARKER: &str = "forwarder-default28";"#));
     assert!(RUNTIME.contains("const SERVICE_WORKER_PROTOCOL: f64 = 10.0;"));
     assert!(WORKER.contains("event.waitUntil(self.skipWaiting())"));
     assert!(WORKER.contains("event.waitUntil(self.clients.claim())"));
@@ -327,10 +327,12 @@ fn hls_routes_own_their_stream_windows_and_preserve_http_validators() {
 fn generic_range_stream_keeps_ordered_bounded_lookahead() {
     assert!(WORKER.contains("const STREAM_STORAGE_WINDOW_BYTES = MIB_BYTES / 2;"));
     assert!(WORKER.contains("const STREAM_LOOKAHEAD_CHUNKS = 8;"));
-    assert!(WORKER.contains("const HLS_STREAM_WINDOW_BYTES = MIB_BYTES / 2;"));
-    assert!(WORKER.contains("const HLS_STREAM_LOOKAHEAD_CHUNKS = 8;"));
-    assert!(WORKER.contains("const HLS_LIVE_STREAM_WINDOW_BYTES = 64 * 1024;"));
-    assert!(WORKER.contains("const HLS_LIVE_STREAM_LOOKAHEAD_CHUNKS = 32;"));
+    assert!(WORKER.contains("const HLS_STREAM_WINDOW_BYTES = MIB_BYTES;"));
+    assert!(WORKER.contains("const HLS_STREAM_INITIAL_LOOKAHEAD_CHUNKS = 2;"));
+    assert!(WORKER.contains("const HLS_STREAM_LOOKAHEAD_CHUNKS = 5;"));
+    assert!(WORKER.contains("const HLS_LIVE_STREAM_WINDOW_BYTES = MIB_BYTES;"));
+    assert!(WORKER.contains("const HLS_LIVE_STREAM_LOOKAHEAD_CHUNKS = 5;"));
+    assert!(WORKER.contains("const RANGE_REQUEST_FLIGHTS = new Map();"));
 
     let request = between(
         WORKER,
@@ -339,6 +341,10 @@ fn generic_range_stream_keeps_ordered_bounded_lookahead() {
     );
     assert!(request.contains("range: `bytes=${start}-${end}`"));
     assert!(request.contains("body.byteLength !== expected"));
+    assert!(request.contains("RANGE_REQUEST_FLIGHTS.get(key)"));
+    assert!(request.contains("RANGE_REQUEST_FLIGHTS.set(key, request)"));
+    assert!(request.contains("RANGE_REQUEST_FLIGHTS.get(key) === request"));
+    assert!(request.contains("RANGE_REQUEST_FLIGHTS.delete(key)"));
 
     let stream = between(
         WORKER,
@@ -351,7 +357,11 @@ fn generic_range_stream_keeps_ordered_bounded_lookahead() {
         "const scheduleMore = () => {",
         "const drainScheduledRanges",
     );
-    assert!(scheduler.contains("scheduled.size < lookahead"));
+    assert!(
+        scheduler
+            .contains("position < initialLookahead * windowBytes ? initialLookahead : lookahead")
+    );
+    assert!(scheduler.contains("scheduled.size < limit"));
     assert!(scheduler.contains("admitRange()"));
 
     let pull = between(stream, "async pull(controller) {", "cancel() {");
@@ -379,6 +389,28 @@ fn generic_range_stream_keeps_ordered_bounded_lookahead() {
     assert!(forward.contains(": hlsResource ? HLS_STREAM_WINDOW_BYTES"));
     assert!(forward.contains("? HLS_LIVE_STREAM_LOOKAHEAD_CHUNKS"));
     assert!(forward.contains(": hlsResource ? HLS_STREAM_LOOKAHEAD_CHUNKS"));
+    assert!(forward.contains("? HLS_STREAM_INITIAL_LOOKAHEAD_CHUNKS"));
+    assert!(forward.contains("url.searchParams.get(\"startup\") === \"1\""));
+    assert!(!forward.contains("beginningHlsResource"));
+}
+
+#[test]
+fn hls_stream_admits_bounded_lookahead_before_the_first_window_is_emitted() {
+    let stream = between(
+        WORKER,
+        "function createRustRangeStream(",
+        "async function forwardRequestToRust(",
+    );
+    assert!(!stream.contains("gateFirstWindow"));
+    assert!(
+        stream.contains("position < initialLookahead * windowBytes ? initialLookahead : lookahead")
+    );
+    let pull = between(stream, "async pull(controller) {", "cancel() {");
+    let first_schedule = pull.find("scheduleMore();").unwrap();
+    let awaited = pull.find("await pending").unwrap();
+    let emitted = pull.find("controller.enqueue(body);").unwrap();
+    let refill = pull.rfind("scheduleMore();").unwrap();
+    assert!(first_schedule < awaited && awaited < emitted && emitted < refill);
 }
 
 #[test]

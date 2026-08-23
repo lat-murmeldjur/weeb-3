@@ -314,11 +314,8 @@ mod connection {
                 && address.contains(".libp2p.direct/tcp/")
                 && address.contains("/tls/ws/p2p/")
         }));
-        assert!(profile.contains("pub(crate) const INITIAL_BOOTNODE_COUNT: usize = 160;"));
-        assert!(
-            profile.find("bootnodes.shuffle(&mut rand::thread_rng())")
-                < profile.find("bootnodes.truncate(INITIAL_BOOTNODE_COUNT)")
-        );
+        assert!(profile.contains("bootnodes.shuffle(&mut rand::thread_rng())"));
+        assert!(!profile.contains("bootnodes.truncate("));
 
         let runtime = include_str!("../src/lib.rs");
         let address_filter = include_str!("../src/addresses.rs");
@@ -346,7 +343,8 @@ mod connection {
             .and_then(|source| source.split("let accounting_event_handle = async").next())
             .expect("bootnode dial handler");
 
-        assert!(profile.contains("pub(crate) const INITIAL_BOOTNODE_COUNT: usize = 160;"));
+        assert!(profile.contains("bootnodes.shuffle(&mut rand::thread_rng())"));
+        assert!(!profile.contains("bootnodes.truncate("));
         assert!(accounting.contains("pub(crate) const CONNECTION_BUILDUP_LIMIT: u64 = 200;"));
         assert!(handler.contains("let mut bootnode_changes = vec![first_change];"));
         assert!(handler.contains("while let Ok(change) = self.bootnode_port.1.try_recv()"));
@@ -381,58 +379,44 @@ mod connection {
     }
 
     #[test]
-    fn bee_handshake_waits_for_the_exact_identify_push() {
+    fn bee_handshake_starts_after_queueing_one_canonical_observed_address() {
         let runtime = include_str!("../src/lib.rs");
         let received = runtime
             .split("identify::Event::Received {")
             .nth(1)
-            .and_then(|source| source.split("identify::Event::Pushed {").next())
-            .expect("identify receive lifecycle");
-        assert!(received.contains("pending_identify_addresses"));
-        assert!(received.contains("identify_push_capacity.acquire_arc().await"));
-        assert!(received.contains("info.observed_addr.clone()"));
-        assert!(received.contains("swarm.add_external_address(info.observed_addr)"));
-        assert!(received.contains(".identify\n                                        .push("));
-        assert!(!received.contains("mark_handshake_ready_connection("));
-
-        let pushed = runtime
-            .split("identify::Event::Pushed {")
-            .nth(1)
             .and_then(|source| source.split("identify::Event::Error {").next())
-            .expect("identify push lifecycle");
-        let ready = pushed
+            .expect("identify receive lifecycle");
+        assert!(received.contains("canonical_identify_address"));
+        assert!(received.contains("canonical.is_none()"));
+        assert!(received.contains("info.observed_addr.clone()"));
+        assert!(received.contains("try_from_multiaddr(&info.observed_addr)"));
+        assert!(received.contains(".is_some_and(|peer| peer != identify_local_peer_id)"));
+        assert!(received.contains("swarm.add_external_address(canonical)"));
+        assert!(received.contains(".identify\n                                        .push("));
+        let push = received
+            .find(".identify\n                                        .push(")
+            .expect("Identify push");
+        let ready = received
             .find("mark_handshake_ready_connection(")
             .expect("Bee handshake readiness");
-        let cleanup = pushed
-            .find("spawn_local(async move")
-            .expect("asynchronous transient address cleanup");
-        assert!(ready < cleanup);
-        assert!(pushed.contains("Some(&info.listen_addrs)"));
-        assert!(pushed.contains("remove_unreferenced_identify_address("));
-        assert!(runtime.contains("const IDENTIFY_PUSH_CONCURRENCY: usize = 32;"));
-        assert!(runtime.contains("const IDENTIFY_PUSH_TIMEOUT_MS: u64 = 5_000;"));
-        assert!(received.contains("IDENTIFY_PUSH_TIMEOUT_MS"));
-        assert!(received.contains("remove_pending_identify_address("));
-        assert!(received.contains(".close_connection(connection_id)"));
+        assert!(push < ready);
+        assert!(!runtime.contains("IDENTIFY_PUSH_CONCURRENCY"));
+        assert!(!runtime.contains("identify_push_capacity"));
+        assert!(!runtime.contains("IDENTIFY_PUSH_TIMEOUT_MS"));
+        assert!(!runtime.contains("pending_identify_push"));
+        assert!(!runtime.contains("identify::Event::Pushed {"));
         assert!(runtime.contains("SwarmEvent::Behaviour(BehaviourEvent::Identify(_))"));
-        let safe_cleanup = runtime
-            .split("async fn remove_unreferenced_identify_address(")
-            .nth(1)
-            .and_then(|source| {
-                source
-                    .split("async fn close_failed_identify_connection(")
-                    .next()
-            })
-            .expect("reference-safe external address cleanup");
-        assert!(
-            safe_cleanup.find("let mut swarm = swarm.lock().await;")
-                < safe_cleanup.find("pending_identify_addresses")
+        assert_eq!(
+            runtime
+                .matches("swarm.add_external_address(canonical)")
+                .count(),
+            1
         );
-        assert!(safe_cleanup.contains("if !referenced"));
-        assert!(safe_cleanup.contains("swarm.remove_external_address(address)"));
+        assert!(runtime.contains("canonical_identify_address"));
+        assert!(runtime.contains("swarm.remove_external_address(&address)"));
 
         let empty_observed = received
-            .split("if info.observed_addr.is_empty() {")
+            .split("if info.observed_addr.is_empty()")
             .nth(1)
             .expect("empty Identify observation handling");
         assert!(empty_observed.contains("close_failed_identify_connection("));
@@ -1186,66 +1170,32 @@ mod retrieve_group_stream {
     }
 
     #[test]
-    fn conservative_ranges_are_serial_direct_and_bounded() {
-        let policies = source_section(
-            "struct DataRangeTraversalPolicy",
-            "struct RetrieveAttemptResult",
-        );
-        assert!(policies.contains("group_concurrency: RETRIEVE_DATA_GROUP_CONCURRENCY"));
-        assert!(policies.contains("erasure_recovery: true"));
-        assert!(policies.contains("maximum_requested_children: usize::MAX"));
-        assert!(policies.contains("group_concurrency: 1"));
-        assert!(policies.contains("erasure_recovery: false"));
-        assert!(policies.contains("maximum_requested_children: CONSERVATIVE_RANGE_MAX_CHILDREN"));
-        assert!(
-            RETRIEVAL_SOURCE
-                .contains("CONSERVATIVE_RANGE_MAX_CHILDREN * RETRIEVE_CHUNK_MAX_ATTEMPT_ERRORS")
-        );
-
+    fn range_traversal_has_one_generic_recovery_policy() {
         let group = source_section(
             "async fn fetch_data_group_indices_streaming(",
             "#[derive(Clone)]\nstruct TraversalNode",
         );
-        assert!(group.contains("requested_indices.len() > policy.maximum_requested_children"));
-        assert!(group.contains("recovery_dispatched && policy.erasure_recovery"));
-        assert!(group.contains("|| !policy.erasure_recovery"));
+        assert!(!group.contains("DataRangeTraversalPolicy"));
+        assert!(!group.contains("maximum_requested_children"));
         assert!(group.contains("let waiter_admission = RetrieveAdmission::new();"));
-        assert!(group.contains("shared_physical_admission"));
 
         let raw_flights =
             source_section("struct RawFetchKey", "#[inline]\nfn decryption_segment_key");
-        assert!(raw_flights.contains("conservative_scope: Option<u64>"));
-        assert!(raw_flights.contains("shared_physical_admission"));
         assert!(raw_flights.contains("admission.clone()"));
-        assert!(raw_flights.contains("key.conservative_scope.is_none()"));
-
-        let conservative = source_section(
-            "pub(crate) async fn retrieve_data_range_from_root_conservative(",
-            "pub(crate) async fn retrieve_data_range_from_root_cancellable(",
-        );
-        assert!(conservative.contains("requested_len > CONSERVATIVE_RANGE_BYTES"));
-        assert!(conservative.contains("CONSERVATIVE_DATA_RANGE_TRAVERSAL"));
 
         let traversal = source_section(
             "async fn retrieve_data_range_from_root_with_prefix_cancellable(",
             "async fn retrieve_data_joined(",
         );
-        assert!(traversal.contains("RetrieveAdmission::new_with_attempt_limit("));
-        assert!(traversal.contains("CONSERVATIVE_RANGE_MAX_PHYSICAL_ATTEMPTS"));
-        assert!(traversal.contains("admission.close_on_drop()"));
-        assert!(traversal.contains("group_shared_physical_admission"));
-
-        let ordinary = source_section(
-            "pub(crate) async fn retrieve_data_range_from_root_cancellable(",
-            "async fn retrieve_data_range_from_root_with_prefix_cancellable(",
+        assert!(traversal.contains("groups.len() < RETRIEVE_DATA_GROUP_CONCURRENCY"));
+        assert!(!traversal.contains("shared_physical_admission"));
+        assert!(
+            !RETRIEVAL_SOURCE
+                .to_ascii_lowercase()
+                .contains("conservative")
         );
-        assert!(ordinary.contains("ORDINARY_DATA_RANGE_TRAVERSAL"));
         assert!(RETRIEVAL_SOURCE.contains("const RETRIEVE_ATTEMPT_TIMEOUT_MS: u64 = 10_000;"));
         assert!(RETRIEVAL_SOURCE.contains("const RETRIEVE_CHUNK_MAX_ATTEMPT_ERRORS: usize = 20;"));
-        assert!(
-            RETRIEVAL_SOURCE
-                .contains("pub(crate) const CONSERVATIVE_RANGE_MAX_PHYSICAL_ATTEMPTS: u64")
-        );
     }
 }
 
@@ -1286,7 +1236,7 @@ mod rolling_erasure_tail {
     }
 
     #[test]
-    fn partial_and_conservative_groups_never_pay_for_a_raw_basis_scan() {
+    fn partial_groups_never_pay_for_a_raw_basis_scan() {
         assert!(rolling_full_group_static_candidate(true, 119, 119, 9));
         assert!(!rolling_full_group_static_candidate(true, 118, 119, 9));
         assert!(!rolling_full_group_static_candidate(false, 119, 119, 9));
@@ -1297,7 +1247,7 @@ mod rolling_erasure_tail {
             .find("if static_rolling_candidate {")
             .expect("static candidate branch");
         let legacy = group[candidate..]
-            .find("} else {\n        // Preserve the legacy fast path")
+            .find("} else {\n        // Partial groups inspect")
             .map(|offset| candidate + offset)
             .expect("legacy fast path");
         assert!(group[candidate..legacy].contains("requested_shard_cache("));
@@ -1439,7 +1389,7 @@ mod rolling_erasure_tail {
         let group = group_source();
         let rolling_start = group.find("if rolling {").expect("rolling branch");
         let legacy_start = group[rolling_start..]
-            .find("} else if recovery_dispatched && policy.erasure_recovery {")
+            .find("} else if recovery_dispatched {")
             .map(|offset| rolling_start + offset)
             .expect("legacy branch");
         let rolling_branch = &group[rolling_start..legacy_start];

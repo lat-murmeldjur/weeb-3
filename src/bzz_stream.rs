@@ -8,9 +8,8 @@ use crate::{
     },
     retrieval::{
         DecodedJoinChunk, retrieve_data, retrieve_data_range_from_root,
-        retrieve_data_range_from_root_cancellable, retrieve_data_range_from_root_conservative,
-        retrieve_decoded_data_root, retrieve_decoded_data_root_cancellable,
-        seek_latest_feed_update,
+        retrieve_data_range_from_root_cancellable, retrieve_decoded_data_root,
+        retrieve_decoded_data_root_cancellable, seek_latest_feed_update,
     },
     retrieve_cancel_token_current,
 };
@@ -291,14 +290,14 @@ pub(crate) async fn retrieve_feed_payload(
     (u64::try_from(bytes.len()).ok()? == span).then_some(bytes)
 }
 
-pub(crate) async fn retrieve_feed_payload_tail_conservative(
+pub(crate) async fn retrieve_feed_payload_tail(
     payload: &FeedPayloadRoot,
     maximum_tail_bytes: usize,
     chunk_retrieve_chan: &ChunkRetrieveSender,
 ) -> Option<Vec<u8>> {
     let maximum_tail_bytes = u64::try_from(maximum_tail_bytes)
         .ok()?
-        .min(crate::retrieval::CONSERVATIVE_RANGE_BYTES);
+        .min(CHUNK_SIZE as u64);
     let span = payload.root.span;
     if span == 0 || maximum_tail_bytes == 0 {
         return None;
@@ -306,7 +305,7 @@ pub(crate) async fn retrieve_feed_payload_tail_conservative(
     let start = span.saturating_sub(maximum_tail_bytes);
     let end_inclusive = span.checked_sub(1)?;
     let expected_len = end_inclusive.checked_sub(start)?.checked_add(1)?;
-    let tail = retrieve_data_range_from_root_conservative(
+    let tail = retrieve_data_range_from_root(
         payload.root.clone(),
         start,
         end_inclusive,
