@@ -1,10 +1,11 @@
-use std::collections::{BTreeMap, BTreeSet};
-
 const INTERFACE: &str = include_str!("../src/interface.rs");
+const LIBRARY: &str = include_str!("../src/library.rs");
 const RUNTIME: &str = include_str!("../src/interface_runtime_conventions.rs");
 const SERVER: &str = include_str!("../src/main.rs");
 const WORKER: &str = include_str!("../static/service.js");
 const BUILD: &str = include_str!("../build.rs");
+const NPM_WORKFLOW: &str = include_str!("../.github/workflows/plain.yml");
+const NPM_README: &str = include_str!("../README.npm.md");
 
 fn between<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
     source
@@ -12,269 +13,6 @@ fn between<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
         .and_then(|(_, tail)| tail.split_once(end))
         .map(|(body, _)| body)
         .unwrap_or_else(|| panic!("missing source section between {start:?} and {end:?}"))
-}
-
-const MODEL_ACTIVE_LIMIT: usize = 4;
-const MODEL_READY_ADMISSION_THRESHOLD: usize = MODEL_ACTIVE_LIMIT - 1;
-const MODEL_OUTSTANDING_LIMIT: usize = MODEL_ACTIVE_LIMIT + MODEL_READY_ADMISSION_THRESHOLD - 1;
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ModelResponse {
-    Ready,
-    Failed,
-}
-
-#[derive(Debug)]
-struct OrderedFlightModel {
-    total_windows: usize,
-    managed_prefix_windows: usize,
-    emitted_windows: usize,
-    next_window: usize,
-    admission_open: bool,
-    lookahead_admitted: bool,
-    known_failure: bool,
-    active: BTreeSet<usize>,
-    retained: BTreeMap<usize, ModelResponse>,
-    dispatched: Vec<usize>,
-}
-
-impl OrderedFlightModel {
-    fn staged(total_windows: usize, managed_prefix_windows: usize) -> Self {
-        Self {
-            total_windows,
-            managed_prefix_windows: managed_prefix_windows.min(total_windows),
-            emitted_windows: 0,
-            next_window: 0,
-            admission_open: true,
-            lookahead_admitted: false,
-            known_failure: false,
-            active: BTreeSet::new(),
-            retained: BTreeMap::new(),
-            dispatched: Vec::new(),
-        }
-    }
-
-    fn admit_first_window(&mut self) {
-        assert!(!self.lookahead_admitted);
-        assert_eq!(self.next_window, 0);
-        self.admit_one();
-    }
-
-    fn admit_one(&mut self) {
-        assert!(self.admission_open);
-        assert!(self.next_window < self.total_windows);
-        assert!(self.active.len() < MODEL_ACTIVE_LIMIT);
-        assert!(self.active.len() + self.retained.len() < MODEL_OUTSTANDING_LIMIT);
-        let window = self.next_window;
-        self.next_window += 1;
-        assert!(self.active.insert(window));
-        self.dispatched.push(window);
-        self.assert_bounds();
-    }
-
-    fn schedule_more(&mut self) {
-        if !self.admission_open || !self.lookahead_admitted || self.known_failure {
-            return;
-        }
-        if self.emitted_windows < self.managed_prefix_windows {
-            if self.next_window < self.total_windows && self.active.len() + self.retained.len() < 1
-            {
-                self.admit_one();
-            }
-            return;
-        }
-        while self.next_window < self.total_windows
-            && self.active.len() < MODEL_ACTIVE_LIMIT
-            && self.retained.len() < MODEL_READY_ADMISSION_THRESHOLD
-            && self.active.len() + self.retained.len() < MODEL_OUTSTANDING_LIMIT
-        {
-            self.admit_one();
-        }
-    }
-
-    fn settle_success(&mut self, window: usize) {
-        assert!(self.active.remove(&window));
-        assert_eq!(self.retained.insert(window, ModelResponse::Ready), None);
-        if self.emitted_windows >= self.managed_prefix_windows {
-            self.schedule_more();
-        }
-        self.assert_bounds();
-    }
-
-    fn settle_failure(&mut self, window: usize) {
-        assert!(self.active.remove(&window));
-        assert_eq!(self.retained.insert(window, ModelResponse::Failed), None);
-        self.known_failure = true;
-        self.assert_bounds();
-    }
-
-    fn emit_next(&mut self) -> Option<usize> {
-        if self.retained.get(&self.emitted_windows) != Some(&ModelResponse::Ready) {
-            return None;
-        }
-
-        let emitted = self.emitted_windows;
-        self.retained.remove(&emitted);
-        self.emitted_windows += 1;
-        self.lookahead_admitted = true;
-        self.schedule_more();
-        self.assert_bounds();
-        Some(emitted)
-    }
-
-    fn close_and_drain_active_snapshot(&mut self) -> Vec<usize> {
-        self.admission_open = false;
-        self.lookahead_admitted = false;
-        self.active.iter().copied().collect()
-    }
-
-    fn retained_windows(&self) -> Vec<usize> {
-        self.retained.keys().copied().collect()
-    }
-
-    fn active_windows(&self) -> Vec<usize> {
-        self.active.iter().copied().collect()
-    }
-
-    fn assert_bounds(&self) {
-        assert!(self.active.len() <= MODEL_ACTIVE_LIMIT);
-        assert!(self.active.len() + self.retained.len() <= MODEL_OUTSTANDING_LIMIT);
-    }
-}
-
-#[test]
-fn ordered_flight_model_refills_successes_until_three_ready_results_gate_admission() {
-    let mut model = OrderedFlightModel::staged(20, 1);
-    model.admit_first_window();
-    model.settle_success(0);
-    assert_eq!(
-        model.next_window, 1,
-        "the first window remains exclusive until emitted"
-    );
-    assert_eq!(model.emit_next(), Some(0));
-    assert_eq!(model.active_windows(), vec![1, 2, 3, 4]);
-
-    for settled in [4, 3] {
-        let next_before = model.next_window;
-        model.settle_success(settled);
-        assert_eq!(model.next_window, next_before + 1);
-        assert_eq!(model.active.len(), MODEL_ACTIVE_LIMIT);
-        assert_eq!(
-            model.emit_next(),
-            None,
-            "window 1 still gates ordered output"
-        );
-    }
-
-    model.settle_success(2);
-    assert_eq!(model.next_window, 7, "three ready responses stop refill");
-    assert_eq!(model.active_windows(), vec![1, 5, 6]);
-    assert_eq!(model.retained_windows(), vec![2, 3, 4]);
-    assert_eq!(model.retained.len(), MODEL_READY_ADMISSION_THRESHOLD);
-    assert_eq!(
-        model.active.len() + model.retained.len(),
-        MODEL_OUTSTANDING_LIMIT
-    );
-    assert_eq!(
-        model.emit_next(),
-        None,
-        "window 1 still gates ordered output"
-    );
-
-    model.settle_success(5);
-    assert_eq!(
-        model.next_window, 7,
-        "already-active settlement does not refill"
-    );
-    assert_eq!(
-        model.retained.len(),
-        4,
-        "ready results may grow after admission stops"
-    );
-    assert_eq!(
-        model.active.len() + model.retained.len(),
-        MODEL_OUTSTANDING_LIMIT
-    );
-
-    model.settle_success(1);
-    assert_eq!(model.emit_next(), Some(1));
-    assert_eq!(
-        model.next_window, 7,
-        "four retained results still gate refill"
-    );
-    assert_eq!(model.emit_next(), Some(2));
-    assert_eq!(
-        model.next_window, 7,
-        "three retained results still gate refill"
-    );
-    assert_eq!(model.emit_next(), Some(3));
-    assert_eq!(
-        model.next_window, 10,
-        "consumption below three refills active pressure"
-    );
-    assert_eq!(model.active.len(), MODEL_ACTIVE_LIMIT);
-    assert_eq!(model.emit_next(), Some(4));
-    assert_eq!(model.emit_next(), Some(5));
-}
-
-#[test]
-fn ordered_flight_model_keeps_every_managed_prefix_window_serial() {
-    let mut model = OrderedFlightModel::staged(12, 5);
-    model.admit_first_window();
-    for window in 0..5 {
-        assert_eq!(model.active_windows(), vec![window]);
-        assert!(model.retained.is_empty());
-        model.settle_success(window);
-        assert!(model.active.is_empty());
-        assert_eq!(model.retained_windows(), vec![window]);
-        assert_eq!(
-            model.next_window,
-            window + 1,
-            "settlement alone must not admit the next prefix range"
-        );
-        assert_eq!(model.emit_next(), Some(window));
-        if window < 4 {
-            assert_eq!(model.active_windows(), vec![window + 1]);
-        }
-    }
-    assert_eq!(model.active_windows(), vec![5, 6, 7, 8]);
-}
-
-#[test]
-fn ordered_flight_model_latches_an_out_of_order_failure_against_later_refills() {
-    let mut model = OrderedFlightModel::staged(20, 1);
-    model.admit_first_window();
-    model.settle_success(0);
-    assert_eq!(model.emit_next(), Some(0));
-    model.settle_failure(4);
-    let next_at_failure = model.next_window;
-    model.settle_success(3);
-    assert_eq!(model.next_window, next_at_failure);
-    assert!(model.known_failure);
-    assert_eq!(
-        model.emit_next(),
-        None,
-        "ordered output still waits for window 1"
-    );
-}
-
-#[test]
-fn ordered_flight_model_closes_admission_before_snapshotting_active_dispatches() {
-    let mut model = OrderedFlightModel::staged(20, 1);
-    model.admit_first_window();
-    model.settle_success(0);
-    assert_eq!(model.emit_next(), Some(0));
-    model.settle_success(4);
-    let active_at_close = model.close_and_drain_active_snapshot();
-    let next_at_close = model.next_window;
-
-    model.settle_success(5);
-    assert_eq!(
-        model.next_window, next_at_close,
-        "settlement cannot refill after close"
-    );
-    assert_eq!(active_at_close, vec![1, 2, 3, 5]);
-    assert_eq!(model.retained_windows(), vec![4, 5]);
 }
 
 #[test]
@@ -392,7 +130,55 @@ fn bfcache_restore_requests_one_full_reload_and_normal_pageshow_does_not() {
 }
 
 #[test]
-fn playback_readiness_never_waits_behind_worker_setup() {
+fn cold_interface_and_npm_paths_install_the_bridge_before_worker_setup() {
+    let interface_mount = between(
+        INTERFACE,
+        "pub(crate) async fn mount_interface(",
+        "pub(crate) async fn mount_interface_after_service_worker_bridge_install(",
+    );
+    assert!(
+        interface_mount
+            .find("install_service_worker_message_bridge(weeb3.clone())")
+            .unwrap()
+            < interface_mount
+                .find("mount_interface_after_service_worker_bridge_install(")
+                .unwrap()
+    );
+
+    let npm_start = between(
+        LIBRARY,
+        "fn schedule_start(&self, options: StartOptions)",
+        "async fn boot_runtime(&self)",
+    );
+    assert!(
+        npm_start
+            .find("install_service_worker_message_bridge(self.inner.clone())")
+            .unwrap()
+            < npm_start.find("get_service_worker().await").unwrap()
+    );
+
+    let npm_attach = between(
+        LIBRARY,
+        "pub async fn attach_stream(",
+        "#[wasm_bindgen(js_name = networkState)]",
+    );
+    assert!(
+        npm_attach.find("self.boot_runtime().await").unwrap()
+            < npm_attach
+                .find("crate::stream_hls::attach_hls_feed_player(")
+                .unwrap()
+    );
+}
+
+#[test]
+fn npm_release_contains_the_worker_required_by_the_runtime_protocol() {
+    assert!(NPM_WORKFLOW.contains("files[5]=\"service.js\""));
+    assert!(NPM_WORKFLOW.contains("static/service.js"));
+    assert!(NPM_README.contains("serve the packaged worker at `/weeb-3/service.js`"));
+}
+
+#[test]
+fn playback_readiness_updates_before_accepting_a_controller() {
     let nonblocking_setup = between(
         RUNTIME,
         "fn start_service_worker_setup_if_idle()",
@@ -411,7 +197,13 @@ fn playback_readiness_never_waits_behind_worker_setup() {
         "pub(crate) async fn service_worker_controls_bzz_requests(",
     );
     assert!(readiness.contains("start_service_worker_setup_if_idle()"));
-    assert!(!readiness.contains("get_service_worker().await"));
+    let setup = readiness
+        .find("let _ = get_service_worker().await")
+        .unwrap();
+    let ready = readiness
+        .find("if service_worker_forwarder_ready().await")
+        .unwrap();
+    assert!(setup < ready);
     assert!(readiness.contains("controlled_service_worker().is_none()"));
     assert!(readiness.contains("service_worker_forwarder_ready_with_timeout(500).await"));
     assert!(!readiness.contains("MAX_FOLLOWUP_PROBES"));
@@ -424,7 +216,9 @@ fn busy_or_failed_setup_remains_retryable_without_overlap() {
         "async fn wait_for_service_worker_control(",
         "pub(crate) async fn service_worker_controls_bzz_requests(",
     );
-    assert!(readiness.contains("let mut next_setup_retry_ms: f64 = 0.0;"));
+    assert!(readiness.contains(
+        "let mut next_setup_retry_ms = js_sys::Date::now() + SERVICE_WORKER_SETUP_RETRY_MS;"
+    ));
     assert!(readiness.contains("&& start_service_worker_setup_if_idle()"));
     assert!(readiness.contains("next_setup_retry_ms = now + SERVICE_WORKER_SETUP_RETRY_MS;"));
     assert!(readiness.contains("now >= next_setup_retry_ms"));
@@ -433,12 +227,20 @@ fn busy_or_failed_setup_remains_retryable_without_overlap() {
 
 #[test]
 fn readiness_requires_a_controlling_protocol_worker() {
-    assert!(WORKER.contains("const SERVICE_WORKER_PROTOCOL = 8;"));
-    assert!(RUNTIME.contains("const SERVICE_WORKER_PROTOCOL: f64 = 8.0;"));
+    assert!(WORKER.contains(r#"const SERVICE_WORKER_MARKER = "forwarder-default24";"#));
+    assert!(WORKER.contains("const SERVICE_WORKER_PROTOCOL = 10;"));
+    assert!(RUNTIME.contains(r#"const SERVICE_WORKER_MARKER: &str = "forwarder-default24";"#));
+    assert!(RUNTIME.contains("const SERVICE_WORKER_PROTOCOL: f64 = 10.0;"));
     assert!(WORKER.contains("event.waitUntil(self.skipWaiting())"));
     assert!(WORKER.contains("event.waitUntil(self.clients.claim())"));
     assert!(WORKER.contains("type: \"WEEB3_PONG\""));
     assert!(WORKER.contains("protocol: SERVICE_WORKER_PROTOCOL"));
+    assert_eq!(WORKER.matches("marker: SERVICE_WORKER_MARKER").count(), 2);
+    assert!(RUNTIME.contains("JsValue::from_str(\"protocol\")"));
+    assert!(RUNTIME.contains("JsValue::from_str(\"marker\")"));
+    assert!(RUNTIME.contains("marker == expected_marker"));
+    assert!(WORKER.contains("event.data?.protocol !== SERVICE_WORKER_PROTOCOL"));
+    assert!(!WORKER.contains("source.navigate("));
     assert!(WORKER.contains("scope: SCOPE_PATH"));
 
     let readiness = between(
@@ -452,224 +254,135 @@ fn readiness_requires_a_controlling_protocol_worker() {
 }
 
 #[test]
-fn staged_range_stream_separates_active_requests_from_settled_ordered_responses() {
-    let stream = between(
+fn hls_routes_own_their_stream_windows_and_preserve_http_validators() {
+    let route_constants = between(
         WORKER,
-        "function createRustRangeStream(",
-        "async function forwardRequestToRust(",
+        "const NETWORK_ROUTE_PREFIXES",
+        "const FETCH_TIMEOUT_MS",
     );
-    assert!(WORKER.contains("const HLS_STREAM_LOOKAHEAD_CHUNKS = 4;"));
-    assert!(
-        stream.contains(
-            "const HLS_STREAM_READY_ADMISSION_THRESHOLD = HLS_STREAM_LOOKAHEAD_CHUNKS - 1;"
-        ) || WORKER.contains(
-            "const HLS_STREAM_READY_ADMISSION_THRESHOLD = HLS_STREAM_LOOKAHEAD_CHUNKS - 1;"
-        )
-    );
-    assert!(
-        WORKER.contains("HLS_STREAM_LOOKAHEAD_CHUNKS + HLS_STREAM_READY_ADMISSION_THRESHOLD - 1;")
-    );
-    assert!(stream.contains("const activeRequests = new Map();"));
-    assert!(stream.contains("const retainedResponses = new Map();"));
+    assert!(route_constants.contains("[\"\", \"mainnet/\", \"testnet/\"]"));
+    assert!(route_constants.contains("[\"hls/bytes\", \"hls-bytes\"]"));
 
-    let admission = between(
-        stream,
-        "const admitStagedRange = () => {",
-        "const scheduleMore = () => {",
-    );
-    let settled = admission
-        .find("activeRequests.delete(start);")
-        .expect("settlement must release active request pressure");
-    let retained = admission
-        .find("retainedResponses.set(start, result);")
-        .expect("settled result must remain available for ordered output");
-    let successful = admission
-        .find("schedulingAdmissionOpen && position >= managedPrefixEnd")
-        .expect("settlement refill starts only beyond the managed prefix");
-    let refill = admission
-        .find("scheduleMore();")
-        .expect("successful settlement must replenish immediately");
-    assert!(settled < retained && retained < successful && successful < refill);
-    assert!(admission.contains("activeRequests.set(start, request);"));
-    assert!(admission.matches("knownRangeFailure = true;").count() >= 2);
-
-    let scheduler = between(
-        stream,
-        "const scheduleMore = () => {",
-        "const drainScheduledRanges",
-    );
-    assert!(
-        scheduler.contains("!schedulingAdmissionOpen || !lookaheadAdmitted || knownRangeFailure")
-    );
-    assert!(scheduler.contains("activeRequests.size < HLS_STREAM_LOOKAHEAD_CHUNKS"));
-    assert!(scheduler.contains("retainedResponses.size < HLS_STREAM_READY_ADMISSION_THRESHOLD"));
-    assert!(
-        scheduler
-            .contains("activeRequests.size + retainedResponses.size < HLS_STREAM_MAX_OUTSTANDING")
-    );
-
-    let pull = between(stream, "async pull(controller) {", "cancel() {");
-    let staged_gate = pull
-        .find("if (lookaheadAdmitted) {")
-        .expect("ordinary streams retain immediate bounded lookahead");
-    let foreground = pull
-        .find("const foreground = admitStagedRange();")
-        .expect("first foreground range admission");
-    let awaited = pull
-        .find("result = await request;")
-        .expect("foreground range completion");
-    let lookahead = pull
-        .find("lookaheadAdmitted = true;")
-        .expect("lookahead admission after foreground completion");
-    let schedule = pull
-        .rfind("scheduleMore();")
-        .expect("bounded speculative scheduling");
-    assert!(
-        staged_gate < foreground
-            && foreground < awaited
-            && awaited < lookahead
-            && lookahead < schedule
-    );
-    assert!(pull[staged_gate..foreground].contains("scheduleMore();"));
-    let ordered_lookup = pull
-        .find("retainedResponses.get(start)")
-        .expect("output must await the exact next range");
-    let ordered_delete = pull
-        .find("retainedResponses.delete(start)")
-        .expect("only the exact next settled result is consumed");
-    let ordered_enqueue = pull
-        .find("controller.enqueue(body);")
-        .expect("ordered response emission");
-    assert!(
-        ordered_lookup < awaited && awaited < ordered_delete && ordered_delete < ordered_enqueue
-    );
-}
-
-#[test]
-fn managed_hls_prefix_keeps_every_critical_window_strictly_serial() {
-    let parser = between(
+    let fetch_routes = between(
         WORKER,
-        "function parseCriticalPrefixWindows(",
-        "function createRustRangeStream(",
+        "self.addEventListener(\"fetch\"",
+        "function clientInScope(",
     );
-    assert!(parser.contains("/^[1-9][0-9]*$/"));
-    assert!(parser.contains("Number.isSafeInteger(size)"));
-    assert!(parser.contains("Math.ceil(size / STREAM_STORAGE_WINDOW_BYTES)"));
-    assert!(parser.contains("Math.min(requested, total)"));
-
-    let stream = between(
-        WORKER,
-        "function createRustRangeStream(",
-        "async function forwardRequestToRust(",
-    );
-    assert!(stream.contains("criticalPrefixWindows = null"));
-    assert!(stream.contains("const managedPrefixEnd = stagedStart"));
+    assert!(fetch_routes.contains("canonicalRawResource(url)"));
+    assert!(fetch_routes.contains("canonicalFeedResource(url)"));
     assert!(
-        stream.contains("const HLS_STREAM_LOOKAHEAD_CHUNKS = 4;")
-            || WORKER.contains("const HLS_STREAM_LOOKAHEAD_CHUNKS = 4;")
+        fetch_routes
+            .matches("request.method === \"GET\" || request.method === \"HEAD\"")
+            .count()
+            >= 3
     );
 
-    let scheduler = between(
-        stream,
-        "const scheduleMore = () => {",
-        "const drainScheduledRanges",
+    let request = between(
+        WORKER,
+        "function requestRustFetch(",
+        "function toUint8Array(",
     );
-    let prefix = between(scheduler, "if (position < managedPrefixEnd) {", "while (");
-    assert!(prefix.contains("activeRequests.size + retainedResponses.size < 1"));
-    assert!(prefix.contains("admitStagedRange();"));
-    assert!(prefix.contains("return;"));
-
-    let admission = between(
-        stream,
-        "const admitStagedRange = () => {",
-        "const scheduleMore = () => {",
-    );
-    assert!(admission.contains("position >= managedPrefixEnd"));
-    let pull = between(stream, "async pull(controller) {", "cancel() {");
-    let position = pull.find("position = start + body.byteLength;").unwrap();
-    let emitted = pull.find("controller.enqueue(body);").unwrap();
-    let refill = pull.rfind("scheduleMore();").unwrap();
-    assert!(position < emitted && emitted < refill);
+    for field in [
+        "type: \"WEEB3_FETCH_REQUEST\"",
+        "method",
+        "range",
+        "networkId",
+        "ifNoneMatch",
+        "ifRange",
+    ] {
+        assert!(request.contains(field), "missing request field {field}");
+    }
 
     let forward = between(
         WORKER,
         "async function forwardRequestToRust(",
         "function parseUploadRedundancyHeader(",
     );
-    assert!(forward.contains("const criticalPrefixWindows = stagedStart"));
-    assert!(forward.contains("headers.get(\"X-Weeb3-HLS-Critical-Prefix-Windows\")"));
-    assert!(forward.contains("criticalPrefixWindows"));
+    assert!(!forward.contains("if (hlsResource && response.stream)"));
+    assert!(forward.contains("if (response.stream && request.method !== \"HEAD\")"));
+    assert!(forward.contains("hlsResource ? \"\" : request.headers.get(\"Range\")"));
+    assert!(forward.contains("request.headers.get(\"If-None-Match\")"));
+    assert!(forward.contains("hlsResource ? \"\" : request.headers.get(\"If-Range\")"));
+    assert!(forward.contains("request.method === \"HEAD\" || status === 304"));
+    assert!(forward.contains("const headers = responseHeaders(response.headers);"));
+
+    for removed in [
+        "HLS_STREAM_READY_ADMISSION_THRESHOLD",
+        "HLS_STREAM_MAX_OUTSTANDING",
+        "HLS_REQUEST_FLIGHTS",
+        "parseCriticalPrefixWindows",
+        "streamToken",
+        "X-Weeb3-Stream-Start",
+        "X-Weeb3-Stream-Token",
+        "X-Weeb3-HLS-Critical-Prefix-Windows",
+    ] {
+        assert!(
+            !WORKER.contains(removed),
+            "obsolete HLS protocol remains: {removed}"
+        );
+    }
 }
 
 #[test]
-fn ordinary_range_streams_keep_their_immediate_bounded_lookahead() {
+fn generic_range_stream_keeps_ordered_bounded_lookahead() {
+    assert!(WORKER.contains("const STREAM_STORAGE_WINDOW_BYTES = MIB_BYTES / 2;"));
+    assert!(WORKER.contains("const STREAM_LOOKAHEAD_CHUNKS = 8;"));
+    assert!(WORKER.contains("const HLS_STREAM_WINDOW_BYTES = MIB_BYTES / 2;"));
+    assert!(WORKER.contains("const HLS_STREAM_LOOKAHEAD_CHUNKS = 8;"));
+    assert!(WORKER.contains("const HLS_LIVE_STREAM_WINDOW_BYTES = 64 * 1024;"));
+    assert!(WORKER.contains("const HLS_LIVE_STREAM_LOOKAHEAD_CHUNKS = 32;"));
+
+    let request = between(
+        WORKER,
+        "function requestRustRange(",
+        "function createRustRangeStream(",
+    );
+    assert!(request.contains("range: `bytes=${start}-${end}`"));
+    assert!(request.contains("body.byteLength !== expected"));
+
     let stream = between(
         WORKER,
         "function createRustRangeStream(",
         "async function forwardRequestToRust(",
     );
-    assert!(WORKER.contains("const STREAM_LOOKAHEAD_CHUNKS = 8;"));
-    assert!(stream.contains(
-        "const lookahead = stagedStart ? HLS_STREAM_LOOKAHEAD_CHUNKS : STREAM_LOOKAHEAD_CHUNKS;"
-    ));
-    assert!(stream.contains("let lookaheadAdmitted = !stagedStart;"));
     assert!(stream.contains("const scheduled = new Map();"));
     let scheduler = between(
         stream,
         "const scheduleMore = () => {",
         "const drainScheduledRanges",
     );
-    let ordinary = between(
-        scheduler,
-        "if (!stagedStart) {",
-        "if (position < managedPrefixEnd) {",
-    );
-    assert!(ordinary.contains("scheduled.size < lookahead"));
-    assert!(ordinary.contains("admitOrdinaryRange()"));
-    assert!(ordinary.contains("return;"));
+    assert!(scheduler.contains("scheduled.size < lookahead"));
+    assert!(scheduler.contains("admitRange()"));
+
     let pull = between(stream, "async pull(controller) {", "cancel() {");
-    let schedule = pull
-        .find("if (lookaheadAdmitted) {")
-        .expect("ordinary lookahead gate");
-    let await_response = pull
-        .find("response = await request;")
-        .expect("range completion");
-    assert!(schedule < await_response);
-    assert!(pull[schedule..await_response].contains("scheduleMore();"));
-    assert!(pull.contains("scheduled.get(start)"));
-    assert!(pull.contains("scheduled.delete(start);"));
-}
-
-#[test]
-fn progressive_range_streams_echo_the_outer_playback_token_to_every_rust_range() {
-    let request = between(
-        WORKER,
-        "function requestRustRange(",
-        "function createRustRangeStream(",
-    );
-    assert!(request.contains("streamToken = \"\""));
-    assert!(request.contains("streamToken\n"));
-
-    let stream = between(
-        WORKER,
-        "function createRustRangeStream(",
-        "async function forwardRequestToRust(",
-    );
-    assert!(stream.contains("streamToken = \"\""));
-    assert!(stream.contains("criticalPrefixWindows = null"));
-    assert!(stream.contains("requestRustRange(clients, url, start, end, networkId, streamToken)"));
+    let schedule = pull.find("scheduleMore();").expect("bounded lookahead");
+    let lookup = pull
+        .find("scheduled.get(start)")
+        .expect("ordered range lookup");
+    let awaited = pull.find("await pending").expect("range completion");
+    let removed = pull
+        .find("scheduled.delete(start)")
+        .expect("consumed range cleanup");
+    let emitted = pull
+        .find("controller.enqueue(body)")
+        .expect("ordered body emission");
+    assert!(schedule < lookup && lookup < awaited && awaited < removed && removed < emitted);
 
     let forward = between(
         WORKER,
         "async function forwardRequestToRust(",
         "function parseUploadRedundancyHeader(",
     );
-    assert!(forward.contains("headers.get(\"X-Weeb3-Stream-Token\")"));
-    assert!(forward.contains("stagedStart,\n        streamToken"));
+    assert!(forward.contains("Number.isSafeInteger(size) || size <= 0"));
+    assert!(forward.contains("url.searchParams.get(\"start\") === \"live\""));
+    assert!(forward.contains("? HLS_LIVE_STREAM_WINDOW_BYTES"));
+    assert!(forward.contains(": hlsResource ? HLS_STREAM_WINDOW_BYTES"));
+    assert!(forward.contains("? HLS_LIVE_STREAM_LOOKAHEAD_CHUNKS"));
+    assert!(forward.contains(": hlsResource ? HLS_STREAM_LOOKAHEAD_CHUNKS"));
 }
 
 #[test]
-fn range_stream_cancel_closes_admission_and_drains_dispatched_promises() {
+fn generic_range_stream_cancel_closes_admission_and_drains_dispatched_promises() {
     let stream = between(
         WORKER,
         "function createRustRangeStream(",
@@ -678,45 +391,52 @@ fn range_stream_cancel_closes_admission_and_drains_dispatched_promises() {
     let drain = between(
         stream,
         "const drainScheduledRanges = () => {",
-        "return new ReadableStream(",
+        "const closeAdmission = () => {",
     );
-    let retained = drain
-        .find("Array.from(activeRequests.values())")
-        .expect("every active staged request must enter the drain snapshot");
-    assert!(drain.contains("Array.from(scheduled.values())"));
-    let settled = drain
-        .find("Promise.allSettled(dispatched)")
-        .expect("already-dispatched range promises must drain");
-    let clear = drain
-        .find("activeRequests.clear();")
-        .expect("settled range bookkeeping cleanup");
-    assert!(retained < settled && settled < clear);
-    assert!(drain.contains("retainedResponses.clear();"));
-    assert!(!drain[..settled].contains("retainedResponses.values()"));
+    assert!(drain.contains("Promise.allSettled(Array.from(scheduled.values()))"));
+    assert!(drain.contains("scheduled.clear();"));
+
+    let bounds = between(
+        stream,
+        "const nextRangeBounds = () => {",
+        "const admitRange = () => {",
+    );
+    assert!(bounds.contains("if (!admissionOpen || schedulePosition >= size)"));
+
+    let admission = between(
+        stream,
+        "const admitRange = () => {",
+        "const scheduleMore = () => {",
+    );
+    let dispatch = admission.find("requestRustRange(").unwrap();
+    let retain = admission.find("scheduled.set(start, request)").unwrap();
+    assert!(dispatch < retain);
 
     let close_admission = between(
         stream,
         "const closeAdmission = () => {",
         "const failStream = async",
     );
-    assert!(close_admission.contains("schedulingAdmissionOpen = false;"));
-    assert!(close_admission.contains("lookaheadAdmitted = false;"));
+    assert!(close_admission.contains("admissionOpen = false;"));
 
     let cancel = between(stream, "cancel() {", "\n    }");
     let close = cancel
         .find("closeAdmission();")
-        .expect("future range scheduling must close first");
+        .expect("future scheduling must close first");
     let drain = cancel
         .find("return drainScheduledRanges();")
-        .expect("cancel must retain the drain promise");
+        .expect("cancel must return the drain promise");
     assert!(close < drain);
-    assert!(!cancel.contains("activeRequests.clear()"));
     assert!(!cancel.contains("requestRustRange("));
-    assert!(!cancel.contains("AbortController"));
     assert!(!cancel.contains(".abort("));
 
     let pull = between(stream, "async pull(controller) {", "cancel() {");
-    let normal_close = between(pull, "if (position >= size) {", "if (lookaheadAdmitted) {");
+    let awaited = pull.find("const response = await pending;").unwrap();
+    let cancelled = pull.find("if (!admissionOpen) {").unwrap();
+    let emitted = pull.find("controller.enqueue(body);").unwrap();
+    let refill = pull.rfind("scheduleMore();").unwrap();
+    assert!(awaited < cancelled && cancelled < emitted && emitted < refill);
+    let normal_close = between(pull, "if (position >= size) {", "scheduleMore();");
     let close_admission = normal_close.find("closeAdmission();").unwrap();
     let close_controller = normal_close.find("controller.close();").unwrap();
     let drain = normal_close.find("await drainScheduledRanges();").unwrap();
@@ -724,7 +444,7 @@ fn range_stream_cancel_closes_admission_and_drains_dispatched_promises() {
 }
 
 #[test]
-fn range_stream_errors_close_new_admission_and_drain_every_dispatched_request() {
+fn generic_range_stream_errors_close_and_drain_before_returning() {
     let stream = between(
         WORKER,
         "function createRustRangeStream(",
@@ -769,6 +489,26 @@ fn setup_validates_scope_and_every_registration_state() {
         .find("register_with_options(")
         .expect("worker must be registered");
     assert!(validation < registration);
+    let update = setup
+        .find("registration.update()")
+        .expect("an existing expected registration must be updated");
+    let acceptance = setup[update..]
+        .find("claim_exact_service_worker(&active).await")
+        .map(|offset| update + offset)
+        .expect("the updated implementation must answer readiness");
+    assert!(validation < update && update < acceptance && acceptance < registration);
+    let expected_url = setup.find("let expected_worker_url").unwrap();
+    assert!(!setup[..expected_url].contains("service_worker_forwarder_ready"));
+    assert!(!setup.contains("or(Some(active))"));
+    assert!(!setup.contains("return Some(service_worker)"));
+    let exact_claim = between(
+        RUNTIME,
+        "async fn claim_exact_service_worker(",
+        "struct ServiceWorkerProtocolPort",
+    );
+    assert!(exact_claim.contains("request_service_worker_claim(worker).await"));
+    assert!(exact_claim.contains("service_worker_forwarder_ready().await"));
+    assert!(exact_claim.contains("controlled_service_worker()"));
     assert!(setup.contains("JsValue::from_str(\"updateViaCache\")"));
     assert!(setup.contains("JsValue::from_str(\"none\")"));
 }

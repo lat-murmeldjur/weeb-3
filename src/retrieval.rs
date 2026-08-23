@@ -9,23 +9,16 @@ use crate::{
         split_references,
     },
     feed::{
-        FEED_FRONTIER_LOOKAHEAD_TIMEOUT, FeedProbe, seek_sequence_feed_frontier,
-        seek_sequence_feed_frontier_bounded_observing_positive, seek_sequence_feed_frontier_from,
-        seek_sequence_feed_frontier_wide_bounded,
+        FeedProbe, seek_sequence_feed_frontier,
+        seek_sequence_feed_frontier_bounded_observing_positive,
     },
     get_feed_address, get_proximity, mpsc, price, reserve,
     retrieval_conventions::SingleflightRegistry,
     retrieval_conventions::{
         RetrieveAdmission, RetrieveHedgeDemand, SharedRetrieveHedgeDemand,
-        retained_feed_probe_empty_is_missing, retrieve_admission_current,
-        retrieve_attempt_start_allowed, rolling_full_group_eligible,
+        retrieve_admission_current, retrieve_attempt_start_allowed, rolling_full_group_eligible,
         rolling_full_group_static_candidate, rolling_next_parity_index,
         rolling_parity_admission_count,
-    },
-    retrieval_profile::{
-        RetrieveAttemptOutcome, RetrieveAttemptProfile, RetrieveProfileRequest,
-        RollingGroupProfile, RollingGroupProfileInit, RollingGroupRegistration,
-        RollingGroupTerminalReason,
     },
     retrieve_cancel_token_current, retrieve_handler, transfer_pause_enabled, valid_cac, valid_soc,
 };
@@ -52,13 +45,11 @@ const RETRIEVE_CHECK_RETRY_WAIT_MS: u64 = 160;
 const RETRIEVE_CHUNK_MAX_ATTEMPT_ERRORS: usize = 20;
 const RETRIEVE_DATA_GROUP_CONCURRENCY: usize = 8;
 const RETRIEVE_DECODED_CHUNK_CACHE_ENTRIES: usize = 2048;
-const RETRIEVE_FEED_HEDGE_ADMISSION_MS: u64 = 1_950;
-const RETRIEVE_FEED_MAX_PHYSICAL_ATTEMPTS: usize = 2;
 
-pub(crate) const CONSERVATIVE_DEFERRED_RANGE_BYTES: u64 = CHUNK_SIZE as u64;
-const CONSERVATIVE_DEFERRED_MAX_RANGE_CHILDREN: usize = 2;
-pub(crate) const CONSERVATIVE_DEFERRED_MAX_PHYSICAL_ATTEMPTS: u64 =
-    (CONSERVATIVE_DEFERRED_MAX_RANGE_CHILDREN * RETRIEVE_CHUNK_MAX_ATTEMPT_ERRORS) as u64;
+pub(crate) const CONSERVATIVE_RANGE_BYTES: u64 = CHUNK_SIZE as u64;
+const CONSERVATIVE_RANGE_MAX_CHILDREN: usize = 2;
+pub(crate) const CONSERVATIVE_RANGE_MAX_PHYSICAL_ATTEMPTS: u64 =
+    (CONSERVATIVE_RANGE_MAX_CHILDREN * RETRIEVE_CHUNK_MAX_ATTEMPT_ERRORS) as u64;
 
 #[derive(Clone, Copy)]
 struct DataRangeTraversalPolicy {
@@ -76,14 +67,8 @@ const ORDINARY_DATA_RANGE_TRAVERSAL: DataRangeTraversalPolicy = DataRangeTravers
 const CONSERVATIVE_DATA_RANGE_TRAVERSAL: DataRangeTraversalPolicy = DataRangeTraversalPolicy {
     group_concurrency: 1,
     erasure_recovery: false,
-    maximum_requested_children: CONSERVATIVE_DEFERRED_MAX_RANGE_CHILDREN,
+    maximum_requested_children: CONSERVATIVE_RANGE_MAX_CHILDREN,
 };
-
-#[derive(Clone, Copy)]
-struct RetainedFeedProbePolicy {
-    hedge_admission: Duration,
-    max_physical_attempts: usize,
-}
 
 struct RetrieveAttemptResult {
     peer: PeerId,
@@ -230,7 +215,6 @@ async fn retrieve_attempt(
     refresh_chan: mpsc::Sender<RefreshmentInstruction>,
     result_chan: mpsc::Sender<RetrieveAttemptResult>,
     admission: Option<RetrieveAdmission>,
-    mut profile: Option<RetrieveAttemptProfile>,
 ) {
     let ReservedRetrievePeer {
         peer,
@@ -253,7 +237,6 @@ async fn retrieve_attempt(
 
     match retrieve_result {
         Ok(retrieve_result) => {
-            let response_kind = retrieve_attempt_response_kind(&retrieve_result);
             if matches!(retrieve_result.as_ref(), Ok(chunk) if chunk.is_empty())
                 && let Some(admission) = admission.as_ref()
             {
@@ -268,13 +251,7 @@ async fn retrieve_attempt(
                 retrieve_result,
             )
             .await;
-            if let Some(profile) = profile.as_mut() {
-                profile.complete_immediate(retrieve_attempt_outcome(response_kind, &result));
-            }
-            let result_send_succeeded = result_chan.try_send(result).is_ok();
-            if let Some(profile) = profile.as_ref() {
-                profile.immediate_result_send(result_send_succeeded);
-            }
+            let _ = result_chan.try_send(result);
         }
         Err(_) => {
             if let Some(admission) = admission.as_ref() {
@@ -283,18 +260,12 @@ async fn retrieve_attempt(
             // Ten seconds is terminal for the logical retrieval, so its in-flight slot and
             // dispatcher permit can be released. The dispatched exchange still owns a reserve;
             // keep its response receiver alive in a detached accounting-only settlement task.
-            let detached_profile = profile.map(RetrieveAttemptProfile::timed_out);
-            let result_send_succeeded =
-                result_chan.try_send(failed_retrieve_attempt(&peer)).is_ok();
-            if let Some(profile) = detached_profile.as_ref() {
-                profile.timeout_result_send(result_send_succeeded);
-            }
+            let _ = result_chan.try_send(failed_retrieve_attempt(&peer));
 
             // A timed-out dispatched request must still settle its accounting reserve.
             wasm_bindgen_futures::spawn_local(async move {
                 let retrieve_result = chunk_in.recv().await;
-                let response_kind = retrieve_attempt_response_kind(&retrieve_result);
-                let result = settle_retrieve_attempt(
+                let _ = settle_retrieve_attempt(
                     peer,
                     caddr,
                     req_price,
@@ -303,43 +274,8 @@ async fn retrieve_attempt(
                     retrieve_result,
                 )
                 .await;
-                if let Some(profile) = detached_profile {
-                    profile.complete(retrieve_attempt_outcome(response_kind, &result));
-                }
             });
         }
-    }
-}
-
-#[derive(Clone, Copy)]
-enum RetrieveAttemptResponseKind {
-    Empty,
-    Nonempty,
-    ChannelClosed,
-}
-
-fn retrieve_attempt_response_kind(
-    retrieve_result: &Result<Vec<u8>, mpsc::RecvError>,
-) -> RetrieveAttemptResponseKind {
-    match retrieve_result {
-        Ok(chunk) if chunk.is_empty() => RetrieveAttemptResponseKind::Empty,
-        Ok(_) => RetrieveAttemptResponseKind::Nonempty,
-        Err(_) => RetrieveAttemptResponseKind::ChannelClosed,
-    }
-}
-
-fn retrieve_attempt_outcome(
-    response_kind: RetrieveAttemptResponseKind,
-    result: &RetrieveAttemptResult,
-) -> RetrieveAttemptOutcome {
-    match response_kind {
-        RetrieveAttemptResponseKind::Empty => RetrieveAttemptOutcome::ConfirmedEmpty,
-        RetrieveAttemptResponseKind::ChannelClosed => RetrieveAttemptOutcome::ChannelClosed,
-        RetrieveAttemptResponseKind::Nonempty if result.valid && result.soc => {
-            RetrieveAttemptOutcome::ValidSoc
-        }
-        RetrieveAttemptResponseKind::Nonempty if result.valid => RetrieveAttemptOutcome::ValidCac,
-        RetrieveAttemptResponseKind::Nonempty => RetrieveAttemptOutcome::InvalidNonempty,
     }
 }
 
@@ -617,37 +553,6 @@ struct RawFetchResult {
     canonical_cac: bool,
 }
 
-pub(crate) trait RawFetchLifecycle {
-    fn finish_registration(
-        self: Box<Self>,
-        registration: RawFetchRegistration,
-        raw_flight_id: Option<u64>,
-    );
-
-    fn leader_selected(&mut self);
-
-    fn leader_registered(&self, raw_flight_id: u64, dispatch_accepted: bool);
-
-    fn complete(self: Box<Self>, raw_flight_id: u64, canonical_cac: bool);
-}
-
-#[derive(Clone)]
-pub(crate) struct RawFetchLifecycleFactory {
-    create: Rc<dyn Fn() -> Box<dyn RawFetchLifecycle>>,
-}
-
-impl RawFetchLifecycleFactory {
-    pub(crate) fn new(create: impl Fn() -> Box<dyn RawFetchLifecycle> + 'static) -> Self {
-        Self {
-            create: Rc::new(create),
-        }
-    }
-
-    fn create(&self) -> Box<dyn RawFetchLifecycle> {
-        (self.create)()
-    }
-}
-
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct RawFetchKey {
     runtime_scope: usize,
@@ -714,63 +619,6 @@ pub(crate) enum RawFetchRegistration {
     Cached,
     Joined,
     Led,
-}
-
-fn rolling_group_registration(registration: RawFetchRegistration) -> RollingGroupRegistration {
-    match registration {
-        RawFetchRegistration::Cached => RollingGroupRegistration::Cached,
-        RawFetchRegistration::Joined => RollingGroupRegistration::Joined,
-        RawFetchRegistration::Led => RollingGroupRegistration::Led,
-    }
-}
-
-fn finish_rolling_group_stale(profile: &mut Option<RollingGroupProfile>) {
-    if let Some(profile) = profile.as_mut() {
-        profile.finish_stale_now();
-    }
-}
-
-fn record_rolling_group_result(
-    profile: &mut Option<RollingGroupProfile>,
-    result: &RawFetchResult,
-    data_count: usize,
-    rolling_active_shards: &[bool],
-    rolling_active: usize,
-    successes: usize,
-    completed: usize,
-) {
-    if result.index >= data_count
-        && let Some(profile) = profile.as_mut()
-    {
-        let valid = !result.chunk.is_empty() && result.canonical_cac;
-        let active_after = rolling_active.saturating_sub(usize::from(
-            rolling_active_shards
-                .get(result.index)
-                .copied()
-                .unwrap_or(false),
-        ));
-        profile.parity_result_now(
-            result.index,
-            result.index.saturating_sub(data_count),
-            valid,
-            rolling_active,
-            active_after,
-            successes,
-            successes.saturating_add(usize::from(valid)),
-            completed,
-        );
-    }
-}
-
-fn update_rolling_group_progress(
-    profile: &mut Option<RollingGroupProfile>,
-    successes: usize,
-    completed: usize,
-    active: usize,
-) {
-    if let Some(profile) = profile.as_mut() {
-        profile.progress(successes, completed, active);
-    }
 }
 
 thread_local! {
@@ -848,7 +696,6 @@ fn queue_drained_raw_chunk(
     cancel: &Option<RetrieveCancelToken>,
     shared_physical_admission: Option<(u64, &RetrieveAdmission)>,
     hedge_demand: RetrieveHedgeDemand,
-    mut lifecycle: Option<Box<dyn RawFetchLifecycle>>,
 ) -> RawFetchRegistration {
     if let Some(reference) = cache_reference.as_ref() {
         if let Some(chunk) = cached_raw_chunk(reference) {
@@ -857,9 +704,6 @@ fn queue_drained_raw_chunk(
                 chunk,
                 canonical_cac: true,
             });
-            if let Some(lifecycle) = lifecycle.take() {
-                lifecycle.finish_registration(RawFetchRegistration::Cached, None);
-            }
             return RawFetchRegistration::Cached;
         }
     }
@@ -895,13 +739,7 @@ fn queue_drained_raw_chunk(
         .shared
         .remember_cache_reference(cache_reference.as_ref());
     if let Some(shared_demand) = registration.shared.hedge_demand.as_ref() {
-        let before = shared_demand.current();
         shared_demand.promote(hedge_demand);
-        if before == RetrieveHedgeDemand::DistinctShardManaged
-            && shared_demand.current() == RetrieveHedgeDemand::Ordinary
-        {
-            crate::retrieval_profile::record_managed_to_ordinary_promotion();
-        }
     }
 
     let waiter_key = registration.key.clone();
@@ -914,14 +752,7 @@ fn queue_drained_raw_chunk(
     });
 
     if !registration.leader {
-        if let Some(lifecycle) = lifecycle.take() {
-            lifecycle.finish_registration(RawFetchRegistration::Joined, Some(flight_id));
-        }
         return RawFetchRegistration::Joined;
-    }
-
-    if let Some(lifecycle) = lifecycle.as_mut() {
-        lifecycle.leader_selected();
     }
 
     let (chan_out, chan_in) = mpsc::unbounded::<Vec<u8>>();
@@ -933,75 +764,19 @@ fn queue_drained_raw_chunk(
             cancel: cancel.clone(),
             admission: Some(registration.shared.admission.clone()),
             hedge_demand: registration.shared.hedge_demand.clone(),
-            profile: None,
         })
         .is_err()
     {
-        if let Some(lifecycle) = lifecycle.as_ref() {
-            lifecycle.leader_registered(flight_id, false);
-        }
-        let canonical_cac = complete_raw_fetch(&completion_key, flight_id, Vec::new());
-        if let Some(lifecycle) = lifecycle {
-            lifecycle.complete(flight_id, canonical_cac);
-        }
+        complete_raw_fetch(&completion_key, flight_id, Vec::new());
         return RawFetchRegistration::Led;
-    }
-
-    if let Some(lifecycle) = lifecycle.as_ref() {
-        lifecycle.leader_registered(flight_id, true);
     }
 
     // The detached producer lets dispatched exchanges settle after callers leave.
     wasm_bindgen_futures::spawn_local(async move {
         let chunk = chan_in.recv().await.unwrap_or_default();
-        let canonical_cac = complete_raw_fetch(&completion_key, flight_id, chunk);
-        if let Some(lifecycle) = lifecycle {
-            lifecycle.complete(flight_id, canonical_cac);
-        }
+        complete_raw_fetch(&completion_key, flight_id, chunk);
     });
     RawFetchRegistration::Led
-}
-
-/// Synchronously registers one ordinary raw child retrieval and returns only
-/// the future that decodes its eventual canonical result. Endpoint-specific
-/// schedulers may attach a lifecycle without gaining access to raw registry or
-/// waiter internals.
-pub(crate) fn queue_decoded_join_child_cancellable(
-    reference: Vec<u8>,
-    chunk_retrieve_chan: ChunkRetrieveSender,
-    cancel: Option<RetrieveCancelToken>,
-    lifecycle: Box<dyn RawFetchLifecycle>,
-) -> Pin<Box<dyn Future<Output = Option<DecodedJoinChunk>>>> {
-    let Some(address) = reference.get(..HASH_SIZE).map(<[u8]>::to_vec) else {
-        return Box::pin(async { None });
-    };
-    let waiter_admission = RetrieveAdmission::new();
-    let waiter_guard = waiter_admission.close_on_drop();
-    let (result_out, result_in) = mpsc::unbounded::<RawFetchResult>();
-    queue_drained_raw_chunk(
-        0,
-        address.clone(),
-        address,
-        Some(reference.clone()),
-        &chunk_retrieve_chan,
-        &result_out,
-        &waiter_admission,
-        &cancel,
-        None,
-        RetrieveHedgeDemand::Ordinary,
-        Some(lifecycle),
-    );
-
-    Box::pin(async move {
-        // The waiter remains live through raw completion even if its controller
-        // has stopped creating additional work.
-        let _waiter_guard = waiter_guard;
-        let result = result_in.recv().await.ok()?;
-        if result.chunk.is_empty() || !result.canonical_cac {
-            return None;
-        }
-        cached_decoded_chunk(&reference)
-    })
 }
 
 #[inline]
@@ -1125,7 +900,6 @@ async fn retrieve_raw_root_cancellable(
             cancel,
             None,
             RetrieveHedgeDemand::Ordinary,
-            None,
         );
         next += 1;
         dispatched += 1;
@@ -1156,7 +930,6 @@ async fn retrieve_raw_root_cancellable(
                     cancel,
                     None,
                     RetrieveHedgeDemand::Ordinary,
-                    None,
                 );
                 next += 1;
                 dispatched += 1;
@@ -1190,7 +963,6 @@ async fn retrieve_raw_root_cancellable(
                             cancel,
                             None,
                             RetrieveHedgeDemand::Ordinary,
-                            None,
                         );
                         next += 1;
                         dispatched += 1;
@@ -1227,15 +999,6 @@ pub(crate) async fn retrieve_decoded_data_root(
     chunk_retrieve_chan: &ChunkRetrieveSender,
 ) -> Option<DecodedJoinChunk> {
     retrieve_decoded_data_root_cancellable(data_address, chunk_retrieve_chan, None, None).await
-}
-
-pub(crate) fn cached_decoded_data_root(data_address: &[u8]) -> Option<DecodedJoinChunk> {
-    if data_address.len() != HASH_SIZE
-        && data_address.len() != erasure_coding::ENCRYPTED_REFERENCE_SIZE
-    {
-        return None;
-    }
-    cached_decoded_chunk(data_address)
 }
 
 pub(crate) async fn retrieve_decoded_data_root_cancellable(
@@ -1347,7 +1110,6 @@ fn dispatch_group_recovery(
                 cancel,
                 None,
                 RetrieveHedgeDemand::Ordinary,
-                None,
             );
         }
         dispatched_shards[index] = true;
@@ -1396,7 +1158,6 @@ fn dispatch_group_parity(
             cancel,
             None,
             RetrieveHedgeDemand::Ordinary,
-            None,
         );
         dispatched_shards[index] = true;
         count += 1;
@@ -1426,7 +1187,6 @@ fn dispatch_one_rolling_group_parity(
         cancel,
         None,
         RetrieveHedgeDemand::DistinctShardManaged,
-        None,
     );
     dispatched_shards[index] = true;
     Some((index, registration))
@@ -1509,7 +1269,6 @@ async fn fetch_data_group_indices_streaming(
     cancel_generations: Option<RetrieveGenerationMap>,
     cancel: Option<RetrieveCancelToken>,
     shared_physical_admission: Option<(u64, RetrieveAdmission)>,
-    terminal_lifecycle_factory: Option<RawFetchLifecycleFactory>,
     child_emitter: GroupChildEmitter,
 ) -> Option<()> {
     let data_count = data_references.len();
@@ -1603,9 +1362,6 @@ async fn fetch_data_group_indices_streaming(
     let mut rolling_active = 0usize;
     let mut successes = 0usize;
     let mut dispatched = 0usize;
-    let mut initial_cached = 0usize;
-    let mut initial_joined = 0usize;
-    let mut initial_led = 0usize;
     let queue_initial_data_shard = |index: usize, hedge_demand: RetrieveHedgeDemand| {
         let reference = &data_references[index];
         let address = reference[..HASH_SIZE].to_vec();
@@ -1622,9 +1378,6 @@ async fn fetch_data_group_indices_streaming(
                 .as_ref()
                 .map(|(scope, admission)| (*scope, admission)),
             hedge_demand,
-            terminal_lifecycle_factory
-                .as_ref()
-                .map(RawFetchLifecycleFactory::create),
         )
     };
     if static_rolling_candidate {
@@ -1649,11 +1402,6 @@ async fn fetch_data_group_indices_streaming(
                 RequestedShardCache::Miss => {}
             }
             let registration = queue_initial_data_shard(index, initial_hedge_demand);
-            match registration {
-                RawFetchRegistration::Cached => initial_cached += 1,
-                RawFetchRegistration::Joined => initial_joined += 1,
-                RawFetchRegistration::Led => initial_led += 1,
-            }
             dispatched_shards[index] = true;
             dispatched += 1;
             if rolling && registration != RawFetchRegistration::Cached {
@@ -1679,28 +1427,6 @@ async fn fetch_data_group_indices_streaming(
     // Anchor both hedge policies after all initial registrations. This preserves the legacy
     // deadline and gives the rolling set a full hedge interval before parity can replace it.
     let started = Date::now();
-    let mut rolling_profile = rolling
-        .then(|| {
-            crate::retrieval_profile::rolling_group_started(RollingGroupProfileInit {
-                anchor_at_ms: started,
-                requested_count,
-                data_count,
-                parity_count: parity_references.len(),
-                decoded_raw_count: requested_count
-                    .saturating_sub(decoded_only_count)
-                    .saturating_sub(unresolved_count),
-                decoded_only_count,
-                miss_count: unresolved_count,
-                static_candidate: static_rolling_candidate,
-                dynamic_eligible: rolling,
-                initial_cached,
-                initial_joined,
-                initial_led,
-                initial_active: rolling_active,
-                initial_successes: successes,
-            })
-        })
-        .flatten();
 
     let mut completed = 0usize;
     let mut recovery_dispatched = false;
@@ -1713,20 +1439,10 @@ async fn fetch_data_group_indices_streaming(
             }
             if !ready_results.is_empty() {
                 if !join_cancel_token_current(&cancel_generations, &cancel).await {
-                    finish_rolling_group_stale(&mut rolling_profile);
                     return None;
                 }
                 for result in ready_results {
                     completed = completed.checked_add(1)?;
-                    record_rolling_group_result(
-                        &mut rolling_profile,
-                        &result,
-                        data_count,
-                        &rolling_active_shards,
-                        rolling_active,
-                        successes,
-                        completed,
-                    );
                     let settled = settle_data_group_result(
                         result,
                         rolling,
@@ -1742,12 +1458,6 @@ async fn fetch_data_group_indices_streaming(
                         &mut successes,
                         &child_emitter,
                     );
-                    update_rolling_group_progress(
-                        &mut rolling_profile,
-                        successes,
-                        completed,
-                        rolling_active,
-                    );
                     settled?;
                 }
                 // Re-evaluate terminal state before any replacement admission.
@@ -1761,26 +1471,12 @@ async fn fetch_data_group_indices_streaming(
         let terminal = all_requested_ready || (recovery_dispatched && successes >= data_count);
         if terminal {
             waiter_admission.close();
-            if let Some(profile) = rolling_profile.as_mut() {
-                profile.close_now(
-                    if all_requested_ready {
-                        RollingGroupTerminalReason::DirectAllReady
-                    } else {
-                        RollingGroupTerminalReason::ReconstructThreshold
-                    },
-                    successes,
-                    completed,
-                    rolling_active,
-                );
-            }
             if !join_cancel_token_current(&cancel_generations, &cancel).await {
-                finish_rolling_group_stale(&mut rolling_profile);
                 return None;
             }
             break;
         }
         if !join_cancel_token_current(&cancel_generations, &cancel).await {
-            finish_rolling_group_stale(&mut rolling_profile);
             return None;
         }
 
@@ -1788,15 +1484,6 @@ async fn fetch_data_group_indices_streaming(
             let mut settled_ready = false;
             while let Ok(result) = result_in.try_recv() {
                 completed = completed.checked_add(1)?;
-                record_rolling_group_result(
-                    &mut rolling_profile,
-                    &result,
-                    data_count,
-                    &rolling_active_shards,
-                    rolling_active,
-                    successes,
-                    completed,
-                );
                 let settled = settle_data_group_result(
                     result,
                     rolling,
@@ -1812,12 +1499,6 @@ async fn fetch_data_group_indices_streaming(
                     &mut successes,
                     &child_emitter,
                 );
-                update_rolling_group_progress(
-                    &mut rolling_profile,
-                    successes,
-                    completed,
-                    rolling_active,
-                );
                 settled?;
                 settled_ready = true;
             }
@@ -1829,8 +1510,7 @@ async fn fetch_data_group_indices_streaming(
         }
 
         if rolling {
-            let decision_at_ms = Date::now();
-            let elapsed = (decision_at_ms - started).max(0.0) as u64;
+            let elapsed = (Date::now() - started).max(0.0) as u64;
             let remaining_parity = (data_count..total_count)
                 .filter(|&index| !dispatched_shards[index])
                 .count();
@@ -1843,7 +1523,6 @@ async fn fetch_data_group_indices_streaming(
                 remaining_parity,
             ) != 0
             {
-                let active_before = rolling_active;
                 let (index, registration) = dispatch_one_rolling_group_parity(
                     data_count,
                     &parity_references,
@@ -1858,19 +1537,6 @@ async fn fetch_data_group_indices_streaming(
                 if registration != RawFetchRegistration::Cached {
                     rolling_active_shards[index] = true;
                     rolling_active += 1;
-                }
-                if let Some(profile) = rolling_profile.as_mut() {
-                    profile.parity_admitted(
-                        decision_at_ms,
-                        elapsed,
-                        index,
-                        index.saturating_sub(data_count),
-                        rolling_group_registration(registration),
-                        active_before,
-                        rolling_active,
-                        successes,
-                        completed,
-                    );
                 }
                 // Admit at most one replacement per coordinator turn, then settle any immediately
                 // ready Cached/completed result and re-check terminal state before another.
@@ -1897,7 +1563,6 @@ async fn fetch_data_group_indices_streaming(
                 return None;
             }
             if !join_cancel_token_current(&cancel_generations, &cancel).await {
-                finish_rolling_group_stale(&mut rolling_profile);
                 return None;
             }
             recovery_dispatched = true;
@@ -1937,7 +1602,6 @@ async fn fetch_data_group_indices_streaming(
                 Ok(Err(_)) => RawFetchReceive::ChannelClosed,
                 Err(_) => {
                     if !join_cancel_token_current(&cancel_generations, &cancel).await {
-                        finish_rolling_group_stale(&mut rolling_profile);
                         return None;
                     }
                     if requested_count == data_count {
@@ -1967,7 +1631,6 @@ async fn fetch_data_group_indices_streaming(
                 Ok(Err(_)) => RawFetchReceive::ChannelClosed,
                 Err(_) => {
                     if !join_cancel_token_current(&cancel_generations, &cancel).await {
-                        finish_rolling_group_stale(&mut rolling_profile);
                         return None;
                     }
                     dispatched += dispatch_group_recovery(
@@ -1989,31 +1652,12 @@ async fn fetch_data_group_indices_streaming(
 
         let result = match result {
             RawFetchReceive::Result(result) => result,
-            RawFetchReceive::Stale => {
-                finish_rolling_group_stale(&mut rolling_profile);
-                return None;
-            }
-            RawFetchReceive::ChannelClosed => {
-                if let Some(profile) = rolling_profile.as_mut() {
-                    profile.finish_channel_closed_now();
-                }
-                return None;
-            }
+            RawFetchReceive::Stale | RawFetchReceive::ChannelClosed => return None,
         };
         completed = completed.checked_add(1)?;
         if !join_cancel_token_current(&cancel_generations, &cancel).await {
-            finish_rolling_group_stale(&mut rolling_profile);
             return None;
         }
-        record_rolling_group_result(
-            &mut rolling_profile,
-            &result,
-            data_count,
-            &rolling_active_shards,
-            rolling_active,
-            successes,
-            completed,
-        );
         let usable = settle_data_group_result(
             result,
             rolling,
@@ -2029,14 +1673,12 @@ async fn fetch_data_group_indices_streaming(
             &mut successes,
             &child_emitter,
         );
-        update_rolling_group_progress(&mut rolling_profile, successes, completed, rolling_active);
         let usable = usable?;
         if !usable && !rolling && !recovery_dispatched {
             if parity_references.is_empty() || !policy.erasure_recovery {
                 return None;
             }
             if !join_cancel_token_current(&cancel_generations, &cancel).await {
-                finish_rolling_group_stale(&mut rolling_profile);
                 return None;
             }
             recovery_dispatched = true;
@@ -2058,13 +1700,9 @@ async fn fetch_data_group_indices_streaming(
         .filter(|&index| !requested_ready[index])
         .collect::<Vec<_>>();
     if missing_indices.is_empty() {
-        if let Some(profile) = rolling_profile.as_mut() {
-            profile.finish_success_now(false);
-        }
         return Some(());
     }
     if !join_cancel_token_current(&cancel_generations, &cancel).await {
-        finish_rolling_group_stale(&mut rolling_profile);
         return None;
     }
     let mut reconstructed_shards = received_shards
@@ -2081,9 +1719,6 @@ async fn fetch_data_group_indices_streaming(
         }
         remember_raw_chunk(reference.clone(), raw.into());
         child_emitter.emit(index, cached_decoded_chunk(reference)?);
-    }
-    if let Some(profile) = rolling_profile.as_mut() {
-        profile.finish_success_now(true);
     }
     Some(())
 }
@@ -2176,7 +1811,7 @@ pub(crate) async fn retrieve_data_range_from_root_conservative(
     let requested_len = payload_end_inclusive
         .checked_sub(payload_start)?
         .checked_add(1)?;
-    if requested_len > CONSERVATIVE_DEFERRED_RANGE_BYTES {
+    if requested_len > CONSERVATIVE_RANGE_BYTES {
         return None;
     }
     retrieve_data_range_from_root_with_prefix_cancellable(
@@ -2189,7 +1824,6 @@ pub(crate) async fn retrieve_data_range_from_root_conservative(
         None,
         None,
         CONSERVATIVE_DATA_RANGE_TRAVERSAL,
-        None,
     )
     .await
 }
@@ -2203,29 +1837,6 @@ pub(crate) async fn retrieve_data_range_from_root_cancellable(
     cancel_generations: Option<RetrieveGenerationMap>,
     cancel: Option<RetrieveCancelToken>,
 ) -> Option<Vec<u8>> {
-    retrieve_data_range_from_root_cancellable_with_lifecycle_factory(
-        root,
-        payload_start,
-        payload_end_inclusive,
-        encrypted,
-        chunk_retrieve_chan,
-        cancel_generations,
-        cancel,
-        None,
-    )
-    .await
-}
-
-pub(crate) async fn retrieve_data_range_from_root_cancellable_with_lifecycle_factory(
-    root: DecodedJoinChunk,
-    payload_start: u64,
-    payload_end_inclusive: u64,
-    encrypted: bool,
-    chunk_retrieve_chan: &ChunkRetrieveSender,
-    cancel_generations: Option<RetrieveGenerationMap>,
-    cancel: Option<RetrieveCancelToken>,
-    terminal_lifecycle_factory: Option<RawFetchLifecycleFactory>,
-) -> Option<Vec<u8>> {
     retrieve_data_range_from_root_with_prefix_cancellable(
         root,
         payload_start,
@@ -2236,7 +1847,6 @@ pub(crate) async fn retrieve_data_range_from_root_cancellable_with_lifecycle_fac
         cancel_generations,
         cancel,
         ORDINARY_DATA_RANGE_TRAVERSAL,
-        terminal_lifecycle_factory,
     )
     .await
 }
@@ -2251,7 +1861,6 @@ async fn retrieve_data_range_from_root_with_prefix_cancellable(
     cancel_generations: Option<RetrieveGenerationMap>,
     cancel: Option<RetrieveCancelToken>,
     policy: DataRangeTraversalPolicy,
-    terminal_lifecycle_factory: Option<RawFetchLifecycleFactory>,
 ) -> Option<Vec<u8>> {
     if !join_cancel_token_current(&cancel_generations, &cancel).await {
         return None;
@@ -2279,7 +1888,7 @@ async fn retrieve_data_range_from_root_with_prefix_cancellable(
         Some((
             next_conservative_raw_fetch_scope(),
             RetrieveAdmission::new_with_attempt_limit(
-                usize::try_from(CONSERVATIVE_DEFERRED_MAX_PHYSICAL_ATTEMPTS).ok()?,
+                usize::try_from(CONSERVATIVE_RANGE_MAX_PHYSICAL_ATTEMPTS).ok()?,
             ),
         ))
     };
@@ -2355,9 +1964,6 @@ async fn retrieve_data_range_from_root_with_prefix_cancellable(
             let group_cancel_generations = cancel_generations.clone();
             let group_cancel = cancel.clone();
             let group_shared_physical_admission = shared_physical_admission.clone();
-            let group_terminal_lifecycle_factory = (layout.child_capacity <= CHUNK_SIZE as u64)
-                .then(|| terminal_lifecycle_factory.clone())
-                .flatten();
             let emitter = GroupChildEmitter {
                 context: GroupTraversalContext {
                     parent_start: node.start,
@@ -2380,7 +1986,6 @@ async fn retrieve_data_range_from_root_with_prefix_cancellable(
                     group_cancel_generations,
                     group_cancel,
                     group_shared_physical_admission,
-                    group_terminal_lifecycle_factory,
                     emitter,
                 )
                 .await
@@ -2452,37 +2057,10 @@ async fn retrieve_data_joined(
     chunk_retrieve_chan: &ChunkRetrieveSender,
     include_span_prefix: bool,
 ) -> Vec<u8> {
-    retrieve_data_joined_cancellable(
-        data_address,
-        chunk_retrieve_chan,
-        include_span_prefix,
-        None,
-        None,
-    )
-    .await
-}
-
-async fn retrieve_data_joined_cancellable(
-    data_address: &Vec<u8>,
-    chunk_retrieve_chan: &ChunkRetrieveSender,
-    include_span_prefix: bool,
-    cancel_generations: Option<RetrieveGenerationMap>,
-    cancel: Option<RetrieveCancelToken>,
-) -> Vec<u8> {
     let encrypted = data_address.len() == erasure_coding::ENCRYPTED_REFERENCE_SIZE;
-    let Some(root) = retrieve_decoded_data_root_cancellable(
-        data_address,
-        chunk_retrieve_chan,
-        cancel_generations.clone(),
-        cancel.clone(),
-    )
-    .await
-    else {
+    let Some(root) = retrieve_decoded_data_root(data_address, chunk_retrieve_chan).await else {
         return vec![];
     };
-    if !join_cancel_token_current(&cancel_generations, &cancel).await {
-        return vec![];
-    }
     let span = root.span;
     let span_prefix = span.to_le_bytes();
     let output_prefix: &[u8] = if include_span_prefix {
@@ -2500,10 +2078,9 @@ async fn retrieve_data_joined_cancellable(
             encrypted,
             chunk_retrieve_chan,
             output_prefix,
-            cancel_generations,
-            cancel,
-            ORDINARY_DATA_RANGE_TRAVERSAL,
             None,
+            None,
+            ORDINARY_DATA_RANGE_TRAVERSAL,
         )
         .await
         else {
@@ -2530,22 +2107,6 @@ pub(crate) async fn retrieve_data_payload(
     retrieve_data_joined(data_address, chunk_retrieve_chan, false).await
 }
 
-pub(crate) async fn retrieve_data_payload_cancellable(
-    data_address: &Vec<u8>,
-    chunk_retrieve_chan: &ChunkRetrieveSender,
-    cancel_generations: RetrieveGenerationMap,
-    cancel: RetrieveCancelToken,
-) -> Vec<u8> {
-    retrieve_data_joined_cancellable(
-        data_address,
-        chunk_retrieve_chan,
-        false,
-        Some(cancel_generations),
-        Some(cancel),
-    )
-    .await
-}
-
 pub async fn retrieve_chunk(
     chunk_address: &Vec<u8>,
     control: StreamControl,
@@ -2558,7 +2119,6 @@ pub async fn retrieve_chunk(
     admission: Option<RetrieveAdmission>,
     hedge_demand: Option<SharedRetrieveHedgeDemand>,
     transfer_paused: Option<Arc<AtomicBool>>,
-    profile: Option<RetrieveProfileRequest>,
 ) -> Vec<u8> {
     let (caddr, encrey, encred) = chunk_address_parts(chunk_address);
 
@@ -2679,9 +2239,6 @@ pub async fn retrieve_chunk(
                 let attempt_out = attempt_out.clone();
                 let caddr = caddr.clone();
                 let attempt_admission = admission.clone();
-                let attempt_profile = profile
-                    .as_ref()
-                    .map(RetrieveProfileRequest::physical_attempt);
                 wasm_bindgen_futures::spawn_local(async move {
                     retrieve_attempt(
                         selected,
@@ -2690,7 +2247,6 @@ pub async fn retrieve_chunk(
                         refresh_chan,
                         attempt_out,
                         attempt_admission,
-                        attempt_profile,
                     )
                     .await;
                 });
@@ -2834,7 +2390,6 @@ pub async fn retrieve_check_chunk(
             refresh_chan.clone(),
             attempt_out.clone(),
             None,
-            None,
         )
         .await;
     }
@@ -2928,14 +2483,11 @@ pub fn decrypt(cd: &Vec<u8>, encrey: Vec<u8>) -> Vec<u8> {
     return [spanbytes, content[..span_decrypted as usize].to_vec()].concat();
 }
 
-async fn get_feed_probe_chunk_with_hedge_admission(
+async fn get_feed_probe_chunk(
     data_address: Vec<u8>,
     chunk_retrieve_chan: &ChunkRetrieveSender,
-    retained_policy: Option<RetainedFeedProbePolicy>,
 ) -> FeedProbe<Vec<u8>> {
-    let admission = retained_policy.map_or_else(RetrieveAdmission::new, |policy| {
-        RetrieveAdmission::new_with_attempt_limit(policy.max_physical_attempts)
-    });
+    let admission = RetrieveAdmission::new();
     let _close_admission = admission.close_on_drop();
     let (chan_out, chan_in) = mpsc::unbounded::<Vec<u8>>();
     if chunk_retrieve_chan
@@ -2945,66 +2497,17 @@ async fn get_feed_probe_chunk_with_hedge_admission(
             cancel: None,
             admission: Some(admission.clone()),
             hedge_demand: None,
-            profile: None,
         })
         .is_err()
     {
         return FeedProbe::Transient;
     }
 
-    // Closing admission stops future peer hedges. The original receiver remains owned so a
-    // dispatched exchange can still return a late authenticated payload and settle accounting.
-    let retrieve_result = match retained_policy {
-        Some(policy) => {
-            let response = chan_in.recv();
-            let close_admission = async_std::task::sleep(policy.hedge_admission);
-            pin_mut!(response, close_admission);
-            match select(response, close_admission).await {
-                Either::Left((result, _)) => result,
-                Either::Right(((), response)) => {
-                    admission.close();
-                    response.await
-                }
-            }
-        }
-        None => chan_in.recv().await,
-    };
-
-    // Dropping the listener stops admission, not dispatched accounting settlement.
-    match retrieve_result {
-        Ok(payload) if valid_feed_update_payload(&payload) => FeedProbe::Found(payload),
-        Ok(_) => match retained_policy {
-            Some(policy)
-                if retained_feed_probe_empty_is_missing(
-                    &admission,
-                    policy.max_physical_attempts,
-                ) =>
-            {
-                FeedProbe::Missing
-            }
-            Some(_) => FeedProbe::Transient,
-            None => FeedProbe::Missing,
-        },
+    match chan_in.recv().await {
+        Ok(payload) if !payload.is_empty() => FeedProbe::Found(payload),
+        Ok(_) => FeedProbe::Missing,
         Err(_) => FeedProbe::Transient,
     }
-}
-
-fn valid_feed_update_payload(data: &[u8]) -> bool {
-    !data.is_empty()
-}
-
-async fn probe_feed_update_status_with_hedge_admission(
-    owner: &String,
-    topic: &String,
-    index: u64,
-    chunk_retrieve_chan: &ChunkRetrieveSender,
-    retained_policy: Option<RetainedFeedProbePolicy>,
-) -> FeedProbe<Vec<u8>> {
-    let address = get_feed_address(owner, topic, index);
-    if address.len() != 32 {
-        return FeedProbe::Missing;
-    }
-    get_feed_probe_chunk_with_hedge_admission(address, chunk_retrieve_chan, retained_policy).await
 }
 
 async fn probe_feed_update_status(
@@ -3013,67 +2516,11 @@ async fn probe_feed_update_status(
     index: u64,
     chunk_retrieve_chan: &ChunkRetrieveSender,
 ) -> FeedProbe<Vec<u8>> {
-    probe_feed_update_status_with_hedge_admission(owner, topic, index, chunk_retrieve_chan, None)
-        .await
-}
-
-pub(crate) async fn retrieve_feed_update_at_index(
-    owner: String,
-    topic: String,
-    index: u64,
-    chunk_retrieve_chan: &ChunkRetrieveSender,
-) -> Option<Vec<u8>> {
-    retrieve_feed_update_at_index_status(owner, topic, index, chunk_retrieve_chan)
-        .await
-        .into_option()
-}
-
-pub(crate) async fn retrieve_feed_update_at_index_status(
-    owner: String,
-    topic: String,
-    index: u64,
-    chunk_retrieve_chan: &ChunkRetrieveSender,
-) -> FeedProbe<Vec<u8>> {
-    probe_feed_update_status(&owner, &topic, index, chunk_retrieve_chan).await
-}
-
-/// Stop admitting peer hedges after the bounded feed wave, but retain the original response
-/// receiver until the caller drops this future or the logical retrieval reaches a terminal result.
-pub(crate) async fn retrieve_feed_update_at_index_retained_status(
-    owner: String,
-    topic: String,
-    index: u64,
-    chunk_retrieve_chan: &ChunkRetrieveSender,
-) -> FeedProbe<Vec<u8>> {
-    probe_feed_update_status_with_hedge_admission(
-        &owner,
-        &topic,
-        index,
-        chunk_retrieve_chan,
-        Some(RetainedFeedProbePolicy {
-            hedge_admission: Duration::from_millis(RETRIEVE_FEED_HEDGE_ADMISSION_MS),
-            max_physical_attempts: RETRIEVE_FEED_MAX_PHYSICAL_ATTEMPTS,
-        }),
-    )
-    .await
-}
-
-/// Bound only the SOC probe; dispatched transport still settles accounting.
-pub(crate) async fn retrieve_feed_update_at_index_bounded(
-    owner: String,
-    topic: String,
-    index: u64,
-    chunk_retrieve_chan: &ChunkRetrieveSender,
-) -> Option<Vec<u8>> {
-    match async_std::future::timeout(
-        FEED_FRONTIER_LOOKAHEAD_TIMEOUT,
-        probe_feed_update_status(&owner, &topic, index, chunk_retrieve_chan),
-    )
-    .await
-    {
-        Ok(result) => result.into_option(),
-        Err(_) => None,
+    let address = get_feed_address(owner, topic, index);
+    if address.len() != 32 {
+        return FeedProbe::Missing;
     }
+    get_feed_probe_chunk(address, chunk_retrieve_chan).await
 }
 
 async fn seek_feed_frontier(
@@ -3099,18 +2546,6 @@ async fn seek_feed_frontier(
             .await
         }
     }
-}
-
-async fn seek_feed_frontier_from(
-    owner: String,
-    topic: String,
-    start_index: u64,
-    chunk_retrieve_chan: &ChunkRetrieveSender,
-) -> (Option<(u64, Vec<u8>)>, u64) {
-    seek_sequence_feed_frontier_from((start_index, Vec::new()), |index| {
-        probe_feed_update_status(&owner, &topic, index, chunk_retrieve_chan)
-    })
-    .await
 }
 
 pub async fn seek_latest_feed_update(
@@ -3144,29 +2579,6 @@ pub(crate) async fn seek_latest_feed_update_indexed_observing_positive(
         (Some((index, payload)), _) => Some((index, payload)),
         (None, _) => None,
     }
-}
-
-pub(crate) async fn seek_latest_feed_update_indexed_wide_bounded(
-    owner: String,
-    topic: String,
-    chunk_retrieve_chan: &ChunkRetrieveSender,
-) -> Option<(u64, Vec<u8>)> {
-    seek_sequence_feed_frontier_wide_bounded(|index| {
-        probe_feed_update_status(&owner, &topic, index, chunk_retrieve_chan)
-    })
-    .await
-    .0
-}
-
-pub(crate) async fn seek_latest_feed_update_indexed_from(
-    owner: String,
-    topic: String,
-    start_index: u64,
-    chunk_retrieve_chan: &ChunkRetrieveSender,
-) -> Option<(u64, Vec<u8>)> {
-    seek_feed_frontier_from(owner, topic, start_index, chunk_retrieve_chan)
-        .await
-        .0
 }
 
 pub async fn seek_next_feed_update_index(

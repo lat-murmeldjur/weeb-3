@@ -1,8 +1,6 @@
 pub(crate) const CONNECTION_BUILDUP_LIMIT: u64 = 200;
 pub(crate) const REFRESH_RATE: u64 = 450000;
 const PO_PRICE: u64 = 10000;
-pub(crate) const MAX_CHUNK_PRICE: u64 = 32 * PO_PRICE;
-
 pub(crate) fn refreshment_due(balance: u64, last_refreshment: f64, payment_threshold: u64) -> bool {
     let target = if last_refreshment == 0.0 {
         REFRESH_RATE.saturating_mul(2)

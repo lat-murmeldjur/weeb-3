@@ -1,6 +1,7 @@
 use super::*;
 
-const SERVICE_WORKER_PROTOCOL: f64 = 8.0;
+const SERVICE_WORKER_PROTOCOL: f64 = 10.0;
+const SERVICE_WORKER_MARKER: &str = "forwarder-default24";
 const SERVICE_WORKER_CONTROL_TOTAL_TIMEOUT_MS: u64 = 30_000;
 const SERVICE_WORKER_SETUP_RETRY_MS: f64 = 1_500.0;
 
@@ -369,6 +370,17 @@ pub(super) async fn apply_network_settings_and_connect(
         return;
     }
 
+    let current_network = weeb3.get_network_id().await;
+    if !is_current_network_apply_generation(apply_generation) {
+        return;
+    }
+    let network_switch = network_id
+        .parse::<u64>()
+        .ok()
+        .is_some_and(|requested| requested != current_network);
+    if network_switch {
+        crate::stream::release_current_stream_view();
+    }
     if !weeb3.set_network_id(network_id.clone()).await {
         weeb3.interface_log(format!("Network id switch failed: {}", network_id));
         return;
@@ -1512,8 +1524,8 @@ fn start_service_worker_setup_if_idle() -> bool {
     };
     let setup_lock = SERVICE_WORKER_SETUP_LOCK.with(Arc::clone);
     let Some(setup_guard) = setup_lock.try_lock_arc() else {
-        // Startup already owns setup. Playback keeps polling the controller
-        // instead of spending its readiness deadline queued behind this lock.
+        // A setup attempt already owns registration/update. Readiness keeps
+        // polling the exact implementation and retries after the lock is free.
         return false;
     };
     spawn_local(async move {
@@ -1526,12 +1538,10 @@ fn start_service_worker_setup_if_idle() -> bool {
 async fn get_service_worker_locked(
     service0: &web_sys::ServiceWorkerContainer,
 ) -> Option<web_sys::ServiceWorker> {
-    // Never replace an unrelated host application's worker.
-    if service_worker_forwarder_ready().await {
-        return controlled_service_worker();
-    }
     let expected_worker_url = configured_service_worker_url()?;
     let expected_scope_url = configured_service_worker_scope_url()?;
+    // Never replace an unrelated host application's worker. It may opt into
+    // the exact forwarding implementation without using weeb-3's script URL.
     if let Some(controller) = controlled_service_worker() {
         if controller.script_url() != expected_worker_url {
             if service_worker_forwarder_ready_with_timeout(1_500).await {
@@ -1549,15 +1559,22 @@ async fn get_service_worker_locked(
         ) {
             return None;
         }
+        // Check the no-cache worker script before accepting a same-URL
+        // controller. Protocol alone cannot distinguish an older forwarder.
+        if let Ok(update) = registration.update() {
+            let _ =
+                async_std::future::timeout(Duration::from_secs(10), JsFuture::from(update)).await;
+        }
+        if !expected_service_worker_registration(
+            &registration,
+            &expected_worker_url,
+            &expected_scope_url,
+        ) {
+            return None;
+        }
         if let Some(active) = registration.active() {
-            let _ = request_service_worker_claim(&active).await;
-            if service_worker_forwarder_ready().await {
-                return controlled_service_worker();
-            }
-
-            if let Ok(update) = registration.update() {
-                let _ = async_std::future::timeout(Duration::from_secs(10), JsFuture::from(update))
-                    .await;
+            if let Some(controller) = claim_exact_service_worker(&active).await {
+                return Some(controller);
             }
         }
     }
@@ -1587,11 +1604,9 @@ async fn get_service_worker_locked(
                     return None;
                 }
                 if let Some(service_worker) = registration.active() {
-                    let _ = request_service_worker_claim(&service_worker).await;
-                    if service_worker_forwarder_ready().await {
-                        return controlled_service_worker();
+                    if let Some(controller) = claim_exact_service_worker(&service_worker).await {
+                        return Some(controller);
                     }
-                    return Some(service_worker);
                 }
             }
 
@@ -1608,11 +1623,11 @@ async fn get_service_worker_locked(
                             return None;
                         }
                         if let Some(service_worker) = registration.active() {
-                            let _ = request_service_worker_claim(&service_worker).await;
-                            if service_worker_forwarder_ready().await {
-                                return controlled_service_worker();
+                            if let Some(controller) =
+                                claim_exact_service_worker(&service_worker).await
+                            {
+                                return Some(controller);
                             }
-                            return Some(service_worker);
                         }
                     }
                 }
@@ -1635,8 +1650,7 @@ async fn get_service_worker_locked(
         return None;
     }
     let active = registration.active()?;
-    let _ = request_service_worker_claim(&active).await;
-    controlled_service_worker().or(Some(active))
+    claim_exact_service_worker(&active).await
 }
 
 fn controlled_service_worker() -> Option<web_sys::ServiceWorker> {
@@ -1669,6 +1683,15 @@ async fn request_service_worker_claim(worker: &web_sys::ServiceWorker) -> bool {
     service_worker_protocol_request(worker, "WEEB3_CLAIM", "WEEB3_CLAIMED", 1_500).await
 }
 
+async fn claim_exact_service_worker(
+    worker: &web_sys::ServiceWorker,
+) -> Option<web_sys::ServiceWorker> {
+    if !request_service_worker_claim(worker).await || !service_worker_forwarder_ready().await {
+        return None;
+    }
+    controlled_service_worker()
+}
+
 struct ServiceWorkerProtocolPort {
     port: MessagePort,
     _callback: Closure<dyn FnMut(MessageEvent)>,
@@ -1692,6 +1715,7 @@ async fn service_worker_protocol_request(
     };
     let (sender, receiver) = async_std::channel::bounded::<bool>(1);
     let expected_scope = STREAMING_SERVICE_WORKER_SCOPE;
+    let expected_marker = SERVICE_WORKER_MARKER;
     let expected_response_type = response_type.to_string();
     let callback = Closure::<dyn FnMut(MessageEvent)>::new(move |event: MessageEvent| {
         let data = event.data();
@@ -1706,7 +1730,11 @@ async fn service_worker_protocol_request(
             && Reflect::get(&data, &JsValue::from_str("scope"))
                 .ok()
                 .and_then(|value| value.as_string())
-                .is_some_and(|scope| scope == expected_scope);
+                .is_some_and(|scope| scope == expected_scope)
+            && Reflect::get(&data, &JsValue::from_str("marker"))
+                .ok()
+                .and_then(|value| value.as_string())
+                .is_some_and(|marker| marker == expected_marker);
         let _ = sender.try_send(matches);
     });
     let protocol_port = ServiceWorkerProtocolPort {
@@ -1723,6 +1751,11 @@ async fn service_worker_protocol_request(
         &ping,
         &JsValue::from_str("type"),
         &JsValue::from_str(request_type),
+    );
+    let _ = Reflect::set(
+        &ping,
+        &JsValue::from_str("protocol"),
+        &JsValue::from_f64(SERVICE_WORKER_PROTOCOL),
     );
     let transfer = Array::new();
     transfer.push(&channel.port2());
@@ -1742,9 +1775,10 @@ async fn service_worker_protocol_request(
 
 pub(crate) fn service_worker_scope_protocol_error(purpose: &str) -> String {
     format!(
-        "Service Worker protocol {} did not become ready for {}: configured worker {} did not \
+        "Service Worker protocol {} implementation {} did not become ready for {}: configured worker {} did not \
          claim scope {} and answer WEEB3_PING within {} ms.",
         SERVICE_WORKER_PROTOCOL as u8,
+        SERVICE_WORKER_MARKER,
         purpose,
         STREAMING_SERVICE_WORKER_URL,
         STREAMING_SERVICE_WORKER_SCOPE,
@@ -1757,16 +1791,24 @@ async fn wait_for_service_worker_control(
     purpose: &str,
     still_needed: &impl Fn() -> bool,
 ) -> bool {
-    if service_worker_forwarder_ready().await {
-        return true;
-    }
     if service_worker_container().is_none() {
         weeb3.interface_log(format!("service worker unavailable for {}", purpose));
         return false;
     }
 
     weeb3.interface_log(format!("service worker activating for {}", purpose));
-    let mut next_setup_retry_ms: f64 = 0.0;
+    // Serialize behind any startup registration so a stale same-URL controller
+    // cannot satisfy readiness before its registration has been updated.
+    let _ = get_service_worker().await;
+    if !still_needed() {
+        return false;
+    }
+    if service_worker_forwarder_ready().await {
+        weeb3.interface_log(format!("service worker controls {}", purpose));
+        return true;
+    }
+
+    let mut next_setup_retry_ms = js_sys::Date::now() + SERVICE_WORKER_SETUP_RETRY_MS;
     let mut activation_retry_logged = false;
     loop {
         if !still_needed() {

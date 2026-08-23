@@ -324,56 +324,6 @@ pub(crate) fn media_prefetch_stage_targets(ahead_limit_bytes: u64) -> Vec<u64> {
     targets
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct MediaPrefetchBatch {
-    pub(crate) unit_count: usize,
-    pub(crate) additional_bytes: u64,
-    pub(crate) planned_end_bytes: u64,
-}
-
-pub(crate) fn plan_media_prefetch_batch(
-    already_planned_bytes: u64,
-    stage_target_bytes: u64,
-    hard_limit_bytes: u64,
-    ordered_unit_sizes: &[u64],
-) -> MediaPrefetchBatch {
-    let hard_limit = hard_limit_bytes.min(MEDIA_PREFETCH_AHEAD_HARD_LIMIT_BYTES);
-    let stage_target = stage_target_bytes.min(hard_limit);
-    if already_planned_bytes >= stage_target || already_planned_bytes >= hard_limit {
-        return MediaPrefetchBatch {
-            planned_end_bytes: already_planned_bytes,
-            ..MediaPrefetchBatch::default()
-        };
-    }
-
-    let mut planned_end = already_planned_bytes;
-    let mut unit_count = 0;
-
-    for &unit_size in ordered_unit_sizes.iter().take(MEDIA_PREFETCH_MAX_PARALLEL) {
-        if unit_size == 0 {
-            break;
-        }
-        let Some(next_end) = planned_end.checked_add(unit_size) else {
-            break;
-        };
-        if next_end > hard_limit {
-            break;
-        }
-
-        planned_end = next_end;
-        unit_count += 1;
-        if planned_end >= stage_target {
-            break;
-        }
-    }
-
-    MediaPrefetchBatch {
-        unit_count,
-        additional_bytes: planned_end.saturating_sub(already_planned_bytes),
-        planned_end_bytes: planned_end,
-    }
-}
-
 fn positive_finite(value: Option<f64>) -> Option<f64> {
     value.filter(|value| value.is_finite() && *value > 0.0)
 }

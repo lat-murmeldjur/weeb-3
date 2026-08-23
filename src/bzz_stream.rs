@@ -1,32 +1,25 @@
 use crate::{
     ChunkRetrieveSender, RetrieveCancelToken, RetrieveGenerationMap,
     erasure_coding::{CHUNK_SIZE, decode_span, encoded_reference_payload_len},
-    feed::{FeedProbe, overscan_sequence_feed_candidate},
     manifest::{
         BzzManifestFork, MAX_PARALLEL_MANIFEST_FORKS, ParsedBzzManifest, ResolutionGuard,
         is_bzz_manifest_header, manifest_payload_size_allowed, manifest_wrapped_reference,
         parse_bzz_manifest,
     },
-    mpsc,
     retrieval::{
-        DecodedJoinChunk, RawFetchLifecycleFactory, retrieve_data, retrieve_data_range_from_root,
-        retrieve_data_range_from_root_cancellable_with_lifecycle_factory,
-        retrieve_data_range_from_root_conservative, retrieve_decoded_data_root,
-        retrieve_decoded_data_root_cancellable, retrieve_feed_update_at_index,
-        retrieve_feed_update_at_index_bounded, retrieve_feed_update_at_index_retained_status,
-        retrieve_feed_update_at_index_status, seek_latest_feed_update,
-        seek_latest_feed_update_indexed_from, seek_latest_feed_update_indexed_observing_positive,
-        seek_latest_feed_update_indexed_wide_bounded,
+        DecodedJoinChunk, retrieve_data, retrieve_data_range_from_root,
+        retrieve_data_range_from_root_cancellable, retrieve_data_range_from_root_conservative,
+        retrieve_decoded_data_root, retrieve_decoded_data_root_cancellable,
+        seek_latest_feed_update,
     },
     retrieve_cancel_token_current,
 };
 
 use libp2p::futures::{StreamExt, stream};
-use std::{future::Future, rc::Rc, time::Duration};
+use std::{rc::Rc, time::Duration};
 
 const RANGE_RETRIEVE_RETRY_COUNT: usize = 2;
 const RANGE_RETRIEVE_RETRY_WAIT_MS: u64 = 120;
-const OBSERVED_FEED_PAYLOAD_DECODES: usize = 3;
 
 #[derive(Clone, Debug)]
 pub struct BzzResource {
@@ -251,560 +244,77 @@ async fn retrieve_embedded_payload_with_span_bounded(
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct RawFeedPayload {
-    pub index: u64,
-    pub bytes: Vec<u8>,
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct DeferredRawFeedPayload {
+pub(crate) struct FeedPayloadRoot {
     pub(crate) index: u64,
-    update: Vec<u8>,
-    span: u64,
+    root: DecodedJoinChunk,
+    encrypted: bool,
 }
 
-impl DeferredRawFeedPayload {
-    pub(crate) fn payload_span(&self) -> u64 {
-        self.span
-    }
-
-    pub(crate) fn retained_bytes(&self) -> usize {
-        self.update.len()
+impl FeedPayloadRoot {
+    pub(crate) fn span(&self) -> u64 {
+        self.root.span
     }
 }
 
-/// An authenticated leading range of a deferred feed payload.
-///
-/// `bytes` is shorter than `payload_span`; keeping this distinct from
-/// [`RawFeedPayload`] prevents a bounded startup range from being mistaken for
-/// a completely retrieved feed payload.
-#[derive(Clone, Debug)]
-pub(crate) struct DeferredRawFeedPayloadPrefix {
-    pub(crate) index: u64,
-    pub(crate) payload_span: u64,
-    pub(crate) bytes: Vec<u8>,
-}
-
-fn deferred_raw_feed_payload_root(
-    deferred: &DeferredRawFeedPayload,
-) -> Option<(DecodedJoinChunk, bool)> {
+pub(crate) fn decode_feed_payload_root(index: u64, update: Vec<u8>) -> Option<FeedPayloadRoot> {
     [false, true].into_iter().find_map(|encrypted| {
-        let root = embedded_join_root(&deferred.update, encrypted)?;
-        (root.span == deferred.span).then_some((root, encrypted))
+        let root = embedded_join_root(&update, encrypted)?;
+        manifest_payload_size_allowed(root.span).then_some(FeedPayloadRoot {
+            index,
+            root,
+            encrypted,
+        })
     })
 }
 
-fn conservative_deferred_payload_range(
-    payload_span: u64,
-    start: u64,
-    maximum_len: u64,
-) -> Option<(u64, u64)> {
-    if start >= payload_span
-        || maximum_len == 0
-        || maximum_len > crate::retrieval::CONSERVATIVE_DEFERRED_RANGE_BYTES
-    {
-        return None;
-    }
-    let len = payload_span.checked_sub(start)?.min(maximum_len);
-    let end_inclusive = start.checked_add(len)?.checked_sub(1)?;
-    Some((start, end_inclusive))
-}
-
-#[derive(Clone, Debug)]
-pub(crate) enum RetainedRawFeedPayloadProbe {
-    Found(RawFeedPayload),
-    Deferred(DeferredRawFeedPayload),
-    Missing,
-    Transient,
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct StartupRawFeedPayload {
-    pub(crate) playable: RawFeedPayload,
-    pub(crate) observed_deferred: Option<DeferredRawFeedPayload>,
-}
-
-fn defer_large_raw_feed_update(index: u64, update: Vec<u8>) -> Option<DeferredRawFeedPayload> {
-    let span = [false, true]
-        .into_iter()
-        .find_map(|encrypted| embedded_join_root(&update, encrypted).map(|root| root.span))?;
-    (span > CHUNK_SIZE as u64 && manifest_payload_size_allowed(span)).then_some(
-        DeferredRawFeedPayload {
-            index,
-            update,
-            span,
-        },
-    )
-}
-
-async fn raw_feed_payload_from_update(
-    update: &[u8],
-    chunk_retrieve_chan: &ChunkRetrieveSender,
-) -> Option<Vec<u8>> {
-    raw_feed_payload_from_update_bounded(update, chunk_retrieve_chan, None).await
-}
-
-async fn raw_feed_payload_from_update_bounded(
-    update: &[u8],
-    chunk_retrieve_chan: &ChunkRetrieveSender,
-    maximum_span: Option<u64>,
-) -> Option<Vec<u8>> {
-    for encrypted in [false, true] {
-        let Some((_, payload)) = retrieve_embedded_payload_with_span_bounded(
-            update,
-            encrypted,
-            chunk_retrieve_chan,
-            maximum_span,
-        )
-        .await
-        else {
-            continue;
-        };
-        return Some(payload);
-    }
-    None
-}
-
-enum ObservedRawFeedPayload {
-    Complete(RawFeedPayload),
-    Deferred(DeferredRawFeedPayload),
-}
-
-fn decode_observed_feed_updates(
-    payloads: Option<mpsc::Sender<RawFeedPayload>>,
-    deferred_payloads: Option<mpsc::Sender<DeferredRawFeedPayload>>,
-    maximum_index: Option<u64>,
-    chunk_retrieve_chan: &ChunkRetrieveSender,
-) -> Option<mpsc::Sender<(u64, Vec<u8>)>> {
-    if payloads.is_none() && deferred_payloads.is_none() {
-        return None;
-    }
-    let (updates_out, updates_in) = mpsc::bounded::<(u64, Vec<u8>)>(16);
-    let chunk_retrieve_chan = chunk_retrieve_chan.clone();
-    let decode_complete = payloads.is_some();
-    wasm_bindgen_futures::spawn_local(async move {
-        let mut payloads = payloads;
-        let mut decoded = updates_in
-            .map(move |(index, update)| {
-                let chunk_retrieve_chan = chunk_retrieve_chan.clone();
-                async move {
-                    if decode_span(&update).is_some_and(|(_, span)| span > CHUNK_SIZE as u64) {
-                        return defer_large_raw_feed_update(index, update)
-                            .map(ObservedRawFeedPayload::Deferred);
-                    }
-                    if maximum_index.is_some_and(|maximum| index > maximum) || !decode_complete {
-                        return None;
-                    }
-                    raw_feed_payload_from_update(&update, &chunk_retrieve_chan)
-                        .await
-                        .map(|bytes| {
-                            ObservedRawFeedPayload::Complete(RawFeedPayload { index, bytes })
-                        })
-                }
-            })
-            .buffer_unordered(OBSERVED_FEED_PAYLOAD_DECODES);
-        while let Some(Some(observed)) = decoded.next().await {
-            match observed {
-                ObservedRawFeedPayload::Complete(payload) => {
-                    let Some(output) = payloads.as_ref() else {
-                        continue;
-                    };
-                    if output.send(payload).await.is_err() {
-                        payloads = None;
-                    }
-                }
-                ObservedRawFeedPayload::Deferred(payload) => {
-                    if let Some(output) = deferred_payloads.as_ref() {
-                        let _ = output.try_send(payload);
-                    }
-                }
-            }
-        }
-    });
-    Some(updates_out)
-}
-
-pub(crate) async fn acquire_raw_feed_payload_at_index(
-    owner: String,
-    topic: String,
-    index: u64,
-    chunk_retrieve_chan: &ChunkRetrieveSender,
-) -> Option<RawFeedPayload> {
-    let update = retrieve_feed_update_at_index(owner, topic, index, chunk_retrieve_chan).await?;
-    let bytes = raw_feed_payload_from_update(&update, chunk_retrieve_chan).await?;
-    Some(RawFeedPayload { index, bytes })
-}
-
-pub(crate) async fn acquire_raw_feed_payload_at_index_retained_status(
-    owner: String,
-    topic: String,
-    index: u64,
+pub(crate) async fn retrieve_feed_payload(
+    payload: &FeedPayloadRoot,
     maximum_payload_bytes: usize,
     chunk_retrieve_chan: &ChunkRetrieveSender,
-) -> RetainedRawFeedPayloadProbe {
-    let update = match retrieve_feed_update_at_index_retained_status(
-        owner,
-        topic,
-        index,
-        chunk_retrieve_chan,
-    )
-    .await
-    {
-        FeedProbe::Found(update) => update,
-        FeedProbe::Missing => return RetainedRawFeedPayloadProbe::Missing,
-        FeedProbe::Transient => return RetainedRawFeedPayloadProbe::Transient,
-    };
-    let Some(maximum_span) = u64::try_from(maximum_payload_bytes).ok() else {
-        return RetainedRawFeedPayloadProbe::Transient;
-    };
-    let Some(span) = [false, true]
-        .into_iter()
-        .find_map(|encrypted| embedded_join_root(&update, encrypted).map(|root| root.span))
-    else {
-        return RetainedRawFeedPayloadProbe::Transient;
-    };
-    if span > maximum_span {
-        return RetainedRawFeedPayloadProbe::Deferred(DeferredRawFeedPayload {
-            index,
-            update,
-            span,
-        });
-    }
-    let Some(bytes) =
-        raw_feed_payload_from_update_bounded(&update, chunk_retrieve_chan, Some(maximum_span))
-            .await
-    else {
-        return RetainedRawFeedPayloadProbe::Transient;
-    };
-    RetainedRawFeedPayloadProbe::Found(RawFeedPayload { index, bytes })
-}
-
-pub(crate) async fn acquire_deferred_raw_feed_payload(
-    deferred: DeferredRawFeedPayload,
-    maximum_payload_bytes: usize,
-    chunk_retrieve_chan: &ChunkRetrieveSender,
-) -> Option<RawFeedPayload> {
+) -> Option<Vec<u8>> {
     let maximum_span = u64::try_from(maximum_payload_bytes).ok()?;
-    if deferred.span > maximum_span {
+    let span = payload.root.span;
+    if span > maximum_span {
         return None;
     }
-    let bytes = raw_feed_payload_from_update_bounded(
-        &deferred.update,
+    if span == 0 {
+        return Some(Vec::new());
+    }
+    let bytes = retrieve_data_range_from_root(
+        payload.root.clone(),
+        0,
+        span.checked_sub(1)?,
+        payload.encrypted,
         chunk_retrieve_chan,
-        Some(maximum_span),
     )
     .await?;
-    (u64::try_from(bytes.len()).ok()? == deferred.span).then_some(RawFeedPayload {
-        index: deferred.index,
-        bytes,
-    })
+    (u64::try_from(bytes.len()).ok()? == span).then_some(bytes)
 }
 
-pub(crate) async fn probe_deferred_raw_feed_payload_tail_conservative(
-    deferred: &DeferredRawFeedPayload,
+pub(crate) async fn retrieve_feed_payload_tail_conservative(
+    payload: &FeedPayloadRoot,
     maximum_tail_bytes: usize,
     chunk_retrieve_chan: &ChunkRetrieveSender,
 ) -> Option<Vec<u8>> {
     let maximum_tail_bytes = u64::try_from(maximum_tail_bytes)
         .ok()?
-        .min(crate::retrieval::CONSERVATIVE_DEFERRED_RANGE_BYTES);
-    let (root, encrypted) = deferred_raw_feed_payload_root(deferred)?;
-    if root.span == 0 || !manifest_payload_size_allowed(root.span) {
+        .min(crate::retrieval::CONSERVATIVE_RANGE_BYTES);
+    let span = payload.root.span;
+    if span == 0 || maximum_tail_bytes == 0 {
         return None;
     }
-    let tail_start = root.span.saturating_sub(maximum_tail_bytes);
-    let (start, end_inclusive) =
-        conservative_deferred_payload_range(root.span, tail_start, maximum_tail_bytes)?;
+    let start = span.saturating_sub(maximum_tail_bytes);
+    let end_inclusive = span.checked_sub(1)?;
     let expected_len = end_inclusive.checked_sub(start)?.checked_add(1)?;
     let tail = retrieve_data_range_from_root_conservative(
-        root,
+        payload.root.clone(),
         start,
         end_inclusive,
-        encrypted,
+        payload.encrypted,
         chunk_retrieve_chan,
     )
     .await?;
     (u64::try_from(tail.len()).ok()? == expected_len).then_some(tail)
-}
-
-pub(crate) async fn acquire_deferred_raw_feed_payload_prefix_conservative(
-    deferred: &DeferredRawFeedPayload,
-    maximum_prefix_bytes: usize,
-    chunk_retrieve_chan: &ChunkRetrieveSender,
-) -> Option<DeferredRawFeedPayloadPrefix> {
-    let maximum_prefix_bytes = u64::try_from(maximum_prefix_bytes)
-        .ok()?
-        .min(crate::retrieval::CONSERVATIVE_DEFERRED_RANGE_BYTES);
-    let (root, encrypted) = deferred_raw_feed_payload_root(deferred)?;
-    if root.span <= crate::retrieval::CONSERVATIVE_DEFERRED_RANGE_BYTES
-        || !manifest_payload_size_allowed(root.span)
-    {
-        return None;
-    }
-    let (start, end_inclusive) =
-        conservative_deferred_payload_range(root.span, 0, maximum_prefix_bytes)?;
-    let expected_len = end_inclusive.checked_sub(start)?.checked_add(1)?;
-    let bytes = retrieve_data_range_from_root_conservative(
-        root,
-        start,
-        end_inclusive,
-        encrypted,
-        chunk_retrieve_chan,
-    )
-    .await?;
-    (u64::try_from(bytes.len()).ok()? == expected_len).then_some(DeferredRawFeedPayloadPrefix {
-        index: deferred.index,
-        payload_span: deferred.span,
-        bytes,
-    })
-}
-
-pub(crate) async fn acquire_deferred_raw_feed_payload_conservative<F, Fut>(
-    deferred: DeferredRawFeedPayload,
-    maximum_payload_bytes: usize,
-    chunk_retrieve_chan: &ChunkRetrieveSender,
-    mut admit_range: F,
-) -> Option<RawFeedPayload>
-where
-    F: FnMut() -> Fut,
-    Fut: Future<Output = bool>,
-{
-    let maximum_span = u64::try_from(maximum_payload_bytes).ok()?;
-    let (root, encrypted) = deferred_raw_feed_payload_root(&deferred)?;
-    if root.span == 0 || root.span > maximum_span || !manifest_payload_size_allowed(root.span) {
-        return None;
-    }
-    let span = root.span;
-    let mut bytes = Vec::new();
-    bytes.try_reserve_exact(usize::try_from(span).ok()?).ok()?;
-    let mut start = 0u64;
-    while let Some((range_start, range_end)) = conservative_deferred_payload_range(
-        span,
-        start,
-        crate::retrieval::CONSERVATIVE_DEFERRED_RANGE_BYTES,
-    ) {
-        if !admit_range().await {
-            return None;
-        }
-        let range = retrieve_data_range_from_root_conservative(
-            root.clone(),
-            range_start,
-            range_end,
-            encrypted,
-            chunk_retrieve_chan,
-        )
-        .await?;
-        let expected_len = range_end.checked_sub(range_start)?.checked_add(1)?;
-        if u64::try_from(range.len()).ok()? != expected_len {
-            return None;
-        }
-        bytes.extend_from_slice(&range);
-        start = range_end.checked_add(1)?;
-    }
-    (start == span && u64::try_from(bytes.len()).ok()? == span).then_some(RawFeedPayload {
-        index: deferred.index,
-        bytes,
-    })
-}
-
-pub(crate) async fn acquire_raw_feed_payload_at_index_bounded(
-    owner: String,
-    topic: String,
-    index: u64,
-    chunk_retrieve_chan: &ChunkRetrieveSender,
-) -> Option<RawFeedPayload> {
-    let update =
-        retrieve_feed_update_at_index_bounded(owner, topic, index, chunk_retrieve_chan).await?;
-    let bytes = raw_feed_payload_from_update(&update, chunk_retrieve_chan).await?;
-    Some(RawFeedPayload { index, bytes })
-}
-
-pub(crate) async fn acquire_latest_raw_feed_payload_startup_observing_deferred(
-    owner: String,
-    topic: String,
-    chunk_retrieve_chan: &ChunkRetrieveSender,
-    early_payloads: Option<mpsc::Sender<RawFeedPayload>>,
-    early_payload_max_index: Option<u64>,
-) -> Option<StartupRawFeedPayload> {
-    acquire_latest_raw_feed_payload_startup_observing_updates(
-        owner,
-        topic,
-        chunk_retrieve_chan,
-        early_payloads,
-        early_payload_max_index,
-        None,
-    )
-    .await
-}
-
-pub(crate) async fn acquire_latest_raw_feed_payload_startup_observing_updates(
-    owner: String,
-    topic: String,
-    chunk_retrieve_chan: &ChunkRetrieveSender,
-    early_payloads: Option<mpsc::Sender<RawFeedPayload>>,
-    early_payload_max_index: Option<u64>,
-    observed_deferred: Option<mpsc::Sender<DeferredRawFeedPayload>>,
-) -> Option<StartupRawFeedPayload> {
-    // Keep the wide startup search when there is no progressive complete-payload
-    // observer. The bounded positive-observation frontier is selected only by
-    // the same condition as before; a deferred observer alone must not narrow
-    // the search.
-    let early_updates = early_payloads.and_then(|payloads| {
-        decode_observed_feed_updates(
-            Some(payloads),
-            observed_deferred.clone(),
-            early_payload_max_index,
-            chunk_retrieve_chan,
-        )
-    });
-    let (index, update) = match early_updates {
-        Some(early_updates) => {
-            seek_latest_feed_update_indexed_observing_positive(
-                owner,
-                topic,
-                chunk_retrieve_chan,
-                Some(early_updates),
-            )
-            .await?
-        }
-        None => {
-            let (index, update) = seek_latest_feed_update_indexed_wide_bounded(
-                owner.clone(),
-                topic.clone(),
-                chunk_retrieve_chan,
-            )
-            .await?;
-            let large_update =
-                decode_span(&update).is_some_and(|(_, span)| span > CHUNK_SIZE as u64);
-            let deferred = large_update
-                .then(|| defer_large_raw_feed_update(index, update.clone()))
-                .flatten();
-            if let (Some(output), Some(deferred)) = (observed_deferred.as_ref(), deferred.as_ref())
-            {
-                let _ = output.try_send(deferred.clone());
-            }
-            if large_update
-                && let Some(previous_index) = index.checked_sub(1)
-                && let Some(previous) = retrieve_feed_update_at_index_bounded(
-                    owner,
-                    topic,
-                    previous_index,
-                    chunk_retrieve_chan,
-                )
-                .await
-                && let Some(bytes) =
-                    raw_feed_payload_from_update(&previous, chunk_retrieve_chan).await
-            {
-                return Some(StartupRawFeedPayload {
-                    playable: RawFeedPayload {
-                        index: previous_index,
-                        bytes,
-                    },
-                    observed_deferred: deferred,
-                });
-            }
-            (index, update)
-        }
-    };
-    let bytes = raw_feed_payload_from_update(&update, chunk_retrieve_chan).await?;
-    Some(StartupRawFeedPayload {
-        playable: RawFeedPayload { index, bytes },
-        observed_deferred: None,
-    })
-}
-
-pub(crate) async fn acquire_latest_raw_feed_payload_bounded_from<AdmitWave, AdmitFuture>(
-    owner: String,
-    topic: String,
-    initial: RawFeedPayload,
-    force_coarse: bool,
-    chunk_retrieve_chan: &ChunkRetrieveSender,
-    admit_wave: AdmitWave,
-    observed_payloads: Option<mpsc::Sender<RawFeedPayload>>,
-) -> Option<(RawFeedPayload, bool)>
-where
-    AdmitWave: Fn(usize) -> AdmitFuture,
-    AdmitFuture: std::future::Future<Output = bool>,
-{
-    acquire_latest_raw_feed_payload_bounded_from_observing_deferred(
-        owner,
-        topic,
-        initial,
-        force_coarse,
-        chunk_retrieve_chan,
-        admit_wave,
-        observed_payloads,
-        None,
-    )
-    .await
-}
-
-pub(crate) async fn acquire_latest_raw_feed_payload_bounded_from_observing_deferred<
-    AdmitWave,
-    AdmitFuture,
->(
-    owner: String,
-    topic: String,
-    initial: RawFeedPayload,
-    force_coarse: bool,
-    chunk_retrieve_chan: &ChunkRetrieveSender,
-    admit_wave: AdmitWave,
-    observed_payloads: Option<mpsc::Sender<RawFeedPayload>>,
-    observed_deferred: Option<mpsc::Sender<DeferredRawFeedPayload>>,
-) -> Option<(RawFeedPayload, bool)>
-where
-    AdmitWave: Fn(usize) -> AdmitFuture,
-    AdmitFuture: std::future::Future<Output = bool>,
-{
-    let observed_updates = decode_observed_feed_updates(
-        observed_payloads,
-        observed_deferred,
-        None,
-        chunk_retrieve_chan,
-    );
-    let ((index, update), verified) = overscan_sequence_feed_candidate(
-        (initial.index, Vec::new()),
-        force_coarse,
-        |index| {
-            retrieve_feed_update_at_index_status(
-                owner.clone(),
-                topic.clone(),
-                index,
-                chunk_retrieve_chan,
-            )
-        },
-        admit_wave,
-        |index, update| {
-            if let Some(observed_updates) = observed_updates.as_ref() {
-                let _ = observed_updates.try_send((index, update.clone()));
-            }
-        },
-    )
-    .await;
-    if index == initial.index {
-        return Some((initial, verified));
-    }
-    let bytes = raw_feed_payload_from_update(&update, chunk_retrieve_chan).await?;
-    Some((RawFeedPayload { index, bytes }, verified))
-}
-
-pub(crate) async fn acquire_latest_raw_feed_payload_from(
-    owner: String,
-    topic: String,
-    initial: RawFeedPayload,
-    chunk_retrieve_chan: &ChunkRetrieveSender,
-) -> Option<RawFeedPayload> {
-    let (index, update) =
-        seek_latest_feed_update_indexed_from(owner, topic, initial.index, chunk_retrieve_chan)
-            .await?;
-    if index == initial.index {
-        return Some(initial);
-    }
-    if index < initial.index {
-        return None;
-    }
-    let bytes = raw_feed_payload_from_update(&update, chunk_retrieve_chan).await?;
-    Some(RawFeedPayload { index, bytes })
 }
 
 async fn retrieve_data_head(
@@ -1480,7 +990,6 @@ pub async fn acquire_resolved_range(
         chunk_retrieve_chan,
         None,
         None,
-        None,
     )
     .await
 }
@@ -1492,7 +1001,6 @@ pub async fn acquire_resolved_range_cancellable(
     chunk_retrieve_chan: &ChunkRetrieveSender,
     cancel: Option<RetrieveCancelToken>,
     cancel_generations: Option<RetrieveGenerationMap>,
-    raw_fetch_lifecycle_factory: Option<RawFetchLifecycleFactory>,
 ) -> Option<(Vec<u8>, BzzMetadata)> {
     if start > end_inclusive || start >= metadata.size {
         return None;
@@ -1516,7 +1024,6 @@ pub async fn acquire_resolved_range_cancellable(
             chunk_retrieve_chan,
             cancel.clone(),
             cancel_generations.clone(),
-            raw_fetch_lifecycle_factory.clone(),
         )
         .await;
 
@@ -1557,7 +1064,6 @@ pub async fn retrieve_data_range_cancellable(
     chunk_retrieve_chan: &ChunkRetrieveSender,
     cancel: Option<RetrieveCancelToken>,
     cancel_generations: Option<RetrieveGenerationMap>,
-    raw_fetch_lifecycle_factory: Option<RawFetchLifecycleFactory>,
 ) -> Vec<u8> {
     if start > end_inclusive {
         return vec![];
@@ -1604,7 +1110,7 @@ pub async fn retrieve_data_range_cancellable(
     let payload_start = start.max(8) - 8;
     let payload_end = end_inclusive - 8;
     let encrypted = data_address.len() == 64;
-    let Some(payload) = retrieve_data_range_from_root_cancellable_with_lifecycle_factory(
+    let Some(payload) = retrieve_data_range_from_root_cancellable(
         root,
         payload_start,
         payload_end,
@@ -1612,7 +1118,6 @@ pub async fn retrieve_data_range_cancellable(
         chunk_retrieve_chan,
         cancel_generations.clone(),
         cancel.clone(),
-        raw_fetch_lifecycle_factory,
     )
     .await
     else {

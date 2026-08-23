@@ -539,6 +539,14 @@ impl Weeb3No103 {
         spawn_local(async move {
             let _guard = serial.lock().await;
             let network_id = options.network_id;
+            let current_network = inner.get_network_id().await;
+            let network_switch = network_id
+                .parse::<u64>()
+                .ok()
+                .is_some_and(|requested| requested != current_network);
+            if network_switch {
+                crate::stream::release_current_stream_view();
+            }
             if inner.set_network_id(network_id.clone()).await {
                 start_weeb3_runtime(inner.clone());
                 schedule_bootnode_dials(inner, network_id, options.bootstrap_nodes);
@@ -689,6 +697,9 @@ impl Weeb3No103 {
         self.startup_configured.store(true, Ordering::Release);
         let profile = profile_for_mode(mode);
         let network_id = profile.swarm_network_id.to_string();
+        if self.inner.get_network_id().await != profile.swarm_network_id {
+            crate::stream::release_current_stream_view();
+        }
         if !self.inner.set_network_id(network_id.clone()).await {
             self.startup_pending.fetch_sub(1, Ordering::AcqRel);
             return error_object("network id switch failed");

@@ -9,16 +9,15 @@ const RAW_ROUTE_KINDS = [
   ["chunks", "chunk"]
 ];
 const FETCH_TIMEOUT_MS = 240000;
-const SERVICE_WORKER_MARKER = "forwarder-default20";
-const SERVICE_WORKER_PROTOCOL = 8;
+const SERVICE_WORKER_MARKER = "forwarder-default24";
+const SERVICE_WORKER_PROTOCOL = 10;
 const MIB_BYTES = 1024 * 1024;
 const STREAM_STORAGE_WINDOW_BYTES = MIB_BYTES / 2;
 const STREAM_LOOKAHEAD_CHUNKS = 8;
-const HLS_STREAM_LOOKAHEAD_CHUNKS = 4;
-const HLS_STREAM_READY_ADMISSION_THRESHOLD = HLS_STREAM_LOOKAHEAD_CHUNKS - 1;
-const HLS_STREAM_MAX_OUTSTANDING =
-  HLS_STREAM_LOOKAHEAD_CHUNKS + HLS_STREAM_READY_ADMISSION_THRESHOLD - 1;
-const HLS_REQUEST_FLIGHTS = new Map();
+const HLS_STREAM_WINDOW_BYTES = MIB_BYTES / 2;
+const HLS_STREAM_LOOKAHEAD_CHUNKS = 8;
+const HLS_LIVE_STREAM_WINDOW_BYTES = 64 * 1024;
+const HLS_LIVE_STREAM_LOOKAHEAD_CHUNKS = 32;
 const CLIENT_RUNTIME_PROBES = new Map();
 const CLIENT_RUNTIME_PROBE_TIMEOUT_MS = 1_500;
 
@@ -166,6 +165,17 @@ function canonicalFeedResource(url) {
   return null;
 }
 
+function isHlsResource(url) {
+  if (canonicalFeedResource(url) !== null) {
+    return true;
+  }
+  return rawRouteMarkers().some(([marker, rawType]) =>
+    rawType === "hls-bytes" &&
+    url.pathname.startsWith(marker) &&
+    canonicalRawResource(url) !== null
+  );
+}
+
 function isAppShellNavigation(request) {
   const headerDestination = request.headers.get("Sec-Fetch-Dest") || "";
   return request.method === "GET" &&
@@ -202,6 +212,12 @@ self.addEventListener("activate", (event) => {
 });
 
 self.addEventListener("message", (event) => {
+  if (
+    (event.data?.type === "WEEB3_CLAIM" || event.data?.type === "WEEB3_PING") &&
+    event.data?.protocol !== SERVICE_WORKER_PROTOCOL
+  ) {
+    return;
+  }
   if (event.data?.type === "WEEB3_CLAIM") {
     const port = event.ports?.[0];
     event.waitUntil((async () => {
@@ -209,7 +225,8 @@ self.addEventListener("message", (event) => {
       port?.postMessage({
         type: "WEEB3_CLAIMED",
         protocol: SERVICE_WORKER_PROTOCOL,
-        scope: SCOPE_PATH
+        scope: SCOPE_PATH,
+        marker: SERVICE_WORKER_MARKER
       });
     })());
     return;
@@ -225,7 +242,8 @@ self.addEventListener("message", (event) => {
   port.postMessage({
     type: "WEEB3_PONG",
     protocol: SERVICE_WORKER_PROTOCOL,
-    scope: SCOPE_PATH
+    scope: SCOPE_PATH,
+    marker: SERVICE_WORKER_MARKER
   });
 });
 
@@ -377,12 +395,7 @@ async function requestClients(event, requestUrl, requiredNetworkId) {
   const eventClientId = event.clientId || "";
   const eventClient = eventClientId ? await self.clients.get(eventClientId) : null;
   const requestUrlObject = requestUrl ? new URL(requestUrl) : null;
-  const directHlsRequest = requestUrlObject !== null && (
-    canonicalFeedResource(requestUrlObject) !== null ||
-    rawRouteMarkers().some(([marker, rawType]) =>
-      rawType === "hls-bytes" && requestUrlObject.pathname.startsWith(marker)
-    )
-  );
+  const directHlsRequest = requestUrlObject !== null && isHlsResource(requestUrlObject);
 
   // Direct top-level HLS requests skip the redundant liveness probe.
   if (
@@ -499,39 +512,6 @@ function messageFirstClient(clients, message, timeoutMs = FETCH_TIMEOUT_MS) {
   return messageClient(clients[0], message, timeoutMs);
 }
 
-function hlsRequestFlightKey(
-  clients,
-  requestUrl,
-  method,
-  range,
-  ifNoneMatch,
-  ifRange
-) {
-  if (!clients.length || !clients[0] || !clients[0].id) {
-    return null;
-  }
-
-  const url = new URL(requestUrl);
-  const hlsRoute = rawRouteMarkers().some(([marker, rawType]) =>
-    rawType === "hls-bytes" && url.pathname.startsWith(marker)
-  );
-  const hlsAsset = hlsRoute && canonicalRawResource(url) !== null;
-  const feedManifest = canonicalFeedResource(url) !== null;
-  if (!hlsAsset && !feedManifest) {
-    return null;
-  }
-
-  return [
-    clients[0].id,
-    method.toUpperCase(),
-    url.pathname.toLowerCase(),
-    url.search,
-    range.trim().toLowerCase(),
-    ifNoneMatch.trim(),
-    ifRange.trim()
-  ].join("|");
-}
-
 function requestRustFetch(
   clients,
   requestUrl,
@@ -541,32 +521,7 @@ function requestRustFetch(
   ifNoneMatch = "",
   ifRange = ""
 ) {
-  const key = hlsRequestFlightKey(
-    clients,
-    requestUrl,
-    method,
-    range,
-    ifNoneMatch,
-    ifRange
-  );
-  if (!key) {
-    return messageFirstClient(clients, {
-      type: "WEEB3_FETCH_REQUEST",
-      url: requestUrl,
-      method,
-      range,
-      networkId,
-      ifNoneMatch,
-      ifRange
-    });
-  }
-
-  const existing = HLS_REQUEST_FLIGHTS.get(key);
-  if (existing) {
-    return existing;
-  }
-
-  const pending = messageFirstClient(clients, {
+  return messageFirstClient(clients, {
     type: "WEEB3_FETCH_REQUEST",
     url: requestUrl,
     method,
@@ -575,14 +530,6 @@ function requestRustFetch(
     ifNoneMatch,
     ifRange
   });
-  let tracked;
-  tracked = pending.finally(() => {
-    if (HLS_REQUEST_FLIGHTS.get(key) === tracked) {
-      HLS_REQUEST_FLIGHTS.delete(key);
-    }
-  });
-  HLS_REQUEST_FLIGHTS.set(key, tracked);
-  return tracked;
 }
 
 function toUint8Array(body) {
@@ -608,14 +555,13 @@ function responseHeaders(headerRows) {
   return headers;
 }
 
-function requestRustRange(clients, url, start, end, networkId, streamToken = "") {
+function requestRustRange(clients, url, start, end, networkId) {
   return messageFirstClient(clients, {
     type: "WEEB3_FETCH_REQUEST",
     url,
     method: "GET",
     range: `bytes=${start}-${end}`,
-    networkId,
-    streamToken
+    networkId
   }).then((response) => {
     if (!response || !response.ok) {
       return response || { ok: false, status: 503, error: "empty weeb-3 range response" };
@@ -635,144 +581,54 @@ function requestRustRange(clients, url, start, end, networkId, streamToken = "")
   });
 }
 
-function parseCriticalPrefixWindows(value, size) {
-  if (!/^[1-9][0-9]*$/.test(value || "") || !Number.isSafeInteger(size) || size <= 0) {
-    return null;
-  }
-  const requested = Number(value);
-  const total = Math.ceil(size / STREAM_STORAGE_WINDOW_BYTES);
-  return Number.isSafeInteger(requested) && requested > 0
-    ? Math.min(requested, total)
-    : null;
-}
-
-function createRustRangeStream(
-  clients,
-  url,
-  size,
-  networkId,
-  stagedStart,
-  streamToken = "",
-  criticalPrefixWindows = null
-) {
+function createRustRangeStream(clients, url, size, networkId, windowBytes, lookahead) {
   let position = 0;
   let schedulePosition = 0;
-  const lookahead = stagedStart ? HLS_STREAM_LOOKAHEAD_CHUNKS : STREAM_LOOKAHEAD_CHUNKS;
-  const managedPrefixEnd = stagedStart && Number.isSafeInteger(criticalPrefixWindows)
-    ? Math.min(size, criticalPrefixWindows * STREAM_STORAGE_WINDOW_BYTES)
-    : 0;
-  let schedulingAdmissionOpen = true;
-  let lookaheadAdmitted = !stagedStart;
-  let knownRangeFailure = false;
+  let admissionOpen = true;
   const scheduled = new Map();
-  const activeRequests = new Map();
-  const retainedResponses = new Map();
 
   const nextRangeBounds = () => {
-    if (!schedulingAdmissionOpen || schedulePosition >= size) {
+    if (!admissionOpen || schedulePosition >= size) {
       return null;
     }
 
     const start = schedulePosition;
-    const end = Math.min(start + STREAM_STORAGE_WINDOW_BYTES - 1, size - 1);
+    const end = Math.min(start + windowBytes - 1, size - 1);
     schedulePosition = end + 1;
     return { start, end };
   };
 
-  const admitOrdinaryRange = () => {
+  const admitRange = () => {
     const range = nextRangeBounds();
     if (!range) {
       return null;
     }
     const { start, end } = range;
-    const request = requestRustRange(clients, url, start, end, networkId, streamToken);
+    const request = requestRustRange(clients, url, start, end, networkId);
     scheduled.set(start, request);
     return { start, request };
   };
 
-  const admitStagedRange = () => {
-    const range = nextRangeBounds();
-    if (!range) {
-      return null;
-    }
-    const { start, end } = range;
-    const pending = requestRustRange(clients, url, start, end, networkId, streamToken);
-    let request;
-    request = pending.then(
-      (response) => {
-        activeRequests.delete(start);
-        const result = { response };
-        retainedResponses.set(start, result);
-        if (!response || !response.ok) {
-          knownRangeFailure = true;
-        } else if (schedulingAdmissionOpen && position >= managedPrefixEnd) {
-          scheduleMore();
-        }
-        return result;
-      },
-      (error) => {
-        activeRequests.delete(start);
-        const result = { error };
-        retainedResponses.set(start, result);
-        knownRangeFailure = true;
-        return result;
-      }
-    );
-    activeRequests.set(start, request);
-    return { start, request };
-  };
-
   const scheduleMore = () => {
-    if (!schedulingAdmissionOpen || !lookaheadAdmitted || knownRangeFailure) {
-      return;
-    }
-
-    if (!stagedStart) {
-      while (schedulePosition < size && scheduled.size < lookahead) {
-        if (!admitOrdinaryRange()) {
-          break;
-        }
-      }
-      return;
-    }
-
-    if (position < managedPrefixEnd) {
-      if (activeRequests.size + retainedResponses.size < 1) {
-        admitStagedRange();
-      }
-      return;
-    }
-
-    while (
-      schedulePosition < size
-      && activeRequests.size < HLS_STREAM_LOOKAHEAD_CHUNKS
-      && retainedResponses.size < HLS_STREAM_READY_ADMISSION_THRESHOLD
-      && activeRequests.size + retainedResponses.size < HLS_STREAM_MAX_OUTSTANDING
-    ) {
-      if (!admitStagedRange()) {
+    while (admissionOpen && schedulePosition < size && scheduled.size < lookahead) {
+      if (!admitRange()) {
         break;
       }
     }
   };
 
   const drainScheduledRanges = () => {
-    const dispatched = stagedStart
-      ? Array.from(activeRequests.values())
-      : Array.from(scheduled.values());
-    return Promise.allSettled(dispatched).then(() => {
-      activeRequests.clear();
-      retainedResponses.clear();
+    return Promise.allSettled(Array.from(scheduled.values())).then(() => {
       scheduled.clear();
     });
   };
 
   const closeAdmission = () => {
-    schedulingAdmissionOpen = false;
-    lookaheadAdmitted = false;
+    admissionOpen = false;
   };
 
   const failStream = async (controller, error) => {
-    if (!schedulingAdmissionOpen) {
+    if (!admissionOpen) {
       return;
     }
     closeAdmission();
@@ -790,58 +646,24 @@ function createRustRangeStream(
           return;
         }
 
-        if (lookaheadAdmitted) {
-          scheduleMore();
-        }
-        const start = Math.floor(position / STREAM_STORAGE_WINDOW_BYTES) * STREAM_STORAGE_WINDOW_BYTES;
-        let response;
-        if (stagedStart) {
-          let result = retainedResponses.get(start);
-          if (!result) {
-            let request = activeRequests.get(start);
-            if (!request) {
-              const foreground = admitStagedRange();
-              if (!foreground || foreground.start !== start) {
-                await failStream(
-                  controller,
-                  new Error("weeb-3 foreground stream window was not admitted")
-                );
-                return;
-              }
-              request = foreground.request;
-            }
-            result = await request;
-          }
-          retainedResponses.delete(start);
-          if (!schedulingAdmissionOpen) {
-            return;
-          }
-          if (result.error) {
+        scheduleMore();
+        const start = Math.floor(position / windowBytes) * windowBytes;
+        let pending = scheduled.get(start);
+        if (!pending) {
+          const foreground = admitRange();
+          if (!foreground || foreground.start !== start) {
             await failStream(
               controller,
-              result.error instanceof Error ? result.error : new Error(String(result.error))
+              new Error("weeb-3 foreground stream window was not admitted")
             );
             return;
           }
-          response = result.response;
-        } else {
-          let request = scheduled.get(start);
-          if (!request) {
-            const foreground = admitOrdinaryRange();
-            if (!foreground || foreground.start !== start) {
-              await failStream(
-                controller,
-                new Error("weeb-3 foreground stream window was not admitted")
-              );
-              return;
-            }
-            request = foreground.request;
-          }
-          response = await request;
-          scheduled.delete(start);
+          pending = foreground.request;
         }
+        const response = await pending;
+        scheduled.delete(start);
 
-        if (!schedulingAdmissionOpen) {
+        if (!admissionOpen) {
           return;
         }
         if (!response || !response.ok) {
@@ -855,10 +677,9 @@ function createRustRangeStream(
         const body = toUint8Array(response.body);
         position = start + body.byteLength;
         controller.enqueue(body);
-        lookaheadAdmitted = true;
         scheduleMore();
       } catch (error) {
-        if (schedulingAdmissionOpen) {
+        if (admissionOpen) {
           await failStream(controller, error);
         }
       }
@@ -878,14 +699,15 @@ async function forwardRequestToRust(request, event) {
       return new Response("weeb-3 route is outside the configured scope", { status: 400 });
     }
     const clients = await requestClients(event, request.url, networkId);
+    const hlsResource = isHlsResource(url);
     const response = await requestRustFetch(
       clients,
       request.url,
       request.method,
-      request.headers.get("Range") || "",
+      hlsResource ? "" : request.headers.get("Range") || "",
       networkId,
       request.headers.get("If-None-Match") || "",
-      request.headers.get("If-Range") || ""
+      hlsResource ? "" : request.headers.get("If-Range") || ""
     );
 
     const status = Number(response.status || (response.ok ? 200 : 404));
@@ -900,22 +722,23 @@ async function forwardRequestToRust(request, event) {
 
     if (response.stream && request.method !== "HEAD") {
       const size = Number(headers.get("Content-Length") || "0");
-      const stagedStart = headers.get("X-Weeb3-Stream-Start") === "1";
-      const streamToken = headers.get("X-Weeb3-Stream-Token") || "";
-      const criticalPrefixWindows = stagedStart
-        ? parseCriticalPrefixWindows(
-            headers.get("X-Weeb3-HLS-Critical-Prefix-Windows"),
-            size
-          )
-        : null;
+      if (!Number.isSafeInteger(size) || size <= 0) {
+        return new Response("weeb-3 stream response has an invalid length", { status: 502 });
+      }
+      const liveHlsResource = hlsResource && url.searchParams.get("start") === "live";
+      const windowBytes = liveHlsResource
+        ? HLS_LIVE_STREAM_WINDOW_BYTES
+        : hlsResource ? HLS_STREAM_WINDOW_BYTES : STREAM_STORAGE_WINDOW_BYTES;
+      const lookahead = liveHlsResource
+        ? HLS_LIVE_STREAM_LOOKAHEAD_CHUNKS
+        : hlsResource ? HLS_STREAM_LOOKAHEAD_CHUNKS : STREAM_LOOKAHEAD_CHUNKS;
       return new Response(createRustRangeStream(
         clients,
         request.url,
         size,
         networkId,
-        stagedStart,
-        streamToken,
-        criticalPrefixWindows
+        windowBytes,
+        lookahead
       ), {
         status,
         headers

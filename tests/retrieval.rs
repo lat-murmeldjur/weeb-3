@@ -336,6 +336,42 @@ mod connection {
     }
 
     #[test]
+    fn cold_bootnode_burst_drains_into_one_dispatch_task() {
+        let runtime = include_str!("../src/lib.rs");
+        let profile = include_str!("../src/network_profile.rs");
+        let accounting = include_str!("../src/accounting.rs");
+        let handler = runtime
+            .split("let swarm_event_handle_2 = async")
+            .nth(1)
+            .and_then(|source| source.split("let accounting_event_handle = async").next())
+            .expect("bootnode dial handler");
+
+        assert!(profile.contains("pub(crate) const INITIAL_BOOTNODE_COUNT: usize = 160;"));
+        assert!(accounting.contains("pub(crate) const CONNECTION_BUILDUP_LIMIT: u64 = 200;"));
+        assert!(handler.contains("let mut bootnode_changes = vec![first_change];"));
+        assert!(handler.contains("while let Ok(change) = self.bootnode_port.1.try_recv()"));
+
+        let spawn = handler
+            .find("spawn_local(async move")
+            .expect("single batch dispatch task");
+        let batch_loop = handler
+            .find("for (baddr, usable, request_generation) in bootnode_changes")
+            .expect("drained bootnode batch loop");
+        let dial = handler
+            .find("start_owned_connection_attempt(")
+            .expect("owned swarm dial");
+        assert!(spawn < batch_loop && batch_loop < dial);
+        assert_eq!(
+            handler.matches("spawn_local(async move").count(),
+            1,
+            "the handler must spawn one task per drained burst, not one per bootnode"
+        );
+        assert!(handler[batch_loop..].contains("reserve_connection_capacity("));
+        assert!(handler[batch_loop..].contains("try_mark_connection_attempt("));
+        assert!(handler[batch_loop..].contains("queue_peer_dial_retry("));
+    }
+
+    #[test]
     fn handshake_signer_is_derived_once_per_node() {
         let runtime = include_str!("../src/lib.rs");
         let handlers = include_str!("../src/handlers.rs");
@@ -1150,23 +1186,21 @@ mod retrieve_group_stream {
     }
 
     #[test]
-    fn conservative_deferred_ranges_are_serial_direct_and_bounded() {
+    fn conservative_ranges_are_serial_direct_and_bounded() {
         let policies = source_section(
             "struct DataRangeTraversalPolicy",
-            "struct RetainedFeedProbePolicy",
+            "struct RetrieveAttemptResult",
         );
         assert!(policies.contains("group_concurrency: RETRIEVE_DATA_GROUP_CONCURRENCY"));
         assert!(policies.contains("erasure_recovery: true"));
         assert!(policies.contains("maximum_requested_children: usize::MAX"));
         assert!(policies.contains("group_concurrency: 1"));
         assert!(policies.contains("erasure_recovery: false"));
+        assert!(policies.contains("maximum_requested_children: CONSERVATIVE_RANGE_MAX_CHILDREN"));
         assert!(
-            policies
-                .contains("maximum_requested_children: CONSERVATIVE_DEFERRED_MAX_RANGE_CHILDREN")
+            RETRIEVAL_SOURCE
+                .contains("CONSERVATIVE_RANGE_MAX_CHILDREN * RETRIEVE_CHUNK_MAX_ATTEMPT_ERRORS")
         );
-        assert!(RETRIEVAL_SOURCE.contains(
-            "CONSERVATIVE_DEFERRED_MAX_RANGE_CHILDREN * RETRIEVE_CHUNK_MAX_ATTEMPT_ERRORS"
-        ));
 
         let group = source_section(
             "async fn fetch_data_group_indices_streaming(",
@@ -1189,7 +1223,7 @@ mod retrieve_group_stream {
             "pub(crate) async fn retrieve_data_range_from_root_conservative(",
             "pub(crate) async fn retrieve_data_range_from_root_cancellable(",
         );
-        assert!(conservative.contains("requested_len > CONSERVATIVE_DEFERRED_RANGE_BYTES"));
+        assert!(conservative.contains("requested_len > CONSERVATIVE_RANGE_BYTES"));
         assert!(conservative.contains("CONSERVATIVE_DATA_RANGE_TRAVERSAL"));
 
         let traversal = source_section(
@@ -1197,7 +1231,7 @@ mod retrieve_group_stream {
             "async fn retrieve_data_joined(",
         );
         assert!(traversal.contains("RetrieveAdmission::new_with_attempt_limit("));
-        assert!(traversal.contains("CONSERVATIVE_DEFERRED_MAX_PHYSICAL_ATTEMPTS"));
+        assert!(traversal.contains("CONSERVATIVE_RANGE_MAX_PHYSICAL_ATTEMPTS"));
         assert!(traversal.contains("admission.close_on_drop()"));
         assert!(traversal.contains("group_shared_physical_admission"));
 
@@ -1210,7 +1244,7 @@ mod retrieve_group_stream {
         assert!(RETRIEVAL_SOURCE.contains("const RETRIEVE_CHUNK_MAX_ATTEMPT_ERRORS: usize = 20;"));
         assert!(
             RETRIEVAL_SOURCE
-                .contains("pub(crate) const CONSERVATIVE_DEFERRED_MAX_PHYSICAL_ATTEMPTS: u64")
+                .contains("pub(crate) const CONSERVATIVE_RANGE_MAX_PHYSICAL_ATTEMPTS: u64")
         );
     }
 }
@@ -1444,123 +1478,6 @@ mod rolling_erasure_tail {
         assert!(RETRIEVAL_SOURCE.contains("const RETRIEVE_ATTEMPT_TIMEOUT_MS: u64 = 10_000;"));
         assert!(RUNTIME_SOURCE.contains("hedge_demand: None"));
     }
-
-    #[test]
-    fn rolling_telemetry_observes_without_reordering_admission_or_settlement() {
-        let group = group_source();
-        let initial_registration = group
-            .find("let registration = queue_initial_data_shard(index, initial_hedge_demand);")
-            .expect("initial rolling registration");
-        let gate_anchor = group
-            .find("let started = Date::now();")
-            .expect("existing post-registration anchor");
-        let profile_start = group
-            .find("let mut rolling_profile = rolling")
-            .expect("actual rolling-only profile handle");
-        assert!(initial_registration < gate_anchor && gate_anchor < profile_start);
-        assert!(!group.contains("let mut rolling_profile = static_rolling_candidate"));
-
-        let parity_dispatch = group
-            .find("dispatch_one_rolling_group_parity(")
-            .expect("rolling parity dispatch");
-        let active_update = group[parity_dispatch..]
-            .find("rolling_active += 1;")
-            .map(|offset| parity_dispatch + offset)
-            .expect("rolling active update");
-        let parity_profile = group[active_update..]
-            .find("profile.parity_admitted(")
-            .map(|offset| active_update + offset)
-            .expect("parity admission observation");
-        let coordinator_continue = group[parity_profile..]
-            .find("continue;")
-            .map(|offset| parity_profile + offset)
-            .expect("coordinator re-check");
-        assert!(parity_dispatch < active_update);
-        assert!(active_update < parity_profile && parity_profile < coordinator_continue);
-
-        let result_profile = group
-            .find("record_rolling_group_result(")
-            .expect("parity result observation");
-        let settlement = group[result_profile..]
-            .find("settle_data_group_result(")
-            .map(|offset| result_profile + offset)
-            .expect("production settlement");
-        let progress = group[settlement..]
-            .find("update_rolling_group_progress(")
-            .map(|offset| settlement + offset)
-            .expect("post-settlement progress mirror");
-        let settlement_exit = group[progress..]
-            .find("settled?;")
-            .map(|offset| progress + offset)
-            .expect("settlement error propagation");
-        assert!(result_profile < settlement && settlement < progress && progress < settlement_exit);
-
-        let close = group
-            .find("waiter_admission.close();")
-            .expect("production synchronous close");
-        let close_profile = group[close..]
-            .find("profile.close_now(")
-            .map(|offset| close + offset)
-            .expect("close observation");
-        let post_close_currentness = group[close_profile..]
-            .find("join_cancel_token_current(&cancel_generations, &cancel).await")
-            .map(|offset| close_profile + offset)
-            .expect("existing post-close currentness check");
-        assert!(close < close_profile && close_profile < post_close_currentness);
-        assert!(group.contains("profile.finish_success_now(false)"));
-        assert!(group.contains("profile.finish_success_now(true)"));
-
-        let receive_match = group
-            .split_once("let result = match result {")
-            .map(|(_, source)| source)
-            .expect("typed receive terminal mapping");
-        let receive_match = receive_match
-            .split_once("completed = completed.checked_add(1)?;")
-            .map(|(source, _)| source)
-            .expect("receive match end");
-        assert!(receive_match.contains("RawFetchReceive::Stale"));
-        assert!(receive_match.contains("RawFetchReceive::ChannelClosed"));
-        assert!(!receive_match.contains("join_cancel_token_current"));
-
-        let receive = RETRIEVAL_SOURCE
-            .split("async fn recv_raw_result_cancellable(")
-            .nth(1)
-            .and_then(|source| source.split("struct RawFetchResult").next())
-            .expect("typed cancellable receive helper");
-        assert!(receive.contains("RawFetchReceive::Stale"));
-        assert!(receive.contains("RawFetchReceive::ChannelClosed"));
-        assert_eq!(receive.matches("receiver.recv()").count(), 2);
-    }
-
-    #[test]
-    fn managed_promotion_is_counted_only_for_the_monotone_transition() {
-        let raw_queue = RETRIEVAL_SOURCE
-            .split("fn queue_drained_raw_chunk(")
-            .nth(1)
-            .and_then(|source| source.split("#[inline]\nfn decryption_segment_key").next())
-            .expect("raw singleflight queue");
-        let before = raw_queue
-            .find("let before = shared_demand.current();")
-            .expect("pre-promotion demand");
-        let promote = raw_queue[before..]
-            .find("shared_demand.promote(hedge_demand);")
-            .map(|offset| before + offset)
-            .expect("monotone promotion");
-        let actual_transition = raw_queue[promote..]
-            .find("shared_demand.current() == RetrieveHedgeDemand::Ordinary")
-            .map(|offset| promote + offset)
-            .expect("post-promotion state check");
-        let record = raw_queue[actual_transition..]
-            .find("record_managed_to_ordinary_promotion();")
-            .map(|offset| actual_transition + offset)
-            .expect("promotion telemetry");
-        let follower_return = raw_queue[record..]
-            .find("return RawFetchRegistration::Joined")
-            .map(|offset| record + offset)
-            .expect("follower return");
-        assert!(before < promote && promote < actual_transition);
-        assert!(actual_transition < record && record < follower_return);
-    }
 }
 
 mod progress_events {
@@ -1638,8 +1555,7 @@ mod retrieve_generations {
 
 mod retrieve_admission {
     use crate::retrieval_conventions::{
-        RetrieveAdmission, acquire_retrieve_permit, retained_feed_probe_empty_is_missing,
-        retrieve_admission_current,
+        RetrieveAdmission, acquire_retrieve_permit, retrieve_admission_current,
     };
     use async_lock::Semaphore;
     use std::{
@@ -1725,34 +1641,6 @@ mod retrieve_admission {
     }
 
     #[test]
-    fn retained_empty_feed_probe_requires_two_confirmed_empty_responses() {
-        let admission = RetrieveAdmission::new_with_attempt_limit(2);
-        assert_eq!(admission.claimed_physical_attempts(), Some(0));
-        assert_eq!(admission.confirmed_empty_physical_attempts(), Some(0));
-        assert!(!retained_feed_probe_empty_is_missing(&admission, 2));
-
-        assert!(admission.try_claim_physical_attempt());
-        assert_eq!(admission.claimed_physical_attempts(), Some(1));
-        admission.record_confirmed_empty_physical_attempt();
-        assert_eq!(admission.confirmed_empty_physical_attempts(), Some(1));
-        assert!(!retained_feed_probe_empty_is_missing(&admission, 2));
-
-        assert!(admission.try_claim_physical_attempt());
-        assert_eq!(admission.claimed_physical_attempts(), Some(2));
-        // A claimed attempt that ended through a channel/transport failure or returned an
-        // invalid nonempty chunk is not evidence that this feed index is absent.
-        assert!(!retained_feed_probe_empty_is_missing(&admission, 2));
-
-        admission.record_confirmed_empty_physical_attempt();
-        assert_eq!(admission.confirmed_empty_physical_attempts(), Some(2));
-        assert!(retained_feed_probe_empty_is_missing(&admission, 2));
-
-        admission.record_physical_attempt_timeout();
-        assert_eq!(admission.timed_out_physical_attempts(), Some(1));
-        assert!(!retained_feed_probe_empty_is_missing(&admission, 2));
-    }
-
-    #[test]
     fn drop_guard_closes_early_return_paths() {
         let admission = RetrieveAdmission::new();
         {
@@ -1820,100 +1708,6 @@ mod retrieve_admission {
             closer.close();
             assert!(waiting.await.is_none());
         });
-    }
-
-    #[test]
-    fn retained_feed_deadline_stops_admission_but_not_late_response_ownership() {
-        let retrieval = include_str!("../src/retrieval.rs");
-        let retained = retrieval
-            .split("async fn get_feed_probe_chunk_with_hedge_admission(")
-            .nth(1)
-            .and_then(|source| source.split("fn valid_feed_update_payload").next())
-            .expect("retained feed probe");
-
-        let response = retained
-            .find("let response = chan_in.recv();")
-            .expect("owned response future");
-        let admission_close = retained[response..]
-            .find("admission.close();")
-            .map(|offset| response + offset)
-            .expect("admission deadline closure");
-        let late_response = retained[admission_close..]
-            .find("response.await")
-            .map(|offset| admission_close + offset)
-            .expect("late response wait");
-        assert!(response < admission_close && admission_close < late_response);
-        assert!(!retained.contains("cancel_reserve("));
-
-        let attempt = retrieval
-            .split("async fn retrieve_attempt(")
-            .nth(1)
-            .and_then(|source| source.split("fn chunk_address_parts").next())
-            .expect("physical retrieve attempt");
-        let confirmed_empty = attempt
-            .find("matches!(retrieve_result.as_ref(), Ok(chunk) if chunk.is_empty())")
-            .expect("only an actual empty Bee delivery is negative evidence");
-        let empty_marker = attempt[confirmed_empty..]
-            .find("admission.record_confirmed_empty_physical_attempt();")
-            .map(|offset| confirmed_empty + offset)
-            .expect("confirmed empty response marker");
-        let immediate_settlement = attempt[empty_marker..]
-            .find("settle_retrieve_attempt(")
-            .map(|offset| empty_marker + offset)
-            .expect("immediate physical settlement");
-        let logical_terminal = attempt
-            .find("failed_retrieve_attempt(&peer)")
-            .expect("ten-second terminal logical result");
-        let timeout_marker = attempt
-            .find("admission.record_physical_attempt_timeout();")
-            .expect("finite admission timeout marker");
-        let detached_settlement = attempt[logical_terminal..]
-            .find("settle_retrieve_attempt(")
-            .map(|offset| logical_terminal + offset)
-            .expect("late detached settlement");
-        assert!(confirmed_empty < empty_marker && empty_marker < immediate_settlement);
-        assert!(timeout_marker < logical_terminal && logical_terminal < detached_settlement);
-        assert_eq!(
-            attempt.matches("result_chan.try_send(").count(),
-            2,
-            "one immediate-completion send and one timeout send"
-        );
-        assert!(!attempt[detached_settlement..].contains("result_chan.try_send("));
-    }
-
-    #[test]
-    fn retained_feed_attempt_cap_is_claimed_before_physical_dispatch() {
-        let retrieval = include_str!("../src/retrieval.rs");
-        assert!(retrieval.contains("const RETRIEVE_FEED_MAX_PHYSICAL_ATTEMPTS: usize = 2;"));
-
-        let retrieve_chunk = retrieval
-            .split("pub async fn retrieve_chunk(")
-            .nth(1)
-            .and_then(|source| source.split("pub async fn retrieve_check_chunk(").next())
-            .expect("logical chunk retrieval");
-        let claim = retrieve_chunk
-            .find("!admission.try_claim_physical_attempt()")
-            .expect("atomic physical attempt claim");
-        let dispatch = retrieve_chunk[claim..]
-            .find("wasm_bindgen_futures::spawn_local(async move")
-            .map(|offset| claim + offset)
-            .expect("physical exchange dispatch");
-        let rejected_claim = &retrieve_chunk[claim..dispatch];
-
-        assert!(retrieve_chunk[..claim].contains("RetrieveAdmission::physical_attempt_available"));
-        assert!(rejected_claim.contains("cancel_reserve(&selected.accounting, selected.price)"));
-        assert!(claim < dispatch);
-
-        let retained = retrieval
-            .split("async fn get_feed_probe_chunk_with_hedge_admission(")
-            .nth(1)
-            .and_then(|source| source.split("fn valid_feed_update_payload").next())
-            .expect("retained feed probe");
-        assert!(
-            retained.contains(
-                "RetrieveAdmission::new_with_attempt_limit(policy.max_physical_attempts)"
-            )
-        );
     }
 }
 

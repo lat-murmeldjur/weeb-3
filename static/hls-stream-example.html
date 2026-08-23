@@ -63,8 +63,10 @@
     <script type="module">
       import init, { Weeb3No103 } from "./weeb_3.js";
 
-      const owner = "6F2728386F8a47ef5EBe323721188e630Ff0FdE9";
-      const topic = "b347b89b-933c-424f-a3d1-403bdd270b25";
+      const parameters = new URLSearchParams(location.search);
+      const owner = parameters.get("owner") || "6F2728386F8a47ef5EBe323721188e630Ff0FdE9";
+      const topic = parameters.get("topic") || "b347b89b-933c-424f-a3d1-403bdd270b25";
+      const initialStart = parameters.get("start") === "live" ? "live" : "beginning";
       const status = document.getElementById("status");
       const video = document.getElementById("stream");
       let attachRequest = 0;
@@ -92,7 +94,7 @@
 
         document.getElementById("beginning").onclick = () => attach("beginning");
         document.getElementById("live").onclick = () => attach("live");
-        await attach("beginning");
+        await attach(initialStart);
       } catch (error) {
         status.textContent = `Could not initialize weeb-3: ${error.message || error}`;
         console.error(error);

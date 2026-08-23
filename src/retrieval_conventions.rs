@@ -295,19 +295,6 @@ impl Drop for RetrieveAdmissionGuard {
     }
 }
 
-/// An empty retained feed response is negative evidence only when every allowed physical
-/// exchange was claimed and actually returned an empty Bee delivery. Capacity, peer-selection,
-/// channel/transport failures, invalid nonempty chunks, and logical timeouts remain transient.
-pub(crate) fn retained_feed_probe_empty_is_missing(
-    admission: &RetrieveAdmission,
-    maximum_attempts: usize,
-) -> bool {
-    maximum_attempts > 0
-        && admission.claimed_physical_attempts() == Some(maximum_attempts)
-        && admission.confirmed_empty_physical_attempts() == Some(maximum_attempts)
-        && admission.timed_out_physical_attempts() == Some(0)
-}
-
 pub(crate) fn retrieve_admission_current(
     stream_generation_current: bool,
     admission: &Option<RetrieveAdmission>,

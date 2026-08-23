@@ -70,8 +70,6 @@ use handlers::*;
 
 mod stream_hls;
 
-mod retrieval_profile;
-
 mod interface;
 
 mod interface_conventions;
@@ -708,24 +706,11 @@ impl ChunkRetrieveSender {
         self.runtime_scope
     }
 
-    fn try_send(
+    pub(crate) fn try_send(
         &self,
-        mut request: ChunkRetrieveRequest,
+        request: ChunkRetrieveRequest,
     ) -> Result<(), mpsc::TrySendError<ChunkRetrieveRequest>> {
-        let relayed = request.profile.is_some();
-        if !relayed {
-            request.profile = retrieval_profile::request_for_enqueue(request.cancel.is_some());
-        }
-        let profile = request.profile.clone();
-        let result = self.sender.try_send(request);
-        if let Some(profile) = profile {
-            if relayed {
-                profile.relay_result(result.is_ok());
-            } else {
-                profile.enqueue_result(result.is_ok());
-            }
-        }
-        result
+        self.sender.try_send(request)
     }
 }
 
@@ -859,7 +844,6 @@ pub(crate) struct ChunkRetrieveRequest {
     pub cancel: Option<RetrieveCancelToken>,
     pub admission: Option<retrieval_conventions::RetrieveAdmission>,
     pub hedge_demand: Option<retrieval_conventions::SharedRetrieveHedgeDemand>,
-    pub profile: Option<retrieval_profile::RetrieveProfileRequest>,
 }
 
 pub(crate) fn chunk_retrieve_request(
@@ -872,7 +856,6 @@ pub(crate) fn chunk_retrieve_request(
         cancel: None,
         admission: None,
         hedge_demand: None,
-        profile: None,
     }
 }
 
@@ -956,7 +939,6 @@ enum BzzRangeRequest {
         start: u64,
         end_inclusive: u64,
         cancel: Option<RetrieveCancelToken>,
-        raw_fetch_lifecycle_factory: Option<retrieval::RawFetchLifecycleFactory>,
         chan: mpsc::Sender<Option<(Vec<u8>, BzzMetadata)>>,
     },
 }
@@ -2048,38 +2030,6 @@ impl Weeb3 {
         *connected
     }
 
-    pub(crate) async fn available_retrieve_slots(&self) -> u64 {
-        let wings = { self.wings.lock().await.clone() };
-        let selectable = wings
-            .overlay_peers
-            .lock()
-            .await
-            .values()
-            .cloned()
-            .collect::<HashSet<_>>();
-        let accounts = wings
-            .accounting_peers
-            .lock()
-            .await
-            .iter()
-            .filter(|(peer, _)| selectable.contains(*peer))
-            .map(|(_, account)| account.clone())
-            .collect::<Vec<_>>();
-        let mut slots = 0_u64;
-        for account in accounts {
-            let account = account.lock().await;
-            if account.connection_id.is_some() {
-                slots = slots.saturating_add(
-                    account
-                        .threshold
-                        .saturating_sub(account.balance.saturating_add(account.reserve))
-                        / accounting::MAX_CHUNK_PRICE,
-                );
-            }
-        }
-        slots
-    }
-
     pub async fn get_network_id(&self) -> u64 {
         let network_id = self.network_id.lock().await;
         *network_id
@@ -3147,38 +3097,41 @@ impl Weeb3 {
 
         let swarm_event_handle_2 = async {
             loop {
-                let mut bootnode_change = match self.bootnode_port.1.recv().await {
+                let first_change = match self.bootnode_port.1.recv().await {
                     Ok(bootnode_change) => bootnode_change,
                     Err(_) => break,
                 };
+                let mut bootnode_changes = vec![first_change];
+                while let Ok(change) = self.bootnode_port.1.try_recv() {
+                    bootnode_changes.push(change);
+                }
 
-                loop {
-                    let (baddr, usable, request_generation) = bootnode_change;
-                    let swarm = self.swarm.clone();
-                    let wings = wings.clone();
-                    let connections_instructions_chan_outgoing =
-                        connections_instructions_chan_outgoing.clone();
-                    let peers_instructions_chan_outgoing = peers_instructions_chan_outgoing.clone();
-                    let connection_generation = self.connection_generation.clone();
-                    let connections = self.connections.clone();
-                    let ongoing_connections = self.ongoing_connections.clone();
+                let swarm = self.swarm.clone();
+                let wings = wings.clone();
+                let connections_instructions_chan_outgoing =
+                    connections_instructions_chan_outgoing.clone();
+                let peers_instructions_chan_outgoing = peers_instructions_chan_outgoing.clone();
+                let connection_generation = self.connection_generation.clone();
+                let connections = self.connections.clone();
+                let ongoing_connections = self.ongoing_connections.clone();
 
-                    spawn_local(async move {
+                spawn_local(async move {
+                    for (baddr, usable, request_generation) in bootnode_changes {
                         if *connection_generation.lock().await != request_generation {
-                            return;
+                            continue;
                         }
 
                         let addr33 = match baddr.parse::<Multiaddr>() {
                             Ok(aok) => aok,
                             _ => {
-                                return;
+                                continue;
                             }
                         };
 
                         let pid: PeerId = match try_from_multiaddr(&addr33.clone()) {
                             Some(aok) => aok,
                             _ => {
-                                return;
+                                continue;
                             }
                         };
 
@@ -3196,21 +3149,21 @@ impl Weeb3 {
                         )
                         .await
                         {
-                            return;
+                            continue;
                         }
 
                         let Some((attempt_id, ready_connection)) =
                             try_mark_connection_attempt(&wings, &pid).await
                         else {
                             decrement_counter(&ongoing_connections).await;
-                            return;
+                            continue;
                         };
 
                         if *connection_generation.lock().await != request_generation {
                             if remove_connection_attempt(&wings, &pid, attempt_id).await {
                                 decrement_counter(&ongoing_connections).await;
                             }
-                            return;
+                            continue;
                         }
                         {
                             let mut known = wings.known_peer_underlays.lock().await;
@@ -3233,7 +3186,7 @@ impl Weeb3 {
                                 if remove_connection_attempt(&wings, &pid, attempt_id).await {
                                     decrement_counter(&ongoing_connections).await;
                                 }
-                                return;
+                                continue;
                             }
                             Err(_) => {
                                 let released =
@@ -3254,7 +3207,7 @@ impl Weeb3 {
                                     .await;
                                     decrement_counter(&ongoing_connections).await;
                                 }
-                                return;
+                                continue;
                             }
                         }
 
@@ -3271,13 +3224,8 @@ impl Weeb3 {
                         {
                             decrement_counter(&ongoing_connections).await;
                         }
-                    });
-
-                    match self.bootnode_port.1.try_recv() {
-                        Ok(change) => bootnode_change = change,
-                        Err(_) => break,
                     }
-                }
+                });
 
                 async_std::task::yield_now().await;
             }
@@ -3968,7 +3916,6 @@ impl Weeb3 {
                                 start,
                                 end_inclusive,
                                 cancel,
-                                raw_fetch_lifecycle_factory,
                                 chan,
                             } => {
                                 register_retrieve_cancel_token(
@@ -3984,7 +3931,6 @@ impl Weeb3 {
                                         &chunk_retrieve_chan,
                                         cancel,
                                         Some(retrieve_cancel_generations),
-                                        raw_fetch_lifecycle_factory,
                                     )
                                     .await
                                 } else {
@@ -4331,7 +4277,6 @@ impl Weeb3 {
         };
 
         let retrieve_chunk_handle = async {
-            retrieval_profile::set_permit_capacity(RETRIEVE_CHUNK_CONCURRENCY);
             let retrieve_sem = Arc::new(Semaphore::new(RETRIEVE_CHUNK_CONCURRENCY));
             let retrieve_dispatch_yield_every = 128usize;
             let mut retrieve_dispatches_since_browser_yield = 0usize;
@@ -4355,10 +4300,6 @@ impl Weeb3 {
                     let cancel = request.cancel;
                     let admission = request.admission;
                     let hedge_demand = request.hedge_demand;
-                    let profile = request.profile;
-                    if let Some(profile) = profile.as_ref() {
-                        profile.dequeued();
-                    }
                     let admission_open =
                         wait_transfer_unpaused_for_admission(&self.transfer_paused, &admission)
                             .await;
@@ -4372,14 +4313,7 @@ impl Weeb3 {
                             &admission,
                         )
                     {
-                        if let Some(profile) = profile.as_ref() {
-                            profile.reject_before_permit();
-                            profile.logical_completed(false);
-                        }
-                        let delivery_succeeded = chan.try_send(vec![]).is_ok();
-                        if let Some(profile) = profile.as_ref() {
-                            profile.delivery_result(delivery_succeeded);
-                        }
+                        let _ = chan.try_send(vec![]);
                         match chunk_retrieve_chan_incoming.try_recv() {
                             Ok(request) => {
                                 incoming_request = request;
@@ -4409,14 +4343,7 @@ impl Weeb3 {
                             if !wait_transfer_unpaused_for_admission(&transfer_paused, &admission)
                                 .await
                             {
-                                if let Some(profile) = profile.as_ref() {
-                                    profile.reject_before_permit();
-                                }
                                 return vec![];
-                            }
-
-                            if let Some(profile) = profile.as_ref() {
-                                profile.begin_permit_wait();
                             }
 
                             let Some(_permit) = retrieval_conventions::acquire_retrieve_permit(
@@ -4425,16 +4352,8 @@ impl Weeb3 {
                             )
                             .await
                             else {
-                                if let Some(profile) = profile.as_ref() {
-                                    profile.permit_aborted();
-                                }
                                 return vec![];
                             };
-                            // This profiler guard is declared after the real semaphore guard, so
-                            // it drops first in the same async-block scope. Drop is synchronous:
-                            // no await separates its counter update from the real permit release.
-                            let _profile_permit =
-                                profile.as_ref().map(|profile| profile.permit_acquired());
 
                             if !wait_transfer_unpaused_for_admission(&transfer_paused, &admission)
                                 .await
@@ -4466,19 +4385,12 @@ impl Weeb3 {
                                 admission,
                                 hedge_demand,
                                 Some(transfer_paused),
-                                profile.clone(),
                             )
                             .await
                         }
                         .await;
 
-                        if let Some(profile) = profile.as_ref() {
-                            profile.logical_completed(!chunk_data.is_empty());
-                        }
-                        let delivery_succeeded = chan.try_send(chunk_data).is_ok();
-                        if let Some(profile) = profile.as_ref() {
-                            profile.delivery_result(delivery_succeeded);
-                        }
+                        let _ = chan.try_send(chunk_data);
                     });
 
                     if retrieve_dispatches_since_browser_yield >= retrieve_dispatch_yield_every {
@@ -4871,7 +4783,6 @@ impl Weeb3 {
                 start,
                 end_inclusive,
                 cancel: None,
-                raw_fetch_lifecycle_factory: None,
                 chan: chan_out,
             })
             .is_err()
@@ -4889,7 +4800,6 @@ impl Weeb3 {
         end_inclusive: u64,
         stream_key: String,
         stream_generation: u64,
-        raw_fetch_lifecycle_factory: Option<retrieval::RawFetchLifecycleFactory>,
     ) -> Option<(Vec<u8>, BzzMetadata)> {
         let (chan_out, chan_in) = mpsc::unbounded::<Option<(Vec<u8>, BzzMetadata)>>();
         let cancel = stream_retrieve_cancel_token(stream_key, stream_generation);
@@ -4904,7 +4814,6 @@ impl Weeb3 {
                 start,
                 end_inclusive,
                 cancel,
-                raw_fetch_lifecycle_factory,
                 chan: chan_out,
             })
             .is_err()
