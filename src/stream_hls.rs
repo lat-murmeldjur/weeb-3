@@ -1,8 +1,10 @@
-//! Minimal append-only HLS feed reader with a two-segment live runway.
+//! Minimal append-only HLS feed reader with a three-segment live startup runway.
 
 use crate::stream_conventions::HlsStart;
 
-pub(crate) const HLS_LIVE_SYNC_SEGMENTS: usize = 2;
+pub(crate) const HLS_LIVE_SYNC_SEGMENTS: usize = 3;
+pub(crate) const HLS_LIVE_EDGE_SEGMENTS: usize = 3;
+pub(crate) const HLS_LIVE_BODY_RUNWAY_SEGMENTS: usize = 4;
 pub(crate) const MAX_STREAM_FEED_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
 
 const HLS_HEADER: &str = "#EXTM3U";
@@ -33,7 +35,36 @@ pub(crate) struct HlsStartupPlan {
     pub(crate) play_position: f64,
     pub(crate) runway_end: f64,
     pub(crate) duration: f64,
-    pub(crate) references: [String; HLS_LIVE_SYNC_SEGMENTS],
+}
+
+#[derive(Default)]
+pub(crate) struct HlsTailFailure {
+    key: Option<(u64, u64, String)>,
+    count: u8,
+}
+
+impl HlsTailFailure {
+    pub(crate) fn record(&mut self, snapshot: u64, sequence: u64, reference: &str) -> bool {
+        let matches =
+            self.key
+                .as_ref()
+                .is_some_and(|(current_snapshot, current_sequence, current)| {
+                    (*current_snapshot, *current_sequence, current.as_str())
+                        == (snapshot, sequence, reference)
+                });
+        if matches {
+            self.count = self.count.saturating_add(1);
+        } else {
+            self.key = Some((snapshot, sequence, reference.to_string()));
+            self.count = 1;
+        }
+        self.count >= 2
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.key = None;
+        self.count = 0;
+    }
 }
 
 impl HlsPlaylist {
@@ -91,10 +122,6 @@ impl HlsPlaylist {
         self.segments.iter().map(|segment| segment.duration).sum()
     }
 
-    pub(crate) fn keep_growing(&mut self) {
-        self.finalized = false;
-    }
-
     pub(crate) fn startup_plan(&self, start: HlsStart) -> Option<HlsStartupPlan> {
         let playable = self
             .segments
@@ -102,12 +129,16 @@ impl HlsPlaylist {
             .enumerate()
             .filter_map(|(index, segment)| (!segment.gap).then_some(index))
             .collect::<Vec<_>>();
-        if playable.len() < HLS_LIVE_SYNC_SEGMENTS {
+        if playable.is_empty() || start == HlsStart::Live && playable.len() < HLS_LIVE_SYNC_SEGMENTS
+        {
             return None;
         }
         let runway = match start {
-            HlsStart::Beginning => &playable[..HLS_LIVE_SYNC_SEGMENTS],
-            HlsStart::Live => &playable[playable.len() - HLS_LIVE_SYNC_SEGMENTS..],
+            HlsStart::Beginning => &playable[..1],
+            HlsStart::Live => {
+                let first = playable.len().saturating_sub(HLS_LIVE_EDGE_SEGMENTS);
+                &playable[first..first + HLS_LIVE_SYNC_SEGMENTS]
+            }
         };
         let first = runway[0];
         let last = *runway.last()?;
@@ -131,15 +162,13 @@ impl HlsPlaylist {
         }
         Some(HlsStartupPlan {
             bootstrap_position,
-            codec_bootstrap: bootstrap.is_some(),
+            codec_bootstrap: bootstrap.is_some() && self.sequence == 0,
             play_position,
             runway_end,
             duration,
-            references: std::array::from_fn(|slot| self.segments[runway[slot]].reference.clone()),
         })
     }
 
-    /// Merge only an authenticated tail that overlaps the active timeline.
     pub(crate) fn merge_tail(&mut self, bytes: &[u8]) -> Option<usize> {
         let text = std::str::from_utf8(bytes).ok()?;
         let candidates = parse_segment_lines(text, 0)
@@ -196,6 +225,23 @@ impl HlsPlaylist {
     pub(crate) fn joins(&self, candidate: &Self) -> bool {
         let mut current = self.clone();
         current.merge_playlist(candidate.clone()).is_some()
+    }
+
+    pub(crate) fn mark_gap(&mut self, sequence: u64, reference: &str) -> bool {
+        let Some(position) = sequence
+            .checked_sub(self.sequence)
+            .and_then(|position| usize::try_from(position).ok())
+        else {
+            return false;
+        };
+        let Some(segment) = self.segments.get_mut(position) else {
+            return false;
+        };
+        if segment.reference != reference {
+            return false;
+        }
+        segment.gap = true;
+        true
     }
 
     pub(crate) fn reconstruct(
@@ -256,7 +302,11 @@ impl HlsPlaylist {
     pub(crate) fn render(&self, local_bytes_base: &str, start: HlsStart) -> Vec<u8> {
         let mut output = String::with_capacity(self.segments.len().saturating_mul(112) + 160);
         output.push_str(HLS_HEADER);
-        output.push_str("\n#EXT-X-VERSION:3");
+        output.push_str(if self.segments.iter().any(|segment| segment.gap) {
+            "\n#EXT-X-VERSION:8"
+        } else {
+            "\n#EXT-X-VERSION:3"
+        });
         output.push_str(&format!(
             "\n#EXT-X-TARGETDURATION:{}\n#EXT-X-PLAYLIST-TYPE:{}\n#EXT-X-MEDIA-SEQUENCE:{}",
             self.target_duration.max(1),
@@ -277,7 +327,7 @@ impl HlsPlaylist {
                     .iter()
                     .rev()
                     .filter(|segment| !segment.gap)
-                    .take(HLS_LIVE_SYNC_SEGMENTS)
+                    .take(HLS_LIVE_EDGE_SEGMENTS)
                     .map(|segment| segment.duration)
                     .sum::<f64>();
                 output.push_str(&format!("\n#EXT-X-START:TIME-OFFSET=-{tail:.6},PRECISE=NO"));
@@ -285,6 +335,8 @@ impl HlsPlaylist {
         }
         let mut discontinuity_sequence = self.discontinuity_sequence;
         let mut beginning_startup = start == HlsStart::Beginning;
+        let mut live_bootstrap = start == HlsStart::Live
+            && self.segments.iter().filter(|segment| !segment.gap).count() > HLS_LIVE_EDGE_SEGMENTS;
         for segment in &self.segments {
             let discontinuity = segment.discontinuity_sequence > discontinuity_sequence;
             if discontinuity {
@@ -301,10 +353,13 @@ impl HlsPlaylist {
             output.push_str(&segment.reference);
             let startup = beginning_startup && !segment.gap;
             beginning_startup &= !startup;
-            output.push_str(match (start, startup) {
-                (HlsStart::Live, _) => "?start=live",
-                (HlsStart::Beginning, true) => "?start=beginning&startup=1",
-                (HlsStart::Beginning, false) => "?start=beginning",
+            let bootstrap = live_bootstrap && !segment.gap;
+            live_bootstrap &= !bootstrap;
+            output.push_str(match (start, startup, bootstrap) {
+                (HlsStart::Live, _, true) => "?start=live&bootstrap=1",
+                (HlsStart::Live, _, false) => "?start=live",
+                (HlsStart::Beginning, true, _) => "?start=beginning&startup=1",
+                (HlsStart::Beginning, false, _) => "?start=beginning",
             });
         }
         if self.finalized {

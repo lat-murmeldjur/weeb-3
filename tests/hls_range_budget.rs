@@ -23,218 +23,406 @@ fn ordinary_media_keeps_its_existing_range_retry_policy() {
 }
 
 #[test]
-fn hls_fragments_use_one_small_windowed_retrieval_path() {
-    let retrieve = section(HLS_RUNTIME, "async fn hls_range(", "fn next_feed_id(");
-    assert_eq!(
-        retrieve.matches("retrieve_data_range_from_root(").count(),
-        1
-    );
-    assert!(!retrieve.contains("retrieve_data_payload("));
-    assert!(!retrieve.contains("RawFetchLifecycle"));
-    assert!(!retrieve.contains("cancel_generations"));
-}
-
-#[test]
-fn hls_range_cache_is_bounded_without_a_policy_engine() {
+fn whole_hls_bodies_are_singleflight_and_share_the_bounded_range_budget() {
     assert!(HLS_RUNTIME.contains("const RANGE_CACHE_HARD_MAX_BYTES: u64 = 96 * 1024 * 1024;"));
-    let cache = section(HLS_RUNTIME, "impl RangeCache {", "struct FeedSession");
-    assert!(cache.contains("saturating_sub(completed_media_range_bytes())"));
-    assert!(cache.contains("set_auxiliary_media_cache_bytes(self.bytes)"));
-    assert!(cache.contains("self.order.pop_front()"));
-    assert!(!cache.contains("self.order.retain"));
+
+    let cache = section(HLS_RUNTIME, "struct RangeCache {", "struct FeedSession");
+    assert!(cache.contains("bodies: HashMap<String, Arc<[u8]>>"));
+    assert!(cache.contains("body_order: VecDeque<String>"));
+    assert!(cache.contains("pending_bodies: HashMap<String, PendingBody>"));
+    assert!(cache.contains("generation: Option<u64>"));
+    assert!(cache.contains("waiters: Vec<mpsc::Sender<Option<Arc<[u8]>>>>"));
+    assert!(cache.contains("enum BodyLoad"));
+
+    let admission = section(cache, "fn body_load(", "fn pending_body(");
+    assert!(admission.contains("BodyLoad::Cached(body.clone())"));
+    assert!(admission.contains("self.pending_bodies.get_mut(reference)"));
+    assert!(admission.contains("pending.waiters.push(sender)"));
+    assert!(admission.contains("mpsc::bounded(1)"));
+    assert!(admission.contains("BodyLoad::Wait(receiver)"));
+    assert!(admission.contains("BodyLoad::Lead"));
+
+    let settlement = section(cache, "fn finish_body(", "fn trim(");
+    assert!(settlement.contains(".pending_bodies"));
+    assert!(settlement.contains(".remove(&reference)"));
+    assert!(settlement.contains("self.bodies.insert(reference.clone(), body.clone())"));
+    assert!(settlement.contains("self.trim()"));
+    assert!(settlement.contains("waiter.try_send(body.clone())"));
+
+    let trim = section(cache, "fn trim(", "fn clear(");
+    assert!(trim.contains("saturating_sub(completed_media_range_bytes())"));
+    assert!(trim.contains(".min(RANGE_CACHE_HARD_MAX_BYTES)"));
+    assert!(trim.contains("self.order.pop_front()"));
+    assert!(trim.contains("self.body_order.pop_front()"));
+    assert!(trim.contains("set_auxiliary_media_cache_bytes(self.bytes)"));
+
+    let load = section(HLS_RUNTIME, "async fn hls_body(", "fn prefetch_bodies(");
+    assert!(load.contains("BodyLoad::Cached(body)"));
+    assert!(load.contains("BodyLoad::Wait(waiter)"));
+    assert!(load.contains("BodyLoad::Lead"));
+    assert!(load.contains("root.span > RANGE_CACHE_HARD_MAX_BYTES"));
+    assert!(load.contains("finish_body(reference, body.clone())"));
 }
 
 #[test]
-fn hls_feed_catchup_warms_only_new_authenticated_live_fragments() {
-    assert!(!HLS_RUNTIME.contains("fn prefetch("));
+fn live_exact_ranges_bypass_pending_bodies_while_other_ranges_can_join_them() {
+    let range = section(HLS_RUNTIME, "async fn hls_range(", "async fn hls_body(");
+    let cached = range
+        .find("cache.borrow().get(&reference, start, end)")
+        .unwrap();
+    let conditional = range.find("if join_pending_body").unwrap();
+    let pending = range.find("pending_body(&reference)").unwrap();
+    let joined = range.find("waiter.recv().await").unwrap();
+    let fallback = range.find("retrieve_data_range_from_root(").unwrap();
+    let exact = range
+        .find("bytes.len() as u64 != end.checked_sub(start)?.checked_add(1)?")
+        .unwrap();
+    let stored = range
+        .find("insert(reference, start, end, bytes.clone())")
+        .unwrap();
+
+    assert!(cached < conditional && conditional < pending && pending < joined && joined < fallback);
+    assert!(fallback < exact && exact < stored);
+    assert!(range.contains("body.get(start..end).map(Arc::from)"));
+    assert_eq!(range.matches("retrieve_data_range_from_root(").count(), 1);
+
+    let response = section(
+        HLS_RUNTIME,
+        "async fn fetch_hls_body_response(",
+        "fn parse_hls_range(",
+    );
+    assert!(
+        response.contains("hls_range(client, reference, root, encrypted, start, end, !live).await")
+    );
+    assert!(
+        response.contains("hls_range(client, reference, root, encrypted, 0, prefix_end, !live)")
+    );
+}
+
+#[test]
+fn beginning_stays_progressive_while_live_keeps_three_successors_ahead() {
+    assert!(HLS_CORE.contains("const HLS_LIVE_BODY_RUNWAY_SEGMENTS: usize = 4;"));
+    assert!(
+        HLS_RUNTIME.contains("const BODY_PREFETCH_HORIZON: usize = HLS_LIVE_BODY_RUNWAY_SEGMENTS;")
+    );
+    assert!(HLS_RUNTIME.contains("const HLS_BODY_PREFETCH_MAX_PARALLEL: usize = 3;"));
+    assert!(
+        HLS_RUNTIME.contains("const HLS_NEXT_RESERVE_STAGGER: Duration = Duration::from_secs(1);")
+    );
+
+    let parallel = section(
+        HLS_RUNTIME,
+        "fn prefetch_bodies(",
+        "fn prefetch_priority_runway(",
+    );
+    assert!(parallel.contains(".take(BODY_PREFETCH_HORIZON)"));
+    assert!(parallel.contains("spawn_local(async move"));
+    assert!(parallel.contains("hls_body(client, reference, generation).await"));
+
+    let priority = section(
+        HLS_RUNTIME,
+        "fn prefetch_priority_runway(",
+        "fn prefetch_playlist_runway(",
+    );
+    let bounded = priority
+        .find("references.truncate(BODY_PREFETCH_HORIZON)")
+        .unwrap();
+    let live_only = priority.find("if start == HlsStart::Live").unwrap();
+    let live_runway = priority
+        .find("prefetch_bodies(client, references, generation)")
+        .unwrap();
+    let live_return = priority[live_runway..].find("return;").unwrap() + live_runway;
+    let progressive_current = priority.find("references.remove(0)").unwrap();
+    let stagger = priority
+        .find("Duration::from_secs(offset as u64 + 1)")
+        .unwrap();
+    let successor = priority
+        .find("hls_body(client, reference, None).await")
+        .unwrap();
+    assert!(
+        bounded < live_only
+            && live_only < live_runway
+            && live_runway < live_return
+            && live_return < progressive_current
+            && progressive_current < stagger
+            && stagger < successor
+    );
+
+    let targets = section(
+        HLS_RUNTIME,
+        "fn live_runway_targets(",
+        "fn live_runway_context(",
+    );
+    assert!(targets.contains("active.live_foreground.as_deref()"));
+    assert!(targets.contains("latest_live_foreground(active)"));
+    assert!(targets.contains(".take(HLS_LIVE_BODY_RUNWAY_SEGMENTS)"));
+
+    let persistent = section(
+        HLS_RUNTIME,
+        "fn spawn_live_runway(",
+        "fn prefetch_from_reference(",
+    );
+    let outer = persistent.find("spawn_local(async move").unwrap();
+    let retry = persistent.find("loop {").unwrap();
+    let cached = persistent
+        .find("cache.borrow().body_cached(reference)")
+        .unwrap();
+    let current = persistent
+        .find("live_runway_context(id).is_some_and(|(_, current)|")
+        .unwrap();
+    let each = persistent.find("for reference in references").unwrap();
+    let owned = persistent
+        .find("body_ready_or_pending(&reference)")
+        .unwrap();
+    let stagger = persistent.find("if stagger").unwrap();
+    let scoped = persistent.find("cache.pending_body_count(id)").unwrap();
+    let bounded = persistent.find("< HLS_BODY_PREFETCH_MAX_PARALLEL").unwrap();
+    let detached = persistent[owned..].find("spawn_local(async move").unwrap() + owned;
+    let load = persistent
+        .find("hls_body(client, reference, Some(id)).await")
+        .unwrap();
+    let poll = persistent
+        .find("async_std::task::sleep(Duration::from_millis(25)).await")
+        .unwrap();
+    assert!(outer < retry && retry < cached && cached < current);
+    assert!(current < each && each < owned && owned < stagger && stagger < scoped);
+    assert!(scoped < bounded && bounded < detached && detached < load && load < poll);
+    assert_eq!(
+        persistent
+            .matches("live_runway_context(id).is_some_and(|(_, current)|")
+            .count(),
+        2
+    );
+    assert!(persistent.contains("active.live_runway_running = true"));
+    assert!(persistent.contains("active.live_runway_running = false"));
+
+    let cursor = section(
+        HLS_RUNTIME,
+        "fn prefetch_from_reference(",
+        "fn next_feed_id(",
+    );
+    assert!(cursor.contains(".position(matches)"));
+    assert!(cursor.contains(".rfind(|(position, segment)|"));
+    assert!(cursor.contains("live_segment_is_playable(active, *position)"));
+    assert!(cursor.contains(".take(BODY_PREFETCH_HORIZON)"));
+    assert!(cursor.contains("active.live_foreground = Some(reference.to_string())"));
+    assert!(
+        cursor.contains("prefetch_priority_runway(client, references, HlsStart::Beginning, None)")
+    );
+    assert!(cursor.contains("spawn_live_runway(id)"));
+
+    let discovery = section(
+        HLS_RUNTIME,
+        "async fn discover_beginning(",
+        "async fn edge_probe_wave(",
+    );
+    assert!(!discovery.contains("prefetch_playlist_runway("));
+}
+
+#[test]
+fn follower_settles_commit337_successors_sequentially_and_tolerates_one_gap() {
+    assert!(HLS_RUNTIME.contains("const FEED_FOLLOW_AHEAD: u64 = 4;"));
+    assert!(HLS_RUNTIME.contains("const FEED_FRONTIER_REFRESH_INTERVAL: f64 = 15_000.0;"));
+    let dispatch = section(
+        HLS_RUNTIME,
+        "fn payload_probe_wave(",
+        "async fn settled_payload_wave(",
+    );
+    let spawn = dispatch.find("spawn_local(async move").unwrap();
+    let await_probe = dispatch.find("probe_feed_payload(").unwrap();
+    let send = dispatch
+        .find("results.try_send((slot, index, result))")
+        .unwrap();
+    let close_dispatch = dispatch.find("drop(results)").unwrap();
+    assert!(dispatch.contains("indices.iter().copied().enumerate()"));
+    assert!(spawn < await_probe && await_probe < send && send < close_dispatch);
+    assert!(dispatch.contains("attempt_limit: Option<usize>"));
+    assert!(dispatch.contains("attempt_limit,"));
+
+    let settled = section(
+        HLS_RUNTIME,
+        "async fn settled_payload_wave(",
+        "async fn merge_history_probe(",
+    );
+    let wave = settled
+        .find("payload_probe_wave(client, owner, topic, indices, Some(FEED_PROBE_ATTEMPTS))")
+        .unwrap();
+    let drain = settled
+        .find("while let Ok((_, index, result)) = input.recv().await")
+        .unwrap();
+    let ordered = settled.find("settled.sort_by_key").unwrap();
+    assert!(wave < drain && drain < ordered);
+
+    let catch_up = section(
+        HLS_RUNTIME,
+        "async fn catch_up_history(",
+        "async fn warm_codec_bootstrap(",
+    );
+    assert!(catch_up.contains("(1..=FEED_FOLLOW_AHEAD)"));
+    assert!(catch_up.contains("settled_payload_wave(client, owner, topic, &indices).await"));
+    assert!(catch_up.contains("for (_, probe) in wave"));
+
     let follower = section(
         HLS_RUNTIME,
         "fn spawn_follower(",
         "async fn fetch_hls_body_response(",
     );
-    assert!(follower.contains("head.checked_add(1)"));
-    assert!(follower.contains("warm_appended(id, appended, start)"));
-    let warm = section(HLS_RUNTIME, "fn warm_appended(", "fn spawn_follower(");
-    assert!(warm.contains("start != HlsStart::Live"));
-    let first_new = warm.find("saturating_sub(appended)").unwrap();
-    let oldest_first = warm.find(".skip(first_new)").unwrap();
-    let skip_gaps = warm.find(".filter(|segment| !segment.gap)").unwrap();
-    let runway = warm.find(".take(HLS_LIVE_SYNC_SEGMENTS)").unwrap();
-    assert!(first_new < oldest_first && oldest_first < skip_gaps && skip_gaps < runway);
-    assert!(warm.contains("warm_startup_reference(&reference, start)"));
-    assert!(!follower.contains("discover_latest_once("));
-    assert!(!follower.contains("last_progress"));
-    assert!(!follower.contains("offset"));
-    assert!(!follower.contains("FuturesUnordered"));
-}
-
-#[test]
-fn beginning_attaches_the_warmed_prefix_while_history_grows_in_background() {
-    const PLAYER: &str = include_str!("../src/stream_hls/player.rs");
-    let attach = section(
-        HLS_RUNTIME,
-        "pub(crate) async fn attach_hls_feed_player(",
-        "pub(crate) async fn open_hls_feed_view(",
-    );
-    let beginning = section(attach, "HlsStart::Beginning => {", "HlsStart::Live => {");
-    let early = beginning.find("let early =").unwrap();
-    let history = beginning.find("spawn_beginning_history(").unwrap();
-    assert!(beginning.contains("discover_beginning(client.clone(), owner.clone(), topic.clone())"));
-    let overlap = beginning
-        .find("join(loader, join(worker, early)).await")
+    let indices = follower
+        .find("for offset in 1..=FEED_FOLLOW_AHEAD")
         .unwrap();
-    assert!(early < history && history < overlap);
-    assert!(!beginning.contains("warm_live_runway"));
-    assert!(beginning.contains("(worker, loader, prefix)"));
-    assert!(!beginning.contains("join(loader, full)"));
-
-    let prefix_parse = attach
-        .find("let playlist = match payload.history.take()")
+    let index = follower.find("head.checked_add(offset)").unwrap();
+    let candidate = follower.find("let candidate =").unwrap();
+    let dispatched = follower[candidate..].find("probe_feed_payload(").unwrap() + candidate;
+    let settled = follower[dispatched..].find(".await;").unwrap() + dispatched;
+    let applied = follower
+        .find("apply_full_update(id, payload.index, playlist)")
         .unwrap();
-    let install = attach.find("install_snapshot(").unwrap();
-    let playback = attach.find("player::play_hls(").unwrap();
-    assert!(prefix_parse < install && install < playback);
-    assert!(!attach.contains("spawn_follower(id)"));
-    assert!(PLAYER.contains("duration + BUFFER_EPSILON_SECONDS >= plan.duration"));
-
-    let background = section(
-        HLS_RUNTIME,
-        "fn spawn_beginning_history(",
-        "fn spawn_follower(",
-    );
-    assert!(background.contains("discover_for_view("));
-    assert!(background.contains("!BEGINNING_MEDIA_READY.with(Cell::get)"));
-    assert!(background.contains("payload.history.take()"));
-    assert!(background.contains("apply_full_update(id, payload.index, history)"));
-    assert!(background.contains("result_view_request_is_current(view_generation)"));
-    let history_gate = section(
-        PLAYER,
-        "fn start_beginning_history_when_safe(",
-        "fn begin_playback(",
-    );
-    assert!(history_gate.contains("!live"));
-    assert!(history_gate.contains("buffered_covers(media, plan.play_position, plan.runway_end)"));
-    assert!(history_gate.contains("super::runtime::start_beginning_history()"));
-    assert!(!background.contains("warm_startup_batch"));
-    assert!(!HLS_RUNTIME.contains("BEGINNING_WARM_SEGMENTS"));
-    assert!(!PLAYER.contains("warm_startup_batch"));
-}
-
-#[test]
-fn active_manifest_refresh_renders_without_cloning_the_full_timeline() {
-    let render = section(
-        HLS_RUNTIME,
-        "fn render_active_feed(",
-        "fn apply_full_update(",
-    );
-    assert!(render.contains("playlist.as_ref()?.render("));
-    assert!(render.contains("(!feed.following).then_some(feed.id)"));
-    assert!(render.contains("feed.following = true"));
-    assert!(!render.contains("playlist.clone()"));
-
-    let response = section(
-        HLS_RUNTIME,
-        "async fn fetch_feed_response(",
-        "pub(crate) async fn try_fetch_response(",
-    );
-    let frozen = response.find("render_active_feed(").unwrap();
-    let follower = response.find("spawn_follower(id)").unwrap();
-    assert!(frozen < follower);
-}
-
-#[test]
-fn edge_snapshot_reuses_bounded_boundary_and_revalidates_stale_setup() {
-    let discovery = section(
-        HLS_RUNTIME,
-        "async fn discover_latest_once(",
-        "async fn discover_for_view(",
-    );
-    let payload = discovery.find("retrieve_feed_payload(").unwrap();
-    let confirmation = discovery.find("probe_feed_update(").unwrap();
-    assert!(confirmation > payload);
-    assert!(discovery.contains("confirmed_at: Some(prerequisite_timestamp())"));
-
-    let catch_up = section(
-        HLS_RUNTIME,
-        "async fn catch_up_current_payload(",
-        "async fn discover_for_view(",
-    );
-    assert!(catch_up.contains("FeedProbe::Transient => {}"));
-    assert!(catch_up.contains("INITIAL_DISCOVERY_RETRY_DELAY"));
-
-    let attach = section(
-        HLS_RUNTIME,
-        "pub(crate) async fn attach_hls_feed_player(",
-        "pub(crate) async fn open_hls_feed_view(",
-    );
-    let joined = attach
-        .find("join(worker, join(loader, discovery)).await")
+    let missing = follower
+        .find("FeedPayloadProbe::Missing | FeedPayloadProbe::Transient => {")
         .unwrap();
-    let freshness = attach.find("let confirmed_after_setup").unwrap();
-    let revalidated = attach
-        .match_indices("catch_up_current_payload(")
-        .map(|(position, _)| position)
-        .collect::<Vec<_>>();
-    let parsed = attach
-        .find("let playlist = match payload.history.take()")
-        .unwrap();
-    let installed = attach.find("install_snapshot(").unwrap();
-    assert_eq!(revalidated.len(), 1);
+    let skip_once = follower[missing..]
+        .find("if skipped_missing_index")
+        .unwrap()
+        + missing;
+    let remember_gap = follower[skip_once..]
+        .find("skipped_missing_index = true")
+        .unwrap()
+        + skip_once;
+    let failed = follower.find("let Some(appended) = appended else").unwrap();
+    let progressed = follower.find("if progressed {").unwrap();
+    let idle_sleep = follower[progressed..]
+        .find("async_std::task::sleep(FEED_POLL_INTERVAL).await")
+        .unwrap()
+        + progressed;
     assert!(
-        joined < freshness
-            && freshness < revalidated[0]
-            && revalidated[0] < parsed
-            && parsed < installed
+        indices < index
+            && index < candidate
+            && candidate < dispatched
+            && dispatched < settled
+            && settled < applied
     );
-    assert!(attach.contains("confirmed > worker_at && confirmed > loader_at"));
-    assert!(attach.contains("if live && !confirmed_after_setup"));
-    assert!(attach.contains("(result, prerequisite_timestamp())"));
-    assert!(attach.contains("(ready, prerequisite_timestamp())"));
+    assert!(applied < missing && missing < skip_once && skip_once < remember_gap);
+    assert!(remember_gap < failed && failed < progressed && progressed < idle_sleep);
+    assert!(!follower.contains("pace_next"));
+    assert!(!follower.contains("Duration::try_from_secs_f64"));
+    assert!(follower.contains("FEED_TAIL_PROBE_BYTES, None)"));
+    assert!(!follower.contains("payload_probe_wave("));
+    assert!(!follower.contains("settled_payload_wave("));
+    assert!(follower.contains("skipped_missing_index"));
+    assert!(!follower[progressed..idle_sleep].contains("recover_feed_frontier"));
+    assert!(!follower.contains("Vec<Option<(u64, FeedPayloadProbe)>>"));
+    assert!(follower.contains("now - last_frontier_check >= FEED_FRONTIER_REFRESH_INTERVAL"));
+    assert!(follower.contains("discover_latest_once(client, owner, topic).await"));
+    assert!(follower.contains("if index == head"));
+    assert!(follower.contains("if index < head"));
+    assert!(follower.contains("hls_history("));
+    assert!(
+        follower.find("HlsPlaylist::parse(&payload.bytes)").unwrap()
+            < follower.find("let Some(history) = hls_history(").unwrap()
+    );
+
+    let publish = section(HLS_RUNTIME, "fn apply_update(", "fn apply_full_update(");
+    assert!(publish.contains("Some((appended, active.start == HlsStart::Live))"));
+    assert!(publish.contains("if updated.0 != 0 && updated.1"));
+    assert!(publish.contains("spawn_live_runway(id)"));
+
+    let runway = section(
+        HLS_RUNTIME,
+        "fn live_segment_is_playable(",
+        "fn live_runway_context(",
+    );
+    assert!(runway.contains("presentation_gaps"));
+    assert!(runway.contains("live_segment_is_playable(active"));
 }
 
 #[test]
-fn hls_service_responses_stream_exact_windows() {
+fn completed_hls_bodies_are_served_before_root_or_range_retrieval() {
+    let cached = section(
+        HLS_RUNTIME,
+        "fn cached_hls_body_response(",
+        "async fn fetch_hls_body_response(",
+    );
+    assert!(cached.contains("cache.borrow().body(reference)"));
+    assert!(cached.contains("body.get(usize::try_from(start).ok()?..=usize::try_from(end).ok()?)"));
+    assert!(cached.contains("FetchResponse::ok_shared(206, headers, bytes)"));
+    assert!(cached.contains("FetchResponse::ok_shared(200, headers, body)"));
+
     let response = section(
         HLS_RUNTIME,
         "async fn fetch_hls_body_response(",
-        "async fn fetch_feed_response(",
+        "fn parse_hls_range(",
     );
-    assert!(response.contains("FetchResponse::stream(200, headers)"));
-    assert!(response.contains("Content-Range"));
-    assert!(response.contains("parse_hls_range(range, span)"));
-
-    let feed = section(
-        HLS_RUNTIME,
-        "async fn fetch_feed_response(",
-        "pub(crate) async fn try_fetch_response(",
-    );
-    assert!(feed.contains("Cache-Control"));
-    assert!(feed.contains("no-store"));
-    assert!(!feed.contains("if_none_match_matches"));
-
-    let routing = section(
-        HLS_RUNTIME,
-        "pub(crate) async fn try_fetch_response(",
-        "fn canonical_hls_bytes_resource(",
-    );
-    assert!(routing.contains("range: Option<&str>"));
-    assert!(routing.contains("fetch_hls_body_response("));
+    let fast_path = response.find("cached_hls_body_response(").unwrap();
+    let fast_return = response[fast_path..].find("return response;").unwrap() + fast_path;
+    let decode = response.find("hex::decode(&reference)").unwrap();
+    let root = response.find("retrieve_decoded_data_root(").unwrap();
+    assert!(fast_path < fast_return && fast_return < decode && decode < root);
 }
 
 #[test]
-fn removed_progressive_policy_engine_stays_absent() {
-    let combined = format!("{HLS_CORE}{HLS_RUNTIME}");
-    for removed in [
-        "HLS_BACKGROUND_RANGE_MAX",
-        "HlsProgressiveRunway",
-        "HlsAlignedRangeState",
-        "prefetch_hls_progressive_ranges",
-        "sequence_zero_start_requested",
-        "pending_ranges",
-    ] {
-        assert!(
-            !combined.contains(removed),
-            "retired progressive HLS policy {removed} returned"
-        );
-    }
+fn live_whole_get_joins_the_runway_body_singleflight() {
+    assert!(HLS_RUNTIME.contains("const HLS_BODY_ATTEMPTS: usize = 6;"));
+    assert!(HLS_RUNTIME.contains("const HLS_BODY_RETRY_DELAY_MS: u64 = 75;"));
+
+    let foreground = section(
+        HLS_RUNTIME,
+        "async fn foreground_hls_body(",
+        "fn prefetch_bodies(",
+    );
+    assert!(foreground.contains("for attempt in 0..HLS_BODY_ATTEMPTS"));
+    assert!(foreground.contains("hls_body(client.clone(), reference.clone(), generation).await"));
+    assert!(foreground.contains("HLS_BODY_RETRY_DELAY_MS * (attempt + 1) as u64"));
+
+    let response = section(
+        HLS_RUNTIME,
+        "async fn fetch_hls_body_response(",
+        "fn parse_hls_range(",
+    );
+    let cached = response.find("cached_hls_body_response(").unwrap();
+    let live = response
+        .find("if live && method == \"GET\" && range.is_none() && !codec_bootstrap")
+        .unwrap();
+    let joined = response.find("foreground_hls_body(").unwrap();
+    let shared = response[joined..]
+        .find("cached_hls_body_response(")
+        .unwrap()
+        + joined;
+    let root = response.find("retrieve_decoded_data_root(").unwrap();
+    assert!(cached < live && live < joined && joined < shared && shared < root);
+}
+
+#[test]
+fn hls_service_streams_whole_bodies_through_exact_inclusive_ranges() {
+    let response = section(
+        HLS_RUNTIME,
+        "async fn fetch_hls_body_response(",
+        "fn parse_hls_range(",
+    );
+    let parsed = response.find("parse_hls_range(range, span)").unwrap();
+    let retrieved = response
+        .find("hls_range(client, reference, root, encrypted, start, end, !live).await")
+        .unwrap();
+    let content_range = response
+        .find("format!(\"bytes {start}-{end}/{span}\")")
+        .unwrap();
+    let shared = response
+        .find("FetchResponse::ok_shared(206, headers, bytes)")
+        .unwrap();
+    assert!(parsed < retrieved && retrieved < content_range && content_range < shared);
+    assert!(response.contains("FetchResponse::stream(200, headers)"));
+    assert!(response.contains("Content-Length"));
+    assert!(response.contains("Accept-Ranges"));
+    assert!(response.contains("let mime = if codec_bootstrap"));
+    assert!(response.contains("hls_payload_mime(&prefix)"));
+    assert!(response.contains("else {\n        \"application/octet-stream\""));
+
+    let parser = section(
+        HLS_RUNTIME,
+        "fn parse_hls_range(",
+        "async fn fetch_feed_response(",
+    );
+    assert!(parser.contains("strip_prefix(\"bytes=\")"));
+    assert!(parser.contains("split_once('-')"));
+    assert!(parser.contains("start.is_empty() || end.is_empty() || end.contains(',')"));
+    assert!(parser.contains("start <= end && end < size"));
 }

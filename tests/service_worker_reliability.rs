@@ -327,11 +327,11 @@ fn hls_routes_own_their_stream_windows_and_preserve_http_validators() {
 fn generic_range_stream_keeps_ordered_bounded_lookahead() {
     assert!(WORKER.contains("const STREAM_STORAGE_WINDOW_BYTES = MIB_BYTES / 2;"));
     assert!(WORKER.contains("const STREAM_LOOKAHEAD_CHUNKS = 8;"));
-    assert!(WORKER.contains("const HLS_STREAM_WINDOW_BYTES = MIB_BYTES;"));
-    assert!(WORKER.contains("const HLS_STREAM_INITIAL_LOOKAHEAD_CHUNKS = 2;"));
-    assert!(WORKER.contains("const HLS_STREAM_LOOKAHEAD_CHUNKS = 5;"));
-    assert!(WORKER.contains("const HLS_LIVE_STREAM_WINDOW_BYTES = MIB_BYTES;"));
-    assert!(WORKER.contains("const HLS_LIVE_STREAM_LOOKAHEAD_CHUNKS = 5;"));
+    assert!(WORKER.contains("const HLS_STREAM_WINDOW_BYTES = MIB_BYTES / 2;"));
+    assert!(WORKER.contains("const HLS_STREAM_INITIAL_LOOKAHEAD_CHUNKS = 1;"));
+    assert!(WORKER.contains("const HLS_STREAM_LOOKAHEAD_CHUNKS = 4;"));
+    assert!(WORKER.contains("const HLS_LIVE_STREAM_WINDOW_BYTES = MIB_BYTES / 2;"));
+    assert!(WORKER.contains("const HLS_LIVE_STREAM_LOOKAHEAD_CHUNKS = 4;"));
     assert!(WORKER.contains("const RANGE_REQUEST_FLIGHTS = new Map();"));
 
     let request = between(
@@ -390,12 +390,13 @@ fn generic_range_stream_keeps_ordered_bounded_lookahead() {
     assert!(forward.contains("? HLS_LIVE_STREAM_LOOKAHEAD_CHUNKS"));
     assert!(forward.contains(": hlsResource ? HLS_STREAM_LOOKAHEAD_CHUNKS"));
     assert!(forward.contains("? HLS_STREAM_INITIAL_LOOKAHEAD_CHUNKS"));
-    assert!(forward.contains("url.searchParams.get(\"startup\") === \"1\""));
+    assert!(forward.contains("const initialLookahead = hlsResource"));
+    assert!(!forward.contains("url.searchParams.get(\"startup\")"));
     assert!(!forward.contains("beginningHlsResource"));
 }
 
 #[test]
-fn hls_stream_admits_bounded_lookahead_before_the_first_window_is_emitted() {
+fn hls_stream_stages_one_window_before_admitting_four_window_lookahead() {
     let stream = between(
         WORKER,
         "function createRustRangeStream(",

@@ -314,8 +314,12 @@ mod connection {
                 && address.contains(".libp2p.direct/tcp/")
                 && address.contains("/tls/ws/p2p/")
         }));
-        assert!(profile.contains("bootnodes.shuffle(&mut rand::thread_rng())"));
-        assert!(!profile.contains("bootnodes.truncate("));
+        assert!(profile.contains("pub(crate) const INITIAL_BOOTNODE_BURST: usize = 160;"));
+        assert!(
+            profile.find("bootnodes.shuffle(&mut rand::thread_rng())")
+                < profile.find("bootnodes.truncate(INITIAL_BOOTNODE_BURST)")
+        );
+        assert!(!profile.contains("bootnodes.retain("));
 
         let runtime = include_str!("../src/lib.rs");
         let address_filter = include_str!("../src/addresses.rs");
@@ -344,7 +348,8 @@ mod connection {
             .expect("bootnode dial handler");
 
         assert!(profile.contains("bootnodes.shuffle(&mut rand::thread_rng())"));
-        assert!(!profile.contains("bootnodes.truncate("));
+        assert!(profile.contains("pub(crate) const INITIAL_BOOTNODE_BURST: usize = 160;"));
+        assert!(profile.contains("bootnodes.truncate(INITIAL_BOOTNODE_BURST)"));
         assert!(accounting.contains("pub(crate) const CONNECTION_BUILDUP_LIMIT: u64 = 200;"));
         assert!(handler.contains("let mut bootnode_changes = vec![first_change];"));
         assert!(handler.contains("while let Ok(change) = self.bootnode_port.1.try_recv()"));

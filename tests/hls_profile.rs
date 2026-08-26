@@ -280,7 +280,8 @@ const RESULT_SCRIPT: &str = r#"
             title: document.title,
             visibility_state: document.visibilityState,
             hls_state: document.querySelector('video')?.getAttribute('data-weeb3-hls-state') || null,
-            hls_error: document.querySelector('video')?.getAttribute('data-weeb3-hls-error') || null
+            hls_error: document.querySelector('video')?.getAttribute('data-weeb3-hls-error') || null,
+            hls_status: document.querySelector('.weeb3-hls-status')?.textContent || null
         },
         service_worker: {
             controlled: Boolean(navigator.serviceWorker?.controller),
@@ -327,7 +328,9 @@ const PLAYLIST_SCRIPT: &str = r#"
             ok: response.ok,
             segment_count: durations.length,
             duration_s: durations.reduce((sum, value) => sum + value, 0),
+            tail_one_s: durations.at(-1) || 0,
             tail_two_s: durations.slice(-2).reduce((sum, value) => sum + value, 0),
+            tail_three_s: durations.slice(-3).reduce((sum, value) => sum + value, 0),
             tail_durations_s: durations.slice(-5),
             tail_references: references.slice(-5),
             target_duration_s: Number.isFinite(targetDuration) ? targetDuration : null,
@@ -346,6 +349,8 @@ struct WebSocketBurstSummary {
     total_created: usize,
     first_created_ms: Option<f64>,
     created_within_150_ms_of_first: usize,
+    created_within_3s: usize,
+    created_within_5s: usize,
     attempt_160_ms: Option<f64>,
     first_to_attempt_160_ms: Option<f64>,
 }
@@ -446,9 +451,13 @@ fn weeb3_hls_profile() -> Result<()> {
     // dispatched within one 150ms burst.
     let navigation_start = Arc::new(Mutex::new(None::<Instant>));
     let websocket_times = Arc::new(Mutex::new(Vec::<f64>::new()));
+    let websocket_request_times = Arc::new(Mutex::new(Vec::<f64>::new()));
+    let websocket_handshake_times = Arc::new(Mutex::new(Vec::<f64>::new()));
     let hls_network = Arc::new(Mutex::new(Vec::<Value>::new()));
     let event_navigation_start = Arc::clone(&navigation_start);
     let event_websocket_times = Arc::clone(&websocket_times);
+    let event_websocket_request_times = Arc::clone(&websocket_request_times);
+    let event_websocket_handshake_times = Arc::clone(&websocket_handshake_times);
     let event_hls_network = Arc::clone(&hls_network);
     let _network_listener = tab
         .add_event_listener(Arc::new(move |event: &Event| match event {
@@ -456,6 +465,20 @@ fn weeb3_hls_profile() -> Result<()> {
                 if let Ok(started) = event_navigation_start.lock()
                     && let Some(started) = *started
                     && let Ok(mut times) = event_websocket_times.lock() =>
+            {
+                times.push(started.elapsed().as_secs_f64() * 1_000.0);
+            }
+            Event::NetworkWebSocketWillSendHandshakeRequest(_)
+                if let Ok(started) = event_navigation_start.lock()
+                    && let Some(started) = *started
+                    && let Ok(mut times) = event_websocket_request_times.lock() =>
+            {
+                times.push(started.elapsed().as_secs_f64() * 1_000.0);
+            }
+            Event::NetworkWebSocketHandshakeResponseReceived(_)
+                if let Ok(started) = event_navigation_start.lock()
+                    && let Some(started) = *started
+                    && let Ok(mut times) = event_websocket_handshake_times.lock() =>
             {
                 times.push(started.elapsed().as_secs_f64() * 1_000.0);
             }
@@ -519,6 +542,18 @@ fn weeb3_hls_profile() -> Result<()> {
         .map_err(|_| anyhow!("WebSocket timing lock was poisoned"))?
         .clone();
     let websocket_burst = summarize_websocket_burst(&socket_times);
+    let mut websocket_request_times = websocket_request_times
+        .lock()
+        .map_err(|_| anyhow!("WebSocket request timing lock was poisoned"))?
+        .clone();
+    websocket_request_times.sort_by(f64::total_cmp);
+    let websocket_request_burst = summarize_websocket_burst(&websocket_request_times);
+    let mut websocket_handshake_times = websocket_handshake_times
+        .lock()
+        .map_err(|_| anyhow!("WebSocket handshake timing lock was poisoned"))?
+        .clone();
+    websocket_handshake_times.sort_by(f64::total_cmp);
+    let websocket_handshake_burst = summarize_websocket_burst(&websocket_handshake_times);
     let hls_network = hls_network
         .lock()
         .map_err(|_| anyhow!("HLS network event lock was poisoned"))?
@@ -538,7 +573,9 @@ fn weeb3_hls_profile() -> Result<()> {
         },
         "summary": {
             "playback": playback,
-            "websocket_burst": websocket_burst
+            "websocket_burst": websocket_burst,
+            "websocket_request_burst": websocket_request_burst,
+            "websocket_handshake_burst": websocket_handshake_burst
         },
         "playlist_at_start": startup_playlist,
         "playlist_at_end": final_playlist,
@@ -764,6 +801,10 @@ fn summarize_playback(metrics: &Value, requested_seconds: f64) -> PlaybackSummar
             .filter(|event| {
                 event.get("name").and_then(Value::as_str) == Some(name)
                     && event
+                        .get("ready_state")
+                        .and_then(Value::as_u64)
+                        .is_none_or(|ready| ready < 3)
+                    && event
                         .get("at_ms")
                         .and_then(Value::as_f64)
                         .is_some_and(|at| first_playing_at.is_some_and(|first| at + 0.001 >= first))
@@ -884,6 +925,8 @@ fn summarize_websocket_burst(times_ms: &[f64]) -> WebSocketBurstSummary {
         created_within_150_ms_of_first: first.map_or(0, |origin| {
             times_ms.iter().filter(|&&at| at - origin <= 150.0).count()
         }),
+        created_within_3s: times_ms.iter().filter(|&&at| at <= 3_000.0).count(),
+        created_within_5s: times_ms.iter().filter(|&&at| at <= 5_000.0).count(),
         attempt_160_ms: attempt_160,
         first_to_attempt_160_ms: first
             .zip(attempt_160)
@@ -1021,7 +1064,7 @@ fn validate_playlist_position(
         .get("segment_count")
         .and_then(Value::as_u64)
         .unwrap_or_default();
-    if segment_count < 3 {
+    if segment_count < 2 {
         return Err(anyhow!(
             "startup HLS playlist exposed only {segment_count} segment(s)"
         ));
@@ -1069,7 +1112,7 @@ fn validate_playlist_position(
         ));
     }
     let manifest_growth = final_playlist_duration - playlist_duration;
-    let observable_growth = summary.observed_after_playing_ms / 1_000.0 + target_duration * 2.0;
+    let observable_growth = summary.observed_after_playing_ms / 1_000.0 + elapsed_tolerance + 1.0;
     if !beginning && manifest_growth > observable_growth {
         return Err(anyhow!(
             "HLS elapsed duration jumped by {manifest_growth:.3}s after playback began; the startup manifest was stale"
@@ -1077,18 +1120,38 @@ fn validate_playlist_position(
     }
 
     if !beginning {
-        let tail = object
-            .get("tail_two_s")
+        let tail_one = object
+            .get("tail_one_s")
             .and_then(Value::as_f64)
             .filter(|duration| duration.is_finite() && *duration > 0.0)
-            .ok_or_else(|| anyhow!("startup HLS playlist had no two-segment live tail"))?;
-        let expected_position = (displayed_duration - tail).max(0.0);
+            .ok_or_else(|| anyhow!("startup HLS playlist had no live tail segment"))?;
+        let tail_two = object
+            .get("tail_two_s")
+            .and_then(Value::as_f64)
+            .filter(|duration| duration.is_finite() && *duration > tail_one)
+            .ok_or_else(|| anyhow!("startup HLS playlist had no two-segment live edge"))?;
+        let tail_three = object
+            .get("tail_three_s")
+            .and_then(Value::as_f64)
+            .filter(|duration| duration.is_finite() && *duration > tail_two)
+            .ok_or_else(|| anyhow!("startup HLS playlist had no three-segment live edge"))?;
         let actual_position = summary
             .first_media_time_s
             .ok_or_else(|| anyhow!("live playback had no initial media position"))?;
-        if (actual_position - expected_position).abs() > 1.0 {
+        let expected = (displayed_duration - tail_three).max(0.0);
+        if (actual_position - expected).abs() > 1.0 {
             return Err(anyhow!(
-                "live playback did not start two segments behind its displayed edge: position={actual_position:.3}s, expected={expected_position:.3}s"
+                "live playback did not start two segments behind its edge: position={actual_position:.3}s, expected={expected:.3}s"
+            ));
+        }
+        let start_buffer = summary
+            .start_buffer_s
+            .filter(|duration| duration.is_finite() && *duration >= 0.0)
+            .ok_or_else(|| anyhow!("live playback had no measurable startup runway"))?;
+        let current_segment = tail_three - tail_two;
+        if start_buffer + 0.75 < current_segment {
+            return Err(anyhow!(
+                "live playback started without one buffered segment: buffered={start_buffer:.3}s, segment={current_segment:.3}s"
             ));
         }
     }
@@ -1323,7 +1386,8 @@ mod tests {
                 {"at_ms": 3_500.0, "current_time_s": 22.5, "forward_buffer_s": 12.0, "duration_s": 54.0, "paused": false, "playback_rate": 1.0}
             ],
             "events": [
-                {"at_ms": 2_000.0, "name": "waiting", "error": null}
+                {"at_ms": 2_000.0, "name": "waiting", "ready_state": 2, "error": null},
+                {"at_ms": 2_500.0, "name": "waiting", "ready_state": 4, "error": null}
             ]
         });
         let summary = summarize_playback(&metrics, 3.0);

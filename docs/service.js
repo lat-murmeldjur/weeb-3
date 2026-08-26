@@ -14,11 +14,11 @@ const SERVICE_WORKER_PROTOCOL = 10;
 const MIB_BYTES = 1024 * 1024;
 const STREAM_STORAGE_WINDOW_BYTES = MIB_BYTES / 2;
 const STREAM_LOOKAHEAD_CHUNKS = 8;
-const HLS_STREAM_WINDOW_BYTES = MIB_BYTES;
-const HLS_STREAM_INITIAL_LOOKAHEAD_CHUNKS = 2;
-const HLS_STREAM_LOOKAHEAD_CHUNKS = 5;
-const HLS_LIVE_STREAM_WINDOW_BYTES = MIB_BYTES;
-const HLS_LIVE_STREAM_LOOKAHEAD_CHUNKS = 5;
+const HLS_STREAM_WINDOW_BYTES = MIB_BYTES / 2;
+const HLS_STREAM_INITIAL_LOOKAHEAD_CHUNKS = 1;
+const HLS_STREAM_LOOKAHEAD_CHUNKS = 4;
+const HLS_LIVE_STREAM_WINDOW_BYTES = MIB_BYTES / 2;
+const HLS_LIVE_STREAM_LOOKAHEAD_CHUNKS = 4;
 const RANGE_REQUEST_FLIGHTS = new Map();
 const CLIENT_RUNTIME_PROBES = new Map();
 const CLIENT_RUNTIME_PROBE_TIMEOUT_MS = 1_500;
@@ -749,14 +749,13 @@ async function forwardRequestToRust(request, event) {
         return new Response("weeb-3 stream response has an invalid length", { status: 502 });
       }
       const liveHlsResource = hlsResource && url.searchParams.get("start") === "live";
-      const startupHlsResource = hlsResource && url.searchParams.get("startup") === "1";
       const windowBytes = liveHlsResource
         ? HLS_LIVE_STREAM_WINDOW_BYTES
         : hlsResource ? HLS_STREAM_WINDOW_BYTES : STREAM_STORAGE_WINDOW_BYTES;
       const lookahead = liveHlsResource
         ? HLS_LIVE_STREAM_LOOKAHEAD_CHUNKS
         : hlsResource ? HLS_STREAM_LOOKAHEAD_CHUNKS : STREAM_LOOKAHEAD_CHUNKS;
-      const initialLookahead = startupHlsResource
+      const initialLookahead = hlsResource
         ? HLS_STREAM_INITIAL_LOOKAHEAD_CHUNKS
         : lookahead;
       return new Response(createRustRangeStream(
