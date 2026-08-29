@@ -27,11 +27,11 @@ fn whole_hls_bodies_are_singleflight_and_share_the_bounded_range_budget() {
     assert!(HLS_RUNTIME.contains("const RANGE_CACHE_HARD_MAX_BYTES: u64 = 96 * 1024 * 1024;"));
 
     let cache = section(HLS_RUNTIME, "struct RangeCache {", "struct FeedSession");
-    assert!(cache.contains("bodies: HashMap<String, Arc<[u8]>>"));
+    assert!(cache.contains("bodies: HashMap<String, Bytes>"));
     assert!(cache.contains("body_order: VecDeque<String>"));
     assert!(cache.contains("pending_bodies: HashMap<String, PendingBody>"));
     assert!(cache.contains("generation: Option<u64>"));
-    assert!(cache.contains("waiters: Vec<mpsc::Sender<Option<Arc<[u8]>>>>"));
+    assert!(cache.contains("waiters: Vec<mpsc::Sender<Option<Bytes>>>"));
     assert!(cache.contains("enum BodyLoad"));
 
     let admission = section(cache, "fn body_load(", "fn pending_body(");
@@ -47,7 +47,7 @@ fn whole_hls_bodies_are_singleflight_and_share_the_bounded_range_budget() {
     assert!(settlement.contains(".remove(&reference)"));
     assert!(settlement.contains("self.bodies.insert(reference.clone(), body.clone())"));
     assert!(settlement.contains("self.trim()"));
-    assert!(settlement.contains("waiter.try_send(body.clone())"));
+    assert!(settlement.contains("waiter.try_send(delivered.clone())"));
 
     let trim = section(cache, "fn trim(", "fn clear(");
     assert!(trim.contains("saturating_sub(completed_media_range_bytes())"));
@@ -58,10 +58,17 @@ fn whole_hls_bodies_are_singleflight_and_share_the_bounded_range_budget() {
 
     let load = section(HLS_RUNTIME, "async fn hls_body(", "fn prefetch_bodies(");
     assert!(load.contains("BodyLoad::Cached(body)"));
+    assert!(load.contains("then(|| Bytes::from(body))"));
+    assert!(!load.contains("Arc::from(body)"));
+
+    let range = section(HLS_RUNTIME, "async fn hls_range(", "async fn hls_body(");
+    assert!(range.contains("let bytes = Bytes::from(bytes);"));
+    assert!(range.contains("body.slice(start..end)"));
+    assert!(!range.contains("Arc::from"));
     assert!(load.contains("BodyLoad::Wait(waiter)"));
     assert!(load.contains("BodyLoad::Lead"));
     assert!(load.contains("root.span > RANGE_CACHE_HARD_MAX_BYTES"));
-    assert!(load.contains("finish_body(reference, body.clone())"));
+    assert!(load.contains("finish_body(reference, epoch, body)"));
 }
 
 #[test]
@@ -78,12 +85,14 @@ fn live_exact_ranges_bypass_pending_bodies_while_other_ranges_can_join_them() {
         .find("bytes.len() as u64 != end.checked_sub(start)?.checked_add(1)?")
         .unwrap();
     let stored = range
-        .find("insert(reference, start, end, bytes.clone())")
+        .find("insert(epoch, reference, start, end, bytes.clone())")
         .unwrap();
 
     assert!(cached < conditional && conditional < pending && pending < joined && joined < fallback);
     assert!(fallback < exact && exact < stored);
-    assert!(range.contains("body.get(start..end).map(Arc::from)"));
+    assert!(range.contains("body.get(start..end)?;"));
+    assert!(range.contains("body.slice(start..end)"));
+    assert!(!range.contains("Arc::from"));
     assert_eq!(range.matches("retrieve_data_range_from_root(").count(), 1);
 
     let response = section(
@@ -132,9 +141,9 @@ fn beginning_stays_progressive_while_live_keeps_three_successors_ahead() {
         .find("prefetch_bodies(client, references, generation)")
         .unwrap();
     let live_return = priority[live_runway..].find("return;").unwrap() + live_runway;
-    let progressive_current = priority.find("references.remove(0)").unwrap();
+    let progressive_current = priority.find("references.into_iter().skip(1)").unwrap();
     let stagger = priority
-        .find("Duration::from_secs(offset as u64 + 1)")
+        .find("offset as u64 + u64::from(!head_ready)")
         .unwrap();
     let successor = priority
         .find("hls_body(client, reference, None).await")
@@ -206,9 +215,12 @@ fn beginning_stays_progressive_while_live_keeps_three_successors_ahead() {
     assert!(cursor.contains("live_segment_is_playable(active, *position)"));
     assert!(cursor.contains(".take(BODY_PREFETCH_HORIZON)"));
     assert!(cursor.contains("active.live_foreground = Some(reference.to_string())"));
-    assert!(
-        cursor.contains("prefetch_priority_runway(client, references, HlsStart::Beginning, None)")
-    );
+    assert!(cursor.contains(
+        "prefetch_priority_runway(client, references, HlsStart::Beginning, None, cached)"
+    ));
+    assert!(cursor.contains("hls_progressive_foreground_transition"));
+    assert!(cursor.contains("let playable = playlist.segments.iter().filter"));
+    assert!(cursor.contains("let successor = transition"));
     assert!(cursor.contains("spawn_live_runway(id)"));
 
     let discovery = section(
@@ -343,9 +355,24 @@ fn completed_hls_bodies_are_served_before_root_or_range_retrieval() {
         "async fn fetch_hls_body_response(",
     );
     assert!(cached.contains("cache.borrow().body(reference)"));
-    assert!(cached.contains("body.get(usize::try_from(start).ok()?..=usize::try_from(end).ok()?)"));
-    assert!(cached.contains("FetchResponse::ok_shared(206, headers, bytes)"));
+    assert!(cached.contains("body.get(slice_start..slice_end)?"));
+    assert!(
+        cached
+            .contains("FetchResponse::ok_shared_slice(206, headers, body, slice_start, slice_end)")
+    );
     assert!(cached.contains("FetchResponse::ok_shared(200, headers, body)"));
+    assert!(!cached.contains("Arc::from(body.get"));
+
+    let transfer = section(
+        STREAM,
+        "enum FetchBody {",
+        "pub(crate) async fn service_worker_message_response(",
+    );
+    assert!(transfer.contains("Shared(Bytes)"));
+    assert!(transfer.contains("body.get(start..end)?"));
+    assert!(transfer.contains("body.slice(start..end)"));
+    assert!(transfer.contains("FetchBody::Shared(body) => body"));
+    assert_eq!(transfer.matches("bytes_to_js(bytes)").count(), 1);
 
     let response = section(
         HLS_RUNTIME,
@@ -357,6 +384,13 @@ fn completed_hls_bodies_are_served_before_root_or_range_retrieval() {
     let decode = response.find("hex::decode(&reference)").unwrap();
     let root = response.find("retrieve_decoded_data_root(").unwrap();
     assert!(fast_path < fast_return && fast_return < decode && decode < root);
+}
+
+#[test]
+fn playback_does_not_add_a_predecessor_eviction_policy() {
+    assert!(!HLS_CORE.contains("cached_predecessors"));
+    assert!(!HLS_RUNTIME.contains("evict_cached_predecessors"));
+    assert!(!HLS_RUNTIME.contains("fn evict_references("));
 }
 
 #[test]
@@ -378,17 +412,43 @@ fn live_whole_get_joins_the_runway_body_singleflight() {
         "async fn fetch_hls_body_response(",
         "fn parse_hls_range(",
     );
-    let cached = response.find("cached_hls_body_response(").unwrap();
     let live = response
         .find("if live && method == \"GET\" && range.is_none() && !codec_bootstrap")
         .unwrap();
-    let joined = response.find("foreground_hls_body(").unwrap();
+    let joined = response[live..].find("foreground_hls_body(").unwrap() + live;
     let shared = response[joined..]
         .find("cached_hls_body_response(")
         .unwrap()
         + joined;
     let root = response.find("retrieve_decoded_data_root(").unwrap();
-    assert!(cached < live && live < joined && joined < shared && shared < root);
+    assert!(live < joined && joined < shared && shared < root);
+}
+
+#[test]
+fn commit337_seek_waits_for_the_current_body_and_successor_only_on_a_discontinuity() {
+    let response = section(
+        HLS_RUNTIME,
+        "async fn fetch_hls_body_response(",
+        "fn parse_hls_range(",
+    );
+    let seek = response
+        .find("if let Some(successor) = seek_successor")
+        .unwrap();
+    let current = response[seek..].find("foreground_hls_body(").unwrap() + seek;
+    let successor = response[current..]
+        .find("hls_body(client.clone(), successor, None).await")
+        .unwrap()
+        + current;
+    let release = response[successor..]
+        .find("cached_hls_body_response(")
+        .unwrap()
+        + successor;
+    let ordinary_fast_path = response[release..].find("if let Some(response)").unwrap() + release;
+    let progressive = response
+        .find("FetchResponse::stream(200, headers)")
+        .unwrap();
+    assert!(seek < current && current < successor && successor < release);
+    assert!(release < ordinary_fast_path && ordinary_fast_path < progressive);
 }
 
 #[test]

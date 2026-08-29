@@ -1,8 +1,8 @@
 use crate::{
     ChunkRetrieveSender, Date, Duration, HashMap, HashSet, Mutex, OutboundProtocolSession,
-    PeerAccounting, PeerId, PhysicalConnectionMap, RETRIEVE_CHECK_CONFIRMATION_PEERS,
-    RefreshmentInstruction, RetrieveCancelToken, RetrieveGenerationMap, StreamControl,
-    apply_credit, cancel_reserve,
+    OverlayPeerMap, PeerAccounting, PeerAccountingMap, PeerId, PhysicalConnectionMap,
+    RETRIEVE_CHECK_CONFIRMATION_PEERS, RefreshmentInstruction, RetrieveCancelToken,
+    RetrieveGenerationMap, StreamControl, apply_credit, cancel_reserve,
     erasure_coding::{
         self, BEE_MAX_UPLOAD_TREE_LEVELS, CHUNK_SIZE, CHUNK_WITH_SPAN_SIZE, HASH_SIZE,
         RedundancyLevel, encoded_reference_payload_len, reconstruct_data_indices, reference_layout,
@@ -23,12 +23,10 @@ use crate::{
     retrieve_cancel_token_current, retrieve_handler, transfer_pause_enabled, valid_cac, valid_soc,
 };
 
-use alloy::primitives::keccak256;
+use alloy_primitives::keccak256;
 use async_std::sync::Arc;
-use std::{
-    cell::RefCell, collections::VecDeque, future::Future, pin::Pin, rc::Rc,
-    sync::atomic::AtomicBool,
-};
+use bytes::Bytes;
+use std::{cell::RefCell, collections::VecDeque, rc::Rc, sync::atomic::AtomicBool};
 
 const RETRIEVE_HEDGE_AFTER_MS: u64 = 1_000;
 const RETRIEVE_RS_HEDGE_AFTER_MS: u64 = RETRIEVE_HEDGE_AFTER_MS * 2;
@@ -64,9 +62,9 @@ use libp2p::futures::{
 };
 
 async fn select_retrieve_peer(
-    caddr: &Vec<u8>,
-    peers: &Arc<Mutex<HashMap<Vec<u8>, PeerId>>>,
-    accounting: &Arc<Mutex<HashMap<PeerId, Arc<Mutex<PeerAccounting>>>>>,
+    caddr: &[u8],
+    peers: &OverlayPeerMap,
+    accounting: &PeerAccountingMap,
     physical_connections: &PhysicalConnectionMap,
     skiplist: &mut HashSet<PeerId>,
     overdraftlist: &mut HashSet<PeerId>,
@@ -78,30 +76,25 @@ async fn select_retrieve_peer(
                 return None;
             }
 
-            let mut closest_peer_id: Option<PeerId> = None;
+            let mut closest_peer_id = None;
             let mut closest_price = 0;
             let mut current_max_po = 0;
             for (overlay, id) in peers_map.iter() {
                 if skiplist.contains(id) {
                     continue;
                 }
-
                 let current_po = get_proximity(caddr, overlay);
-
                 if current_po >= current_max_po || closest_peer_id.is_none() {
                     closest_peer_id = Some(*id);
                     closest_price = price(overlay, caddr);
                     current_max_po = current_po;
                 }
             }
-
             closest_peer_id.map(|peer| (peer, closest_price))
         };
-        let Some((peer, req_price)) = selected else {
-            return None;
-        };
+        let (peer, req_price) = selected?;
 
-        skiplist.insert(peer.clone());
+        skiplist.insert(peer);
 
         let accounting_peer = {
             let accounting_peers = accounting.lock().await;
@@ -111,7 +104,7 @@ async fn select_retrieve_peer(
         if let Some(accounting_peer) = accounting_peer {
             if let Some(connection_id) = reserve(&accounting_peer, req_price).await {
                 if let Some(session) = OutboundProtocolSession::capture(
-                    peer.clone(),
+                    peer,
                     connection_id,
                     physical_connections.clone(),
                 ) {
@@ -142,10 +135,24 @@ fn reset_overdraft(skiplist: &mut HashSet<PeerId>, overdraftlist: &mut HashSet<P
 
 fn failed_retrieve_attempt(peer: &PeerId) -> RetrieveAttemptResult {
     RetrieveAttemptResult {
-        peer: peer.clone(),
+        peer: *peer,
         chunk: vec![],
         valid: false,
         soc: false,
+    }
+}
+
+fn record_retrieve_attempt_result(
+    result: RetrieveAttemptResult,
+    in_flight: &mut usize,
+    error_count: &mut usize,
+) -> Option<(Vec<u8>, bool)> {
+    *in_flight = in_flight.saturating_sub(1);
+    if result.valid {
+        Some((result.chunk, result.soc))
+    } else {
+        *error_count += 1;
+        None
     }
 }
 
@@ -195,7 +202,7 @@ async fn retrieve_attempt(
         session,
     } = selected;
     let (chunk_out, chunk_in) = mpsc::unbounded::<Vec<u8>>();
-    let handler_peer = peer.clone();
+    let handler_peer = peer;
     let handler_caddr = caddr.clone();
     wasm_bindgen_futures::spawn_local(async move {
         retrieve_handler(handler_peer, handler_caddr, control, session, &chunk_out).await;
@@ -251,11 +258,11 @@ async fn retrieve_attempt(
     }
 }
 
-fn chunk_address_parts(chunk_address: &Vec<u8>) -> (Vec<u8>, Vec<u8>, bool) {
+fn chunk_address_parts(chunk_address: &[u8]) -> (Vec<u8>, Vec<u8>, bool) {
     if chunk_address.len() == 64 {
         return (
-            (&chunk_address[0..32]).to_vec(),
-            (&chunk_address[32..64]).to_vec(),
+            chunk_address[..32].to_vec(),
+            chunk_address[32..].to_vec(),
             true,
         );
     }
@@ -270,7 +277,7 @@ fn decode_retrieved_chunk(cd: Vec<u8>, soc: bool, encrey: Vec<u8>, encred: bool)
                 return vec![];
             }
 
-            let cd00 = decrypt(&(&cd[97..]).to_vec(), encrey);
+            let cd00 = decrypt(&cd[97..], &encrey);
             if cd00.len() >= 8 {
                 return cd00;
             } else {
@@ -278,11 +285,11 @@ fn decode_retrieved_chunk(cd: Vec<u8>, soc: bool, encrey: Vec<u8>, encred: bool)
             }
         }
 
-        return decrypt(&cd, encrey);
+        return decrypt(&cd, &encrey);
     }
 
     if soc && cd.len() >= 97 + 8 {
-        return (&cd[97..]).to_vec();
+        return cd[97..].to_vec();
     }
     cd
 }
@@ -291,12 +298,12 @@ fn decode_retrieved_chunk(cd: Vec<u8>, soc: bool, encrey: Vec<u8>, encred: bool)
 pub(crate) struct DecodedJoinChunk {
     pub level: RedundancyLevel,
     pub span: u64,
-    pub payload: Rc<[u8]>,
+    pub payload: Bytes,
 }
 
 #[derive(Clone)]
 struct CachedJoinChunk {
-    raw: Option<Rc<[u8]>>,
+    raw: Option<Bytes>,
     decoded: Option<DecodedJoinChunk>,
     generation: u64,
 }
@@ -324,7 +331,7 @@ impl DecodedChunkCache {
             return Some(decoded);
         }
 
-        let decoded = decode_raw_join_chunk(raw.as_ref()?.as_ref(), reference)?;
+        let decoded = decode_shared_raw_join_chunk(raw.as_ref()?.clone(), reference)?;
         if let Some(entry) = self.chunks.get_mut(reference) {
             entry.decoded = Some(decoded.clone());
         }
@@ -334,7 +341,7 @@ impl DecodedChunkCache {
     fn get_decoded_and_raw(
         &mut self,
         reference: &[u8],
-    ) -> Option<(DecodedJoinChunk, Option<Rc<[u8]>>)> {
+    ) -> Option<(DecodedJoinChunk, Option<Bytes>)> {
         self.generation = self.generation.wrapping_add(1);
         let generation = self.generation;
         let entry = self.chunks.get_mut(reference)?;
@@ -347,14 +354,14 @@ impl DecodedChunkCache {
             return Some((decoded, raw));
         }
 
-        let decoded = decode_raw_join_chunk(raw.as_ref()?.as_ref(), reference)?;
+        let decoded = decode_shared_raw_join_chunk(raw.as_ref()?.clone(), reference)?;
         if let Some(entry) = self.chunks.get_mut(reference) {
             entry.decoded = Some(decoded.clone());
         }
         Some((decoded, raw))
     }
 
-    fn get_raw(&mut self, reference: &[u8]) -> Option<Rc<[u8]>> {
+    fn get_raw(&mut self, reference: &[u8]) -> Option<Bytes> {
         self.generation = self.generation.wrapping_add(1);
         let generation = self.generation;
         let entry = self.chunks.get_mut(reference)?;
@@ -383,7 +390,7 @@ impl DecodedChunkCache {
         self.finish_touch(reference, generation);
     }
 
-    fn insert_raw(&mut self, reference: Vec<u8>, raw: Rc<[u8]>) {
+    fn insert_raw(&mut self, reference: Vec<u8>, raw: Bytes) {
         self.generation = self.generation.wrapping_add(1);
         let generation = self.generation;
         if let Some(entry) = self.chunks.get_mut(&reference) {
@@ -405,6 +412,7 @@ impl DecodedChunkCache {
     }
 
     fn finish_touch(&mut self, reference: Vec<u8>, generation: u64) {
+        self.compact_order_if_needed();
         self.order.push_back((reference, generation));
 
         while self.chunks.len() > RETRIEVE_DECODED_CHUNK_CACHE_ENTRIES {
@@ -419,11 +427,10 @@ impl DecodedChunkCache {
                 self.chunks.remove(&expired);
             }
         }
-        self.compact_order_if_needed();
     }
 
     fn compact_order_if_needed(&mut self) {
-        if self.order.len() <= RETRIEVE_DECODED_CHUNK_CACHE_ENTRIES * 2 {
+        if self.order.len() < RETRIEVE_DECODED_CHUNK_CACHE_ENTRIES * 2 {
             return;
         }
 
@@ -445,11 +452,11 @@ pub(crate) fn cached_decoded_chunk(reference: &[u8]) -> Option<DecodedJoinChunk>
     RETRIEVE_DECODED_CHUNK_CACHE.with(|cache| cache.borrow_mut().get_decoded(reference))
 }
 
-fn cached_decoded_and_raw_chunk(reference: &[u8]) -> Option<(DecodedJoinChunk, Option<Rc<[u8]>>)> {
+fn cached_decoded_and_raw_chunk(reference: &[u8]) -> Option<(DecodedJoinChunk, Option<Bytes>)> {
     RETRIEVE_DECODED_CHUNK_CACHE.with(|cache| cache.borrow_mut().get_decoded_and_raw(reference))
 }
 
-fn cached_raw_chunk(reference: &[u8]) -> Option<Rc<[u8]>> {
+fn cached_raw_chunk(reference: &[u8]) -> Option<Bytes> {
     RETRIEVE_DECODED_CHUNK_CACHE.with(|cache| cache.borrow_mut().get_raw(reference))
 }
 
@@ -459,7 +466,7 @@ fn remember_decoded_chunk(reference: Vec<u8>, chunk: &DecodedJoinChunk) {
     });
 }
 
-fn remember_raw_chunk(reference: Vec<u8>, raw: Rc<[u8]>) {
+fn remember_raw_chunk(reference: Vec<u8>, raw: Bytes) {
     RETRIEVE_DECODED_CHUNK_CACHE.with(|cache| {
         cache.borrow_mut().insert_raw(reference, raw);
     });
@@ -473,6 +480,10 @@ async fn join_cancel_token_current(
         return retrieve_cancel_token_current(generations, cancel).await;
     }
     true
+}
+
+fn transfer_is_paused(transfer_paused: &Option<Arc<AtomicBool>>) -> bool {
+    transfer_paused.as_ref().is_some_and(transfer_pause_enabled)
 }
 
 async fn chunk_retrieve_admission_current(
@@ -521,16 +532,16 @@ enum RawFetchReceive {
 
 struct RawFetchResult {
     index: usize,
-    chunk: Rc<[u8]>,
+    chunk: Bytes,
     canonical_cac: bool,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct RawFetchKey {
     runtime_scope: usize,
-    request_address: Vec<u8>,
-    expected_cac: Vec<u8>,
-    cancel_scope: Option<(String, u64)>,
+    request_address: Bytes,
+    expected_cac: Bytes,
+    cancel_scope: Option<(Arc<str>, u64)>,
 }
 
 impl RawFetchKey {
@@ -540,6 +551,12 @@ impl RawFetchKey {
         expected_cac: Vec<u8>,
         cancel: &Option<RetrieveCancelToken>,
     ) -> Self {
+        let request_address = Bytes::from(request_address);
+        let expected_cac = if request_address.as_ref() == expected_cac.as_slice() {
+            request_address.clone()
+        } else {
+            Bytes::from(expected_cac)
+        };
         Self {
             runtime_scope,
             request_address,
@@ -561,7 +578,7 @@ struct RawFetchWaiter {
 struct RawFetchShared {
     admission: RetrieveAdmission,
     hedge_demand: Option<SharedRetrieveHedgeDemand>,
-    cache_references: Rc<RefCell<HashSet<Vec<u8>>>>,
+    cache_references: Rc<RefCell<Vec<Vec<u8>>>>,
 }
 
 impl RawFetchShared {
@@ -570,13 +587,16 @@ impl RawFetchShared {
             admission: RetrieveAdmission::new(),
             hedge_demand: (hedge_demand == RetrieveHedgeDemand::DistinctShardManaged)
                 .then(|| SharedRetrieveHedgeDemand::new(hedge_demand)),
-            cache_references: Rc::new(RefCell::new(HashSet::new())),
+            cache_references: Rc::new(RefCell::new(Vec::new())),
         }
     }
 
-    fn remember_cache_reference(&self, reference: Option<&Vec<u8>>) {
+    fn remember_cache_reference(&self, reference: Option<&[u8]>) {
         if let Some(reference) = reference {
-            self.cache_references.borrow_mut().insert(reference.clone());
+            let mut references = self.cache_references.borrow_mut();
+            if !references.iter().any(|known| known.as_slice() == reference) {
+                references.push(reference.to_vec());
+            }
         }
     }
 }
@@ -616,15 +636,15 @@ fn complete_raw_fetch(key: &RawFetchKey, flight_id: u64, chunk: Vec<u8>) -> bool
 
     let usable = (erasure_coding::SPAN_SIZE..=CHUNK_WITH_SPAN_SIZE).contains(&chunk.len());
     let canonical_cac = usable && valid_cac(&chunk, &key.expected_cac);
-    let chunk: Rc<[u8]> = chunk.into();
-    let delivered = if usable { chunk } else { Rc::from([]) };
+    let chunk = Bytes::from(chunk);
+    let delivered = if usable { chunk } else { Bytes::new() };
 
     // Cache ownership belongs to the physical flight, not to its current
     // logical waiters. A retired caller may have zero waiters when a canonical
     // late result arrives, and that result must still benefit a later caller.
     if canonical_cac {
         for reference in flight.shared.cache_references.borrow().iter() {
-            remember_raw_chunk(reference.clone(), Rc::clone(&delivered));
+            remember_raw_chunk(reference.clone(), delivered.clone());
         }
     }
 
@@ -634,7 +654,7 @@ fn complete_raw_fetch(key: &RawFetchKey, flight_id: u64, chunk: Vec<u8>) -> bool
         }
         let _ = waiter.result_chan.try_send(RawFetchResult {
             index: waiter.index,
-            chunk: Rc::clone(&delivered),
+            chunk: delivered.clone(),
             canonical_cac,
         });
     }
@@ -652,15 +672,15 @@ fn queue_drained_raw_chunk(
     cancel: &Option<RetrieveCancelToken>,
     hedge_demand: RetrieveHedgeDemand,
 ) -> RawFetchRegistration {
-    if let Some(reference) = cache_reference.as_ref() {
-        if let Some(chunk) = cached_raw_chunk(reference) {
-            let _ = result_chan.try_send(RawFetchResult {
-                index,
-                chunk,
-                canonical_cac: true,
-            });
-            return RawFetchRegistration::Cached;
-        }
+    if let Some(reference) = cache_reference.as_ref()
+        && let Some(chunk) = cached_raw_chunk(reference)
+    {
+        let _ = result_chan.try_send(RawFetchResult {
+            index,
+            chunk,
+            canonical_cac: true,
+        });
+        return RawFetchRegistration::Cached;
     }
 
     let key = RawFetchKey::new(
@@ -682,7 +702,7 @@ fn queue_drained_raw_chunk(
     });
     registration
         .shared
-        .remember_cache_reference(cache_reference.as_ref());
+        .remember_cache_reference(cache_reference.as_deref());
     if let Some(shared_demand) = registration.shared.hedge_demand.as_ref() {
         shared_demand.promote(hedge_demand);
     }
@@ -704,7 +724,7 @@ fn queue_drained_raw_chunk(
     let completion_key = registration.key;
     if chunk_retrieve_chan
         .try_send(crate::ChunkRetrieveRequest {
-            address: completion_key.request_address.clone(),
+            address: completion_key.request_address.to_vec(),
             chan: chan_out,
             cancel: cancel.clone(),
             admission: Some(registration.shared.admission.clone()),
@@ -737,29 +757,26 @@ fn decrypt_join_chunk(raw: &[u8], key: &[u8]) -> Option<Vec<u8>> {
         return None;
     }
 
+    let mut plain = raw.to_vec();
     let span_key = decryption_segment_key(key, (CHUNK_SIZE / key.len()) as u32);
-    let mut plain = Vec::with_capacity(raw.len());
-    for index in 0..erasure_coding::SPAN_SIZE {
-        plain.push(raw[index] ^ span_key[index]);
+    for (byte, mask) in plain[..erasure_coding::SPAN_SIZE].iter_mut().zip(span_key) {
+        *byte ^= mask;
     }
 
-    for (segment_index, segment) in raw[erasure_coding::SPAN_SIZE..]
-        .chunks(key.len())
+    for (segment_index, segment) in plain[erasure_coding::SPAN_SIZE..]
+        .chunks_mut(key.len())
         .enumerate()
     {
         let segment_key = decryption_segment_key(key, segment_index as u32);
-        plain.extend(
-            segment
-                .iter()
-                .zip(segment_key.iter())
-                .map(|(&value, &mask)| value ^ mask),
-        );
+        for (byte, mask) in segment.iter_mut().zip(segment_key) {
+            *byte ^= mask;
+        }
     }
     Some(plain)
 }
 
-fn canonical_plain_chunk(plain: &[u8], encrypted: bool) -> Option<DecodedJoinChunk> {
-    let (level, span) = erasure_coding::decode_span(plain)?;
+fn canonical_plain_chunk(plain: Bytes, encrypted: bool) -> Option<DecodedJoinChunk> {
+    let (level, span) = erasure_coding::decode_span(&plain)?;
     let payload_len = if span <= CHUNK_SIZE as u64 {
         usize::try_from(span).ok()?
     } else {
@@ -772,11 +789,11 @@ fn canonical_plain_chunk(plain: &[u8], encrypted: bool) -> Option<DecodedJoinChu
     Some(DecodedJoinChunk {
         level,
         span,
-        payload: Rc::from(&plain[erasure_coding::SPAN_SIZE..chunk_len]),
+        payload: plain.slice(erasure_coding::SPAN_SIZE..chunk_len),
     })
 }
 
-pub(crate) fn decode_raw_join_chunk(raw: &[u8], reference: &[u8]) -> Option<DecodedJoinChunk> {
+fn decode_shared_raw_join_chunk(raw: Bytes, reference: &[u8]) -> Option<DecodedJoinChunk> {
     if reference.len() != HASH_SIZE && reference.len() != erasure_coding::ENCRYPTED_REFERENCE_SIZE {
         return None;
     }
@@ -786,8 +803,8 @@ pub(crate) fn decode_raw_join_chunk(raw: &[u8], reference: &[u8]) -> Option<Deco
 
     let encrypted = reference.len() == erasure_coding::ENCRYPTED_REFERENCE_SIZE;
     if encrypted {
-        let plain = decrypt_join_chunk(raw, &reference[HASH_SIZE..])?;
-        canonical_plain_chunk(&plain, true)
+        let plain = decrypt_join_chunk(&raw, &reference[HASH_SIZE..])?;
+        canonical_plain_chunk(Bytes::from(plain), true)
     } else {
         canonical_plain_chunk(raw, false)
     }
@@ -809,7 +826,7 @@ async fn retrieve_raw_root_cancellable(
     chunk_retrieve_chan: &ChunkRetrieveSender,
     cancel_generations: &Option<RetrieveGenerationMap>,
     cancel: &Option<RetrieveCancelToken>,
-) -> Option<(Rc<[u8]>, bool)> {
+) -> Option<(Bytes, bool)> {
     let root_cac = reference.get(..HASH_SIZE)?.to_vec();
     let replicas = erasure_coding::replicas(
         &root_cac,
@@ -828,26 +845,30 @@ async fn retrieve_raw_root_cancellable(
     let mut dispatched = 0usize;
     let mut completed = 0usize;
     let mut next_batch = 2usize;
+    let dispatch_batch = |next: &mut usize, dispatched: &mut usize, batch: usize| {
+        let end = next.saturating_add(batch).min(requests.len());
+        while *next < end {
+            queue_drained_raw_chunk(
+                *next,
+                requests[*next].clone(),
+                root_cac.clone(),
+                Some(reference.to_vec()),
+                chunk_retrieve_chan,
+                &result_out,
+                &admission,
+                cancel,
+                RetrieveHedgeDemand::Ordinary,
+            );
+            *next += 1;
+            *dispatched += 1;
+        }
+    };
 
     let initial = requests.len().min(3); // original CAC plus Bee's first two replicas
     if !join_cancel_token_current(cancel_generations, cancel).await {
         return None;
     }
-    while next < initial {
-        queue_drained_raw_chunk(
-            next,
-            requests[next].clone(),
-            root_cac.clone(),
-            Some(reference.to_vec()),
-            chunk_retrieve_chan,
-            &result_out,
-            &admission,
-            cancel,
-            RetrieveHedgeDemand::Ordinary,
-        );
-        next += 1;
-        dispatched += 1;
-    }
+    dispatch_batch(&mut next, &mut dispatched, initial);
     let mut hedge_started = Date::now();
 
     loop {
@@ -861,22 +882,7 @@ async fn retrieve_raw_root_cancellable(
             if !join_cancel_token_current(cancel_generations, cancel).await {
                 return None;
             }
-            let end = (next + next_batch).min(requests.len());
-            while next < end {
-                queue_drained_raw_chunk(
-                    next,
-                    requests[next].clone(),
-                    root_cac.clone(),
-                    Some(reference.to_vec()),
-                    chunk_retrieve_chan,
-                    &result_out,
-                    &admission,
-                    cancel,
-                    RetrieveHedgeDemand::Ordinary,
-                );
-                next += 1;
-                dispatched += 1;
-            }
+            dispatch_batch(&mut next, &mut dispatched, next_batch);
             next_batch = next_batch.saturating_mul(2);
             hedge_started = Date::now();
         }
@@ -893,22 +899,7 @@ async fn retrieve_raw_root_cancellable(
                     if !join_cancel_token_current(cancel_generations, cancel).await {
                         return None;
                     }
-                    let end = (next + next_batch).min(requests.len());
-                    while next < end {
-                        queue_drained_raw_chunk(
-                            next,
-                            requests[next].clone(),
-                            root_cac.clone(),
-                            Some(reference.to_vec()),
-                            chunk_retrieve_chan,
-                            &result_out,
-                            &admission,
-                            cancel,
-                            RetrieveHedgeDemand::Ordinary,
-                        );
-                        next += 1;
-                        dispatched += 1;
-                    }
+                    dispatch_batch(&mut next, &mut dispatched, next_batch);
                     next_batch = next_batch.saturating_mul(2);
                     hedge_started = Date::now();
                     continue;
@@ -937,14 +928,14 @@ async fn retrieve_raw_root_cancellable(
 }
 
 pub(crate) async fn retrieve_decoded_data_root(
-    data_address: &Vec<u8>,
+    data_address: &[u8],
     chunk_retrieve_chan: &ChunkRetrieveSender,
 ) -> Option<DecodedJoinChunk> {
     retrieve_decoded_data_root_cancellable(data_address, chunk_retrieve_chan, None, None).await
 }
 
 pub(crate) async fn retrieve_decoded_data_root_cancellable(
-    data_address: &Vec<u8>,
+    data_address: &[u8],
     chunk_retrieve_chan: &ChunkRetrieveSender,
     cancel_generations: Option<RetrieveGenerationMap>,
     cancel: Option<RetrieveCancelToken>,
@@ -970,14 +961,12 @@ pub(crate) async fn retrieve_decoded_data_root_cancellable(
     if !join_cancel_token_current(&cancel_generations, &cancel).await {
         return None;
     }
-    if canonical_cac {
-        if let Some(root) = cached_decoded_chunk(data_address) {
-            return Some(root);
-        }
+    if canonical_cac && let Some(root) = cached_decoded_chunk(data_address) {
+        return Some(root);
     }
-    let root = decode_raw_join_chunk(raw.as_ref(), data_address)?;
+    let root = decode_shared_raw_join_chunk(raw, data_address)?;
     if canonical_cac {
-        remember_decoded_chunk(data_address.clone(), &root);
+        remember_decoded_chunk(data_address.to_vec(), &root);
     }
     Some(root)
 }
@@ -994,7 +983,7 @@ fn padded_rs_shard(chunk: &[u8]) -> Option<Vec<u8>> {
 pub(crate) enum RequestedShardCache {
     DecodedAndRaw {
         decoded: DecodedJoinChunk,
-        raw: Rc<[u8]>,
+        raw: Bytes,
     },
     DecodedOnly(DecodedJoinChunk),
     Miss,
@@ -1152,7 +1141,7 @@ fn settle_data_group_result(
     parity_present: bool,
     requested_mask: &[bool],
     requested_ready: &mut [bool],
-    received_shards: &mut [Option<Rc<[u8]>>],
+    received_shards: &mut [Option<Bytes>],
     authenticated_shards: &mut [bool],
     rolling_active_shards: &mut [bool],
     rolling_active: &mut usize,
@@ -1170,7 +1159,7 @@ fn settle_data_group_result(
     }
 
     let result_index = result.index;
-    let result_chunk = Rc::clone(&result.chunk);
+    let result_chunk = result.chunk.clone();
     *received_shards.get_mut(result_index)? = Some(result.chunk);
     *authenticated_shards.get_mut(result_index)? = result.canonical_cac;
     *successes = successes.checked_add(1)?;
@@ -1182,14 +1171,14 @@ fn settle_data_group_result(
         let reference = data_references.get(result_index)?;
         let chunk = if result.canonical_cac {
             cached_decoded_chunk(reference).or_else(|| {
-                remember_raw_chunk(reference.clone(), Rc::clone(&result_chunk));
+                remember_raw_chunk(reference.clone(), result_chunk.clone());
                 cached_decoded_chunk(reference)
             })?
         } else {
             if parity_present {
                 return None;
             }
-            decode_raw_join_chunk(result_chunk.as_ref(), reference)?
+            decode_shared_raw_join_chunk(result_chunk, reference)?
         };
         child_emitter.emit(result_index, chunk);
         requested_ready[result_index] = true;
@@ -1250,7 +1239,7 @@ async fn fetch_data_group_indices_streaming(
     let (result_out, result_in) = mpsc::unbounded::<RawFetchResult>();
     let mut dispatched_shards = vec![false; total_count];
     let mut requested_ready = vec![false; data_count];
-    let mut received_shards: Vec<Option<Rc<[u8]>>> = vec![None; total_count];
+    let mut received_shards: Vec<Option<Bytes>> = vec![None; total_count];
     let mut authenticated_shards = vec![false; total_count];
     let static_rolling_candidate = rolling_full_group_static_candidate(
         true,
@@ -1619,7 +1608,7 @@ async fn fetch_data_group_indices_streaming(
         if authenticated_shards[index]
             && let Some(raw) = raw
         {
-            remember_raw_chunk(data_references[index].clone(), Rc::clone(raw));
+            remember_raw_chunk(data_references[index].clone(), raw.clone());
         }
     }
 
@@ -1699,8 +1688,6 @@ impl GroupChildEmitter {
     }
 }
 
-type GroupJoiner = FuturesUnordered<Pin<Box<dyn Future<Output = ()>>>>;
-
 fn allocate_join_output(payload_len: u64, prefix: &[u8]) -> Option<Vec<u8>> {
     let payload_len = usize::try_from(payload_len).ok()?;
     let len = prefix.len().checked_add(payload_len)?;
@@ -1779,7 +1766,7 @@ async fn retrieve_data_range_from_root_with_prefix_cancellable(
         depth: 0,
         chunk: root,
     }]);
-    let mut groups: GroupJoiner = FuturesUnordered::new();
+    let mut groups = FuturesUnordered::new();
     let (group_event_out, group_event_in) = mpsc::unbounded::<GroupFetchEvent>();
     let mut active_groups = 0usize;
 
@@ -1861,7 +1848,7 @@ async fn retrieve_data_range_from_root_with_prefix_cancellable(
                 events: group_event_out.clone(),
             };
             let terminal_emitter = emitter.clone();
-            groups.push(Box::pin(async move {
+            groups.push(async move {
                 let success = fetch_data_group_indices_streaming(
                     data_references,
                     parity_references,
@@ -1875,7 +1862,7 @@ async fn retrieve_data_range_from_root_with_prefix_cancellable(
                 .await
                 .is_some();
                 terminal_emitter.finish(success);
-            }));
+            });
             active_groups = active_groups.checked_add(1)?;
         }
 
@@ -1937,7 +1924,7 @@ async fn retrieve_data_range_from_root_with_prefix_cancellable(
 }
 
 async fn retrieve_data_joined(
-    data_address: &Vec<u8>,
+    data_address: &[u8],
     chunk_retrieve_chan: &ChunkRetrieveSender,
     include_span_prefix: bool,
 ) -> Vec<u8> {
@@ -1952,7 +1939,7 @@ async fn retrieve_data_joined(
     } else {
         &[]
     };
-    let data = if span == 0 {
+    if span == 0 {
         output_prefix.to_vec()
     } else {
         let Some(payload) = retrieve_data_range_from_root_with_prefix_cancellable(
@@ -1970,13 +1957,12 @@ async fn retrieve_data_joined(
             return vec![];
         };
         payload
-    };
-    data
+    }
 }
 
 /// Retrieve Bee's historical joined representation (`span || payload`).
 pub async fn retrieve_data(
-    data_address: &Vec<u8>,
+    data_address: &[u8],
     chunk_retrieve_chan: &ChunkRetrieveSender,
 ) -> Vec<u8> {
     retrieve_data_joined(data_address, chunk_retrieve_chan, true).await
@@ -1984,17 +1970,17 @@ pub async fn retrieve_data(
 
 /// Retrieve a Bee bytes payload without its internal span.
 pub(crate) async fn retrieve_data_payload(
-    data_address: &Vec<u8>,
+    data_address: &[u8],
     chunk_retrieve_chan: &ChunkRetrieveSender,
 ) -> Vec<u8> {
     retrieve_data_joined(data_address, chunk_retrieve_chan, false).await
 }
 
 pub async fn retrieve_chunk(
-    chunk_address: &Vec<u8>,
+    chunk_address: &[u8],
     control: StreamControl,
-    peers: &Arc<Mutex<HashMap<Vec<u8>, PeerId>>>,
-    accounting: &Arc<Mutex<HashMap<PeerId, Arc<Mutex<PeerAccounting>>>>>,
+    peers: &OverlayPeerMap,
+    accounting: &PeerAccountingMap,
     physical_connections: &PhysicalConnectionMap,
     refresh_chan: &mpsc::Sender<RefreshmentInstruction>,
     cancel_generations: Option<RetrieveGenerationMap>,
@@ -2005,15 +1991,13 @@ pub async fn retrieve_chunk(
 ) -> Vec<u8> {
     let (caddr, encrey, encred) = chunk_address_parts(chunk_address);
 
-    let mut soc = false;
     let mut skiplist: HashSet<PeerId> = HashSet::new();
     let mut overdraftlist: HashSet<PeerId> = HashSet::new();
 
     let mut attempt_count = 0;
     let mut error_count = 0;
 
-    #[allow(unused_assignments)]
-    let mut cd = vec![];
+    let mut retrieved = None;
 
     let (attempt_out, attempt_in) = mpsc::unbounded::<RetrieveAttemptResult>();
     let mut in_flight = 0_usize;
@@ -2022,26 +2006,21 @@ pub async fn retrieve_chunk(
     while error_count < RETRIEVE_CHUNK_MAX_ATTEMPT_ERRORS
         && (attempt_count < RETRIEVE_CHUNK_MAX_ATTEMPT_ERRORS || in_flight > 0)
     {
-        if in_flight > 0 {
-            if let Ok(result) = attempt_in.try_recv() {
-                in_flight = in_flight.saturating_sub(1);
-                if result.valid {
-                    cd = result.chunk;
-                    soc = result.soc;
-                    break;
-                }
-                error_count += 1;
-                cd = vec![];
-
-                async_std::task::sleep(Duration::from_millis(RETRIEVE_HOT_LOOP_GUARD_MS)).await;
-                continue;
+        if in_flight > 0
+            && let Ok(result) = attempt_in.try_recv()
+        {
+            if let Some(success) =
+                record_retrieve_attempt_result(result, &mut in_flight, &mut error_count)
+            {
+                retrieved = Some(success);
+                break;
             }
+
+            async_std::task::sleep(Duration::from_millis(RETRIEVE_HOT_LOOP_GUARD_MS)).await;
+            continue;
         }
 
-        let paused = transfer_paused
-            .as_ref()
-            .map(transfer_pause_enabled)
-            .unwrap_or(false);
+        let paused = transfer_is_paused(&transfer_paused);
         let admission_current =
             chunk_retrieve_admission_current(&cancel_generations, &cancel, &admission).await;
         if !admission_current && in_flight == 0 {
@@ -2093,11 +2072,7 @@ pub async fn retrieve_chunk(
                     continue;
                 }
 
-                if transfer_paused
-                    .as_ref()
-                    .map(transfer_pause_enabled)
-                    .unwrap_or(false)
-                {
+                if transfer_is_paused(&transfer_paused) {
                     cancel_reserve(&selected.accounting, selected.price).await;
                     skiplist.remove(&selected.peer);
                     async_std::task::sleep(Duration::from_millis(RETRIEVE_HOT_LOOP_GUARD_MS)).await;
@@ -2169,28 +2144,28 @@ pub async fn retrieve_chunk(
 
         match async_std::future::timeout(Duration::from_millis(wait_ms), attempt_in.recv()).await {
             Ok(Ok(result)) => {
-                in_flight = in_flight.saturating_sub(1);
-                if result.valid {
-                    cd = result.chunk;
-                    soc = result.soc;
+                if let Some(success) =
+                    record_retrieve_attempt_result(result, &mut in_flight, &mut error_count)
+                {
+                    retrieved = Some(success);
                     break;
                 }
-                error_count += 1;
-                cd = vec![];
             }
             Ok(Err(_)) => break,
             Err(_) => {}
         };
     }
 
-    decode_retrieved_chunk(cd, soc, encrey, encred)
+    retrieved
+        .map(|(chunk, soc)| decode_retrieved_chunk(chunk, soc, encrey, encred))
+        .unwrap_or_default()
 }
 
 pub async fn retrieve_check_chunk(
-    chunk_address: &Vec<u8>,
+    chunk_address: &[u8],
     control: StreamControl,
-    peers: &Arc<Mutex<HashMap<Vec<u8>, PeerId>>>,
-    accounting: &Arc<Mutex<HashMap<PeerId, Arc<Mutex<PeerAccounting>>>>>,
+    peers: &OverlayPeerMap,
+    accounting: &PeerAccountingMap,
     physical_connections: &PhysicalConnectionMap,
     refresh_chan: &mpsc::Sender<RefreshmentInstruction>,
     transfer_paused: Option<Arc<AtomicBool>>,
@@ -2214,7 +2189,7 @@ pub async fn retrieve_check_chunk(
         while let Ok(result) = attempt_in.try_recv() {
             // Each physical attempt reports exactly one logical result. A timed-out transport's
             // later response is consumed only by its detached accounting settlement task.
-            if !reported_peers.insert(result.peer.clone()) {
+            if !reported_peers.insert(result.peer) {
                 continue;
             }
             if result.valid {
@@ -2231,11 +2206,7 @@ pub async fn retrieve_check_chunk(
             break;
         }
 
-        while transfer_paused
-            .as_ref()
-            .map(transfer_pause_enabled)
-            .unwrap_or(false)
-        {
+        while transfer_is_paused(&transfer_paused) {
             async_std::task::sleep(Duration::from_millis(100)).await;
         }
 
@@ -2256,11 +2227,7 @@ pub async fn retrieve_check_chunk(
             continue;
         };
 
-        if transfer_paused
-            .as_ref()
-            .map(transfer_pause_enabled)
-            .unwrap_or(false)
-        {
+        if transfer_is_paused(&transfer_paused) {
             cancel_reserve(&selected.accounting, selected.price).await;
             async_std::task::sleep(Duration::from_millis(RETRIEVE_HOT_LOOP_GUARD_MS)).await;
             continue;
@@ -2284,86 +2251,45 @@ pub async fn retrieve_check_chunk(
     decode_retrieved_chunk(cd, soc, encrey, encred)
 }
 
-pub fn verify_chunk(caddr: &Vec<u8>, cd: &Vec<u8>) -> (bool, bool) {
-    let contaddrd = valid_cac(&cd, &caddr);
-    if !contaddrd {
-        let soc = valid_soc(&cd, &caddr);
-        if !soc {
-            return (false, false);
-        } else {
-            return (true, true);
-        }
+pub fn verify_chunk(caddr: &[u8], cd: &[u8]) -> (bool, bool) {
+    if valid_cac(cd, caddr) {
+        (true, false)
     } else {
-        return (true, false);
+        let soc = valid_soc(cd, caddr);
+        (soc, soc)
     }
 }
 
-pub fn decrypt(cd: &Vec<u8>, encrey: Vec<u8>) -> Vec<u8> {
-    if cd.len() < 8 {
+pub fn decrypt(cd: &[u8], encrey: &[u8]) -> Vec<u8> {
+    let Some(mut decrypted) = decrypt_join_chunk(cd, encrey) else {
+        return vec![];
+    };
+    let mut span_decrypted = u64::from_le_bytes(
+        decrypted[..erasure_coding::SPAN_SIZE]
+            .try_into()
+            .expect("decrypt_join_chunk validated the span"),
+    );
+
+    if span_decrypted > CHUNK_SIZE as u64 {
+        let mut carry_span = CHUNK_SIZE as u64;
+        loop {
+            let k = span_decrypted / carry_span;
+            let remainder = u64::from(span_decrypted % carry_span != 0);
+
+            if k + remainder <= 64 {
+                span_decrypted = (k + remainder) * 64;
+                break;
+            }
+            carry_span *= 64;
+        }
+    }
+
+    let decrypted_len = erasure_coding::SPAN_SIZE + span_decrypted as usize;
+    if decrypted_len > decrypted.len() {
         return vec![];
     }
-
-    let spancred = (&cd[0..8]).to_vec();
-    let concred = (&cd[8..]).to_vec();
-    let creylen = encrey.len();
-
-    let mut spanbytes: Vec<u8> = vec![];
-    let spansegmentkey0 = ((4096 / creylen) as u32).to_le_bytes();
-    let spansegmentkey1 =
-        keccak256(keccak256([encrey.clone(), spansegmentkey0.to_vec()].concat()).to_vec()).to_vec();
-
-    for j in 0..8 {
-        spanbytes.push(spancred[j] ^ spansegmentkey1[j])
-    }
-
-    let mut content: Vec<u8> = vec![];
-    let mut done = false;
-    let mut i = 0;
-    while !done {
-        let mut k = creylen;
-        if k > concred.len() - (i * creylen) {
-            k = concred.len() - (i * creylen);
-        };
-
-        let contentsegmentkey0 = (i as u32).to_le_bytes();
-        let contentsegmentkey1 = keccak256(keccak256(
-            [encrey.clone(), contentsegmentkey0.to_vec()].concat(),
-        ))
-        .to_vec();
-
-        for j in (i * creylen)..(i * creylen + k) {
-            content.push(concred[j] ^ contentsegmentkey1[j - i * creylen])
-        }
-
-        i += 1;
-
-        if !(i * creylen < concred.len()) {
-            done = true;
-        }
-    }
-
-    let mut span_decrypted = u64::from_le_bytes(spanbytes.clone().try_into().unwrap());
-
-    if span_decrypted > 4096 {
-        let mut done0 = false;
-        let mut carry_span = 4096_u64;
-        while !done0 {
-            let k = span_decrypted / carry_span;
-            let mut l0 = span_decrypted % carry_span;
-            if l0 > 0 {
-                l0 = 1;
-            }
-
-            if k + l0 <= 64 {
-                done0 = true;
-                span_decrypted = (k + l0) * 64;
-            } else {
-                carry_span *= 64;
-            }
-        }
-    };
-
-    return [spanbytes, content[..span_decrypted as usize].to_vec()].concat();
+    decrypted.truncate(decrypted_len);
+    decrypted
 }
 
 async fn get_feed_probe_chunk(
@@ -2394,8 +2320,8 @@ async fn get_feed_probe_chunk(
 }
 
 async fn probe_feed_update_status(
-    owner: &String,
-    topic: &String,
+    owner: &str,
+    topic: &str,
     index: u64,
     chunk_retrieve_chan: &ChunkRetrieveSender,
 ) -> FeedProbe<Vec<u8>> {
@@ -2435,7 +2361,6 @@ pub async fn seek_latest_feed_update(
     owner: String,
     topic: String,
     chunk_retrieve_chan: &ChunkRetrieveSender,
-    _redundancy: u8,
 ) -> Vec<u8> {
     seek_latest_feed_update_indexed(owner, topic, chunk_retrieve_chan)
         .await
@@ -2458,25 +2383,144 @@ pub(crate) async fn seek_latest_feed_update_indexed_observing_positive(
     chunk_retrieve_chan: &ChunkRetrieveSender,
     early_updates: Option<mpsc::Sender<(u64, Vec<u8>)>>,
 ) -> Option<(u64, Vec<u8>)> {
-    match seek_feed_frontier(owner, topic, chunk_retrieve_chan, early_updates).await {
-        (Some((index, payload)), _) => Some((index, payload)),
-        (None, _) => None,
-    }
+    seek_feed_frontier(owner, topic, chunk_retrieve_chan, early_updates)
+        .await
+        .0
 }
 
 pub async fn seek_next_feed_update_index(
     owner: String,
     topic: String,
     chunk_retrieve_chan: &ChunkRetrieveSender,
-    _redundancy: u8,
 ) -> u64 {
     let (_latest, next_index) = seek_feed_frontier(owner, topic, chunk_retrieve_chan, None).await;
     next_index
 }
 
 #[cfg(test)]
+mod decrypt_tests {
+    use super::*;
+
+    fn encrypted_chunk(span: u64, content: &[u8], key: &[u8; HASH_SIZE], pad: bool) -> Vec<u8> {
+        let mut chunk = span.to_le_bytes().to_vec();
+        chunk.extend_from_slice(content);
+        if pad {
+            chunk.resize(CHUNK_WITH_SPAN_SIZE, 0xa5);
+        }
+
+        let span_key = decryption_segment_key(key, (CHUNK_SIZE / HASH_SIZE) as u32);
+        for (byte, mask) in chunk[..erasure_coding::SPAN_SIZE].iter_mut().zip(span_key) {
+            *byte ^= mask;
+        }
+        for (counter, segment) in chunk[erasure_coding::SPAN_SIZE..]
+            .chunks_mut(HASH_SIZE)
+            .enumerate()
+        {
+            let segment_key = decryption_segment_key(key, counter as u32);
+            for (byte, mask) in segment.iter_mut().zip(segment_key) {
+                *byte ^= mask;
+            }
+        }
+        chunk
+    }
+
+    #[test]
+    fn encrypted_cac_and_soc_payloads_have_identical_canonical_output() {
+        let key = [0x5a; HASH_SIZE];
+        let payload = b"retrieved payload";
+        let ciphertext = encrypted_chunk(payload.len() as u64, payload, &key, true);
+        let mut expected = (payload.len() as u64).to_le_bytes().to_vec();
+        expected.extend_from_slice(payload);
+
+        let plain_reference = vec![0x11; HASH_SIZE];
+        let (address, plain_key, encrypted) = chunk_address_parts(&plain_reference);
+        assert_eq!(address, plain_reference);
+        assert!(plain_key.is_empty());
+        assert!(!encrypted);
+
+        let mut encrypted_reference = vec![0x11; HASH_SIZE];
+        encrypted_reference.extend_from_slice(&key);
+        let (address, extracted_key, encrypted) = chunk_address_parts(&encrypted_reference);
+        assert_eq!(address, encrypted_reference[..HASH_SIZE]);
+        assert_eq!(extracted_key, key);
+        assert!(encrypted);
+        assert_eq!(
+            decode_retrieved_chunk(ciphertext.clone(), false, extracted_key.clone(), true),
+            expected
+        );
+
+        let mut soc = vec![0x33; 97];
+        soc.extend_from_slice(&ciphertext);
+        assert_eq!(
+            decode_retrieved_chunk(soc, true, extracted_key, true),
+            expected
+        );
+    }
+
+    #[test]
+    fn malformed_or_short_ciphertext_returns_empty_without_panicking() {
+        let key = [0x2c; HASH_SIZE];
+        assert!(decrypt(&[], &key).is_empty());
+        assert!(decrypt(&[0; erasure_coding::SPAN_SIZE - 1], &key).is_empty());
+        assert!(decrypt(&[0; erasure_coding::SPAN_SIZE], &key[..HASH_SIZE - 1]).is_empty());
+
+        let undersized = encrypted_chunk(2, b"x", &key, false);
+        assert!(decrypt(&undersized, &key).is_empty());
+        assert!(
+            decode_retrieved_chunk(
+                vec![0; 97 + erasure_coding::SPAN_SIZE - 1],
+                true,
+                key.to_vec(),
+                true
+            )
+            .is_empty()
+        );
+
+        let empty = encrypted_chunk(0, &[], &key, false);
+        assert_eq!(decrypt(&empty, &key), 0_u64.to_le_bytes());
+    }
+
+    #[test]
+    fn multilevel_spans_keep_the_span_and_normalize_reference_payload_width() {
+        let key = [0xb7; HASH_SIZE];
+        let content = (0..CHUNK_SIZE)
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>();
+
+        for (span, expected_payload_len) in [
+            (CHUNK_SIZE as u64 + 1, 2 * 64),
+            (CHUNK_SIZE as u64 * 64, CHUNK_SIZE),
+            (CHUNK_SIZE as u64 * 64 + 1, 2 * 64),
+        ] {
+            let ciphertext = encrypted_chunk(span, &content, &key, false);
+            let decrypted = decrypt(&ciphertext, &key);
+            assert_eq!(&decrypted[..erasure_coding::SPAN_SIZE], &span.to_le_bytes());
+            assert_eq!(
+                &decrypted[erasure_coding::SPAN_SIZE..],
+                &content[..expected_payload_len]
+            );
+        }
+    }
+}
+
+#[cfg(test)]
 mod raw_fetch_tests {
     use super::*;
+
+    #[test]
+    fn unencrypted_decoded_payload_shares_the_cached_raw_backing() {
+        let mut bytes = 3_u64.to_le_bytes().to_vec();
+        bytes.extend_from_slice(b"cat");
+        let raw = Bytes::from(bytes);
+        let decoded = decode_shared_raw_join_chunk(raw.clone(), &[0; HASH_SIZE])
+            .expect("valid leaf chunk should decode");
+
+        assert_eq!(decoded.payload.as_ref(), b"cat");
+        assert_eq!(
+            raw.as_ptr().wrapping_add(erasure_coding::SPAN_SIZE),
+            decoded.payload.as_ptr()
+        );
+    }
 
     #[test]
     fn zero_waiter_late_success_caches_every_full_reference_owned_by_the_flight() {
@@ -2486,13 +2530,7 @@ mod raw_fetch_tests {
         let plain_reference = expected_cac.clone();
         let mut encrypted_reference = expected_cac.clone();
         encrypted_reference.extend_from_slice(&[0x5a; HASH_SIZE]);
-        let key = RawFetchKey::new(
-            usize::MAX - 17,
-            expected_cac.clone(),
-            expected_cac,
-            &None,
-            None,
-        );
+        let key = RawFetchKey::new(usize::MAX - 17, expected_cac.clone(), expected_cac, &None);
         let admission = RetrieveAdmission::new();
         let (result_chan, _result_in) = mpsc::unbounded();
         let registration = RAW_FETCH_FLIGHTS.with(|flights| {
@@ -2511,7 +2549,11 @@ mod raw_fetch_tests {
             .remember_cache_reference(Some(&plain_reference));
         registration
             .shared
+            .remember_cache_reference(Some(&plain_reference));
+        registration
+            .shared
             .remember_cache_reference(Some(&encrypted_reference));
+        assert_eq!(registration.shared.cache_references.borrow().len(), 2);
         remove_raw_fetch_waiter(&key, registration.flight_id, registration.waiter_id);
 
         assert!(complete_raw_fetch(

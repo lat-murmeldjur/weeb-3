@@ -2,9 +2,9 @@ use crate::{
     ChunkRetrieveSender, RetrieveCancelToken, RetrieveGenerationMap,
     erasure_coding::{CHUNK_SIZE, decode_span, encoded_reference_payload_len},
     manifest::{
-        BzzManifestFork, MAX_PARALLEL_MANIFEST_FORKS, ParsedBzzManifest, ResolutionGuard,
-        is_bzz_manifest_header, manifest_payload_size_allowed, manifest_wrapped_reference,
-        parse_bzz_manifest,
+        BzzManifestFork, MAX_PARALLEL_MANIFEST_FORKS, NODE_TYPE_EDGE, NODE_TYPE_WITH_METADATA,
+        ParsedBzzManifest, ResolutionGuard, is_bzz_manifest_header, manifest_payload_size_allowed,
+        manifest_wrapped_reference, parse_bzz_manifest,
     },
     retrieval::{
         DecodedJoinChunk, retrieve_data, retrieve_data_range_from_root,
@@ -15,12 +15,12 @@ use crate::{
 };
 
 use libp2p::futures::{StreamExt, stream};
-use std::{rc::Rc, time::Duration};
+use std::time::Duration;
 
 const RANGE_RETRIEVE_RETRY_COUNT: usize = 2;
 const RANGE_RETRIEVE_RETRY_WAIT_MS: u64 = 120;
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct BzzResource {
     pub reference: Vec<u8>,
     pub path: String,
@@ -36,7 +36,7 @@ pub struct BzzMetadata {
     pub target_count: usize,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub(crate) struct BzzTarget {
     pub(crate) data_reference: Vec<u8>,
     pub(crate) mime: String,
@@ -50,62 +50,21 @@ struct ManifestTargetResult {
     explicit_index: Option<String>,
 }
 
-fn strip_known_bzz_prefix(resource: &str) -> String {
-    let mut resource0 = resource.trim().to_string();
-
-    if let Some(query_pos) = resource0.find('?') {
-        resource0.truncate(query_pos);
+fn strip_known_bzz_prefix(resource: &str) -> &str {
+    let resource = resource.trim();
+    let resource = resource.split_once('?').map_or(resource, |(path, _)| path);
+    let path = resource
+        .split_once('#')
+        .map_or(resource, |(_, route)| route)
+        .trim_start_matches('/');
+    let reference = path.split('/').next().unwrap_or_default();
+    if matches!(reference.len(), 64 | 128) && reference.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return path;
     }
-
-    let markers = [
-        "/weeb-3/#/testnet/bzz/",
-        "/weeb-3/#/mainnet/bzz/",
-        "/weeb-3/#/bzz/",
-        "/weeb-3/testnet/bzz/",
-        "/weeb-3/mainnet/bzz/",
-        "/weeb-3/bzz/",
-        "/#/testnet/bzz/",
-        "/#/mainnet/bzz/",
-        "/#/bzz/",
-        "/testnet/bzz/",
-        "/mainnet/bzz/",
-        "/bzz/",
-        "weeb-3/#/testnet/bzz/",
-        "weeb-3/#/mainnet/bzz/",
-        "weeb-3/#/bzz/",
-        "weeb-3/testnet/bzz/",
-        "weeb-3/mainnet/bzz/",
-        "weeb-3/bzz/",
-        "#/testnet/bzz/",
-        "#/mainnet/bzz/",
-        "#/bzz/",
-        "testnet/bzz/",
-        "mainnet/bzz/",
-        "bzz/",
-    ];
-
-    for marker in markers {
-        if let Some(idx) = resource0.find(marker) {
-            let mut stripped = resource0[idx + marker.len()..]
-                .trim_start_matches('/')
-                .to_string();
-            if let Some(hash_pos) = stripped.find('#') {
-                stripped.truncate(hash_pos);
-            }
-            return stripped;
-        }
-    }
-
-    if let Some(hash_pos) = resource0.find('#') {
-        resource0 = resource0[hash_pos + 1..].to_string();
-    }
-
-    resource0.trim_start_matches('/').to_string()
-}
-
-fn is_reference_hex(segment: &str) -> bool {
-    (segment.len() == 64 || segment.len() == 128)
-        && segment.as_bytes().iter().all(|b| b.is_ascii_hexdigit())
+    path.strip_prefix("bzz/")
+        .or_else(|| path.rsplit_once("/bzz/").map(|(_, resource)| resource))
+        .unwrap_or(path)
 }
 
 pub fn parse_bzz_resource(resource: &str) -> Option<BzzResource> {
@@ -113,12 +72,8 @@ pub fn parse_bzz_resource(resource: &str) -> Option<BzzResource> {
     let mut parts = stripped.splitn(2, '/');
     let reference_hex = parts.next().unwrap_or_default();
 
-    if !is_reference_hex(reference_hex) {
-        return None;
-    }
-
     let reference = match hex::decode(reference_hex) {
-        Ok(reference) if reference.len() == 32 || reference.len() == 64 => reference,
+        Ok(reference) if matches!(reference.len(), 32 | 64) => reference,
         _ => return None,
     };
 
@@ -137,12 +92,12 @@ pub fn normalize_bzz_path(path: &str) -> String {
 }
 
 fn bzz_paths_match(left: &str, right: &str) -> bool {
-    normalize_bzz_path(left) == normalize_bzz_path(right)
+    left.trim().trim_matches('/') == right.trim().trim_matches('/')
 }
 
-fn child_path(path_prefix_heritance: &[u8], fork_prefix: &[u8]) -> Vec<u8> {
-    let mut bequeath = Vec::with_capacity(path_prefix_heritance.len() + fork_prefix.len());
-    bequeath.extend_from_slice(path_prefix_heritance);
+fn child_path(path_prefix: &[u8], fork_prefix: &[u8]) -> Vec<u8> {
+    let mut bequeath = Vec::with_capacity(path_prefix.len() + fork_prefix.len());
+    bequeath.extend_from_slice(path_prefix);
     bequeath.extend_from_slice(fork_prefix);
     bequeath
 }
@@ -164,14 +119,12 @@ fn display_bzz_path(path: &[u8]) -> String {
 }
 
 async fn reference_span(
-    reference: &Vec<u8>,
+    reference: &[u8],
     chunk_retrieve_chan: &ChunkRetrieveSender,
 ) -> Option<u64> {
-    Some(
-        retrieve_decoded_data_root(reference, chunk_retrieve_chan)
-            .await?
-            .span,
-    )
+    retrieve_decoded_data_root(reference, chunk_retrieve_chan)
+        .await
+        .map(|root| root.span)
 }
 
 fn embedded_join_root(data: &[u8], encrypted: bool) -> Option<DecodedJoinChunk> {
@@ -189,7 +142,7 @@ fn embedded_join_root(data: &[u8], encrypted: bool) -> Option<DecodedJoinChunk> 
     Some(DecodedJoinChunk {
         level,
         span,
-        payload: Rc::from(&data[8..end]),
+        payload: bytes::Bytes::copy_from_slice(&data[8..end]),
     })
 }
 
@@ -212,18 +165,9 @@ async fn retrieve_embedded_payload_with_span(
     encrypted: bool,
     chunk_retrieve_chan: &ChunkRetrieveSender,
 ) -> Option<(u64, Vec<u8>)> {
-    retrieve_embedded_payload_with_span_bounded(data, encrypted, chunk_retrieve_chan, None).await
-}
-
-async fn retrieve_embedded_payload_with_span_bounded(
-    data: &[u8],
-    encrypted: bool,
-    chunk_retrieve_chan: &ChunkRetrieveSender,
-    maximum_span: Option<u64>,
-) -> Option<(u64, Vec<u8>)> {
     let root = embedded_join_root(data, encrypted)?;
     let span = root.span;
-    if !manifest_payload_size_allowed(span) || maximum_span.is_some_and(|maximum| span > maximum) {
+    if !manifest_payload_size_allowed(span) {
         return None;
     }
     let payload = if span == 0 {
@@ -317,7 +261,7 @@ pub(crate) async fn retrieve_feed_payload_tail(
 }
 
 async fn retrieve_data_head(
-    reference: &Vec<u8>,
+    reference: &[u8],
     chunk_retrieve_chan: &ChunkRetrieveSender,
 ) -> Option<Vec<u8>> {
     let encrypted = reference.len() == 64;
@@ -348,7 +292,7 @@ async fn retrieve_data_head(
 }
 
 async fn get_manifest_if_manifest(
-    reference: &Vec<u8>,
+    reference: &[u8],
     chunk_retrieve_chan: &ChunkRetrieveSender,
 ) -> Option<ParsedBzzManifest> {
     let head = retrieve_data_head(reference, chunk_retrieve_chan).await?;
@@ -367,15 +311,8 @@ async fn get_manifest_if_manifest(
     parse_bzz_manifest(data)
 }
 
-async fn get_root_manifest_if_manifest(
-    reference: &Vec<u8>,
-    chunk_retrieve_chan: &ChunkRetrieveSender,
-) -> Option<ParsedBzzManifest> {
-    get_manifest_if_manifest(reference, chunk_retrieve_chan).await
-}
-
 pub(crate) async fn collect_reference_targets(
-    path_prefix_heritance: Vec<u8>,
+    path_prefix: Vec<u8>,
     reference: Vec<u8>,
     chunk_retrieve_chan: &ChunkRetrieveSender,
     guard: ResolutionGuard,
@@ -389,7 +326,7 @@ pub(crate) async fn collect_reference_targets(
 
     if let Some(manifest) = get_manifest_if_manifest(&reference, chunk_retrieve_chan).await {
         return Box::pin(collect_manifest_targets(
-            path_prefix_heritance,
+            path_prefix,
             manifest,
             chunk_retrieve_chan,
             guard,
@@ -405,7 +342,7 @@ pub(crate) async fn collect_reference_targets(
         vec![BzzTarget {
             data_reference: reference,
             mime: "application/octet-stream".to_string(),
-            path: display_bzz_path(&path_prefix_heritance),
+            path: display_bzz_path(&path_prefix),
             raw_fallback: true,
         }],
         String::new(),
@@ -413,7 +350,7 @@ pub(crate) async fn collect_reference_targets(
 }
 
 async fn collect_manifest_fork_targets(
-    path_prefix_heritance: Vec<u8>,
+    path_prefix: Vec<u8>,
     ref_size: usize,
     fork: BzzManifestFork,
     chunk_retrieve_chan: ChunkRetrieveSender,
@@ -428,8 +365,8 @@ async fn collect_manifest_fork_targets(
         return result;
     }
 
-    let has_edge = fork.fork_type & 4 == 4;
-    if fork.fork_type & 16 == 16 {
+    let has_edge = fork.fork_type & NODE_TYPE_EDGE == NODE_TYPE_EDGE;
+    if fork.fork_type & NODE_TYPE_WITH_METADATA == NODE_TYPE_WITH_METADATA {
         let Some(metadata) = fork.metadata else {
             return result;
         };
@@ -443,30 +380,25 @@ async fn collect_manifest_fork_targets(
                 .get("swarm-feed-topic")
                 .and_then(|str0f1| str0f1.as_str())
                 .map(|topic| topic.to_string()),
-        ) {
-            if let Some(feed_guard) = guard.descend_feed(&owner, &topic) {
-                let feed_data_soc =
-                    seek_latest_feed_update(owner, topic, &chunk_retrieve_chan, 8).await;
+        ) && let Some(feed_guard) = guard.descend_feed(&owner, &topic)
+        {
+            let feed_data_soc = seek_latest_feed_update(owner, topic, &chunk_retrieve_chan).await;
 
-                if feed_data_soc.len() >= 8 {
-                    if let Some(feed_data_content) =
-                        retrieve_embedded_data(&feed_data_soc, ref_size == 64, &chunk_retrieve_chan)
-                            .await
-                    {
-                        if let Some(feed_manifest) = parse_bzz_manifest(feed_data_content) {
-                            let (mut feed_targets, feed_index) =
-                                Box::pin(collect_manifest_targets(
-                                    Vec::new(),
-                                    feed_manifest,
-                                    &chunk_retrieve_chan,
-                                    feed_guard,
-                                ))
-                                .await;
-                            result.targets.append(&mut feed_targets);
-                            result.fallback_index = Some(feed_index);
-                        }
-                    }
-                }
+            if feed_data_soc.len() >= 8
+                && let Some(feed_data_content) =
+                    retrieve_embedded_data(&feed_data_soc, ref_size == 64, &chunk_retrieve_chan)
+                        .await
+                && let Some(feed_manifest) = parse_bzz_manifest(feed_data_content)
+            {
+                let (mut feed_targets, feed_index) = Box::pin(collect_manifest_targets(
+                    Vec::new(),
+                    feed_manifest,
+                    &chunk_retrieve_chan,
+                    feed_guard,
+                ))
+                .await;
+                result.targets.append(&mut feed_targets);
+                result.fallback_index = Some(feed_index);
             }
         }
 
@@ -477,7 +409,7 @@ async fn collect_manifest_fork_targets(
             result.explicit_index = Some(explicit_index.to_string());
         }
 
-        let bequeath = child_path(&path_prefix_heritance, &fork.prefix);
+        let bequeath = child_path(&path_prefix, &fork.prefix);
         let Some(mime) = metadata
             .get("Content-Type")
             .and_then(|str0| str0.as_str())
@@ -499,11 +431,10 @@ async fn collect_manifest_fork_targets(
 
         let mut data_reference = fork.reference.clone();
         if let Some(root_manifest) =
-            get_root_manifest_if_manifest(&fork.reference, &chunk_retrieve_chan).await
+            get_manifest_if_manifest(&fork.reference, &chunk_retrieve_chan).await
+            && let Some(wrapped_reference) = manifest_wrapped_reference(root_manifest)
         {
-            if let Some(wrapped_reference) = manifest_wrapped_reference(root_manifest) {
-                data_reference = wrapped_reference;
-            }
+            data_reference = wrapped_reference;
         }
 
         if guard.reserve_target() {
@@ -531,7 +462,7 @@ async fn collect_manifest_fork_targets(
         return result;
     }
 
-    let bequeath = child_path(&path_prefix_heritance, &fork.prefix);
+    let bequeath = child_path(&path_prefix, &fork.prefix);
     let (mut child_targets, child_index) = Box::pin(collect_reference_targets(
         bequeath,
         fork.reference,
@@ -545,7 +476,7 @@ async fn collect_manifest_fork_targets(
 }
 
 async fn collect_manifest_targets(
-    path_prefix_heritance: Vec<u8>,
+    path_prefix: Vec<u8>,
     parsed: ParsedBzzManifest,
     chunk_retrieve_chan: &ChunkRetrieveSender,
     guard: ResolutionGuard,
@@ -556,7 +487,7 @@ async fn collect_manifest_targets(
 
     let loads = parsed.forks.into_iter().map(|fork| {
         collect_manifest_fork_targets(
-            path_prefix_heritance.clone(),
+            path_prefix.clone(),
             parsed.ref_size,
             fork,
             chunk_retrieve_chan.clone(),
@@ -578,46 +509,40 @@ async fn collect_manifest_targets(
     }
 
     if index.is_empty() {
-        if let Some(fallback_index) = fallback_index {
-            index = fallback_index;
-        }
+        index = fallback_index.unwrap_or_default();
     }
 
     (targets, index)
 }
 
 fn select_bzz_target(
-    targets: Vec<BzzTarget>,
+    mut targets: Vec<BzzTarget>,
     requested_path: &str,
     index: &str,
 ) -> Option<BzzTarget> {
-    if !requested_path.is_empty() {
-        if let Some(target) = targets
+    for candidate in [requested_path, index, "index.html"] {
+        if candidate.is_empty() {
+            continue;
+        }
+        if let Some(position) = targets
             .iter()
-            .find(|target| bzz_paths_match(&target.path, requested_path))
+            .position(|target| bzz_paths_match(&target.path, candidate))
         {
-            return Some(target.clone());
+            return Some(targets.swap_remove(position));
         }
     }
+    targets.into_iter().next()
+}
 
-    if !index.is_empty() {
-        if let Some(target) = targets
-            .iter()
-            .find(|target| bzz_paths_match(&target.path, index))
-        {
-            return Some(target.clone());
-        }
+fn target_metadata(target: BzzTarget, size: u64, target_count: usize) -> BzzMetadata {
+    BzzMetadata {
+        etag: format!("\"{}\"", hex::encode(&target.data_reference)),
+        data_reference: target.data_reference,
+        mime: target.mime,
+        size,
+        path: normalize_bzz_path(&target.path),
+        target_count,
     }
-
-    if targets.len() == 1 {
-        return targets.into_iter().next();
-    }
-
-    targets
-        .iter()
-        .find(|target| bzz_paths_match(&target.path, "index.html"))
-        .cloned()
-        .or_else(|| targets.into_iter().next())
 }
 
 fn bzz_path_bytes_match(left: &[u8], right: &[u8]) -> bool {
@@ -630,8 +555,30 @@ fn bzz_path_starts_with(path: &[u8], prefix: &[u8]) -> bool {
     prefix.is_empty() || path.starts_with(prefix)
 }
 
+async fn metadata_fork_target(
+    fork: &BzzManifestFork,
+    path: &[u8],
+    mime: String,
+    chunk_retrieve_chan: &ChunkRetrieveSender,
+    guard: &ResolutionGuard,
+) -> Option<BzzTarget> {
+    let mut data_reference = fork.reference.clone();
+    if let Some(root_manifest) =
+        get_manifest_if_manifest(&fork.reference, chunk_retrieve_chan).await
+        && let Some(wrapped_reference) = manifest_wrapped_reference(root_manifest)
+    {
+        data_reference = wrapped_reference;
+    }
+    guard.reserve_target().then(|| BzzTarget {
+        data_reference,
+        mime,
+        path: display_bzz_path(path),
+        raw_fallback: false,
+    })
+}
+
 async fn lazy_reference_target(
-    path_prefix_heritance: Vec<u8>,
+    path_prefix: Vec<u8>,
     reference: Vec<u8>,
     requested_path: &[u8],
     chunk_retrieve_chan: &ChunkRetrieveSender,
@@ -644,7 +591,7 @@ async fn lazy_reference_target(
 
     if let Some(manifest) = get_manifest_if_manifest(&reference, chunk_retrieve_chan).await {
         return Box::pin(lazy_manifest_target(
-            path_prefix_heritance,
+            path_prefix,
             manifest,
             requested_path,
             chunk_retrieve_chan,
@@ -653,14 +600,14 @@ async fn lazy_reference_target(
         .await;
     }
 
-    if requested_path.is_empty() || bzz_path_bytes_match(&path_prefix_heritance, requested_path) {
+    if requested_path.is_empty() || bzz_path_bytes_match(&path_prefix, requested_path) {
         if !guard.reserve_target() {
             return None;
         }
         return Some(BzzTarget {
             data_reference: reference,
             mime: "application/octet-stream".to_string(),
-            path: display_bzz_path(&path_prefix_heritance),
+            path: display_bzz_path(&path_prefix),
             raw_fallback: true,
         });
     }
@@ -669,7 +616,7 @@ async fn lazy_reference_target(
 }
 
 async fn lazy_manifest_target(
-    path_prefix_heritance: Vec<u8>,
+    path_prefix: Vec<u8>,
     parsed: ParsedBzzManifest,
     requested_path: &[u8],
     chunk_retrieve_chan: &ChunkRetrieveSender,
@@ -679,10 +626,10 @@ async fn lazy_manifest_target(
 
     if !requested_path.is_empty() {
         requested_paths.push(normalize_bzz_path_bytes(requested_path).to_vec());
-    } else if let Some(index) = parsed.explicit_index.clone() {
-        if !index.is_empty() {
-            requested_paths.push(normalize_bzz_path(&index).into_bytes());
-        }
+    } else if let Some(index) = parsed.explicit_index.as_deref()
+        && !index.is_empty()
+    {
+        requested_paths.push(normalize_bzz_path(index).into_bytes());
     }
 
     if requested_path.is_empty() {
@@ -693,9 +640,8 @@ async fn lazy_manifest_target(
 
     for desired_path in requested_paths {
         if let Some(target) = Box::pin(lazy_manifest_target_for_path(
-            path_prefix_heritance.clone(),
-            parsed.ref_size,
-            parsed.forks.clone(),
+            &path_prefix,
+            &parsed.forks,
             &desired_path,
             chunk_retrieve_chan,
             guard.clone(),
@@ -708,9 +654,8 @@ async fn lazy_manifest_target(
 
     if requested_path.is_empty() {
         return Box::pin(lazy_first_manifest_target(
-            path_prefix_heritance,
-            parsed.ref_size,
-            parsed.forks,
+            &path_prefix,
+            &parsed.forks,
             chunk_retrieve_chan,
             guard,
         ))
@@ -721,9 +666,8 @@ async fn lazy_manifest_target(
 }
 
 async fn lazy_manifest_target_for_path(
-    path_prefix_heritance: Vec<u8>,
-    ref_size: usize,
-    forks: Vec<BzzManifestFork>,
+    path_prefix: &[u8],
+    forks: &[BzzManifestFork],
     requested_path: &[u8],
     chunk_retrieve_chan: &ChunkRetrieveSender,
     guard: ResolutionGuard,
@@ -732,15 +676,15 @@ async fn lazy_manifest_target_for_path(
         if !guard.reserve_fork() {
             return None;
         }
-        let bequeath = child_path(&path_prefix_heritance, &fork.prefix);
-        let has_edge = fork.fork_type & 4 == 4;
+        let bequeath = child_path(path_prefix, &fork.prefix);
+        let has_edge = fork.fork_type & NODE_TYPE_EDGE == NODE_TYPE_EDGE;
 
         if !bzz_path_starts_with(requested_path, &bequeath) {
             continue;
         }
 
-        if fork.fork_type & 16 == 16 {
-            let Some(metadata) = fork.metadata.clone() else {
+        if fork.fork_type & NODE_TYPE_WITH_METADATA == NODE_TYPE_WITH_METADATA {
+            let Some(metadata) = fork.metadata.as_ref() else {
                 continue;
             };
 
@@ -755,36 +699,27 @@ async fn lazy_manifest_target_for_path(
                 .and_then(|str0| str0.as_str())
                 .map(|mime| mime.to_string())
             {
-                if !bzz_path_bytes_match(&bequeath, requested_path) && !has_edge {
+                let exact_path = bzz_path_bytes_match(&bequeath, requested_path);
+                if !exact_path && !has_edge {
                     continue;
                 }
 
-                if bzz_path_bytes_match(&bequeath, requested_path) {
-                    let mut data_reference = fork.reference.clone();
-                    if let Some(root_manifest) =
-                        get_root_manifest_if_manifest(&fork.reference, chunk_retrieve_chan).await
-                    {
-                        if let Some(wrapped_reference) = manifest_wrapped_reference(root_manifest) {
-                            data_reference = wrapped_reference;
-                        }
-                    }
-
-                    if !guard.reserve_target() {
-                        return None;
-                    }
-                    return Some(BzzTarget {
-                        data_reference,
+                if exact_path {
+                    return metadata_fork_target(
+                        fork,
+                        &bequeath,
                         mime,
-                        path: display_bzz_path(&bequeath),
-                        raw_fallback: false,
-                    });
+                        chunk_retrieve_chan,
+                        &guard,
+                    )
+                    .await;
                 }
             }
         }
 
         if let Some(target) = Box::pin(lazy_reference_target(
             bequeath,
-            fork.reference,
+            fork.reference.clone(),
             requested_path,
             chunk_retrieve_chan,
             guard.clone(),
@@ -793,19 +728,14 @@ async fn lazy_manifest_target_for_path(
         {
             return Some(target);
         }
-
-        if ref_size == 0 {
-            continue;
-        }
     }
 
     None
 }
 
 async fn lazy_first_manifest_target(
-    path_prefix_heritance: Vec<u8>,
-    ref_size: usize,
-    forks: Vec<BzzManifestFork>,
+    path_prefix: &[u8],
+    forks: &[BzzManifestFork],
     chunk_retrieve_chan: &ChunkRetrieveSender,
     guard: ResolutionGuard,
 ) -> Option<BzzTarget> {
@@ -813,10 +743,10 @@ async fn lazy_first_manifest_target(
         if !guard.reserve_fork() {
             return None;
         }
-        let bequeath = child_path(&path_prefix_heritance, &fork.prefix);
+        let bequeath = child_path(path_prefix, &fork.prefix);
 
-        if fork.fork_type & 16 == 16 {
-            let Some(metadata) = fork.metadata.clone() else {
+        if fork.fork_type & NODE_TYPE_WITH_METADATA == NODE_TYPE_WITH_METADATA {
+            let Some(metadata) = fork.metadata.as_ref() else {
                 continue;
             };
 
@@ -831,30 +761,14 @@ async fn lazy_first_manifest_target(
                 .and_then(|str0| str0.as_str())
                 .map(|mime| mime.to_string())
             {
-                let mut data_reference = fork.reference.clone();
-                if let Some(root_manifest) =
-                    get_root_manifest_if_manifest(&fork.reference, chunk_retrieve_chan).await
-                {
-                    if let Some(wrapped_reference) = manifest_wrapped_reference(root_manifest) {
-                        data_reference = wrapped_reference;
-                    }
-                }
-
-                if !guard.reserve_target() {
-                    return None;
-                }
-                return Some(BzzTarget {
-                    data_reference,
-                    mime,
-                    path: display_bzz_path(&bequeath),
-                    raw_fallback: false,
-                });
+                return metadata_fork_target(fork, &bequeath, mime, chunk_retrieve_chan, &guard)
+                    .await;
             }
         }
 
         if let Some(target) = Box::pin(lazy_reference_target(
             bequeath,
-            fork.reference,
+            fork.reference.clone(),
             b"",
             chunk_retrieve_chan,
             guard.clone(),
@@ -862,10 +776,6 @@ async fn lazy_first_manifest_target(
         .await
         {
             return Some(target);
-        }
-
-        if ref_size == 0 {
-            continue;
         }
     }
 
@@ -877,12 +787,11 @@ pub async fn resolve_bzz(
     chunk_retrieve_chan: &ChunkRetrieveSender,
 ) -> Option<BzzMetadata> {
     let parsed = parse_bzz_resource(resource)?;
-    let requested_path = normalize_bzz_path(&parsed.path).into_bytes();
 
     if let Some(target) = lazy_reference_target(
         Vec::new(),
         parsed.reference.clone(),
-        &requested_path,
+        parsed.path.as_bytes(),
         chunk_retrieve_chan,
         ResolutionGuard::new(),
     )
@@ -890,14 +799,7 @@ pub async fn resolve_bzz(
     {
         let size = reference_span(&target.data_reference, chunk_retrieve_chan).await?;
 
-        return Some(BzzMetadata {
-            etag: format!("\"{}\"", hex::encode(&target.data_reference)),
-            data_reference: target.data_reference,
-            mime: target.mime,
-            size,
-            path: normalize_bzz_path(&target.path),
-            target_count: 1,
-        });
+        return Some(target_metadata(target, size, 1));
     }
 
     let (targets, index) = collect_reference_targets(
@@ -911,14 +813,7 @@ pub async fn resolve_bzz(
     let target = select_bzz_target(targets, &parsed.path, &index)?;
     let size = reference_span(&target.data_reference, chunk_retrieve_chan).await?;
 
-    Some(BzzMetadata {
-        etag: format!("\"{}\"", hex::encode(&target.data_reference)),
-        data_reference: target.data_reference,
-        mime: target.mime,
-        size,
-        path: normalize_bzz_path(&target.path),
-        target_count,
-    })
+    Some(target_metadata(target, size, target_count))
 }
 
 async fn latest_feed_manifest(
@@ -926,7 +821,7 @@ async fn latest_feed_manifest(
     topic: String,
     chunk_retrieve_chan: &ChunkRetrieveSender,
 ) -> Option<ParsedBzzManifest> {
-    let feed_data_soc = seek_latest_feed_update(owner, topic, chunk_retrieve_chan, 8).await;
+    let feed_data_soc = seek_latest_feed_update(owner, topic, chunk_retrieve_chan).await;
     if feed_data_soc.len() < 8 {
         return None;
     }
@@ -934,10 +829,9 @@ async fn latest_feed_manifest(
     for encrypted in [false, true] {
         if let Some(content) =
             retrieve_embedded_data(&feed_data_soc, encrypted, chunk_retrieve_chan).await
+            && let Some(manifest) = parse_bzz_manifest(content)
         {
-            if let Some(manifest) = parse_bzz_manifest(content) {
-                return Some(manifest);
-            }
+            return Some(manifest);
         }
     }
 
@@ -960,14 +854,7 @@ pub async fn acquire_latest_feed(
     ))
     .await?;
     let size = reference_span(&target.data_reference, chunk_retrieve_chan).await?;
-    let metadata = BzzMetadata {
-        etag: format!("\"{}\"", hex::encode(&target.data_reference)),
-        data_reference: target.data_reference,
-        mime: target.mime,
-        size,
-        path: normalize_bzz_path(&target.path),
-        target_count: 1,
-    };
+    let metadata = target_metadata(target, size, 1);
 
     if size == 0 {
         return Some((vec![], metadata));
@@ -1057,7 +944,7 @@ async fn range_cancel_token_current(
 }
 
 pub async fn retrieve_data_range_cancellable(
-    data_address: &Vec<u8>,
+    data_address: &[u8],
     start: u64,
     end_inclusive: u64,
     chunk_retrieve_chan: &ChunkRetrieveSender,

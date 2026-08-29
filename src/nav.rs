@@ -6,7 +6,7 @@ use crate::{
     stream_conventions::{HlsStart, STREAMING_ROUTE_BASE, parse_stream_share_link},
 };
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub(crate) enum ResourceRoute {
     Bzz(String),
     Bytes(String),
@@ -18,7 +18,7 @@ pub(crate) enum ResourceRoute {
     },
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub(crate) struct NetworkedResourceRoute {
     pub network: NetworkMode,
     pub resource: ResourceRoute,
@@ -30,48 +30,57 @@ fn strip_query(input: &str) -> &str {
 }
 
 fn trim_route_prefix(input: &str) -> String {
-    let mut route = strip_query(input).trim().replace('\\', "/");
+    let route = strip_query(input).trim();
+    let normalized;
+    let route = if route.contains('\\') {
+        normalized = route.replace('\\', "/");
+        normalized.as_str()
+    } else {
+        route
+    };
 
-    if let Some(hash_path) = route.find("#/") {
-        route = route[hash_path + 2..].to_string();
-    } else if route.starts_with('#') {
-        route = route[1..].to_string();
+    let route = if let Some(hash_path) = route.find("#/") {
+        &route[hash_path + 2..]
+    } else if let Some(route) = route.strip_prefix('#') {
+        route
     } else if let Some(hash_path) = route.find('#') {
-        route.truncate(hash_path);
-    }
+        &route[..hash_path]
+    } else {
+        route
+    };
 
-    if let Some(scheme) = route.find("://") {
+    let route = if let Some(scheme) = route.find("://") {
         let after_scheme = scheme + 3;
         if let Some(path_start) = route[after_scheme..].find('/') {
-            route = route[after_scheme + path_start..].to_string();
+            &route[after_scheme + path_start..]
+        } else {
+            route
         }
-    }
+    } else {
+        route
+    };
 
-    let route_base = STREAMING_ROUTE_BASE;
-    let relative_base = route_base.trim_start_matches('/');
-    for prefix in [
-        format!("{route_base}/"),
-        format!("{relative_base}/"),
-        format!("{route_base}/#/"),
-        format!("{relative_base}/#/"),
-    ] {
-        if let Some(rest) = route.strip_prefix(&prefix) {
-            route = rest.to_string();
-            break;
-        }
-    }
-    if route == route_base || route == relative_base {
-        route.clear();
-    }
-
+    let route = route.trim_start_matches('/');
+    let route_base = STREAMING_ROUTE_BASE.trim_matches('/');
+    let route = if route == route_base {
+        ""
+    } else {
+        route
+            .strip_prefix(route_base)
+            .and_then(|rest| rest.strip_prefix('/'))
+            .unwrap_or(route)
+    };
     route.trim_start_matches('/').to_string()
 }
 
 fn network_mode_segment(segment: &str) -> Option<NetworkMode> {
-    match segment.trim().to_ascii_lowercase().as_str() {
-        "mainnet" => Some(NetworkMode::Mainnet),
-        "testnet" => Some(NetworkMode::Testnet),
-        _ => None,
+    let segment = segment.trim();
+    if segment.eq_ignore_ascii_case("mainnet") {
+        Some(NetworkMode::Mainnet)
+    } else if segment.eq_ignore_ascii_case("testnet") {
+        Some(NetworkMode::Testnet)
+    } else {
+        None
     }
 }
 
@@ -210,16 +219,8 @@ pub(crate) fn parse_resource_route(input: &str) -> Option<ResourceRoute> {
 }
 
 #[cfg(target_arch = "wasm32")]
-pub async fn read_routes() -> Vec<ResourceRoute> {
-    let window = match window() {
-        Some(w) => w,
-        None => return vec![],
-    };
+pub fn read_route() -> Option<ResourceRoute> {
+    let window = window()?;
     let location = window.location();
-    let pathname = match location.pathname() {
-        Ok(p) => p,
-        Err(_) => return vec![],
-    };
-
-    parse_resource_route(&pathname).into_iter().collect()
+    parse_resource_route(&location.pathname().ok()?)
 }

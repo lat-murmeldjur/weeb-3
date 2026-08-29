@@ -370,11 +370,12 @@ mod bee_compatibility {
             })
         }
 
+        type RecoveredChild = (Vec<u8>, Vec<u8>);
         fn recover_children(
             store: &SimStore,
             decoded: &DecodedNode,
             encrypted: bool,
-        ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, String> {
+        ) -> Result<Vec<RecoveredChild>, String> {
             let (data_references, parity_references) = erasure_coding::split_references(
                 &decoded.payload,
                 decoded.span,
@@ -1496,11 +1497,8 @@ mod erasure_contracts {
 
     #[test]
     fn virtual_zero_padding_matches_explicit_bee_shards() {
-        let short = vec![
-            deterministic_shards(1, SPAN_SIZE)[0].clone(),
-            deterministic_shards(1, 137)[0].clone(),
-            deterministic_shards(1, CHUNK_WITH_SPAN_SIZE)[0].clone(),
-        ];
+        let short = [SPAN_SIZE, 137, CHUNK_WITH_SPAN_SIZE]
+            .map(|size| deterministic_shards(1, size).remove(0));
         let explicit = short
             .iter()
             .map(|shard| padded_chunk(shard).unwrap())
@@ -1672,7 +1670,7 @@ mod erasure_contracts {
 mod upload_redundancy {
     use crate::erasure_coding::RedundancyLevel;
     use crate::erasure_coding::{
-        upload_redundancy_from_number, upload_redundancy_from_select, validated_upload_redundancy,
+        upload_redundancy_from_select, validated_upload_redundancy,
         validated_upload_redundancy_number,
     };
 
@@ -1718,32 +1716,13 @@ mod upload_redundancy {
     }
 
     #[test]
-    fn javascript_numbers_must_be_finite_integral_bee_values() {
+    fn numeric_upload_levels_must_be_finite_integral_bee_values() {
         assert_eq!(
             validated_upload_redundancy_number(2.0),
             Some(RedundancyLevel::Strong)
         );
-        assert_eq!(
-            upload_redundancy_from_number(Some(2.0)),
-            RedundancyLevel::Strong
-        );
-        for malformed in [
-            None,
-            Some(-1.0),
-            Some(-255.0),
-            Some(1.5),
-            Some(5.0),
-            Some(257.0),
-            Some(f64::NAN),
-            Some(f64::INFINITY),
-        ] {
-            if let Some(value) = malformed {
-                assert_eq!(validated_upload_redundancy_number(value), None);
-            }
-            assert_eq!(
-                upload_redundancy_from_number(malformed),
-                RedundancyLevel::Medium
-            );
+        for malformed in [-1.0, -255.0, 1.5, 5.0, 257.0, f64::NAN, f64::INFINITY] {
+            assert_eq!(validated_upload_redundancy_number(malformed), None);
         }
     }
 

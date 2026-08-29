@@ -1,14 +1,11 @@
+#[path = "support/source.rs"]
+pub mod source;
+
+use source::between as section;
+
 const RETRIEVAL: &str = include_str!("../src/retrieval.rs");
 const HLS_CORE: &str = include_str!("../src/stream_hls.rs");
 const HLS_RUNTIME: &str = include_str!("../src/stream_hls/runtime.rs");
-
-fn section<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
-    source
-        .split_once(start)
-        .and_then(|(_, tail)| tail.split_once(end))
-        .map(|(body, _)| body)
-        .unwrap_or_else(|| panic!("missing source section between {start:?} and {end:?}"))
-}
 
 fn edge_anchors() -> Vec<u64> {
     section(HLS_RUNTIME, "const EDGE_ANCHORS: [u64; 16] = [", "];")
@@ -128,9 +125,11 @@ fn live_autoplay_and_persistent_body_runway_keep_separate_horizons() {
         "pub(crate) fn startup_plan",
         "pub(crate) fn merge_tail",
     );
-    assert!(startup.contains("playable.len() < HLS_LIVE_SYNC_SEGMENTS"));
-    assert!(startup.contains("playable.len().saturating_sub(HLS_LIVE_EDGE_SEGMENTS)"));
-    assert!(startup.contains("&playable[first..first + HLS_LIVE_SYNC_SEGMENTS]"));
+    assert!(startup.contains(".filter(|segment| !segment.gap)"));
+    assert!(startup.contains("playable < HLS_LIVE_SYNC_SEGMENTS"));
+    assert!(startup.contains("playable.saturating_sub(HLS_LIVE_EDGE_SEGMENTS)"));
+    assert!(startup.contains("if ordinal == last"));
+    assert!(!startup.contains("collect::<Vec<_>>()"));
 
     let runway = section(
         HLS_RUNTIME,
@@ -272,11 +271,11 @@ fn cold_discovery_is_bounded_and_edge_search_is_hls_owned() {
 }
 
 #[test]
-fn beginning_runway_starts_exact_following_while_history_reconstructs() {
+fn beginning_history_and_exact_following_run_concurrently_after_media_is_ready() {
     let history = section(
         HLS_RUNTIME,
         "fn spawn_beginning_history(",
-        "pub(super) fn start_beginning_history()",
+        "pub(crate) fn start_beginning_history()",
     );
     let follow = history.find("spawn_follower(id)").unwrap();
     let discover = history.find("let history = discover_for_view(").unwrap();
@@ -291,8 +290,8 @@ fn beginning_runway_starts_exact_following_while_history_reconstructs() {
 fn underfilled_beginning_prefix_starts_exact_following_immediately() {
     let attach = section(
         HLS_RUNTIME,
-        "pub(crate) async fn attach_hls_feed_player(",
-        "pub(crate) fn release_hls_view()",
+        "pub(crate) async fn prepare_hls_feed(",
+        "pub(crate) fn release_hls_runtime()",
     );
     let underfilled = attach.find("let underfilled_beginning = !live").unwrap();
     let install = attach

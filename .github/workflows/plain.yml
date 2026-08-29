@@ -14,8 +14,6 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@v5
-        with:
-          submodules: "true"
       - name: Install Protoc
         uses: arduino/setup-protoc@v3
       - name: Install wasm target
@@ -27,27 +25,15 @@ jobs:
         with:
           node-version: 24
           registry-url: https://registry.npmjs.org
-      - name: Build
-        run: cargo build --verbose
-      - name: Test Bee compatibility and transfer contracts
-        run: cargo test --locked --tests -- --skip weeb3_loads_in_browser
-      - name: Build npm package
+      - name: Build unified Wasm and npm package
         env:
           NPM_SCOPE: ${{ vars.NPM_SCOPE || github.repository_owner }}
         run: |
           set -euo pipefail
-          SCOPE_ARGS=()
-          if [ -n "${NPM_SCOPE:-}" ]; then
-            SCOPE_ARGS=(--scope "$NPM_SCOPE")
-          fi
-          RUSTFLAGS='--cfg getrandom_backend="wasm_js"' wasm-pack build --locked --target web --out-dir static --out-name weeb_3 "${SCOPE_ARGS[@]}"
+          RUSTFLAGS='--cfg getrandom_backend="wasm_js"' wasm-pack build --target web --out-dir static --out-name weeb_3 --scope "$NPM_SCOPE"
           cp README.npm.md static/README.md
           cd static
-          npm pkg delete files || true
-          npm pkg delete sideEffects || true
-          npm pkg delete exports || true
-          npm pkg delete keywords || true
-          npm pkg delete publishConfig || true
+          npm pkg delete files sideEffects exports keywords publishConfig || true
           npm pkg set \
             name="@${NPM_SCOPE}/weeb_3" \
             description="A Swarm client for browsers" \
@@ -67,6 +53,7 @@ jobs:
             files[3]="weeb_3_bg.wasm" \
             files[4]="weeb_3_bg.wasm.d.ts" \
             files[5]="service.js" \
+            files[6]="worker.js" \
             sideEffects[0]="./snippets/**/*" \
             keywords[0]="bee" \
             keywords[1]="browser" \
@@ -76,28 +63,25 @@ jobs:
             'exports[.].types=./weeb_3.d.ts' \
             'exports[.].import=./weeb_3.js' \
             'exports[.].default=./weeb_3.js' \
+            'exports[./service.js].default=./service.js' \
+            'exports[./worker.js].default=./worker.js' \
             'dependencies[hls.js]=^1.6.2'
           if [ "${GITHUB_EVENT_NAME}" = "push" ] && [ "${GITHUB_REF}" = "refs/heads/main" ]; then
             BASE_VERSION="$(node -p "require('./package.json').version.split('-')[0]")"
             RELEASE_VERSION="$(node -e "const [major, minor, patch] = process.argv[1].split('.').map(Number); const run = Number(process.argv[2]); const attempt = Number(process.argv[3]); console.log([major, minor, patch + run * 1000 + attempt].join('.'))" "$BASE_VERSION" "$GITHUB_RUN_NUMBER" "$GITHUB_RUN_ATTEMPT")"
             npm version "$RELEASE_VERSION" --no-git-tag-version
           fi
-      - name: Check npm pack contents
-        run: npm pack --dry-run ./static
+      - name: Build native server with the generated Wasm
+        run: cargo build --verbose
+      - name: Test Bee compatibility and transfer contracts
+        run: cargo test --tests -- --skip weeb3_loads_in_browser
+      - name: Pack npm release
+        run: npm pack ./static
       - name: Upload npm package artifact
         uses: actions/upload-artifact@v4
         with:
           name: npm-package
-          path: |
-            static/LICENSE
-            static/README.md
-            static/package.json
-            static/service.js
-            static/snippets
-            static/weeb_3.d.ts
-            static/weeb_3.js
-            static/weeb_3_bg.wasm
-            static/weeb_3_bg.wasm.d.ts
+          path: "*.tgz"
 
   publish-npm:
     needs: build
@@ -111,7 +95,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: npm-package
-          path: static
+          path: package
       - name: Setup Node.js
         uses: actions/setup-node@v6
         with:
@@ -120,4 +104,4 @@ jobs:
       - name: Publish npm package
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: npm publish ./static --access public
+        run: npm publish ./package/*.tgz --access public

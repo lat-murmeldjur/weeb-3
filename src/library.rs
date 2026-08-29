@@ -1,12 +1,13 @@
 #![cfg(target_arch = "wasm32")]
 
+use crate::PrivateKeySigner;
 use crate::{
-    Weeb3, decode_resources, encrey,
+    decode_resources, encrey,
     erasure_coding::RedundancyLevel,
     erasure_coding::validated_upload_redundancy_number,
     interface::{
-        begin_interface_mount, get_service_worker, install_service_worker_message_bridge,
-        mount_interface_after_service_worker_bridge_install,
+        begin_interface_mount, get_service_worker, install_bfcache_restore_guard,
+        mount_interface_with_generation, release_result_object_url,
     },
     interface_conventions::render_interface_shell,
     nav::route_network_mode_from_location,
@@ -26,18 +27,23 @@ use crate::{
     },
     secure_vault::{
         secure_batch_state_for_wallet, secure_commit_batch_purchase_and_verify,
-        secure_ensure_feed_owner, secure_open_vault_from_user_action,
+        secure_ensure_feed_owner_in_window, secure_open_vault_from_user_action,
         secure_prepare_batch_purchase,
     },
+    shared_runtime::SharedNodeClient,
     stream_conventions::{HlsStart, StreamShareRoute},
     strip_hex_prefix,
+    worker_protocol::{
+        bytes_to_js, progress_to_js as progress_row_to_js, property, set as set_js,
+        set_bool as set_js_bool, set_number as set_js_number, set_string as set_js_str,
+    },
 };
-use alloy::signers::local::PrivateKeySigner;
-use async_std::sync::Arc;
+use event_listener::Event;
 use js_sys::{Array, Function, Object, Promise, Reflect, Uint8Array};
 use std::{
+    cell::{Cell, RefCell},
+    rc::Rc,
     str::FromStr,
-    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
     time::Duration,
 };
 use wasm_bindgen::prelude::*;
@@ -47,7 +53,7 @@ use web_sys::{Element, File, FilePropertyBag, HtmlMediaElement};
 use web3::types::{Address, U256};
 
 #[wasm_bindgen(typescript_custom_section)]
-const UPLOAD_REDUNDANCY_TYPES: &'static str = r#"
+const UPLOAD_REDUNDANCY_TYPES: &str = r#"
 /** Bee-compatible erasure-coding level used for uploads. */
 export type UploadRedundancyLevel = 0 | 1 | 2 | 3 | 4;
 export type HlsStart = "beginning" | "live";
@@ -55,41 +61,15 @@ export type HlsStart = "beginning" | "live";
 
 fn resource_to_js(bytes: Vec<u8>, mime: String, path: String) -> Object {
     let obj = Object::new();
-    let u8 = Uint8Array::new_with_length(bytes.len() as u32);
-    u8.copy_from(&bytes);
-    let _ = Reflect::set(&obj, &"body".into(), &u8);
-    let _ = Reflect::set(&obj, &"mime".into(), &JsValue::from_str(&mime));
-    let _ = Reflect::set(&obj, &"path".into(), &JsValue::from_str(&path));
+    set_js(&obj, "body", bytes_to_js(&bytes).into());
+    set_js_str(&obj, "mime", mime);
+    set_js_str(&obj, "path", path);
     obj
 }
 
-fn progress_row_to_js(row: crate::events::ProgressRow) -> Object {
-    let obj = Object::new();
-    set_js_str(&obj, "id", row.id);
-    set_js_str(&obj, "kind", row.kind);
-    set_js_str(&obj, "subject", row.subject);
-    set_js_str(&obj, "phase", row.phase);
-    match row.percent {
-        Some(percent) => set_js(&obj, "percent", JsValue::from_f64(percent as f64)),
-        None => set_js(&obj, "percent", JsValue::NULL),
-    }
-    set_js_str(&obj, "detail", row.detail);
-    set_js(&obj, "done", JsValue::from_bool(row.done));
-    set_js(&obj, "ok", JsValue::from_bool(row.ok));
-    obj
-}
-
-fn bytes_to_js(bytes: &[u8]) -> Uint8Array {
-    let out = Uint8Array::new_with_length(bytes.len() as u32);
-    out.copy_from(bytes);
-    out
-}
-
-fn make_js_file(bytes: Vec<u8>, mime: &str, name: &str) -> File {
+fn make_js_file(bytes: Uint8Array, mime: &str, name: &str) -> File {
     let parts = Array::new();
-    let u8 = Uint8Array::new_with_length(bytes.len() as u32);
-    u8.copy_from(&bytes);
-    parts.push(&u8);
+    parts.push(&bytes);
 
     let bag = FilePropertyBag::new();
     bag.set_type(mime);
@@ -98,12 +78,14 @@ fn make_js_file(bytes: Vec<u8>, mime: &str, name: &str) -> File {
     File::new_with_u8_array_sequence_and_options(&parts, name, &bag).unwrap()
 }
 
-fn set_js(target: &Object, name: &str, value: JsValue) {
-    let _ = Reflect::set(target, &JsValue::from_str(name), &value);
-}
-
-fn set_js_str(target: &Object, name: &str, value: impl AsRef<str>) {
-    set_js(target, name, JsValue::from_str(value.as_ref()));
+fn make_upload_file(bytes: Uint8Array, mime: String, name: String) -> File {
+    let mime = if mime.is_empty() {
+        "application/octet-stream"
+    } else {
+        &mime
+    };
+    let name = if name.is_empty() { "bytes" } else { &name };
+    make_js_file(bytes, mime, name)
 }
 
 fn ok_object() -> Object {
@@ -142,7 +124,7 @@ fn normalize_feed_owner(owner: &str) -> Option<String> {
 async fn feed_owner_for_request(owner: &str) -> Result<Option<String>, String> {
     let owner = owner.trim();
     if owner.is_empty() {
-        return match secure_ensure_feed_owner().await {
+        return match secure_ensure_feed_owner_in_window().await {
             Some(owner) if owner.len() == 20 => Ok(Some(format!("0x{}", hex::encode(owner)))),
             Some(owner) => Err(format!("feed owner had invalid length {}", owner.len())),
             None => Err("feed owner unavailable".to_string()),
@@ -182,10 +164,6 @@ fn feed_status(
     }
 }
 
-fn active_wallet_chain_id() -> u64 {
-    active_profile().wallet_chain_id
-}
-
 fn network_mode_from_input(mode: &str) -> Option<NetworkMode> {
     match mode.trim().to_ascii_lowercase().as_str() {
         "mainnet" => Some(NetworkMode::Mainnet),
@@ -204,21 +182,9 @@ fn network_mode_label(mode: NetworkMode) -> &'static str {
 fn network_profile_object(profile: NetworkProfile, current_network_id: u64) -> Object {
     let obj = ok_object();
     set_js_str(&obj, "mode", network_mode_label(profile.mode));
-    set_js(
-        &obj,
-        "networkId",
-        JsValue::from_f64(current_network_id as f64),
-    );
-    set_js(
-        &obj,
-        "swarmNetworkId",
-        JsValue::from_f64(profile.swarm_network_id as f64),
-    );
-    set_js(
-        &obj,
-        "walletChainId",
-        JsValue::from_f64(profile.wallet_chain_id as f64),
-    );
+    set_js_number(&obj, "networkId", current_network_id as f64);
+    set_js_number(&obj, "swarmNetworkId", profile.swarm_network_id as f64);
+    set_js_number(&obj, "walletChainId", profile.wallet_chain_id as f64);
     set_js_str(&obj, "baseSymbol", profile.base_symbol);
     set_js_str(&obj, "bzzSymbol", profile.bzz_symbol);
 
@@ -239,7 +205,6 @@ fn network_profile_object(profile: NetworkProfile, current_network_id: u64) -> O
     obj
 }
 
-#[derive(Clone)]
 struct StartBootstrapNode {
     multiaddr: String,
     usable: bool,
@@ -250,48 +215,48 @@ struct StartOptions {
     bootstrap_nodes: Vec<StartBootstrapNode>,
 }
 
-fn js_prop(value: &JsValue, name: &str) -> JsValue {
-    Reflect::get(value, &JsValue::from_str(name)).unwrap_or(JsValue::UNDEFINED)
-}
-
-fn js_bool_prop(value: &JsValue, names: &[&str]) -> Option<bool> {
-    names.iter().find_map(|name| {
-        let prop = js_prop(value, name);
-        if prop.is_null() || prop.is_undefined() {
-            None
-        } else {
-            prop.as_bool()
-        }
-    })
-}
-
-fn js_string_prop(value: &JsValue, names: &[&str]) -> Option<String> {
-    names.iter().find_map(|name| {
-        let prop = js_prop(value, name);
-        if prop.is_null() || prop.is_undefined() {
-            return None;
-        }
-
-        if let Some(text) = prop.as_string() {
-            let text = text.trim();
-            if !text.is_empty() {
-                return Some(text.to_string());
-            }
-        }
-
-        prop.as_f64().and_then(|number| {
-            if number.is_finite() && number >= 0.0 {
-                Some(format!("{}", number as u64))
-            } else {
-                None
-            }
+fn profile_bootstrap_nodes(profile: NetworkProfile) -> Vec<StartBootstrapNode> {
+    initial_bootnodes(profile)
+        .into_iter()
+        .map(|address| StartBootstrapNode {
+            multiaddr: address.to_string(),
+            usable: true,
         })
+        .collect()
+}
+
+fn js_bool_prop(value: &JsValue, name: &str) -> Option<bool> {
+    let prop = property(value, name);
+    (!prop.is_null() && !prop.is_undefined())
+        .then(|| prop.as_bool())
+        .flatten()
+}
+
+fn js_string_prop(value: &JsValue, name: &str) -> Option<String> {
+    let prop = property(value, name);
+    if prop.is_null() || prop.is_undefined() {
+        return None;
+    }
+
+    if let Some(text) = prop.as_string() {
+        let text = text.trim();
+        if !text.is_empty() {
+            return Some(text.to_string());
+        }
+    }
+
+    prop.as_f64().and_then(|number| {
+        if number.is_finite() && number >= 0.0 {
+            Some((number as u64).to_string())
+        } else {
+            None
+        }
     })
 }
 
 fn parse_start_bootstrap_node(value: JsValue) -> Option<StartBootstrapNode> {
-    let multiaddr = js_string_prop(&value, &["multiaddr"])?;
-    let usable = js_bool_prop(&value, &["usable"]).unwrap_or(true);
+    let multiaddr = js_string_prop(&value, "multiaddr")?;
+    let usable = js_bool_prop(&value, "usable").unwrap_or(true);
     Some(StartBootstrapNode { multiaddr, usable })
 }
 
@@ -313,12 +278,12 @@ fn start_options_from_js(options: Option<JsValue>) -> StartOptions {
     let explicit_network_id = if bare_bootnodes {
         None
     } else {
-        js_string_prop(&options, &["networkId"])
+        js_string_prop(&options, "networkId")
     };
 
-    let mode = if js_bool_prop(&options, &["testnet"]).unwrap_or(false) {
+    let mode = if js_bool_prop(&options, "testnet").unwrap_or(false) {
         NetworkMode::Testnet
-    } else if js_bool_prop(&options, &["mainnet"]).unwrap_or(false) {
+    } else if js_bool_prop(&options, "mainnet").unwrap_or(false) {
         NetworkMode::Mainnet
     } else if let Some(network_id) = explicit_network_id.as_deref() {
         network_id
@@ -336,17 +301,11 @@ fn start_options_from_js(options: Option<JsValue>) -> StartOptions {
     let configured_nodes = if bare_bootnodes {
         parse_start_bootstrap_nodes(options)
     } else {
-        parse_start_bootstrap_nodes(js_prop(&options, "bootstrapNodes"))
+        parse_start_bootstrap_nodes(property(&options, "bootstrapNodes"))
     };
 
     let bootstrap_nodes = if configured_nodes.is_empty() {
-        initial_bootnodes(profile)
-            .into_iter()
-            .map(|address| StartBootstrapNode {
-                multiaddr: address.to_string(),
-                usable: true,
-            })
-            .collect()
+        profile_bootstrap_nodes(profile)
     } else {
         configured_nodes
     };
@@ -370,7 +329,9 @@ async fn call_promise(
     JsFuture::from(promise).await.map_err(|e| format!("{e:?}"))
 }
 
-async fn request_wallet_via_shell_connector(chain_id: u64) -> Option<Result<Address, String>> {
+pub(crate) async fn request_wallet_via_shell_connector(
+    chain_id: u64,
+) -> Option<Result<Address, String>> {
     let window = web_sys::window()?;
     let function = Reflect::get(&window, &JsValue::from_str("weeb3EnsureEip1193"))
         .ok()?
@@ -441,7 +402,7 @@ async fn switch_injected_wallet_chain(chain_id: u64) -> Result<(), String> {
 }
 
 async fn request_wallet_address() -> Result<Address, String> {
-    let chain_id = active_wallet_chain_id();
+    let chain_id = active_profile().wallet_chain_id;
     if let Some(result) = request_wallet_via_shell_connector(chain_id).await {
         return result;
     }
@@ -456,27 +417,53 @@ async fn request_wallet_address() -> Result<Address, String> {
         })
 }
 
+#[derive(Default)]
+struct StartupState {
+    configured: Cell<bool>,
+    pending: Cell<usize>,
+    idle: Event,
+    error: RefCell<Option<String>>,
+    serial: async_lock::Mutex<()>,
+}
+
+impl StartupState {
+    fn begin(&self) {
+        self.pending.set(self.pending.get().wrapping_add(1));
+    }
+
+    fn finish(&self, error: Option<String>) {
+        *self.error.borrow_mut() = error;
+        let remaining = self.pending.get() - 1;
+        self.pending.set(remaining);
+        if remaining == 0 {
+            self.idle.notify(usize::MAX);
+        }
+    }
+
+    async fn wait(&self) {
+        loop {
+            let idle = self.idle.listen();
+            if self.pending.get() == 0 {
+                return;
+            }
+            idle.await;
+        }
+    }
+}
+
 #[wasm_bindgen]
 pub struct Weeb3No103 {
-    inner: Arc<Weeb3>,
-    startup_configured: Arc<AtomicBool>,
-    startup_pending: Arc<AtomicUsize>,
-    startup_serial: Arc<async_lock::Mutex<()>>,
+    inner: Rc<SharedNodeClient>,
+    startup: Rc<StartupState>,
 }
 
-fn start_weeb3_runtime(inner: Arc<Weeb3>) {
-    spawn_local(async move {
-        inner.run(String::new()).await;
-    });
-}
-
-fn schedule_bootnode_dials(
-    inner: Arc<Weeb3>,
+async fn configure_shared_node(
+    inner: &SharedNodeClient,
     network_id: String,
     bootstrap_nodes: Vec<StartBootstrapNode>,
-) {
+) -> Result<(), String> {
     let Ok(expected_network_id) = network_id.parse::<u64>() else {
-        return;
+        return Err(format!("invalid Swarm network id {network_id}"));
     };
     let mut seen = std::collections::HashSet::new();
     let mut dial_nodes = Vec::new();
@@ -495,51 +482,44 @@ fn schedule_bootnode_dials(
         dial_nodes.push(node);
     }
 
-    spawn_local(async move {
-        inner
-            .connect_bootnodes_for_current_network(
-                dial_nodes
-                    .into_iter()
-                    .map(|node| (node.multiaddr, node.usable))
-                    .collect(),
-                expected_network_id,
-            )
-            .await;
-    });
+    inner
+        .configure(
+            expected_network_id,
+            dial_nodes
+                .into_iter()
+                .map(|node| (node.multiaddr, node.usable))
+                .collect(),
+        )
+        .await
 }
 
 #[wasm_bindgen]
 impl Weeb3No103 {
     #[wasm_bindgen(constructor)]
-    pub fn new() -> Weeb3No103 {
+    pub fn new(shared_worker_url: Option<String>) -> Weeb3No103 {
+        install_bfcache_restore_guard();
         Weeb3No103 {
-            inner: Arc::new(Weeb3::new("".to_string())),
-            startup_configured: Arc::new(AtomicBool::new(false)),
-            startup_pending: Arc::new(AtomicUsize::new(0)),
-            startup_serial: Arc::new(async_lock::Mutex::new(())),
+            inner: Rc::new(SharedNodeClient::new(
+                active_profile().swarm_network_id,
+                shared_worker_url.as_deref(),
+            )),
+            startup: Rc::new(StartupState::default()),
         }
     }
 
     fn schedule_start(&self, options: StartOptions) {
-        if let Ok(network_id) = options.network_id.parse::<u64>() {
-            if let Some(profile) = profile_for_swarm_network_id(network_id) {
-                activate_profile(profile);
-            }
-        }
-        install_service_worker_message_bridge(self.inner.clone());
         spawn_local(async {
             let _ = get_service_worker().await;
         });
-        self.startup_configured.store(true, Ordering::Release);
-        self.startup_pending.fetch_add(1, Ordering::AcqRel);
+        self.startup.configured.set(true);
+        self.startup.begin();
         let inner = self.inner.clone();
-        let pending = self.startup_pending.clone();
-        let serial = self.startup_serial.clone();
+        let startup = self.startup.clone();
 
         spawn_local(async move {
-            let _guard = serial.lock().await;
+            let _guard = startup.serial.lock().await;
             let network_id = options.network_id;
-            let current_network = inner.get_network_id().await;
+            let current_network = inner.network_id();
             let network_switch = network_id
                 .parse::<u64>()
                 .ok()
@@ -547,28 +527,25 @@ impl Weeb3No103 {
             if network_switch {
                 crate::stream::release_current_stream_view();
             }
-            if inner.set_network_id(network_id.clone()).await {
-                start_weeb3_runtime(inner.clone());
-                schedule_bootnode_dials(inner, network_id, options.bootstrap_nodes);
+            match configure_shared_node(&inner, network_id, options.bootstrap_nodes).await {
+                Ok(()) => startup.finish(None),
+                Err(error) => {
+                    inner.interface_log(format!("SharedWorker startup failed: {error}"));
+                    startup.finish(Some(error));
+                }
             }
-            pending.fetch_sub(1, Ordering::AcqRel);
         });
     }
 
-    async fn boot_runtime(&self) {
-        install_service_worker_message_bridge(self.inner.clone());
-        if !self.startup_configured.swap(true, Ordering::AcqRel) {
+    async fn boot_runtime(&self) -> Result<(), String> {
+        if !self.startup.configured.replace(true) {
             self.schedule_start(start_options_from_js(None));
         }
-        self.await_startup_tasks().await;
-        start_weeb3_runtime(self.inner.clone());
-        async_std::task::yield_now().await;
-    }
-
-    async fn await_startup_tasks(&self) {
-        while self.startup_pending.load(Ordering::Acquire) != 0 {
-            async_std::task::sleep(Duration::from_millis(10)).await;
+        self.startup.wait().await;
+        if let Some(error) = self.startup.error.borrow().clone() {
+            return Err(error);
         }
+        self.inner.ensure().await.map(|_| ())
     }
 
     #[wasm_bindgen(js_name = start)]
@@ -581,53 +558,47 @@ impl Weeb3No103 {
         let mount_generation = begin_interface_mount();
         let initial_result_generation = crate::stream::begin_result_view_request();
         crate::stream::release_current_stream_view();
-        if let Some(mode) = route_network_mode_from_location() {
-            activate_profile(profile_for_mode(mode));
-        }
-        let startup_already_configured = self.startup_configured.swap(true, Ordering::AcqRel);
-        self.startup_pending.fetch_add(1, Ordering::AcqRel);
-        install_service_worker_message_bridge(self.inner.clone());
+        release_result_object_url();
+        let startup_already_configured = self.startup.configured.replace(true);
+        self.startup.begin();
         render_interface_shell(&container);
 
         let s = self.inner.clone();
-        let pending = self.startup_pending.clone();
-        let serial = self.startup_serial.clone();
+        let startup = self.startup.clone();
         spawn_local(async move {
-            let guard = serial.lock().await;
-            let network_before_route = s.get_network_id().await;
-            let mut route_changed_network = false;
-            if let Some(mode) = route_network_mode_from_location() {
-                let profile = profile_for_mode(mode);
-                route_changed_network = network_before_route != profile.swarm_network_id;
-                let _ = s.set_network_id(profile.swarm_network_id.to_string()).await;
-            }
-            let network_id = s.get_network_id().await;
+            let guard = startup.serial.lock().await;
+            let network_before_route = s.network_id();
+            let route_mode = route_network_mode_from_location();
+            let network_id = route_mode
+                .map(|mode| profile_for_mode(mode).swarm_network_id)
+                .unwrap_or(network_before_route);
+            let route_changed_network = network_before_route != network_id;
             let bootstrap_nodes = profile_for_swarm_network_id(network_id)
-                .map(|profile| {
-                    initial_bootnodes(profile)
-                        .into_iter()
-                        .map(|address| StartBootstrapNode {
-                            multiaddr: address.to_string(),
-                            usable: true,
-                        })
-                        .collect()
-                })
+                .map(profile_bootstrap_nodes)
                 .unwrap_or_default();
-            start_weeb3_runtime(s.clone());
-            if !startup_already_configured || route_changed_network {
-                schedule_bootnode_dials(s.clone(), network_id.to_string(), bootstrap_nodes);
+            let startup_result = if !startup_already_configured || route_changed_network {
+                configure_shared_node(&s, network_id.to_string(), bootstrap_nodes).await
+            } else {
+                s.ensure().await.map(|_| ())
+            };
+            if let Err(error) = startup_result {
+                s.interface_log(format!("SharedWorker startup failed: {error}"));
+                startup.finish(Some(error));
+                return;
             }
-            pending.fetch_sub(1, Ordering::AcqRel);
+            startup.finish(None);
             drop(guard);
-            let _ = mount_interface_after_service_worker_bridge_install(
+            if let Err(error) = mount_interface_with_generation(
                 s,
-                false,
-                true,
                 Some(initial_result_generation),
-                false,
                 mount_generation,
             )
-            .await;
+            .await
+            {
+                web_sys::console::error_1(&JsValue::from_str(&format!(
+                    "weeb-3 interface mount failed: {error:?}"
+                )));
+            }
         });
 
         ok_object()
@@ -655,7 +626,9 @@ impl Weeb3No103 {
             StreamShareRoute::new(owner, topic).map_err(|error| JsValue::from_str(&error))?;
         let view_generation = crate::stream::begin_result_view_request();
         crate::stream::release_current_stream_view();
-        self.boot_runtime().await;
+        self.boot_runtime()
+            .await
+            .map_err(|error| JsValue::from_str(&error))?;
         crate::stream_hls::attach_hls_feed_player(
             self.inner.clone(),
             &media,
@@ -671,14 +644,28 @@ impl Weeb3No103 {
 
     #[wasm_bindgen(js_name = networkState)]
     pub async fn network_state(&self) -> Object {
-        self.await_startup_tasks().await;
-        let network_id = self.inner.get_network_id().await;
+        if let Err(error) = self.boot_runtime().await {
+            return error_object(error);
+        }
+        let network_id = self.inner.network_id();
         let profile = profile_for_swarm_network_id(network_id).unwrap_or_else(active_profile);
         network_profile_object(profile, network_id)
     }
 
     #[wasm_bindgen(js_name = openSecureVault)]
     pub fn open_secure_vault(&self) -> Object {
+        if self.startup.pending.get() != 0 {
+            return error_object(
+                "weeb-3 is still starting; wait for networkState before opening the vault",
+            );
+        }
+        if let Some(error) = self.startup.error.borrow().as_ref() {
+            return error_object(error);
+        }
+        if let Some(profile) = profile_for_swarm_network_id(self.inner.network_id()) {
+            activate_profile(profile);
+        }
+        self.inner.claim_vault_broker();
         secure_open_vault_from_user_action();
         ok_object()
     }
@@ -688,40 +675,36 @@ impl Weeb3No103 {
         let Some(mode) = network_mode_from_input(&mode) else {
             return error_object("unknown network mode");
         };
-        install_service_worker_message_bridge(self.inner.clone());
         spawn_local(async {
             let _ = get_service_worker().await;
         });
-        self.startup_pending.fetch_add(1, Ordering::AcqRel);
-        let _guard = self.startup_serial.lock().await;
-        self.startup_configured.store(true, Ordering::Release);
+        self.startup.begin();
+        let _guard = self.startup.serial.lock().await;
+        self.startup.configured.set(true);
         let profile = profile_for_mode(mode);
         let network_id = profile.swarm_network_id.to_string();
-        if self.inner.get_network_id().await != profile.swarm_network_id {
+        if self.inner.network_id() != profile.swarm_network_id {
             crate::stream::release_current_stream_view();
         }
-        if !self.inner.set_network_id(network_id.clone()).await {
-            self.startup_pending.fetch_sub(1, Ordering::AcqRel);
-            return error_object("network id switch failed");
-        }
-        start_weeb3_runtime(self.inner.clone());
-
         let requested_bootnodes = Array::new();
         let skipped_bootnodes = Array::new();
         let mut bootstrap_nodes = Vec::new();
-        for address in initial_bootnodes(profile) {
-            if is_browser_dialable_underlay(address) {
-                requested_bootnodes.push(&JsValue::from_str(address));
-                bootstrap_nodes.push(StartBootstrapNode {
-                    multiaddr: address.to_string(),
-                    usable: true,
-                });
+        for node in profile_bootstrap_nodes(profile) {
+            if is_browser_dialable_underlay(&node.multiaddr) {
+                requested_bootnodes.push(&JsValue::from_str(&node.multiaddr));
+                bootstrap_nodes.push(node);
             } else {
-                skipped_bootnodes.push(&JsValue::from_str(address));
+                skipped_bootnodes.push(&JsValue::from_str(&node.multiaddr));
             }
         }
-        schedule_bootnode_dials(self.inner.clone(), network_id, bootstrap_nodes);
-        self.startup_pending.fetch_sub(1, Ordering::AcqRel);
+        if let Err(error) =
+            configure_shared_node(&self.inner, network_id.clone(), bootstrap_nodes).await
+        {
+            self.startup.finish(Some(error.clone()));
+            return error_object(format!("network id switch failed: {error}"));
+        }
+
+        self.startup.finish(None);
 
         let obj = network_profile_object(profile, profile.swarm_network_id);
         set_js(&obj, "requestedBootnodes", requested_bootnodes.into());
@@ -730,8 +713,10 @@ impl Weeb3No103 {
     }
 
     #[wasm_bindgen(js_name = retrieve)]
-    pub async fn retrieve(&self, address: String) -> Array {
-        self.boot_runtime().await;
+    pub async fn retrieve(&self, address: String) -> Result<Array, JsValue> {
+        self.boot_runtime()
+            .await
+            .map_err(|error| JsValue::from_str(&error))?;
         let raw = self.inner.acquire(address).await;
         let (mut data, indx) = decode_resources(raw);
 
@@ -746,51 +731,51 @@ impl Weeb3No103 {
 
         if let Some(pos) = data.iter().position(|(_, _, p)| *p == indx) {
             let (bytes, mime, path) = data.remove(pos);
-            let file = make_js_file(bytes, &mime, &path);
+            let file = make_js_file(bytes_to_js(&bytes), &mime, &path);
             let entry = make_entry(&path, &file);
             out.push(&entry);
         }
 
         for (bytes, mime, path) in data {
-            let file = make_js_file(bytes, &mime, &path);
+            let file = make_js_file(bytes_to_js(&bytes), &mime, &path);
             let entry = make_entry(&path, &file);
             out.push(&entry);
         }
 
-        out
+        Ok(out)
     }
 
     #[wasm_bindgen(js_name = retrieveBytes)]
-    pub async fn retrieve_bytes(&self, address: String) -> Uint8Array {
-        self.boot_runtime().await;
-        let bytes = self.inner.retrieve_bytes(address).await;
-        let out = Uint8Array::new_with_length(bytes.len() as u32);
-        out.copy_from(&bytes);
-        out
+    pub async fn retrieve_bytes(&self, address: String) -> Result<Uint8Array, JsValue> {
+        self.boot_runtime()
+            .await
+            .map_err(|error| JsValue::from_str(&error))?;
+        Ok(self.inner.retrieve_bytes(address).await)
     }
 
     #[wasm_bindgen(js_name = retrieveChunk)]
-    pub async fn retrieve_chunk(&self, address: String) -> Uint8Array {
-        self.boot_runtime().await;
-        let bytes = self.inner.retrieve_chunk_bytes(address).await;
-        let out = Uint8Array::new_with_length(bytes.len() as u32);
-        out.copy_from(&bytes);
-        out
+    pub async fn retrieve_chunk(&self, address: String) -> Result<Uint8Array, JsValue> {
+        self.boot_runtime()
+            .await
+            .map_err(|error| JsValue::from_str(&error))?;
+        Ok(self.inner.retrieve_chunk_bytes(address).await)
     }
 
     #[wasm_bindgen(js_name = ready)]
-    pub async fn ready(&self, min_connections: u32, timeout_ms: u32) -> bool {
-        self.boot_runtime().await;
+    pub async fn ready(&self, min_connections: u32, timeout_ms: u32) -> Result<bool, JsValue> {
+        self.boot_runtime()
+            .await
+            .map_err(|error| JsValue::from_str(&error))?;
 
         let min_connections = min_connections.max(1) as u64;
         let started = js_sys::Date::now();
         loop {
             if self.inner.get_connections().await >= min_connections {
-                return true;
+                return Ok(true);
             }
 
             if timeout_ms == 0 || js_sys::Date::now() - started >= timeout_ms as f64 {
-                return false;
+                return Ok(false);
             }
 
             async_std::task::sleep(Duration::from_millis(160)).await;
@@ -812,15 +797,15 @@ impl Weeb3No103 {
 
         match self.inner.get_progress_snapshot(seen_revision as u64).await {
             Some((revision, snapshot)) => {
-                set_js(&obj, "changed", JsValue::from_bool(true));
-                set_js(&obj, "revision", JsValue::from_f64(revision as f64));
+                set_js_bool(&obj, "changed", true);
+                set_js_number(&obj, "revision", revision as f64);
                 for row in snapshot {
                     rows.push(&progress_row_to_js(row));
                 }
             }
             None => {
-                set_js(&obj, "changed", JsValue::from_bool(false));
-                set_js(&obj, "revision", JsValue::from_f64(seen_revision as f64));
+                set_js_bool(&obj, "changed", false);
+                set_js_number(&obj, "revision", seen_revision as f64);
             }
         }
 
@@ -831,12 +816,14 @@ impl Weeb3No103 {
     #[wasm_bindgen(js_name = postPushChunk)]
     pub async fn post_push_chunk_js(
         &self,
-        data: Vec<u8>,
+        data: Uint8Array,
         soc: bool,
-        chunk_address: Vec<u8>,
-        stamp: Vec<u8>,
-    ) -> String {
-        self.boot_runtime().await;
+        chunk_address: Uint8Array,
+        stamp: Uint8Array,
+    ) -> Result<String, JsValue> {
+        self.boot_runtime()
+            .await
+            .map_err(|error| JsValue::from_str(&error))?;
         let raw = self
             .inner
             .post_push_chunk(data, soc, chunk_address, stamp)
@@ -844,11 +831,11 @@ impl Weeb3No103 {
 
         let (resources, _) = decode_resources(raw);
 
-        if let Some((bytes, _, _)) = resources.into_iter().next() {
+        Ok(if let Some((bytes, _, _)) = resources.into_iter().next() {
             String::from_utf8(bytes).unwrap_or_else(|_| "Invalid UTF-8 result".to_string())
         } else {
             "No upload result returned".to_string()
-        }
+        })
     }
 
     pub async fn upload(
@@ -885,7 +872,9 @@ impl Weeb3No103 {
         };
         let redundancy_level = f64::from(redundancy_level.as_u8());
 
-        self.boot_runtime().await;
+        if let Err(error) = self.boot_runtime().await {
+            return error_object(error);
+        }
         let feed_topic = if add_to_feed {
             normalize_feed_topic(&feed_topic)
         } else {
@@ -910,12 +899,12 @@ impl Weeb3No103 {
             ok_object()
         };
 
-        let _ = Reflect::set(&obj, &"reference".into(), &JsValue::from_str(&indx));
-        set_js(&obj, "redundancyLevel", JsValue::from_f64(redundancy_level));
+        set_js_str(&obj, "reference", &indx);
+        set_js_number(&obj, "redundancyLevel", redundancy_level);
         if add_to_feed {
             set_js_str(&obj, "feedTopic", &feed_topic);
             set_js_str(&obj, "feedReference", &indx);
-            match secure_ensure_feed_owner().await {
+            match secure_ensure_feed_owner_in_window().await {
                 Some(owner) if owner.len() == 20 => {
                     set_js_str(&obj, "feedOwner", format!("0x{}", hex::encode(owner)));
                 }
@@ -934,31 +923,21 @@ impl Weeb3No103 {
         for (bytes, mime, path) in data {
             resources.push(&resource_to_js(bytes, mime, path));
         }
-        let _ = Reflect::set(&obj, &"resources".into(), &resources);
+        set_js(&obj, "resources", resources.into());
         obj
     }
 
     #[wasm_bindgen(js_name = postUploadBytes)]
     pub async fn post_upload_bytes(
         &self,
-        bytes: Vec<u8>,
+        bytes: Uint8Array,
         mime: String,
         filename: String,
         encryption: bool,
         add_to_feed: bool,
         feed_topic: String,
     ) -> Object {
-        let mime = if mime.is_empty() {
-            "application/octet-stream".to_string()
-        } else {
-            mime
-        };
-        let filename = if filename.is_empty() {
-            "bytes".to_string()
-        } else {
-            filename
-        };
-        let file = make_js_file(bytes, &mime, &filename);
+        let file = make_upload_file(bytes, mime, filename);
         self.upload(file, encryption, String::new(), add_to_feed, feed_topic)
             .await
     }
@@ -966,7 +945,7 @@ impl Weeb3No103 {
     #[wasm_bindgen(js_name = postUploadBytesWithRedundancy)]
     pub async fn post_upload_bytes_with_redundancy(
         &self,
-        bytes: Vec<u8>,
+        bytes: Uint8Array,
         mime: String,
         filename: String,
         encryption: bool,
@@ -974,17 +953,7 @@ impl Weeb3No103 {
         add_to_feed: bool,
         feed_topic: String,
     ) -> Object {
-        let mime = if mime.is_empty() {
-            "application/octet-stream".to_string()
-        } else {
-            mime
-        };
-        let filename = if filename.is_empty() {
-            "bytes".to_string()
-        } else {
-            filename
-        };
-        let file = make_js_file(bytes, &mime, &filename);
+        let file = make_upload_file(bytes, mime, filename);
         self.upload_with_redundancy(
             file,
             encryption,
@@ -1000,7 +969,7 @@ impl Weeb3No103 {
     pub async fn post_feed_bytes(
         &self,
         topic: String,
-        bytes: Vec<u8>,
+        bytes: Uint8Array,
         mime: String,
         filename: String,
         encryption: bool,
@@ -1011,7 +980,9 @@ impl Weeb3No103 {
 
     #[wasm_bindgen(js_name = acquireFeedBytes)]
     pub async fn acquire_feed_bytes(&self, owner: String, topic: String) -> Object {
-        self.boot_runtime().await;
+        if let Err(error) = self.boot_runtime().await {
+            return error_object(error);
+        }
         let feed_topic = normalize_feed_topic(&topic);
         let feed_owner = match feed_owner_for_request(&owner).await {
             Ok(feed_owner) => feed_owner,
@@ -1065,7 +1036,9 @@ impl Weeb3No103 {
 
     #[wasm_bindgen(js_name = batchState)]
     pub async fn batch_state(&self, depth: u8, validity_days: u32) -> Object {
-        self.boot_runtime().await;
+        if let Err(error) = self.boot_runtime().await {
+            return error_object(error);
+        }
         let profile = active_profile();
         let payer = match request_wallet_address().await {
             Ok(payer) => payer,
@@ -1088,52 +1061,36 @@ impl Weeb3No103 {
         let obj = ok_object();
         set_js_str(&obj, "network", network_mode_label(profile.mode));
         set_js_str(&obj, "mode", network_mode_label(profile.mode));
-        set_js(
-            &obj,
-            "swarmNetworkId",
-            JsValue::from_f64(profile.swarm_network_id as f64),
-        );
-        set_js(
-            &obj,
-            "walletChainId",
-            JsValue::from_f64(profile.wallet_chain_id as f64),
-        );
+        set_js_number(&obj, "swarmNetworkId", profile.swarm_network_id as f64);
+        set_js_number(&obj, "walletChainId", profile.wallet_chain_id as f64);
         set_js_str(&obj, "wallet", hex_address(payer));
         set_js_str(&obj, "chainId", chain_id.to_string());
-        set_js(&obj, "hasBatch", JsValue::from_bool(secure_state.has_batch));
-        set_js(
-            &obj,
-            "usableBatch",
-            JsValue::from_bool(secure_state.usable()),
-        );
+        set_js_bool(&obj, "hasBatch", secure_state.has_batch);
+        set_js_bool(&obj, "usableBatch", secure_state.usable());
         set_js_str(&obj, "batchId", hex::encode(&secure_state.batch_id));
-        set_js(
+        set_js_number(
             &obj,
             "batchBucketLimit",
-            JsValue::from_f64(secure_state.batch_bucket_limit as f64),
+            secure_state.batch_bucket_limit as f64,
         );
         set_js_str(
             &obj,
             "batchValidityStatus",
             &secure_state.batch_validity_status,
         );
-        set_js(&obj, "depth", JsValue::from_f64(depth as f64));
-        set_js(
-            &obj,
-            "validityDays",
-            JsValue::from_f64(validity_days as f64),
-        );
+        set_js_number(&obj, "depth", depth as f64);
+        set_js_number(&obj, "validityDays", validity_days as f64);
 
         if chain_id != U256::from(profile.wallet_chain_id) {
             set_js_str(&obj, "status", "wrong_network");
             return obj;
         }
 
-        let postage = match postage_contract(&w3).await {
+        let postage = match postage_contract(&w3) {
             Ok(postage) => postage,
             Err(error) => return error_object(format!("postage contract failed: {error:?}")),
         };
-        let token = match token_contract(&w3).await {
+        let token = match token_contract(&w3) {
             Ok(token) => token,
             Err(error) => return error_object(format!("token contract failed: {error:?}")),
         };
@@ -1162,7 +1119,7 @@ impl Weeb3No103 {
             * chunk_count_for_depth(depth);
 
         if secure_state.usable() {
-            let remaining = get_batch_validity(secure_state.batch_id.clone()).await;
+            let remaining = get_batch_validity(&secure_state.batch_id).await;
             let day_price = last_price * U256::from(7200u64);
             let days = if day_price.is_zero() {
                 U256::from(0)
@@ -1178,17 +1135,15 @@ impl Weeb3No103 {
         set_js(&obj, "requiredBzz", u256_string(required));
         set_js(&obj, "tokenBalance", u256_string(token_balance));
         set_js(&obj, "baseBalance", u256_string(base_balance));
-        set_js(
-            &obj,
-            "hasFunds",
-            JsValue::from_bool(token_balance >= required),
-        );
+        set_js_bool(&obj, "hasFunds", token_balance >= required);
         obj
     }
 
     #[wasm_bindgen(js_name = buyBatch)]
     pub async fn buy_batch(&self, depth: u8, validity_days: u32) -> Object {
-        self.boot_runtime().await;
+        if let Err(error) = self.boot_runtime().await {
+            return error_object(error);
+        }
         let profile = active_profile();
         let payer = match request_wallet_address().await {
             Ok(payer) => payer,
@@ -1196,18 +1151,13 @@ impl Weeb3No103 {
         };
         if let Some(state) =
             secure_batch_state_for_wallet(payer.as_bytes(), profile.swarm_network_id).await
+            && state.usable()
         {
-            if state.usable() {
-                let obj = ok_object();
-                set_js_str(&obj, "status", "already_ready");
-                set_js_str(&obj, "batchId", hex::encode(&state.batch_id));
-                set_js(
-                    &obj,
-                    "batchBucketLimit",
-                    JsValue::from_f64(state.batch_bucket_limit as f64),
-                );
-                return obj;
-            }
+            let obj = ok_object();
+            set_js_str(&obj, "status", "already_ready");
+            set_js_str(&obj, "batchId", hex::encode(&state.batch_id));
+            set_js_number(&obj, "batchBucketLimit", state.batch_bucket_limit as f64);
+            return obj;
         }
 
         let prepared = match secure_prepare_batch_purchase(
@@ -1249,17 +1199,9 @@ impl Weeb3No103 {
         set_js_str(&obj, "wallet", hex_address(payer));
         set_js_str(&obj, "owner", hex_address(owner));
         set_js_str(&obj, "batchId", hex::encode(&purchase.batch_id));
-        set_js(&obj, "depth", JsValue::from_f64(prepared.depth as f64));
-        set_js(
-            &obj,
-            "validityDays",
-            JsValue::from_f64(prepared.validity_days as f64),
-        );
-        set_js(
-            &obj,
-            "batchBucketLimit",
-            JsValue::from_f64(purchase.bucket_limit as f64),
-        );
+        set_js_number(&obj, "depth", prepared.depth as f64);
+        set_js_number(&obj, "validityDays", prepared.validity_days as f64);
+        set_js_number(&obj, "batchBucketLimit", purchase.bucket_limit as f64);
         set_js_str(
             &obj,
             "approveTx",
@@ -1272,7 +1214,9 @@ impl Weeb3No103 {
 
     #[wasm_bindgen(js_name = deployChequebook)]
     pub async fn deploy_chequebook(&self) -> Object {
-        self.boot_runtime().await;
+        if let Err(error) = self.boot_runtime().await {
+            return error_object(error);
+        }
         let stored_key = get_chequebook_signer_key().await;
         let stored_address = get_chequebook_address().await;
         if !stored_key.is_empty() && stored_address.len() == 20 {
@@ -1301,7 +1245,7 @@ impl Weeb3No103 {
         if !set_chequebook_signer_key(&cheque_signer_key).await {
             return error_object("chequebook deployed, but signer key could not be saved");
         }
-        if !set_chequebook_address(&deployment.chequebook.as_bytes().to_vec()).await {
+        if !set_chequebook_address(deployment.chequebook.as_bytes()).await {
             return error_object("chequebook deployed, but address could not be saved");
         }
 
@@ -1319,7 +1263,9 @@ impl Weeb3No103 {
 
     #[wasm_bindgen(js_name = depositChequebook)]
     pub async fn deposit_chequebook(&self, amount: String) -> Object {
-        self.boot_runtime().await;
+        if let Err(error) = self.boot_runtime().await {
+            return error_object(error);
+        }
         let amount = match U256::from_dec_str(amount.trim()) {
             Ok(amount) => amount,
             Err(_) => return error_object("amount must be a base-unit integer string"),
@@ -1337,7 +1283,7 @@ impl Weeb3No103 {
             Ok(w3) => w3,
             Err(error) => return error_object(format!("provider init failed: {error:?}")),
         };
-        let token = match token_contract(&w3).await {
+        let token = match token_contract(&w3) {
             Ok(token) => token,
             Err(error) => return error_object(format!("token contract failed: {error:?}")),
         };
@@ -1358,18 +1304,16 @@ impl Weeb3No103 {
 
     #[wasm_bindgen(js_name = resetStamp)]
     pub async fn reset_stamp(&self) -> Object {
-        self.boot_runtime().await;
+        if let Err(error) = self.boot_runtime().await {
+            return error_object(error);
+        }
         let raw = self.inner.reset_stamp().await;
-        let (data, _indx) = decode_resources(raw);
+        let (data, _) = decode_resources(raw);
         let obj = Object::new();
-        if let Some((bytes, mime, path)) = data.get(0) {
-            let _ = Reflect::set(
-                &obj,
-                &"message".into(),
-                &JsValue::from_str(&String::from_utf8_lossy(bytes)),
-            );
-            let _ = Reflect::set(&obj, &"mime".into(), &JsValue::from_str(mime));
-            let _ = Reflect::set(&obj, &"path".into(), &JsValue::from_str(path));
+        if let Some((bytes, mime, path)) = data.first() {
+            set_js_str(&obj, "message", String::from_utf8_lossy(bytes));
+            set_js_str(&obj, "mime", mime);
+            set_js_str(&obj, "path", path);
         }
         obj
     }

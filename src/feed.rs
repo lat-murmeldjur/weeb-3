@@ -32,17 +32,14 @@ fn probe_index(base: u64, level: usize) -> Option<u64> {
     base.checked_add(distance.checked_sub(1)?)
 }
 
-async fn confirm_sequence_feed_missing<T, Probe, ProbeFuture, ProbeResult>(
-    probe: &Probe,
-    index: u64,
+async fn probe_with_timeout<T, ProbeFuture, ProbeResult>(
+    lookup: ProbeFuture,
     timeout: Option<Duration>,
 ) -> FeedProbe<T>
 where
-    Probe: Fn(u64) -> ProbeFuture,
     ProbeFuture: Future<Output = ProbeResult>,
     ProbeResult: Into<FeedProbe<T>>,
 {
-    let lookup = probe(index);
     if let Some(timeout) = timeout {
         return match async_std::future::timeout(timeout, lookup).await {
             Ok(result) => result.into(),
@@ -60,7 +57,7 @@ where
     ProbeFuture: Future<Output = ProbeResult>,
     ProbeResult: Into<FeedProbe<T>>,
 {
-    seek_sequence_feed_frontier_inner(None, probe, |_, _| {}, None).await
+    seek_sequence_feed_frontier_inner(probe, |_, _| {}, None).await
 }
 
 pub(crate) async fn seek_sequence_feed_frontier_bounded_observing_positive<
@@ -80,7 +77,6 @@ where
     ObservePositive: FnMut(u64, &T),
 {
     seek_sequence_feed_frontier_inner(
-        None,
         probe,
         observe_positive,
         Some(FEED_FRONTIER_LOOKAHEAD_TIMEOUT),
@@ -89,7 +85,6 @@ where
 }
 
 async fn seek_sequence_feed_frontier_inner<T, Probe, ProbeFuture, ProbeResult, ObservePositive>(
-    initial_latest: Option<(u64, T)>,
     probe: Probe,
     mut observe_positive: ObservePositive,
     lookahead_timeout: Option<Duration>,
@@ -100,9 +95,8 @@ where
     ProbeResult: Into<FeedProbe<T>>,
     ObservePositive: FnMut(u64, &T),
 {
-    let (mut latest, mut level_limit, mut known_missing) = if let Some(latest) = initial_latest {
-        (latest, FEED_FRONTIER_LOOKAHEAD_LEVELS, None)
-    } else if let Some(timeout) = lookahead_timeout {
+    let (mut latest, mut level_limit, mut known_missing) = if let Some(timeout) = lookahead_timeout
+    {
         // An authenticated higher sequence update proves the lower contiguous interval.
         let mut probes = FuturesUnordered::new();
         for level in BOUNDED_INITIAL_LEVELS.into_iter().rev() {
@@ -113,14 +107,7 @@ where
             };
             let lookup = probe(index);
             probes.push(async move {
-                let result = if level == 0 {
-                    lookup.await.into()
-                } else {
-                    match async_std::future::timeout(timeout, lookup).await {
-                        Ok(result) => result.into(),
-                        Err(_) => FeedProbe::Transient,
-                    }
-                };
+                let result = probe_with_timeout(lookup, (level != 0).then_some(timeout)).await;
                 (level, index, result)
             });
         }
@@ -204,13 +191,7 @@ where
             };
             let lookup = probe(index);
             probes.push(async move {
-                let result = match lookahead_timeout {
-                    Some(timeout) => match async_std::future::timeout(timeout, lookup).await {
-                        Ok(result) => result.into(),
-                        Err(_) => FeedProbe::Transient,
-                    },
-                    None => lookup.await.into(),
-                };
+                let result = probe_with_timeout(lookup, lookahead_timeout).await;
                 (level, index, result)
             });
         }
@@ -250,7 +231,7 @@ where
 
         if highest_found_level == 0 {
             let next = latest.0.saturating_add(1);
-            match confirm_sequence_feed_missing(&probe, next, lookahead_timeout).await {
+            match probe_with_timeout(probe(next), lookahead_timeout).await {
                 FeedProbe::Found(payload) => {
                     observe_positive(next, &payload);
                     latest = (next, payload);
@@ -270,7 +251,7 @@ where
             if let Some(missing) = known_missing
                 && Some(missing) == latest.0.checked_add(1)
             {
-                match confirm_sequence_feed_missing(&probe, missing, lookahead_timeout).await {
+                match probe_with_timeout(probe(missing), lookahead_timeout).await {
                     FeedProbe::Found(payload) => {
                         observe_positive(missing, &payload);
                         latest = (missing, payload);

@@ -298,10 +298,6 @@
             };
             const WALLETCONNECT_SRC = "https://cdn.jsdelivr.net/npm/@walletconnect/ethereum-provider@2.23.3/dist/index.umd.js";
             let walletConnectScriptPromise = null;
-            const WC_DEBUG = false;
-            const wcDebug = (...args) => {
-                if (WC_DEBUG) console.log(...args);
-            };
 
             const RELAYS = [
                 "wss://relay.walletconnect.com",
@@ -315,9 +311,7 @@
                         relayIdx: 0,
                         connectInFlight: false,
                         openedWalletThisAttempt: false,
-                        wcUri: null,
                         lastAccounts: [],
-                        lastChainId: null,
                         targetChainId: null,
                     };
                 }
@@ -338,10 +332,6 @@
 
                 const swarmNetworkId = Number(document.getElementById("networkIDSettings")?.value || 1);
                 return swarmNetworkId === 1 ? 100 : 11155111;
-            }
-
-            function chainIdHex(chainId) {
-                return ("0x" + Number(chainId).toString(16)).toLowerCase();
             }
 
             function sleep(ms) {
@@ -370,23 +360,8 @@
                 return walletConnectScriptPromise;
             }
 
-            async function waitFor(fn, {
-                timeoutMs = 90000,
-                intervalMs = 400,
-                label = "condition",
-            } = {}) {
-                const started = Date.now();
-                while (Date.now() - started < timeoutMs) {
-                    try {
-                        if (await fn()) return true;
-                    } catch (_) {}
-                    await sleep(intervalMs);
-                }
-                throw new Error(`Timed out waiting for ${label} (${Math.round(timeoutMs / 1000)}s).`);
-            }
-
             function isRelayishError(e) {
-                const msg = String((e && (e.message ?? e)) ?? "");
+                const msg = String(e?.message ?? e ?? "");
                 return (
                     msg.includes("relay") ||
                     msg.includes("socket connection") ||
@@ -412,11 +387,9 @@
                 try { await s.provider?.disconnect?.(); } catch (_) {}
 
                 s.provider = null;
-                s.wcUri = null;
                 s.connectInFlight = false;
                 s.openedWalletThisAttempt = false;
                 s.lastAccounts = [];
-                s.lastChainId = null;
                 s.targetChainId = null;
             }
 
@@ -434,7 +407,7 @@
                     throw new Error("WalletConnect EthereumProvider not loaded");
                 }
 
-                const network = NETWORKS[targetChainId] || NETWORKS[11155111];
+                const network = NETWORKS[targetChainId];
                 const provider = await WC.EthereumProvider.init({
                     projectId,
                     relayUrl: RELAYS[s.relayIdx],
@@ -453,9 +426,6 @@
                 });
 
                 provider.on("display_uri", (uri) => {
-                    s.wcUri = uri;
-                    wcDebug("WC display_uri ready");
-
                     if (!s.connectInFlight) return;
                     if (s.openedWalletThisAttempt) return;
 
@@ -463,27 +433,14 @@
                     openMetaMaskForUri(uri);
                 });
 
-                provider.on("connect", (info) => {
-                    wcDebug("WC connected:", info);
-                });
-
-                provider.on("disconnect", (info) => {
-                    wcDebug("WC disconnected:", info);
-                    s.wcUri = null;
+                provider.on("disconnect", () => {
                     s.connectInFlight = false;
                     s.openedWalletThisAttempt = false;
                     s.lastAccounts = [];
-                    s.lastChainId = null;
                 });
 
                 provider.on("accountsChanged", (accounts) => {
                     s.lastAccounts = Array.isArray(accounts) ? accounts : [];
-                    wcDebug("WC accountsChanged:", s.lastAccounts);
-                });
-
-                provider.on("chainChanged", (chainId) => {
-                    s.lastChainId = normalizeChainIdToHex(chainId);
-                    wcDebug("WC chainChanged:", s.lastChainId);
                 });
 
                 s.provider = provider;
@@ -496,7 +453,6 @@
                 let provider = await ensureProvider(projectId, targetChainId);
 
                 if (provider.session) {
-                    wcDebug("Reusing existing WalletConnect session");
                     return provider;
                 }
 
@@ -528,7 +484,7 @@
             async function getAccountsWithoutExtraPrompt(provider) {
                 const s = getState();
 
-                if (Array.isArray(s.lastAccounts) && s.lastAccounts.length > 0) {
+                if (s.lastAccounts.length > 0) {
                     return s.lastAccounts;
                 }
 
@@ -540,25 +496,14 @@
                     }
                 } catch (_) {}
 
-                try {
-                    await waitFor(async () => {
-                        if (Array.isArray(s.lastAccounts) && s.lastAccounts.length > 0) return true;
-
-                        const accounts = await provider.request({ method: "eth_accounts" }).catch(() => []);
-                        if (Array.isArray(accounts) && accounts.length > 0) {
-                            s.lastAccounts = accounts;
-                            return true;
-                        }
-                        return false;
-                    }, {
-                        timeoutMs: 15000,
-                        intervalMs: 500,
-                        label: "authorized account after connect",
-                    });
-                } catch (_) {}
-
-                if (Array.isArray(s.lastAccounts) && s.lastAccounts.length > 0) {
-                    return s.lastAccounts;
+                for (let attempt = 0; attempt < 30; attempt++) {
+                    if (s.lastAccounts.length > 0) return s.lastAccounts;
+                    const accounts = await provider.request({ method: "eth_accounts" }).catch(() => []);
+                    if (Array.isArray(accounts) && accounts.length > 0) {
+                        s.lastAccounts = accounts;
+                        return accounts;
+                    }
+                    await sleep(500);
                 }
 
                 try {
@@ -571,11 +516,11 @@
                     console.warn("eth_requestAccounts failed:", e);
                 }
 
-                return Array.isArray(s.lastAccounts) ? s.lastAccounts : [];
+                return s.lastAccounts;
             }
 
             async function ensureInjectedChain(provider, targetChainId) {
-                const expected = chainIdHex(targetChainId);
+                const expected = normalizeChainIdToHex(targetChainId);
                 let current = normalizeChainIdToHex(
                     await provider.request({ method: "eth_chainId" })
                 );
@@ -645,8 +590,6 @@
                         await provider.request({ method: "eth_chainId" })
                     );
 
-                    window.ethereum = provider;
-
                     return {
                         ok: true,
                         accounts,
@@ -663,61 +606,23 @@
         })();
         </script>
         <script type="module" defer>
-            async function requestPersistentStorage() {
-                if (navigator.storage && navigator.storage.persist) {
-                    const isPersisted = await navigator.storage.persist();
-                    return isPersisted;
-                } else {
-                    console.warn("StorageManager API or persist() not supported.");
-                    return false;
-                }
+            if (navigator.storage?.persist) {
+                navigator.storage.persist().catch(error => {
+                    console.warn("weeb-3 storage persistence failed", error);
+                });
+            } else {
+                console.warn("StorageManager API or persist() not supported.");
             }
 
-            function bootReport(message, error) {
-                const text = error ? `${message}: ${error?.stack || error?.message || error}` : message;
-                if (error) {
-                    console.error(text);
-                } else {
-                    console.log(text);
-                }
-
+            try {
+                const { default: init, interweeb } = await import("/weeb-3/weeb_3.js");
+                await init();
+                interweeb("").catch(error => {
+                    console.error("weeb-3 interface failed", error);
+                });
+            } catch (error) {
+                console.error("weeb-3 startup failed", error);
             }
-
-            window.addEventListener("error", event => {
-                bootReport("weeb-3 boot error", event.error || event.message);
-            });
-            window.addEventListener("unhandledrejection", event => {
-                bootReport("weeb-3 boot rejection", event.reason);
-            });
-
-            function withTimeout(promise, label, ms) {
-                return Promise.race([
-                    promise,
-                    new Promise((_, reject) => {
-                        setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
-                    }),
-                ]);
-            }
-
-            bootReport("weeb-3 page script loaded");
-            requestPersistentStorage().catch(error => {
-                bootReport("weeb-3 storage persistence failed", error);
-            });
-
-            (async () => {
-                try {
-                    bootReport("weeb-3 module loading");
-                    const { default: init, interweeb } = await import("/weeb-3/weeb_3.js");
-                    bootReport("weeb-3 wasm init");
-                    await withTimeout(init(), "weeb-3 wasm init", 30000);
-                    bootReport("weeb-3 interface start");
-                    Promise.resolve(interweeb("")).catch(error => {
-                        bootReport("weeb-3 interface failed", error);
-                    });
-                } catch (error) {
-                    bootReport("weeb-3 boot failed", error);
-                }
-            })();
         </script>
     </body>
 </html>

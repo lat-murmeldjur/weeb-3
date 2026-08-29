@@ -1,90 +1,63 @@
 package;
-import haxe.Int64;
 
 class Code_One {
    
 	static public function smax_init() {
-		var count:Int64 = 0;
-
 		var w1:String = './hax/chronicl.dt';
 		var w2:String = './hax/featuring.dt';
 		var w3:String = './hax/ohio.note';
 
-		clientele('rustup', ['update'], count);
-		clientele('cargo', ['update'], count);
-		clientele('cargo', ['fix', '--allow-staged', '--allow-dirty'], count);
-		var wbuild:Array<Null<Bool>> = [null];
-		var build:Array<Null<Bool>> = [null];
+		clientele('rustup', ['update']);
+		clientele('cargo', ['update']);
+		clientele('cargo', ['fix', '--allow-staged', '--allow-dirty']);
 
 		Sys.putEnv("RUSTFLAGS", "--cfg getrandom_backend=\"wasm_js\"");
-		clientele('wasm-pack', [ '-v', 'build', '--target', 'web', '--out-dir', 'static', '--out-name', 'weeb_3'], count, wbuild);
+		var wasmBuilt = clientele('wasm-pack', [ '-v', 'build', '--target', 'web', '--out-dir', 'static', '--out-name', 'weeb_3']);
+		if (wasmBuilt) {
+			sys.io.File.saveContent('./static/.gitignore', '*\n!worker.js\n');
+		}
 		Sys.putEnv("RUSTFLAGS", null);
-		clientele('cargo', ['build'], count, build);
+		var nativeBuilt = clientele('cargo', ['build']);
 
-		if ( build[0] && wbuild[0]) {
-			var clean:Array<Null<Bool>> = [null];
-			clientele('rm', [ '-rf', './docs/snippets' ], count, clean);
-			if (!clean[0]) {
+		if (nativeBuilt && wasmBuilt) {
+			if (!clientele('rm', [ '-rf', './docs/snippets' ])) {
 				trace('Warning/Error: Cannot replace generated docs snippets');
 				return;
 			}
-			clientele('cp', [ './static/example.html', './docs/' ], count);
-			clientele('cp', [ './static/hls-stream-example.html', './docs/' ], count);
-			clientele('cp', [ './static/issue-1-json-sync-example.html', './docs/' ], count);
-			clientele('cp', [ './static/index.html', './docs/' ], count);
-			clientele('cp', [ './static/404.html', './docs/' ], count);
-			clientele('cp', [ './static/weeb_3.js', './docs/' ], count);
-			clientele('cp', [ './static/weeb_3_bg.wasm', './docs/' ], count);
-			clientele('cp', [ './static/service.js', './docs/' ], count);
-			clientele('mkdir', [ '-p', './docs/snippets' ], count);
-			clientele('cp', [ '-R', './static/snippets/.', './docs/snippets/' ], count);
+			for (asset in [
+				'example.html', 'hls-stream-example.html', 'issue-1-json-sync-example.html',
+				'index.html', '404.html', 'weeb_3.js', 'weeb_3_bg.wasm', 'service.js', 'worker.js'
+			]) clientele('cp', [ './static/$asset', './docs/' ]);
+			clientele('mkdir', [ '-p', './docs/snippets' ]);
+			clientele('cp', [ '-R', './static/snippets/.', './docs/snippets/' ]);
 
 			var mist = gitcoal(w1);
 			var dome = gitcoal(w2);
 			temporas(w3);
 
-			clientele('git', ['checkout', '-b', 'feature-$dome'], count);
-			clientele('git', ['add', '.'], count);
-			clientele('git', ['commit', '-am', '"Commit number $mist"'], count);
-			clientele('git', ['push', 'origin', 'feature-$dome'], count);
-			clientele('git', ['checkout', 'main'], count);
-			var merge:Array<Null<Bool>> = [null];
-			clientele('git', ['merge', 'feature-$dome'], count, merge);
-			if ( merge[0] ) {
-				clientele('git', ['push', 'origin', 'main'], count);
+			clientele('git', ['checkout', '-b', 'feature-$dome']);
+			clientele('git', ['add', '.']);
+			clientele('git', ['commit', '-m', 'Commit number $mist']);
+			clientele('git', ['push', 'origin', 'feature-$dome']);
+			clientele('git', ['checkout', 'main']);
+			if (clientele('git', ['merge', 'feature-$dome'])) {
+				clientele('git', ['push', 'origin', 'main']);
 			}
 		}
 	}
 
-	static public function clientele(crx:String, ?arx:Array<String>, ?count:Int64, ?really:Array<Null<Bool>>):String {
+	static public function clientele(crx:String, ?arx:Array<String>):Bool {
 		if (arx == null) arx = [];
 		trace('Executing: $crx ${arx.join(" ")}');
 
-		var exit = -1;
 		try {
-			exit = Sys.command(crx, arx);
+			var exit = Sys.command(crx, arx);
+			if (exit == 0) return true;
+			trace('Warning/Error: Cannot execute $crx: exited with code $exit');
 		} catch (e:Dynamic) {
-			trace('Warning/Error: Cannot start process_$count ... $crx ' + Std.string(e));
-			if (really != null ) {
-				really[0] = false;
-			}
-			count++;
-			return "";
+			trace('Warning/Error: Cannot start $crx: ' + Std.string(e));
 		}
-
-		if (exit != 0) {
-			trace('Warning/Error: Cannot execute process_$count ... $crx exited with code $exit');
-			if (really != null ) {
-				really[0] = false;
-			}
-			count++;
-			return "";
-		};
-		if (really != null ) {
-			really[0] = true;
-		}
-		count++;
-		return "";
+		return false;
 	}
 
 	static public function temporas(?oh:String) {

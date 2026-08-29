@@ -4,16 +4,14 @@ use wasm_bindgen::{JsCast, JsValue, closure::Closure, prelude::wasm_bindgen};
 use wasm_bindgen_futures::{JsFuture, spawn_local};
 use web_sys::{Element, Event, HtmlMediaElement};
 
-use super::{HLS_LIVE_EDGE_SEGMENTS, HlsStart, HlsStartupPlan, HlsTailFailure};
+use super::{HLS_LIVE_EDGE_SEGMENTS, HlsStart, HlsStartupPlan};
 
 #[rustfmt::skip]
 const HLS_EVENTS: [&str; 4] = ["hlsManifestParsed", "hlsBufferAppended", "hlsFragBuffered", "hlsError"];
 #[rustfmt::skip]
 const NATIVE_EVENTS: [&str; 6] = ["loadedmetadata", "durationchange", "progress", "canplay", "canplaythrough", "error"];
-const MEDIA_LIFECYCLE_EVENTS: [&str; 5] =
-    ["play", "seeking", "seeked", "timeupdate", "durationchange"];
+const MEDIA_LIFECYCLE_EVENTS: [&str; 3] = ["play", "timeupdate", "durationchange"];
 const BUFFER_EPSILON_SECONDS: f64 = 0.15;
-const SEEK_ALIGNMENT_SECONDS: f64 = 1.0;
 const CLOCK_ADVANCE_EPSILON_SECONDS: f64 = 0.01;
 const LIVE_RUNWAY_BUFFER: (f64, f64) = (90.0, 120.0);
 const MAX_CONSECUTIVE_MEDIA_RECOVERIES: u8 = 1;
@@ -71,16 +69,15 @@ struct Player {
     plan: HlsStartupPlan,
     restore_autoplay: bool,
     live: bool,
-    live_bootstrap_pending: bool,
+    codec_bootstrap_pending: bool,
     live_runway_locked: bool,
+    live_lock_pending: bool,
     ready: bool,
     consecutive_media_recoveries: u8,
     hard_restarts: u8,
-    tail_failure: HlsTailFailure,
     reload_position: Option<f64>,
     clock_started: bool,
     clock_origin: f64,
-    seek: Option<SeekGate>,
 }
 
 struct NativePlayer {
@@ -95,32 +92,30 @@ struct NativePlayer {
     ready: bool,
     clock_started: bool,
     clock_origin: f64,
-    seek: Option<SeekGate>,
-}
-
-#[derive(Clone, Copy)]
-struct SeekGate {
-    target: f64,
-    resume: bool,
 }
 
 enum Action {
     None,
     Start(Hls, f64),
     Play(HtmlMediaElement, f64),
-    Resume(HtmlMediaElement),
     Retarget(Hls, HtmlMediaElement, f64),
     RecoverNetwork(Hls, f64),
     ReloadSource(Hls, String),
     RecoverMedia(Hls),
     HardRestart(String),
+    ResolveRemoteTail {
+        sequence: u64,
+        reference: String,
+        restart: f64,
+        error_type: Option<String>,
+        details: String,
+    },
 }
 
 enum MediaAction {
     None,
     Begin(f64),
     Pause,
-    Resume,
     Playing,
 }
 
@@ -158,10 +153,9 @@ pub(super) fn play_hls(
     }
 
     let hls = construct_hls(&hls_class, &hls_config(start))?;
-    let callback =
-        Closure::<dyn FnMut(JsValue, JsValue)>::new(move |event: JsValue, data: JsValue| {
-            handle_event(id, event.as_string().as_deref().unwrap_or_default(), &data);
-        });
+    let callback = Closure::new(move |event: JsValue, data: JsValue| {
+        handle_event(id, event.as_string().as_deref().unwrap_or_default(), &data);
+    });
     for event in HLS_EVENTS {
         if let Err(error) = hls.on(event, callback.as_ref().unchecked_ref()) {
             remove_hls_events(&hls, &callback);
@@ -190,7 +184,7 @@ pub(super) fn play_hls(
     );
 
     let live = start == HlsStart::Live;
-    let live_bootstrap_pending = live && plan.codec_bootstrap;
+    let codec_bootstrap_pending = plan.codec_bootstrap;
     ACTIVE.with(|active| {
         *active.borrow_mut() = Some(Player {
             id,
@@ -204,15 +198,14 @@ pub(super) fn play_hls(
             plan,
             restore_autoplay,
             live,
-            live_bootstrap_pending,
+            codec_bootstrap_pending,
             live_runway_locked: false,
+            live_lock_pending: false,
             ready: false,
             consecutive_media_recoveries: 0,
             hard_restarts: 0,
-            tail_failure: HlsTailFailure::default(),
             reload_position: None,
             clock_started: false,
-            seek: None,
         });
     });
 
@@ -284,7 +277,6 @@ fn play_native(
             positioned: false,
             ready: false,
             clock_started: false,
-            seek: None,
         });
     });
     set_state(
@@ -344,18 +336,12 @@ fn handle_media_event(id: u64, media: &HtmlMediaElement, event: &str, native: bo
                 return MediaAction::None;
             };
             let ready = player.ready;
-            let runway = playback_runway(&player.plan);
-            if event == "seeking" && !player.live {
-                super::runtime::start_beginning_history();
-            }
             media_action(
                 media,
                 event,
                 ready,
                 &mut player.clock_started,
                 &mut player.clock_origin,
-                &mut player.seek,
-                runway,
             )
         })
     } else {
@@ -364,12 +350,9 @@ fn handle_media_event(id: u64, media: &HtmlMediaElement, event: &str, native: bo
             let Some(player) = active.as_mut().filter(|player| player.id == id) else {
                 return MediaAction::None;
             };
-            if player.live && matches!(event, "seeking" | "seeked") {
-                return MediaAction::None;
-            }
             if event == "durationchange"
                 && !player.ready
-                && !player.live_bootstrap_pending
+                && !player.codec_bootstrap_pending
                 && !lock_latest_live_plan(player)
                 && let Some(position) =
                     playback_start_position(media, &player.plan, player.live, false)
@@ -379,18 +362,12 @@ fn handle_media_event(id: u64, media: &HtmlMediaElement, event: &str, native: bo
                 return MediaAction::Begin(position);
             }
             let ready = player.ready;
-            let runway = playback_runway(&player.plan);
-            if event == "seeking" && !player.live {
-                super::runtime::start_beginning_history();
-            }
             media_action(
                 media,
                 event,
                 ready,
                 &mut player.clock_started,
                 &mut player.clock_origin,
-                &mut player.seek,
-                runway,
             )
         })
     };
@@ -411,43 +388,12 @@ fn media_action(
     ready: bool,
     clock_started: &mut bool,
     clock_origin: &mut f64,
-    seek: &mut Option<SeekGate>,
-    runway: f64,
 ) -> MediaAction {
-    if event == "seeking" && ready && (*clock_started || seek.is_some()) {
-        let target = media.current_time();
-        if target.is_finite() && target >= 0.0 {
-            let resume = seek.map_or(!media.paused(), |pending| pending.resume);
-            *seek = Some(SeekGate { target, resume });
-            *clock_started = false;
-            *clock_origin = target;
-            set_state(media, "buffering", "Buffering the HLS seek runway...");
-            return MediaAction::Pause;
-        }
-    }
-    if event == "play" {
-        if !ready {
-            return MediaAction::Pause;
-        }
-        if let Some(pending) = seek.as_mut() {
-            pending.resume = true;
-            if settle_seek(media, runway, seek) == Some(true) {
-                set_state(
-                    media,
-                    "starting",
-                    "Seek runway buffered; waiting for the media clock...",
-                );
-                return MediaAction::None;
-            }
-            return MediaAction::Pause;
-        }
-    }
-    if event == "seeked" && settle_seek(media, runway, seek) == Some(true) {
-        return MediaAction::Resume;
+    if event == "play" && !ready {
+        return MediaAction::Pause;
     }
     if event == "timeupdate"
         && ready
-        && seek.is_none()
         && !*clock_started
         && !media.paused()
         && media.current_time() >= *clock_origin + CLOCK_ADVANCE_EPSILON_SECONDS
@@ -465,7 +411,6 @@ fn apply_media_action(media: &HtmlMediaElement, action: MediaAction, message: &s
         MediaAction::Pause => {
             let _ = media.pause();
         }
-        MediaAction::Resume => resume_playback(media.clone()),
         MediaAction::Playing => set_state(media, "playing", message),
     }
 }
@@ -486,9 +431,7 @@ fn handle_native_event(id: u64, event: &str) {
         }
         start_beginning_history_when_safe(&player.media, &player.plan, player.live);
         if player.ready {
-            let runway = playback_runway(&player.plan);
-            return (settle_seek(&player.media, runway, &mut player.seek) == Some(true))
-                .then(|| (player.media.clone(), None));
+            return None;
         }
         if let Some(position) =
             playback_start_position(&player.media, &player.plan, player.live, true)
@@ -541,7 +484,7 @@ fn handle_event(id: u64, event: &str, data: &JsValue) {
                 );
                 Action::Start(
                     player.hls.clone(),
-                    if player.live_bootstrap_pending {
+                    if player.codec_bootstrap_pending {
                         player.plan.bootstrap_position
                     } else {
                         player.plan.play_position
@@ -552,14 +495,16 @@ fn handle_event(id: u64, event: &str, data: &JsValue) {
                     },
                 )
             }
-            "hlsFragBuffered" if player.live && player.live_bootstrap_pending => {
+            "hlsFragBuffered" if player.codec_bootstrap_pending => {
                 if !is_main_fragment(data) {
                     return Action::None;
                 }
-                player.live_bootstrap_pending = false;
-                lock_latest_live_plan(player);
+                player.codec_bootstrap_pending = false;
+                if lock_latest_live_plan(player) {
+                    return Action::None;
+                }
                 if let Some(position) =
-                    playback_start_position(&player.media, &player.plan, true, false)
+                    playback_start_position(&player.media, &player.plan, player.live, false)
                 {
                     player.ready = true;
                     player.clock_origin = position;
@@ -574,6 +519,9 @@ fn handle_event(id: u64, event: &str, data: &JsValue) {
             }
             "hlsBufferAppended" | "hlsFragBuffered" if !player.ready => {
                 let retarget = lock_latest_live_plan(player);
+                if player.live_lock_pending {
+                    return Action::None;
+                }
                 if let Some(position) =
                     playback_start_position(&player.media, &player.plan, player.live, false)
                 {
@@ -600,12 +548,7 @@ fn handle_event(id: u64, event: &str, data: &JsValue) {
                     player.consecutive_media_recoveries = 0;
                     player.media.remove_attribute("data-weeb3-hls-error").ok();
                 }
-                let runway = playback_runway(&player.plan);
-                if settle_seek(&player.media, runway, &mut player.seek) == Some(true) {
-                    Action::Resume(player.media.clone())
-                } else {
-                    Action::None
-                }
+                Action::None
             }
             "hlsError" if js_bool(data, "fatal") == Some(true) => {
                 let details =
@@ -619,7 +562,7 @@ fn handle_event(id: u64, event: &str, data: &JsValue) {
                 }
                 let restart = if player.ready {
                     player.media.current_time()
-                } else if player.live_bootstrap_pending {
+                } else if player.codec_bootstrap_pending {
                     player.plan.bootstrap_position + BUFFER_EPSILON_SECONDS
                 } else {
                     player.plan.play_position
@@ -629,58 +572,37 @@ fn handle_event(id: u64, event: &str, data: &JsValue) {
                             0.0
                         }
                 };
-                let tail_failure = player
-                    .live
-                    .then(|| {
-                        matches!(
-                            details.as_str(),
-                            "fragLoadError" | "fragLoadTimeOut" | "fragParsingError"
-                        )
-                        .then(|| failed_media_identity(data))
-                        .flatten()
-                        .and_then(|(sequence, reference)| {
-                            super::runtime::live_tail_failure_identity(sequence, &reference)
-                        })
-                    })
-                    .flatten();
-                let fallback_target = tail_failure.and_then(|(snapshot, sequence, reference)| {
-                    player
-                        .tail_failure
-                        .record(snapshot, sequence, &reference)
-                        .then(|| {
-                            super::runtime::install_live_tail_fallback(
-                                snapshot, sequence, &reference,
-                            )
-                        })
-                        .flatten()
-                });
-                let tail_failed = fallback_target.is_some();
-                let restart = fallback_target.unwrap_or(restart);
-                if tail_failed {
-                    player.tail_failure.clear();
-                    player.consecutive_media_recoveries = 0;
-                    player.reload_position = Some(restart);
-                }
-                match (tail_failed, js_string(data, "type")) {
-                    (true, _) => Action::ReloadSource(player.hls.clone(), player.source.clone()),
-                    (false, Some(error)) if error == "networkError" => {
-                        Action::RecoverNetwork(player.hls.clone(), restart)
+                if player.live
+                    && matches!(
+                        details.as_str(),
+                        "fragLoadError" | "fragLoadTimeOut" | "fragParsingError"
+                    )
+                    && let Some((sequence, reference)) = failed_media_identity(data)
+                {
+                    Action::ResolveRemoteTail {
+                        sequence,
+                        reference,
+                        restart,
+                        error_type: js_string(data, "type"),
+                        details,
                     }
-                    (false, Some(error))
-                        if error == "mediaError"
-                            && player.consecutive_media_recoveries
-                                < MAX_CONSECUTIVE_MEDIA_RECOVERIES =>
-                    {
-                        player.consecutive_media_recoveries += 1;
-                        Action::RecoverMedia(player.hls.clone())
-                    }
-                    _ => Action::HardRestart(details),
+                } else {
+                    fatal_recovery_action(
+                        player,
+                        js_string(data, "type").as_deref(),
+                        details,
+                        restart,
+                    )
                 }
             }
             _ => Action::None,
         }
     });
 
+    apply_action(id, action);
+}
+
+fn apply_action(id: u64, action: Action) {
     match action {
         Action::None => {}
         Action::Start(hls, position) | Action::RecoverNetwork(hls, position) => {
@@ -688,7 +610,6 @@ fn handle_event(id: u64, event: &str, data: &JsValue) {
             finish_hls_action(id, &hls, "HLS loading failed", result);
         }
         Action::Play(media, position) => begin_playback(media, position),
-        Action::Resume(media) => resume_playback(media),
         Action::Retarget(hls, media, position) => {
             spawn_local(async move {
                 if !is_current_hls(id, &hls) {
@@ -710,8 +631,60 @@ fn handle_event(id: u64, event: &str, data: &JsValue) {
             let result = hls.recover_media_error();
             finish_hls_action(id, &hls, "HLS media recovery failed", result);
         }
+        Action::ResolveRemoteTail {
+            sequence,
+            reference,
+            restart,
+            error_type,
+            details,
+        } => resolve_remote_tail_failure(id, sequence, reference, restart, error_type, details),
         Action::HardRestart(message) => hard_restart(id, message),
     }
+}
+
+fn fatal_recovery_action(
+    player: &mut Player,
+    error_type: Option<&str>,
+    details: String,
+    restart: f64,
+) -> Action {
+    match error_type {
+        Some("networkError") => Action::RecoverNetwork(player.hls.clone(), restart),
+        Some("mediaError")
+            if player.consecutive_media_recoveries < MAX_CONSECUTIVE_MEDIA_RECOVERIES =>
+        {
+            player.consecutive_media_recoveries += 1;
+            Action::RecoverMedia(player.hls.clone())
+        }
+        _ => Action::HardRestart(details),
+    }
+}
+
+fn resolve_remote_tail_failure(
+    id: u64,
+    sequence: u64,
+    reference: String,
+    restart: f64,
+    error_type: Option<String>,
+    details: String,
+) {
+    spawn_local(async move {
+        let target = super::page_bridge::resolve_live_tail_failure(sequence, &reference).await;
+        let action = ACTIVE.with(|active| {
+            let mut active = active.borrow_mut();
+            let Some(player) = active.as_mut().filter(|player| player.id == id) else {
+                return Action::None;
+            };
+            if let Some(target) = target {
+                player.consecutive_media_recoveries = 0;
+                player.reload_position = Some(target);
+                Action::ReloadSource(player.hls.clone(), player.source.clone())
+            } else {
+                fatal_recovery_action(player, error_type.as_deref(), details, restart)
+            }
+        });
+        apply_action(id, action);
+    });
 }
 
 fn finish_hls_action(id: u64, hls: &Hls, context: &str, result: Result<(), JsValue>) {
@@ -784,11 +757,10 @@ fn hard_restart(id: u64, message: String) {
         let retired = std::mem::replace(&mut player.hls, hls.clone());
         player.reload_position = None;
         player.ready = false;
-        player.live_bootstrap_pending = player.live && player.plan.codec_bootstrap;
+        player.codec_bootstrap_pending = player.plan.codec_bootstrap;
         player.consecutive_media_recoveries = 0;
         player.clock_started = false;
         player.clock_origin = position;
-        player.seek = None;
         player.media.remove_attribute("data-weeb3-hls-error").ok();
         Some(Ok((
             hls,
@@ -811,7 +783,7 @@ fn hard_restart(id: u64, message: String) {
         }
         Some(Err((_, error, false))) => hard_restart(id, error),
         Some(Err((media, error, true))) => {
-            super::runtime::release_hls_view();
+            super::page_bridge::release_hls_view();
             set_state(&media, "error", &format!("HLS recovery failed: {error}"));
         }
         None => {}
@@ -820,7 +792,7 @@ fn hard_restart(id: u64, message: String) {
 
 fn start_beginning_history_when_safe(media: &HtmlMediaElement, plan: &HlsStartupPlan, live: bool) {
     if !live && buffered_covers(media, plan.play_position, plan.runway_end) {
-        super::runtime::start_beginning_history();
+        let _ = super::page_bridge::start_beginning_history();
     }
 }
 
@@ -858,32 +830,6 @@ fn resume_playback(media: HtmlMediaElement) {
             "HLS media is buffered. Press play if autoplay is blocked.",
         ),
     }
-}
-
-fn settle_seek(media: &HtmlMediaElement, runway: f64, seek: &mut Option<SeekGate>) -> Option<bool> {
-    let pending = *seek.as_ref()?;
-    let aligned_target = pending.target + SEEK_ALIGNMENT_SECONDS;
-    let mut end = aligned_target + runway;
-    let duration = media.duration();
-    if duration.is_finite() {
-        end = end.min(duration);
-    }
-    if !runway.is_finite()
-        || runway <= 0.0
-        || (!buffered_covers(media, aligned_target, end)
-            && end > aligned_target + BUFFER_EPSILON_SECONDS)
-    {
-        return None;
-    }
-    *seek = None;
-    if !pending.resume {
-        set_state(
-            media,
-            "ready",
-            "Seek runway buffered. Press play to continue.",
-        );
-    }
-    Some(pending.resume)
 }
 
 fn playback_start_position(
@@ -938,22 +884,58 @@ fn lock_latest_live_plan(player: &mut Player) -> bool {
     {
         return false;
     }
-    if player.live_runway_locked {
-        if let Some(plan) = super::runtime::current_live_startup_plan()
-            && plan.play_position > player.plan.play_position + BUFFER_EPSILON_SECONDS
-            && buffered_covers(&player.media, plan.play_position, plan.runway_end)
-        {
-            player.plan = plan;
-        }
-        return false;
+    if player.live_lock_pending {
+        return true;
     }
-    let Some(plan) = super::runtime::lock_live_startup_plan() else {
-        return false;
-    };
-    player.live_runway_locked = true;
-    let changed = plan.play_position > player.plan.play_position + BUFFER_EPSILON_SECONDS;
-    player.plan = plan;
-    changed
+    let was_locked = player.live_runway_locked;
+    player.live_lock_pending = true;
+    let id = player.id;
+    spawn_local(async move {
+        let plan = super::page_bridge::lock_live_plan().await;
+        let action = ACTIVE.with(|active| {
+            let mut active = active.borrow_mut();
+            let player = active.as_mut().filter(|player| player.id == id)?;
+            player.live_lock_pending = false;
+            let changed = if let Some(plan) = plan {
+                let changed = !was_locked
+                    && plan.play_position > player.plan.play_position + BUFFER_EPSILON_SECONDS;
+                if !was_locked
+                    || (plan.play_position > player.plan.play_position + BUFFER_EPSILON_SECONDS
+                        && buffered_covers(&player.media, plan.play_position, plan.runway_end))
+                {
+                    player.plan = plan;
+                }
+                player.live_runway_locked = true;
+                changed
+            } else {
+                false
+            };
+            if let Some(position) =
+                playback_start_position(&player.media, &player.plan, true, false)
+            {
+                player.ready = true;
+                player.clock_origin = position;
+                Some(Action::Play(player.media.clone(), position))
+            } else if changed {
+                Some(Action::Retarget(
+                    player.hls.clone(),
+                    player.media.clone(),
+                    player.plan.play_position,
+                ))
+            } else {
+                set_state(
+                    &player.media,
+                    "buffering",
+                    "Buffering the HLS startup runway...",
+                );
+                Some(Action::None)
+            }
+        });
+        if let Some(action) = action {
+            apply_action(id, action);
+        }
+    });
+    true
 }
 
 #[rustfmt::skip]

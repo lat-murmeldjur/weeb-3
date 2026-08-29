@@ -1,21 +1,22 @@
-#![allow(dead_code)]
-
 use anyhow_crates_io::{Context, Result, anyhow};
-use headless_chrome::{Browser, LaunchOptionsBuilder};
-use serde_json_crates_io::{Value, json};
+use serde_json::{Value, json};
 use std::{
-    env,
-    ffi::OsStr,
-    fs,
-    path::PathBuf,
+    env, fs,
     time::{Duration, Instant},
 };
 
-const DEFAULT_TARGET_URL: &str = "https://192.168.100.148:8080/weeb-3/bzz/296e6d5d416e538cefcfeaae6898c483a8becfe3c94964bf0b979cb1f537f7a2ef8fd00fedd11253510f6624dd543513562e57e307740f41482a675ac1484c8e";
+#[path = "support/browser.rs"]
+mod browser;
 
 #[test]
 fn weeb3_loads_in_browser() -> Result<()> {
-    let target_url = env::var("WEEB3_URL").unwrap_or_else(|_| DEFAULT_TARGET_URL.to_string());
+    let Some(target_url) = env::var("WEEB3_URL")
+        .ok()
+        .filter(|url| !url.trim().is_empty())
+    else {
+        println!("WEEB3_URL is not set; skipping browser load profile");
+        return Ok(());
+    };
 
     let runs = env_u64("WEEB3_RUNS", 3)? as u32;
     assert!(runs > 0, "WEEB3_RUNS must be greater than 0");
@@ -27,10 +28,10 @@ fn weeb3_loads_in_browser() -> Result<()> {
         .ok()
         .filter(|s| !s.trim().is_empty());
 
-    let mut results: Vec<Value> = Vec::new();
+    let mut results = Vec::new();
 
     for run in 1..=runs {
-        let browser = launch_browser(timeout)?;
+        let browser = browser::launch(timeout, true)?;
         let tab = browser
             .new_tab()
             .map_err(|err| anyhow!("failed to open a new Chrome tab: {err:?}"))?;
@@ -137,8 +138,8 @@ fn weeb3_loads_in_browser() -> Result<()> {
     fs::create_dir_all("target/weeb3-load-test")
         .context("failed to create target/weeb3-load-test directory")?;
 
-    let summary_json = serde_json_crates_io::to_string_pretty(&summary)
-        .context("failed to serialize load test summary")?;
+    let summary_json =
+        serde_json::to_string_pretty(&summary).context("failed to serialize load test summary")?;
 
     fs::write(
         "target/weeb3-load-test/weeb3-load-results.json",
@@ -157,45 +158,6 @@ fn weeb3_loads_in_browser() -> Result<()> {
     }
 
     Ok(())
-}
-
-fn launch_browser(timeout: Duration) -> Result<Browser> {
-    let args = vec![
-        OsStr::new("--disable-background-networking"),
-        OsStr::new("--disable-cache"),
-        OsStr::new("--disable-dev-shm-usage"),
-        OsStr::new("--disable-extensions"),
-        OsStr::new("--ignore-certificate-errors"),
-        OsStr::new("--no-first-run"),
-    ];
-
-    let mut builder = LaunchOptionsBuilder::default();
-
-    builder
-        .headless(!env_bool("WEEB3_HEADFUL", false))
-        .ignore_certificate_errors(true)
-        .sandbox(!env_bool("WEEB3_CHROME_NO_SANDBOX", true))
-        .window_size(Some((1280, 720)))
-        .idle_browser_timeout(timeout + Duration::from_secs(30))
-        .args(args);
-
-    if let Ok(path) = env::var("WEEB3_CHROME") {
-        if !path.trim().is_empty() {
-            builder.path(Some(PathBuf::from(path)));
-        }
-    }
-
-    let options = builder
-        .build()
-        .map_err(|err| anyhow!("failed to build Chrome launch options: {err:?}"))?;
-
-    Browser::new(options).map_err(|err| {
-        anyhow!(
-            "failed to launch Chrome/Chromium. \
-                 Install Chrome/Chromium, set CHROME, or set WEEB3_CHROME=/path/to/chrome. \
-                 Error: {err:?}"
-        )
-    })
 }
 
 fn wait_for_load_event_end(tab: &headless_chrome::Tab, timeout: Duration) -> Result<()> {
@@ -290,7 +252,7 @@ fn read_browser_metrics(tab: &headless_chrome::Tab) -> Result<Value> {
         .and_then(|value| value.as_str().map(ToOwned::to_owned))
         .ok_or_else(|| anyhow!("Chrome did not return metrics JSON"))?;
 
-    serde_json_crates_io::from_str(&raw).context("failed to parse browser metrics JSON")
+    serde_json::from_str(&raw).context("failed to parse browser metrics JSON")
 }
 
 fn elapsed_ms(started: Instant) -> u64 {
@@ -308,12 +270,7 @@ fn median(mut values: Vec<u64>) -> u64 {
 }
 
 fn env_u64(name: &str, default: u64) -> Result<u64> {
-    match env::var(name) {
-        Ok(value) if !value.trim().is_empty() => value
-            .parse::<u64>()
-            .with_context(|| format!("{name} must be an unsigned integer")),
-        _ => Ok(default),
-    }
+    Ok(env_optional_u64(name)?.unwrap_or(default))
 }
 
 fn env_optional_u64(name: &str) -> Result<Option<u64>> {
@@ -326,15 +283,5 @@ fn env_optional_u64(name: &str) -> Result<Option<u64>> {
             Ok(Some(parsed))
         }
         _ => Ok(None),
-    }
-}
-
-fn env_bool(name: &str, default: bool) -> bool {
-    match env::var(name) {
-        Ok(value) => matches!(
-            value.trim().to_ascii_lowercase().as_str(),
-            "1" | "true" | "yes" | "y" | "on"
-        ),
-        Err(_) => default,
     }
 }

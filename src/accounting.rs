@@ -41,9 +41,7 @@ pub(crate) fn bee_reconnect_delay_seconds(
         .saturating_add(reserve)
         .max(bee_refresh_rate)
         .saturating_add(bee_payment_threshold)
-        .checked_div(bee_refresh_rate)
-        .unwrap_or(1)
-        .max(1)
+        / bee_refresh_rate
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -61,11 +59,7 @@ pub(crate) type RefreshmentInstruction = (PeerId, Arc<Mutex<PeerAccounting>>, Co
 
 #[cfg(target_arch = "wasm32")]
 pub(crate) async fn set_payment_threshold(accounting: &Mutex<PeerAccounting>, amount: u64) {
-    let mut account = accounting.lock().await;
-    account.threshold = amount;
-    if amount > REFRESH_RATE * 2 {
-        account.payment_threshold = REFRESH_RATE * 2;
-    }
+    accounting.lock().await.threshold = amount;
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -111,10 +105,9 @@ pub(crate) async fn apply_credit(
     drop(account);
 
     if let Some(instruction) = instruction {
-        let accounting = instruction.1.clone();
         match refreshments.try_send(instruction) {
             Ok(()) => async_std::task::sleep(std::time::Duration::ZERO).await,
-            Err(_) => accounting.lock().await.refresh_scheduled = false,
+            Err(error) => error.into_inner().1.lock().await.refresh_scheduled = false,
         }
     }
 }
@@ -130,7 +123,7 @@ pub(crate) async fn apply_refreshment(
         account.balance = 0;
         account.surplus_balance = account.surplus_balance.saturating_add(surplus_growth);
         if surplus_growth > 0 {
-            return Some((account.id.clone(), surplus_growth, account.surplus_balance));
+            return Some((account.id, surplus_growth, account.surplus_balance));
         }
     } else {
         account.balance -= amount;

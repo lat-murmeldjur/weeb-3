@@ -3,194 +3,151 @@ use crate::JsValue;
 use indexed_db_futures::database::Database;
 use indexed_db_futures::prelude::*;
 use indexed_db_futures::transaction::TransactionMode;
+use std::fmt::Debug;
 
-async fn cat_base(identifier: String) -> Option<Database> {
-    let db = match Database::open("weeb_".to_string() + &identifier)
+const DATASTORE: &str = "weeb_datastore";
+const BATCH_DATABASE: &str = "weeb_batchstore_data";
+
+fn log_failure<T, E: Debug>(result: Result<T, E>, action: &str, field: &str) -> Option<T> {
+    match result {
+        Ok(value) => Some(value),
+        Err(error) => {
+            web_sys::console::log_1(&JsValue::from(format!(
+                "Failed to {action} batch metadata {field}: {error:?}"
+            )));
+            None
+        }
+    }
+}
+
+async fn open_batch_database() -> Option<Database> {
+    match Database::open(BATCH_DATABASE)
         .with_version(1u8)
         .with_on_upgrade_needed(|event, db| {
-            match (event.old_version(), event.new_version()) {
-                (0.0, Some(1.0)) => {
-                    let _ = db
-                        .create_object_store("weeb_datastore")
-                        .with_auto_increment(true)
-                        .build();
-                }
-                _ => {}
+            if event.old_version() == 0.0 && event.new_version() == Some(1.0) {
+                let _ = db
+                    .create_object_store(DATASTORE)
+                    .with_auto_increment(true)
+                    .build();
             }
-
             Ok(())
         })
         .await
     {
-        Ok(db0) => db0,
-        Err(e) => {
-            web_sys::console::log_1(&JsValue::from(format!("error opening database: {}", e)));
-            return None;
+        Ok(database) => Some(database),
+        Err(error) => {
+            web_sys::console::log_1(&JsValue::from(format!(
+                "Failed to open batch database: {error}"
+            )));
+            None
         }
-    };
-
-    Some(db)
+    }
 }
 
-pub async fn get_batch_field(field: String) -> Vec<u8> {
-    let db = match cat_base("batchstore_data".to_string()).await {
-        Some(db0) => db0,
-        _ => {
-            web_sys::console::log_1(&JsValue::from(format!(
-                "Failed to open database for batch metadata {}",
-                field
-            )));
-            return vec![];
-        }
+pub async fn get_batch_field(field: &str) -> Vec<u8> {
+    let Some(db) = open_batch_database().await else {
+        return vec![];
     };
 
-    let transaction = match db
-        .transaction("weeb_datastore")
-        .with_mode(TransactionMode::Readonly)
-        .build()
-    {
-        Ok(t0) => t0,
-        Err(e) => {
-            web_sys::console::log_1(&JsValue::from(format!(
-                "Failed to open transaction for batch metadata {} {:#?}",
-                field, e
-            )));
-            return vec![];
-        }
+    let Some(transaction) = log_failure(
+        db.transaction(DATASTORE)
+            .with_mode(TransactionMode::Readonly)
+            .build(),
+        "open a read transaction for",
+        field,
+    ) else {
+        return vec![];
     };
-
-    let store = match transaction.object_store("weeb_datastore") {
-        Ok(s0) => s0,
-        Err(e) => {
-            web_sys::console::log_1(&JsValue::from(format!(
-                "Failed to open datastore for batch metadata {} {:#?}",
-                field, e
-            )));
-            return vec![];
-        }
+    let Some(store) = log_failure(
+        transaction.object_store(DATASTORE),
+        "open the datastore for",
+        field,
+    ) else {
+        return vec![];
     };
-
-    let key_data0 = match store.get(field).primitive() {
-        Ok(aok) => aok,
-        _ => return vec![],
+    let Ok(request) = store.get(field).primitive() else {
+        return vec![];
     };
-
-    let key_data: Vec<u8> = match key_data0.await {
-        Ok(Some(b)) => b,
-        _ => vec![],
-    };
+    let key_data = request.await.ok().flatten().unwrap_or_default();
 
     let _ = transaction.commit().await;
-
-    return key_data;
+    key_data
 }
 
-pub async fn set_batch_field(field: String, value: &Vec<u8>) -> bool {
-    let db = match cat_base("batchstore_data".to_string()).await {
-        Some(db0) => db0,
-        _ => {
-            web_sys::console::log_1(&JsValue::from(format!(
-                "Failed to open database for setting batch metadata {}",
-                field
-            )));
-            return false;
-        }
+pub async fn set_batch_field(field: &str, value: &[u8]) -> bool {
+    let Some(db) = open_batch_database().await else {
+        return false;
     };
 
-    let transaction = match db
-        .transaction("weeb_datastore")
-        .with_mode(TransactionMode::Readwrite)
-        .build()
-    {
-        Ok(t0) => t0,
-        Err(e) => {
-            web_sys::console::log_1(&JsValue::from(format!(
-                "Failed to open transaction for setting batch metadata {} {:#?}",
-                field, e
-            )));
-            return false;
-        }
+    let Some(transaction) = log_failure(
+        db.transaction(DATASTORE)
+            .with_mode(TransactionMode::Readwrite)
+            .build(),
+        "open a write transaction for",
+        field,
+    ) else {
+        return false;
     };
+    let Some(store) = log_failure(
+        transaction.object_store(DATASTORE),
+        "open the datastore for",
+        field,
+    ) else {
+        return false;
+    };
+    if log_failure(store.put(value).with_key(field).primitive(), "write", field).is_none() {
+        let _ = transaction.commit().await;
+        return false;
+    }
 
-    let store = match transaction.object_store("weeb_datastore") {
-        Ok(s0) => s0,
-        Err(e) => {
+    match transaction.commit().await {
+        Ok(_) => true,
+        Err(error) => {
             web_sys::console::log_1(&JsValue::from(format!(
-                "Failed to open datastore for setting batch metadata {} {:#?}",
-                field, e
+                "Failed to commit batch metadata {field}: {error:?}"
             )));
-            return false;
+            false
         }
-    };
-
-    match store.put(value).with_key(field.clone()).primitive() {
-        Ok(_) => {}
-        Err(e) => {
-            web_sys::console::log_1(&JsValue::from(format!(
-                "Failed to put for setting batch metadata {} {:#?}",
-                field, e
-            )));
-            let _ = transaction.commit().await;
-            return false;
-        }
-    };
-
-    let _ = match transaction.commit().await {
-        Ok(_) => {}
-        Err(e) => {
-            web_sys::console::log_1(&JsValue::from(format!(
-                "Failed to commit put for setting batch metadata {} {:#?}",
-                field, e
-            )));
-            return false;
-        }
-    };
-    return true;
+    }
 }
 
 pub async fn get_chequebook_signer_key() -> Vec<u8> {
-    return get_batch_field("chequebook_signer_key".to_string()).await;
+    get_batch_field("chequebook_signer_key").await
 }
 
-pub async fn set_chequebook_signer_key(key: &Vec<u8>) -> bool {
-    return set_batch_field("chequebook_signer_key".to_string(), key).await;
+pub async fn set_chequebook_signer_key(key: &[u8]) -> bool {
+    set_batch_field("chequebook_signer_key", key).await
 }
 
 pub async fn get_chequebook_address() -> Vec<u8> {
-    return get_batch_field("chequebook_address".to_string()).await;
+    get_batch_field("chequebook_address").await
 }
 
-pub async fn set_chequebook_address(addr: &Vec<u8>) -> bool {
-    return set_batch_field("chequebook_address".to_string(), addr).await;
+pub async fn set_chequebook_address(addr: &[u8]) -> bool {
+    set_batch_field("chequebook_address", addr).await
 }
 
 fn chequebook_last_issued_cheque_payout_key(chequebook: &[u8], beneficiary: &[u8]) -> String {
-    return format!(
+    format!(
         "swap_chequebook_last_issued_cheque_{}_{}",
         hex::encode(chequebook),
         hex::encode(beneficiary)
-    );
+    )
 }
 
 pub async fn get_chequebook_last_issued_cheque_payout(
     chequebook: &[u8],
     beneficiary: &[u8],
 ) -> Vec<u8> {
-    return get_batch_field(chequebook_last_issued_cheque_payout_key(
-        chequebook,
-        beneficiary,
-    ))
-    .await;
+    let key = chequebook_last_issued_cheque_payout_key(chequebook, beneficiary);
+    get_batch_field(&key).await
 }
 
 pub async fn set_chequebook_last_issued_cheque_payout(
     chequebook: &[u8],
     beneficiary: &[u8],
-    payout: &Vec<u8>,
+    payout: &[u8],
 ) -> bool {
-    return set_batch_field(
-        chequebook_last_issued_cheque_payout_key(chequebook, beneficiary),
-        payout,
-    )
-    .await;
+    let key = chequebook_last_issued_cheque_payout_key(chequebook, beneficiary);
+    set_batch_field(&key, payout).await
 }

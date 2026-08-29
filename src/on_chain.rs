@@ -1,71 +1,37 @@
 use std::str::FromStr;
 
+use alloy_primitives::{B256, keccak256};
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use wasm_bindgen::JsError;
 use web3::{
     contract::{Contract, Options},
+    ethabi::{Token, encode},
     transports::eip_1193::{Eip1193, Provider},
     types::{Address, H160, H256, TransactionReceipt, U256},
 };
 
-use base64;
-use ethers::abi::{Token, encode};
-use ethers::signers::LocalWallet;
-use ethers::types::{Address as EthAddress, H256 as EthH256, Signature, U256 as EthU256};
-use ethers::utils::keccak256;
-use hex;
-
-use crate::{is_mainnet, is_testnet_official, network_profile::active_profile};
+use crate::{
+    PrivateKeySigner,
+    network_profile::{NetworkMode, active_profile},
+};
 
 #[derive(Clone, Debug)]
 pub struct Cheque {
-    pub chequebook: EthAddress,
-    pub beneficiary: EthAddress,
-    pub cumulative_payout: EthU256,
-}
-
-struct SignedChequeJson {
-    chequebook: String,
-    beneficiary: String,
-    cumulative_payout: String,
-    signature: String,
-}
-
-impl SignedChequeJson {
-    fn from_cheque(cheque: &Cheque, signature: &[u8]) -> Self {
-        let chequebook = format!("{:#x}", cheque.chequebook);
-        let beneficiary = format!("{:#x}", cheque.beneficiary);
-
-        let cumulative_payout = cheque.cumulative_payout.to_string();
-
-        #[allow(deprecated)]
-        let signature = base64::encode(signature);
-        Self {
-            chequebook,
-            beneficiary,
-            cumulative_payout,
-            signature,
-        }
-    }
-
-    fn to_bytes(&self) -> Vec<u8> {
-        format!(
-            r#"{{"Chequebook":"{}","Beneficiary":"{}","CumulativePayout":{},"Signature":"{}"}}"#,
-            self.chequebook, self.beneficiary, self.cumulative_payout, self.signature
-        )
-        .into_bytes()
-    }
+    pub chequebook: Address,
+    pub beneficiary: Address,
+    pub cumulative_payout: U256,
 }
 
 pub struct ChequeSigner {
-    wallet: LocalWallet,
-    chain_id: EthU256,
+    wallet: PrivateKeySigner,
+    chain_id: U256,
 }
 
 impl ChequeSigner {
-    pub fn new(wallet: LocalWallet, chain_id: u64) -> Self {
+    pub fn new(wallet: PrivateKeySigner, chain_id: u64) -> Self {
         Self {
             wallet,
-            chain_id: EthU256::from(chain_id),
+            chain_id: U256::from(chain_id),
         }
     }
 
@@ -73,51 +39,54 @@ impl ChequeSigner {
         let type_hash = keccak256(b"EIP712Domain(string name,string version,uint256 chainId)");
         let name_hash = keccak256(b"Chequebook");
         let version_hash = keccak256(b"1.0");
-        let tokens = vec![
+        let tokens = [
             Token::FixedBytes(type_hash.to_vec()),
             Token::FixedBytes(name_hash.to_vec()),
             Token::FixedBytes(version_hash.to_vec()),
             Token::Uint(self.chain_id),
         ];
         let encoded = encode(&tokens);
-        keccak256(encoded)
+        keccak256(encoded).into()
     }
 
     fn cheque_struct_hash(&self, cheque: &Cheque) -> [u8; 32] {
         let type_hash =
             keccak256(b"Cheque(address chequebook,address beneficiary,uint256 cumulativePayout)");
-        let tokens = vec![
+        let tokens = [
             Token::FixedBytes(type_hash.to_vec()),
             Token::Address(cheque.chequebook),
             Token::Address(cheque.beneficiary),
             Token::Uint(cheque.cumulative_payout),
         ];
         let encoded = encode(&tokens);
-        keccak256(encoded)
+        keccak256(encoded).into()
+    }
+
+    fn digest(&self, cheque: &Cheque) -> B256 {
+        let domain_separator = self.domain_separator();
+        let struct_hash = self.cheque_struct_hash(cheque);
+        let mut buf = [0u8; 66];
+        buf[..2].copy_from_slice(&[0x19, 0x01]);
+        buf[2..34].copy_from_slice(&domain_separator);
+        buf[34..].copy_from_slice(&struct_hash);
+        keccak256(buf)
     }
 
     pub fn sign(&self, cheque: &Cheque) -> Option<Vec<u8>> {
-        let domain_separator = self.domain_separator();
-        let struct_hash = self.cheque_struct_hash(cheque);
-        let mut buf = Vec::with_capacity(2 + 32 + 32);
-        buf.push(0x19);
-        buf.push(0x01);
-        buf.extend_from_slice(&domain_separator);
-        buf.extend_from_slice(&struct_hash);
-        let digest_bytes = keccak256(&buf);
-        let digest = EthH256::from(digest_bytes);
-        let sig: Signature = self.wallet.sign_hash(digest).ok()?;
-        Some(sig.to_vec())
+        self.wallet
+            .sign_hash_sync(&self.digest(cheque))
+            .ok()
+            .map(|signature| signature.as_bytes().to_vec())
     }
 }
 
 pub struct ChequebookClient {
     signer: ChequeSigner,
-    chequebook: EthAddress,
+    chequebook: Address,
 }
 
 impl ChequebookClient {
-    pub fn new(chequebook: EthAddress, wallet: LocalWallet, chain_id: u64) -> Self {
+    pub fn new(chequebook: Address, wallet: PrivateKeySigner, chain_id: u64) -> Self {
         Self {
             signer: ChequeSigner::new(wallet, chain_id),
             chequebook,
@@ -126,8 +95,8 @@ impl ChequebookClient {
 
     pub fn prepare_emit_cheque_bytes(
         &self,
-        beneficiary: EthAddress,
-        cumulative_payout: EthU256,
+        beneficiary: Address,
+        cumulative_payout: U256,
     ) -> Option<Vec<u8>> {
         let cheque = Cheque {
             chequebook: self.chequebook,
@@ -135,10 +104,14 @@ impl ChequebookClient {
             cumulative_payout,
         };
 
-        let signature = self.signer.sign(&cheque)?;
-
-        let json = SignedChequeJson::from_cheque(&cheque, &signature);
-        Some(json.to_bytes())
+        let signature = BASE64.encode(self.signer.sign(&cheque)?);
+        Some(
+            format!(
+                r#"{{"Chequebook":"{:#x}","Beneficiary":"{:#x}","CumulativePayout":{},"Signature":"{}"}}"#,
+                cheque.chequebook, cheque.beneficiary, cheque.cumulative_payout, signature
+            )
+            .into_bytes(),
+        )
     }
 }
 
@@ -159,44 +132,30 @@ const MAINNET_CHEQUEBOOK_FACTORY_ADDR: &str = "c2d5a532cf69aa9a1378737d8ccdef884
 
 const BUCKET_DEPTH: u8 = 16;
 
-fn select_postage_contract_addr() -> Result<&'static str, JsError> {
-    if is_mainnet() {
-        Ok(MAINNET_POSTAGE_CONTRACT_ADDR)
-    } else if is_testnet_official() {
-        Ok(TESTNET_POSTAGE_CONTRACT_ADDR)
-    } else {
-        Err(JsError::new("No active network selected"))
+fn select_network_address(mainnet: &'static str, testnet: &'static str) -> &'static str {
+    match active_profile().mode {
+        NetworkMode::Mainnet => mainnet,
+        NetworkMode::Testnet => testnet,
     }
 }
 
-fn select_token_contract_addr() -> Result<&'static str, JsError> {
-    if is_mainnet() {
-        Ok(MAINNET_TOKEN_CONTRACT_ADDR)
-    } else if is_testnet_official() {
-        Ok(TESTNET_TOKEN_CONTRACT_ADDR)
-    } else {
-        Err(JsError::new("No active network selected"))
-    }
+fn select_postage_contract_addr() -> &'static str {
+    select_network_address(MAINNET_POSTAGE_CONTRACT_ADDR, TESTNET_POSTAGE_CONTRACT_ADDR)
 }
 
-fn select_price_oracle_addr() -> Result<&'static str, JsError> {
-    if is_mainnet() {
-        Ok(MAINNET_PRICE_ORACLE_ADDR)
-    } else if is_testnet_official() {
-        Ok(TESTNET_PRICE_ORACLE_ADDR)
-    } else {
-        Err(JsError::new("No active network selected"))
-    }
+fn select_token_contract_addr() -> &'static str {
+    select_network_address(MAINNET_TOKEN_CONTRACT_ADDR, TESTNET_TOKEN_CONTRACT_ADDR)
 }
 
-fn select_chequebook_factory_addr() -> Result<&'static str, JsError> {
-    if is_mainnet() {
-        Ok(MAINNET_CHEQUEBOOK_FACTORY_ADDR)
-    } else if is_testnet_official() {
-        Ok(TESTNET_CHEQUEBOOK_FACTORY_ADDR)
-    } else {
-        Err(JsError::new("No active network selected"))
-    }
+fn select_price_oracle_addr() -> &'static str {
+    select_network_address(MAINNET_PRICE_ORACLE_ADDR, TESTNET_PRICE_ORACLE_ADDR)
+}
+
+fn select_chequebook_factory_addr() -> &'static str {
+    select_network_address(
+        MAINNET_CHEQUEBOOK_FACTORY_ADDR,
+        TESTNET_CHEQUEBOOK_FACTORY_ADDR,
+    )
 }
 
 pub type Web3Inst = web3::Web3<Eip1193>;
@@ -227,17 +186,32 @@ pub fn web3() -> Result<Web3Inst, JsError> {
     Ok(web3::Web3::new(Eip1193::new(prov)))
 }
 
-pub async fn postage_contract(w3: &Web3Inst) -> Result<PostageContract, JsError> {
-    let addr_str = select_postage_contract_addr()?;
-    let addr = ensure_addr(addr_str)?;
+async fn ensure_wallet_chain(w3: &Web3Inst) -> Result<(), JsError> {
+    let profile = active_profile();
+    let chain_id = w3
+        .eth()
+        .chain_id()
+        .await
+        .map_err(|error| JsError::new(&format!("chain_id failed: {error:?}")))?;
+    if chain_id == U256::from(profile.wallet_chain_id) {
+        Ok(())
+    } else {
+        Err(JsError::new(&format!(
+            "Wrong network. Please switch wallet to chain {} for {:?}.",
+            profile.wallet_chain_id, profile.mode
+        )))
+    }
+}
+
+pub fn postage_contract(w3: &Web3Inst) -> Result<PostageContract, JsError> {
+    let addr = ensure_addr(select_postage_contract_addr())?;
 
     Contract::from_json(w3.eth(), addr, include_bytes!("./postagestamp.json"))
         .map_err(|e| JsError::new(&format!("Failed to load Postage contract: {e}")))
 }
 
-pub async fn token_contract(w3: &Web3Inst) -> Result<TokenContract, JsError> {
-    let addr_str = select_token_contract_addr()?;
-    let addr = ensure_addr(addr_str)?;
+pub fn token_contract(w3: &Web3Inst) -> Result<TokenContract, JsError> {
+    let addr = ensure_addr(select_token_contract_addr())?;
     Contract::from_json(w3.eth(), addr, include_bytes!("./sbzz.json")).map_err(|e| {
         JsError::new(&format!(
             "Failed to load {} token contract: {e}",
@@ -246,18 +220,14 @@ pub async fn token_contract(w3: &Web3Inst) -> Result<TokenContract, JsError> {
     })
 }
 
-pub async fn chequebook_factory(w3: &Web3Inst) -> Result<ChequebookFactory, JsError> {
-    let addr_str = select_chequebook_factory_addr()?;
-    let addr = ensure_addr(addr_str)?;
+pub fn chequebook_factory(w3: &Web3Inst) -> Result<ChequebookFactory, JsError> {
+    let addr = ensure_addr(select_chequebook_factory_addr())?;
 
     Contract::from_json(w3.eth(), addr, include_bytes!("./factory.json"))
         .map_err(|e| JsError::new(&format!("Failed to load chequebook factory contract: {e}")))
 }
 
-pub async fn chequebook_contract(
-    w3: &Web3Inst,
-    addr: Address,
-) -> Result<ChequebookContract, JsError> {
+pub fn chequebook_contract(w3: &Web3Inst, addr: Address) -> Result<ChequebookContract, JsError> {
     Contract::from_json(w3.eth(), addr, include_bytes!("./simple_swap.json"))
         .map_err(|e| JsError::new(&format!("Failed to load chequebook contract: {e}")))
 }
@@ -276,42 +246,39 @@ pub async fn expired_batches_exist(postage: &PostageContract) -> Result<bool, Js
         .map_err(|e| JsError::new(&format!("expiredBatchesExist() failed: {e}")))
 }
 
-pub async fn get_batch_validity(batch_id: Vec<u8>) -> U256 {
-    let Ok(w3) = web3() else { return U256::from(0) };
-    let Ok(contract) = postage_contract(&w3).await else {
-        return U256::from(0);
+pub async fn get_batch_validity(batch_id: &[u8]) -> U256 {
+    let Ok(w3) = web3() else {
+        return U256::zero();
+    };
+    let Ok(contract) = postage_contract(&w3) else {
+        return U256::zero();
+    };
+    let Ok(batch_id): Result<[u8; 32], _> = batch_id.try_into() else {
+        return U256::zero();
     };
 
-    let id_bytes_32: [u8; 32] = match batch_id.try_into() {
-        Ok(x) => x,
-        Err(_) => return U256::from(0),
-    };
-
-    match contract
+    contract
         .query(
             "remainingBalance",
-            (id_bytes_32,),
+            (batch_id,),
             None,
             Options::default(),
             None,
         )
         .await
-    {
-        Ok(val) => val,
-        Err(_) => U256::from(0),
-    }
+        .unwrap_or_default()
 }
 
 pub fn parse_batch_id_from_receipt(receipt: &TransactionReceipt) -> Option<Vec<u8>> {
     let topic = H256::from_slice(&hex::decode(BATCH_CREATED_TOPIC).ok()?);
-    let addr_str = select_postage_contract_addr().ok()?;
-    let contract = H160::from_slice(&hex::decode(addr_str).ok()?);
+    let contract = H160::from_slice(&hex::decode(select_postage_contract_addr()).ok()?);
 
     for log in receipt.logs.iter() {
-        if log.topics.get(0) == Some(&topic) && log.address == contract {
-            if let Some(batch_topic) = log.topics.get(1) {
-                return Some(batch_topic.as_bytes().to_vec());
-            }
+        if log.topics.first() == Some(&topic)
+            && log.address == contract
+            && let Some(batch_topic) = log.topics.get(1)
+        {
+            return Some(batch_topic.as_bytes().to_vec());
         }
     }
     None
@@ -344,24 +311,10 @@ pub async fn buy_postage_batch_with_payer(
     payer: Address,
 ) -> Result<BatchPurchaseResult, JsError> {
     let w3 = web3()?;
+    ensure_wallet_chain(&w3).await?;
 
-    {
-        let profile = active_profile();
-        let cid = w3
-            .eth()
-            .chain_id()
-            .await
-            .map_err(|e| JsError::new(&format!("chain_id failed: {e:?}")))?;
-        if cid != U256::from(profile.wallet_chain_id) {
-            return Err(JsError::new(&format!(
-                "Wrong network. Please switch wallet to chain {} for {:?}.",
-                profile.wallet_chain_id, profile.mode
-            )));
-        }
-    }
-
-    let postage = postage_contract(&w3).await?;
-    let token = token_contract(&w3).await?;
+    let postage = postage_contract(&w3)?;
+    let token = token_contract(&w3)?;
 
     let lp = last_price(&postage).await?;
     let initial_per_chunk = compute_initial_balance_per_chunk(lp, validity_days);
@@ -399,10 +352,7 @@ pub async fn buy_postage_batch_with_payer(
     }
 
     let mut approve_opts = Options::default();
-    let addr_str = select_postage_contract_addr()?;
-    let spender = Address::from_slice(
-        &hex::decode(addr_str).map_err(|_| JsError::new("Invalid postage contract address"))?,
-    );
+    let spender = ensure_addr(select_postage_contract_addr())?;
 
     let approve_gas = token
         .estimate_gas("approve", (spender, approve_amt), payer, Options::default())
@@ -482,12 +432,12 @@ pub struct BatchPurchaseResult {
 
 pub fn parse_chequebook_address_from_receipt(receipt: &TransactionReceipt) -> Option<Address> {
     let topic_bytes = keccak256(b"SimpleSwapDeployed(address)");
-    let topic = H256::from_slice(&topic_bytes);
-    let addr_str = select_chequebook_factory_addr().ok()?;
+    let topic = H256::from_slice(topic_bytes.as_slice());
+    let addr_str = select_chequebook_factory_addr();
     let factory = H160::from_slice(&hex::decode(addr_str).ok()?);
 
     for log in receipt.logs.iter() {
-        if log.address == factory && log.topics.get(0) == Some(&topic) {
+        if log.address == factory && log.topics.first() == Some(&topic) {
             let data = log.data.0.as_slice();
             if data.len() >= 32 {
                 let addr_bytes = &data[12..32];
@@ -499,7 +449,7 @@ pub fn parse_chequebook_address_from_receipt(receipt: &TransactionReceipt) -> Op
 }
 
 pub async fn chequebook_balance(w3: &Web3Inst, chequebook_addr: Address) -> Result<U256, JsError> {
-    let contract = chequebook_contract(w3, chequebook_addr).await?;
+    let contract = chequebook_contract(w3, chequebook_addr)?;
     contract
         .query("balance", (), None, Options::default(), None)
         .await
@@ -535,23 +485,9 @@ pub async fn deploy_chequebook_with_payer(
     payer: Address,
 ) -> Result<ChequebookDeploymentResult, JsError> {
     let w3 = web3()?;
+    ensure_wallet_chain(&w3).await?;
 
-    {
-        let profile = active_profile();
-        let cid = w3
-            .eth()
-            .chain_id()
-            .await
-            .map_err(|e| JsError::new(&format!("chain_id failed: {e:?}")))?;
-        if cid != U256::from(profile.wallet_chain_id) {
-            return Err(JsError::new(&format!(
-                "Wrong network. Please switch wallet to chain {} for {:?}.",
-                profile.wallet_chain_id, profile.mode
-            )));
-        }
-    }
-
-    let factory = chequebook_factory(&w3).await?;
+    let factory = chequebook_factory(&w3)?;
 
     let salt: [u8; 32] = crate::encrey()
         .try_into()
@@ -593,30 +529,78 @@ fn add_buffer(g: U256) -> U256 {
     g + (g / U256::from(5u8))
 }
 
-async fn price_oracle_contract(w3: &Web3Inst) -> Result<PriceOracleContract, JsError> {
-    let addr_str = select_price_oracle_addr()?;
-    let addr = ensure_addr(addr_str)?;
+fn price_oracle_contract(w3: &Web3Inst) -> Result<PriceOracleContract, JsError> {
+    let addr = ensure_addr(select_price_oracle_addr())?;
 
     Contract::from_json(w3.eth(), addr, include_bytes!("./priceoracle.json"))
         .map_err(|e| JsError::new(&format!("Failed to load PriceOracle contract: {e}")))
 }
 
-pub async fn get_price_from_oracle() -> (U256, U256) {
-    let w3 = match web3() {
-        Ok(w3) => w3,
-        Err(_) => return (U256::from(0), U256::from(0)),
-    };
+pub async fn get_price_from_oracle() -> Option<(U256, U256)> {
+    crate::secure_vault::worker_price_oracle().await
+}
 
-    let oracle = match price_oracle_contract(&w3).await {
-        Ok(oracle) => oracle,
-        Err(_) => return (U256::from(0), U256::from(0)),
-    };
-
-    match oracle
+pub(crate) async fn get_price_from_oracle_in_window() -> Option<(U256, U256)> {
+    let w3 = web3().ok()?;
+    let oracle = price_oracle_contract(&w3).ok()?;
+    let (price, deduction) = oracle
         .query::<(U256, U256), _, _, _>("getPrice", (), None, Options::default(), None)
         .await
-    {
-        Ok((price, cheque_value_deduction)) => (price, cheque_value_deduction),
-        Err(_) => (U256::from(0), U256::from(0)),
+        .ok()?;
+    (!price.is_zero()).then_some((price, deduction))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy_primitives::Signature;
+    use wasm_bindgen_test::wasm_bindgen_test;
+
+    const PRIVATE_KEY: [u8; 32] = [1; 32];
+    const EXPECTED_SIGNATURE: &str = "59914b4bd53a81a73a6e28ddff40ee0457b99d824cce48ee2c68eeacd7df6dfd42589fcee1a12a0799217b1cc797c67d9ff0f9be1386fcc2b2c3e17474318e121c";
+
+    fn fixture() -> (PrivateKeySigner, Cheque) {
+        let wallet = PrivateKeySigner::from_slice(&PRIVATE_KEY).expect("fixture private key");
+        let cheque = Cheque {
+            chequebook: Address::from_slice(&[0x11; 20]),
+            beneficiary: Address::from_slice(&[0x22; 20]),
+            cumulative_payout: U256::from_dec_str("12345678901234567890").expect("fixture payout"),
+        };
+        (wallet, cheque)
+    }
+
+    #[wasm_bindgen_test]
+    fn cheque_signature_is_the_stable_ethers_compatible_65_byte_value() {
+        let (wallet, cheque) = fixture();
+        let signer = ChequeSigner::new(wallet.clone(), 100);
+        let signature = signer.sign(&cheque).expect("sign cheque");
+
+        assert_eq!(signature.len(), 65);
+        assert!(matches!(signature[64], 27 | 28));
+        assert_eq!(hex::encode(&signature), EXPECTED_SIGNATURE);
+
+        let signature = Signature::from_raw(&signature).expect("parse signature");
+        assert_eq!(
+            signature
+                .recover_address_from_prehash(&signer.digest(&cheque))
+                .expect("recover signer"),
+            wallet.address()
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn cheque_json_keeps_the_exact_bee_wire_shape() {
+        let (wallet, cheque) = fixture();
+        let expected_signature = BASE64.encode(hex::decode(EXPECTED_SIGNATURE).unwrap());
+        let client = ChequebookClient::new(cheque.chequebook, wallet, 100);
+        let encoded = client
+            .prepare_emit_cheque_bytes(cheque.beneficiary, cheque.cumulative_payout)
+            .expect("encode cheque");
+        assert_eq!(
+            String::from_utf8(encoded).unwrap(),
+            format!(
+                r#"{{"Chequebook":"0x1111111111111111111111111111111111111111","Beneficiary":"0x2222222222222222222222222222222222222222","CumulativePayout":12345678901234567890,"Signature":"{expected_signature}"}}"#
+            )
+        );
     }
 }

@@ -4,9 +4,9 @@ use std::{cell::RefCell, rc::Rc};
 pub const MANTARAY_PREFIX_MAX_BYTES: usize = 30;
 
 const NODE_TYPE_VALUE: u8 = 2;
-const NODE_TYPE_EDGE: u8 = 4;
+pub(crate) const NODE_TYPE_EDGE: u8 = 4;
 const NODE_TYPE_WITH_PATH_SEPARATOR: u8 = 8;
-const NODE_TYPE_WITH_METADATA: u8 = 16;
+pub(crate) const NODE_TYPE_WITH_METADATA: u8 = 16;
 const METADATA_BLOCK_BYTES: usize = 32;
 
 pub fn common_prefix_bytes(paths: &[&[u8]]) -> Option<Vec<u8>> {
@@ -156,7 +156,6 @@ pub fn ordered_indexed_forks(mut forks: Vec<Vec<u8>>) -> Option<(Vec<Vec<u8>>, [
     Some((forks, index))
 }
 
-pub const MAX_MANIFEST_FORKS: usize = 256;
 pub const MAX_MANIFEST_PAYLOAD_BYTES: usize = 17 * 1024 * 1024;
 pub const MAX_MANIFEST_DEPTH: usize = 256;
 pub const MAX_MANIFEST_VISITS: usize = 4096;
@@ -254,23 +253,14 @@ pub fn manifest_payload_size_allowed(size: u64) -> bool {
     size <= MAX_MANIFEST_PAYLOAD_BYTES as u64
 }
 
-pub fn manifest_fork_keys(index: &[u8], reference_size: usize) -> Option<Vec<u8>> {
+pub fn manifest_fork_count(index: &[u8], reference_size: usize) -> Option<usize> {
     if index.len() != 32 {
         return None;
     }
     if reference_size == 0 {
-        return Some(Vec::new());
+        return Some(0);
     }
-
-    let mut keys = Vec::new();
-    for (byte_index, bits) in index.iter().copied().enumerate() {
-        for bit in 0..8 {
-            if bits & (1 << bit) != 0 {
-                keys.push((byte_index * 8 + bit) as u8);
-            }
-        }
-    }
-    (keys.len() <= MAX_MANIFEST_FORKS).then_some(keys)
+    Some(index.iter().map(|byte| byte.count_ones() as usize).sum())
 }
 
 const MANIFEST_FIXED_HEADER_SIZE: usize = 72;
@@ -279,7 +269,7 @@ const MANIFEST_VERSION_START: usize = 40;
 const MANIFEST_VERSION_END: usize = 71;
 const MANIFEST_REFERENCE_SIZE_OFFSET: usize = 71;
 
-const MANTARAY_VERSION_02: [u8; 31] = [
+pub(crate) const MANTARAY_VERSION_02: [u8; 31] = [
     0x57, 0x68, 0xb3, 0xb6, 0xa7, 0xdb, 0x56, 0xd2, 0x1d, 0x1a, 0xbf, 0xf4, 0x0d, 0x41, 0xce, 0xbf,
     0xc8, 0x34, 0x48, 0xfe, 0xd8, 0xd7, 0xe9, 0xb0, 0x6e, 0xc0, 0xd3, 0xb0, 0x73, 0xf2, 0x8f,
 ];
@@ -288,7 +278,7 @@ const MANTARAY_VERSION_01: [u8; 31] = [
     0x7d, 0x74, 0x00, 0x87, 0x5e, 0xbe, 0x4d, 0x9b, 0x5d, 0x1e, 0x76, 0xbd, 0x96, 0x52, 0xa9,
 ];
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub(crate) struct BzzManifestFork {
     pub(crate) fork_type: u8,
     pub(crate) prefix: Vec<u8>,
@@ -387,16 +377,13 @@ pub(crate) fn parse_bzz_manifest(mut input: Vec<u8>) -> Option<ParsedBzzManifest
     };
 
     let index_delimiter = reference_end.checked_add(MANIFEST_INDEX_SIZE)?;
-    let fork_keys = manifest_fork_keys(&input[reference_end..index_delimiter], ref_size)?;
-    if fork_keys.len() > MAX_MANIFEST_FORKS {
-        return None;
-    }
+    let fork_count = manifest_fork_count(&input[reference_end..index_delimiter], ref_size)?;
 
     let mut fork_start_current = index_delimiter;
-    let mut forks = Vec::with_capacity(fork_keys.len());
+    let mut forks = Vec::with_capacity(fork_count);
     let mut explicit_index = None;
 
-    for _fork_key in fork_keys {
+    for _ in 0..fork_count {
         let fork_start = fork_start_current;
         if input.len() < fork_start.checked_add(32)?.checked_add(ref_size)? {
             return None;
@@ -405,7 +392,7 @@ pub(crate) fn parse_bzz_manifest(mut input: Vec<u8>) -> Option<ParsedBzzManifest
         let fork_type = input[fork_start];
         let fork_prefix_length = input[fork_start + 1] as usize;
         if fork_prefix_length == 0
-            || fork_prefix_length > 30
+            || fork_prefix_length > MANTARAY_PREFIX_MAX_BYTES
             || input.len() < fork_start.checked_add(2)?.checked_add(fork_prefix_length)?
         {
             return None;
@@ -418,7 +405,7 @@ pub(crate) fn parse_bzz_manifest(mut input: Vec<u8>) -> Option<ParsedBzzManifest
         let fork_reference_delimiter = fork_prefix_delimiter.checked_add(ref_size)?;
         let reference = input[fork_prefix_delimiter..fork_reference_delimiter].to_vec();
 
-        let metadata = if fork_type & 16 == 16 {
+        let metadata = if fork_type & NODE_TYPE_WITH_METADATA == NODE_TYPE_WITH_METADATA {
             if input.len() < fork_reference_delimiter.checked_add(2)? {
                 return None;
             }

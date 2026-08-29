@@ -1,17 +1,22 @@
 use super::*;
+use js_sys::{Object, Reflect};
+use web_sys::{MessageChannel, MessageEvent, MessagePort};
+
+use crate::worker_protocol::{number_property, set as set_js, string_property};
 
 const SERVICE_WORKER_PROTOCOL: f64 = 10.0;
-const SERVICE_WORKER_MARKER: &str = "forwarder-default28";
+const SERVICE_WORKER_MARKER: &str = "forwarder-default29";
 const SERVICE_WORKER_CONTROL_TOTAL_TIMEOUT_MS: u64 = 30_000;
 const SERVICE_WORKER_SETUP_RETRY_MS: f64 = 1_500.0;
+const DOWNLOAD_URL_REVOKE_DELAY_MS: i32 = 1_000;
+static SERVICE_WORKER_SETUP_LOCK: async_lock::Mutex<()> = async_lock::Mutex::new(());
 
 thread_local! {
-    static SERVICE_WORKER_MISSING_VISIBLE: Cell<bool> = Cell::new(false);
-    static SERVICE_WORKER_SETUP_LOCK: Arc<async_lock::Mutex<()>> =
-        Arc::new(async_lock::Mutex::new(()));
+    static SERVICE_WORKER_MISSING_VISIBLE: Cell<bool> = const { Cell::new(false) };
+    static ACTIVE_RESULT_OBJECT_URL: RefCell<Option<String>> = const { RefCell::new(None) };
 }
 
-pub(super) async fn check_upload_prerequisites(weeb3: Arc<Weeb3>) {
+pub(super) async fn check_upload_prerequisites(weeb3: InterfaceNode) {
     let progress_id = weeb3
         .start_progress(
             "upload-prereq",
@@ -22,23 +27,18 @@ pub(super) async fn check_upload_prerequisites(weeb3: Arc<Weeb3>) {
         )
         .await;
 
-    match collect_upload_prerequisites().await {
-        Ok(message) => {
-            render_text_result(&message);
-            weeb3.interface_log(message);
-            weeb3
-                .finish_progress(&progress_id, "complete", "prerequisites checked", true)
-                .await;
-        }
-        Err(error) => {
-            let message = format!("Upload prerequisites failed: {}", error);
-            render_text_result(&message);
-            weeb3.interface_log(message);
-            weeb3
-                .finish_progress(&progress_id, "failed", "prerequisite check failed", false)
-                .await;
-        }
-    }
+    let (message, phase, detail, ok) = match collect_upload_prerequisites().await {
+        Ok(message) => (message, "complete", "prerequisites checked", true),
+        Err(error) => (
+            format!("Upload prerequisites failed: {error}"),
+            "failed",
+            "prerequisite check failed",
+            false,
+        ),
+    };
+    render_text_result(&message);
+    weeb3.interface_log(message);
+    weeb3.finish_progress(&progress_id, phase, detail, ok).await;
 }
 
 pub(super) async fn collect_upload_prerequisites() -> Result<String, String> {
@@ -75,18 +75,14 @@ pub(super) async fn collect_upload_prerequisites() -> Result<String, String> {
         return Ok(lines.join("\n"));
     }
 
-    let postage = postage_contract(&w3)
-        .await
-        .map_err(|e| format!("postage contract failed: {:?}", e))?;
-    let token = token_contract(&w3)
-        .await
-        .map_err(|e| format!("token contract failed: {:?}", e))?;
+    let postage = postage_contract(&w3).map_err(|e| format!("postage contract failed: {:?}", e))?;
+    let token = token_contract(&w3).map_err(|e| format!("token contract failed: {:?}", e))?;
     let lp = last_price(&postage)
         .await
         .map_err(|e| format!("last price failed: {:?}", e))?;
 
     if secure_state.usable() {
-        let remaining = get_batch_validity(secure_state.batch_id.clone()).await;
+        let remaining = get_batch_validity(&secure_state.batch_id).await;
         let day_price = lp * U256::from(7200u64);
         let days = if day_price.is_zero() {
             U256::from(0)
@@ -172,46 +168,9 @@ pub(super) fn read_batch_request_settings() -> Result<(u8, u64), String> {
 }
 
 pub(super) async fn connect_wallet_address() -> Result<Address, String> {
-    let window = web_sys::window().ok_or_else(|| "window is not available".to_string())?;
-    let func = js_sys::Reflect::get(&window, &JsValue::from_str("weeb3EnsureEip1193"))
-        .map_err(|_| "wallet connector is not available".to_string())?;
-    let func = func
-        .dyn_into::<js_sys::Function>()
-        .map_err(|_| "wallet connector is not callable".to_string())?;
-    let project_id = JsValue::from_str("64c5f91181ce0a3192a783346a475d23");
-    let profile = current_network_profile();
-    let args = js_sys::Array::new();
-    args.push(&project_id);
-    args.push(&JsValue::from_f64(profile.wallet_chain_id as f64));
-    let promise = func
-        .apply(&JsValue::NULL, &args)
-        .map_err(|_| "wallet connector call failed".to_string())?
-        .dyn_into::<js_sys::Promise>()
-        .map_err(|_| "wallet connector did not return a promise".to_string())?;
-    let obj = JsFuture::from(promise)
+    crate::library::request_wallet_via_shell_connector(current_network_profile().wallet_chain_id)
         .await
-        .map_err(|_| "wallet connection failed".to_string())?;
-
-    let ok = js_sys::Reflect::get(&obj, &"ok".into())
-        .ok()
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    if !ok {
-        let error = js_sys::Reflect::get(&obj, &"error".into())
-            .ok()
-            .and_then(|v| v.as_string())
-            .unwrap_or_else(|| "wallet connection failed".to_string());
-        return Err(error);
-    }
-
-    let accounts = js_sys::Reflect::get(&obj, &"accounts".into())
-        .map_err(|_| "wallet account list missing".to_string())?;
-    let first = js_sys::Array::from(&accounts).get(0);
-    let address = first
-        .as_string()
-        .ok_or_else(|| "connected wallet did not return an account".to_string())?;
-
-    Address::from_str(&address).map_err(|_| "connected account is not an address".to_string())
+        .unwrap_or_else(|| Err("wallet connector is not available".to_string()))
 }
 
 pub(super) fn next_network_apply_generation() -> u64 {
@@ -226,7 +185,7 @@ pub(super) fn is_current_network_apply_generation(apply_generation: u64) -> bool
     NETWORK_APPLY_GENERATION.with(|generation| generation.get() == apply_generation)
 }
 
-pub(super) fn install_network_profile_toggle(weeb3: Arc<Weeb3>) {
+pub(super) fn install_network_profile_toggle(weeb3: InterfaceNode) {
     let document = web_sys::window().unwrap().document().unwrap();
     update_network_mode_toggle(current_network_profile().mode);
 
@@ -236,7 +195,7 @@ pub(super) fn install_network_profile_toggle(weeb3: Arc<Weeb3>) {
 
     let callback =
         wasm_bindgen::closure::Closure::<dyn FnMut(web_sys::MessageEvent)>::new(move |_msg| {
-            let weeb300 = weeb3.clone();
+            let node = weeb3.clone();
             let mode = match current_network_profile().mode {
                 NetworkMode::Testnet => NetworkMode::Mainnet,
                 NetworkMode::Mainnet => NetworkMode::Testnet,
@@ -245,18 +204,18 @@ pub(super) fn install_network_profile_toggle(weeb3: Arc<Weeb3>) {
             set_network_profile_inputs(mode);
             let apply_generation = next_network_apply_generation();
             let network_id = profile.swarm_network_id.to_string();
-            weeb300.interface_log(format!(
+            node.interface_log(format!(
                 "Network mode switched to {:?} chain {}",
                 profile.mode, profile.wallet_chain_id
             ));
             spawn_local(async move {
-                apply_network_settings_and_connect(weeb300, apply_generation, network_id).await;
+                apply_network_settings_and_connect(node, apply_generation, network_id).await;
             });
         });
 
     if let Some(button) = button.dyn_ref::<HtmlButtonElement>() {
-        button.set_onclick(Some(callback.as_ref().unchecked_ref()));
-        callback.forget();
+        let callback = callback.into_js_value();
+        button.set_onclick(Some(callback.unchecked_ref()));
     }
 }
 
@@ -265,10 +224,11 @@ pub(super) fn set_network_profile_inputs(mode: NetworkMode) {
     let document = web_sys::window().unwrap().document().unwrap();
     update_network_mode_toggle(profile.mode);
 
-    if let Some(network_id_input) = document.get_element_by_id("networkIDSettings") {
-        if let Some(network_id_input) = network_id_input.dyn_ref::<HtmlInputElement>() {
-            network_id_input.set_value(&profile.swarm_network_id.to_string());
-        }
+    if let Some(network_id_input) = document
+        .get_element_by_id("networkIDSettings")
+        .and_then(|element| element.dyn_into::<HtmlInputElement>().ok())
+    {
+        network_id_input.set_value(&profile.swarm_network_id.to_string());
     }
 
     for (index, element_id) in BOOTNODE_INPUT_IDS.iter().enumerate() {
@@ -348,16 +308,23 @@ pub(super) fn ensure_progress_child(
     Some(child)
 }
 
-pub(super) fn prepend_progress_node(node: &Element) {
+fn append_result_action(node: &Element) {
     let document = web_sys::window().unwrap().document().unwrap();
-    let Some(actions) = ensure_progress_child(&document, "progressActions", "div") else {
+    let Some(parent) = ensure_progress_child(&document, "progressActions", "div") else {
         return;
     };
-    let _ = actions.prepend_with_node_1(node);
+    let actions = document.get_element_by_id("resultActions").or_else(|| {
+        let actions = document.create_element("div").ok()?;
+        actions.set_id("resultActions");
+        parent.append_child(&actions).ok()?;
+        Some(actions)
+    });
+    let Some(actions) = actions else { return };
+    let _ = actions.append_child(node);
 }
 
 pub(super) async fn apply_network_settings_and_connect(
-    weeb3: Arc<Weeb3>,
+    weeb3: InterfaceNode,
     apply_generation: u64,
     network_id: String,
 ) {
@@ -366,14 +333,11 @@ pub(super) async fn apply_network_settings_and_connect(
     }
 
     if network_id.trim().is_empty() {
-        weeb3.interface_log("Network id is empty; not reconnecting".to_string());
+        weeb3.interface_log("Network id is empty; not reconnecting");
         return;
     }
 
-    let current_network = weeb3.get_network_id().await;
-    if !is_current_network_apply_generation(apply_generation) {
-        return;
-    }
+    let current_network = weeb3.network_id();
     let network_switch = network_id
         .parse::<u64>()
         .ok()
@@ -381,15 +345,6 @@ pub(super) async fn apply_network_settings_and_connect(
     if network_switch {
         crate::stream::release_current_stream_view();
     }
-    if !weeb3.set_network_id(network_id.clone()).await {
-        weeb3.interface_log(format!("Network id switch failed: {}", network_id));
-        return;
-    }
-
-    if !is_current_network_apply_generation(apply_generation) {
-        return;
-    }
-
     update_network_mode_toggle(current_network_profile().mode);
     connect_all_bootnode_settings(weeb3, apply_generation).await;
 }
@@ -403,7 +358,7 @@ pub(super) fn current_network_id_input() -> String {
         .unwrap_or_else(|| "1".to_string())
 }
 
-pub(super) async fn connect_all_bootnode_settings(weeb3: Arc<Weeb3>, apply_generation: u64) {
+pub(super) async fn connect_all_bootnode_settings(weeb3: InterfaceNode, apply_generation: u64) {
     if !is_current_network_apply_generation(apply_generation) {
         return;
     }
@@ -415,31 +370,28 @@ pub(super) async fn connect_all_bootnode_settings(weeb3: Arc<Weeb3>, apply_gener
     let mut seen = std::collections::HashSet::<String>::new();
     let mut dial_requests = Vec::<(String, bool)>::new();
 
-    let profile = network_id
-        .parse::<u64>()
-        .ok()
-        .and_then(profile_for_swarm_network_id);
+    let profile = profile_for_swarm_network_id(expected_network_id);
     if let Some(profile) = profile {
         for address in initial_bootnodes(profile) {
             let address = address.to_string();
-            if seen.insert(address.clone()) {
+            if !is_browser_dialable_underlay(&address) {
+                weeb3.interface_log(format!(
+                    "Skipped non-browser bootnode for network {network_id}: {address}"
+                ));
+            } else if seen.insert(address.clone()) {
                 dial_requests.push((address, true));
             }
         }
     }
 
     for (index, element_id) in BOOTNODE_INPUT_IDS.iter().enumerate() {
-        let (address, node_network_id) = parsebootconnect(element_id.to_string());
-        if address.trim().is_empty() || node_network_id.trim().is_empty() {
+        let address = bootnode_setting(element_id);
+        if address.trim().is_empty() {
             continue;
         }
-        if node_network_id != network_id {
-            continue;
-        }
-        if node_network_id == network_id
-            && profile
-                .and_then(|profile| profile.bootnodes.get(index))
-                .is_some_and(|default| address == *default)
+        if profile
+            .and_then(|profile| profile.bootnodes.get(index))
+            .is_some_and(|default| address == *default)
         {
             continue;
         }
@@ -461,12 +413,15 @@ pub(super) async fn connect_all_bootnode_settings(weeb3: Arc<Weeb3>, apply_gener
         network_id
     ));
 
-    if !is_current_network_apply_generation(apply_generation) {
-        return;
+    if let Err(error) = weeb3.configure(expected_network_id, dial_requests).await {
+        weeb3.interface_log(format!(
+            "SharedWorker network configuration failed: {error}"
+        ));
+        let actual_network_id = weeb3.network_id();
+        if let Some(profile) = profile_for_swarm_network_id(actual_network_id) {
+            set_network_profile_inputs(profile.mode);
+        }
     }
-    weeb3
-        .connect_bootnodes_for_current_network(dial_requests, expected_network_id)
-        .await;
 }
 
 pub(super) fn update_network_mode_toggle(mode: NetworkMode) {
@@ -489,10 +444,10 @@ pub(super) fn update_network_mode_toggle(mode: NetworkMode) {
     );
 }
 
-pub(super) async fn open_resource_input(weeb3: Arc<Weeb3>, input: String) {
+pub(super) async fn open_resource_input(weeb3: InterfaceNode, input: String) {
     if let Some(route) = parse_networked_resource_route(&input) {
         let profile = profile_for_mode(route.network);
-        if weeb3.get_network_id().await != profile.swarm_network_id {
+        if weeb3.network_id() != profile.swarm_network_id {
             set_network_profile_inputs(route.network);
             let apply_generation = next_network_apply_generation();
             apply_network_settings_and_connect(
@@ -501,7 +456,7 @@ pub(super) async fn open_resource_input(weeb3: Arc<Weeb3>, input: String) {
                 profile.swarm_network_id.to_string(),
             )
             .await;
-            if weeb3.get_network_id().await != profile.swarm_network_id {
+            if weeb3.network_id() != profile.swarm_network_id {
                 render_text_result("Could not apply the resource route network");
                 return;
             }
@@ -512,16 +467,16 @@ pub(super) async fn open_resource_input(weeb3: Arc<Weeb3>, input: String) {
     }
 }
 
-pub(super) async fn open_resource(weeb3: Arc<Weeb3>, route: ResourceRoute) {
+pub(super) async fn open_resource(weeb3: InterfaceNode, route: ResourceRoute) {
     match route {
         ResourceRoute::Bzz(resource) => open_bzz_resource(weeb3, resource).await,
         ResourceRoute::Bytes(reference) => {
             let bytes = weeb3.retrieve_bytes(reference.clone()).await;
-            download_raw_bytes(bytes, reference, "bytes").await;
+            download_raw_bytes(bytes, reference, "bytes");
         }
         ResourceRoute::Chunks(reference) => {
             let bytes = weeb3.retrieve_chunk_bytes(reference.clone()).await;
-            download_raw_bytes(bytes, reference, "chunk").await;
+            download_raw_bytes(bytes, reference, "chunk");
         }
         ResourceRoute::Hls {
             owner,
@@ -533,76 +488,48 @@ pub(super) async fn open_resource(weeb3: Arc<Weeb3>, route: ResourceRoute) {
     }
 }
 
-pub(super) async fn download_raw_bytes(bytes: Vec<u8>, filename: String, label: &str) {
-    if bytes.is_empty() {
+pub(super) fn download_raw_bytes(bytes: Uint8Array, filename: String, label: &str) {
+    if bytes.length() == 0 {
         render_text_result(&format!("Could not retrieve {} {}", label, filename));
         return;
     }
 
-    let props = BlobPropertyBag::new();
-    props.set_type("application/octet-stream");
-
-    let data: Uint8Array = JsValue::from(bytes.clone()).into();
-    let parts = Array::new();
-    parts.push(&data);
-
-    let blob = match Blob::new_with_u8_array_sequence_and_options(&parts, &props) {
-        Ok(blob) => blob,
-        Err(_) => {
-            render_text_result(&format!(
-                "Could not create download for {} {}",
-                label, filename
-            ));
-            return;
-        }
+    let Some(url) = create_blob_part(bytes.as_ref(), "application/octet-stream")
+        .as_ref()
+        .and_then(blob_object_url)
+    else {
+        render_text_result(&format!(
+            "Could not create download for {} {}",
+            label, filename
+        ));
+        return;
     };
-
-    let blob_url = match web_sys::Url::create_object_url_with_blob(&blob) {
-        Ok(url) => url,
-        Err(_) => {
-            render_text_result(&format!(
-                "Could not create download URL for {} {}",
-                label, filename
-            ));
-            return;
-        }
-    };
-
-    let document = web_sys::window().unwrap().document().unwrap();
-    let anchor = match document.create_element("a") {
-        Ok(anchor) => anchor,
-        Err(_) => return,
-    };
-    let _ = anchor.set_attribute("href", &blob_url);
-    let _ = anchor.set_attribute("download", &filename);
-    let _ = anchor.set_attribute("style", "display:none");
-
-    if let Some(body) = document.body() {
-        let _ = body.append_child(&anchor);
-    }
-
-    if let Some(anchor) = anchor.dyn_ref::<HtmlElement>() {
-        anchor.click();
-    }
+    click_download_url(url, &filename);
 
     render_text_result(&format!(
         "Started {} download {} ({} bytes)",
         label,
         filename,
-        bytes.len()
+        bytes.length()
     ));
 }
 
-pub(super) fn click_download_url(url: &str, filename: &str) {
+pub(super) fn click_download_url(url: String, filename: &str) {
     let document = match web_sys::window().and_then(|window| window.document()) {
         Some(document) => document,
-        None => return,
+        None => {
+            revoke_object_url_later(url);
+            return;
+        }
     };
     let anchor = match document.create_element("a") {
         Ok(anchor) => anchor,
-        Err(_) => return,
+        Err(_) => {
+            revoke_object_url_later(url);
+            return;
+        }
     };
-    let _ = anchor.set_attribute("href", url);
+    let _ = anchor.set_attribute("href", &url);
     let _ = anchor.set_attribute("download", filename);
     let _ = anchor.set_attribute("style", "display:none");
 
@@ -613,18 +540,48 @@ pub(super) fn click_download_url(url: &str, filename: &str) {
     if let Some(anchor) = anchor.dyn_ref::<HtmlElement>() {
         anchor.click();
     }
+
+    if let Some(parent) = anchor.parent_node() {
+        let _ = parent.remove_child(&anchor);
+    }
+    revoke_object_url_later(url);
 }
 
-pub(super) fn blob_url(bytes: &[u8], mime: &str) -> Option<String> {
+fn revoke_object_url_later(url: String) {
+    let revoke_url = url.clone();
+    let callback = wasm_bindgen::closure::Closure::once_into_js(move || {
+        let _ = web_sys::Url::revoke_object_url(&revoke_url);
+    });
+    let scheduled = web_sys::window().is_some_and(|window| {
+        window
+            .set_timeout_with_callback_and_timeout_and_arguments_0(
+                callback.unchecked_ref(),
+                DOWNLOAD_URL_REVOKE_DELAY_MS,
+            )
+            .is_ok()
+    });
+    if !scheduled {
+        let _ = web_sys::Url::revoke_object_url(&url);
+    }
+}
+
+fn create_blob_part(part: &JsValue, mime: &str) -> Option<Blob> {
     let props = BlobPropertyBag::new();
     props.set_type(mime);
-
-    let data: Uint8Array = JsValue::from(bytes.to_vec()).into();
     let parts = Array::new();
-    parts.push(&data);
+    parts.push(part);
+    Blob::new_with_u8_array_sequence_and_options(&parts, &props).ok()
+}
 
-    let blob = Blob::new_with_u8_array_sequence_and_options(&parts, &props).ok()?;
-    web_sys::Url::create_object_url_with_blob(&blob).ok()
+fn create_blob(bytes: &[u8], mime: &str) -> Option<Blob> {
+    create_blob_part(Uint8Array::from(bytes).as_ref(), mime)
+}
+
+fn blob_object_url(blob: &Blob) -> Option<String> {
+    web_sys::Url::create_object_url_with_blob(blob).ok()
+}
+pub(super) fn blob_url(bytes: &[u8], mime: &str) -> Option<String> {
+    blob_object_url(&create_blob(bytes, mime)?)
 }
 
 pub(super) fn result_filename(path: &str, fallback: &str) -> String {
@@ -636,17 +593,43 @@ pub(super) fn result_filename(path: &str, fallback: &str) -> String {
     }
 }
 
-pub(super) fn prepend_result_node(node: &Element) {
-    let document = web_sys::window().unwrap().document().unwrap();
-    let _ = document
-        .get_element_by_id("resultField")
-        .expect("#resultField should exist")
-        .dyn_ref::<HtmlElement>()
-        .unwrap()
-        .prepend_with_node_1(node);
+pub(crate) fn release_result_object_url() {
+    ACTIVE_RESULT_OBJECT_URL.with(|active| {
+        if let Some(url) = active.borrow_mut().take() {
+            let _ = web_sys::Url::revoke_object_url(&url);
+        }
+    });
 }
 
-pub(super) fn render_single_result_with_download(bytes: Vec<u8>, mime: String, path: String) {
+fn clear_result_view() {
+    let document = web_sys::window().unwrap().document().unwrap();
+    if let Some(actions) = document.get_element_by_id("resultActions") {
+        actions.set_inner_html("");
+    }
+    release_result_object_url();
+    SERVICE_WORKER_MISSING_VISIBLE.with(|visible| visible.set(false));
+    let result = document
+        .get_element_by_id("resultField")
+        .expect("#resultField should exist");
+    result.set_inner_html("");
+}
+
+pub(crate) fn replace_result_view(node: &Element) {
+    clear_result_view();
+    append_result_view(node);
+}
+
+fn append_result_view(node: &Element) {
+    let document = web_sys::window().unwrap().document().unwrap();
+    let result = document
+        .get_element_by_id("resultField")
+        .expect("#resultField should exist");
+    let _ = result.append_child(node);
+}
+
+type RenderedEntries = Rc<Vec<(Vec<u8>, String, String)>>;
+
+pub(super) fn render_single_result_with_download((bytes, mime, path): &(Vec<u8>, String, String)) {
     let document = web_sys::window().unwrap().document().unwrap();
     let wrapper = match document.create_element("div") {
         Ok(wrapper) => wrapper,
@@ -657,36 +640,36 @@ pub(super) fn render_single_result_with_download(bytes: Vec<u8>, mime: String, p
         Err(_) => return,
     };
 
-    let filename = result_filename(&path, "download");
+    let filename = result_filename(path, "download");
     set_bracket_button_label(&button, &format!("Download {}", filename));
-    let download_bytes = bytes.clone();
-    let download_mime = mime.clone();
-    let download_filename = filename.clone();
+    let blob = create_blob(bytes, mime);
+    let download_blob = blob.clone();
     let callback = wasm_bindgen::closure::Closure::<dyn FnMut(Event)>::new(move |_event| {
-        if let Some(url) = blob_url(&download_bytes, &download_mime) {
-            click_download_url(&url, &download_filename);
+        if let Some(url) = download_blob.as_ref().and_then(blob_object_url) {
+            click_download_url(url, &filename);
         }
     });
+    let callback = callback.into_js_value();
     let _ = button.add_event_listener_with_callback("click", callback.as_ref().unchecked_ref());
-    callback.forget();
-    prepend_progress_node(&button);
+    append_result_action(&button);
 
     let display_mime = mime.split(';').next().unwrap_or("").trim();
     if display_mime.starts_with("text/") {
-        let text = String::from_utf8_lossy(&bytes);
+        let text = String::from_utf8_lossy(bytes);
         if let Ok(display) = document.create_element("div") {
             display.set_text_content(Some(&text));
             let _ = wrapper.append_child(&display);
         }
-    } else if let Some(url) = blob_url(&bytes, &mime) {
-        let display = create_element_wmt(mime, url);
+    } else if let Some(url) = blob.as_ref().and_then(blob_object_url) {
+        let display = create_element_wmt(mime, &url);
         let _ = wrapper.append_child(&display);
+        ACTIVE_RESULT_OBJECT_URL.with(|active| *active.borrow_mut() = Some(url));
     } else if let Ok(error) = document.create_element("div") {
         error.set_text_content(Some("Could not create display blob"));
         let _ = wrapper.append_child(&error);
     }
 
-    prepend_result_node(&wrapper);
+    append_result_view(&wrapper);
 }
 
 pub(super) fn tar_entries(entries: &[(Vec<u8>, String, String)]) -> Option<Vec<u8>> {
@@ -695,7 +678,7 @@ pub(super) fn tar_entries(entries: &[(Vec<u8>, String, String)]) -> Option<Vec<u
         let cursor = Cursor::new(&mut out);
         let mut builder = Builder::new(cursor);
         for (bytes, _mime, path) in entries.iter() {
-            let name = normalize_bzz_path(&path);
+            let name = normalize_bzz_path(path);
             if name.is_empty() {
                 continue;
             }
@@ -712,10 +695,7 @@ pub(super) fn tar_entries(entries: &[(Vec<u8>, String, String)]) -> Option<Vec<u
     Some(out)
 }
 
-pub(super) fn render_collection_download_button(
-    entries: Rc<Vec<(Vec<u8>, String, String)>>,
-    index: &str,
-) {
+pub(super) fn render_collection_download_button(entries: RenderedEntries, index: &str) {
     let document = web_sys::window().unwrap().document().unwrap();
     let button = match document.create_element("button") {
         Ok(button) => button,
@@ -724,19 +704,19 @@ pub(super) fn render_collection_download_button(
     let filename = format!("{}.tar", result_filename(index, "collection"));
     set_bracket_button_label(&button, &format!("Download {}", filename));
     let callback = wasm_bindgen::closure::Closure::<dyn FnMut(Event)>::new(move |_event| {
-        if let Some(bytes) = tar_entries(&entries) {
-            if let Some(url) = blob_url(&bytes, "application/x-tar") {
-                click_download_url(&url, &filename);
-            }
+        if let Some(bytes) = tar_entries(&entries)
+            && let Some(url) = blob_url(&bytes, "application/x-tar")
+        {
+            click_download_url(url, &filename);
         }
     });
+    let callback = callback.into_js_value();
     let _ = button.add_event_listener_with_callback("click", callback.as_ref().unchecked_ref());
-    callback.forget();
-    prepend_progress_node(&button);
+    append_result_action(&button);
 }
 
 async fn bzz_view_request_is_current(
-    weeb3: &Arc<Weeb3>,
+    weeb3: &InterfaceNode,
     progress_id: &str,
     view_generation: u64,
 ) -> bool {
@@ -755,7 +735,7 @@ async fn bzz_view_request_is_current(
     false
 }
 
-pub(super) async fn open_bzz_resource(weeb3: Arc<Weeb3>, resource: String) {
+pub(super) async fn open_bzz_resource(weeb3: InterfaceNode, resource: String) {
     let view_generation = crate::stream::begin_result_view_request();
     let stream_files = stream_files_when_available();
     let progress_id = weeb3
@@ -830,7 +810,7 @@ pub(super) async fn open_bzz_resource(weeb3: Arc<Weeb3>, resource: String) {
     }
     let (data, indx) = decode_resources(result);
     let ok = !data.is_empty();
-    render_result(data, indx).await;
+    render_result(data, indx);
     weeb3
         .finish_progress(
             &progress_id,
@@ -846,7 +826,7 @@ pub(super) async fn open_bzz_resource(weeb3: Arc<Weeb3>, resource: String) {
 }
 
 pub(super) async fn render_resolved_asset(
-    weeb3: Arc<Weeb3>,
+    weeb3: InterfaceNode,
     resource: &str,
     metadata: BzzMetadata,
     view_generation: u64,
@@ -869,7 +849,7 @@ pub(super) async fn render_resolved_asset(
             return true;
         }
         if let Some(url) = canonical_bzz_url(resource, &metadata) {
-            let index_html = preload_canonical_bzz_frame(&weeb3, resource, &url, &metadata).await;
+            let index_html = preload_canonical_bzz_frame(&weeb3, resource, &metadata).await;
             if !crate::stream::result_view_request_is_current(view_generation) {
                 return true;
             }
@@ -883,26 +863,18 @@ pub(super) async fn render_resolved_asset(
     }
 
     if metadata.size == 0 {
-        render_result(
-            vec![(vec![], metadata.mime.clone(), metadata.path.clone())],
-            metadata.path,
-        )
-        .await;
+        let path = metadata.path;
+        render_result(vec![(vec![], metadata.mime, path.clone())], path);
         return true;
     }
 
-    if let Some((bytes, metadata)) = weeb3
-        .acquire_resolved_range(metadata.clone(), 0, metadata.size - 1)
-        .await
-    {
+    let end = metadata.size - 1;
+    if let Some((bytes, metadata)) = weeb3.acquire_resolved_range(metadata, 0, end).await {
         if !crate::stream::result_view_request_is_current(view_generation) {
             return true;
         }
-        render_result(
-            vec![(bytes, metadata.mime.clone(), metadata.path.clone())],
-            metadata.path,
-        )
-        .await;
+        let path = metadata.path;
+        render_result(vec![(bytes, metadata.mime, path.clone())], path);
         return true;
     }
 
@@ -913,9 +885,8 @@ pub(super) async fn render_resolved_asset(
 }
 
 async fn preload_canonical_bzz_frame(
-    weeb3: &Arc<Weeb3>,
+    weeb3: &InterfaceNode,
     resource: &str,
-    url: &str,
     metadata: &BzzMetadata,
 ) -> Option<Vec<u8>> {
     if metadata.size == 0 {
@@ -946,14 +917,6 @@ async fn preload_canonical_bzz_frame(
 
     match retrieved {
         Some((bytes, _)) if bytes.len() == metadata.size as usize => {
-            crate::stream::warm_bzz_fetch_cache(resource, metadata.clone(), bytes.clone());
-            if let Some(canonical_resource) = strip_canonical_bzz_url_prefix(&url) {
-                crate::stream::warm_bzz_fetch_cache(
-                    canonical_resource,
-                    metadata.clone(),
-                    bytes.clone(),
-                );
-            }
             weeb3
                 .finish_progress(&progress_id, "complete", "website index retrieved", true)
                 .await;
@@ -997,20 +960,6 @@ fn active_bzz_route_prefix() -> &'static str {
     }
 }
 
-fn strip_canonical_bzz_url_prefix(url: &str) -> Option<&str> {
-    for prefix in [
-        "/weeb-3/bzz/",
-        "/weeb-3/mainnet/bzz/",
-        "/weeb-3/testnet/bzz/",
-    ] {
-        if let Some(resource) = url.strip_prefix(prefix) {
-            return Some(resource);
-        }
-    }
-
-    None
-}
-
 pub(super) fn canonical_bzz_url(resource: &str, metadata: &BzzMetadata) -> Option<String> {
     let reference = bzz_reference_hex(resource)?;
     let requested_path = resource
@@ -1040,7 +989,7 @@ pub(super) fn canonical_bzz_url(resource: &str, metadata: &BzzMetadata) -> Optio
 }
 
 pub(super) async fn download_bzz_resource(
-    weeb3: Arc<Weeb3>,
+    weeb3: InterfaceNode,
     resource: String,
     fallback_filename: String,
 ) {
@@ -1073,22 +1022,19 @@ pub(super) async fn download_bzz_resource(
                 format!("{} files", entries.len()),
             )
             .await;
-        match tar_entries(&entries) {
-            Some(bytes) => {
-                if let Some(url) = blob_url(&bytes, "application/x-tar") {
-                    click_download_url(&url, &fallback_filename);
-                    weeb3
-                        .finish_progress(
-                            &progress_id,
-                            "complete",
-                            format!("{} bytes", bytes.len()),
-                            true,
-                        )
-                        .await;
-                    return;
-                }
-            }
-            None => {}
+        if let Some(bytes) = tar_entries(&entries)
+            && let Some(url) = blob_url(&bytes, "application/x-tar")
+        {
+            click_download_url(url, &fallback_filename);
+            weeb3
+                .finish_progress(
+                    &progress_id,
+                    "complete",
+                    format!("{} bytes", bytes.len()),
+                    true,
+                )
+                .await;
+            return;
         }
 
         weeb3
@@ -1102,7 +1048,7 @@ pub(super) async fn download_bzz_resource(
     let filename = result_filename(&path, &fallback_filename);
     match blob_url(&bytes, &mime) {
         Some(url) => {
-            click_download_url(&url, &filename);
+            click_download_url(url, &filename);
             weeb3
                 .finish_progress(
                     &progress_id,
@@ -1122,7 +1068,7 @@ pub(super) async fn download_bzz_resource(
 }
 
 pub(super) fn render_canonical_bzz_frame(
-    weeb3: Arc<Weeb3>,
+    weeb3: InterfaceNode,
     resource: &str,
     url: &str,
     metadata: &BzzMetadata,
@@ -1156,17 +1102,15 @@ pub(super) fn render_canonical_bzz_frame(
     let frame_url = url.to_string();
     let resource = resource.to_string();
     let callback = wasm_bindgen::closure::Closure::<dyn FnMut(Event)>::new(move |_event| {
-        let weeb300 = weeb3.clone();
+        let node = weeb3.clone();
         let resource = resource.clone();
         let filename = download_filename.clone();
         spawn_local(async move {
-            download_bzz_resource(weeb300, resource, filename).await;
+            download_bzz_resource(node, resource, filename).await;
         });
     });
-    let _ = download.add_event_listener_with_callback("click", callback.as_ref().unchecked_ref());
-    callback.forget();
-    prepend_progress_node(&download);
-
+    let callback = callback.into_js_value();
+    let _ = download.add_event_listener_with_callback("click", callback.unchecked_ref());
     let frame = match document.create_element("iframe") {
         Ok(frame) => frame,
         Err(_) => return,
@@ -1179,25 +1123,19 @@ pub(super) fn render_canonical_bzz_frame(
     let _ = frame.set_attribute("referrerpolicy", "same-origin");
 
     let _ = wrapper.append_child(&frame);
-
-    let _ = document
-        .get_element_by_id("resultField")
-        .expect("#resultField should exist")
-        .dyn_ref::<HtmlElement>()
-        .unwrap()
-        .prepend_with_node_1(&wrapper);
+    replace_result_view(&wrapper);
+    append_result_action(&download);
 }
 
 fn srcdoc_with_base(bytes: &[u8], canonical_url: &str) -> String {
     let html = String::from_utf8_lossy(bytes);
     let base = format!(r#"<base href="{}">"#, srcdoc_base_url(canonical_url));
-    let lower = html.to_ascii_lowercase();
 
-    if let Some(head_end) = lower.find("<head>") {
+    if let Some(head_end) = find_ascii_case_insensitive(&html, "<head>") {
         let insert = head_end + "<head>".len();
         format!("{}{}{}", &html[..insert], base, &html[insert..])
-    } else if let Some(head_end) = lower.find("<head ") {
-        match lower[head_end..].find('>') {
+    } else if let Some(head_end) = find_ascii_case_insensitive(&html, "<head ") {
+        match html[head_end..].find('>') {
             Some(offset) => {
                 let insert = head_end + offset + 1;
                 format!("{}{}{}", &html[..insert], base, &html[insert..])
@@ -1209,25 +1147,26 @@ fn srcdoc_with_base(bytes: &[u8], canonical_url: &str) -> String {
     }
 }
 
-fn srcdoc_base_url(canonical_url: &str) -> String {
+fn find_ascii_case_insensitive(haystack: &str, needle: &str) -> Option<usize> {
+    haystack
+        .as_bytes()
+        .windows(needle.len())
+        .position(|candidate| candidate.eq_ignore_ascii_case(needle.as_bytes()))
+}
+
+fn srcdoc_base_url(canonical_url: &str) -> &str {
     match canonical_url.rfind('/') {
-        Some(index) => canonical_url[..=index].to_string(),
-        None => canonical_url.to_string(),
+        Some(index) => &canonical_url[..=index],
+        None => canonical_url,
     }
 }
 
 pub(super) fn stream_files_when_available() -> bool {
     let document = web_sys::window().unwrap().document().unwrap();
-
-    let stream_setting = match document.get_element_by_id("streamFilesWhenAvailable") {
-        Some(stream_setting) => stream_setting,
-        None => return true,
-    };
-
-    match stream_setting.dyn_ref::<HtmlInputElement>() {
-        Some(stream_setting) => stream_setting.checked(),
-        None => true,
-    }
+    document
+        .get_element_by_id("streamFilesWhenAvailable")
+        .and_then(|setting| setting.dyn_into::<HtmlInputElement>().ok())
+        .is_none_or(|setting| setting.checked())
 }
 
 pub(super) fn update_transfer_pause_button(paused: bool) {
@@ -1241,29 +1180,27 @@ pub(super) fn update_transfer_pause_button(paused: bool) {
         .dyn_ref::<HtmlButtonElement>()
         .expect("#transferPauseToggle should be a HtmlButtonElement");
 
-    if paused {
-        set_bracket_button_label(
-            button.unchecked_ref::<Element>(),
-            " Resume retrieve / push ",
-        );
+    let label = if paused {
+        " Resume retrieve / push "
     } else {
-        set_bracket_button_label(button.unchecked_ref::<Element>(), " Pause retrieve / push ");
-    }
+        " Pause retrieve / push "
+    };
+    set_bracket_button_label(button.unchecked_ref::<Element>(), label);
 }
 
-pub(super) fn create_element_wmt(tmype: String, blob_url: String) -> Element {
+pub(super) fn create_element_wmt(mime: &str, blob_url: &str) -> Element {
     let document = web_sys::window().unwrap().document().unwrap();
-    if tmype == "undefined" {
-        let e = document.create_element("div").unwrap();
-        e.set_inner_html("Not found");
-        return e;
+    if mime == "undefined" {
+        let element = document.create_element("div").unwrap();
+        element.set_text_content(Some("Not found"));
+        return element;
     }
 
-    let i = document.create_element("embed").unwrap();
-    let _ = i.set_attribute("src", &blob_url);
-    let _ = i.set_attribute("type", &tmype);
+    let element = document.create_element("embed").unwrap();
+    let _ = element.set_attribute("src", blob_url);
+    let _ = element.set_attribute("type", mime);
 
-    return i;
+    element
 }
 
 pub(crate) fn service_worker_missing() {
@@ -1295,17 +1232,11 @@ pub(crate) fn service_worker_missing() {
 
 pub(super) fn render_text_result(message: &str) {
     let document = web_sys::window().unwrap().document().unwrap();
-    let result = match document.create_element("div") {
-        Ok(result) => result,
-        Err(_) => return,
+    let Ok(result) = document.create_element("div") else {
+        return;
     };
     result.set_text_content(Some(message));
-    let _ = document
-        .get_element_by_id("resultField")
-        .expect("#resultField should exist")
-        .dyn_ref::<HtmlElement>()
-        .unwrap()
-        .prepend_with_node_1(&result);
+    replace_result_view(&result);
 }
 
 pub(super) fn render_log_messages(messages: &[String]) {
@@ -1364,58 +1295,32 @@ pub(super) fn render_progress_rows(rows: Vec<crate::events::ProgressRow>) {
     progress_rows.set_text_content(Some(&lines.join("\n")));
 }
 
-pub(super) async fn render_result(data: Vec<(Vec<u8>, String, String)>, indx: String) {
-    if data.len() == 0 {
-        let new_element = create_element_wmt("undefined".to_string(), "".to_string());
-        prepend_result_node(&new_element);
-    } else if data.len() == 1 {
-        let (bytes, mime, path) = data.into_iter().next().unwrap();
-        render_single_result_with_download(bytes, mime, path);
+pub(super) fn render_result(data: Vec<(Vec<u8>, String, String)>, indx: String) {
+    clear_result_view();
+    if data.is_empty() {
+        let new_element = create_element_wmt("undefined", "");
+        append_result_view(&new_element);
     } else {
         let selected = data
             .iter()
-            .find(|(_, _, path)| *path == indx)
-            .or_else(|| data.get(0))
-            .cloned();
-        if let Some((bytes, mime, path)) = selected {
-            render_single_result_with_download(bytes, mime, path);
+            .position(|(_, _, path)| *path == indx)
+            .unwrap_or(0);
+        render_single_result_with_download(&data[selected]);
+        if data.len() > 1 {
+            render_collection_download_button(Rc::new(data), &indx);
         }
-        render_collection_download_button(Rc::new(data), &indx);
     }
 }
 
-pub fn parsebootconnect(boot_node_masettings_id: String) -> (String, String) {
+fn bootnode_setting(id: &str) -> String {
     let document = web_sys::window().unwrap().document().unwrap();
-
-    let bootnode_input = document
-        .get_element_by_id(&boot_node_masettings_id)
-        .expect(&format!("#{} should exist", boot_node_masettings_id));
-
-    let bootnode_input = bootnode_input
+    let bootnode_element = document
+        .get_element_by_id(id)
+        .unwrap_or_else(|| panic!("#{id} should exist"));
+    let bootnode_input = bootnode_element
         .dyn_ref::<HtmlInputElement>()
-        .expect(&format!(
-            "#{} should be a HtmlInputElement",
-            boot_node_masettings_id
-        ));
-
-    match bootnode_input.value().parse::<String>() {
-        Ok(bootnode_address) => {
-            let network_id_input = document
-                .get_element_by_id("networkIDSettings")
-                .expect("#networkIDSettings should exist");
-
-            let network_id_input = network_id_input
-                .dyn_ref::<HtmlInputElement>()
-                .expect("#networkIDSettings should be a HtmlInputElement");
-
-            match network_id_input.value().parse::<String>() {
-                Ok(network_id) => return (bootnode_address, network_id),
-                _ => return (bootnode_address, "10".to_string()),
-            };
-        }
-        _ => {}
-    };
-    return ("".to_string(), "".to_string());
+        .unwrap_or_else(|| panic!("#{id} should be a HtmlInputElement"));
+    bootnode_input.value()
 }
 
 pub(super) fn service_worker_container() -> Option<web_sys::ServiceWorkerContainer> {
@@ -1454,20 +1359,18 @@ async fn service_worker_registration(
     registration.dyn_into::<ServiceWorkerRegistration>().ok()
 }
 
-fn configured_service_worker_url() -> Option<String> {
+fn configured_service_worker_urls() -> Option<(String, String)> {
     let window = web_sys::window()?;
     let page_url = window.location().href().ok()?;
-    web_sys::Url::new_with_base(STREAMING_SERVICE_WORKER_URL, &page_url)
-        .ok()
-        .map(|url| url.href())
-}
-
-fn configured_service_worker_scope_url() -> Option<String> {
-    let window = web_sys::window()?;
-    let page_url = window.location().href().ok()?;
-    web_sys::Url::new_with_base(STREAMING_SERVICE_WORKER_SCOPE, &page_url)
-        .ok()
-        .map(|url| url.href())
+    let absolute = |path| {
+        web_sys::Url::new_with_base(path, &page_url)
+            .ok()
+            .map(|url| url.href())
+    };
+    Some((
+        absolute(STREAMING_SERVICE_WORKER_URL)?,
+        absolute(STREAMING_SERVICE_WORKER_SCOPE)?,
+    ))
 }
 
 fn expected_service_worker_registration(
@@ -1499,6 +1402,21 @@ fn expected_service_worker_registration(
     true
 }
 
+async fn claim_service_worker_registration(
+    registration: &ServiceWorkerRegistration,
+    expected_worker_url: &str,
+    expected_scope_url: &str,
+) -> Result<Option<web_sys::ServiceWorker>, ()> {
+    if !expected_service_worker_registration(registration, expected_worker_url, expected_scope_url)
+    {
+        return Err(());
+    }
+    let Some(active) = registration.active() else {
+        return Ok(None);
+    };
+    Ok(claim_exact_service_worker(&active).await)
+}
+
 fn warn_about_worker_conflict(worker: &str, expected_scope_url: &str) {
     web_sys::console::warn_1(&JsValue::from_str(&format!(
         "weeb-3 left the existing Service Worker in place ({worker}); integrate the weeb-3 \
@@ -1512,8 +1430,7 @@ pub async fn get_service_worker() -> Option<web_sys::ServiceWorker> {
         service_worker_missing();
         return None;
     };
-    let setup_lock = SERVICE_WORKER_SETUP_LOCK.with(Arc::clone);
-    let _setup_guard = setup_lock.lock_arc().await;
+    let _setup_guard = SERVICE_WORKER_SETUP_LOCK.lock().await;
     get_service_worker_locked(&service0).await
 }
 
@@ -1522,8 +1439,7 @@ fn start_service_worker_setup_if_idle() -> bool {
         service_worker_missing();
         return false;
     };
-    let setup_lock = SERVICE_WORKER_SETUP_LOCK.with(Arc::clone);
-    let Some(setup_guard) = setup_lock.try_lock_arc() else {
+    let Some(setup_guard) = SERVICE_WORKER_SETUP_LOCK.try_lock() else {
         // A setup attempt already owns registration/update. Readiness keeps
         // polling the exact implementation and retries after the lock is free.
         return false;
@@ -1538,20 +1454,19 @@ fn start_service_worker_setup_if_idle() -> bool {
 async fn get_service_worker_locked(
     service0: &web_sys::ServiceWorkerContainer,
 ) -> Option<web_sys::ServiceWorker> {
-    let expected_worker_url = configured_service_worker_url()?;
-    let expected_scope_url = configured_service_worker_scope_url()?;
+    let (expected_worker_url, expected_scope_url) = configured_service_worker_urls()?;
     // Never replace an unrelated host application's worker. It may opt into
     // the exact forwarding implementation without using weeb-3's script URL.
-    if let Some(controller) = controlled_service_worker() {
-        if controller.script_url() != expected_worker_url {
-            if service_worker_forwarder_ready_with_timeout(1_500).await {
-                return Some(controller);
-            }
-            warn_about_worker_conflict(&controller.script_url(), &expected_scope_url);
-            return None;
+    if let Some(controller) = controlled_service_worker()
+        && controller.script_url() != expected_worker_url
+    {
+        if service_worker_forwarder_ready_with_timeout(1_500).await {
+            return Some(controller);
         }
+        warn_about_worker_conflict(&controller.script_url(), &expected_scope_url);
+        return None;
     }
-    if let Some(registration) = service_worker_registration(&service0).await {
+    if let Some(registration) = service_worker_registration(service0).await {
         if !expected_service_worker_registration(
             &registration,
             &expected_worker_url,
@@ -1565,17 +1480,15 @@ async fn get_service_worker_locked(
             let _ =
                 async_std::future::timeout(Duration::from_secs(10), JsFuture::from(update)).await;
         }
-        if !expected_service_worker_registration(
+        if let Some(controller) = claim_service_worker_registration(
             &registration,
             &expected_worker_url,
             &expected_scope_url,
-        ) {
-            return None;
-        }
-        if let Some(active) = registration.active() {
-            if let Some(controller) = claim_exact_service_worker(&active).await {
-                return Some(controller);
-            }
+        )
+        .await
+        .ok()?
+        {
+            return Some(controller);
         }
     }
 
@@ -1595,42 +1508,31 @@ async fn get_service_worker_locked(
     .await
     {
         Ok(Ok(registration)) => {
-            if let Ok(registration) = registration.dyn_into::<ServiceWorkerRegistration>() {
-                if !expected_service_worker_registration(
+            if let Ok(registration) = registration.dyn_into::<ServiceWorkerRegistration>()
+                && let Some(controller) = claim_service_worker_registration(
                     &registration,
                     &expected_worker_url,
                     &expected_scope_url,
-                ) {
-                    return None;
-                }
-                if let Some(service_worker) = registration.active() {
-                    if let Some(controller) = claim_exact_service_worker(&service_worker).await {
-                        return Some(controller);
-                    }
-                }
+                )
+                .await
+                .ok()?
+            {
+                return Some(controller);
             }
 
-            if let Ok(ready) = service0.ready() {
-                if let Ok(Ok(registration)) =
+            if let Ok(ready) = service0.ready()
+                && let Ok(Ok(registration)) =
                     async_std::future::timeout(Duration::from_secs(10), JsFuture::from(ready)).await
-                {
-                    if let Ok(registration) = registration.dyn_into::<ServiceWorkerRegistration>() {
-                        if !expected_service_worker_registration(
-                            &registration,
-                            &expected_worker_url,
-                            &expected_scope_url,
-                        ) {
-                            return None;
-                        }
-                        if let Some(service_worker) = registration.active() {
-                            if let Some(controller) =
-                                claim_exact_service_worker(&service_worker).await
-                            {
-                                return Some(controller);
-                            }
-                        }
-                    }
-                }
+                && let Ok(registration) = registration.dyn_into::<ServiceWorkerRegistration>()
+                && let Some(controller) = claim_service_worker_registration(
+                    &registration,
+                    &expected_worker_url,
+                    &expected_scope_url,
+                )
+                .await
+                .ok()?
+            {
+                return Some(controller);
             }
         }
         Ok(Err(err)) => {
@@ -1641,26 +1543,15 @@ async fn get_service_worker_locked(
         )),
     }
 
-    let registration = service_worker_registration(&service0).await?;
-    if !expected_service_worker_registration(
-        &registration,
-        &expected_worker_url,
-        &expected_scope_url,
-    ) {
-        return None;
-    }
-    let active = registration.active()?;
-    claim_exact_service_worker(&active).await
+    let registration = service_worker_registration(service0).await?;
+    claim_service_worker_registration(&registration, &expected_worker_url, &expected_scope_url)
+        .await
+        .ok()
+        .flatten()
 }
 
 fn controlled_service_worker() -> Option<web_sys::ServiceWorker> {
-    let Some(service0) = service_worker_container() else {
-        return None;
-    };
-    js_sys::Reflect::get(service0.as_ref(), &JsValue::from_str("controller"))
-        .ok()?
-        .dyn_into::<web_sys::ServiceWorker>()
-        .ok()
+    service_worker_container()?.controller()
 }
 
 async fn service_worker_forwarder_ready() -> bool {
@@ -1719,22 +1610,11 @@ async fn service_worker_protocol_request(
     let expected_response_type = response_type.to_string();
     let callback = Closure::<dyn FnMut(MessageEvent)>::new(move |event: MessageEvent| {
         let data = event.data();
-        let matches = Reflect::get(&data, &JsValue::from_str("type"))
-            .ok()
-            .and_then(|value| value.as_string())
+        let matches = string_property(&data, "type")
             .is_some_and(|value| value == expected_response_type)
-            && Reflect::get(&data, &JsValue::from_str("protocol"))
-                .ok()
-                .and_then(|value| value.as_f64())
-                == Some(SERVICE_WORKER_PROTOCOL)
-            && Reflect::get(&data, &JsValue::from_str("scope"))
-                .ok()
-                .and_then(|value| value.as_string())
-                .is_some_and(|scope| scope == expected_scope)
-            && Reflect::get(&data, &JsValue::from_str("marker"))
-                .ok()
-                .and_then(|value| value.as_string())
-                .is_some_and(|marker| marker == expected_marker);
+            && number_property(&data, "protocol") == Some(SERVICE_WORKER_PROTOCOL)
+            && string_property(&data, "scope").is_some_and(|scope| scope == expected_scope)
+            && string_property(&data, "marker").is_some_and(|marker| marker == expected_marker);
         let _ = sender.try_send(matches);
     });
     let protocol_port = ServiceWorkerProtocolPort {
@@ -1747,15 +1627,11 @@ async fn service_worker_protocol_request(
     protocol_port.port.start();
 
     let ping = Object::new();
-    let _ = Reflect::set(
+    set_js(&ping, "type", JsValue::from_str(request_type));
+    set_js(
         &ping,
-        &JsValue::from_str("type"),
-        &JsValue::from_str(request_type),
-    );
-    let _ = Reflect::set(
-        &ping,
-        &JsValue::from_str("protocol"),
-        &JsValue::from_f64(SERVICE_WORKER_PROTOCOL),
+        "protocol",
+        JsValue::from_f64(SERVICE_WORKER_PROTOCOL),
     );
     let transfer = Array::new();
     transfer.push(&channel.port2());
@@ -1787,7 +1663,7 @@ pub(crate) fn service_worker_scope_protocol_error(purpose: &str) -> String {
 }
 
 async fn wait_for_service_worker_control(
-    weeb3: &Arc<Weeb3>,
+    weeb3: &InterfaceNode,
     purpose: &str,
     still_needed: &impl Fn() -> bool,
 ) -> bool {
@@ -1847,7 +1723,7 @@ async fn wait_for_service_worker_control(
 }
 
 pub(crate) async fn service_worker_controls_bzz_requests(
-    weeb3: &Arc<Weeb3>,
+    weeb3: &InterfaceNode,
     purpose: &str,
     still_needed: impl Fn() -> bool,
 ) -> bool {

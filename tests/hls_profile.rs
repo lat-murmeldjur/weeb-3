@@ -11,24 +11,32 @@ use anyhow_crates_io::{Context, Result, anyhow};
 use headless_chrome::protocol::cdp::Network::{
     ClearBrowserCache, Enable as EnableNetwork, SetCacheDisabled,
 };
-use headless_chrome::protocol::cdp::Page::AddScriptToEvaluateOnNewDocument;
 use headless_chrome::protocol::cdp::types::Event;
+use headless_chrome::protocol::cdp::{Page::AddScriptToEvaluateOnNewDocument, Target::GetTargets};
 use headless_chrome::{Browser, LaunchOptionsBuilder};
 use serde::Serialize;
-use serde_json_crates_io::{Value, json};
+use serde_json::{Value, json};
+use sha3_crates_io::{Digest, Sha3_256};
 use std::{
+    collections::{HashMap, HashSet},
     env,
     ffi::OsStr,
     fs,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    process::Command,
+    sync::{Arc, Mutex, mpsc},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 
 const DEFAULT_PROFILE_SECONDS: u64 = 75;
 const DEFAULT_MAX_STARTUP_MS: u64 = 5_000;
-const DEFAULT_MAX_STALL_MS: u64 = 2_500;
+// A media clock may appear stationary between two 250 ms samples because of
+// timestamp quantization. Anything beyond one sampling interval is observable
+// playback interruption, while waiting/stalled/paused events always fail.
+const DEFAULT_MAX_STALL_MS: u64 = 250;
+const RESOURCE_SAMPLE_INTERVAL: Duration = Duration::from_millis(500);
 
 const PROFILE_SCRIPT: &str = r#"
 (() => {
@@ -53,8 +61,11 @@ const PROFILE_SCRIPT: &str = r#"
         events: [],
         page_errors: [],
         interface_logs: [],
+        connection_logs: [],
+        shared_worker_attached: false,
         hls_open_log: null,
-        refreshment_logs: []
+        refreshment_logs: [],
+        lifecycle_logs: []
     };
 
     const finite = value => Number.isFinite(value) ? value : null;
@@ -208,12 +219,25 @@ const PROFILE_SCRIPT: &str = r#"
             logged.add(node);
             profile.interface_logs.push(text);
             if (profile.interface_logs.length > 4096) profile.interface_logs.shift();
+            if (/Connected to (?:peer|bootnode) /.test(text)) {
+                profile.connection_logs.push(text);
+                if (profile.connection_logs.length > 512) profile.connection_logs.shift();
+            }
+            if (text.includes('Attached to the SharedWorker node')) {
+                profile.shared_worker_attached = true;
+            }
             if (profile.hls_open_log === null && /HLS open index=.*elapsed=/.test(text)) {
                 profile.hls_open_log = text;
             }
             if (/refresh|feed update/i.test(text)) {
                 profile.refreshment_logs.push(text);
                 if (profile.refreshment_logs.length > 2048) profile.refreshment_logs.shift();
+            }
+            if (
+                /(?:Disconnected from|Connection closed|Queued reconnect|Closed unowned|ambiguous|not dispatched)/i.test(text)
+            ) {
+                profile.lifecycle_logs.push(text);
+                if (profile.lifecycle_logs.length > 1024) profile.lifecycle_logs.shift();
             }
         });
     };
@@ -344,6 +368,41 @@ const PLAYLIST_SCRIPT: &str = r#"
 })()
 "#;
 
+const SERVED_ASSET_PROVENANCE_SCRIPT: &str = r#"
+(async () => {
+    const base = new URL('/weeb-3/', location.origin);
+    const hex = bytes => Array.from(new Uint8Array(bytes), byte =>
+        byte.toString(16).padStart(2, '0')).join('');
+    const assets = [];
+    for (const name of [
+        'weeb_3.js', 'weeb_3_bg.wasm', 'service.js', 'worker.js'
+    ]) {
+        const url = new URL(name, base).href;
+        try {
+            const response = await fetch(url, { cache: 'no-store' });
+            const body = await response.arrayBuffer();
+            assets.push({
+                name,
+                url,
+                status: response.status,
+                ok: response.ok,
+                bytes: body.byteLength,
+                sha256: hex(await crypto.subtle.digest('SHA-256', body)),
+                etag: response.headers.get('etag'),
+                last_modified: response.headers.get('last-modified')
+            });
+        } catch (error) {
+            assets.push({ name, url, error: String(error?.message || error) });
+        }
+    }
+    return JSON.stringify({
+        user_agent: navigator.userAgent,
+        hardware_concurrency: navigator.hardwareConcurrency || null,
+        assets
+    });
+})()
+"#;
+
 #[derive(Clone, Debug, Serialize)]
 struct WebSocketBurstSummary {
     total_created: usize,
@@ -353,6 +412,477 @@ struct WebSocketBurstSummary {
     created_within_5s: usize,
     attempt_160_ms: Option<f64>,
     first_to_attempt_160_ms: Option<f64>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct UsableConnectionSummary {
+    source: &'static str,
+    total_unique_ready: usize,
+    first_ready_ms: Option<f64>,
+    ready_within_3s: usize,
+    ready_within_5s: usize,
+    ready_40_ms: Option<f64>,
+    ready_80_ms: Option<f64>,
+    ready_160_ms: Option<f64>,
+    ready_200_ms: Option<f64>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ResourcePhase {
+    Startup,
+    SteadyPlayback,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct BrowserResourceSample {
+    at_ms: f64,
+    interval_ms: f64,
+    phase: ResourcePhase,
+    process_count: usize,
+    resident_bytes: u64,
+    private_equivalent_bytes: u64,
+    accumulated_cpu_ms: u64,
+    cpu_delta_ms: u64,
+    processes: Vec<BrowserProcessResourceSample>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct BrowserProcessResourceSample {
+    pid: u32,
+    parent_pid: Option<u32>,
+    process_type: String,
+    utility_sub_type: Option<String>,
+    resident_bytes: u64,
+    private_equivalent_bytes: u64,
+    accumulated_cpu_ms: u64,
+    cpu_delta_ms: u64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct BrowserResourcePhaseSummary {
+    sample_count: usize,
+    observed_ms: f64,
+    average_resident_bytes: Option<f64>,
+    peak_resident_bytes: Option<u64>,
+    average_private_equivalent_bytes: Option<f64>,
+    peak_private_equivalent_bytes: Option<u64>,
+    accumulated_cpu_ms: u64,
+    average_cpu_cores: Option<f64>,
+    average_cpu_percent_of_machine: Option<f64>,
+    maximum_process_count: Option<usize>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct BrowserResourceSummary {
+    root_pid: u32,
+    sample_interval_ms: u64,
+    logical_cpu_count: usize,
+    memory_scope: &'static str,
+    private_equivalent_metric: &'static str,
+    startup: BrowserResourcePhaseSummary,
+    steady_playback: BrowserResourcePhaseSummary,
+    samples: Vec<BrowserResourceSample>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct TransferWindowSummary {
+    completed_responses: usize,
+    encoded_bytes: u64,
+    decoded_bytes: u64,
+    observed_ms: f64,
+    encoded_mib_per_second: Option<f64>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct HlsEfficiencySummary {
+    all_hls_responses: TransferWindowSummary,
+    steady_playback: TransferWindowSummary,
+    cpu_seconds: f64,
+    cpu_seconds_per_encoded_mib: Option<f64>,
+    buffer_growth_s: Option<f64>,
+    media_plus_buffer_growth_s: Option<f64>,
+    cpu_seconds_per_media_plus_buffer_second: Option<f64>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct GitProvenance {
+    worktree: Option<String>,
+    head: Option<String>,
+    dirty: Option<bool>,
+    changed_entries: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct FileProvenance {
+    path: String,
+    bytes: u64,
+    modified_unix_ms: Option<u128>,
+    sha3_256: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct RunProvenance {
+    variant: Option<String>,
+    harness_git: GitProvenance,
+    harness_executable: Option<FileProvenance>,
+    server_git: Option<GitProvenance>,
+    server_executable: Option<FileProvenance>,
+    served_assets: Value,
+}
+
+enum ResourceSamplerCommand {
+    MarkSteadyPlayback,
+    Stop,
+}
+
+struct BrowserResourceSampler {
+    root_pid: u32,
+    commands: Option<mpsc::Sender<ResourceSamplerCommand>>,
+    thread: Option<thread::JoinHandle<Vec<BrowserResourceSample>>>,
+}
+
+impl BrowserResourceSampler {
+    fn start(root_pid: u32) -> Self {
+        let (commands, receiver) = mpsc::channel();
+        let thread = thread::spawn(move || sample_browser_process_tree(root_pid, receiver));
+        Self {
+            root_pid,
+            commands: Some(commands),
+            thread: Some(thread),
+        }
+    }
+
+    fn mark_steady_playback(&self) -> Result<()> {
+        self.commands
+            .as_ref()
+            .ok_or_else(|| anyhow!("browser resource sampler has already stopped"))?
+            .send(ResourceSamplerCommand::MarkSteadyPlayback)
+            .map_err(|_| anyhow!("browser resource sampler stopped before playback"))
+    }
+
+    fn finish(mut self) -> Result<BrowserResourceSummary> {
+        if let Some(commands) = self.commands.take() {
+            let _ = commands.send(ResourceSamplerCommand::Stop);
+        }
+        let samples = self
+            .thread
+            .take()
+            .ok_or_else(|| anyhow!("browser resource sampler thread was missing"))?
+            .join()
+            .map_err(|_| anyhow!("browser resource sampler thread panicked"))?;
+        Ok(summarize_browser_resources(self.root_pid, samples))
+    }
+}
+
+impl Drop for BrowserResourceSampler {
+    fn drop(&mut self) {
+        if let Some(commands) = self.commands.take() {
+            let _ = commands.send(ResourceSamplerCommand::Stop);
+        }
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+fn sample_browser_process_tree(
+    root_pid: u32,
+    receiver: mpsc::Receiver<ResourceSamplerCommand>,
+) -> Vec<BrowserResourceSample> {
+    let root = Pid::from_u32(root_pid);
+    let refresh_kind = ProcessRefreshKind::nothing()
+        .with_memory()
+        .with_cpu()
+        .with_cmd(UpdateKind::OnlyIfNotSet)
+        .without_tasks();
+    let started = Instant::now();
+    let mut system = System::new();
+    let mut samples = Vec::new();
+    let mut phase = ResourcePhase::Startup;
+    let mut previous_at_ms = 0.0;
+    let mut previous_cpu = HashMap::<(u32, u64), u64>::new();
+    let mut take_sample = |phase| {
+        system.refresh_processes_specifics(ProcessesToUpdate::All, true, refresh_kind);
+        let pids = browser_process_tree(&system, root);
+        let at_ms = started.elapsed().as_secs_f64() * 1_000.0;
+        let interval_ms = (at_ms - previous_at_ms).max(0.0);
+        previous_at_ms = at_ms;
+        let mut resident_bytes = 0u64;
+        let mut private_equivalent_bytes = 0u64;
+        let mut accumulated_cpu_ms = 0u64;
+        let mut cpu_delta_ms = 0u64;
+        let mut processes = Vec::with_capacity(pids.len());
+
+        for pid in &pids {
+            let Some(process) = system.process(*pid) else {
+                continue;
+            };
+            resident_bytes = resident_bytes.saturating_add(process.memory());
+            private_equivalent_bytes =
+                private_equivalent_bytes.saturating_add(process.virtual_memory());
+            let accumulated = process.accumulated_cpu_time();
+            accumulated_cpu_ms = accumulated_cpu_ms.saturating_add(accumulated);
+            let identity = (pid.as_u32(), process.start_time());
+            // A process's accumulated value covers its whole lifetime. Establish a
+            // baseline on first observation instead of charging that lifetime to one
+            // 500 ms sample; subsequent samples account for every measured delta.
+            let process_cpu_delta_ms = previous_cpu
+                .insert(identity, accumulated)
+                .map_or(0, |previous| accumulated.saturating_sub(previous));
+            cpu_delta_ms = cpu_delta_ms.saturating_add(process_cpu_delta_ms);
+            let (process_type, utility_sub_type) = edge_process_type(process, *pid == root);
+            processes.push(BrowserProcessResourceSample {
+                pid: pid.as_u32(),
+                parent_pid: process.parent().map(|parent| parent.as_u32()),
+                process_type,
+                utility_sub_type,
+                resident_bytes: process.memory(),
+                private_equivalent_bytes: process.virtual_memory(),
+                accumulated_cpu_ms: accumulated,
+                cpu_delta_ms: process_cpu_delta_ms,
+            });
+        }
+        processes.sort_unstable_by_key(|process| process.pid);
+
+        samples.push(BrowserResourceSample {
+            at_ms,
+            interval_ms,
+            phase,
+            process_count: pids.len(),
+            resident_bytes,
+            private_equivalent_bytes,
+            accumulated_cpu_ms,
+            cpu_delta_ms,
+            processes,
+        });
+    };
+
+    take_sample(phase);
+    loop {
+        match receiver.recv_timeout(RESOURCE_SAMPLE_INTERVAL) {
+            Ok(ResourceSamplerCommand::MarkSteadyPlayback) => {
+                // Close the startup interval before changing phases so startup
+                // CPU is not charged to steady playback.
+                take_sample(phase);
+                phase = ResourcePhase::SteadyPlayback;
+            }
+            Ok(ResourceSamplerCommand::Stop) | Err(mpsc::RecvTimeoutError::Disconnected) => {
+                take_sample(phase);
+                break;
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => take_sample(phase),
+        }
+    }
+    samples
+}
+
+fn edge_process_type(process: &sysinfo::Process, root: bool) -> (String, Option<String>) {
+    let flag = |prefix: &str| {
+        process.cmd().iter().find_map(|argument| {
+            argument
+                .to_string_lossy()
+                .strip_prefix(prefix)
+                .map(str::to_owned)
+        })
+    };
+    let process_type = flag("--type=").unwrap_or_else(|| {
+        if root {
+            "browser".to_string()
+        } else {
+            process.name().to_string_lossy().into_owned()
+        }
+    });
+    (process_type, flag("--utility-sub-type="))
+}
+
+fn browser_process_tree(system: &System, root: Pid) -> HashSet<Pid> {
+    let mut tree = HashSet::from([root]);
+    loop {
+        let mut changed = false;
+        for (pid, process) in system.processes() {
+            if process
+                .parent()
+                .is_some_and(|parent| tree.contains(&parent))
+            {
+                changed |= tree.insert(*pid);
+            }
+        }
+        if !changed {
+            return tree;
+        }
+    }
+}
+
+fn summarize_browser_resources(
+    root_pid: u32,
+    samples: Vec<BrowserResourceSample>,
+) -> BrowserResourceSummary {
+    let logical_cpu_count = thread::available_parallelism().map_or(1, usize::from);
+    BrowserResourceSummary {
+        root_pid,
+        sample_interval_ms: RESOURCE_SAMPLE_INTERVAL.as_millis() as u64,
+        logical_cpu_count,
+        memory_scope: "sum of the Edge root process and all live descendants",
+        private_equivalent_metric: if cfg!(target_os = "windows") {
+            "Windows process PrivateUsage"
+        } else {
+            "process virtual memory"
+        },
+        startup: summarize_resource_phase(&samples, ResourcePhase::Startup, logical_cpu_count),
+        steady_playback: summarize_resource_phase(
+            &samples,
+            ResourcePhase::SteadyPlayback,
+            logical_cpu_count,
+        ),
+        samples,
+    }
+}
+
+fn summarize_resource_phase(
+    samples: &[BrowserResourceSample],
+    phase: ResourcePhase,
+    logical_cpu_count: usize,
+) -> BrowserResourcePhaseSummary {
+    let phase_samples: Vec<_> = samples
+        .iter()
+        .filter(|sample| sample.phase == phase)
+        .collect();
+    let observed_ms = phase_samples
+        .iter()
+        .map(|sample| sample.interval_ms)
+        .sum::<f64>();
+    let accumulated_cpu_ms = phase_samples
+        .iter()
+        .map(|sample| sample.cpu_delta_ms)
+        .sum::<u64>();
+    let weighted_average = |value: fn(&BrowserResourceSample) -> u64| {
+        if phase_samples.is_empty() {
+            return None;
+        }
+        if observed_ms > 0.0 {
+            Some(
+                phase_samples
+                    .iter()
+                    .map(|sample| value(sample) as f64 * sample.interval_ms)
+                    .sum::<f64>()
+                    / observed_ms,
+            )
+        } else {
+            Some(
+                phase_samples
+                    .iter()
+                    .map(|sample| value(sample) as f64)
+                    .sum::<f64>()
+                    / phase_samples.len() as f64,
+            )
+        }
+    };
+    let average_cpu_cores = (observed_ms > 0.0).then_some(accumulated_cpu_ms as f64 / observed_ms);
+
+    BrowserResourcePhaseSummary {
+        sample_count: phase_samples.len(),
+        observed_ms,
+        average_resident_bytes: weighted_average(|sample| sample.resident_bytes),
+        peak_resident_bytes: phase_samples
+            .iter()
+            .map(|sample| sample.resident_bytes)
+            .max(),
+        average_private_equivalent_bytes: weighted_average(|sample| {
+            sample.private_equivalent_bytes
+        }),
+        peak_private_equivalent_bytes: phase_samples
+            .iter()
+            .map(|sample| sample.private_equivalent_bytes)
+            .max(),
+        accumulated_cpu_ms,
+        average_cpu_cores,
+        average_cpu_percent_of_machine: average_cpu_cores
+            .map(|cores| cores * 100.0 / logical_cpu_count as f64),
+        maximum_process_count: phase_samples
+            .iter()
+            .map(|sample| sample.process_count)
+            .max(),
+    }
+}
+
+fn summarize_hls_efficiency(
+    metrics: &Value,
+    playback: &PlaybackSummary,
+    steady_resources: &BrowserResourcePhaseSummary,
+) -> HlsEfficiencySummary {
+    let resources: Vec<&Value> = metrics
+        .get("hls_resources")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .collect();
+    let all_start_ms = resources
+        .iter()
+        .filter_map(|resource| number_at(resource, "/start_ms"))
+        .reduce(f64::min);
+    let all_end_ms = resources
+        .iter()
+        .filter_map(|resource| number_at(resource, "/response_end_ms"))
+        .reduce(f64::max);
+    let all_observed_ms = all_start_ms
+        .zip(all_end_ms)
+        .map_or(0.0, |(start, end)| (end - start).max(0.0));
+    let first_playing_ms = number_at(metrics, "/marks/first_confirmed_playback_ms");
+    let steady_end_ms = first_playing_ms.map(|start| start + steady_resources.observed_ms);
+    let completed_during_steady: Vec<&Value> = resources
+        .iter()
+        .copied()
+        .filter(|resource| {
+            number_at(resource, "/response_end_ms").is_some_and(|completed| {
+                first_playing_ms.is_some_and(|start| completed >= start)
+                    && steady_end_ms.is_some_and(|end| completed <= end)
+            })
+        })
+        .collect();
+    let all_hls_responses = summarize_transfer_window(&resources, all_observed_ms);
+    let steady_playback =
+        summarize_transfer_window(&completed_during_steady, steady_resources.observed_ms);
+    let cpu_seconds = steady_resources.accumulated_cpu_ms as f64 / 1_000.0;
+    let encoded_mib = steady_playback.encoded_bytes as f64 / (1024.0 * 1024.0);
+    let buffer_growth_s = playback
+        .start_buffer_s
+        .zip(playback.final_buffer_s)
+        .map(|(start, end)| end - start);
+    let media_plus_buffer_growth_s =
+        buffer_growth_s.map(|growth| playback.media_advance_s + growth);
+
+    HlsEfficiencySummary {
+        all_hls_responses,
+        steady_playback,
+        cpu_seconds,
+        cpu_seconds_per_encoded_mib: (encoded_mib > 0.0).then_some(cpu_seconds / encoded_mib),
+        buffer_growth_s,
+        media_plus_buffer_growth_s,
+        cpu_seconds_per_media_plus_buffer_second: media_plus_buffer_growth_s
+            .filter(|seconds| *seconds > 0.0)
+            .map(|seconds| cpu_seconds / seconds),
+    }
+}
+
+fn summarize_transfer_window(resources: &[&Value], observed_ms: f64) -> TransferWindowSummary {
+    let encoded_bytes = resources
+        .iter()
+        .filter_map(|resource| resource.get("encoded_bytes").and_then(Value::as_u64))
+        .sum();
+    let decoded_bytes = resources
+        .iter()
+        .filter_map(|resource| resource.get("decoded_bytes").and_then(Value::as_u64))
+        .sum();
+    let observed_seconds = observed_ms / 1_000.0;
+    let encoded_mib = encoded_bytes as f64 / (1024.0 * 1024.0);
+    TransferWindowSummary {
+        completed_responses: resources.len(),
+        encoded_bytes,
+        decoded_bytes,
+        observed_ms,
+        encoded_mib_per_second: (observed_seconds > 0.0).then_some(encoded_mib / observed_seconds),
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -407,6 +937,24 @@ fn weeb3_hls_profile() -> Result<()> {
     let max_stall_ms = env_u64("WEEB3_HLS_MAX_STALL_MS", DEFAULT_MAX_STALL_MS)?;
     let minimum_progress_ratio = env_f64("WEEB3_HLS_MIN_PROGRESS_RATIO", 0.75)?;
     let seek_seconds = env_optional_f64("WEEB3_HLS_SEEK_SECONDS")?;
+    let connection_validation =
+        env::var("WEEB3_HLS_CONNECTION_VALIDATION").unwrap_or_else(|_| "page_cdp".to_string());
+    let shared_worker_connection_logs = match connection_validation.as_str() {
+        "page_cdp" => false,
+        "shared_worker_logs" => true,
+        value => {
+            return Err(anyhow!(
+                "WEEB3_HLS_CONNECTION_VALIDATION must be page_cdp or shared_worker_logs, not {value}"
+            ));
+        }
+    };
+    let minimum_usable_connections = env_u64("WEEB3_HLS_MIN_USABLE_CONNECTIONS", 1)? as usize;
+    let max_usable_connection_ms = env_u64("WEEB3_HLS_MAX_USABLE_CONNECTION_MS", 10_000)? as f64;
+    if shared_worker_connection_logs && minimum_usable_connections == 0 {
+        return Err(anyhow!(
+            "WEEB3_HLS_MIN_USABLE_CONNECTIONS must be positive for shared_worker_logs validation"
+        ));
+    }
     let require_buffer_growth = env_bool(
         "WEEB3_HLS_REQUIRE_BUFFER_GROWTH",
         !live_target && profile_seconds >= 60,
@@ -419,6 +967,9 @@ fn weeb3_hls_profile() -> Result<()> {
 
     let timeout = Duration::from_secs(profile_seconds.saturating_add(45));
     let browser = launch_fresh_edge(timeout)?;
+    let browser_root_pid = browser
+        .get_process_id()
+        .ok_or_else(|| anyhow!("Edge did not expose its root process id"))?;
     let tab = browser
         .new_tab()
         .map_err(|error| anyhow!("failed to open HLS profile tab: {error:?}"))?;
@@ -511,6 +1062,7 @@ fn weeb3_hls_profile() -> Result<()> {
         }))
         .map_err(|error| anyhow!("failed to observe WebSocket creation: {error:?}"))?;
 
+    let resource_sampler = BrowserResourceSampler::start(browser_root_pid);
     *navigation_start
         .lock()
         .map_err(|_| anyhow!("navigation clock lock was poisoned"))? = Some(Instant::now());
@@ -532,11 +1084,24 @@ fn weeb3_hls_profile() -> Result<()> {
         cold_playing
     };
     if playing.is_some() {
+        resource_sampler.mark_steady_playback()?;
         thread::sleep(Duration::from_secs(profile_seconds));
     }
+    let resource_usage = resource_sampler.finish()?;
 
     let final_playlist = evaluate_playlist(&tab)?;
     let browser_metrics = evaluate_profile(&tab)?;
+    let browser_targets = match tab.call_method(GetTargets { filter: None }) {
+        Ok(snapshot) => json!({
+            "captured_after_playback": true,
+            "target_infos": snapshot.target_infos
+        }),
+        Err(error) => json!({
+            "captured_after_playback": true,
+            "error": format!("{error:?}")
+        }),
+    };
+    let served_assets = evaluate_served_asset_provenance(&tab)?;
     let socket_times = websocket_times
         .lock()
         .map_err(|_| anyhow!("WebSocket timing lock was poisoned"))?
@@ -559,6 +1124,10 @@ fn weeb3_hls_profile() -> Result<()> {
         .map_err(|_| anyhow!("HLS network event lock was poisoned"))?
         .clone();
     let playback = summarize_playback(&browser_metrics, profile_seconds as f64);
+    let efficiency =
+        summarize_hls_efficiency(&browser_metrics, &playback, &resource_usage.steady_playback);
+    let usable_connections = summarize_usable_connections(&browser_metrics);
+    let provenance = collect_run_provenance(served_assets)?;
 
     let report = json!({
         "target_url": target_url,
@@ -569,10 +1138,19 @@ fn weeb3_hls_profile() -> Result<()> {
             "max_startup_ms": max_startup_ms,
             "max_stall_ms": max_stall_ms,
             "minimum_progress_ratio": minimum_progress_ratio,
-            "require_buffer_growth": require_buffer_growth
+            "require_buffer_growth": require_buffer_growth,
+            "connection_validation": connection_validation,
+            "minimum_usable_connections": minimum_usable_connections,
+            "max_usable_connection_ms": max_usable_connection_ms
         },
         "summary": {
             "playback": playback,
+            "browser_process_tree": {
+                "startup": &resource_usage.startup,
+                "steady_playback": &resource_usage.steady_playback
+            },
+            "hls_efficiency": efficiency,
+            "usable_connections": usable_connections,
             "websocket_burst": websocket_burst,
             "websocket_request_burst": websocket_request_burst,
             "websocket_handshake_burst": websocket_handshake_burst
@@ -580,13 +1158,16 @@ fn weeb3_hls_profile() -> Result<()> {
         "playlist_at_start": startup_playlist,
         "playlist_at_end": final_playlist,
         "hls_network": hls_network,
-        "browser": browser_metrics
+        "browser_process_tree": resource_usage,
+        "browser_targets": browser_targets,
+        "browser": browser_metrics,
+        "provenance": provenance
     });
     let output = write_report(&report)?;
     println!("HLS profile written to {output}");
     println!(
         "HLS profile summary: {}",
-        serde_json_crates_io::to_string_pretty(&report["summary"])
+        serde_json::to_string_pretty(&report["summary"])
             .context("failed to serialize HLS summary")?
     );
 
@@ -621,7 +1202,18 @@ fn weeb3_hls_profile() -> Result<()> {
         &final_playlist,
         !live_target || seek_seconds.is_some(),
     )?;
-    validate_connection_burst(&websocket_burst)?;
+    if shared_worker_connection_logs {
+        println!(
+            "SharedWorker socket construction is outside page-target CDP; explicitly validating timestamped usable-connection logs"
+        );
+        validate_shared_worker_connections(
+            &browser_metrics,
+            minimum_usable_connections,
+            max_usable_connection_ms,
+        )?;
+    } else {
+        validate_connection_burst(&websocket_burst)?;
+    }
     Ok(())
 }
 
@@ -699,7 +1291,18 @@ fn evaluate_profile(tab: &headless_chrome::browser::tab::Tab) -> Result<Value> {
         .value
         .and_then(|value| value.as_str().map(ToOwned::to_owned))
         .ok_or_else(|| anyhow!("Edge did not return HLS profile JSON"))?;
-    serde_json_crates_io::from_str(&raw).context("failed to parse HLS profile JSON")
+    serde_json::from_str(&raw).context("failed to parse HLS profile JSON")
+}
+
+fn evaluate_served_asset_provenance(tab: &headless_chrome::browser::tab::Tab) -> Result<Value> {
+    let remote = tab
+        .evaluate(SERVED_ASSET_PROVENANCE_SCRIPT, true)
+        .map_err(|error| anyhow!("failed to inspect served asset provenance: {error:?}"))?;
+    let raw = remote
+        .value
+        .and_then(|value| value.as_str().map(ToOwned::to_owned))
+        .ok_or_else(|| anyhow!("Edge did not return served asset provenance JSON"))?;
+    serde_json::from_str(&raw).context("failed to parse served asset provenance JSON")
 }
 
 fn evaluate_playlist(tab: &headless_chrome::browser::tab::Tab) -> Result<Value> {
@@ -710,7 +1313,7 @@ fn evaluate_playlist(tab: &headless_chrome::browser::tab::Tab) -> Result<Value> 
         .value
         .and_then(|value| value.as_str().map(ToOwned::to_owned))
         .ok_or_else(|| anyhow!("Edge did not return rendered HLS playlist JSON"))?;
-    serde_json_crates_io::from_str(&raw).context("failed to parse rendered HLS playlist JSON")
+    serde_json::from_str(&raw).context("failed to parse rendered HLS playlist JSON")
 }
 
 fn summarize_playback(metrics: &Value, requested_seconds: f64) -> PlaybackSummary {
@@ -932,6 +1535,55 @@ fn summarize_websocket_burst(times_ms: &[f64]) -> WebSocketBurstSummary {
             .zip(attempt_160)
             .map(|(origin, last)| (last - origin).max(0.0)),
     }
+}
+
+fn summarize_usable_connections(metrics: &Value) -> UsableConnectionSummary {
+    let times = usable_connection_times(metrics);
+    UsableConnectionSummary {
+        source: "timestamped Connected-to-peer/bootnode interface logs (unique overlays)",
+        total_unique_ready: times.len(),
+        first_ready_ms: times.first().copied(),
+        ready_within_3s: times.iter().filter(|&&at| at <= 3_000.0).count(),
+        ready_within_5s: times.iter().filter(|&&at| at <= 5_000.0).count(),
+        ready_40_ms: times.get(39).copied(),
+        ready_80_ms: times.get(79).copied(),
+        ready_160_ms: times.get(159).copied(),
+        ready_200_ms: times.get(199).copied(),
+    }
+}
+
+fn usable_connection_times(metrics: &Value) -> Vec<f64> {
+    let mut ready_by_overlay = HashMap::<String, f64>::new();
+    for line in metrics
+        .get("connection_logs")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+    {
+        let Some((ready_ms, overlay)) = parse_usable_connection_log(line) else {
+            continue;
+        };
+        ready_by_overlay
+            .entry(overlay.to_owned())
+            .and_modify(|previous| *previous = previous.min(ready_ms))
+            .or_insert(ready_ms);
+    }
+    let mut times: Vec<_> = ready_by_overlay.into_values().collect();
+    times.sort_by(f64::total_cmp);
+    times
+}
+
+fn parse_usable_connection_log(line: &str) -> Option<(f64, &str)> {
+    let line = line.strip_prefix("[+")?;
+    let (timestamp, message) = line.split_once("ms] ")?;
+    let overlay = message
+        .strip_prefix("Connected to peer ")
+        .or_else(|| message.strip_prefix("Connected to bootnode "))?
+        .trim();
+    (!overlay.is_empty())
+        .then(|| timestamp.parse::<f64>().ok().map(|at| (at, overlay)))
+        .flatten()
 }
 
 fn validate_playback(
@@ -1220,6 +1872,38 @@ fn validate_connection_burst(summary: &WebSocketBurstSummary) -> Result<()> {
     Ok(())
 }
 
+fn validate_shared_worker_connections(
+    metrics: &Value,
+    minimum_usable_connections: usize,
+    max_usable_connection_ms: f64,
+) -> Result<()> {
+    let shared_worker_attached = metrics
+        .get("shared_worker_attached")
+        .and_then(Value::as_bool)
+        == Some(true);
+    if !shared_worker_attached {
+        return Err(anyhow!(
+            "shared_worker_logs validation was selected, but the interface did not report attaching to its SharedWorker"
+        ));
+    }
+    let times = usable_connection_times(metrics);
+    if times.len() < minimum_usable_connections {
+        return Err(anyhow!(
+            "SharedWorker logs retained only {} unique usable connection(s); required {minimum_usable_connections}",
+            times.len()
+        ));
+    }
+    if minimum_usable_connections > 0 {
+        let ready_ms = times[minimum_usable_connections - 1];
+        if ready_ms > max_usable_connection_ms {
+            return Err(anyhow!(
+                "SharedWorker usable connection {minimum_usable_connections} became ready at {ready_ms:.0}ms; limit is {max_usable_connection_ms:.0}ms"
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn number_at(value: &Value, pointer: &str) -> Option<f64> {
     value.pointer(pointer).and_then(Value::as_f64)
 }
@@ -1240,11 +1924,101 @@ fn write_report(report: &Value) -> Result<String> {
     let output = format!("target/weeb3-hls-profile/hls-profile-{timestamp}.json");
     fs::write(
         &output,
-        serde_json_crates_io::to_string_pretty(report)
-            .context("failed to serialize HLS profile")?,
+        serde_json::to_string_pretty(report).context("failed to serialize HLS profile")?,
     )
     .context("failed to write HLS profile")?;
     Ok(output)
+}
+
+fn collect_run_provenance(served_assets: Value) -> Result<RunProvenance> {
+    let current_dir = env::current_dir().context("failed to identify the profile worktree")?;
+    let harness_executable = env::current_exe()
+        .ok()
+        .map(|path| file_provenance(&path))
+        .transpose()?;
+    let server_executable_path = env::var_os("WEEB3_HLS_SERVER_EXECUTABLE")
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from);
+    let server_executable = server_executable_path
+        .as_deref()
+        .map(file_provenance)
+        .transpose()?;
+    let server_worktree = env::var_os("WEEB3_HLS_SERVER_WORKTREE")
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            server_executable_path
+                .as_deref()
+                .and_then(Path::parent)
+                .map(Path::to_path_buf)
+        });
+
+    Ok(RunProvenance {
+        variant: env::var("WEEB3_HLS_VARIANT")
+            .ok()
+            .filter(|value| !value.trim().is_empty()),
+        harness_git: git_provenance(&current_dir),
+        harness_executable,
+        server_git: server_worktree
+            .as_deref()
+            .map(git_provenance)
+            .filter(|git| git.head.is_some()),
+        server_executable,
+        served_assets,
+    })
+}
+
+fn git_provenance(path: &Path) -> GitProvenance {
+    let worktree = git_output(path, &["rev-parse", "--show-toplevel"]);
+    let head = git_output(path, &["rev-parse", "HEAD"]);
+    let status = git_output(path, &["status", "--porcelain=v1", "--untracked-files=all"]);
+    let changed_entries = status
+        .as_deref()
+        .into_iter()
+        .flat_map(str::lines)
+        .map(ToOwned::to_owned)
+        .collect();
+    GitProvenance {
+        worktree,
+        head,
+        dirty: status.as_ref().map(|status| !status.is_empty()),
+        changed_entries,
+    }
+}
+
+fn git_output(path: &Path, arguments: &[&str]) -> Option<String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(arguments)
+        .output()
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+}
+
+fn file_provenance(path: &Path) -> Result<FileProvenance> {
+    let bytes = fs::read(path)
+        .with_context(|| format!("failed to hash profile artifact {}", path.display()))?;
+    let metadata = fs::metadata(path)
+        .with_context(|| format!("failed to inspect profile artifact {}", path.display()))?;
+    let sha3_256 = Sha3_256::digest(&bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    let modified_unix_ms = metadata
+        .modified()
+        .ok()
+        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_millis());
+    Ok(FileProvenance {
+        path: path.to_string_lossy().into_owned(),
+        bytes: metadata.len(),
+        modified_unix_ms,
+        sha3_256,
+    })
 }
 
 fn launch_fresh_edge(timeout: Duration) -> Result<Browser> {
@@ -1407,5 +2181,166 @@ mod tests {
         assert_eq!(summary.created_within_150_ms_of_first, 160);
         assert!((summary.first_to_attempt_160_ms.unwrap() - 127.2).abs() < f64::EPSILON * 512.0);
         validate_connection_burst(&summary).unwrap();
+    }
+
+    #[test]
+    fn resource_phase_summary_is_time_weighted_and_uses_cpu_time() {
+        let samples = vec![
+            BrowserResourceSample {
+                at_ms: 100.0,
+                interval_ms: 100.0,
+                phase: ResourcePhase::Startup,
+                process_count: 3,
+                resident_bytes: 100,
+                private_equivalent_bytes: 200,
+                accumulated_cpu_ms: 10,
+                cpu_delta_ms: 10,
+                processes: Vec::new(),
+            },
+            BrowserResourceSample {
+                at_ms: 400.0,
+                interval_ms: 300.0,
+                phase: ResourcePhase::Startup,
+                process_count: 4,
+                resident_bytes: 300,
+                private_equivalent_bytes: 400,
+                accumulated_cpu_ms: 40,
+                cpu_delta_ms: 30,
+                processes: Vec::new(),
+            },
+            BrowserResourceSample {
+                at_ms: 900.0,
+                interval_ms: 500.0,
+                phase: ResourcePhase::SteadyPlayback,
+                process_count: 4,
+                resident_bytes: 500,
+                private_equivalent_bytes: 600,
+                accumulated_cpu_ms: 50,
+                cpu_delta_ms: 10,
+                processes: Vec::new(),
+            },
+        ];
+        let summary = summarize_resource_phase(&samples, ResourcePhase::Startup, 8);
+        assert_eq!(summary.observed_ms, 400.0);
+        assert_eq!(summary.average_resident_bytes, Some(250.0));
+        assert_eq!(summary.average_private_equivalent_bytes, Some(350.0));
+        assert_eq!(summary.peak_resident_bytes, Some(300));
+        assert_eq!(summary.accumulated_cpu_ms, 40);
+        assert_eq!(summary.average_cpu_cores, Some(0.1));
+        assert_eq!(summary.average_cpu_percent_of_machine, Some(1.25));
+        assert_eq!(summary.maximum_process_count, Some(4));
+    }
+
+    #[test]
+    fn browser_resource_sampler_tracks_its_root_and_both_phases() {
+        let sampler = BrowserResourceSampler::start(std::process::id());
+        thread::sleep(Duration::from_millis(20));
+        sampler.mark_steady_playback().unwrap();
+        thread::sleep(Duration::from_millis(20));
+        let summary = sampler.finish().unwrap();
+        assert_eq!(summary.root_pid, std::process::id());
+        assert!(summary.startup.sample_count >= 2);
+        assert!(summary.steady_playback.sample_count >= 1);
+        assert!(
+            summary
+                .startup
+                .peak_resident_bytes
+                .is_some_and(|bytes| bytes > 0)
+        );
+        assert!(
+            summary
+                .startup
+                .peak_private_equivalent_bytes
+                .is_some_and(|bytes| bytes > 0)
+        );
+    }
+
+    #[test]
+    fn usable_connection_summary_deduplicates_overlays_and_sorts_milestones() {
+        let metrics = json!({
+            "connection_logs": [
+                "[+2500ms] Connected to peer overlay-a",
+                "[+900ms] Connected to bootnode overlay-b",
+                "[+2000ms] Connected to peer overlay-a",
+                "[+50ms] unrelated"
+            ]
+        });
+        let summary = summarize_usable_connections(&metrics);
+        assert_eq!(summary.total_unique_ready, 2);
+        assert_eq!(summary.first_ready_ms, Some(900.0));
+        assert_eq!(summary.ready_within_3s, 2);
+        assert_eq!(usable_connection_times(&metrics), vec![900.0, 2_000.0]);
+    }
+
+    #[test]
+    fn shared_worker_connection_validation_is_explicit_and_timed() {
+        let metrics = json!({
+            "shared_worker_attached": true,
+            "connection_logs": [
+                "[+1000ms] Connected to peer overlay-a",
+                "[+2000ms] Connected to peer overlay-b"
+            ]
+        });
+        validate_shared_worker_connections(&metrics, 2, 2_500.0).unwrap();
+        assert!(validate_shared_worker_connections(&metrics, 2, 1_500.0).is_err());
+        assert!(
+            validate_shared_worker_connections(
+                &json!({"shared_worker_attached": false, "connection_logs": []}),
+                1,
+                5_000.0
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn hls_efficiency_normalizes_cpu_by_completed_steady_bytes() {
+        let metrics = json!({
+            "marks": {
+                "first_confirmed_playback_ms": 1_000.0,
+                "first_confirmed_playback_current_time_s": 0.0
+            },
+            "samples": [
+                {"at_ms": 1_000.0, "current_time_s": 0.0, "forward_buffer_s": 4.0, "duration_s": 20.0, "paused": false, "playback_rate": 1.0},
+                {"at_ms": 2_000.0, "current_time_s": 1.0, "forward_buffer_s": 14.0, "duration_s": 20.0, "paused": false, "playback_rate": 1.0}
+            ],
+            "events": [],
+            "hls_resources": [
+                {"start_ms": 100.0, "response_end_ms": 500.0, "encoded_bytes": 1_048_576u64, "decoded_bytes": 1_048_576u64},
+                {"start_ms": 600.0, "response_end_ms": 1_100.0, "encoded_bytes": 2_097_152u64, "decoded_bytes": 2_097_152u64},
+                {"start_ms": 1_200.0, "response_end_ms": 1_800.0, "encoded_bytes": 3_145_728u64, "decoded_bytes": 3_145_728u64},
+                {"start_ms": 2_100.0, "response_end_ms": 2_600.0, "encoded_bytes": 4_194_304u64, "decoded_bytes": 4_194_304u64}
+            ]
+        });
+        let playback = summarize_playback(&metrics, 1.0);
+        let steady = BrowserResourcePhaseSummary {
+            sample_count: 2,
+            observed_ms: 1_000.0,
+            average_resident_bytes: None,
+            peak_resident_bytes: None,
+            average_private_equivalent_bytes: None,
+            peak_private_equivalent_bytes: None,
+            accumulated_cpu_ms: 10_000,
+            average_cpu_cores: Some(10.0),
+            average_cpu_percent_of_machine: None,
+            maximum_process_count: None,
+        };
+        let summary = summarize_hls_efficiency(&metrics, &playback, &steady);
+        assert_eq!(summary.all_hls_responses.encoded_bytes, 10 * 1_048_576);
+        assert_eq!(summary.steady_playback.completed_responses, 2);
+        assert_eq!(summary.steady_playback.encoded_bytes, 5 * 1_048_576);
+        assert_eq!(summary.steady_playback.encoded_mib_per_second, Some(5.0));
+        assert_eq!(summary.cpu_seconds_per_encoded_mib, Some(2.0));
+        assert_eq!(summary.buffer_growth_s, Some(10.0));
+        assert_eq!(summary.media_plus_buffer_growth_s, Some(11.0));
+    }
+
+    #[test]
+    fn served_asset_provenance_covers_every_runtime_entrypoint() {
+        for asset in ["weeb_3.js", "weeb_3_bg.wasm", "service.js", "worker.js"] {
+            assert!(SERVED_ASSET_PROVENANCE_SCRIPT.contains(asset));
+        }
+        assert!(SERVED_ASSET_PROVENANCE_SCRIPT.contains("SHA-256"));
+        assert!(SERVED_ASSET_PROVENANCE_SCRIPT.contains("cache: 'no-store'"));
     }
 }

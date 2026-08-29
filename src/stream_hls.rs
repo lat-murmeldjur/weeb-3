@@ -1,5 +1,7 @@
 //! Minimal append-only HLS feed reader with a three-segment live startup runway.
 
+use std::fmt::Write;
+
 use crate::stream_conventions::HlsStart;
 
 pub(crate) const HLS_LIVE_SYNC_SEGMENTS: usize = 3;
@@ -37,6 +39,11 @@ pub(crate) struct HlsStartupPlan {
     pub(crate) duration: f64,
 }
 
+pub(crate) struct PreparedHlsFeed {
+    pub(crate) source: String,
+    pub(crate) plan: HlsStartupPlan,
+}
+
 #[derive(Default)]
 pub(crate) struct HlsTailFailure {
     key: Option<(u64, u64, String)>,
@@ -64,6 +71,22 @@ impl HlsTailFailure {
     pub(crate) fn clear(&mut self) {
         self.key = None;
         self.count = 0;
+    }
+}
+
+pub(crate) fn hls_progressive_foreground_transition(
+    last_foreground_position: usize,
+    foreground_position: usize,
+    cached: bool,
+) -> (bool, usize) {
+    if cached && foreground_position < last_foreground_position {
+        (false, last_foreground_position)
+    } else {
+        (
+            foreground_position < last_foreground_position
+                || last_foreground_position.abs_diff(foreground_position) > 1,
+            foreground_position,
+        )
     }
 }
 
@@ -118,41 +141,45 @@ impl HlsPlaylist {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn duration(&self) -> f64 {
         self.segments.iter().map(|segment| segment.duration).sum()
     }
 
     pub(crate) fn startup_plan(&self, start: HlsStart) -> Option<HlsStartupPlan> {
-        let playable = self
-            .segments
-            .iter()
-            .enumerate()
-            .filter_map(|(index, segment)| (!segment.gap).then_some(index))
-            .collect::<Vec<_>>();
-        if playable.is_empty() || start == HlsStart::Live && playable.len() < HLS_LIVE_SYNC_SEGMENTS
-        {
+        let playable = self.segments.iter().filter(|segment| !segment.gap).count();
+        if playable == 0 || start == HlsStart::Live && playable < HLS_LIVE_SYNC_SEGMENTS {
             return None;
         }
-        let runway = match start {
-            HlsStart::Beginning => &playable[..1],
-            HlsStart::Live => {
-                let first = playable.len().saturating_sub(HLS_LIVE_EDGE_SEGMENTS);
-                &playable[first..first + HLS_LIVE_SYNC_SEGMENTS]
+        let first = match start {
+            HlsStart::Beginning => 0,
+            HlsStart::Live => playable.saturating_sub(HLS_LIVE_EDGE_SEGMENTS),
+        };
+        let last = first.checked_add(match start {
+            HlsStart::Beginning => 0,
+            HlsStart::Live => HLS_LIVE_SYNC_SEGMENTS - 1,
+        })?;
+        let mut offset = 0.0;
+        let mut ordinal = 0;
+        let mut first_playable = None;
+        let mut play_position = None;
+        let mut runway_end = None;
+        for segment in &self.segments {
+            if !segment.gap {
+                first_playable.get_or_insert(offset);
+                if ordinal == first {
+                    play_position = Some(offset);
+                }
+                if ordinal == last {
+                    runway_end = Some(offset + segment.duration);
+                }
+                ordinal += 1;
             }
-        };
-        let first = runway[0];
-        let last = *runway.last()?;
-        let offset = |index: usize| {
-            self.segments[..index]
-                .iter()
-                .map(|segment| segment.duration)
-                .sum::<f64>()
-        };
-        let play_position = offset(first);
-        let bootstrap = (start == HlsStart::Live && first != playable[0]).then_some(playable[0]);
-        let bootstrap_position = bootstrap.map_or(play_position, offset);
-        let runway_end = offset(last) + self.segments[last].duration;
-        let duration = self.duration();
+            offset += segment.duration;
+        }
+        let play_position = play_position?;
+        let runway_end = runway_end?;
+        let duration = offset;
         if !play_position.is_finite()
             || !runway_end.is_finite()
             || !duration.is_finite()
@@ -160,9 +187,14 @@ impl HlsPlaylist {
         {
             return None;
         }
+        let has_bootstrap = start == HlsStart::Live && first != 0;
         Some(HlsStartupPlan {
-            bootstrap_position,
-            codec_bootstrap: bootstrap.is_some() && self.sequence == 0,
+            bootstrap_position: if has_bootstrap {
+                first_playable?
+            } else {
+                play_position
+            },
+            codec_bootstrap: has_bootstrap && self.sequence == 0,
             play_position,
             runway_end,
             duration,
@@ -181,6 +213,17 @@ impl HlsPlaylist {
     }
 
     pub(crate) fn merge_playlist(&mut self, candidate: Self) -> Option<usize> {
+        let (appended, first) = self.merge_extension(&candidate)?;
+        if appended != 0 {
+            self.segments
+                .extend_from_slice(candidate.segments.get(first..)?);
+        }
+        self.finalized = candidate.finalized;
+        self.target_duration = self.target_duration.max(candidate.target_duration);
+        Some(appended)
+    }
+
+    fn merge_extension(&self, candidate: &Self) -> Option<(usize, usize)> {
         let current_end = self
             .sequence
             .checked_add(u64::try_from(self.segments.len()).ok()?)?;
@@ -205,26 +248,23 @@ impl HlsPlaylist {
                 return None;
             }
         }
-        let target_duration = candidate.target_duration;
         let appended = usize::try_from(candidate_end.saturating_sub(current_end)).ok()?;
-        if appended != 0 {
+        let first = if appended == 0 {
+            0
+        } else {
             let first = usize::try_from(current_end.checked_sub(candidate.sequence)?).ok()?;
             let previous = self.segments.last()?.discontinuity_sequence;
             let next = candidate.segments.get(first)?.discontinuity_sequence;
             if next < previous || next > previous.checked_add(1)? {
                 return None;
             }
-            self.segments
-                .extend_from_slice(candidate.segments.get(first..)?);
-        }
-        self.finalized = candidate.finalized;
-        self.target_duration = self.target_duration.max(target_duration);
-        Some(appended)
+            first
+        };
+        Some((appended, first))
     }
 
     pub(crate) fn joins(&self, candidate: &Self) -> bool {
-        let mut current = self.clone();
-        current.merge_playlist(candidate.clone()).is_some()
+        self.merge_extension(candidate).is_some()
     }
 
     pub(crate) fn mark_gap(&mut self, sequence: u64, reference: &str) -> bool {
@@ -251,17 +291,18 @@ impl HlsPlaylist {
     ) -> Option<Self> {
         snapshots.retain(|(index, _)| *index < head_index);
         snapshots.sort_by_key(|(index, _)| *index);
-        snapshots.push((head_index, head.clone()));
-        let (_, mut archive) = snapshots.first()?.clone();
-        if archive.sequence != 0 {
-            return None;
-        }
-        for (_, snapshot) in snapshots.into_iter().skip(1) {
-            archive.merge_playlist(snapshot)?;
-        }
         let expected_end = head
             .sequence
             .checked_add(u64::try_from(head.segments.len()).ok()?)?;
+        snapshots.push((head_index, head));
+        let mut snapshots = snapshots.into_iter();
+        let (_, mut archive) = snapshots.next()?;
+        if archive.sequence != 0 {
+            return None;
+        }
+        for (_, snapshot) in snapshots {
+            archive.merge_playlist(snapshot)?;
+        }
         let archive_end = archive
             .sequence
             .checked_add(u64::try_from(archive.segments.len()).ok()?)?;
@@ -307,17 +348,19 @@ impl HlsPlaylist {
         } else {
             "\n#EXT-X-VERSION:3"
         });
-        output.push_str(&format!(
+        let _ = write!(
+            output,
             "\n#EXT-X-TARGETDURATION:{}\n#EXT-X-PLAYLIST-TYPE:{}\n#EXT-X-MEDIA-SEQUENCE:{}",
             self.target_duration.max(1),
             if self.finalized { "VOD" } else { "EVENT" },
             self.sequence
-        ));
+        );
         if self.discontinuity_sequence != 0 {
-            output.push_str(&format!(
+            let _ = write!(
+                output,
                 "\n#EXT-X-DISCONTINUITY-SEQUENCE:{}",
                 self.discontinuity_sequence
-            ));
+            );
         }
         match start {
             HlsStart::Beginning => output.push_str("\n#EXT-X-START:TIME-OFFSET=0,PRECISE=YES"),
@@ -330,25 +373,26 @@ impl HlsPlaylist {
                     .take(HLS_LIVE_EDGE_SEGMENTS)
                     .map(|segment| segment.duration)
                     .sum::<f64>();
-                output.push_str(&format!("\n#EXT-X-START:TIME-OFFSET=-{tail:.6},PRECISE=NO"));
+                let _ = write!(output, "\n#EXT-X-START:TIME-OFFSET=-{tail:.6},PRECISE=NO");
             }
         }
         let mut discontinuity_sequence = self.discontinuity_sequence;
         let mut beginning_startup = start == HlsStart::Beginning;
         let mut live_bootstrap = start == HlsStart::Live
             && self.segments.iter().filter(|segment| !segment.gap).count() > HLS_LIVE_EDGE_SEGMENTS;
+        let local_bytes_base = local_bytes_base.trim_end_matches('/');
         for segment in &self.segments {
             let discontinuity = segment.discontinuity_sequence > discontinuity_sequence;
             if discontinuity {
                 output.push_str("\n#EXT-X-DISCONTINUITY");
             }
             discontinuity_sequence = segment.discontinuity_sequence;
-            output.push_str(&format!("\n#EXTINF:{:.6},", segment.duration));
+            let _ = write!(output, "\n#EXTINF:{:.6},", segment.duration);
             if segment.gap {
                 output.push_str("\n#EXT-X-GAP");
             }
             output.push('\n');
-            output.push_str(local_bytes_base.trim_end_matches('/'));
+            output.push_str(local_bytes_base);
             output.push('/');
             output.push_str(&segment.reference);
             let startup = beginning_startup && !segment.gap;
@@ -375,7 +419,7 @@ pub(crate) fn is_hls_manifest(bytes: &[u8]) -> bool {
         .ok()
         .map(|text| text.strip_prefix('\u{feff}').unwrap_or(text).trim_start())
         .and_then(|text| text.lines().next())
-        .is_some_and(|line| line.trim_end_matches('\r').trim() == HLS_HEADER)
+        .is_some_and(|line| line.trim() == HLS_HEADER)
 }
 
 pub(crate) fn hls_payload_mime(bytes: &[u8]) -> &'static str {
@@ -416,7 +460,7 @@ fn parse_segment_lines(text: &str, mut discontinuity_sequence: u64) -> Option<Ve
     let mut gap = false;
     let mut discontinuity = false;
     for original in text.lines() {
-        let line = original.trim_end_matches('\r').trim();
+        let line = original.trim();
         if let Some(value) = line.strip_prefix("#EXTINF:") {
             if duration.is_some() {
                 return None;
@@ -456,7 +500,7 @@ fn parse_segment_lines(text: &str, mut discontinuity_sequence: u64) -> Option<Ve
 fn hls_has_terminal_endlist(text: &str) -> bool {
     text.lines()
         .rev()
-        .map(|line| line.trim_end_matches('\r').trim())
+        .map(str::trim)
         .find(|line| !line.is_empty())
         == Some(HLS_ENDLIST)
 }
@@ -470,7 +514,7 @@ fn swarm_reference(uri: &str) -> Option<&str> {
         return Some(candidate);
     }
     let path = if let Some((scheme, remainder)) = candidate.split_once("://") {
-        if !matches!(scheme.to_ascii_lowercase().as_str(), "http" | "https") {
+        if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
             return None;
         }
         let slash = remainder.find('/')?;
@@ -491,11 +535,29 @@ fn is_hex_reference(value: &str) -> bool {
 mod player;
 
 #[cfg(target_arch = "wasm32")]
+#[path = "stream_hls/page_bridge.rs"]
+mod page_bridge;
+
+#[cfg(target_arch = "wasm32")]
+#[path = "stream_hls/protocol.rs"]
+mod protocol;
+
+#[cfg(target_arch = "wasm32")]
 #[path = "stream_hls/runtime.rs"]
 mod runtime;
 
 #[cfg(target_arch = "wasm32")]
-pub(crate) use runtime::{
+#[path = "stream_hls/worker_bridge.rs"]
+pub(crate) mod worker_bridge;
+
+#[cfg(target_arch = "wasm32")]
+pub(crate) use page_bridge::{
     attach_hls_feed_player, open_hls_feed_view, release_hls_for_bzz_view, release_hls_view,
+};
+
+#[cfg(target_arch = "wasm32")]
+pub(crate) use runtime::{
+    clear_hls_runtime_cache, install_live_tail_fallback, live_tail_failure_identity,
+    lock_live_startup_plan, prepare_hls_feed, release_hls_runtime, start_beginning_history,
     try_fetch_response,
 };

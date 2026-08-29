@@ -3,11 +3,11 @@
 use libp2p::multiaddr::Protocol;
 use libp2p::{Multiaddr, PeerId, swarm::ConnectionId};
 
-use alloy::primitives::keccak256;
-use alloy::primitives::{Signature, normalize_v};
+use crate::erasure_coding::CHUNK_SIZE;
+pub use crate::erasure_coding::SPAN_SIZE;
+use alloy_primitives::{Signature, keccak256, normalize_v};
 
 pub const MAX_PO: u8 = 31;
-pub const SPAN_SIZE: usize = 8;
 
 #[derive(Debug, Clone)]
 pub struct PeerFile {
@@ -23,7 +23,6 @@ pub struct PeerAccounting {
     pub balance: u64,
     pub surplus_balance: u64,
     pub threshold: u64,
-    pub payment_threshold: u64,
     pub reserve: u64,
     pub refreshment: f64,
     pub refresh_scheduled: bool,
@@ -39,34 +38,19 @@ pub fn try_from_multiaddr(address: &Multiaddr) -> Option<PeerId> {
 }
 
 pub fn get_proximity(one: &[u8], other: &[u8]) -> u8 {
-    let mut b: usize = (MAX_PO / 4 + 1).into();
-
-    if b > one.len() {
-        b = one.len();
-    }
-
-    if b > other.len() {
-        b = other.len();
-    }
-
-    if b == 0 {
+    let compared_bytes = usize::from(MAX_PO / 4 + 1).min(one.len()).min(other.len());
+    if compared_bytes == 0 {
         return 0;
     }
-
-    let m: usize = 8;
-    for i in 0..b {
-        let oxo = one[i] ^ other[i];
-
-        for j in 0..m {
-            if (oxo >> (7 - j)) & 0x01 != 0 {
-                return (i * 8 + j).try_into().unwrap();
-            }
+    for (index, (&left, &right)) in one.iter().zip(other).take(compared_bytes).enumerate() {
+        let difference = left ^ right;
+        if difference != 0 {
+            return u8::try_from(index * 8 + difference.leading_zeros() as usize).unwrap();
         }
     }
-    return MAX_PO;
+    MAX_PO
 }
 
-const CHUNK_SIZE: usize = 4096;
 const SECTION_SIZE: usize = 32;
 const SECTION2_SIZE: usize = 2 * SECTION_SIZE;
 const BMT_LEAF_COUNT: usize = CHUNK_SIZE / SECTION2_SIZE;
@@ -127,10 +111,10 @@ fn bmt_root(content: &[u8]) -> Option<BmtHash> {
     }
 
     let mut reduce = |nodes: &mut [BmtHash; BMT_LEAF_COUNT], zero_nodes: Option<&[BmtHash]>| {
-        if let Some(zero_nodes) = zero_nodes {
-            if occupied_leaves % 2 != 0 {
-                nodes[occupied_leaves] = zero_nodes[0];
-            }
+        if let Some(zero_nodes) = zero_nodes
+            && occupied_leaves % 2 != 0
+        {
+            nodes[occupied_leaves] = zero_nodes[0];
         }
 
         let mut width = BMT_LEAF_COUNT;
@@ -185,33 +169,30 @@ pub fn valid_cac(chunk_content: &[u8], address: &[u8]) -> bool {
     content_address_array(chunk_content).is_some_and(|expected| address == expected.as_slice())
 }
 
-pub fn valid_soc(chunk_content: &Vec<u8>, address: &Vec<u8>) -> bool {
+pub fn valid_soc(chunk_content: &[u8], address: &[u8]) -> bool {
     if chunk_content.len() < 97 + SPAN_SIZE {
         return false;
     }
-    let soc_address = chunk_content[0..32].to_vec();
-    let soc_signature = chunk_content[32..97].to_vec();
-
-    let wrapped_address = content_address(&chunk_content[97..]);
-
-    let to_sign = keccak256([soc_address.clone(), wrapped_address].concat()).to_vec();
-    let parity: bool = match normalize_v(soc_signature[64] as u64) {
-        Some(par) => par,
-        _ => {
-            return false;
-        }
+    let soc_address = &chunk_content[..32];
+    let soc_signature = &chunk_content[32..97];
+    let Some(wrapped_address) = content_address_array(&chunk_content[97..]) else {
+        return false;
+    };
+    let mut sign_input = [0_u8; 64];
+    sign_input[..32].copy_from_slice(soc_address);
+    sign_input[32..].copy_from_slice(&wrapped_address);
+    let to_sign = keccak256(sign_input);
+    let Some(parity) = normalize_v(soc_signature[64] as u64) else {
+        return false;
     };
     let sig = Signature::from_bytes_and_parity(&soc_signature[0..64], parity);
-
-    let owner = match sig.recover_address_from_msg(to_sign) {
-        Ok(ow) => ow,
-        _ => {
-            return false;
-        }
+    let Ok(owner) = sig.recover_address_from_msg(to_sign) else {
+        return false;
     };
-
-    let address_constructed = keccak256([soc_address, owner.as_slice().to_vec()].concat()).to_vec();
-    *address == address_constructed
+    let mut address_input = [0_u8; 52];
+    address_input[..32].copy_from_slice(soc_address);
+    address_input[32..].copy_from_slice(owner.as_slice());
+    address == keccak256(address_input).as_slice()
 }
 
 pub fn get_feed_address(owner: &str, topic: &str, index: u64) -> Vec<u8> {
@@ -270,56 +251,30 @@ pub fn decode_resources(encoded_data: Vec<u8>) -> (Vec<(Vec<u8>, String, String)
     crate::erasure_coding::decode_resource_bundle(&encoded_data).unwrap_or_default()
 }
 
-pub async fn read_file(file: web_sys::File) -> Vec<Vec<u8>> {
-    let fils = file.size();
+pub async fn read_file(file: web_sys::File) -> Vec<u8> {
+    let file_size = file.size();
     let partition_size = 69001216.0_f64;
-
-    if fils <= partition_size {
-        let content_buf = match wasm_bindgen_futures::JsFuture::from(file.array_buffer()).await {
-            Ok(buf) => buf,
-            Err(_) => return vec![],
-        };
-
-        let content_u8a = js_sys::Uint8Array::new(&content_buf);
-
-        return vec![content_u8a.to_vec()];
-    } else {
-        let mut content: Vec<Vec<u8>> = vec![];
-
-        let mut start = 0.0_f64;
-        let mut end = partition_size;
-        let mut going = true;
-
-        while going {
-            let content_slice = file.slice_with_f64_and_f64(start, end);
-
-            let content_buf = match content_slice {
-                Ok(b) => match wasm_bindgen_futures::JsFuture::from(b.array_buffer()).await {
-                    Ok(buf) => buf,
-                    Err(_) => return vec![],
-                },
-                Err(_) => return vec![],
-            };
-
-            let content_u8a = js_sys::Uint8Array::new(&content_buf);
-
-            let slice = content_u8a.to_vec();
-            content.push(slice);
-
-            start = end;
-            end += partition_size;
-
-            if end >= fils {
-                end = fils;
-            }
-
-            if start >= fils {
-                going = false;
-            }
-        }
-
-        return content;
+    if file_size > usize::MAX as f64 {
+        return vec![];
     }
+
+    let mut content = Vec::with_capacity(file_size as usize);
+    let mut start = 0.0_f64;
+    while start < file_size {
+        let end = (start + partition_size).min(file_size);
+        let Ok(slice) = file.slice_with_f64_and_f64(start, end) else {
+            return vec![];
+        };
+        let Ok(buffer) = wasm_bindgen_futures::JsFuture::from(slice.array_buffer()).await else {
+            return vec![];
+        };
+        let bytes = js_sys::Uint8Array::new(&buffer);
+        let offset = content.len();
+        content.resize(offset + bytes.length() as usize, 0);
+        bytes.copy_to(&mut content[offset..]);
+        start = end;
+    }
+    content
 }
 
 pub const EMPTY_CHEQUEBOOK_ADDRESS: [u8; 20] = [0; 20];
@@ -332,7 +287,15 @@ pub fn generate_sign_data(
     timestamp: i64,
     chequebook_address: &[u8],
 ) -> Vec<u8> {
-    let mut out = b"bee-handshake-".to_vec();
+    let cheque_len = if chequebook_address.is_empty() {
+        EMPTY_CHEQUEBOOK_ADDRESS.len()
+    } else {
+        chequebook_address.len()
+    };
+    let mut out = Vec::with_capacity(
+        b"bee-handshake-".len() + underlay.len() + overlay.len() + 8 + nonce.len() + 8 + cheque_len,
+    );
+    out.extend_from_slice(b"bee-handshake-");
     out.extend_from_slice(underlay);
     out.extend_from_slice(overlay);
     out.extend_from_slice(&network_id.to_be_bytes());
@@ -346,24 +309,15 @@ pub fn generate_sign_data(
     out
 }
 
-fn recover_address(signature: &[u8], message: &[u8]) -> Vec<u8> {
+fn recover_address(signature: &[u8], message: &[u8]) -> Option<alloy_primitives::Address> {
     if signature.len() != 65 {
-        return Vec::new();
+        return None;
     }
 
-    let parity = match normalize_v(signature[64] as u64) {
-        Some(p) => p,
-        None => return Vec::new(),
-    };
+    let parity = normalize_v(signature[64] as u64)?;
 
     let sig = Signature::from_bytes_and_parity(&signature[0..64], parity);
-
-    let address = match sig.recover_address_from_msg(message) {
-        Ok(addr) => addr,
-        Err(_) => return Vec::new(),
-    };
-
-    address.as_slice().to_vec()
+    sig.recover_address_from_msg(message).ok()
 }
 
 pub fn parse_address(
@@ -383,11 +337,7 @@ pub fn parse_address(
         timestamp,
         chequebook_address,
     );
-    let recovered = recover_address(signature, &sign_data);
-
-    if recovered.len() != 20 {
-        return web3::types::Address::zero();
-    }
-
-    web3::types::Address::from_slice(&recovered)
+    recover_address(signature, &sign_data)
+        .map(|address| web3::types::Address::from_slice(address.as_slice()))
+        .unwrap_or_default()
 }

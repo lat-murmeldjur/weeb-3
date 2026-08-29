@@ -1,6 +1,9 @@
 use rand::seq::SliceRandom;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 pub(crate) const INITIAL_BOOTNODE_BURST: usize = 160;
+
+static MAINNET_ACTIVE: AtomicBool = AtomicBool::new(true);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum NetworkMode {
@@ -385,20 +388,11 @@ pub(crate) fn profile_for_mode(mode: NetworkMode) -> NetworkProfile {
 }
 
 pub(crate) fn activate_profile(profile: NetworkProfile) {
-    match profile.mode {
-        NetworkMode::Mainnet => {
-            crate::set_mainnet(true);
-            crate::set_testnet_official(false);
-        }
-        NetworkMode::Testnet => {
-            crate::set_testnet_official(true);
-            crate::set_mainnet(false);
-        }
-    }
+    MAINNET_ACTIVE.store(profile.mode == NetworkMode::Mainnet, Ordering::Relaxed);
 }
 
 pub(crate) fn active_profile() -> NetworkProfile {
-    if crate::is_mainnet() {
+    if MAINNET_ACTIVE.load(Ordering::Relaxed) {
         MAINNET_PROFILE
     } else {
         TESTNET_PROFILE

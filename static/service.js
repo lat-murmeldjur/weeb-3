@@ -1,15 +1,22 @@
 const SCOPE = new URL(self.registration.scope);
 const SCOPE_PATH = SCOPE.pathname.endsWith("/") ? SCOPE.pathname : `${SCOPE.pathname}/`;
-const APP_ROOT = SCOPE_PATH;
-const APP_INDEX = `${SCOPE_PATH}index.html`;
 const NETWORK_ROUTE_PREFIXES = ["", "mainnet/", "testnet/"];
 const RAW_ROUTE_KINDS = [
   ["hls/bytes", "hls-bytes"],
   ["bytes", "bytes"],
   ["chunks", "chunk"]
 ];
+const BZZ_ROUTE_MARKERS = NETWORK_ROUTE_PREFIXES.map(
+  (prefix) => `${SCOPE_PATH}${prefix}bzz/`
+);
+const RAW_ROUTE_MARKERS = NETWORK_ROUTE_PREFIXES.flatMap((prefix) =>
+  RAW_ROUTE_KINDS.map(([kind, rawType]) => [`${SCOPE_PATH}${prefix}${kind}/`, rawType])
+);
+const FEED_ROUTE_MARKERS = NETWORK_ROUTE_PREFIXES.map(
+  (prefix) => `${SCOPE_PATH}${prefix}feeds/`
+);
 const FETCH_TIMEOUT_MS = 240000;
-const SERVICE_WORKER_MARKER = "forwarder-default28";
+const SERVICE_WORKER_MARKER = "forwarder-default29";
 const SERVICE_WORKER_PROTOCOL = 10;
 const MIB_BYTES = 1024 * 1024;
 const STREAM_STORAGE_WINDOW_BYTES = MIB_BYTES / 2;
@@ -20,8 +27,15 @@ const HLS_STREAM_LOOKAHEAD_CHUNKS = 4;
 const HLS_LIVE_STREAM_WINDOW_BYTES = MIB_BYTES / 2;
 const HLS_LIVE_STREAM_LOOKAHEAD_CHUNKS = 4;
 const RANGE_REQUEST_FLIGHTS = new Map();
-const CLIENT_RUNTIME_PROBES = new Map();
-const CLIENT_RUNTIME_PROBE_TIMEOUT_MS = 1_500;
+const SHARED_WORKER_PROTOCOL = 5;
+const WINDOW_RELAY_TIMEOUT_MS = 1_500;
+const RUNTIME_PORT_BIND_TIMEOUT_MS = 1_500;
+
+const cachedWindowNetworks = new Map();
+const windowNetworkDiscoveries = new Map();
+let runtimePort = null;
+let runtimePortBinding = null;
+let nextRuntimePortId = 0;
 
 console.log(`weeb-3 service worker start ${SERVICE_WORKER_MARKER}`);
 
@@ -33,28 +47,13 @@ function isSwarmReference(reference) {
   return /^(?:[a-fA-F0-9]{64}|[a-fA-F0-9]{128})$/.test(reference);
 }
 
-function bzzMarkers() {
-  return NETWORK_ROUTE_PREFIXES.map((prefix) => `${SCOPE_PATH}${prefix}bzz/`);
-}
-
-function rawRouteMarkers() {
-  return NETWORK_ROUTE_PREFIXES.flatMap((prefix) =>
-    RAW_ROUTE_KINDS.map(([kind, rawType]) => [`${SCOPE_PATH}${prefix}${kind}/`, rawType])
-  );
-}
-
-function feedMarkers() {
-  return NETWORK_ROUTE_PREFIXES.map((prefix) => `${SCOPE_PATH}${prefix}feeds/`);
-}
-
 function canonicalRouteNetworkId(pathname) {
   if (!pathname.startsWith(SCOPE_PATH)) {
     return null;
   }
 
   const relative = pathname.substring(SCOPE_PATH.length);
-  const first = relative.split("/", 1)[0];
-  return first === "testnet" ? 10 : 1;
+  return relative === "testnet" || relative.startsWith("testnet/") ? 10 : 1;
 }
 
 function isNetworkShellPath(pathname) {
@@ -94,7 +93,7 @@ function isBzzUploadPath(pathname) {
 }
 
 function canonicalBzzResource(url) {
-  for (const marker of bzzMarkers()) {
+  for (const marker of BZZ_ROUTE_MARKERS) {
     if (!url.pathname.startsWith(marker)) {
       continue;
     }
@@ -120,7 +119,7 @@ function canonicalBzzResource(url) {
 }
 
 function canonicalRawResource(url) {
-  for (const [marker, rawType] of rawRouteMarkers()) {
+  for (const [marker, rawType] of RAW_ROUTE_MARKERS) {
     if (!url.pathname.startsWith(marker)) {
       continue;
     }
@@ -146,7 +145,7 @@ function canonicalRawResource(url) {
 }
 
 function canonicalFeedResource(url) {
-  for (const marker of feedMarkers()) {
+  for (const marker of FEED_ROUTE_MARKERS) {
     if (!url.pathname.startsWith(marker)) {
       continue;
     }
@@ -168,10 +167,7 @@ function canonicalFeedResource(url) {
 }
 
 function isHlsResource(url) {
-  if (canonicalFeedResource(url) !== null) {
-    return true;
-  }
-  return rawRouteMarkers().some(([marker, rawType]) =>
+  return canonicalFeedResource(url) !== null || RAW_ROUTE_MARKERS.some(([marker, rawType]) =>
     rawType === "hls-bytes" &&
     url.pathname.startsWith(marker) &&
     canonicalRawResource(url) !== null
@@ -197,7 +193,7 @@ async function fetchOrError(request) {
 }
 
 function appShellRequest(sourceRequest) {
-  return new Request(new URL(APP_ROOT, self.registration.scope).toString(), {
+  return new Request(new URL(SCOPE_PATH, self.registration.scope).toString(), {
     cache: sourceRequest.cache,
     credentials: "same-origin"
   });
@@ -230,6 +226,7 @@ self.addEventListener("message", (event) => {
         scope: SCOPE_PATH,
         marker: SERVICE_WORKER_MARKER
       });
+      closeMessagePort(port);
     })());
     return;
   }
@@ -247,6 +244,7 @@ self.addEventListener("message", (event) => {
     scope: SCOPE_PATH,
     marker: SERVICE_WORKER_MARKER
   });
+  closeMessagePort(port);
 });
 
 self.addEventListener("fetch", (event) => {
@@ -254,7 +252,7 @@ self.addEventListener("fetch", (event) => {
   const url = new URL(request.url);
 
   if (request.method === "POST" && url.origin === SCOPE.origin && isBzzUploadPath(url.pathname)) {
-    event.respondWith(forwardUploadToRust(request, event));
+    event.respondWith(forwardUploadToRust(request, event.clientId, event.resultingClientId));
     return;
   }
 
@@ -275,247 +273,326 @@ self.addEventListener("fetch", (event) => {
     if (isAppShellNavigation(request)) {
       event.respondWith(fetchOrError(appShellRequest(request)));
     } else {
-      event.respondWith(forwardRequestToRust(request, event));
+      event.respondWith(forwardRequestToRust(request, event.clientId, event.resultingClientId));
     }
     return;
   }
 
   const rawResource = canonicalRawResource(url);
   if (rawResource && (request.method === "GET" || request.method === "HEAD")) {
-    event.respondWith(forwardRequestToRust(request, event));
+    event.respondWith(forwardRequestToRust(request, event.clientId, event.resultingClientId));
     return;
   }
 
   const feedResource = canonicalFeedResource(url);
   if (feedResource && (request.method === "GET" || request.method === "HEAD")) {
-    event.respondWith(forwardRequestToRust(request, event));
+    event.respondWith(forwardRequestToRust(request, event.clientId, event.resultingClientId));
     return;
   }
 
 });
 
-function clientInScope(client) {
+function isStableWindowClient(client) {
+  if (!client || typeof client.postMessage !== "function") {
+    return false;
+  }
   try {
     const url = new URL(client.url);
-    return url.origin === SCOPE.origin && url.pathname.startsWith(SCOPE_PATH);
+    return client.type === "window" &&
+      url.origin === SCOPE.origin &&
+      url.pathname.startsWith(SCOPE_PATH);
   } catch (_) {
     return false;
   }
 }
 
-function isTopLevelClient(client) {
-  return client.frameType === "top-level" || client.frameType === "auxiliary";
-}
-
-function bzzReferenceFromResource(resource) {
-  return resource ? resource.split("/", 1)[0] : "";
-}
-
-function bzzReferenceFromUrl(url) {
-  return bzzReferenceFromResource(canonicalBzzResource(url));
-}
-
-function isAppShellClient(client) {
-  if (!clientInScope(client)) {
-    return false;
-  }
-
-  try {
-    const url = new URL(client.url);
-    if (url.pathname === APP_ROOT || url.pathname === APP_INDEX) {
-      return true;
-    }
-
-    if (isNetworkShellPath(url.pathname) || isDirectShareShellPath(url.pathname)) {
-      return true;
-    }
-
-    const bzzResource = canonicalBzzResource(url);
-    return Boolean(bzzResource && !bzzResource.includes("/"));
-  } catch (_) {
-    return false;
+function invalidateWindowClient(client) {
+  if (client?.id) {
+    cachedWindowNetworks.delete(client.id);
   }
 }
 
-function pushUniqueClient(list, seen, client) {
-  if (!client || seen.has(client.id)) {
+function invalidateRuntimePort(candidate = runtimePort) {
+  if (!candidate || runtimePort !== candidate) {
     return;
   }
-  seen.add(client.id);
-  list.push(client);
+  runtimePort = null;
+  closeMessagePort(candidate.port);
 }
 
-async function clientWeeb3NetworkId(client) {
-  const existing = CLIENT_RUNTIME_PROBES.get(client.id);
-  if (existing) {
-    return existing;
+async function windowNetworkId(client) {
+  if (cachedWindowNetworks.has(client.id)) {
+    return cachedWindowNetworks.get(client.id);
   }
 
-  let tracked;
-  tracked = messageClient(
-    client,
-    { type: "WEEB3_CLIENT_PING" },
-    CLIENT_RUNTIME_PROBE_TIMEOUT_MS
-  )
-    .then((response) => {
-      const ready = response?.ok === true && response?.type === "WEEB3_CLIENT_PONG";
+  let discovery = windowNetworkDiscoveries.get(client.id);
+  if (!discovery) {
+    discovery = messageClient(
+      client,
+      { type: "WEEB3_CLIENT_PING" },
+      WINDOW_RELAY_TIMEOUT_MS
+    ).then((response) => {
       const networkId = Number(response?.networkId);
-      return ready && Number.isSafeInteger(networkId) ? networkId : null;
-    })
-    .finally(() => {
-      if (CLIENT_RUNTIME_PROBES.get(client.id) === tracked) {
-        CLIENT_RUNTIME_PROBES.delete(client.id);
+      if (
+        response?.ok !== true ||
+        response?.type !== "WEEB3_CLIENT_PONG" ||
+        Number(response?.sharedWorkerProtocol) !== SHARED_WORKER_PROTOCOL ||
+        !Number.isSafeInteger(networkId)
+      ) {
+        return null;
+      }
+      cachedWindowNetworks.set(client.id, networkId);
+      return networkId;
+    }).finally(() => {
+      if (windowNetworkDiscoveries.get(client.id) === discovery) {
+        windowNetworkDiscoveries.delete(client.id);
       }
     });
-  CLIENT_RUNTIME_PROBES.set(client.id, tracked);
-  return tracked;
+    windowNetworkDiscoveries.set(client.id, discovery);
+  }
+  return discovery;
 }
 
-async function firstReadyClient(candidates, requiredNetworkId) {
-  if (!candidates.length) {
-    return [];
+async function windowMatchesNetwork(client, requiredNetworkId) {
+  const hadCachedNetwork = cachedWindowNetworks.has(client.id);
+  if (await windowNetworkId(client) === requiredNetworkId) {
+    return true;
   }
-
-  // Probe candidates concurrently without redispatching work.
-  const probes = candidates.map((candidate) => clientWeeb3NetworkId(candidate));
-  if (await probes[0] === requiredNetworkId) {
-    return [candidates[0]];
+  if (!hadCachedNetwork) {
+    return false;
   }
-
-  const remainingNetworkIds = await Promise.all(probes.slice(1));
-  const match = remainingNetworkIds.findIndex(
-    (networkId) => networkId === requiredNetworkId
-  );
-  if (match >= 0) {
-    return [candidates[match + 1]];
-  }
-
-  return [];
+  // A SharedWorker network switch keeps the WindowClient identity stable.
+  // Re-probe once instead of letting its old cached network strand the tab.
+  invalidateWindowClient(client);
+  return await windowNetworkId(client) === requiredNetworkId;
 }
 
-async function requestClients(event, requestUrl, requiredNetworkId) {
-  const eventClientId = event.clientId || "";
-  const eventClient = eventClientId ? await self.clients.get(eventClientId) : null;
-  const requestUrlObject = requestUrl ? new URL(requestUrl) : null;
-  const directHlsRequest = requestUrlObject !== null && isHlsResource(requestUrlObject);
+async function originatingWindow(clientId, resultingClientId) {
+  for (const id of [clientId, resultingClientId]) {
+    if (!id) {
+      continue;
+    }
+    const client = await self.clients.get(id);
+    if (isStableWindowClient(client)) {
+      return client;
+    }
+  }
+  return null;
+}
 
-  // Direct top-level HLS requests skip the redundant liveness probe.
-  if (
-    directHlsRequest &&
-    eventClient &&
-    isTopLevelClient(eventClient) &&
-    clientInScope(eventClient)
-  ) {
-    return [eventClient];
+async function requestClient(requiredNetworkId, clientId, resultingClientId, allowFallback = true) {
+  const originating = await originatingWindow(clientId, resultingClientId);
+  if (originating && await windowMatchesNetwork(originating, requiredNetworkId)) {
+    return originating;
+  }
+  if (!allowFallback) {
+    return null;
   }
 
-  const allClients = await self.clients.matchAll({
-    includeUncontrolled: true,
-    type: "window"
+  const clients = await self.clients.matchAll({
+    type: "window",
+    includeUncontrolled: false
   });
-  const candidates = [];
-  const seen = new Set();
-  const requestReference = requestUrlObject ? bzzReferenceFromUrl(requestUrlObject) : "";
+  const candidates = clients.filter(
+    (client) => isStableWindowClient(client) && client.id !== originating?.id
+  );
+  const cached = candidates.find(
+    (client) => cachedWindowNetworks.get(client.id) === requiredNetworkId
+  );
+  if (cached) {
+    return cached;
+  }
+  const matches = await Promise.all(
+    candidates.map((client) => windowMatchesNetwork(client, requiredNetworkId))
+  );
+  const index = matches.findIndex(Boolean);
+  return index < 0 ? null : candidates[index];
+}
 
-  if (eventClient && isTopLevelClient(eventClient) && clientInScope(eventClient)) {
-    pushUniqueClient(candidates, seen, eventClient);
+function bindRuntimePort(client, networkId) {
+  if (!client || typeof client.postMessage !== "function") {
+    return Promise.resolve(null);
+  }
+  if (runtimePort?.networkId === networkId) {
+    return Promise.resolve(runtimePort);
+  }
+  if (runtimePort) {
+    invalidateRuntimePort(runtimePort);
+  }
+  if (runtimePortBinding) {
+    return runtimePortBinding.then(() => bindRuntimePort(client, networkId));
   }
 
-  if (requestReference) {
-    for (const client of allClients) {
+  const channel = new MessageChannel();
+  const candidate = {
+    id: `shared-worker:${networkId}:${++nextRuntimePortId}`,
+    networkId,
+    fallback: client,
+    port: channel.port1
+  };
+  runtimePortBinding = new Promise((resolve) => {
+    let settled = false;
+    const finish = (value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (!value) closeMessagePort(candidate.port);
+      resolve(value);
+    };
+    const invalidate = () => {
+      invalidateRuntimePort(candidate);
+      finish(null);
+    };
+    const timer = setTimeout(invalidate, RUNTIME_PORT_BIND_TIMEOUT_MS);
+    candidate.port.onmessage = (event) => {
+      const message = event.data;
       if (
-        isTopLevelClient(client) &&
-        clientInScope(client) &&
-        bzzReferenceFromUrl(new URL(client.url)) === requestReference
+        message?.type !== "WEEB3_RUNTIME_PORT_READY" ||
+        message?.ok !== true ||
+        Number(message?.protocol) !== SHARED_WORKER_PROTOCOL ||
+        Number(message?.networkId) !== networkId
       ) {
-        pushUniqueClient(candidates, seen, client);
+        invalidate();
+        return;
       }
+      runtimePort = candidate;
+      candidate.port.onmessage = (controlEvent) => {
+        if (controlEvent.data?.type === "WEEB3_RUNTIME_PORT_INVALID") {
+          invalidateRuntimePort(candidate);
+        }
+      };
+      finish(candidate);
+    };
+    candidate.port.onmessageerror = invalidate;
+    candidate.port.addEventListener("close", invalidate);
+    candidate.port.start();
+    try {
+      client.postMessage({
+        type: "WEEB3_RUNTIME_PORT_BIND",
+        networkId,
+        serviceWorkerRelay: SHARED_WORKER_PROTOCOL
+      }, [channel.port2]);
+    } catch (_) {
+      closeMessagePort(channel.port2);
+      invalidate();
     }
-  }
+  }).finally(() => {
+    runtimePortBinding = null;
+  });
+  return runtimePortBinding;
+}
 
-  for (const client of allClients) {
-    if (isTopLevelClient(client) && isAppShellClient(client)) {
-      pushUniqueClient(candidates, seen, client);
-    }
+async function requestRuntime(networkId, clientId, resultingClientId) {
+  if (runtimePort?.networkId === networkId) {
+    return runtimePort;
   }
-
-  for (const client of allClients) {
-    if (isTopLevelClient(client) && clientInScope(client)) {
-      pushUniqueClient(candidates, seen, client);
-    }
-  }
-
-  return firstReadyClient(candidates, requiredNetworkId);
+  const client = await requestClient(networkId, clientId, resultingClientId);
+  return await bindRuntimePort(client, networkId) || client;
 }
 
 function closeMessagePort(port) {
   try {
+    port.onmessage = null;
+    port.onmessageerror = null;
     port.close();
   } catch (_) {
   }
 }
 
-function messageClient(client, message, timeoutMs = FETCH_TIMEOUT_MS) {
-  return new Promise((resolve) => {
-    if (!client || typeof client.postMessage !== "function") {
-      resolve({ ok: false, status: 502, error: "weeb-3 client is not available" });
-      return;
-    }
+function errorResult(status, error) {
+  return { ok: false, status, error };
+}
 
+function messageChannelRequest(timeoutMs, invalidate, send, sendFailure, receive = value => value) {
+  return new Promise((resolve) => {
     const channel = new MessageChannel();
     let settled = false;
-    let timer = null;
-
     const settle = (value) => {
-      if (settled) {
-        return;
-      }
+      if (settled) return;
       settled = true;
-      if (timer !== null) {
-        clearTimeout(timer);
-      }
+      clearTimeout(timer);
       closeMessagePort(channel.port1);
-      resolve(value || { ok: false, status: 500, error: "empty weeb-3 response" });
+      resolve(value || errorResult(500, "empty weeb-3 response"));
     };
-
-    timer = setTimeout(() => {
-      settle({ ok: false, status: 504, error: "Timed out waiting for weeb-3" });
+    const timer = setTimeout(() => {
+      invalidate();
+      settle(errorResult(504, "Timed out waiting for weeb-3"));
     }, timeoutMs);
-
-    channel.port1.onmessage = (event) => {
-      settle(event.data);
-    };
-
+    channel.port1.onmessage = (event) => settle(receive(event.data));
     try {
-      client.postMessage(message, [channel.port2]);
+      send(channel.port2);
     } catch (error) {
-      settle({
-        ok: false,
-        status: 502,
-        error: error && error.message ? error.message : "failed to message weeb-3"
-      });
+      closeMessagePort(channel.port2);
+      invalidate();
+      void Promise.resolve(sendFailure(error)).then(settle);
     }
   });
 }
 
-function messageFirstClient(clients, message, timeoutMs = FETCH_TIMEOUT_MS) {
-  if (!clients.length) {
+function messageClient(client, message, timeoutMs = FETCH_TIMEOUT_MS) {
+  if (!client || typeof client.postMessage !== "function") {
+    invalidateWindowClient(client);
+    return Promise.resolve(errorResult(502, "weeb-3 window relay is not available"));
+  }
+  const invalidate = () => invalidateWindowClient(client);
+  return messageChannelRequest(
+    timeoutMs,
+    invalidate,
+    (port) => {
+      message.serviceWorkerRelay = SHARED_WORKER_PROTOCOL;
+      client.postMessage(message, [port]);
+    },
+    (error) => errorResult(502, error?.message || "failed to message weeb-3"),
+    (value) => {
+      if (!value) invalidate();
+      return value;
+    }
+  );
+}
+
+function messageRuntimePort(runtime, message, timeoutMs) {
+  // A timed-out dispatched request is detached, never replayed. A synchronous
+  // send failure happened before dispatch, so the validated window remains safe.
+  return messageChannelRequest(
+    timeoutMs,
+    () => invalidateRuntimePort(runtime),
+    (port) => runtime.port.postMessage(message, [port]),
+    () => {
+      // A synchronous post failure happened before dispatch, so the validated
+      // broker window is still a safe fallback for this one request.
+      return messageClient(runtime.fallback, message, timeoutMs);
+    }
+  );
+}
+
+function messageRuntime(runtime, message, timeoutMs = FETCH_TIMEOUT_MS) {
+  if (!runtime) {
     const networkId = Number(message?.networkId);
-    return Promise.resolve({
-      ok: false,
-      status: 503,
-      error: Number.isSafeInteger(networkId)
+    return Promise.resolve(errorResult(
+      503,
+      Number.isSafeInteger(networkId)
         ? `weeb-3 runtime for Swarm network ${networkId} is not available`
         : "weeb-3 runtime is not available"
-    });
+    ));
   }
 
   // Timeouts detach the port; dispatched accounting work is never replayed.
-  return messageClient(clients[0], message, timeoutMs);
+  const response = runtime.port
+    ? messageRuntimePort(runtime, message, timeoutMs)
+    : messageClient(runtime, message, timeoutMs);
+  return response.then((response) => {
+    if (Number(response?.status) === 409) {
+      // A network transition can make the cached discovery stale. Never replay
+      // this request; make the next request discover the worker again.
+      if (runtime.port) invalidateRuntimePort(runtime);
+      else invalidateWindowClient(runtime);
+    }
+    return response;
+  });
 }
 
 function requestRustFetch(
-  clients,
+  client,
   requestUrl,
   method,
   range,
@@ -523,7 +600,7 @@ function requestRustFetch(
   ifNoneMatch = "",
   ifRange = ""
 ) {
-  return messageFirstClient(clients, {
+  return messageRuntime(client, {
     type: "WEEB3_FETCH_REQUEST",
     url: requestUrl,
     method,
@@ -547,6 +624,16 @@ function toUint8Array(body) {
   return new Uint8Array();
 }
 
+function responseBodyStream(body) {
+  const bytes = toUint8Array(body);
+  return new ReadableStream({
+    start(controller) {
+      controller.enqueue(bytes);
+      controller.close();
+    }
+  });
+}
+
 function responseHeaders(headerRows) {
   const headers = new Headers();
   for (const row of headerRows || []) {
@@ -557,13 +644,14 @@ function responseHeaders(headerRows) {
   return headers;
 }
 
-function requestRustRange(clients, url, start, end, networkId) {
-  const key = `${clients[0]?.id || ""}|${networkId}|${url}|${start}|${end}`;
+function requestRustRange(client, url, start, end, networkId) {
+  const key = `${client?.id || ""}|${networkId}|${url}|${start}|${end}`;
   const existing = RANGE_REQUEST_FLIGHTS.get(key);
   if (existing) {
     return existing;
   }
-  const request = messageFirstClient(clients, {
+
+  const request = messageRuntime(client, {
     type: "WEEB3_FETCH_REQUEST",
     url,
     method: "GET",
@@ -596,7 +684,7 @@ function requestRustRange(clients, url, start, end, networkId) {
 }
 
 function createRustRangeStream(
-  clients,
+  client,
   url,
   size,
   networkId,
@@ -626,7 +714,7 @@ function createRustRangeStream(
       return null;
     }
     const { start, end } = range;
-    const request = requestRustRange(clients, url, start, end, networkId);
+    const request = requestRustRange(client, url, start, end, networkId);
     scheduled.set(start, request);
     return { start, request };
   };
@@ -714,17 +802,17 @@ function createRustRangeStream(
   });
 }
 
-async function forwardRequestToRust(request, event) {
+async function forwardRequestToRust(request, clientId, resultingClientId) {
   try {
     const url = new URL(request.url);
     const networkId = canonicalRouteNetworkId(url.pathname);
     if (networkId === null) {
       return new Response("weeb-3 route is outside the configured scope", { status: 400 });
     }
-    const clients = await requestClients(event, request.url, networkId);
+    const client = await requestRuntime(networkId, clientId, resultingClientId);
     const hlsResource = isHlsResource(url);
     const response = await requestRustFetch(
-      clients,
+      client,
       request.url,
       request.method,
       hlsResource ? "" : request.headers.get("Range") || "",
@@ -759,7 +847,7 @@ async function forwardRequestToRust(request, event) {
         ? HLS_STREAM_INITIAL_LOOKAHEAD_CHUNKS
         : lookahead;
       return new Response(createRustRangeStream(
-        clients,
+        client,
         request.url,
         size,
         networkId,
@@ -775,7 +863,7 @@ async function forwardRequestToRust(request, event) {
     return new Response(
       request.method === "HEAD" || status === 304
         ? null
-        : toUint8Array(response.body),
+        : responseBodyStream(response.body),
       {
         status,
         headers
@@ -800,7 +888,7 @@ function parseUploadRedundancyHeader(value) {
   return Number.isSafeInteger(level) && level <= 4 ? level : null;
 }
 
-async function forwardUploadToRust(request, event) {
+async function forwardUploadToRust(request, clientId, resultingClientId) {
   try {
     const url = new URL(request.url);
     const networkId = canonicalRouteNetworkId(url.pathname);
@@ -821,8 +909,8 @@ async function forwardUploadToRust(request, event) {
       return new Response("Swarm-Redundancy-Level must be an integer from 0 to 4", { status: 400 });
     }
 
-    const clients = await requestClients(event, request.url, networkId);
-    const response = await messageFirstClient(clients, {
+    const client = await requestClient(networkId, clientId, resultingClientId, false);
+    const response = await messageRuntime(client, {
       type: "UPLOAD_REQUEST",
       file,
       networkId,

@@ -6,6 +6,8 @@ mod accounting;
 mod events;
 #[path = "../src/retrieval_conventions.rs"]
 mod retrieval_conventions;
+#[path = "support/source.rs"]
+pub mod source;
 
 mod connection {
     use crate::accounting::{
@@ -40,10 +42,9 @@ mod connection {
             .map(|offset| selection_start + offset)
             .expect("retrieve peer selector end");
         let selection = &retrieval[selection_start..selection_end];
-        assert!(
-            include_str!("../src/lib.rs")
-                .contains("overlay_peers: Arc<Mutex<HashMap<Vec<u8>, PeerId>>>")
-        );
+        let runtime = include_str!("../src/lib.rs");
+        assert!(runtime.contains("type OverlayPeerMap = Arc<Mutex<HashMap<Vec<u8>, PeerId>>>"));
+        assert!(runtime.contains("overlay_peers: OverlayPeerMap"));
         assert!(selection.contains("if peers_map.is_empty()"));
         assert!(selection.contains("for (overlay, id) in peers_map.iter()"));
         assert!(selection.contains("current_po >= current_max_po || closest_peer_id.is_none()"));
@@ -52,6 +53,28 @@ mod connection {
         assert!(!selection.contains("hex::decode"));
         assert!(!selection.contains("CONNECTION_BUILDUP_LIMIT"));
         assert!(!selection.contains("CONNECTION_DIAL_CONCURRENCY_LIMIT"));
+        assert!(selection.contains("overdraftlist.insert(peer);"));
+        assert!(selection.contains("async_std::task::yield_now().await;"));
+        assert!(selection.contains("RETRIEVE_HOT_LOOP_GUARD_MS"));
+        let transient_session = selection
+            .split("cancel_reserve(&accounting_peer, req_price).await;")
+            .nth(1)
+            .and_then(|source| source.split("overdraftlist.insert(peer);").next())
+            .expect("session publication race handling");
+        assert!(transient_session.contains("continue;"));
+    }
+
+    #[test]
+    fn decoded_plain_chunks_share_the_canonical_raw_cache_backing() {
+        let retrieval = include_str!("../src/retrieval.rs");
+        assert!(retrieval.contains("const RETRIEVE_DECODED_CHUNK_CACHE_ENTRIES: usize = 2048;"));
+        assert!(retrieval.contains("payload: Bytes,"));
+        assert!(retrieval.contains("plain.slice(erasure_coding::SPAN_SIZE..chunk_len)"));
+        assert!(
+            retrieval.contains("decode_shared_raw_join_chunk(raw.as_ref()?.clone(), reference)")
+        );
+        assert!(retrieval.contains("decode_shared_raw_join_chunk(raw, data_address)?"));
+        assert!(!retrieval.contains("Rc::from(&plain[erasure_coding::SPAN_SIZE..chunk_len])"));
     }
 
     #[test]
@@ -273,9 +296,18 @@ mod connection {
             .find(".insert(peer, owner)")
             .expect("owner-bound duplicate suppression");
         let disconnect = duplicate
-            .find("swarm.disconnect_peer_id(peer.clone())")
+            .find("swarm.disconnect_peer_id(peer)")
             .expect("duplicate disconnect");
         assert!(reject < disconnect);
+        assert!(
+            duplicate[..disconnect].contains("known_peer_underlays.lock().await.remove(&peer)")
+        );
+        assert!(
+            duplicate[..disconnect].contains("known_peer_generations.lock().await.remove(&peer)")
+        );
+        assert!(
+            duplicate[..disconnect].contains("delayed_peer_retries.lock().await.remove(&peer)")
+        );
 
         let feeder = runtime
             .split("let swarm_event_handle_0 = async")
@@ -380,7 +412,12 @@ mod connection {
         let handlers = include_str!("../src/handlers.rs");
         assert!(runtime.contains("handshake_signer: Arc<PrivateKeySigner>"));
         assert_eq!(runtime.matches("PrivateKeySigner::from_slice(").count(), 1);
-        assert!(!handlers.contains("PrivateKeySigner::from_slice("));
+        let handshake = handlers
+            .split("async fn handshake_exchange(")
+            .nth(1)
+            .and_then(|source| source.split("pub async fn pricing_handler(").next())
+            .expect("handshake exchange");
+        assert!(!handshake.contains("PrivateKeySigner::from_slice("));
     }
 
     #[test]
@@ -396,6 +433,8 @@ mod connection {
         assert!(received.contains("info.observed_addr.clone()"));
         assert!(received.contains("try_from_multiaddr(&info.observed_addr)"));
         assert!(received.contains(".is_some_and(|peer| peer != identify_local_peer_id)"));
+        assert_eq!(received.matches("physical_connections").count(), 1);
+        assert_eq!(received.matches("handshake_ready_connections").count(), 1);
         assert!(received.contains("swarm.add_external_address(canonical)"));
         assert!(received.contains(".identify\n                                        .push("));
         let push = received
@@ -501,7 +540,7 @@ mod connection {
             .find("let accounting_peer_lock = {")
             .expect("saved accounting peer");
         let connected = accounting
-            .find("connected_peers.insert(peer.clone(), peer_file.clone())")
+            .find("connected_peers.insert(peer, peer_file.clone())")
             .expect("connected-peer publication");
         let threshold = accounting
             .find("let threshold_ready = {")
@@ -548,7 +587,7 @@ mod connection {
             .find("attempts.remove(&peer)")
             .expect("reservation transfer");
         let overlay_publish = promotion
-            .find("overlay_peers_map.insert(overlay.clone(), peer.clone())")
+            .find("overlay_peers_map.insert(overlay.clone(), peer)")
             .expect("overlay publication");
         let counter_transfer = promotion
             .find("let mut connections = self.connections.lock().await;")
@@ -852,16 +891,17 @@ mod connection {
         assert!(runtime.contains("Duration::from_millis(HANDSHAKE_PROTOCOL_TIMEOUT_MS)"));
 
         let handlers = include_str!("../src/handlers.rs");
-        assert!(handlers.contains("let Some(ack) = rec_0.ack.as_ref()"));
-        assert!(handlers.contains("let Some(peer_address) = ack.address.as_ref()"));
+        assert!(handlers.contains("let Some(ack) = rec_0.ack else"));
+        assert!(handlers.contains("let Some(peer_address) = ack.address else"));
         let handshake = handlers
-            .split("pub async fn ceive(")
+            .split("async fn handshake_exchange(")
             .nth(1)
             .and_then(|source| source.split("pub async fn pricing_handler(").next())
             .expect("handshake initiator");
         assert!(handshake.contains("deserialize_underlays(&syn.observed_underlay)"));
         assert!(handshake.contains("try_from_multiaddr(underlay).as_ref() != Some(&local_peer)"));
-        assert!(handshake.contains("let underlay = syn.observed_underlay.clone();"));
+        assert!(handshake.contains("let underlay = syn.observed_underlay;"));
+        assert!(!handshake.contains("underlay.clone()"));
         assert!(handshake.contains("if ack.network_id != network_id"));
 
         let connection = handlers
@@ -901,9 +941,9 @@ mod connection {
             2
         );
         let refresh = handlers
-            .split("pub async fn fresh(")
+            .split("async fn refreshment_exchange(")
             .nth(1)
-            .and_then(|source| source.split("pub async fn issue(").next())
+            .and_then(|source| source.split("async fn cheque_exchange(").next())
             .expect("refresh handler");
         assert_eq!(
             refresh
@@ -966,8 +1006,9 @@ mod connection {
     #[test]
     fn retrieval_reads_complete_length_delimited_frames_despite_transport_fragmentation() {
         let handlers = include_str!("../src/handlers.rs");
+        assert!(handlers.contains("const EMPTY_HEADERS_FRAME: &[u8] = &[0];"));
         let retrieval = handlers
-            .split("pub async fn trieve(")
+            .split("async fn retrieval_exchange(")
             .nth(1)
             .and_then(|source| source.split("pub async fn connection_handler(").next())
             .expect("retrieval protocol handler");
@@ -990,7 +1031,7 @@ mod connection {
         let hive = handlers
             .split("pub async fn gossip_handler(")
             .nth(1)
-            .and_then(|source| source.split("pub async fn fresh(").next())
+            .and_then(|source| source.split("async fn refreshment_exchange(").next())
             .expect("Hive protocol handler");
 
         assert_eq!(
@@ -1016,7 +1057,7 @@ mod connection {
     fn pushsync_uses_exact_framing_and_cannot_drop_a_short_write() {
         let handlers = include_str!("../src/handlers.rs");
         let pushsync = handlers
-            .split("pub async fn sync(")
+            .split("async fn pushsync_exchange(")
             .nth(1)
             .expect("pushsync protocol handler");
 
@@ -1090,17 +1131,12 @@ mod connection {
 }
 
 mod retrieve_group_stream {
+    use crate::source::between;
+
     const RETRIEVAL_SOURCE: &str = include_str!("../src/retrieval.rs");
 
     fn source_section(start: &str, end: &str) -> &'static str {
-        let start = RETRIEVAL_SOURCE
-            .find(start)
-            .unwrap_or_else(|| panic!("missing retrieval source marker: {start}"));
-        let tail = &RETRIEVAL_SOURCE[start..];
-        let end = tail
-            .find(end)
-            .unwrap_or_else(|| panic!("missing retrieval source marker: {end}"));
-        &tail[..end]
+        between(RETRIEVAL_SOURCE, start, end)
     }
 
     #[test]
@@ -1210,20 +1246,18 @@ mod rolling_erasure_tail {
         rolling_full_group_eligible, rolling_full_group_static_candidate,
         rolling_next_parity_index, rolling_parity_admission_count,
     };
+    use crate::source::between;
 
     const GATE_MS: u64 = 1_000;
     const RETRIEVAL_SOURCE: &str = include_str!("../src/retrieval.rs");
     const RUNTIME_SOURCE: &str = include_str!("../src/lib.rs");
 
     fn group_source() -> &'static str {
-        let start = RETRIEVAL_SOURCE
-            .find("async fn fetch_data_group_indices_streaming(")
-            .expect("group fetch start");
-        let end = RETRIEVAL_SOURCE[start..]
-            .find("#[derive(Clone)]\nstruct TraversalNode")
-            .map(|offset| start + offset)
-            .expect("group fetch end");
-        &RETRIEVAL_SOURCE[start..end]
+        between(
+            RETRIEVAL_SOURCE,
+            "async fn fetch_data_group_indices_streaming(",
+            "#[derive(Clone)]\nstruct TraversalNode",
+        )
     }
 
     #[test]
@@ -1440,7 +1474,7 @@ mod progress_events {
 
     #[test]
     fn late_updates_do_not_reopen_finished_progress() {
-        let mut store = ProgressStore::new();
+        let mut store = ProgressStore::default();
         let id = store.start("upload", "file", "read", Some(0), "reading");
         store.finish(&id, "failed", "slice read failed", false);
         store.update(&id, "push", Some(50), "late chunk receipt");

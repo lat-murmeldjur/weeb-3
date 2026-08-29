@@ -2,15 +2,8 @@ syntax = "proto3";
 
 package weeb_3.etiquette_2;
 
-message Peers {
-    repeated BzzAddress peers = 1;
-}
+import "etiquette_1.proto";
 
-message BzzAddress {
-    bytes Underlay = 1;
-    bytes Signature = 2;
-    bytes Overlay = 3;
-    bytes Nonce = 4;
-    int64 Timestamp = 5;
-    bytes ChequebookAddress = 6;
+message Peers {
+    repeated weeb_3.etiquette_1.BzzAddress peers = 1;
 }

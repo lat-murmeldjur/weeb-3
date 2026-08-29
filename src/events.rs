@@ -12,7 +12,7 @@ pub(crate) struct ProgressRow {
     pub ok: bool,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub(crate) struct ProgressStore {
     next_id: u64,
     revision: u64,
@@ -20,14 +20,6 @@ pub(crate) struct ProgressStore {
 }
 
 impl ProgressStore {
-    pub(crate) fn new() -> Self {
-        Self {
-            next_id: 0,
-            revision: 0,
-            rows: Vec::new(),
-        }
-    }
-
     pub(crate) fn start(
         &mut self,
         kind: impl Into<String>,
@@ -51,7 +43,6 @@ impl ProgressStore {
                 ok: true,
             },
         );
-        self.trim_completed();
         self.bump_revision();
         id
     }
@@ -63,14 +54,14 @@ impl ProgressStore {
         percent: Option<u8>,
         detail: impl Into<String>,
     ) {
-        let phase = phase.into();
-        let detail = detail.into();
         let Some(row) = self.rows.iter_mut().find(|row| row.id == id) else {
             return;
         };
         if row.done {
             return;
         }
+        let phase = phase.into();
+        let detail = detail.into();
 
         if row.phase == phase && row.percent == percent && row.detail == detail {
             return;
@@ -89,11 +80,11 @@ impl ProgressStore {
         detail: impl Into<String>,
         ok: bool,
     ) {
-        let phase = phase.into();
-        let detail = detail.into();
         let Some(row) = self.rows.iter_mut().find(|row| row.id == id) else {
             return;
         };
+        let phase = phase.into();
+        let detail = detail.into();
 
         let percent = if ok { Some(100) } else { row.percent };
         if row.phase == phase
@@ -122,11 +113,11 @@ impl ProgressStore {
             return None;
         }
 
-        let (mut active, completed): (Vec<_>, Vec<_>) =
-            self.rows.iter().cloned().partition(|row| !row.done);
-        active.extend(completed);
+        let mut rows = Vec::with_capacity(self.rows.len());
+        rows.extend(self.rows.iter().filter(|row| !row.done).cloned());
+        rows.extend(self.rows.iter().filter(|row| row.done).cloned());
 
-        Some((self.revision, active))
+        Some((self.revision, rows))
     }
 
     fn bump_revision(&mut self) {

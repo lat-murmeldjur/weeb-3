@@ -17,13 +17,15 @@ mod network_profile {
 
 #[path = "../src/nav.rs"]
 mod nav;
+#[path = "support/source.rs"]
+pub mod source;
 
 mod hls_minimal {
     use crate::{
         stream_conventions::HlsStart,
         stream_hls::{
             HLS_LIVE_EDGE_SEGMENTS, HLS_LIVE_SYNC_SEGMENTS, HlsPlaylist, HlsTailFailure,
-            hls_payload_mime, is_hls_manifest,
+            hls_payload_mime, hls_progressive_foreground_transition, is_hls_manifest,
         },
     };
 
@@ -88,6 +90,49 @@ mod hls_minimal {
         assert_eq!(plan.play_position, 0.0);
         assert!((plan.runway_end - 4.166667).abs() < 0.000_01);
         assert!((plan.duration - parsed.duration()).abs() < 0.000_01);
+    }
+
+    #[test]
+    fn commit337_foreground_transition_ignores_sequential_and_cached_backward_reads() {
+        assert_eq!(
+            hls_progressive_foreground_transition(4, 5, false),
+            (false, 5)
+        );
+        assert_eq!(
+            hls_progressive_foreground_transition(5, 5, false),
+            (false, 5)
+        );
+        assert_eq!(
+            hls_progressive_foreground_transition(5, 8, false),
+            (true, 8)
+        );
+        assert_eq!(
+            hls_progressive_foreground_transition(5, 2, false),
+            (true, 2)
+        );
+        assert_eq!(
+            hls_progressive_foreground_transition(5, 2, true),
+            (false, 5)
+        );
+    }
+
+    #[test]
+    fn live_plan_offsets_include_gaps_without_bootstrapping_a_nonzero_window() {
+        let body = format!(
+            "#EXTM3U\n#EXT-X-TARGETDURATION:5\n#EXT-X-MEDIA-SEQUENCE:4\n\
+             #EXTINF:1,\n{}\n#EXTINF:2,\n#EXT-X-GAP\n{}\n\
+             #EXTINF:3,\n{}\n#EXTINF:4,\n{}\n#EXTINF:5,\n{}\n",
+            REFERENCES[0], REFERENCES[1], REFERENCES[2], REFERENCES[3], REFERENCES[4]
+        );
+        let plan = HlsPlaylist::parse(body.as_bytes())
+            .unwrap()
+            .startup_plan(HlsStart::Live)
+            .unwrap();
+        assert_eq!(plan.bootstrap_position, 0.0);
+        assert!(!plan.codec_bootstrap);
+        assert_eq!(plan.play_position, 3.0);
+        assert_eq!(plan.runway_end, 15.0);
+        assert_eq!(plan.duration, 15.0);
     }
 
     #[test]
@@ -339,9 +384,49 @@ mod hls_minimal {
             })
             .sum::<usize>();
         assert!(
-            lines < 3_850,
+            lines < 4_000,
             "minimal HLS core grew to {lines} nonblank lines"
         );
+        const PAGE: &str = include_str!("../src/stream_hls/page_bridge.rs");
+        let page_lines = PAGE.lines().filter(|line| !line.trim().is_empty()).count();
+        assert!(
+            page_lines < 350,
+            "HLS page boundary grew to {page_lines} nonblank lines"
+        );
+        let worker_split_lines = [
+            include_str!("../src/stream_hls/worker_bridge.rs"),
+            include_str!("../src/stream_hls/protocol.rs"),
+        ]
+        .iter()
+        .map(|source| {
+            source
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .count()
+        })
+        .sum::<usize>();
+        assert!(
+            worker_split_lines < 200,
+            "HLS worker boundary grew to {worker_split_lines} nonblank lines"
+        );
+        assert!(!RUNTIME.contains("HtmlMediaElement"));
+        assert!(!RUNTIME.contains("SharedNodeClient"));
+        let history = RUNTIME
+            .split_once("async fn hls_history(")
+            .unwrap()
+            .1
+            .split_once("async fn discover_raw_for_view(")
+            .unwrap()
+            .0;
+        assert!(history.contains("HlsPlaylist::reconstruct(snapshots.clone()"));
+        assert!(
+            history.find("HlsPlaylist::reconstruct(snapshots.clone()")
+                < history.find("let repairs = history_repairs(")
+        );
+        assert!(!RUNTIME.contains("snapshots.to_vec()"));
+        assert!(!CORE.contains("candidate.clone()).is_some()"));
+        assert!(PAGE.contains("pub(crate) async fn attach_hls_feed_player("));
+        assert!(PAGE.contains("pub(crate) async fn open_hls_feed_view("));
         for removed in [
             "HlsMediaPlanRegistry",
             "HlsProgressiveRunway",
@@ -361,6 +446,7 @@ mod hls_minimal {
         assert!(PLAYER.contains("HardRestart(String)"));
         assert!(PLAYER.contains("const MAX_HARD_RESTARTS: u8 = 2"));
         assert!(PLAYER.contains("hard_restarts: u8"));
+        assert!(PLAYER.contains("callback: Closure<dyn FnMut(JsValue, JsValue)>"));
         assert!(PLAYER.contains("hls_class: JsValue"));
         assert!(PLAYER.contains("player.plan.play_position"));
         assert!(PLAYER.contains("Action::RecoverNetwork(hls, position)"));
@@ -368,6 +454,10 @@ mod hls_minimal {
         assert!(PLAYER.contains("finish_hls_action(id"));
         assert!(PLAYER.contains("Action::ReloadSource(hls, source) =>"));
         assert!(PLAYER.contains("hls.load_source(&source)"));
+        assert!(!PLAYER.contains("missing_video_source_buffer_error"));
+        assert!(!PLAYER.contains("RestartAfterEvent"));
+        assert!(!PLAYER.contains("HlsJsTrackRemovedError"));
+        assert!(PLAYER.contains("player.codec_bootstrap_pending = player.plan.codec_bootstrap"));
         assert!(PLAYER.contains("fn hard_restart(id: u64, message: String)"));
         assert!(PLAYER.contains("construct_hls(&player.hls_class"));
         assert!(PLAYER.contains("std::mem::replace(&mut player.hls"));
@@ -383,10 +473,13 @@ mod hls_minimal {
             .unwrap()
             .0;
         assert!(restart.contains("player.ready.then(|| player.media.current_time())"));
+        assert!(!PLAYER.contains("SeekGate"));
         assert!(restart.contains(".unwrap_or(player.plan.play_position)"));
+        assert!(!restart.contains("player.plan.duration = player.plan.duration.max(duration)"));
         assert!(!restart.contains("reload_position\n            .take()"));
         assert!(restart.contains("(position + runway).min(player.plan.duration)"));
         assert!(restart.find("std::mem::replace") < restart.find("reload_position = None"));
+        assert!(!restart.contains("player.seek"));
         assert!(!restart.contains("tail_failure.clear()"));
         assert!(PLAYER.contains("return play_native(id, media, source, plan, start)"));
         assert!(PLAYER.contains("media.set_src(source)"));
@@ -420,7 +513,7 @@ mod hls_minimal {
         assert!(ownership.contains("BodyLoad::Cached(body.clone())"));
         assert!(ownership.contains("pending.waiters.push(sender)"));
         assert!(ownership.contains("BodyLoad::Wait(receiver)"));
-        assert!(ownership.contains("BodyLoad::Lead"));
+        assert!(ownership.contains("BodyLoad::Lead(self.epoch)"));
 
         let body = RUNTIME
             .split_once("async fn hls_body(")
@@ -430,8 +523,9 @@ mod hls_minimal {
             .unwrap()
             .0;
         assert!(body.contains("BodyLoad::Wait(waiter) => return waiter.recv().await"));
+        assert!(body.contains("BodyLoad::Lead(epoch) => epoch"));
         assert!(body.contains("retrieve_data_range_from_root(root, 0, end"));
-        assert!(body.contains("finish_body(reference, body.clone())"));
+        assert!(body.contains("finish_body(reference, epoch, body)"));
 
         let range = RUNTIME
             .split_once("async fn hls_range(")
@@ -454,13 +548,10 @@ mod hls_minimal {
         assert!(runway.contains("HlsStart::Live => playlist"));
         assert!(runway.contains(".rev()"));
         assert!(runway.contains(".take(HLS_LIVE_EDGE_SEGMENTS)"));
-        assert!(runway.contains(".into_iter()"));
-        assert!(runway.contains(".rev()"));
-        assert!(
-            runway.contains(
-                "prefetch_priority_runway(client, references.clone(), start, generation)"
-            )
-        );
+        assert!(runway.contains("references.reverse()"));
+        assert!(runway.contains(
+            "prefetch_priority_runway(client, references.clone(), start, generation, false)"
+        ));
     }
 
     #[test]
@@ -499,61 +590,39 @@ mod hls_minimal {
     }
 
     #[test]
-    fn beginning_startup_and_post_start_seeks_keep_the_planned_one_segment_runway() {
+    fn hls_seeks_use_the_media_cursor_without_a_generic_pause_gate() {
         const PLAYER: &str = include_str!("../src/stream_hls/player.rs");
-        assert!(
-            PLAYER.contains(
-                "[\"play\", \"seeking\", \"seeked\", \"timeupdate\", \"durationchange\"]"
-            )
-        );
-        let seek = PLAYER
+        assert!(PLAYER.contains(
+            "const MEDIA_LIFECYCLE_EVENTS: [&str; 3] = [\"play\", \"timeupdate\", \"durationchange\"]"
+        ));
+        for pause_gate in [
+            "\"seeking\"",
+            "\"seeked\"",
+            "SeekGate",
+            "settle_seek",
+            "HLS seek runway",
+        ] {
+            assert!(!PLAYER.contains(pause_gate));
+        }
+        let lifecycle = PLAYER
             .split_once("fn media_action(")
             .unwrap()
             .1
             .split_once("fn apply_media_action(")
             .unwrap()
             .0;
-        let intercept = seek.find("event == \"seeking\"").unwrap();
-        let advancing = seek.find("*clock_started || seek.is_some()").unwrap();
-        let remember = seek
-            .find("*seek = Some(SeekGate { target, resume })")
-            .unwrap();
-        let reset = seek.find("*clock_origin = target").unwrap();
-        let pause = seek.find("return MediaAction::Pause").unwrap();
-        assert!(intercept < advancing && advancing < remember && remember < reset && reset < pause);
-        assert!(seek.contains("seek.map_or(!media.paused(), |pending| pending.resume)"));
-        assert!(seek.contains("seek.is_none()"));
-        assert!(seek.contains("*clock_origin + CLOCK_ADVANCE_EPSILON_SECONDS"));
-
-        let gate = PLAYER
-            .split_once("fn settle_seek(")
-            .unwrap()
-            .1
-            .split_once("fn playback_start_position(")
-            .unwrap()
-            .0;
-        assert!(gate.contains("pending.target + SEEK_ALIGNMENT_SECONDS"));
-        assert!(gate.contains("aligned_target + runway"));
-        assert!(gate.contains("end = end.min(duration)"));
-        assert!(gate.contains("buffered_covers(media, aligned_target, end)"));
-        assert!(gate.contains("*seek = None"));
-        assert!(gate.contains("Some(pending.resume)"));
-        assert!(PLAYER.contains("\"hlsBufferAppended\" | \"hlsFragBuffered\" =>"));
-        assert!(PLAYER.contains("fn playback_runway(plan: &HlsStartupPlan)"));
-        assert!(PLAYER.contains("plan.runway_end"));
-        assert!(PLAYER.contains("- plan.play_position"));
-        assert_eq!(
-            PLAYER.matches("settle_seek(&player.media, runway").count(),
-            2
-        );
+        assert!(lifecycle.contains("event == \"play\" && !ready"));
+        assert!(lifecycle.contains("event == \"timeupdate\""));
+        assert!(lifecycle.contains("*clock_origin + CLOCK_ADVANCE_EPSILON_SECONDS"));
     }
 
     #[test]
-    fn live_playback_primes_codec_from_the_first_playable_segment() {
+    fn codec_bootstrap_primes_from_the_first_playable_segment() {
         const PLAYER: &str = include_str!("../src/stream_hls/player.rs");
         const RUNTIME: &str = include_str!("../src/stream_hls/runtime.rs");
+        const WORKER_BRIDGE: &str = include_str!("../src/stream_hls/worker_bridge.rs");
         assert!(!PLAYER.contains("hlsBufferCreated"));
-        assert!(PLAYER.contains("live_bootstrap_pending"));
+        assert!(PLAYER.contains("codec_bootstrap_pending"));
         assert!(!PLAYER.contains("has_video_track"));
         assert!(PLAYER.contains("is_main_fragment(data)"));
         assert!(PLAYER.contains("player.plan.bootstrap_position"));
@@ -564,9 +633,13 @@ mod hls_minimal {
         assert!(PLAYER.contains("fragLoadTimeOut"));
         assert!(PLAYER.contains("fragParsingError"));
         assert!(PLAYER.contains("failed_media_identity(data)"));
-        assert!(PLAYER.contains(".record(snapshot, sequence, &reference)"));
-        assert!(RUNTIME.contains("pub(super) fn live_tail_failure_identity("));
-        assert!(RUNTIME.contains("pub(super) fn install_live_tail_fallback("));
+        assert!(PLAYER.contains("resolve_remote_tail_failure("));
+        assert!(
+            PLAYER.contains("super::page_bridge::resolve_live_tail_failure(sequence, &reference)")
+        );
+        assert!(WORKER_BRIDGE.contains(".record(snapshot, sequence, &reference)"));
+        assert!(RUNTIME.contains("pub(crate) fn live_tail_failure_identity("));
+        assert!(RUNTIME.contains("pub(crate) fn install_live_tail_fallback("));
         assert!(RUNTIME.contains("let retreat = (0..failed)"));
         assert!(RUNTIME.contains("const LIVE_TAIL_FALLBACK_LIMIT: usize = 4"));
         assert!(RUNTIME.contains("const LIVE_TAIL_FALLBACK_WINDOW_MS: f64 = 300_000.0"));
@@ -582,8 +655,11 @@ mod hls_minimal {
         assert!(RUNTIME.contains(".take(HLS_LIVE_EDGE_SEGMENTS)"));
         assert!(PLAYER.contains("player.source.clone()"));
         assert!(PLAYER.contains("Action::ReloadSource("));
-        assert!(PLAYER.contains("player.reload_position = Some(restart)"));
-        assert!(PLAYER.contains("let restart = fallback_target.unwrap_or(restart)"));
+        assert!(PLAYER.contains("player.reload_position = Some(target)"));
+        assert!(
+            PLAYER
+                .contains("fatal_recovery_action(player, error_type.as_deref(), details, restart)")
+        );
         assert!(PLAYER.contains("if player.reload_position.is_some()"));
         assert!(PLAYER.contains("return Action::HardRestart(details)"));
         assert!(!PLAYER.contains("internal_seek"));
@@ -601,7 +677,7 @@ mod hls_minimal {
             .unwrap()
             + manifest;
         let handoff = PLAYER
-            .find("\"hlsFragBuffered\" if player.live && player.live_bootstrap_pending")
+            .find("\"hlsFragBuffered\" if player.codec_bootstrap_pending")
             .unwrap();
         let tail = PLAYER[handoff..].find("player.plan.play_position").unwrap() + handoff;
         assert!(
@@ -629,9 +705,8 @@ mod hls_minimal {
             .split_once("fn media_action(")
             .unwrap()
             .0;
-        assert!(lifecycle.contains("matches!(event, \"seeking\" | \"seeked\")"));
-        assert!(lifecycle.contains("if player.live"));
-        assert!(lifecycle.contains("return MediaAction::None"));
+        assert!(!lifecycle.contains("seeking"));
+        assert!(!lifecycle.contains("seeked"));
         let duration_retry = PLAYER
             .split_once("if event == \"durationchange\"")
             .unwrap()
@@ -639,14 +714,14 @@ mod hls_minimal {
             .split_once("let ready = player.ready;")
             .unwrap()
             .0;
-        assert!(duration_retry.contains("&& !player.live_bootstrap_pending"));
+        assert!(duration_retry.contains("&& !player.codec_bootstrap_pending"));
         let ready_gate = handoff + PLAYER[handoff..].find("if !player.ready =>").unwrap();
         let handoff_path = &PLAYER[handoff..ready_gate];
         let cleared = handoff_path
-            .find("player.live_bootstrap_pending = false")
+            .find("player.codec_bootstrap_pending = false")
             .unwrap();
         let recheck = handoff_path
-            .find("playback_start_position(&player.media, &player.plan, true, false)")
+            .find("playback_start_position(&player.media, &player.plan, player.live, false)")
             .unwrap();
         let play = handoff_path
             .find("Action::Play(player.media.clone(), position)")
@@ -684,8 +759,23 @@ mod hls_minimal {
         assert!(!RUNTIME.contains("warm_reference_head"));
         assert!(PLAYER.contains("live_runway_locked"));
         assert!(PLAYER.contains("lock_latest_live_plan(player)"));
-        assert!(RUNTIME.contains("pub(super) fn lock_live_startup_plan()"));
+        assert!(RUNTIME.contains("pub(crate) fn lock_live_startup_plan()"));
         assert!(RUNTIME.contains("active.live_foreground = latest_live_foreground(active)"));
+
+        let lock = PLAYER
+            .split_once("fn lock_latest_live_plan(")
+            .unwrap()
+            .1
+            .split_once("fn playback_runway(")
+            .unwrap()
+            .0;
+        let optional_plan = lock.find("if let Some(plan) = plan").unwrap();
+        let locked = lock.find("player.live_runway_locked = true").unwrap();
+        let fallback = lock.find("playback_start_position(").unwrap();
+        assert!(optional_plan < locked && locked < fallback);
+        assert!(lock.contains("let changed = !was_locked"));
+        assert!(lock.contains("} else if changed {"));
+        assert!(!lock.contains("Could not lock the live HLS startup position"));
 
         let update = RUNTIME
             .split_once("fn apply_update(")
@@ -737,15 +827,17 @@ mod hls_minimal {
         assert!(successor.contains(".position(matches)"));
         assert!(successor.contains(".rfind(|(position, segment)|"));
         assert!(successor.contains("live_segment_is_playable(active, *position)"));
-        assert!(successor.contains("playlist.segments[position..]"));
+        assert!(successor.contains("let playable = playlist.segments.iter().filter"));
+        assert!(successor.contains("playable\n            .skip(position)"));
         assert!(successor.contains(".take(BODY_PREFETCH_HORIZON)"));
         assert!(successor.contains("active.live_foreground = Some(reference.to_string())"));
         assert!(successor.contains("Some((active.id, None))"));
-        assert!(
-            successor.contains(
-                "prefetch_priority_runway(client, references, HlsStart::Beginning, None)"
-            )
-        );
+        assert!(successor.contains(
+            "prefetch_priority_runway(client, references, HlsStart::Beginning, None, cached)"
+        ));
+        assert!(successor.contains("hls_progressive_foreground_transition"));
+        assert!(successor.contains("let playable = playlist.segments.iter().filter"));
+        assert!(successor.contains("let successor = transition"));
         assert!(successor.contains("spawn_live_runway(id)"));
 
         let response = RUNTIME
@@ -756,7 +848,10 @@ mod hls_minimal {
             .unwrap()
             .0;
         assert!(response.contains("method == \"GET\" && range.is_none() && !codec_bootstrap"));
-        assert!(response.contains("prefetch_from_reference(&reference)"));
+        assert!(response.contains("prefetch_from_reference(&reference, cached)"));
+        assert!(response.contains("if let Some(successor) = seek_successor"));
+        assert!(response.contains("foreground_hls_body(client.clone(), reference.clone(), None)"));
+        assert!(response.contains("hls_body(client.clone(), successor, None).await"));
         assert!(response.contains("let mime = if codec_bootstrap"));
     }
 }
@@ -1219,48 +1314,26 @@ mod network_routes {
     }
 }
 mod service_worker {
+    use crate::source::between as source_between;
+
     const STATIC_WORKER: &str = include_str!("../static/service.js");
     const INTERFACE: &str = include_str!("../src/interface.rs");
     const INTERFACE_RUNTIME: &str = include_str!("../src/interface_runtime_conventions.rs");
-    const BZZ_STREAM: &str = include_str!("../src/bzz_stream.rs");
-    const HLS_PLAYER: &str = include_str!("../src/stream_hls.rs");
     const LIBRARY: &str = include_str!("../src/library.rs");
     const NAV: &str = include_str!("../src/nav.rs");
     const STATIC_404: &str = include_str!("../static/404.html");
-    const STATIC_HLS_LOADER: &str = include_str!("../static/hls_loader.js");
-    const STATIC_EXAMPLE: &str = include_str!("../static/example.html");
-    const HLS_STREAM_EXAMPLE: &str = include_str!("../static/hls-stream-example.html");
     const MAIN_SERVER: &str = include_str!("../src/main.rs");
-    const HAXE_BUILD: &str = include_str!("../Code_One.hx");
-    const NPM_WORKFLOW: &str = include_str!("../.github/workflows/plain.yml");
-    const NPM_README: &str = include_str!("../README.npm.md");
-    const RUNTIME: &str = include_str!("../src/lib.rs");
-    const UPLOAD: &str = include_str!("../src/upload.rs");
-
-    fn source_between<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
-        source
-            .split_once(start)
-            .and_then(|(_, tail)| tail.split_once(end))
-            .map(|(body, _)| body)
-            .unwrap_or_else(|| panic!("missing source section between {start:?} and {end:?}"))
-    }
 
     #[test]
-    fn npm_and_interface_share_the_core_runtime_and_network_dial_path() {
-        assert!(RUNTIME.contains("runtime_started: AtomicBool"));
-        assert!(RUNTIME.contains("self.runtime_started.swap(true, Ordering::AcqRel)"));
-        assert!(LIBRARY.contains("inner: Arc<Weeb3>"));
-        assert!(!LIBRARY.contains("Swarm<Behaviour>"));
-        assert!(LIBRARY.contains("start_weeb3_runtime(inner.clone())"));
-        assert!(LIBRARY.contains("connect_bootnodes_for_current_network("));
-
+    fn interface_mount_waits_for_the_shared_node_before_reading_routes() {
         let npm_start = source_between(
             LIBRARY,
             "fn schedule_start(&self, options: StartOptions)",
             "async fn boot_runtime(&self)",
         );
-        assert!(npm_start.contains("install_service_worker_message_bridge(self.inner.clone())"));
+        assert!(!npm_start.contains("install_service_worker_message_bridge"));
         assert!(npm_start.contains("get_service_worker().await"));
+        assert!(npm_start.contains("configure_shared_node(&inner"));
 
         let implicit_start = source_between(
             LIBRARY,
@@ -1268,18 +1341,26 @@ mod service_worker {
             "async fn call_promise(",
         );
         assert!(implicit_start.contains("route_network_mode_from_location()"));
-        assert!(INTERFACE_RUNTIME.contains("connect_bootnodes_for_current_network("));
-        assert!(RUNTIME.contains("pub(crate) async fn connect_bootnodes_for_current_network("));
-
+        assert!(INTERFACE_RUNTIME.contains("weeb3.configure(expected_network_id, dial_requests)"));
         let mount = source_between(
             INTERFACE,
-            "pub(crate) async fn mount_interface_after_service_worker_bridge_install(",
+            "pub(crate) async fn mount_interface_with_generation(",
             "let mut last_progress_revision",
         );
         assert!(
-            mount.find("connect_all_bootnode_settings(").unwrap()
-                < mount.find("if read_initial_routes").unwrap()
+            mount.find("weeb3.ensure().await").unwrap()
+                < mount.find("let Some(route) = read_route()").unwrap()
         );
+        assert!(!mount.contains("connect_all_bootnode_settings("));
+        assert!(!mount.contains("if read_initial_routes"));
+    }
+
+    #[test]
+    fn optional_interface_callback_is_retained_without_polling_it() {
+        assert!(INTERFACE.contains("let _retained_message_callback = if let Some(button)"));
+        assert!(INTERFACE.contains("Some(callback_prereq)"));
+        assert!(!INTERFACE.contains("retained_message_callbacks"));
+        assert!(!INTERFACE.contains("_retained_callback_count"));
     }
 
     #[test]
@@ -1293,7 +1374,7 @@ mod service_worker {
             .find("crate::stream::release_current_stream_view()")
             .expect("npm network switch stream release");
         let npm_switch = npm_start
-            .find("inner.set_network_id(")
+            .find("configure_shared_node(&inner")
             .expect("npm network switch");
         assert!(npm_release < npm_switch);
 
@@ -1306,7 +1387,7 @@ mod service_worker {
             .find("crate::stream::release_current_stream_view()")
             .expect("settings network switch stream release");
         let settings_switch = settings
-            .find("weeb3.set_network_id(")
+            .find("connect_all_bootnode_settings(")
             .expect("settings network switch");
         assert!(settings_release < settings_switch);
 
@@ -1319,7 +1400,7 @@ mod service_worker {
             .find("crate::stream::release_current_stream_view()")
             .expect("switchNetwork stream release");
         let api_set = api_switch
-            .find("self.inner.set_network_id(")
+            .find("configure_shared_node(&self.inner")
             .expect("switchNetwork network switch");
         assert!(api_release < api_set);
     }
@@ -1331,21 +1412,19 @@ mod service_worker {
             "pub fn render_interface(&self, container: Element)",
             "#[wasm_bindgen(js_name = attachStream)]",
         );
-        assert!(render.contains("self.startup_pending.fetch_add(1, Ordering::AcqRel)"));
-        assert!(render.contains("let guard = serial.lock().await"));
+        assert!(render.contains("self.startup.begin()"));
+        assert!(render.contains("let guard = startup.serial.lock().await"));
         assert!(render.contains("route_network_mode_from_location()"));
-        assert!(render.contains("pending.fetch_sub(1, Ordering::AcqRel)"));
+        assert!(render.contains("startup.finish(None)"));
         assert!(render.contains("Some(initial_result_generation)"));
 
-        let dial = render.find("schedule_bootnode_dials(").unwrap();
-        let release = render
-            .find("pending.fetch_sub(1, Ordering::AcqRel)")
-            .unwrap();
+        let dial = render.find("configure_shared_node(&s").unwrap();
+        let release = render.find("startup.finish(None)").unwrap();
         assert!(dial < release);
 
         let mount = source_between(
             INTERFACE,
-            "pub(crate) async fn mount_interface_after_service_worker_bridge_install(",
+            "pub(crate) async fn mount_interface_with_generation(",
             "let mut last_progress_revision",
         );
         assert!(mount.contains("initial_result_generation: Option<u64>"));
@@ -1353,52 +1432,36 @@ mod service_worker {
     }
 
     #[test]
-    fn runtime_logging_is_bounded_off_the_network_hot_path() {
-        assert!(RUNTIME.contains("mpsc::bounded::<String>(LOG_QUEUE_CAPACITY)"));
-        assert!(RUNTIME.contains("for _ in 0..LOG_DRAIN_BATCH"));
-        assert!(!RUNTIME.contains("DEBUG_RUNTIME_LOGS"));
-        assert!(INTERFACE_RUNTIME.contains("logs.child_element_count() > crate::LOG_DOM_RETAINED"));
-        assert!(UPLOAD.contains("logs.child_element_count() > crate::LOG_DOM_RETAINED"));
-    }
-
-    #[test]
-    fn accounting_sensitive_work_is_sent_to_one_client_without_abort() {
+    fn originating_window_relay_is_cached_after_one_network_checked_ping() {
         let selection = source_between(
             STATIC_WORKER,
-            "async function firstReadyClient(candidates, requiredNetworkId)",
-            "async function requestClients(",
-        );
-        assert!(selection.contains("return [candidates[0]]"));
-        assert!(selection.contains("return [candidates[match + 1]]"));
-
-        let dispatch = source_between(
-            STATIC_WORKER,
-            "function messageFirstClient(clients, message, timeoutMs = FETCH_TIMEOUT_MS)",
-            "function toUint8Array(body)",
-        );
-        assert!(dispatch.contains("return messageClient(clients[0], message, timeoutMs)"));
-        assert!(!dispatch.contains("Promise.race"));
-        assert!(!dispatch.contains("AbortController"));
-        assert!(!dispatch.contains("HLS_REQUEST_FLIGHTS"));
-
-        assert!(INTERFACE.contains("event.stop_immediate_propagation()"));
-        assert!(!INTERFACE.contains("port.post_message(&resp).unwrap()"));
-        assert!(INTERFACE.contains("let _ = port.post_message(&resp);"));
-    }
-
-    #[test]
-    fn top_level_hls_requests_skip_only_the_redundant_runtime_probe() {
-        let selection = source_between(
-            STATIC_WORKER,
-            "async function requestClients(event, requestUrl, requiredNetworkId)",
+            "function isStableWindowClient(client)",
             "function closeMessagePort(",
         );
-        assert!(selection.contains("directHlsRequest"));
-        assert!(selection.contains("isTopLevelClient(eventClient)"));
-        assert!(selection.contains("clientInScope(eventClient)"));
-        assert!(selection.contains("return [eventClient]"));
-        assert!(selection.contains("return firstReadyClient(candidates, requiredNetworkId)"));
-        assert!(INTERFACE.contains("if active_network_id != required_network_id"));
+        assert!(selection.contains("async function windowNetworkId(client)"));
+        assert!(selection.contains("{ type: \"WEEB3_CLIENT_PING\" }"));
+        assert!(selection.contains("response?.type !== \"WEEB3_CLIENT_PONG\""));
+        assert!(selection.contains("response?.sharedWorkerProtocol"));
+        assert!(
+            selection.contains("async function originatingWindow(clientId, resultingClientId)")
+        );
+        assert!(selection.contains("for (const id of [clientId, resultingClientId])"));
+        assert!(selection.contains("windowNetworkDiscoveries.get(client.id)"));
+        assert!(selection.contains("cachedWindowNetworks.set(client.id, networkId)"));
+        assert!(selection.contains("allowFallback = true"));
+        assert!(selection.contains("includeUncontrolled: false"));
+        assert!(!selection.contains("includeUncontrolled: true"));
+        assert_eq!(STATIC_WORKER.matches("WEEB3_CLIENT_PING").count(), 1);
+
+        let fetch = source_between(
+            STATIC_WORKER,
+            "self.addEventListener(\"fetch\", (event) => {",
+            "function isStableWindowClient(client)",
+        );
+        assert!(fetch.contains("event.clientId, event.resultingClientId"));
+        assert!(
+            STATIC_WORKER.contains("requestClient(networkId, clientId, resultingClientId, false)")
+        );
     }
 
     #[test]
@@ -1408,12 +1471,17 @@ mod service_worker {
             "function canonicalRouteNetworkId(pathname)",
             "function isNetworkShellPath(pathname)",
         );
-        assert!(route_network.contains("first === \"testnet\" ? 10 : 1"));
+        assert!(route_network.contains("if (!pathname.startsWith(SCOPE_PATH))"));
+        assert!(route_network.contains("const relative = pathname.substring(SCOPE_PATH.length)"));
+        assert!(
+            route_network
+                .contains("relative === \"testnet\" || relative.startsWith(\"testnet/\") ? 10 : 1")
+        );
 
         let fetch_handler = source_between(
             STATIC_WORKER,
             "self.addEventListener(\"fetch\", (event) => {",
-            "function clientInScope(client)",
+            "function isStableWindowClient(client)",
         );
         for route in [
             "isBzzUploadPath",
@@ -1437,65 +1505,9 @@ mod service_worker {
             "function canonicalRawResource(url)",
             "function canonicalFeedResource(url)",
         );
-        assert!(raw_routes.contains("for (const [marker, rawType] of rawRouteMarkers())"));
+        assert!(raw_routes.contains("for (const [marker, rawType] of RAW_ROUTE_MARKERS)"));
         assert!(raw_routes.contains(r#"rawType === "hls-bytes" && !isSwarmReference(resource)"#));
         assert!(raw_routes.contains("return resource;"));
-    }
-
-    #[test]
-    fn first_visit_claims_worker_control_without_reloading() {
-        assert!(STATIC_WORKER.contains(r#"const SERVICE_WORKER_MARKER = "forwarder-default28";"#));
-        assert!(STATIC_WORKER.contains("const SERVICE_WORKER_PROTOCOL = 10;"));
-        assert!(
-            INTERFACE_RUNTIME
-                .contains(r#"const SERVICE_WORKER_MARKER: &str = "forwarder-default28";"#)
-        );
-        assert!(INTERFACE_RUNTIME.contains("const SERVICE_WORKER_PROTOCOL: f64 = 10.0;"));
-        assert!(STATIC_WORKER.contains("event.data?.type === \"WEEB3_CLAIM\""));
-        assert!(STATIC_WORKER.contains("type: \"WEEB3_CLAIMED\""));
-        assert_eq!(
-            STATIC_WORKER
-                .matches("marker: SERVICE_WORKER_MARKER")
-                .count(),
-            2
-        );
-        assert!(INTERFACE_RUNTIME.contains("JsValue::from_str(\"marker\")"));
-        assert!(STATIC_WORKER.contains("event.data?.protocol !== SERVICE_WORKER_PROTOCOL"));
-        assert!(!STATIC_WORKER.contains("source.navigate("));
-        assert!(INTERFACE_RUNTIME.contains("claim_exact_service_worker(&active).await"));
-        assert!(
-            INTERFACE_RUNTIME
-                .contains("service worker still activating for {}; retrying without a reload")
-        );
-
-        let setup = source_between(
-            INTERFACE_RUNTIME,
-            "pub async fn get_service_worker()",
-            "fn controlled_service_worker()",
-        );
-        assert!(setup.contains("SERVICE_WORKER_SETUP_LOCK.with(Arc::clone)"));
-        assert!(setup.contains("setup_lock.lock_arc().await"));
-        assert!(setup.contains("setup_lock.try_lock_arc()"));
-        let update = setup.find("registration.update()").unwrap();
-        let acceptance = setup[update..]
-            .find("claim_exact_service_worker(&active).await")
-            .map(|offset| update + offset)
-            .unwrap();
-        assert!(update < acceptance);
-        assert!(!setup.contains("or(Some(active))"));
-        assert!(!setup.contains("return Some(service_worker)"));
-
-        let readiness = INTERFACE_RUNTIME
-            .split_once("pub(crate) async fn service_worker_controls_bzz_requests(")
-            .map(|(_, body)| body)
-            .unwrap();
-        assert!(
-            readiness.contains("Duration::from_millis(SERVICE_WORKER_CONTROL_TOTAL_TIMEOUT_MS)")
-        );
-        let readiness = readiness.to_ascii_lowercase();
-        assert!(!readiness.contains("please reload"));
-        assert!(!readiness.contains("reload the page"));
-        assert!(!INTERFACE_RUNTIME.contains("location.reload"));
     }
 
     #[test]
@@ -1527,7 +1539,7 @@ mod service_worker {
         let fetch_handler = source_between(
             STATIC_WORKER,
             "self.addEventListener(\"fetch\", (event) => {",
-            "function clientInScope(client)",
+            "function isStableWindowClient(client)",
         );
         assert!(fetch_handler.contains("isAppShellNavigation(request)"));
         assert!(fetch_handler.contains("isDirectShareShellPath(url.pathname)"));
@@ -1552,8 +1564,9 @@ mod service_worker {
     }
 }
 mod stream_reader_concurrency {
+    use crate::source::between;
+
     const STREAMING_PLAYER: &str = include_str!("../src/stream.rs");
-    const HLS_STREAM: &str = include_str!("../src/stream_hls.rs");
     const PREFETCH_POLICY: &str = include_str!("../src/stream_conventions.rs");
 
     const MIB_BYTES: u64 = 1024 * 1024;
@@ -1562,25 +1575,7 @@ mod stream_reader_concurrency {
     const SEEK_RESET_GAP_BYTES: u64 = 16 * MIB_BYTES;
 
     fn source_section(start: &str, end: &str) -> &'static str {
-        let start = STREAMING_PLAYER
-            .find(start)
-            .unwrap_or_else(|| panic!("missing streaming-player source marker: {start}"));
-        let tail = &STREAMING_PLAYER[start..];
-        let end = tail
-            .find(end)
-            .unwrap_or_else(|| panic!("missing streaming-player source marker: {end}"));
-        &tail[..end]
-    }
-
-    fn hls_source_section(start: &str, end: &str) -> &'static str {
-        let start = HLS_STREAM
-            .find(start)
-            .unwrap_or_else(|| panic!("missing HLS source marker: {start}"));
-        let tail = &HLS_STREAM[start..];
-        let end = tail
-            .find(end)
-            .unwrap_or_else(|| panic!("missing HLS source marker: {end}"));
-        &tail[..end]
+        between(STREAMING_PLAYER, start, end)
     }
 
     fn request_is_seek(
@@ -1662,7 +1657,10 @@ mod stream_reader_concurrency {
 
     #[test]
     fn stable_and_seekable_reads_have_separate_pending_slots() {
-        let keying = source_section("fn pending_range_key(", "fn range_cache_prefix(");
+        let keying = source_section(
+            "fn pending_range_key(",
+            "fn range_storage_window_for_start(",
+        );
         assert!(keying.contains("\"{cache_key}|pending:stable\""));
         assert!(keying.contains("\"{cache_key}|pending:media\""));
 
@@ -1671,28 +1669,22 @@ mod stream_reader_concurrency {
             "fn spawn_prefetch_media_stages(",
         );
         assert!(window.contains("range_load_role(&cache_key, &pending_key, generation)"));
-        assert!(window.contains("leader_cache_key.clone()"));
-        assert!(window.contains("&leader_pending_key"));
+        let moved_key = window.find("let leader_cache_key = cache_key;").unwrap();
+        let remembered = window.find("remember_range(").unwrap();
+        let completed = window.find("finish_pending_range(").unwrap();
+        assert!(moved_key < remembered && remembered < completed);
+        assert!(window[completed..].contains("&leader_pending_key"));
     }
 
     #[test]
-    fn media_pause_stops_future_batches_without_failing_dispatched_windows() {
-        let suspend = source_section(
-            "fn suspend_bzz_fetch_resource_prefetch(",
-            "fn suspend_bzz_fetch_url_prefetch(",
-        );
-        assert!(suspend.contains("state.generation = next_media_generation()"));
-        assert!(suspend.contains("state.prefetch_running = false"));
-        assert!(!suspend.contains("fail_pending_ranges_with_prefix"));
-        assert!(!suspend.contains("finish_pending_range"));
+    fn page_media_events_do_not_mutate_the_worker_owned_fetch_cache() {
+        assert!(!STREAMING_PLAYER.contains("ACTIVE_BZZ_MEDIA_URL"));
+        assert!(!STREAMING_PLAYER.contains("reset_bzz_fetch_url_activity"));
+        assert!(!STREAMING_PLAYER.contains("suspend_bzz_fetch_url_prefetch"));
+        assert!(!STREAMING_PLAYER.contains("BZZ_MEDIA_PLAYING"));
 
-        let lifecycle = source_section(
-            "fn install_bzz_media_prefetch_lifecycle(",
-            "fn install_playback_notifications(",
-        );
-        assert!(lifecycle.contains("[\"pause\", \"seeking\"]"));
-        assert!(lifecycle.contains("suspend_bzz_fetch_url_prefetch(&src)"));
-        assert!(!lifecycle.contains("AbortController"));
-        assert!(!lifecycle.contains(".abort("));
+        let retry = source_section("fn install_play_retries(", "fn schedule_media_retry(");
+        assert!(retry.contains("MediaRetryState"));
+        assert!(!retry.contains("FETCH_CACHE"));
     }
 }

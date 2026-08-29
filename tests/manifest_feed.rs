@@ -216,7 +216,7 @@ mod feed_frontier {
     use std::{
         future::{Future, poll_fn},
         pin::Pin,
-        task::{Context, Poll, Wake, Waker},
+        task::{Context, Poll, Waker},
     };
 
     use feed::{
@@ -281,25 +281,15 @@ mod feed_frontier {
         }
     }
 
-    struct NoopWake;
-
-    impl Wake for NoopWake {
-        fn wake(self: Arc<Self>) {}
-    }
-
     fn assert_lookup_ready(
         lookup: impl Future<Output = (Option<(u64, u64)>, u64)>,
         expected_latest: u64,
     ) {
         let mut lookup = Box::pin(lookup);
-        let waker = Waker::from(Arc::new(NoopWake));
-        let mut context = Context::from_waker(&waker);
+        let mut context = Context::from_waker(Waker::noop());
         match lookup.as_mut().poll(&mut context) {
             Poll::Ready((latest, next)) => {
-                assert_eq!(
-                    latest.map(|(index, payload)| (index, payload)),
-                    Some((expected_latest, expected_latest,))
-                );
+                assert_eq!(latest, Some((expected_latest, expected_latest)));
                 assert_eq!(next, expected_latest + 1);
             }
             Poll::Pending => panic!("irrelevant lower feed probe held up the resolved frontier"),
@@ -315,10 +305,7 @@ mod feed_frontier {
                 })
                 .await;
 
-                assert_eq!(
-                    latest.map(|(index, payload)| (index, payload)),
-                    head.map(|head| (head, head))
-                );
+                assert_eq!(latest, head.map(|head| (head, head)));
                 assert_eq!(next, head.map_or(0, |head| head.saturating_add(1)));
             }
         });
@@ -392,8 +379,7 @@ mod feed_frontier {
                 DeterministicProbeResult::Ready((index <= 646).then_some(index))
             },
         }));
-        let waker = Waker::from(Arc::new(NoopWake));
-        let mut context = Context::from_waker(&waker);
+        let mut context = Context::from_waker(Waker::noop());
         assert_eq!(lookup.as_mut().poll(&mut context), Poll::Pending);
     }
 
@@ -535,7 +521,7 @@ mod feed_frontier {
 
         assert!(retrieval.contains("async fn probe_feed_update_status("));
         assert!(retrieval.contains("probe_feed_update_status(&owner, &topic, index,"));
-        assert!(finder.contains("confirm_sequence_feed_missing("));
+        assert!(finder.contains("probe_with_timeout("));
         assert!(retrieval.contains("seek_sequence_feed_frontier(|index|"));
         assert_eq!(
             FEED_FRONTIER_LOOKAHEAD_TIMEOUT,
@@ -662,7 +648,7 @@ mod manifest_format_contracts {
                 .collect::<Vec<_>>(),
             [b'.', b'/', b'a']
         );
-        for key in [b'.', b'/', b'a'] {
+        for key in *b"./a" {
             assert_ne!(index[(key / 8) as usize] & (1 << (key % 8)), 0);
         }
     }
@@ -744,8 +730,8 @@ mod manifest_resolution_contracts {
         let mut index = [0u8; 32];
         index[0] = 0b1000_0011;
         index[31] = 0b1000_0000;
-        assert_eq!(manifest_fork_keys(&index, 32).unwrap(), [0, 1, 7, 255]);
-        assert_eq!(manifest_fork_keys(&index, 0).unwrap(), Vec::<u8>::new());
-        assert!(manifest_fork_keys(&index[..31], 32).is_none());
+        assert_eq!(manifest_fork_count(&index, 32), Some(4));
+        assert_eq!(manifest_fork_count(&index, 0), Some(0));
+        assert!(manifest_fork_count(&index[..31], 32).is_none());
     }
 }

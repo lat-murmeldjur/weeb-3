@@ -26,19 +26,15 @@ impl Drop for ThemeListener {
     }
 }
 
-fn interface_style() -> &'static str {
-    let start = r#"<style id="weeb3InterfaceStyle">"#;
-    let Some(start_index) = INDEX_HTML.find(start).map(|index| index + start.len()) else {
-        return "";
-    };
-    let Some(end_index) = INDEX_HTML[start_index..]
-        .find("</style>")
-        .map(|index| start_index + index)
-    else {
-        return "";
-    };
+fn embedded_section(start: &str, end: &str) -> &'static str {
+    INDEX_HTML
+        .split_once(start)
+        .and_then(|(_, content)| content.split_once(end))
+        .map_or("", |(content, _)| content.trim())
+}
 
-    INDEX_HTML[start_index..end_index].trim()
+fn interface_style() -> &'static str {
+    embedded_section(r#"<style id="weeb3InterfaceStyle">"#, "</style>")
 }
 
 fn interface_shell() -> &'static str {
@@ -55,18 +51,7 @@ fn interface_shell() -> &'static str {
 }
 
 fn wallet_helper_script() -> &'static str {
-    let start = "<script>";
-    let Some(start_index) = INDEX_HTML.find(start).map(|index| index + start.len()) else {
-        return "";
-    };
-    let Some(end_index) = INDEX_HTML[start_index..]
-        .find("</script>")
-        .map(|index| start_index + index)
-    else {
-        return "";
-    };
-
-    INDEX_HTML[start_index..end_index].trim()
+    embedded_section("<script>", "</script>")
 }
 #[derive(Clone, Copy)]
 struct CollapseSection {
@@ -117,7 +102,6 @@ pub(crate) fn install_interface_conventions() {
     install_collapsible_group(PRIMARY_SECTIONS);
     install_collapsible_group(LOG_SECTIONS);
     set_section_state(LOG_SECTIONS[0], true);
-    install_static_button_labels();
     install_theme_toggle();
 }
 
@@ -171,9 +155,7 @@ fn ensure_wallet_helper() {
         return;
     }
 
-    let Ok(_) = Function::new_no_args(source).call0(&JsValue::NULL) else {
-        return;
-    };
+    let _ = Function::new_no_args(source).call0(&JsValue::NULL);
 }
 
 fn html_element(id: &str) -> Option<HtmlElement> {
@@ -188,30 +170,8 @@ fn set_menu_button_label(button: &Element, label: &str) {
     button.set_text_content(Some(&format!("[ {} ]", label)));
 }
 
-fn set_button_label_by_id(button_id: &str, label: &str) {
-    if let Some(button) = element(button_id) {
-        set_bracket_button_label(&button, label);
-    }
-}
-
-fn install_static_button_labels() {
-    for (button_id, label) in [
-        ("networkSet", " Change network settings "),
-        ("transferPauseToggle", " Pause retrieve / push "),
-        ("uploadGetBatch", " Create Storage on Swarm for Uploads "),
-        ("uploadResetStamp", " Reuse Space on Swarm for New Uploads "),
-        ("uploadFile", " Upload on Swarm "),
-        ("deployChequebook", " Deploy chequebook "),
-        ("depositCash", " Deposit cash "),
-    ] {
-        set_button_label_by_id(button_id, label);
-    }
-}
-
 fn panel_open(panel_id: &str) -> bool {
-    element(panel_id)
-        .map(|panel| !panel.has_attribute("hidden"))
-        .unwrap_or(false)
+    element(panel_id).is_some_and(|panel| !panel.has_attribute("hidden"))
 }
 
 fn set_section_state(section: CollapseSection, open: bool) {
@@ -292,19 +252,17 @@ fn prefers_dark() -> bool {
                 .ok()
                 .flatten()
         })
-        .map(|query| query.matches())
-        .unwrap_or(false)
+        .is_some_and(|query| query.matches())
 }
 
 fn theme_class(name: &str) -> bool {
     element("weeb3InterfaceRoot")
         .and_then(|wrapper| wrapper.get_attribute("class"))
-        .map(|class_name| {
+        .is_some_and(|class_name| {
             class_name
                 .split_whitespace()
                 .any(|class_item| class_item == name)
         })
-        .unwrap_or(false)
 }
 
 fn set_theme_class(wrapper: &Element, theme: &str) {

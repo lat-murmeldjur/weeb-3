@@ -128,47 +128,39 @@ fn hex_value(byte: u8) -> Option<u8> {
 }
 
 pub(crate) fn parse_single_range(range: Option<&str>, size: u64) -> Option<Result<(u64, u64), ()>> {
-    let range = range?.trim();
-    let Some((unit, spec)) = range.split_once('=') else {
-        return Some(Err(()));
-    };
+    range.map(|range| parse_range(range.trim(), size))
+}
+
+fn parse_range(range: &str, size: u64) -> Result<(u64, u64), ()> {
+    let (unit, spec) = range.split_once('=').ok_or(())?;
     if !unit.eq_ignore_ascii_case("bytes") || spec.is_empty() || spec.contains(',') || size == 0 {
-        return Some(Err(()));
+        return Err(());
     }
 
-    let Some((start, end)) = spec.split_once('-') else {
-        return Some(Err(()));
-    };
+    let (start, end) = spec.split_once('-').ok_or(())?;
     if start.is_empty() {
-        let Some(suffix) = parse_decimal(end) else {
-            return Some(Err(()));
-        };
+        let suffix = parse_decimal(end).ok_or(())?;
         if suffix == 0 {
-            return Some(Err(()));
+            return Err(());
         }
-        return Some(Ok((size.saturating_sub(suffix), size - 1)));
+        return Ok((size.saturating_sub(suffix), size - 1));
     }
 
-    let Some(start) = parse_decimal(start) else {
-        return Some(Err(()));
-    };
+    let start = parse_decimal(start).ok_or(())?;
     if start >= size {
-        return Some(Err(()));
+        return Err(());
     }
 
     let end = if end.is_empty() {
         size - 1
     } else {
-        let Some(end) = parse_decimal(end) else {
-            return Some(Err(()));
-        };
-        end.min(size - 1)
+        parse_decimal(end).ok_or(())?.min(size - 1)
     };
 
     if end < start {
-        return Some(Err(()));
+        return Err(());
     }
-    Some(Ok((start, end)))
+    Ok((start, end))
 }
 
 fn parse_decimal(value: &str) -> Option<u64> {
@@ -243,11 +235,7 @@ pub(crate) fn immutable_metadata_identity(
 }
 
 pub(crate) fn window_key(identity: &str, size: u64, start: u64, end: u64) -> String {
-    format!("{}|{}|{}-{}", identity, size, start, end)
-}
-
-pub(crate) fn window_prefix(identity: &str, size: u64) -> String {
-    format!("{}|{}|", identity, size)
+    format!("{identity}|{size}|{start}-{end}")
 }
 
 pub(crate) const MIB_BYTES: u64 = 1024 * 1024;

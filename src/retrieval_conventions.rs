@@ -375,20 +375,14 @@ where
         waiter: W,
         make_shared: impl FnOnce() -> A,
     ) -> SingleflightRegistration<K, A> {
-        self.next_waiter_id = self.next_waiter_id.wrapping_add(1);
-        if self.next_waiter_id == 0 {
-            self.next_waiter_id = 1;
-        }
+        self.next_waiter_id = next_nonzero_generation(self.next_waiter_id);
         let waiter_id = self.next_waiter_id;
 
         let (flight_id, shared, leader) = if let Some(flight) = self.flights.get_mut(&key) {
             flight.waiters.insert(waiter_id, waiter);
             (flight.flight_id, flight.shared.clone(), false)
         } else {
-            self.next_flight_id = self.next_flight_id.wrapping_add(1);
-            if self.next_flight_id == 0 {
-                self.next_flight_id = 1;
-            }
+            self.next_flight_id = next_nonzero_generation(self.next_flight_id);
             let flight_id = self.next_flight_id;
             let shared = make_shared();
             self.flights.insert(

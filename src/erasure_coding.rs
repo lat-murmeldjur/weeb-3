@@ -1,9 +1,4 @@
-use std::{
-    cell::RefCell,
-    collections::{HashMap, VecDeque},
-    fmt,
-    rc::Rc,
-};
+use std::{cell::RefCell, collections::VecDeque, fmt, rc::Rc};
 
 pub const SPAN_SIZE: usize = 8;
 pub const CHUNK_SIZE: usize = 4096;
@@ -17,62 +12,28 @@ const CODING_MATRIX_CACHE_ENTRIES: usize = 64;
 type CodingMatrix = Rc<Vec<Vec<u8>>>;
 type CodingMatrixKey = (usize, usize);
 
-#[derive(Clone)]
-struct CachedCodingMatrix {
-    matrix: CodingMatrix,
-    generation: u64,
-}
-
 #[derive(Default)]
 struct CodingMatrixCache {
-    matrices: HashMap<CodingMatrixKey, CachedCodingMatrix>,
-    order: VecDeque<(CodingMatrixKey, u64)>,
-    generation: u64,
+    entries: VecDeque<(CodingMatrixKey, CodingMatrix)>,
 }
 
 impl CodingMatrixCache {
     fn get(&mut self, key: CodingMatrixKey) -> Option<CodingMatrix> {
-        self.generation = self.generation.wrapping_add(1);
-        let generation = self.generation;
-        let entry = self.matrices.get_mut(&key)?;
-        entry.generation = generation;
-        let matrix = Rc::clone(&entry.matrix);
-        self.finish_touch(key, generation);
+        let index = self
+            .entries
+            .iter()
+            .position(|(candidate, _)| *candidate == key)?;
+        let entry = self.entries.remove(index)?;
+        let matrix = Rc::clone(&entry.1);
+        self.entries.push_back(entry);
         Some(matrix)
     }
 
     fn insert(&mut self, key: CodingMatrixKey, matrix: CodingMatrix) {
-        self.generation = self.generation.wrapping_add(1);
-        let generation = self.generation;
-        self.matrices
-            .insert(key, CachedCodingMatrix { matrix, generation });
-        self.finish_touch(key, generation);
-    }
-
-    fn finish_touch(&mut self, key: CodingMatrixKey, generation: u64) {
-        self.order.push_back((key, generation));
-        while self.matrices.len() > CODING_MATRIX_CACHE_ENTRIES {
-            let Some((expired, expired_generation)) = self.order.pop_front() else {
-                break;
-            };
-            if self
-                .matrices
-                .get(&expired)
-                .is_some_and(|entry| entry.generation == expired_generation)
-            {
-                self.matrices.remove(&expired);
-            }
+        if self.entries.len() == CODING_MATRIX_CACHE_ENTRIES {
+            self.entries.pop_front();
         }
-
-        if self.order.len() > CODING_MATRIX_CACHE_ENTRIES * 2 {
-            let mut live = self
-                .matrices
-                .iter()
-                .map(|(&key, entry)| (key, entry.generation))
-                .collect::<Vec<_>>();
-            live.sort_unstable_by_key(|(_, generation)| *generation);
-            self.order = live.into();
-        }
+        self.entries.push_back((key, matrix));
     }
 }
 
@@ -230,7 +191,7 @@ pub fn upload_tree_chunk_count(
 ) -> Option<u64> {
     let chunk_size = CHUNK_SIZE as u64;
     let mut input_chunks = data_length / chunk_size;
-    if data_length % chunk_size != 0 {
+    if !data_length.is_multiple_of(chunk_size) {
         input_chunks = input_chunks.checked_add(1)?;
     }
     input_chunks = input_chunks.max(1);
@@ -343,12 +304,14 @@ pub fn encoded_reference_payload_len(
         .checked_add(parity_shards.checked_mul(HASH_SIZE)?)
 }
 
+pub type SplitReferences = (Vec<Vec<u8>>, Vec<Vec<u8>>);
+
 pub fn split_references(
     payload: &[u8],
     span: u64,
     level: RedundancyLevel,
     encrypted: bool,
-) -> Option<(Vec<Vec<u8>>, Vec<Vec<u8>>)> {
+) -> Option<SplitReferences> {
     let (data_count, parity_count) = reference_count(span, level, encrypted)?;
     let data_reference_size = if encrypted {
         ENCRYPTED_REFERENCE_SIZE
@@ -366,8 +329,10 @@ pub fn split_references(
         .map(<[u8]>::to_vec)
         .collect();
     let parity = payload[data_bytes..]
-        .chunks_exact(HASH_SIZE)
-        .map(<[u8]>::to_vec)
+        .as_chunks::<HASH_SIZE>()
+        .0
+        .iter()
+        .map(|reference| reference.to_vec())
         .collect();
     Some((data, parity))
 }
@@ -545,30 +510,17 @@ pub fn reconstruct_data_indices(
     data_count: usize,
     requested_indices: &[usize],
 ) -> Result<(), ReedSolomonError> {
-    reconstruct_data_targets(shards, data_count, Some(requested_indices))
-}
-
-fn reconstruct_data_targets(
-    shards: &mut [Option<Vec<u8>>],
-    data_count: usize,
-    requested_indices: Option<&[usize]>,
-) -> Result<(), ReedSolomonError> {
     if data_count == 0 || shards.len() <= data_count || shards.len() > 256 {
         return Err(ReedSolomonError::InvalidShardCount);
     }
 
-    let requested_mask = if let Some(requested_indices) = requested_indices {
-        let mut requested_mask = vec![false; data_count];
-        for &index in requested_indices {
-            let Some(requested) = requested_mask.get_mut(index) else {
-                return Err(ReedSolomonError::InvalidShardCount);
-            };
-            *requested = true;
-        }
-        Some(requested_mask)
-    } else {
-        None
-    };
+    let mut requested_mask = vec![false; data_count];
+    for &index in requested_indices {
+        let Some(requested) = requested_mask.get_mut(index) else {
+            return Err(ReedSolomonError::InvalidShardCount);
+        };
+        *requested = true;
+    }
 
     let shard_size = shards
         .iter()
@@ -594,12 +546,7 @@ fn reconstruct_data_targets(
     }
 
     let missing_indices = (0..data_count)
-        .filter(|&data_index| {
-            shards[data_index].is_none()
-                && requested_mask
-                    .as_ref()
-                    .is_none_or(|requested| requested[data_index])
-        })
+        .filter(|&data_index| shards[data_index].is_none() && requested_mask[data_index])
         .collect::<Vec<_>>();
     if missing_indices.is_empty() {
         return Ok(());
@@ -616,38 +563,17 @@ fn reconstruct_data_targets(
         })
         .collect();
 
-    let recovered = if requested_mask.is_some() {
-        let decode_rows = inverse_rows_for_selected(&matrix, &selected, &missing_indices)?;
-        missing_indices
-            .into_iter()
-            .zip(decode_rows)
-            .map(|(data_index, decode_row)| {
-                (
-                    data_index,
-                    code_row_slices(&decode_row, &selected_shards, shard_size),
-                )
-            })
-            .collect::<Vec<_>>()
-    } else {
-        let sub_matrix = selected
-            .iter()
-            .map(|&index| matrix[index].clone())
-            .collect::<Vec<_>>();
-        let data_decode_matrix = invert(sub_matrix)?;
-        missing_indices
-            .into_iter()
-            .map(|data_index| {
-                (
-                    data_index,
-                    code_row_slices(
-                        &data_decode_matrix[data_index],
-                        &selected_shards,
-                        shard_size,
-                    ),
-                )
-            })
-            .collect::<Vec<_>>()
-    };
+    let decode_rows = inverse_rows_for_selected(&matrix, &selected, &missing_indices)?;
+    let recovered = missing_indices
+        .into_iter()
+        .zip(decode_rows)
+        .map(|(data_index, decode_row)| {
+            (
+                data_index,
+                code_row_slices(&decode_row, &selected_shards, shard_size),
+            )
+        })
+        .collect::<Vec<_>>();
     drop(selected_shards);
     for (data_index, shard) in recovered {
         shards[data_index] = Some(shard);
@@ -782,10 +708,10 @@ fn invert(matrix: Vec<Vec<u8>>) -> Result<Vec<Vec<u8>>, ReedSolomonError> {
     let width = size
         .checked_mul(2)
         .ok_or(ReedSolomonError::InvalidShardCount)?;
-    let mut work = vec![vec![0; width]; size];
-    for row in 0..size {
-        work[row][..size].copy_from_slice(&matrix[row]);
-        work[row][size + row] = 1;
+    let mut work = matrix;
+    for (row_index, row) in work.iter_mut().enumerate() {
+        row.resize(width, 0);
+        row[size + row_index] = 1;
     }
 
     gauss_jordan(&mut work, size)?;
@@ -823,8 +749,11 @@ fn gauss_jordan(work: &mut [Vec<u8>], size: usize) -> Result<(), ReedSolomonErro
             if scale == 0 {
                 continue;
             }
-            for column in 0..width {
-                work[row][column] ^= gf_mul(scale, work[diagonal][column]);
+            let (before_target, target_and_after) = work.split_at_mut(row);
+            let source = &before_target[diagonal];
+            let target = &mut target_and_after[0];
+            for (target, source) in target.iter_mut().zip(source) {
+                *target ^= gf_mul(scale, *source);
             }
         }
     }
@@ -835,8 +764,11 @@ fn gauss_jordan(work: &mut [Vec<u8>], size: usize) -> Result<(), ReedSolomonErro
             if scale == 0 {
                 continue;
             }
-            for column in 0..width {
-                work[row][column] ^= gf_mul(scale, work[diagonal][column]);
+            let (before_source, source_and_after) = work.split_at_mut(diagonal);
+            let target = &mut before_source[row];
+            let source = &source_and_after[0];
+            for (target, source) in target.iter_mut().zip(source) {
+                *target ^= gf_mul(scale, *source);
             }
         }
     }
@@ -923,12 +855,6 @@ pub(crate) fn upload_redundancy_from_select(value: Option<&str>) -> RedundancyLe
     value
         .and_then(|value| value.parse::<u8>().ok())
         .and_then(validated_upload_redundancy)
-        .unwrap_or(RedundancyLevel::DEFAULT_UPLOAD)
-}
-
-pub(crate) fn upload_redundancy_from_number(value: Option<f64>) -> RedundancyLevel {
-    value
-        .and_then(validated_upload_redundancy_number)
         .unwrap_or(RedundancyLevel::DEFAULT_UPLOAD)
 }
 

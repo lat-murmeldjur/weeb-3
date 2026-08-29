@@ -1,7 +1,7 @@
 #![cfg(target_arch = "wasm32")]
 
 use libp2p::{Multiaddr, multiaddr::Protocol};
-use std::{convert::TryFrom, net::Ipv4Addr, str::FromStr};
+use std::{convert::TryFrom, net::Ipv4Addr};
 
 const UNDERLAY_LIST_PREFIX: u8 = 0x99;
 const MAX_UNDERLAYS_PER_PEER: usize = 20;
@@ -185,24 +185,24 @@ fn libp2p_direct_ipv4(hostname: &str) -> Option<Ipv4Addr> {
 }
 
 pub(crate) fn beewss_to_dns_transformed(address: &Multiaddr) -> Multiaddr {
-    let mut hostname = None;
-    let mut tcp_port = None;
-    let mut peer_id = None;
+    let (mut hostname, mut tcp_port, mut peer_id) = (None, None, None);
 
     for protocol in address.iter() {
         match protocol {
-            Protocol::Sni(value) => hostname = Some(value.to_string()),
+            Protocol::Sni(value) => hostname = Some(value),
             Protocol::Tcp(value) => tcp_port = Some(value),
-            Protocol::P2p(value) => peer_id = Some(value.to_string()),
+            Protocol::P2p(value) => peer_id = Some(value),
             _ => {}
         }
     }
 
-    Multiaddr::from_str(&format!(
-        "/dns4/{}/tcp/{}/tls/ws/p2p/{}",
-        hostname.expect("BeeWss requires SNI"),
-        tcp_port.expect("BeeWss requires TCP port"),
-        peer_id.expect("BeeWss requires PeerId"),
-    ))
-    .expect("constructed DNS-transformed WSS multiaddr must be valid")
+    [
+        Protocol::Dns4(hostname.expect("BeeWss requires SNI")),
+        Protocol::Tcp(tcp_port.expect("BeeWss requires TCP port")),
+        Protocol::Tls,
+        Protocol::Ws("/".into()),
+        Protocol::P2p(peer_id.expect("BeeWss requires PeerId")),
+    ]
+    .into_iter()
+    .collect()
 }
