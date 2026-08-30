@@ -1,5 +1,5 @@
 use crate::{
-    ChunkRetrieveSender, RetrieveCancelToken, RetrieveGenerationMap,
+    ChunkRetrieveSender, RetrieveCancelToken,
     erasure_coding::{CHUNK_SIZE, decode_span, encoded_reference_payload_len},
     manifest::{
         BzzManifestFork, MAX_PARALLEL_MANIFEST_FORKS, NODE_TYPE_EDGE, NODE_TYPE_WITH_METADATA,
@@ -12,6 +12,7 @@ use crate::{
         retrieve_decoded_data_root_cancellable, seek_latest_feed_update,
     },
     retrieve_cancel_token_current,
+    stream_conventions::{is_swarm_reference_hex, streaming_route_path},
 };
 
 use libp2p::futures::{StreamExt, stream};
@@ -58,8 +59,7 @@ fn strip_known_bzz_prefix(resource: &str) -> &str {
         .map_or(resource, |(_, route)| route)
         .trim_start_matches('/');
     let reference = path.split('/').next().unwrap_or_default();
-    if matches!(reference.len(), 64 | 128) && reference.bytes().all(|byte| byte.is_ascii_hexdigit())
-    {
+    if is_swarm_reference_hex(reference) {
         return path;
     }
     path.strip_prefix("bzz/")
@@ -89,6 +89,41 @@ pub fn bzz_reference_hex(resource: &str) -> Option<String> {
 
 pub fn normalize_bzz_path(path: &str) -> String {
     path.trim().trim_matches('/').to_string()
+}
+
+pub(crate) fn canonical_bzz_url(
+    resource: &str,
+    resolved_path: &str,
+    empty_path: Option<&str>,
+) -> Option<String> {
+    let reference = bzz_reference_hex(resource)?;
+    let requested_path = resource
+        .split_once(&reference)
+        .map(|(_, tail)| normalize_bzz_path(tail))
+        .unwrap_or_default();
+    let resolved_path = normalize_bzz_path(resolved_path);
+    let path = if !requested_path.is_empty()
+        && (resolved_path.is_empty() || requested_path == resolved_path)
+    {
+        requested_path
+    } else {
+        resolved_path
+    };
+    let path = if path.is_empty() {
+        empty_path.unwrap_or_default()
+    } else {
+        &path
+    };
+    let route = match crate::network_profile::active_profile().mode {
+        crate::network_profile::NetworkMode::Mainnet => "bzz",
+        crate::network_profile::NetworkMode::Testnet => "testnet/bzz",
+    };
+    let prefix = streaming_route_path(route);
+    if path.is_empty() || path.starts_with("unknown") || path == "not found" {
+        Some(format!("{prefix}/{reference}"))
+    } else {
+        Some(format!("{prefix}/{reference}/{path}"))
+    }
 }
 
 fn bzz_paths_match(left: &str, right: &str) -> bool {
@@ -374,11 +409,11 @@ async fn collect_manifest_fork_targets(
         if let (Some(owner), Some(topic)) = (
             metadata
                 .get("swarm-feed-owner")
-                .and_then(|str0f0| str0f0.as_str())
+                .and_then(serde_json::Value::as_str)
                 .map(|owner| owner.to_string()),
             metadata
                 .get("swarm-feed-topic")
-                .and_then(|str0f1| str0f1.as_str())
+                .and_then(serde_json::Value::as_str)
                 .map(|topic| topic.to_string()),
         ) && let Some(feed_guard) = guard.descend_feed(&owner, &topic)
         {
@@ -404,7 +439,7 @@ async fn collect_manifest_fork_targets(
 
         if let Some(explicit_index) = metadata
             .get("website-index-document")
-            .and_then(|str0i| str0i.as_str())
+            .and_then(serde_json::Value::as_str)
         {
             result.explicit_index = Some(explicit_index.to_string());
         }
@@ -412,7 +447,7 @@ async fn collect_manifest_fork_targets(
         let bequeath = child_path(&path_prefix, &fork.prefix);
         let Some(mime) = metadata
             .get("Content-Type")
-            .and_then(|str0| str0.as_str())
+            .and_then(serde_json::Value::as_str)
             .map(|mime| mime.to_string())
         else {
             let (mut child_targets, child_index) = Box::pin(collect_reference_targets(
@@ -696,7 +731,7 @@ async fn lazy_manifest_target_for_path(
 
             if let Some(mime) = metadata
                 .get("Content-Type")
-                .and_then(|str0| str0.as_str())
+                .and_then(serde_json::Value::as_str)
                 .map(|mime| mime.to_string())
             {
                 let exact_path = bzz_path_bytes_match(&bequeath, requested_path);
@@ -758,7 +793,7 @@ async fn lazy_first_manifest_target(
 
             if let Some(mime) = metadata
                 .get("Content-Type")
-                .and_then(|str0| str0.as_str())
+                .and_then(serde_json::Value::as_str)
                 .map(|mime| mime.to_string())
             {
                 return metadata_fork_target(fork, &bequeath, mime, chunk_retrieve_chan, &guard)
@@ -869,15 +904,8 @@ pub async fn acquire_resolved_range(
     end_inclusive: u64,
     chunk_retrieve_chan: &ChunkRetrieveSender,
 ) -> Option<(Vec<u8>, BzzMetadata)> {
-    acquire_resolved_range_cancellable(
-        metadata,
-        start,
-        end_inclusive,
-        chunk_retrieve_chan,
-        None,
-        None,
-    )
-    .await
+    acquire_resolved_range_cancellable(metadata, start, end_inclusive, chunk_retrieve_chan, None)
+        .await
 }
 
 pub async fn acquire_resolved_range_cancellable(
@@ -886,7 +914,6 @@ pub async fn acquire_resolved_range_cancellable(
     end_inclusive: u64,
     chunk_retrieve_chan: &ChunkRetrieveSender,
     cancel: Option<RetrieveCancelToken>,
-    cancel_generations: Option<RetrieveGenerationMap>,
 ) -> Option<(Vec<u8>, BzzMetadata)> {
     if start > end_inclusive || start >= metadata.size {
         return None;
@@ -899,26 +926,41 @@ pub async fn acquire_resolved_range_cancellable(
         .and_then(|len| usize::try_from(len).ok())?;
 
     for attempt in 0..=RANGE_RETRIEVE_RETRY_COUNT {
-        if !range_cancel_token_current(&cancel_generations, &cancel).await {
+        if !retrieve_cancel_token_current(&cancel) {
             return None;
         }
 
-        let data = retrieve_data_range_cancellable(
+        let data = if let Some(root) = retrieve_decoded_data_root_cancellable(
             &metadata.data_reference,
-            start + 8,
-            end_inclusive + 8,
             chunk_retrieve_chan,
             cancel.clone(),
-            cancel_generations.clone(),
         )
-        .await;
+        .await
+        {
+            retrieve_data_range_from_root_cancellable(
+                root,
+                start,
+                end_inclusive,
+                metadata.data_reference.len() == 64,
+                chunk_retrieve_chan,
+                cancel.clone(),
+            )
+            .await
+            .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+
+        if !retrieve_cancel_token_current(&cancel) {
+            return None;
+        }
 
         if data.len() == expected_len {
             return Some((data, metadata));
         }
 
         if attempt < RANGE_RETRIEVE_RETRY_COUNT {
-            if !range_cancel_token_current(&cancel_generations, &cancel).await {
+            if !retrieve_cancel_token_current(&cancel) {
                 return None;
             }
 
@@ -930,101 +972,4 @@ pub async fn acquire_resolved_range_cancellable(
     }
 
     None
-}
-
-async fn range_cancel_token_current(
-    cancel_generations: &Option<RetrieveGenerationMap>,
-    cancel: &Option<RetrieveCancelToken>,
-) -> bool {
-    if let (Some(generations), Some(_)) = (cancel_generations, cancel) {
-        return retrieve_cancel_token_current(generations, cancel).await;
-    }
-
-    true
-}
-
-pub async fn retrieve_data_range_cancellable(
-    data_address: &[u8],
-    start: u64,
-    end_inclusive: u64,
-    chunk_retrieve_chan: &ChunkRetrieveSender,
-    cancel: Option<RetrieveCancelToken>,
-    cancel_generations: Option<RetrieveGenerationMap>,
-) -> Vec<u8> {
-    if start > end_inclusive {
-        return vec![];
-    }
-
-    if !range_cancel_token_current(&cancel_generations, &cancel).await {
-        return vec![];
-    }
-
-    let Some(root) = retrieve_decoded_data_root_cancellable(
-        data_address,
-        chunk_retrieve_chan,
-        cancel_generations.clone(),
-        cancel.clone(),
-    )
-    .await
-    else {
-        return vec![];
-    };
-    if !range_cancel_token_current(&cancel_generations, &cancel).await {
-        return vec![];
-    }
-
-    let Some(total_len) = root.span.checked_add(8) else {
-        return vec![];
-    };
-    if start >= total_len {
-        return vec![];
-    }
-
-    let end_inclusive = end_inclusive.min(total_len - 1);
-    let Some(output_len) = end_inclusive
-        .checked_sub(start)
-        .and_then(|len| len.checked_add(1))
-        .and_then(|len| usize::try_from(len).ok())
-    else {
-        return vec![];
-    };
-    let span = root.span.to_le_bytes();
-    if end_inclusive < 8 {
-        return span[start as usize..=end_inclusive as usize].to_vec();
-    }
-
-    let payload_start = start.max(8) - 8;
-    let payload_end = end_inclusive - 8;
-    let encrypted = data_address.len() == 64;
-    let Some(payload) = retrieve_data_range_from_root_cancellable(
-        root,
-        payload_start,
-        payload_end,
-        encrypted,
-        chunk_retrieve_chan,
-        cancel_generations.clone(),
-        cancel.clone(),
-    )
-    .await
-    else {
-        return vec![];
-    };
-
-    if !range_cancel_token_current(&cancel_generations, &cancel).await {
-        return vec![];
-    }
-
-    if start >= 8 {
-        return (payload.len() == output_len)
-            .then_some(payload)
-            .unwrap_or_default();
-    }
-
-    let mut output = Vec::with_capacity(output_len);
-    output.extend_from_slice(&span[start as usize..]);
-    output.extend_from_slice(&payload);
-
-    (output.len() == output_len)
-        .then_some(output)
-        .unwrap_or_default()
 }

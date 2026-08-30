@@ -310,25 +310,25 @@ pub async fn buy_postage_batch_with_payer(
     owner: Address,
     payer: Address,
 ) -> Result<BatchPurchaseResult, JsError> {
-    let w3 = web3()?;
-    ensure_wallet_chain(&w3).await?;
+    let web3 = web3()?;
+    ensure_wallet_chain(&web3).await?;
 
-    let postage = postage_contract(&w3)?;
-    let token = token_contract(&w3)?;
+    let postage = postage_contract(&web3)?;
+    let token = token_contract(&web3)?;
 
-    let lp = last_price(&postage).await?;
-    let initial_per_chunk = compute_initial_balance_per_chunk(lp, validity_days);
-    let approve_amt = total_approve_amount(initial_per_chunk, depth);
+    let current_price = last_price(&postage).await?;
+    let initial_per_chunk = compute_initial_balance_per_chunk(current_price, validity_days);
+    let approval = total_approve_amount(initial_per_chunk, depth);
 
     let bzz_balance: U256 = token
         .query("balanceOf", (payer,), None, Options::default(), None)
         .await
         .map_err(|e| JsError::new(&format!("balanceOf() failed: {e}")))?;
-    if bzz_balance < approve_amt {
+    if bzz_balance < approval {
         return Err(JsError::new(&format!(
             "Insufficient {}. Need {}, have {}. Reduce depth/validity or top up.",
             active_profile().bzz_symbol,
-            approve_amt,
+            approval,
             bzz_balance
         )));
     }
@@ -355,26 +355,20 @@ pub async fn buy_postage_batch_with_payer(
     let spender = ensure_addr(select_postage_contract_addr())?;
 
     let approve_gas = token
-        .estimate_gas("approve", (spender, approve_amt), payer, Options::default())
+        .estimate_gas("approve", (spender, approval), payer, Options::default())
         .await
         .unwrap_or(U256::from(100_000u64));
     approve_opts.gas = Some(add_buffer(approve_gas));
     let approve_receipt = token
-        .call_with_confirmations(
-            "approve",
-            (spender, approve_amt),
-            payer,
-            approve_opts,
-            1usize,
-        )
+        .call_with_confirmations("approve", (spender, approval), payer, approve_opts, 1usize)
         .await
         .map_err(|e| JsError::new(&format!("approve() failed: {e}")))?;
 
-    let mut cb_opts = Options::default();
-    let nonce_rand: [u8; 32] = crate::encrey()
+    let mut create_batch_options = Options::default();
+    let nonce_rand: [u8; 32] = crate::random_encryption_key()
         .try_into()
         .map_err(|_| JsError::new("nonce gen"))?;
-    let cb_gas = postage
+    let create_batch_gas = postage
         .estimate_gas(
             "createBatch",
             (
@@ -390,7 +384,7 @@ pub async fn buy_postage_batch_with_payer(
         )
         .await
         .unwrap_or(U256::from(1_500_000u64));
-    cb_opts.gas = Some(add_buffer(cb_gas));
+    create_batch_options.gas = Some(add_buffer(create_batch_gas));
     let create_receipt = postage
         .call_with_confirmations(
             "createBatch",
@@ -403,7 +397,7 @@ pub async fn buy_postage_batch_with_payer(
                 false,
             ),
             payer,
-            cb_opts,
+            create_batch_options,
             1usize,
         )
         .await
@@ -416,7 +410,7 @@ pub async fn buy_postage_batch_with_payer(
         approve_tx: approve_receipt.transaction_hash,
         create_tx: create_receipt.transaction_hash,
         batch_id,
-        last_price: lp,
+        last_price: current_price,
         bucket_limit: buckets_for_depth(depth),
     })
 }
@@ -484,12 +478,12 @@ pub async fn deploy_chequebook_with_payer(
     issuer: Address,
     payer: Address,
 ) -> Result<ChequebookDeploymentResult, JsError> {
-    let w3 = web3()?;
-    ensure_wallet_chain(&w3).await?;
+    let web3 = web3()?;
+    ensure_wallet_chain(&web3).await?;
 
-    let factory = chequebook_factory(&w3)?;
+    let factory = chequebook_factory(&web3)?;
 
-    let salt: [u8; 32] = crate::encrey()
+    let salt: [u8; 32] = crate::random_encryption_key()
         .try_into()
         .map_err(|_| JsError::new("nonce gen"))?;
 
@@ -541,8 +535,8 @@ pub async fn get_price_from_oracle() -> Option<(U256, U256)> {
 }
 
 pub(crate) async fn get_price_from_oracle_in_window() -> Option<(U256, U256)> {
-    let w3 = web3().ok()?;
-    let oracle = price_oracle_contract(&w3).ok()?;
+    let web3 = web3().ok()?;
+    let oracle = price_oracle_contract(&web3).ok()?;
     let (price, deduction) = oracle
         .query::<(U256, U256), _, _, _>("getPrice", (), None, Options::default(), None)
         .await

@@ -6,7 +6,7 @@ use std::{
 };
 
 use async_lock::Mutex;
-use js_sys::{Array, Function, Object, Reflect, Uint8Array};
+use js_sys::{Array, Object, Uint8Array};
 use wasm_bindgen::{JsCast, JsValue, closure::Closure};
 use wasm_bindgen_futures::spawn_local;
 use web_sys::{
@@ -16,6 +16,7 @@ use web_sys::{
 
 use crate::{
     bzz_stream::BzzMetadata,
+    erasure_coding::RedundancyLevel,
     events::ProgressRow,
     worker_protocol::{
         array_property, bool_property, bytes_from_js, integer_property, metadata_from_js,
@@ -70,19 +71,10 @@ pub(crate) struct RuntimeSnapshot {
     pub(crate) progress: Option<(u64, Vec<ProgressRow>)>,
 }
 
-pub(crate) fn supported() -> bool {
-    web_sys::window()
-        .and_then(|window| Reflect::get(window.as_ref(), &JsValue::from_str("SharedWorker")).ok())
-        .is_some_and(|constructor| constructor.dyn_ref::<Function>().is_some())
-}
-
 fn create_runtime(
     status: Rc<RuntimeStatus>,
     requested_url: Option<&str>,
 ) -> Result<SharedRuntime, String> {
-    if !supported() {
-        return Err("SharedWorker is unavailable".to_string());
-    }
     let window =
         web_sys::window().ok_or_else(|| "SharedWorker requires a window client".to_string())?;
     let base = window
@@ -385,7 +377,7 @@ impl SharedNodeClient {
         bootstrap_nodes: Vec<(String, bool)>,
     ) -> Result<(), String> {
         let _guard = self.transition.lock().await;
-        let runtime = self.runtime.clone()?;
+        let runtime = self.runtime.as_ref().map_err(Clone::clone)?;
         runtime.start(network_id).await?;
         if !bootstrap_nodes.is_empty() {
             let request = node_request_object("connectBootnodes", network_id);
@@ -679,7 +671,7 @@ impl SharedNodeClient {
         &self,
         file: File,
         encryption: bool,
-        redundancy_level: f64,
+        redundancy_level: RedundancyLevel,
         index_string: String,
         add_to_feed: bool,
         feed_topic: String,
@@ -687,7 +679,11 @@ impl SharedNodeClient {
         self.bytes_operation("upload", |request| {
             set(request, "file", file.into());
             set_bool(request, "encryption", encryption);
-            set_number(request, "redundancyLevel", redundancy_level);
+            set_number(
+                request,
+                "redundancyLevel",
+                f64::from(redundancy_level.as_u8()),
+            );
             set_string(request, "indexString", index_string);
             set_bool(request, "addToFeed", add_to_feed);
             set_string(request, "feedTopic", feed_topic);
@@ -715,27 +711,15 @@ impl SharedNodeClient {
         self.bytes_operation("resetStamp", |_| {}).await
     }
 
-    fn bytes_operation<'a>(
-        &'a self,
-        op: &'a str,
-        populate: impl FnOnce(&Object),
-    ) -> impl Future<Output = Vec<u8>> + 'a {
-        let request = node_request_object(op, self.network_id());
-        populate(&request);
-        self.send_bytes_operation(op, request)
-    }
-
-    async fn send_bytes_operation(&self, op: &str, request: Object) -> Vec<u8> {
-        let Ok(response) = self.send_node_operation(op, request).await else {
+    async fn bytes_operation(&self, op: &str, populate: impl FnOnce(&Object)) -> Vec<u8> {
+        let Ok(response) = self.node_operation(op, populate).await else {
             return Vec::new();
         };
         bytes_from_js(&response, "body").unwrap_or_default()
     }
 
     async fn typed_bytes_operation(&self, op: &str, populate: impl FnOnce(&Object)) -> Uint8Array {
-        let request = node_request_object(op, self.network_id());
-        populate(&request);
-        self.send_node_operation(op, request)
+        self.node_operation(op, populate)
             .await
             .ok()
             .and_then(|response| property(&response, "body").dyn_into().ok())

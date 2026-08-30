@@ -15,10 +15,9 @@ use web_sys::{Element, HtmlMediaElement};
 
 use crate::{
     Weeb3,
-    bzz_stream::{BzzMetadata, bzz_reference_hex, normalize_bzz_path},
+    bzz_stream::{BzzMetadata, canonical_bzz_url},
     interface::service_worker_controls_bzz_requests,
     mpsc,
-    network_profile::{NetworkMode, active_profile},
     retrieval_conventions::{
         PendingGenerationRelation, next_nonzero_generation, pending_generation_relation,
     },
@@ -26,9 +25,9 @@ use crate::{
     stream_conventions::{
         MEDIA_PREFETCH_BATCH_YIELD_MS, MEDIA_PREFETCH_MAX_PARALLEL, MEDIA_STARTUP_RESPONSE_BYTES,
         MEDIA_STORAGE_WINDOW_BYTES, MIB_BYTES, decode_component, if_none_match_matches,
-        if_range_allows_range, immutable_metadata_identity, media_cache_budget_bytes,
-        media_prefetch_ahead_limit_bytes, media_prefetch_stage_targets, parse_single_range,
-        streaming_route_path, window_key,
+        if_range_allows_range, immutable_metadata_identity, is_swarm_reference_hex,
+        media_cache_budget_bytes, media_prefetch_ahead_limit_bytes, media_prefetch_stage_targets,
+        parse_single_range, window_key,
     },
     worker_protocol::{bytes_to_js, set as set_js, string_property},
 };
@@ -292,18 +291,15 @@ struct PendingRange {
 
 impl PendingRange {
     fn finish(self, result: Result<Bytes, String>) {
-        let mut waiters = self
-            .waiters
-            .into_iter()
-            .filter(|waiter| !waiter.is_closed())
-            .peekable();
-        while let Some(waiter) = waiters.next() {
-            if waiters.peek().is_none() {
-                let _ = waiter.try_send(result);
-                return;
-            }
+        let mut waiters = self.waiters;
+        waiters.retain(|waiter| !waiter.is_closed());
+        let Some(last) = waiters.pop() else {
+            return;
+        };
+        for waiter in waiters {
             let _ = waiter.try_send(result.clone());
         }
+        let _ = last.try_send(result);
     }
 }
 
@@ -644,7 +640,7 @@ async fn fetch_raw_response(
     if parts.any(|part| !part.is_empty()) {
         return FetchResponse::error(400, "raw route accepts one swarm reference");
     }
-    if !is_swarm_reference(reference) {
+    if !is_swarm_reference_hex(reference) {
         return FetchResponse::error(400, "invalid swarm reference");
     }
     let reference = reference.to_string();
@@ -1013,12 +1009,13 @@ fn mark_range_windows_scheduled(
         return;
     };
 
-    let windows = range_storage_windows_for_span(start, end, metadata.size);
+    if metadata.size == 0 || start > end || start >= metadata.size || end >= metadata.size {
+        return;
+    }
+    let (_, window_end) = range_storage_window_for_start(end, metadata.size);
     let key = media_state_key(resource, metadata);
     with_current_media_state(&key, media_state.generation, |state| {
-        for (_, window_end) in windows {
-            state.mark_scheduled(window_end);
-        }
+        state.mark_scheduled(window_end);
     });
 }
 
@@ -1113,8 +1110,26 @@ async fn read_cached_range(
     if windows.is_empty() {
         return Err("range did not produce storage windows".into());
     }
-    if windows.len() == 1 && windows[0] == (start, end) {
-        return read_range_window(weeb3, resource, metadata, start, end, generation).await;
+    if let [(window_start, window_end)] = windows.as_slice() {
+        let body = read_range_window(
+            weeb3,
+            resource,
+            metadata,
+            *window_start,
+            *window_end,
+            generation,
+        )
+        .await?;
+        let slice_start = usize::try_from(start - window_start)
+            .map_err(|_| "storage window offset overflow".to_string())?;
+        let slice_end = usize::try_from(end - window_start)
+            .ok()
+            .and_then(|end| end.checked_add(1))
+            .ok_or_else(|| "storage window offset overflow".to_string())?;
+        if body.get(slice_start..slice_end).is_none() {
+            return Err("storage window did not contain the requested range".into());
+        }
+        return Ok(body.slice(slice_start..slice_end));
     }
 
     let body_len = inclusive_range_len(start, end)
@@ -1478,7 +1493,7 @@ fn metadata_headers(metadata: &BzzMetadata, length: u64) -> Vec<(String, String)
 fn canonical_bzz_resource(pathname: &str) -> Option<String> {
     let resource = route_resource(pathname, "bzz/")?.trim();
     let reference = resource.split('/').next().unwrap_or_default();
-    if resource.is_empty() || !is_swarm_reference(reference) {
+    if resource.is_empty() || !is_swarm_reference_hex(reference) {
         return None;
     }
     Some(decode_component(resource))
@@ -1507,11 +1522,6 @@ fn route_resource<'a>(pathname: &'a str, route: &str) -> Option<&'a str> {
     path.strip_prefix(route)
 }
 
-fn is_swarm_reference(reference: &str) -> bool {
-    (reference.len() == 64 || reference.len() == 128)
-        && reference.as_bytes().iter().all(|b| b.is_ascii_hexdigit())
-}
-
 pub async fn try_render_streaming_player(
     weeb3: Rc<SharedNodeClient>,
     resource: String,
@@ -1525,7 +1535,7 @@ pub async fn try_render_streaming_player(
         return true;
     }
 
-    let Some(src) = canonical_bzz_url(&resource, &metadata) else {
+    let Some(src) = canonical_bzz_url(&resource, &metadata.path, None) else {
         return false;
     };
 
@@ -1557,33 +1567,6 @@ pub async fn try_render_streaming_player(
 
 fn is_streamable_mime(mime: &str) -> bool {
     mime.starts_with("video/") || mime.starts_with("audio/")
-}
-
-fn canonical_bzz_url(resource: &str, metadata: &BzzMetadata) -> Option<String> {
-    let reference = bzz_reference_hex(resource)?;
-    let requested_path = resource
-        .split_once(&reference)
-        .map(|(_, tail)| normalize_bzz_path(tail))
-        .unwrap_or_default();
-    let resolved_path = normalize_bzz_path(&metadata.path);
-    let path = if !requested_path.is_empty()
-        && (resolved_path.is_empty() || requested_path == resolved_path)
-    {
-        requested_path
-    } else {
-        resolved_path
-    };
-
-    let prefix = match active_profile().mode {
-        NetworkMode::Mainnet => streaming_route_path("bzz"),
-        NetworkMode::Testnet => streaming_route_path("testnet/bzz"),
-    };
-
-    if path.is_empty() || path.starts_with("unknown") || path == "not found" {
-        Some(format!("{}/{}", prefix, reference))
-    } else {
-        Some(format!("{}/{}/{}", prefix, reference, path))
-    }
 }
 
 pub(crate) fn replace_stream_result_view(new_element: &Element, view_generation: u64) -> bool {

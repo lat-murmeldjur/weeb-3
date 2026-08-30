@@ -164,7 +164,9 @@ fn parse_range(range: &str, size: u64) -> Result<(u64, u64), ()> {
 }
 
 fn parse_decimal(value: &str) -> Option<u64> {
-    (!value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()))
+    value
+        .bytes()
+        .all(|byte| byte.is_ascii_digit())
         .then(|| value.parse::<u64>().ok())
         .flatten()
 }
@@ -173,16 +175,10 @@ pub(crate) fn if_none_match_matches(value: Option<&str>, current_etag: &str) -> 
     let Some(value) = value else {
         return false;
     };
-    if value.split(',').any(|candidate| candidate.trim() == "*") {
-        return true;
-    }
-    if current_etag.is_empty() {
-        return false;
-    }
     let current = strip_weak_validator(current_etag.trim());
     value.split(',').any(|candidate| {
         let candidate = candidate.trim();
-        strip_weak_validator(candidate) == current
+        candidate == "*" || (!current_etag.is_empty() && strip_weak_validator(candidate) == current)
     })
 }
 
@@ -210,14 +206,8 @@ fn is_weak_validator(value: &str) -> bool {
         .is_some_and(|prefix| prefix.eq_ignore_ascii_case("W/"))
 }
 
-fn encode_hex(bytes: &[u8]) -> String {
-    const DIGITS: &[u8; 16] = b"0123456789abcdef";
-    let mut encoded = String::with_capacity(bytes.len() * 2);
-    for &byte in bytes {
-        encoded.push(DIGITS[(byte >> 4) as usize] as char);
-        encoded.push(DIGITS[(byte & 0x0f) as usize] as char);
-    }
-    encoded
+pub(crate) fn is_swarm_reference_hex(reference: &str) -> bool {
+    matches!(reference.len(), 64 | 128) && reference.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 pub(crate) fn immutable_metadata_identity(
@@ -226,7 +216,7 @@ pub(crate) fn immutable_metadata_identity(
     etag: &str,
 ) -> String {
     if data_reference.len() == 32 || data_reference.len() == 64 {
-        encode_hex(data_reference)
+        hex::encode(data_reference)
     } else if !etag.is_empty() {
         etag.to_string()
     } else {

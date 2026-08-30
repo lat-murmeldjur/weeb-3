@@ -61,61 +61,45 @@ fn read_underlay_uvarint(src: &[u8]) -> (u64, usize) {
     (0, 0)
 }
 
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) enum UnderlayFormat {
-    BeeWss,
-    DnsTransformedWss,
-    Other,
-}
-
-pub(crate) fn detect_underlay_format(address: &Multiaddr) -> UnderlayFormat {
+pub(crate) fn browser_dial_address(address: Multiaddr) -> Result<Multiaddr, Multiaddr> {
     let mut protocols = address.iter();
-    match protocols.next() {
-        Some(Protocol::Ip4(_)) => {
-            if matches!(
-                (
-                    protocols.next(),
-                    protocols.next(),
-                    protocols.next(),
-                    protocols.next(),
-                    protocols.next(),
-                    protocols.next(),
-                ),
-                (
-                    Some(Protocol::Tcp(_)),
-                    Some(Protocol::Tls),
-                    Some(Protocol::Sni(_)),
-                    Some(Protocol::Ws(_)),
-                    Some(Protocol::P2p(_)),
-                    None,
-                )
-            ) {
-                return UnderlayFormat::BeeWss;
-            }
-        }
-        Some(Protocol::Dns4(_)) => {
-            if matches!(
-                (
-                    protocols.next(),
-                    protocols.next(),
-                    protocols.next(),
-                    protocols.next(),
-                    protocols.next(),
-                ),
-                (
-                    Some(Protocol::Tcp(_)),
-                    Some(Protocol::Tls),
-                    Some(Protocol::Ws(_)),
-                    Some(Protocol::P2p(_)),
-                    None,
-                )
-            ) {
-                return UnderlayFormat::DnsTransformedWss;
-            }
-        }
-        _ => {}
+    match (
+        protocols.next(),
+        protocols.next(),
+        protocols.next(),
+        protocols.next(),
+        protocols.next(),
+        protocols.next(),
+        protocols.next(),
+    ) {
+        (
+            Some(Protocol::Ip4(_)),
+            Some(Protocol::Tcp(tcp_port)),
+            Some(Protocol::Tls),
+            Some(Protocol::Sni(hostname)),
+            Some(Protocol::Ws(_)),
+            Some(Protocol::P2p(peer_id)),
+            None,
+        ) => Ok([
+            Protocol::Dns4(hostname),
+            Protocol::Tcp(tcp_port),
+            Protocol::Tls,
+            Protocol::Ws("/".into()),
+            Protocol::P2p(peer_id),
+        ]
+        .into_iter()
+        .collect()),
+        (
+            Some(Protocol::Dns4(_)),
+            Some(Protocol::Tcp(_)),
+            Some(Protocol::Tls),
+            Some(Protocol::Ws(_)),
+            Some(Protocol::P2p(_)),
+            None,
+            None,
+        ) => Ok(address),
+        _ => Err(address),
     }
-    UnderlayFormat::Other
 }
 
 pub(crate) fn is_publicly_dialable_underlay(address: &Multiaddr) -> bool {
@@ -140,17 +124,22 @@ pub(crate) fn is_publicly_dialable_underlay(address: &Multiaddr) -> bool {
 }
 
 fn is_public_dns_name(hostname: &str) -> bool {
-    let hostname = hostname.trim_end_matches('.').to_ascii_lowercase();
+    let hostname = hostname.trim_end_matches('.');
     if let Ok(address) = hostname.parse::<Ipv4Addr>() {
         return is_public_ipv4(address);
     }
+    let ends_with = |suffix: &str| {
+        let bytes = hostname.as_bytes();
+        bytes.len() >= suffix.len()
+            && bytes[bytes.len() - suffix.len()..].eq_ignore_ascii_case(suffix.as_bytes())
+    };
     !hostname.is_empty()
         && hostname.contains('.')
-        && hostname != "localhost"
-        && !hostname.ends_with(".localhost")
-        && !hostname.ends_with(".local")
-        && !hostname.ends_with(".internal")
-        && !hostname.ends_with(".home.arpa")
+        && !hostname.eq_ignore_ascii_case("localhost")
+        && !ends_with(".localhost")
+        && !ends_with(".local")
+        && !ends_with(".internal")
+        && !ends_with(".home.arpa")
 }
 
 fn is_public_ipv4(address: Ipv4Addr) -> bool {
@@ -182,27 +171,4 @@ fn libp2p_direct_ipv4(hostname: &str) -> Option<Ipv4Addr> {
         octets.next()?.parse().ok()?,
     );
     octets.next().is_none().then_some(address)
-}
-
-pub(crate) fn beewss_to_dns_transformed(address: &Multiaddr) -> Multiaddr {
-    let (mut hostname, mut tcp_port, mut peer_id) = (None, None, None);
-
-    for protocol in address.iter() {
-        match protocol {
-            Protocol::Sni(value) => hostname = Some(value),
-            Protocol::Tcp(value) => tcp_port = Some(value),
-            Protocol::P2p(value) => peer_id = Some(value),
-            _ => {}
-        }
-    }
-
-    [
-        Protocol::Dns4(hostname.expect("BeeWss requires SNI")),
-        Protocol::Tcp(tcp_port.expect("BeeWss requires TCP port")),
-        Protocol::Tls,
-        Protocol::Ws("/".into()),
-        Protocol::P2p(peer_id.expect("BeeWss requires PeerId")),
-    ]
-    .into_iter()
-    .collect()
 }

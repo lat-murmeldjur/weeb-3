@@ -57,6 +57,7 @@ mod bzz_manifest {
             parsed.forks[0].metadata.as_ref().unwrap()["Filename"],
             "prefix"
         );
+        assert_eq!(manifest_wrapped_reference(parsed), None);
     }
 
     #[test]

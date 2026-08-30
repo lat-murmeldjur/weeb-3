@@ -39,8 +39,10 @@ function requestedNetworkId(message) {
 
 function getRuntime() {
   if (!runtimePromise) {
-    runtimePromise = init().then(() => new Weeb3WorkerRuntime());
-    void runtimePromise.catch(() => { runtimePromise = undefined; });
+    runtimePromise = init().then(() => new Weeb3WorkerRuntime()).catch((error) => {
+      runtimePromise = undefined;
+      throw error;
+    });
   }
   return runtimePromise;
 }
@@ -272,11 +274,8 @@ function dispatchForClient(message, client) {
   return flight;
 }
 
-async function acquirePlaybackLock() {
-  if (playbackLockRelease) return true;
-  if (!self.navigator?.locks?.request) return true;
-  let acquiredResolve;
-  const acquired = new Promise((resolve) => { acquiredResolve = resolve; });
+function acquirePlaybackLock() {
+  if (playbackLockRelease || !self.navigator?.locks?.request) return;
   let release;
   const held = new Promise((resolve) => { release = resolve; });
   playbackLockRelease = release;
@@ -284,7 +283,6 @@ async function acquirePlaybackLock() {
     mode: "exclusive",
     ifAvailable: true
   }, async (lock) => {
-    acquiredResolve(Boolean(lock));
     if (!lock) {
       if (playbackLockRelease === release) playbackLockRelease = null;
       return;
@@ -292,9 +290,7 @@ async function acquirePlaybackLock() {
     await held;
   }).catch(() => {
     if (playbackLockRelease === release) playbackLockRelease = null;
-    acquiredResolve(false);
   });
-  return acquired;
 }
 
 function releasePlaybackLock() {
@@ -324,6 +320,7 @@ async function removeClient(client) {
     releasePlaybackLock();
     try { await cancelHlsLease(lease); } catch (_) {}
   }
+  if (clients.size === 0) closeServiceWorkerPort(true);
 }
 
 async function dispatch(message, client = null) {

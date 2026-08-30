@@ -31,6 +31,7 @@ jobs:
         run: |
           set -euo pipefail
           RUSTFLAGS='--cfg getrandom_backend="wasm_js"' wasm-pack build --target web --out-dir static --out-name weeb_3 --scope "$NPM_SCOPE"
+          git restore static/.gitignore
           cp README.npm.md static/README.md
           cd static
           npm pkg delete files sideEffects exports keywords publishConfig || true

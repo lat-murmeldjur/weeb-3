@@ -9,6 +9,7 @@ use axum::extract::OriginalUri;
 use axum::extract::Path;
 use axum::http::HeaderMap;
 use axum::http::HeaderName;
+use axum::http::HeaderValue;
 use axum::http::StatusCode;
 use axum::http::header::{
     ACCEPT_ENCODING, CACHE_CONTROL, CONTENT_ENCODING, CONTENT_TYPE, ETAG, IF_NONE_MATCH, RANGE,
@@ -33,7 +34,7 @@ async fn main() {
 }
 
 #[derive(rust_embed::RustEmbed)]
-#[folder = "$CARGO_MANIFEST_DIR/static"]
+#[folder = "static"]
 #[include = "404.html"]
 #[include = "example.html"]
 #[include = "hls-stream-example.html"]
@@ -179,18 +180,12 @@ fn embedded_asset_response(
         && accepts_content_encoding(request_headers, compressed.content_encoding())
     {
         let content: &'static [u8] = compressed.data.compressed();
-        return Ok((
-            [
-                (CONTENT_TYPE, content_type),
-                (CACHE_CONTROL, REVALIDATE_EMBEDDED_ASSET),
-                (ETAG, EMBEDDED_ASSET_ETAG),
-                (WEEB3_BUILD_VERSION_HEADER, EMBEDDED_ASSET_BUILD_VERSION),
-                (VARY, "Accept-Encoding"),
-                (CONTENT_ENCODING, compressed.content_encoding()),
-            ],
-            Cow::Borrowed(content),
-        )
-            .into_response());
+        let mut response = (response_headers, Cow::Borrowed(content)).into_response();
+        response.headers_mut().insert(
+            CONTENT_ENCODING,
+            HeaderValue::from_static(compressed.content_encoding()),
+        );
+        return Ok(response);
     }
     let content = match identity {
         Some(content) => content,
@@ -234,7 +229,7 @@ async fn get_static_snippet(
         return Err(StatusCode::NOT_FOUND);
     }
 
-    let embedded_path = format!("snippets/{}", path);
+    let embedded_path = format!("snippets/{path}");
     embedded_asset_response(&headers, &embedded_path, "text/javascript")
 }
 

@@ -922,6 +922,7 @@ mod http_range {
         ));
         assert!(if_none_match_matches(Some("\"other\", *"), current));
         assert!(if_none_match_matches(Some("*"), ""));
+        assert!(if_none_match_matches(Some(""), " "));
         assert!(!if_none_match_matches(Some("\"other\""), current));
         assert!(!if_none_match_matches(None, current));
 

@@ -23,14 +23,6 @@ strip = "symbols"
 [package.metadata.wasm-pack.profile.release]
 wasm-opt = ["-O", "--all-features"]
 
-[dependencies]
-rand = "0.8"
-prost = "0.14.4"
-serde_json = "1"
-event-listener = "5.4.1"
-futures = "0.3.33"
-bytes = "1.12"
-
 [build-dependencies]
 prost-build = "0.14.4"
 
@@ -38,7 +30,7 @@ prost-build = "0.14.4"
 axum = { git = "https://github.com/tokio-rs/axum.git", default-features = false, features = ["original-uri"] }
 axum-server = { git = "https://github.com/programatik29/axum-server.git", features = ["tls-rustls-no-provider"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
-rust-embed = { version = "8.7.1", features = ["compression", "include-exclude", "interpolate-folder-path"] }
+rust-embed = { version = "8.7.1", features = ["compression", "include-exclude"] }
 tokio = { version = "1.38.0", default-features = false, features = ["macros", "net", "rt"] }
 tower-http = { git = "https://github.com/tower-rs/tower-http.git", features = ["cors"] }
 
@@ -46,7 +38,10 @@ tower-http = { git = "https://github.com/tower-rs/tower-http.git", features = ["
 alloy-primitives = { git = "https://github.com/alloy-rs/core.git", default-features = false, features = ["std", "k256"] }
 k256 = { version = "0.13.4", default-features = false, features = ["ecdsa", "std"] }
 async-std = { git = "https://github.com/async-rs/async-std.git" }
-libp2p = { git = "https://github.com/libp2p/rust-libp2p.git", rev = "6348a0be4aeb5b48eecf17a5d0aae15ff8239984", features = [
+bytes = "1.12"
+event-listener = "5.4.1"
+futures = "0.3.33"
+libp2p = { git = "https://github.com/libp2p/rust-libp2p.git", features = [
     "ecdsa",
     "identify",
     "macros",
@@ -55,7 +50,10 @@ libp2p = { git = "https://github.com/libp2p/rust-libp2p.git", rev = "6348a0be4ae
     "websocket-websys",
     "yamux",
 ] }
-libp2p-stream = { git = "https://github.com/libp2p/rust-libp2p.git", rev = "6348a0be4aeb5b48eecf17a5d0aae15ff8239984" }
+libp2p-stream = { git = "https://github.com/libp2p/rust-libp2p.git" }
+prost = "0.14.4"
+rand = "0.8"
+serde_json = "1"
 wasm-bindgen = "0.2.100"
 wasm-bindgen-futures = "0.4.50"
 js-sys = { version = "0.3.77" }
@@ -110,8 +108,13 @@ wasm-bindgen-test = "0.3.50"
 [dev-dependencies]
 async-std = { git = "https://github.com/async-rs/async-std.git" }
 async-lock = "3.4.2"
+bytes = "1.12"
+event-listener = "5.4.1"
+futures = "0.3.33"
 headless_chrome = "1.0.21"
+hex = "0.4.3"
 sysinfo = { version = "0.39.6", default-features = false, features = ["system"] }
 anyhow_crates_io = { package = "anyhow", version = "1" }
 serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1"
 sha3_crates_io = { package = "sha3", version = "0.10.9" }

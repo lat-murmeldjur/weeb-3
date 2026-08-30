@@ -45,16 +45,15 @@ mod connection {
         let runtime = include_str!("../src/lib.rs");
         assert!(runtime.contains("type OverlayPeerMap = Arc<Mutex<HashMap<Vec<u8>, PeerId>>>"));
         assert!(runtime.contains("overlay_peers: OverlayPeerMap"));
-        assert!(selection.contains("if peers_map.is_empty()"));
-        assert!(selection.contains("for (overlay, id) in peers_map.iter()"));
-        assert!(selection.contains("current_po >= current_max_po || closest_peer_id.is_none()"));
+        assert!(selection.contains(".filter(|(_, id)| !skiplist.contains(id))"));
+        assert!(selection.contains(".max_by_key(|(overlay, _)| get_proximity(caddr, overlay))"));
+        assert!(selection.contains(".map(|(overlay, id)| (*id, price(overlay, caddr)))"));
         assert!(!selection.contains("peer_candidates"));
         assert!(!selection.contains(".collect()"));
         assert!(!selection.contains("hex::decode"));
         assert!(!selection.contains("CONNECTION_BUILDUP_LIMIT"));
         assert!(!selection.contains("CONNECTION_DIAL_CONCURRENCY_LIMIT"));
         assert!(selection.contains("overdraftlist.insert(peer);"));
-        assert!(selection.contains("async_std::task::yield_now().await;"));
         assert!(selection.contains("RETRIEVE_HOT_LOOP_GUARD_MS"));
         let transient_session = selection
             .split("cancel_reserve(&accounting_peer, req_price).await;")
@@ -99,9 +98,9 @@ mod connection {
 
         let runtime = include_str!("../src/lib.rs");
         let feeder = runtime
-            .split("let swarm_event_handle_0 = async")
+            .split("let peer_dial_scheduler = async")
             .nth(1)
-            .and_then(|source| source.split("let swarm_event_handle_1 = async").next())
+            .and_then(|source| source.split("let swarm_event_loop = async").next())
             .expect("peer dial feeder");
         assert!(feeder.contains("VecDeque::<QueuedPeerDial>::new()"));
         assert!(feeder.contains("HashSet::<(PeerId, Multiaddr)>::new()"));
@@ -113,19 +112,17 @@ mod connection {
         );
         assert!(feeder.contains("queue_peer_dial_retry("));
         assert!(runtime.contains("mpsc::bounded::<PeerDialInstruction>(MAX_QUEUED_PEER_DIALS)"));
-        assert!(
-            runtime.contains("remove_connection_attempt_for_dial(&wings, &peer_id, connection_id)")
-        );
+        assert!(runtime.contains("remove_connection_attempt_for_connection("));
         let failed_dial = runtime
             .split("let retryable = !matches!(")
             .nth(1)
             .and_then(|source| source.split("SwarmEvent::ConnectionClosed {").next())
             .expect("outgoing dial error");
         let removal = failed_dial
-            .find("remove_connection_attempt_for_dial")
+            .find("remove_connection_attempt_for_connection")
             .expect("exact dial removal");
         let release = failed_dial
-            .find("decrement_counter(&ongoing_connections)")
+            .find("release_connection_reservation(")
             .expect("dial capacity release");
         let retry = failed_dial
             .find("queue_peer_dial_retry(")
@@ -172,7 +169,7 @@ mod connection {
             .find("failed_peer_retry_delay_ms(&address)")
             .expect("configured retry backoff");
         let ownership = retry
-            .find("delayed.get(&peer) == Some(&(expected_generation, retry_id))")
+            .find("delayed.get(&peer) != Some(&(expected_generation, retry_id))")
             .expect("exact delayed retry ownership");
         let enqueue = retry
             .find(".send(PeerDialInstruction {")
@@ -184,9 +181,9 @@ mod connection {
         assert!(register < sleep && sleep < ownership && ownership < enqueue && enqueue < release);
 
         let feeder = runtime
-            .split("let swarm_event_handle_0 = async")
+            .split("let peer_dial_scheduler = async")
             .nth(1)
-            .and_then(|source| source.split("let swarm_event_handle_1 = async").next())
+            .and_then(|source| source.split("let swarm_event_loop = async").next())
             .expect("peer dial feeder");
         assert!(feeder.contains("wings.delayed_peer_retries"));
         assert!(feeder.contains("*generation == queue_generation"));
@@ -200,7 +197,7 @@ mod connection {
         assert!(runtime.contains("const PEER_POPULATION_RESCAN_MS: u64 = 2_000;"));
 
         let joiner = runtime
-            .split("let hive_joiner = async")
+            .split("let handshake_instruction_handle = async")
             .nth(1)
             .and_then(|source| source.split("join!(").next())
             .expect("connection handshake joiner");
@@ -223,22 +220,23 @@ mod connection {
             .map(|offset| removal + offset)
             .expect("timed-out retry registration");
         let release = joiner[retry..]
-            .find("decrement_counter(&ongoing_connections)")
+            .find("release_connection_reservation(")
             .map(|offset| retry + offset)
-            .expect("single ongoing-counter release");
+            .expect("single reservation release");
         assert!(ready_timeout < ownership && ownership < ready_wait);
         assert!(ready_wait < removal && removal < retry && retry < release);
 
         let feeder = runtime
-            .split("let swarm_event_handle_0 = async")
+            .split("let peer_dial_scheduler = async")
             .nth(1)
-            .and_then(|source| source.split("let swarm_event_handle_1 = async").next())
+            .and_then(|source| source.split("let swarm_event_loop = async").next())
             .expect("peer dial feeder");
         assert!(feeder.contains("current_connection_population_deficit("));
         assert!(feeder.contains("peers_instructions_chan_incoming.recv()"));
         assert!(feeder.contains("last_population_rescan_ms"));
-        assert!(feeder.contains("wings.known_peer_underlays.lock().await"));
-        assert!(feeder.contains("wings.known_peer_generations.lock().await.clone()"));
+        assert!(feeder.contains("wings.known_peers.lock().await"));
+        assert!(feeder.contains("known.generation == queue_generation"));
+        assert!(!feeder.contains("known_peer_generations"));
         assert!(feeder.contains("!connected.contains(*peer)"));
         assert!(feeder.contains("!attempts.contains(*peer)"));
         assert!(feeder.contains("!cooldowns.contains(*peer)"));
@@ -254,7 +252,7 @@ mod connection {
             .find("remove_connection_attempt(&wings, &id, connection_attempt_id)")
             .expect("exact reservation removal");
         let release = timeout_cleanup
-            .find("decrement_counter(&ongoing_connections)")
+            .find("release_connection_reservation(")
             .expect("reservation counter release");
         assert!(disconnect < removal && removal < release);
 
@@ -264,14 +262,14 @@ mod connection {
             .and_then(|source| source.split("SwarmEvent::ConnectionClosed {").next())
             .expect("late outgoing dial failure");
         let late_removal = outgoing_error
-            .find("if !remove_connection_attempt_for_dial(")
+            .find("if !remove_connection_attempt_for_connection(")
             .expect("late event ownership guard");
         let late_return = outgoing_error[late_removal..]
             .find("return;")
             .map(|offset| late_removal + offset)
             .expect("stale event return");
         let late_release = outgoing_error
-            .find("decrement_counter(&ongoing_connections)")
+            .find("release_connection_reservation(")
             .expect("owned dial failure release");
         assert!(late_removal < late_return && late_return < late_release);
     }
@@ -299,20 +297,15 @@ mod connection {
             .find("swarm.disconnect_peer_id(peer)")
             .expect("duplicate disconnect");
         assert!(reject < disconnect);
-        assert!(
-            duplicate[..disconnect].contains("known_peer_underlays.lock().await.remove(&peer)")
-        );
-        assert!(
-            duplicate[..disconnect].contains("known_peer_generations.lock().await.remove(&peer)")
-        );
+        assert!(duplicate[..disconnect].contains("known_peers.lock().await.remove(&peer)"));
         assert!(
             duplicate[..disconnect].contains("delayed_peer_retries.lock().await.remove(&peer)")
         );
 
         let feeder = runtime
-            .split("let swarm_event_handle_0 = async")
+            .split("let peer_dial_scheduler = async")
             .nth(1)
-            .and_then(|source| source.split("let swarm_event_handle_1 = async").next())
+            .and_then(|source| source.split("let swarm_event_loop = async").next())
             .expect("peer dial feeder");
         assert!(feeder.contains("!rejected.contains_key(*peer)"));
         assert!(feeder.contains("rejected.contains_key(&candidate.peer)"));
@@ -356,15 +349,18 @@ mod connection {
         let runtime = include_str!("../src/lib.rs");
         let address_filter = include_str!("../src/addresses.rs");
         assert!(runtime.contains("is_publicly_dialable_underlay(&source_addr)"));
+        assert!(runtime.contains("browser_dial_address(source_addr).ok()?"));
+        assert!(runtime.contains("browser_dial_address(addr33).unwrap_or_else"));
+        assert!(address_filter.contains("pub(crate) fn browser_dial_address("));
+        assert!(!address_filter.contains("enum UnderlayFormat"));
+        assert!(!address_filter.contains("fn beewss_to_dns_transformed"));
         assert!(runtime.contains("!self.allow_private_gossip.load(Ordering::Acquire)"));
-        assert!(
-            runtime
-                .contains("profile_for_swarm_network_id(*self.network_id.lock().await).is_some()")
-        );
+        assert!(runtime.contains("self.service_worker_network_id() != 0"));
         assert!(address_filter.contains("|embedded| embedded == address"));
         assert!(address_filter.contains(".map(is_public_ipv4)"));
         assert!(address_filter.contains(".unwrap_or_else(|| is_public_dns_name(&hostname))"));
-        assert!(address_filter.contains("!hostname.ends_with(\".local\")"));
+        assert!(address_filter.contains("&& !ends_with(\".local\")"));
+        assert!(address_filter.contains("eq_ignore_ascii_case"));
         assert!(include_str!("../src/handlers.rs").contains("underlay: peer.underlay,"));
     }
 
@@ -374,7 +370,7 @@ mod connection {
         let profile = include_str!("../src/network_profile.rs");
         let accounting = include_str!("../src/accounting.rs");
         let handler = runtime
-            .split("let swarm_event_handle_2 = async")
+            .split("let bootnode_change_handle = async")
             .nth(1)
             .and_then(|source| source.split("let accounting_event_handle = async").next())
             .expect("bootnode dial handler");
@@ -430,7 +426,8 @@ mod connection {
             .expect("identify receive lifecycle");
         assert!(received.contains("canonical_identify_address"));
         assert!(received.contains("canonical.is_none()"));
-        assert!(received.contains("info.observed_addr.clone()"));
+        assert!(received.contains("let observed_addr = info.observed_addr;"));
+        assert!(received.contains("Some(observed_addr.clone())"));
         assert!(received.contains("try_from_multiaddr(&info.observed_addr)"));
         assert!(received.contains(".is_some_and(|peer| peer != identify_local_peer_id)"));
         assert_eq!(received.matches("physical_connections").count(), 1);
@@ -540,7 +537,7 @@ mod connection {
             .find("let accounting_peer_lock = {")
             .expect("saved accounting peer");
         let connected = accounting
-            .find("connected_peers.insert(peer, peer_file.clone())")
+            .find("connected_peers.insert(peer, peer_file)")
             .expect("connected-peer publication");
         let threshold = accounting
             .find("let threshold_ready = {")
@@ -553,8 +550,8 @@ mod connection {
                 && connected_guard < physical
                 && physical < ownership
                 && ownership < accounting_arc
-                && accounting_arc < connected
-                && connected < threshold
+                && accounting_arc < threshold
+                && threshold < connected
                 && threshold < promotion,
             "a handshake must own physical and counted capacity before publication and promotion"
         );
@@ -562,8 +559,8 @@ mod connection {
             accounting.contains("let accounting_peer_for_timeout = accounting_peer_lock.clone();")
         );
         assert!(accounting.contains("Arc::ptr_eq("));
-        assert!(accounting.contains("peer_file.connection_attempt_id == timeout_attempt_id"));
-        assert!(accounting.contains("timeout_attempt_id"));
+        assert!(accounting.contains("peer_file.connection_attempt_id == connection_attempt_id"));
+        assert!(!accounting.contains("timeout_attempt_id"));
 
         let promotion = runtime
             .split("async fn promote_priced_peer(")
@@ -580,21 +577,15 @@ mod connection {
         let physical = promotion
             .find("exclusive_physical_connection(&wings.physical_connections, &peer)")
             .expect("physical connection validation");
-        let reservation_owner = promotion
-            .find("attempts.get(&peer).map(|attempt| attempt.id)")
-            .expect("attempt ownership validation");
-        let reservation_remove = promotion
-            .find("attempts.remove(&peer)")
-            .expect("reservation transfer");
+        let reservation_transfer = promotion
+            .find("remove_connection_attempt(wings, &peer, peer_file.connection_attempt_id)")
+            .expect("owned reservation transfer");
         let overlay_publish = promotion
-            .find("overlay_peers_map.insert(overlay.clone(), peer)")
+            .find("overlay_peers_map.insert(peer_file.overlay.clone(), peer)")
             .expect("overlay publication");
-        let counter_transfer = promotion
-            .find("let mut connections = self.connections.lock().await;")
-            .expect("counter transfer");
-        let ongoing_transfer = promotion
-            .find("let mut ongoing = self.ongoing_connections.lock().await;")
-            .expect("ongoing-counter transfer");
+        let population_transfer = promotion
+            .find("complete_connection_reservation(")
+            .expect("atomic reservation transfer");
         let connected_drop = promotion
             .find("drop(connected_peers_guard);")
             .expect("disconnect serialization release");
@@ -603,12 +594,10 @@ mod connection {
             .expect("duplicate cleanup");
         assert!(
             connected_guard < physical
-                && physical < reservation_owner
-                && reservation_owner < reservation_remove
-                && reservation_remove < overlay_publish
-                && overlay_publish < counter_transfer
-                && counter_transfer < ongoing_transfer
-                && ongoing_transfer < connected_drop
+                && physical < reservation_transfer
+                && reservation_transfer < overlay_publish
+                && overlay_publish < population_transfer
+                && population_transfer < connected_drop
                 && connected_drop < duplicate_cleanup,
             "disconnect must not interleave the reservation, overlay, and counter transfer"
         );
@@ -636,7 +625,7 @@ mod connection {
             .expect("pricing handler should remain inspectable");
         assert!(handler.contains("session: TransportConnectionSession"));
         assert!(handler.contains("if !session.is_current()"));
-        assert!(handler.contains("chan.try_send((peer, pt, session))"));
+        assert!(handler.contains("pricing_updates.try_send((peer, payment_threshold, session))"));
 
         let application = runtime
             .split("let pricing_event_handle = async")
@@ -712,7 +701,7 @@ mod connection {
             .find("Duration::from_millis(reconnect_delay_ms)")
             .expect("backoff sleep");
         let generation_check = close[sleep..]
-            .find("*connection_generation.lock().await == retry_generation")
+            .find("connection_generation.load(Ordering::Acquire) == retry_generation")
             .expect("post-backoff generation check");
         let cooldown_release = close[sleep..]
             .find(".remove(&peer_id)")
@@ -736,6 +725,31 @@ mod connection {
             .and_then(|source| source.split("async fn remove_connection_attempt(").next())
             .expect("connection attempt reservation");
         assert!(reservation.contains("connection_cooldowns.contains(peer)"));
+    }
+
+    #[test]
+    fn connection_generation_is_atomic_saturating_and_snapshotted_around_network_id() {
+        let runtime = include_str!("../src/lib.rs");
+        let context = runtime
+            .split("async fn current_connection_context(&self)")
+            .nth(1)
+            .and_then(|source| source.split("fn bump_connection_generation(&self)").next())
+            .expect("connection context snapshot");
+        let before = context
+            .find("let before = self.current_connection_generation();")
+            .unwrap();
+        let network = context
+            .find("let network_id = *self.network_id.lock().await;")
+            .unwrap();
+        let after = context
+            .find("let after = self.current_connection_generation();")
+            .unwrap();
+        assert!(before < network && network < after);
+        assert!(runtime.contains(".fetch_update("));
+        assert!(runtime.contains("Ordering::AcqRel"));
+        assert!(runtime.contains("Ordering::Acquire"));
+        assert!(runtime.contains("Some(generation.saturating_add(1))"));
+        assert!(!runtime.contains("connection_generation.lock().await"));
     }
 
     #[test]
@@ -862,7 +876,11 @@ mod connection {
         let retrieve = runtime
             .split("let retrieve_chunk_handle = async")
             .nth(1)
-            .and_then(|source| source.split("let hive_joiner = async").next())
+            .and_then(|source| {
+                source
+                    .split("let handshake_instruction_handle = async")
+                    .next()
+            })
             .expect("retrieve dispatcher");
         assert!(retrieve.contains("let retrieve_dispatch_yield_every = 128usize;"));
         assert!(retrieve.contains("let mut retrieve_dispatches_since_browser_yield = 0usize;"));
@@ -886,12 +904,31 @@ mod connection {
     }
 
     #[test]
+    fn direct_work_requests_do_not_cross_forwarding_queues() {
+        let runtime = include_str!("../src/lib.rs");
+
+        assert!(runtime.contains("chunk_push_port: AsyncPort<ChunkUploadRequest>"));
+        assert!(runtime.contains("self.chunk_push_port.1.recv().await"));
+        assert!(!runtime.contains("DirectChunkPushRequest"));
+        assert!(!runtime.contains("push_chunk_port_handle"));
+
+        let resolve = runtime
+            .split("pub async fn resolve_bzz(&self, resource: String)")
+            .nth(1)
+            .and_then(|source| source.split("pub async fn acquire_resolved_range(").next())
+            .expect("BZZ resolver entry point");
+        assert!(resolve.contains("bzz_stream::resolve_bzz(&resource, &self.chunk_port.0).await"));
+        assert!(!runtime.contains("BzzResolveRequest"));
+        assert!(!runtime.contains("resolve_bzz_handle"));
+    }
+
+    #[test]
     fn handshake_and_cheque_lifecycles_are_session_bound() {
         let runtime = include_str!("../src/lib.rs");
         assert!(runtime.contains("Duration::from_millis(HANDSHAKE_PROTOCOL_TIMEOUT_MS)"));
 
         let handlers = include_str!("../src/handlers.rs");
-        assert!(handlers.contains("let Some(ack) = rec_0.ack else"));
+        assert!(handlers.contains("let Some(ack) = syn_ack.ack else"));
         assert!(handlers.contains("let Some(peer_address) = ack.address else"));
         let handshake = handlers
             .split("async fn handshake_exchange(")
@@ -921,7 +958,7 @@ mod connection {
         assert!(handlers.contains("read_control_protocol_frame(&mut stream).await"));
         assert!(handlers.contains("stream.read_exact(&mut frame).await"));
         assert!(handlers.contains("enum RefreshmentOutcome"));
-        assert!(handlers.contains("if refr_am > amount"));
+        assert!(handlers.contains("if acknowledged_amount > amount"));
         assert!(handlers.contains("RefreshmentOutcome::AmbiguousAfterPayment"));
         let refresh_handler = handlers
             .split("pub async fn refresh_handler(")
@@ -951,13 +988,18 @@ mod connection {
                 .count(),
             2
         );
-        assert!(!handlers.contains("rec_0.ack.clone().unwrap()"));
+        assert!(!handlers.contains("syn_ack.ack.clone().unwrap()"));
 
         assert!(runtime.contains("cheques.insert("));
         assert!(runtime.contains("claim_current_cheque("));
         assert!(runtime.contains("(cheque_amt, cheque_generation)"));
         assert!(runtime.contains("map.get(&peer).copied() == Some((amount, cheque_generation))"));
         assert!(runtime.contains("generation == cheque_generation"));
+        assert!(!runtime.contains("swap_beneficiaries"));
+        assert!(!handlers.contains("beneficiaries:"));
+        assert!(handlers.contains(
+            "prepare_outgoing_cheque_state(beneficiary, amount, price, deduction).await"
+        ));
 
         let cheque_claim = runtime
             .split("async fn claim_current_cheque(")
@@ -989,6 +1031,11 @@ mod connection {
         let capture = cheque_dispatch
             .find("OutboundProtocolSession::capture(")
             .expect("cheque transport-session capture");
+        let beneficiary = cheque_dispatch[capture..]
+            .find("peer_file.connection_id == protocol_session.connection_id()")
+            .map(|offset| capture + offset)
+            .expect("cheque beneficiary must belong to the captured connection");
+        assert!(cheque_dispatch[beneficiary..].contains("peer_file.beneficiary"));
         let post_capture_claim = cheque_dispatch[capture..]
             .find("map.get(&peer).copied() == Some((amount, cheque_generation))")
             .map(|offset| capture + offset)
@@ -998,7 +1045,9 @@ mod connection {
             .map(|offset| post_capture_claim + offset)
             .expect("cheque protocol dispatch");
         assert!(
-            capture < post_capture_claim && post_capture_claim < dispatch,
+            capture < beneficiary
+                && beneficiary < post_capture_claim
+                && post_capture_claim < dispatch,
             "a stale cheque claim must not cross onto a replacement peer session"
         );
     }
@@ -1068,8 +1117,8 @@ mod connection {
             2,
             "both Headers and Receipt must use exact length-delimited framing"
         );
-        assert!(pushsync.contains("stream.write_all(&bufw_1).await"));
-        assert!(!pushsync.contains("stream.write(&bufw_1"));
+        assert!(pushsync.contains("stream.write_all(&delivery_frame).await"));
+        assert!(!pushsync.contains("stream.write(&delivery_frame"));
         assert!(!pushsync.contains("stream.read("));
         assert!(pushsync.contains("etiquette_7::Receipt::decode("));
         assert!(!pushsync.contains("Receipt::decode_length_delimited"));
@@ -1218,11 +1267,11 @@ mod retrieve_group_stream {
         );
         assert!(!group.contains("DataRangeTraversalPolicy"));
         assert!(!group.contains("maximum_requested_children"));
-        assert!(group.contains("let waiter_admission = RetrieveAdmission::new();"));
+        assert!(group.contains("let mut raw_fetches = RawFetchQueue::new("));
 
-        let raw_flights =
-            source_section("struct RawFetchKey", "#[inline]\nfn decryption_segment_key");
+        let raw_flights = source_section("struct RawFetchKey", "fn decrypt_join_chunk");
         assert!(raw_flights.contains("admission.clone()"));
+        assert!(!raw_flights.contains("wait_closed().await"));
 
         let traversal = source_section(
             "async fn retrieve_data_range_from_root_with_prefix_cancellable(",
@@ -1264,22 +1313,20 @@ mod rolling_erasure_tail {
     fn rolling_requires_a_full_recoverable_mixed_cache_group() {
         // A production Medium full group is 119 data + 9 parity. Eight decoded-only
         // hits leave one parity beyond the cache-basis deficit; nine do not.
-        assert!(rolling_full_group_eligible(true, 119, 119, 9, 0, 119));
-        assert!(rolling_full_group_eligible(true, 119, 119, 9, 8, 1));
+        assert!(rolling_full_group_eligible(119, 119, 9, 0, 119));
+        assert!(rolling_full_group_eligible(119, 119, 9, 8, 1));
 
-        assert!(!rolling_full_group_eligible(false, 119, 119, 9, 0, 119));
-        assert!(!rolling_full_group_eligible(true, 118, 119, 9, 0, 118));
-        assert!(!rolling_full_group_eligible(true, 119, 119, 0, 0, 119));
-        assert!(!rolling_full_group_eligible(true, 119, 119, 9, 9, 1));
-        assert!(!rolling_full_group_eligible(true, 119, 119, 9, 0, 0));
+        assert!(!rolling_full_group_eligible(118, 119, 9, 0, 118));
+        assert!(!rolling_full_group_eligible(119, 119, 0, 0, 119));
+        assert!(!rolling_full_group_eligible(119, 119, 9, 9, 1));
+        assert!(!rolling_full_group_eligible(119, 119, 9, 0, 0));
     }
 
     #[test]
     fn partial_groups_never_pay_for_a_raw_basis_scan() {
-        assert!(rolling_full_group_static_candidate(true, 119, 119, 9));
-        assert!(!rolling_full_group_static_candidate(true, 118, 119, 9));
-        assert!(!rolling_full_group_static_candidate(false, 119, 119, 9));
-        assert!(!rolling_full_group_static_candidate(true, 119, 119, 0));
+        assert!(rolling_full_group_static_candidate(119, 119, 9));
+        assert!(!rolling_full_group_static_candidate(118, 119, 9));
+        assert!(!rolling_full_group_static_candidate(119, 119, 0));
 
         let group = group_source();
         let candidate = group
@@ -1299,7 +1346,7 @@ mod rolling_erasure_tail {
             .find("cached_decoded_chunk(reference)")
             .expect("legacy decoded cache lookup");
         let queue = legacy_source
-            .find("queue_initial_data_shard(index, RetrieveHedgeDemand::Ordinary)")
+            .find("raw_fetches.queue_data_shard(")
             .expect("legacy raw registration");
         assert!(reference < cache_hit && cache_hit < queue);
 
@@ -1414,13 +1461,29 @@ mod rolling_erasure_tail {
     }
 
     #[test]
-    fn an_ordinary_follower_monotonically_promotes_a_managed_flight() {
-        let demand = SharedRetrieveHedgeDemand::new(RetrieveHedgeDemand::DistinctShardManaged);
-        assert_eq!(demand.current(), RetrieveHedgeDemand::DistinctShardManaged);
-        demand.promote(RetrieveHedgeDemand::Ordinary);
-        assert_eq!(demand.current(), RetrieveHedgeDemand::Ordinary);
-        demand.promote(RetrieveHedgeDemand::DistinctShardManaged);
-        assert_eq!(demand.current(), RetrieveHedgeDemand::Ordinary);
+    fn an_ordinary_follower_wakes_and_monotonically_promotes_a_managed_flight() {
+        async_std::task::block_on(async {
+            let demand = SharedRetrieveHedgeDemand::new(RetrieveHedgeDemand::DistinctShardManaged);
+            assert_eq!(demand.current(), RetrieveHedgeDemand::DistinctShardManaged);
+            let waiting = demand.clone();
+            let waiter = async_std::task::spawn(async move {
+                waiting.wait_until_ordinary().await;
+            });
+            async_std::task::yield_now().await;
+            demand.promote(RetrieveHedgeDemand::Ordinary);
+            async_std::future::timeout(std::time::Duration::from_secs(1), waiter)
+                .await
+                .expect("promotion should wake a managed leader");
+            assert_eq!(demand.current(), RetrieveHedgeDemand::Ordinary);
+            demand.promote(RetrieveHedgeDemand::DistinctShardManaged);
+            assert_eq!(demand.current(), RetrieveHedgeDemand::Ordinary);
+            async_std::future::timeout(
+                std::time::Duration::from_secs(1),
+                demand.wait_until_ordinary(),
+            )
+            .await
+            .expect("promotion before listening must not be missed");
+        });
     }
 
     #[test]
@@ -1445,16 +1508,14 @@ mod rolling_erasure_tail {
         let raw_queue = RETRIEVAL_SOURCE
             .split("fn queue_drained_raw_chunk(")
             .nth(1)
-            .and_then(|source| source.split("#[inline]\nfn decryption_segment_key").next())
+            .and_then(|source| source.split("fn decrypt_join_chunk").next())
             .expect("raw singleflight queue");
         let promote = raw_queue
             .find("shared_demand.promote(hedge_demand)")
             .unwrap();
-        let follower_return = raw_queue
-            .find("return RawFetchRegistration::Joined")
-            .unwrap();
+        let follower_branch = raw_queue.find("if !registration.leader").unwrap();
         let detached = raw_queue.find("The detached producer").unwrap();
-        assert!(promote < follower_return && follower_return < detached);
+        assert!(promote < follower_branch && follower_branch < detached);
         assert!(raw_queue.contains("hedge_demand: registration.shared.hedge_demand.clone()"));
 
         let retrieve_chunk = RETRIEVAL_SOURCE
@@ -1464,6 +1525,17 @@ mod rolling_erasure_tail {
             .expect("retrieve chunk");
         assert!(retrieve_chunk.contains("map(SharedRetrieveHedgeDemand::current)"));
         assert!(retrieve_chunk.contains("unwrap_or(RetrieveHedgeDemand::Ordinary)"));
+        assert!(retrieve_chunk.contains("wait_until_ordinary()"));
+        assert!(!retrieve_chunk.contains("RETRIEVE_MANAGED_ADMISSION_POLL_MS"));
+        assert!(retrieve_chunk.contains("mpsc::unbounded::<RetrieveAttemptResult>()"));
+        let physical_attempt = RETRIEVAL_SOURCE
+            .split("async fn retrieve_attempt(")
+            .nth(1)
+            .and_then(|source| source.split("fn chunk_address_parts(").next())
+            .expect("physical retrieve attempt");
+        assert!(physical_attempt.contains("Box::pin(retrieve_handler("));
+        assert!(physical_attempt.contains("exchange.as_mut()"));
+        assert!(physical_attempt.contains("let retrieve_result = exchange.await;"));
         assert!(RETRIEVAL_SOURCE.contains("const RETRIEVE_ATTEMPT_TIMEOUT_MS: u64 = 10_000;"));
         assert!(RUNTIME_SOURCE.contains("hedge_demand: None"));
     }
@@ -1490,7 +1562,7 @@ mod progress_events {
 
 mod retrieve_generations {
     use crate::retrieval_conventions::{
-        PendingGenerationRelation, cancel_generation_is_current, generation_is_newer,
+        PendingGenerationRelation, RetrieveCancelRegistry, generation_is_newer,
         latest_registered_generation, next_nonzero_generation, pending_generation_relation,
     };
 
@@ -1503,8 +1575,6 @@ mod retrieve_generations {
         assert_eq!(created, 1);
         assert!(sought > created);
         assert!(recreated > sought);
-        assert!(!cancel_generation_is_current(Some(sought), created));
-        assert!(cancel_generation_is_current(Some(sought), recreated));
     }
 
     #[test]
@@ -1512,8 +1582,6 @@ mod retrieve_generations {
         assert_eq!(next_nonzero_generation(u64::MAX), 1);
         assert!(generation_is_newer(1, u64::MAX));
         assert!(!generation_is_newer(u64::MAX, 1));
-        assert!(cancel_generation_is_current(Some(u64::MAX), 1));
-        assert!(!cancel_generation_is_current(Some(1), u64::MAX));
         assert_eq!(latest_registered_generation(u64::MAX, 1), 1);
         assert_eq!(latest_registered_generation(1, u64::MAX), 1);
     }
@@ -1539,6 +1607,26 @@ mod retrieve_generations {
             pending_generation_relation(0, 7),
             PendingGenerationRelation::Join
         );
+    }
+
+    #[test]
+    fn replacement_wakes_the_old_token_and_stale_registration_stays_cancelled() {
+        async_std::task::block_on(async {
+            let registry = RetrieveCancelRegistry::default();
+            let old = registry.register("stream".into(), u64::MAX).await.unwrap();
+            let replacement = registry.register("stream".into(), 1);
+            let (_, current) = futures::join!(old.cancelled(), replacement);
+            let current = current.unwrap();
+
+            assert!(!old.is_current());
+            assert!(current.is_current());
+            assert!(
+                registry
+                    .register("stream".into(), u64::MAX)
+                    .await
+                    .is_some_and(|stale| !stale.is_current())
+            );
+        });
     }
 }
 
@@ -1577,11 +1665,14 @@ mod retrieve_admission {
 
         assert!(admission.is_open());
         assert!(queued.is_open());
+        assert!(!queued.returned_cac());
+        admission.record_returned_cac();
         admission.close();
         admission.close();
 
         assert!(!admission.is_open());
         assert!(!queued.is_open());
+        assert!(queued.returned_cac());
     }
 
     #[test]
@@ -1701,105 +1792,8 @@ mod retrieve_admission {
 }
 
 mod retrieve_singleflight {
-    use crate::retrieval_conventions::{RetrieveAdmission, SingleflightRegistry};
-    use std::{
-        cell::Cell,
-        collections::HashMap,
-        rc::Rc,
-        sync::{
-            Arc, Mutex,
-            atomic::{AtomicBool, AtomicUsize, Ordering},
-        },
-    };
-
-    #[derive(Default)]
-    struct AttemptLedger {
-        next_attempt: u64,
-        reserved: u64,
-        credited: u64,
-        cancelled: u64,
-        settled: usize,
-        pending: HashMap<u64, u64>,
-    }
-
-    impl AttemptLedger {
-        fn dispatch(&mut self, price: u64) -> u64 {
-            self.next_attempt += 1;
-            let attempt = self.next_attempt;
-            assert!(self.pending.insert(attempt, price).is_none());
-            self.reserved += price;
-            attempt
-        }
-
-        fn settle(&mut self, attempt: u64, success: bool) {
-            let price = self
-                .pending
-                .remove(&attempt)
-                .expect("each physical attempt settles exactly once");
-            self.reserved -= price;
-            if success {
-                self.credited += price;
-            } else {
-                self.cancelled += price;
-            }
-            self.settled += 1;
-        }
-    }
-
-    #[test]
-    fn finite_admission_caps_dispatch_without_cancelling_claimed_attempt_settlement() {
-        const PRICE: u64 = 17;
-        let admission = RetrieveAdmission::new_with_attempt_limit(2);
-        let mut ledger = AttemptLedger::default();
-
-        assert!(admission.try_claim_physical_attempt());
-        let primary = ledger.dispatch(PRICE);
-        assert!(admission.try_claim_physical_attempt());
-        let hedge = ledger.dispatch(PRICE);
-
-        assert!(!admission.is_open());
-        assert!(!admission.try_claim_physical_attempt());
-        assert_eq!(ledger.pending.len(), 2);
-
-        // Closing future admission does not alter either dispatched reserve. Each physical
-        // attempt still reaches the same terminal accounting paths.
-        ledger.settle(primary, true);
-        ledger.settle(hedge, false);
-
-        assert_eq!(ledger.reserved, 0);
-        assert_eq!(ledger.credited, PRICE);
-        assert_eq!(ledger.cancelled, PRICE);
-        assert_eq!(ledger.settled, 2);
-        assert!(ledger.pending.is_empty());
-    }
-
-    #[test]
-    fn logical_timeout_releases_once_while_late_accounting_settles_once() {
-        const PRICE: u64 = 17;
-        let mut ledger = AttemptLedger::default();
-        let attempt = ledger.dispatch(PRICE);
-        let mut logical_in_flight = 1_usize;
-        let mut logical_failures = 0_usize;
-
-        // The ten-second notification is terminal only for the logical retrieval.
-        logical_in_flight = logical_in_flight.saturating_sub(1);
-        logical_failures += 1;
-        assert_eq!(logical_in_flight, 0);
-        assert_eq!(logical_failures, 1);
-        assert_eq!(ledger.pending.len(), 1);
-        assert_eq!(ledger.settled, 0);
-
-        // A later authenticated response belongs exclusively to detached accounting settlement;
-        // it must not re-enter or resurrect the completed logical retrieval.
-        ledger.settle(attempt, true);
-        assert_eq!(logical_in_flight, 0);
-        assert_eq!(logical_failures, 1);
-        assert_eq!(ledger.reserved, 0);
-        assert_eq!(ledger.credited, PRICE);
-        assert_eq!(ledger.cancelled, 0);
-        assert_eq!(ledger.settled, 1);
-        assert!(ledger.pending.is_empty());
-    }
+    use crate::retrieval_conventions::SingleflightRegistry;
+    use std::{cell::Cell, rc::Rc};
 
     #[test]
     fn identical_keys_share_one_leader_and_one_resource() {
@@ -1855,107 +1849,6 @@ mod retrieve_singleflight {
         let successor = flights.register(7, (), || Rc::new(Cell::new(true)));
         assert!(successor.leader);
         assert_ne!(successor.flight_id, first.flight_id);
-    }
-
-    #[test]
-    fn detached_waiter_does_not_ghost_dispatched_accounting_or_replace_the_producer() {
-        async_std::task::block_on(async {
-            const PRICE: u64 = 17;
-            type Flights = SingleflightRegistry<&'static str, Arc<AtomicUsize>, Arc<AtomicBool>>;
-
-            let logical_producers = Arc::new(AtomicUsize::new(0));
-            let detached_deliveries = Arc::new(AtomicUsize::new(0));
-            let joined_deliveries = Arc::new(AtomicUsize::new(0));
-            let flights = Arc::new(Mutex::new(Flights::default()));
-            let ledger = Arc::new(Mutex::new(AttemptLedger::default()));
-
-            let first = flights
-                .lock()
-                .unwrap()
-                .register("chunk", detached_deliveries.clone(), {
-                    let logical_producers = logical_producers.clone();
-                    move || {
-                        logical_producers.fetch_add(1, Ordering::SeqCst);
-                        Arc::new(AtomicBool::new(true))
-                    }
-                });
-            assert!(first.leader);
-            let first_flight_id = first.flight_id;
-            let first_waiter_id = first.waiter_id;
-
-            // Both reservations represent real, dispatched transports. The second is an
-            // intentional physical hedge, not another logical/raw-fetch producer.
-            let primary_attempt = ledger.lock().unwrap().dispatch(PRICE);
-            let hedge_attempt = ledger.lock().unwrap().dispatch(PRICE);
-            let (primary_out, primary_in) = async_std::channel::bounded::<bool>(1);
-            let (hedge_out, hedge_in) = async_std::channel::bounded::<bool>(1);
-
-            let primary = async_std::task::spawn({
-                let flights = flights.clone();
-                let ledger = ledger.clone();
-                async move {
-                    let success = primary_in.recv().await.expect("primary terminal result");
-                    ledger.lock().unwrap().settle(primary_attempt, success);
-                    if success {
-                        let completed = flights
-                            .lock()
-                            .unwrap()
-                            .take(&"chunk", first_flight_id)
-                            .expect("the dispatched producer still owns its flight");
-                        for waiter in completed.waiters {
-                            waiter.fetch_add(1, Ordering::SeqCst);
-                        }
-                    }
-                }
-            });
-            let hedge = async_std::task::spawn({
-                let ledger = ledger.clone();
-                async move {
-                    let success = hedge_in.recv().await.expect("hedge terminal result");
-                    ledger.lock().unwrap().settle(hedge_attempt, success);
-                }
-            });
-
-            async_std::task::yield_now().await;
-            let shared = flights
-                .lock()
-                .unwrap()
-                .remove_waiter(&"chunk", first_flight_id, first_waiter_id)
-                .expect("the last browser waiter releases admission only");
-            shared.store(false, Ordering::SeqCst);
-
-            let joined = flights
-                .lock()
-                .unwrap()
-                .register("chunk", joined_deliveries.clone(), {
-                    let logical_producers = logical_producers.clone();
-                    move || {
-                        logical_producers.fetch_add(1, Ordering::SeqCst);
-                        Arc::new(AtomicBool::new(true))
-                    }
-                });
-            assert!(!joined.leader);
-            assert_eq!(joined.flight_id, first_flight_id);
-            assert!(!joined.shared.load(Ordering::SeqCst));
-            assert_eq!(logical_producers.load(Ordering::SeqCst), 1);
-
-            // A response arriving after listener detachment still credits the dispatch.
-            primary_out.send(true).await.unwrap();
-            primary.await;
-            // Completion of the logical read cannot cancel an already-dispatched hedge.
-            hedge_out.send(false).await.unwrap();
-            hedge.await;
-
-            let ledger = ledger.lock().unwrap();
-            assert_eq!(ledger.reserved, 0);
-            assert_eq!(ledger.credited, PRICE);
-            assert_eq!(ledger.cancelled, PRICE);
-            assert_eq!(ledger.settled, 2);
-            assert!(ledger.pending.is_empty());
-            assert_eq!(detached_deliveries.load(Ordering::SeqCst), 0);
-            assert_eq!(joined_deliveries.load(Ordering::SeqCst), 1);
-            assert_eq!(logical_producers.load(Ordering::SeqCst), 1);
-        });
     }
 
     #[test]

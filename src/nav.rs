@@ -3,7 +3,9 @@ use web_sys::window;
 
 use crate::{
     network_profile::NetworkMode,
-    stream_conventions::{HlsStart, STREAMING_ROUTE_BASE, parse_stream_share_link},
+    stream_conventions::{
+        HlsStart, STREAMING_ROUTE_BASE, is_swarm_reference_hex, parse_stream_share_link,
+    },
 };
 
 #[derive(Debug, PartialEq, Eq)]
@@ -144,16 +146,11 @@ pub(crate) fn clear_hash_route() {
     }
 }
 
-fn is_reference_hex(reference: &str) -> bool {
-    (reference.len() == 64 || reference.len() == 128)
-        && reference.as_bytes().iter().all(|b| b.is_ascii_hexdigit())
-}
-
 fn is_hls_bytes_route(route: &str) -> bool {
     let Some(reference) = route.strip_prefix("hls/bytes/") else {
         return false;
     };
-    is_reference_hex(reference.trim_matches('/'))
+    is_swarm_reference_hex(reference.trim_matches('/'))
 }
 
 fn parse_resource_route_body(route: &str) -> Option<ResourceRoute> {
@@ -167,7 +164,7 @@ fn parse_resource_route_body(route: &str) -> Option<ResourceRoute> {
             if resource
                 .split('/')
                 .next()
-                .map(is_reference_hex)
+                .map(is_swarm_reference_hex)
                 .unwrap_or(false)
             {
                 Some(ResourceRoute::Bzz(resource.to_string()))
@@ -177,7 +174,7 @@ fn parse_resource_route_body(route: &str) -> Option<ResourceRoute> {
         }
         "bytes" => {
             let reference = tail.trim_matches('/');
-            if is_reference_hex(reference) {
+            if is_swarm_reference_hex(reference) {
                 Some(ResourceRoute::Bytes(reference.to_string()))
             } else {
                 None
@@ -185,13 +182,15 @@ fn parse_resource_route_body(route: &str) -> Option<ResourceRoute> {
         }
         "chunks" => {
             let reference = tail.trim_matches('/');
-            if is_reference_hex(reference) {
+            if is_swarm_reference_hex(reference) {
                 Some(ResourceRoute::Chunks(reference.to_string()))
             } else {
                 None
             }
         }
-        reference if is_reference_hex(reference) => Some(ResourceRoute::Bzz(route.to_string())),
+        reference if is_swarm_reference_hex(reference) => {
+            Some(ResourceRoute::Bzz(route.to_string()))
+        }
         _ => None,
     }
 }

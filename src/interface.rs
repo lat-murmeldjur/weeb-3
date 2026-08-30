@@ -1,14 +1,10 @@
 use std::{
     cell::{Cell, RefCell},
-    io::Cursor,
     rc::Rc,
     time::Duration,
 };
 
-use web3::{
-    contract::Options,
-    types::{Address, U256},
-};
+use web3::types::{Address, U256};
 
 use js_sys::{Array, Reflect, Uint8Array};
 use tar::{Builder, Header};
@@ -22,8 +18,8 @@ use web_sys::{
 
 use crate::PrivateKeySigner;
 use crate::{
-    bzz_stream::{BzzMetadata, bzz_reference_hex, normalize_bzz_path},
-    decode_resources, encrey,
+    bzz_stream::{BzzMetadata, bzz_reference_hex, canonical_bzz_url, normalize_bzz_path},
+    decode_resources,
     erasure_coding::upload_redundancy_from_select,
     interface_conventions::{install_interface_conventions, set_bracket_button_label},
     nav::{
@@ -35,20 +31,21 @@ use crate::{
         profile_for_mode, profile_for_swarm_network_id,
     },
     on_chain::{
-        Web3Inst, buy_postage_batch_with_payer, chequebook_balance, chunk_count_for_depth,
-        compute_initial_balance_per_chunk, deploy_chequebook_with_payer, deposit_to_chequebook,
-        get_batch_validity, last_price, postage_contract, token_contract,
+        Web3Inst, chequebook_balance, deploy_chequebook_with_payer, deposit_to_chequebook,
+        token_contract,
     },
     persistence::{
         get_chequebook_address, get_chequebook_signer_key, set_chequebook_address,
         set_chequebook_signer_key,
     },
-    secure_vault::{
-        secure_batch_state_for_wallet, secure_commit_batch_purchase_and_verify,
-        secure_open_vault_from_user_action, secure_prepare_batch_purchase,
-    },
+    random_encryption_key,
+    secure_vault::secure_open_vault_from_user_action,
     shared_runtime::SharedNodeClient,
     stream_conventions::{STREAMING_SERVICE_WORKER_SCOPE, STREAMING_SERVICE_WORKER_URL},
+    wallet_workflows::{
+        BatchPurchaseError, BatchPurchaseOutcome, MissingSecureBatchState, ensure_batch,
+        inspect_batch,
+    },
 };
 
 #[path = "interface_runtime_conventions.rs"]
@@ -79,6 +76,10 @@ fn required_element<T: JsCast>(document: &web_sys::Document, id: &str) -> T {
         .unwrap_or_else(|| panic!("#{id} should exist"))
         .dyn_into::<T>()
         .unwrap_or_else(|_| panic!("#{id} has an unexpected element type"))
+}
+
+fn interface_document() -> web_sys::Document {
+    web_sys::window().unwrap().document().unwrap()
 }
 
 fn alert(message: &str) {
@@ -197,12 +198,8 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
     let initial_profile = profile_for_mode(initial_mode);
     set_network_profile_inputs(initial_mode);
 
-    if !crate::shared_runtime::supported() {
-        return Err(JsError::new("SharedWorker is required by weeb-3"));
-    }
     // Overlap service-worker installation/update with SharedWorker WASM startup and
-    // the initial connection burst. The setup lock makes the mount-time call below
-    // an inexpensive join when this flight is still running.
+    // the initial connection burst.
     spawn_local(async {
         let _ = get_service_worker().await;
     });
@@ -211,7 +208,7 @@ pub async fn interweeb(_st: String) -> Result<(), JsError> {
         None,
     ));
     let initial_apply = next_network_apply_generation();
-    connect_all_bootnode_settings(weeb3.clone(), initial_apply).await;
+    connect_all_bootnode_settings(&weeb3, initial_apply, initial_profile.swarm_network_id).await;
     weeb3.interface_log(format!(
         "Attached to the SharedWorker node for {:?} network {}",
         initial_profile.mode, initial_profile.swarm_network_id
@@ -237,10 +234,6 @@ pub(crate) async fn mount_interface_with_generation(
         return Err(JsError::new(&error));
     }
 
-    spawn_local(async {
-        let _ = get_service_worker().await;
-    });
-
     async_std::task::yield_now().await;
     if !interface_mount_is_current(mount_generation) {
         return Ok(());
@@ -265,138 +258,102 @@ pub(crate) async fn mount_interface_with_generation(
     let pause_node = weeb3.clone();
     let prerequisites_node = weeb3.clone();
 
-    let chequebook_state = Rc::new(RefCell::new(None::<Address>));
-
-    let chequebook_state_init = chequebook_state.clone();
-    spawn_local(async move {
-        if let Some(address) = stored_chequebook_address().await {
-            *chequebook_state_init.borrow_mut() = Some(address);
-        }
-    });
-
+    let chequebook_state = Rc::new(Cell::new(None::<Address>));
     let chequebook_state_deploy = chequebook_state.clone();
     let chequebook_state_deposit = chequebook_state.clone();
-    let document = web_sys::window().unwrap().document().unwrap();
+    let document = interface_document();
 
-    let resource_input_callback =
-        wasm_bindgen::closure::Closure::<dyn FnMut(web_sys::MessageEvent)>::new(move |_msg| {
-            let node = input_node.clone();
-            let document = web_sys::window().unwrap().document().unwrap();
-            let input_field = required_element::<HtmlInputElement>(&document, "inputString");
+    let resource_input_callback = Closure::<dyn FnMut(Event)>::new(move |_| {
+        let node = input_node.clone();
+        let document = interface_document();
+        let input_field = required_element::<HtmlInputElement>(&document, "inputString");
 
-            let text = input_field.value();
-            spawn_local(async move {
-                open_resource_input(node, text).await;
-            });
+        let text = input_field.value();
+        spawn_local(async move {
+            open_resource_input(node, text).await;
         });
+    });
 
     required_element::<HtmlInputElement>(&document, "inputString")
         .set_oninput(Some(resource_input_callback.as_ref().unchecked_ref()));
 
-    let pause_callback =
-        wasm_bindgen::closure::Closure::<dyn FnMut(web_sys::MessageEvent)>::new(move |_msg| {
-            let node = pause_node.clone();
+    let pause_callback = Closure::<dyn FnMut(Event)>::new(move |_| {
+        let node = pause_node.clone();
 
-            spawn_local(async move {
-                let paused = node.toggle_transfer_pause().await;
-                update_transfer_pause_button(paused);
-            });
+        spawn_local(async move {
+            let paused = node.toggle_transfer_pause().await;
+            update_transfer_pause_button(paused);
         });
+    });
 
     required_element::<HtmlButtonElement>(&document, "transferPauseToggle")
         .set_onclick(Some(pause_callback.as_ref().unchecked_ref()));
 
-    let batch_purchase_callback =
-        wasm_bindgen::closure::Closure::<dyn FnMut(web_sys::MessageEvent)>::new(move |_msg| {
-            let (batch_depth, validity) = match read_batch_request_settings() {
-                Ok(settings) => settings,
+    let batch_purchase_callback = Closure::<dyn FnMut(Event)>::new(move |_| {
+        let (batch_depth, validity) = match read_batch_request_settings() {
+            Ok(settings) => settings,
+            Err(error) => {
+                alert(&error);
+                return;
+            }
+        };
+
+        spawn_local(async move {
+            let payer = match connect_wallet_address().await {
+                Ok(payer) => payer,
                 Err(error) => {
-                    alert(&error);
+                    alert(&format!("Wallet connect failed: {error}"));
                     return;
                 }
             };
 
-            spawn_local(async move {
-                let payer = match connect_wallet_address().await {
-                    Ok(payer) => payer,
-                    Err(error) => {
-                        alert(&format!("Wallet connect failed: {error}"));
-                        return;
-                    }
-                };
+            let profile = current_network_profile();
 
-                let profile = current_network_profile();
-
-                let secure_state =
-                    match secure_batch_state_for_wallet(payer.as_bytes(), profile.swarm_network_id)
-                        .await
-                    {
-                        Some(state) => state,
-                        None => {
-                            alert("Could not check weeb-3-secure for the connected wallet");
-                            return;
-                        }
-                    };
-
-                if secure_state.usable() {
+            let (prepared, purchase) = match ensure_batch(
+                payer,
+                profile,
+                batch_depth,
+                validity,
+                MissingSecureBatchState::Error,
+            )
+            .await
+            {
+                Ok(BatchPurchaseOutcome::AlreadyReady(_)) => {
                     alert("Already have a secure batch for uploads");
                     return;
                 }
-
-                let prepared = match secure_prepare_batch_purchase(
-                    batch_depth,
-                    validity,
-                    profile.swarm_network_id,
-                )
-                .await
-                {
-                    Some(prepared) if prepared.owner.len() == 20 => prepared,
-                    _ => {
-                        alert("Failed to prepare secure batch owner");
-                        return;
-                    }
-                };
-                let owner = Address::from_slice(&prepared.owner);
-
-                let purchase = match buy_postage_batch_with_payer(
-                    prepared.validity_days,
-                    prepared.depth,
-                    owner,
-                    payer,
-                )
-                .await
-                {
-                    Ok(p) => p,
-                    Err(e) => {
-                        alert(&format!(
-                            "Batch purchase failed: {:?}. Ensure wallet is on {:?} and has {} + {}.",
-                            e, profile.mode, profile.bzz_symbol, profile.base_symbol
-                        ));
-                        return;
-                    }
-                };
-
-                if !secure_commit_batch_purchase_and_verify(
-                    payer.as_bytes(),
-                    &purchase.batch_id,
-                    purchase.bucket_limit,
-                    prepared.depth,
-                    profile.swarm_network_id,
-                )
-                .await
-                {
+                Ok(BatchPurchaseOutcome::Purchased {
+                    prepared, purchase, ..
+                }) => (prepared, purchase),
+                Err(BatchPurchaseError::CheckSecure) => {
+                    alert("Could not check weeb-3-secure for the connected wallet");
+                    return;
+                }
+                Err(BatchPurchaseError::PrepareSecure) => {
+                    alert("Failed to prepare secure batch owner");
+                    return;
+                }
+                Err(BatchPurchaseError::OnChain(error)) => {
+                    alert(&format!(
+                        "Batch purchase failed: {:?}. Ensure wallet is on {:?} and has {} + {}.",
+                        error, profile.mode, profile.bzz_symbol, profile.base_symbol
+                    ));
+                    return;
+                }
+                Err(BatchPurchaseError::CommitSecure) => {
                     alert("Failed to save or verify batch in weeb-3-secure");
                     return;
                 }
+            };
 
-                alert(&format!(
-                    "Storage batch ready.\nBatch ID: 0x{}\nDepth: {}\nStorage slots per bucket: {}",
-                    hex::encode(&purchase.batch_id),
-                    prepared.depth,
-                    purchase.bucket_limit
-                ));
-            });
+            alert(&format!(
+                "Storage batch ready.\nBatch ID: 0x{}\nDepth: {}\nStorage slots per bucket: {}",
+                hex::encode(&purchase.batch_id),
+                prepared.depth,
+                purchase.bucket_limit
+            ));
         });
+    });
 
     required_element::<HtmlButtonElement>(&document, "uploadGetBatch")
         .set_onclick(Some(batch_purchase_callback.as_ref().unchecked_ref()));
@@ -405,16 +362,15 @@ pub(crate) async fn mount_interface_with_generation(
         .get_element_by_id("uploadPrereqCheck")
         .and_then(|button| button.dyn_into::<HtmlButtonElement>().ok())
     {
-        let callback_prereq =
-            wasm_bindgen::closure::Closure::<dyn FnMut(web_sys::MessageEvent)>::new({
-                let prerequisites_node = prerequisites_node.clone();
-                move |_msg| {
-                    let node = prerequisites_node.clone();
-                    spawn_local(async move {
-                        check_upload_prerequisites(node).await;
-                    });
-                }
-            });
+        let callback_prereq = Closure::<dyn FnMut(Event)>::new({
+            let prerequisites_node = prerequisites_node.clone();
+            move |_| {
+                let node = prerequisites_node.clone();
+                spawn_local(async move {
+                    check_upload_prerequisites(node).await;
+                });
+            }
+        });
 
         button.set_onclick(Some(callback_prereq.as_ref().unchecked_ref()));
         Some(callback_prereq)
@@ -422,258 +378,245 @@ pub(crate) async fn mount_interface_with_generation(
         None
     };
 
-    let upload_callback =
-        wasm_bindgen::closure::Closure::<dyn FnMut(web_sys::MessageEvent)>::new(move |_msg| {
-            let node = upload_node.clone();
+    let upload_callback = Closure::<dyn FnMut(Event)>::new(move |_| {
+        let node = upload_node.clone();
 
-            let document = web_sys::window().unwrap().document().unwrap();
-            let file_input = required_element::<HtmlInputElement>(&document, "uploadFileSelect");
+        let document = interface_document();
+        let file_input = required_element::<HtmlInputElement>(&document, "uploadFileSelect");
 
-            let file0 = match file_input.files() {
-                Some(aok) => aok,
-                _ => return,
+        let Some(file) = file_input.files().and_then(|files| files.item(0)) else {
+            return;
+        };
+        file_input.set_value("");
+        secure_open_vault_from_user_action();
+        spawn_local(async move {
+            let file_enc = required_element::<HtmlInputElement>(&document, "uploadFileEncrypt");
+            let upload_to_feed = required_element::<HtmlInputElement>(&document, "uploadAddToFeed");
+            let upload_to_feed = upload_to_feed.checked();
+
+            let feed_topic = if upload_to_feed {
+                let topic_field =
+                    required_element::<HtmlInputElement>(&document, "feedTopicString");
+                topic_field.value()
+            } else {
+                String::new()
             };
 
-            let file = match file0.item(0) {
-                Some(aok) => aok,
-                _ => return,
-            };
-            file_input.set_value("");
-            secure_open_vault_from_user_action();
-            spawn_local(async move {
-                let file_enc = required_element::<HtmlInputElement>(&document, "uploadFileEncrypt");
-                let upload_to_feed =
-                    required_element::<HtmlInputElement>(&document, "uploadAddToFeed");
+            let index_input = required_element::<HtmlInputElement>(&document, "indexString");
+            let index_string = index_input.value();
 
-                let feed_topic = if upload_to_feed.checked() {
-                    let topic_field =
-                        required_element::<HtmlInputElement>(&document, "feedTopicString");
-                    topic_field.value()
-                } else {
-                    String::new()
-                };
+            let redundancy_value = document
+                .get_element_by_id("uploadRedundancyLevel")
+                .and_then(|element| element.dyn_into::<HtmlSelectElement>().ok())
+                .map(|select| select.value());
+            let redundancy_level = upload_redundancy_from_select(redundancy_value.as_deref());
 
-                let index_input = required_element::<HtmlInputElement>(&document, "indexString");
-                let index_string = index_input.value();
+            let result = node
+                .post_upload_with_redundancy(
+                    file,
+                    file_enc.checked() && !upload_to_feed,
+                    redundancy_level,
+                    index_string,
+                    upload_to_feed,
+                    feed_topic,
+                )
+                .await;
 
-                let redundancy_value = document
-                    .get_element_by_id("uploadRedundancyLevel")
-                    .and_then(|element| element.dyn_into::<HtmlSelectElement>().ok())
-                    .map(|select| select.value());
-                let redundancy_level =
-                    upload_redundancy_from_select(redundancy_value.as_deref()).as_u8();
+            let (data, indx) = decode_resources(result);
 
-                let result = node
-                    .post_upload_with_redundancy(
-                        file,
-                        file_enc.checked() && !upload_to_feed.checked(),
-                        f64::from(redundancy_level),
-                        index_string,
-                        upload_to_feed.checked(),
-                        feed_topic,
-                    )
-                    .await;
-
-                let (data, indx) = decode_resources(result);
-
-                render_result(data, indx);
-            })
-        });
+            render_result(data, indx);
+        })
+    });
 
     required_element::<HtmlButtonElement>(&document, "uploadFile")
         .set_onclick(Some(upload_callback.as_ref().unchecked_ref()));
 
     let network_toggle_node = network_node.clone();
-    let network_apply_callback =
-        wasm_bindgen::closure::Closure::<dyn FnMut(web_sys::MessageEvent)>::new(move |_msg| {
-            let node = network_node.clone();
-
-            let apply_generation = next_network_apply_generation();
-            let network_id = current_network_id_input();
-            spawn_local(async move {
-                apply_network_settings_and_connect(node, apply_generation, network_id).await;
-            });
+    let network_apply_callback = Closure::<dyn FnMut(Event)>::new(move |_| {
+        let node = network_node.clone();
+        let network_id = current_network_id_input();
+        let apply_generation = next_network_apply_generation();
+        spawn_local(async move {
+            apply_network_settings_and_connect(&node, apply_generation, network_id).await;
         });
+    });
 
     required_element::<HtmlButtonElement>(&document, "networkSet")
         .set_onclick(Some(network_apply_callback.as_ref().unchecked_ref()));
 
-    install_network_profile_toggle(network_toggle_node);
+    let _network_profile_toggle_callback = install_network_profile_toggle(network_toggle_node);
 
-    let stamp_reset_callback =
-        wasm_bindgen::closure::Closure::<dyn FnMut(web_sys::MessageEvent)>::new(move |_msg| {
-            let node = reset_node.clone();
+    let stamp_reset_callback = Closure::<dyn FnMut(Event)>::new(move |_| {
+        let node = reset_node.clone();
 
-            let window = web_sys::window().unwrap();
+        let window = web_sys::window().unwrap();
 
-            if window
-                .confirm_with_message(
-                    "This will enable overwriting previously uploaded content with new content.",
-                )
-                .unwrap_or(false)
-            {
-                spawn_local(async move {
-                    let result = node.reset_stamp().await;
+        if window
+            .confirm_with_message(
+                "This will enable overwriting previously uploaded content with new content.",
+            )
+            .unwrap_or(false)
+        {
+            spawn_local(async move {
+                let result = node.reset_stamp().await;
 
-                    let (data, indx) = decode_resources(result);
+                let (data, indx) = decode_resources(result);
 
-                    render_result(data, indx);
-                })
-            }
-        });
+                render_result(data, indx);
+            })
+        }
+    });
 
     required_element::<HtmlButtonElement>(&document, "uploadResetStamp")
         .set_onclick(Some(stamp_reset_callback.as_ref().unchecked_ref()));
 
-    let deploy_chequebook_callback =
-        wasm_bindgen::closure::Closure::<dyn FnMut(web_sys::MessageEvent)>::new(move |_msg| {
-            let state = chequebook_state_deploy.clone();
-            spawn_local(async move {
-                let payer = match connect_wallet_address().await {
-                    Ok(payer) => payer,
-                    Err(error) => {
-                        alert(&format!("Wallet connect failed: {error}"));
-                        return;
-                    }
-                };
-
-                if let Some(address) = stored_chequebook_address().await {
-                    alert(&format!(
-                        "Already have a chequebook deployed at address 0x{}",
-                        hex::encode(address.as_bytes())
-                    ));
-                    return;
-                }
-
-                let cheque_signer_key = encrey();
-                let cheque_signer = match PrivateKeySigner::from_slice(&cheque_signer_key) {
-                    Ok(s) => s,
-                    Err(_) => {
-                        alert("Failed to create chequebook signer key");
-                        return;
-                    }
-                };
-                let issuer_h160_bytes: [u8; 20] = *cheque_signer.address().as_ref();
-                let issuer = Address::from(issuer_h160_bytes);
-
-                let deployment = match deploy_chequebook_with_payer(issuer, payer).await {
-                    Ok(d) => d,
-                    Err(e) => {
-                        alert(&format!("Chequebook deployment failed: {e:?}"));
-                        return;
-                    }
-                };
-
-                if !set_chequebook_signer_key(&cheque_signer_key).await {
-                    alert("Chequebook deployed, but failed to save signer key locally.");
-                }
-
-                if !set_chequebook_address(deployment.chequebook.as_bytes()).await {
-                    alert("Chequebook deployed, but failed to save address locally.");
-                }
-
-                *state.borrow_mut() = Some(deployment.chequebook);
-
-                alert(&format!(
-                    "Chequebook deployed at 0x{}.\nIssuer: 0x{}\nDeployment tx: 0x{}",
-                    hex::encode(deployment.chequebook.as_bytes()),
-                    hex::encode(issuer_h160_bytes),
-                    hex::encode(deployment.tx.as_bytes())
-                ));
-            });
-        });
-
-    required_element::<HtmlButtonElement>(&document, "deployChequebook")
-        .set_onclick(Some(deploy_chequebook_callback.as_ref().unchecked_ref()));
-
-    let deposit_callback =
-        wasm_bindgen::closure::Closure::<dyn FnMut(web_sys::MessageEvent)>::new(move |_msg| {
-            let state = chequebook_state_deposit.clone();
-
-            let document = web_sys::window().unwrap().document().unwrap();
-            let amount_input = required_element::<HtmlInputElement>(&document, "depositAmount");
-
-            let amount_raw = amount_input.value();
-            let amount = match U256::from_dec_str(amount_raw.trim()) {
-                Ok(v) => v,
-                Err(_) => {
-                    alert("Failed to read deposit amount");
+    let deploy_chequebook_callback = Closure::<dyn FnMut(Event)>::new(move |_| {
+        let state = chequebook_state_deploy.clone();
+        spawn_local(async move {
+            let payer = match connect_wallet_address().await {
+                Ok(payer) => payer,
+                Err(error) => {
+                    alert(&format!("Wallet connect failed: {error}"));
                     return;
                 }
             };
 
-            if amount == U256::from(0u8) {
-                alert("Deposit amount must be greater than zero");
+            if let Some(address) = stored_chequebook_address().await {
+                alert(&format!(
+                    "Already have a chequebook deployed at address 0x{}",
+                    hex::encode(address.as_bytes())
+                ));
                 return;
             }
 
-            let chequebook = *state.borrow();
-
-            spawn_local(async move {
-                let chequebook = match chequebook {
-                    Some(addr) => addr,
-                    None => match stored_chequebook_address().await {
-                        Some(address) => {
-                            *state.borrow_mut() = Some(address);
-                            address
-                        }
-                        None => {
-                            alert("Deploy a chequebook first before depositing.");
-                            return;
-                        }
-                    },
-                };
-
-                let payer = match connect_wallet_address().await {
-                    Ok(payer) => payer,
-                    Err(error) => {
-                        alert(&format!("Wallet connect failed: {error}"));
-                        return;
-                    }
-                };
-
-                let w3 = match crate::on_chain::web3() {
-                    Ok(w) => w,
-                    Err(e) => {
-                        alert(&format!("Failed to initialize web3: {e:?}"));
-                        return;
-                    }
-                };
-
-                let profile = current_network_profile();
-
-                if !wallet_chain_matches(&w3, profile).await {
+            let cheque_signer_key = random_encryption_key();
+            let cheque_signer = match PrivateKeySigner::from_slice(&cheque_signer_key) {
+                Ok(s) => s,
+                Err(_) => {
+                    alert("Failed to create chequebook signer key");
                     return;
                 }
+            };
+            let issuer_h160_bytes: [u8; 20] = *cheque_signer.address().as_ref();
+            let issuer = Address::from(issuer_h160_bytes);
 
-                let token = match token_contract(&w3) {
-                    Ok(t) => t,
-                    Err(e) => {
-                        alert(&format!("Failed to load token contract: {e:?}"));
-                        return;
-                    }
-                };
-
-                let receipt = match deposit_to_chequebook(&token, chequebook, payer, amount).await {
-                    Ok(r) => r,
-                    Err(e) => {
-                        alert(&format!("Deposit failed: {e:?}"));
-                        return;
-                    }
-                };
-
-                let mut balance_note = String::new();
-                if let Ok(balance) = chequebook_balance(&w3, chequebook).await {
-                    balance_note = format!("\nNew balance: {}", balance);
+            let deployment = match deploy_chequebook_with_payer(issuer, payer).await {
+                Ok(d) => d,
+                Err(e) => {
+                    alert(&format!("Chequebook deployment failed: {e:?}"));
+                    return;
                 }
+            };
 
-                alert(&format!(
-                    "Deposit submitted.\nTx: 0x{}{}",
-                    hex::encode(receipt.transaction_hash.as_bytes()),
-                    balance_note
-                ));
-            });
+            if !set_chequebook_signer_key(&cheque_signer_key).await {
+                alert("Chequebook deployed, but failed to save signer key locally.");
+            }
+
+            if !set_chequebook_address(deployment.chequebook.as_bytes()).await {
+                alert("Chequebook deployed, but failed to save address locally.");
+            }
+
+            state.set(Some(deployment.chequebook));
+
+            alert(&format!(
+                "Chequebook deployed at 0x{}.\nIssuer: 0x{}\nDeployment tx: 0x{}",
+                hex::encode(deployment.chequebook.as_bytes()),
+                hex::encode(issuer_h160_bytes),
+                hex::encode(deployment.tx.as_bytes())
+            ));
         });
+    });
+
+    required_element::<HtmlButtonElement>(&document, "deployChequebook")
+        .set_onclick(Some(deploy_chequebook_callback.as_ref().unchecked_ref()));
+
+    let deposit_callback = Closure::<dyn FnMut(Event)>::new(move |_| {
+        let state = chequebook_state_deposit.clone();
+
+        let document = interface_document();
+        let amount_input = required_element::<HtmlInputElement>(&document, "depositAmount");
+
+        let amount_raw = amount_input.value();
+        let amount = match U256::from_dec_str(amount_raw.trim()) {
+            Ok(v) => v,
+            Err(_) => {
+                alert("Failed to read deposit amount");
+                return;
+            }
+        };
+
+        if amount == U256::from(0u8) {
+            alert("Deposit amount must be greater than zero");
+            return;
+        }
+
+        let chequebook = state.get();
+
+        spawn_local(async move {
+            let chequebook = match chequebook {
+                Some(addr) => addr,
+                None => match stored_chequebook_address().await {
+                    Some(address) => {
+                        state.set(Some(address));
+                        address
+                    }
+                    None => {
+                        alert("Deploy a chequebook first before depositing.");
+                        return;
+                    }
+                },
+            };
+
+            let payer = match connect_wallet_address().await {
+                Ok(payer) => payer,
+                Err(error) => {
+                    alert(&format!("Wallet connect failed: {error}"));
+                    return;
+                }
+            };
+
+            let w3 = match crate::on_chain::web3() {
+                Ok(w) => w,
+                Err(e) => {
+                    alert(&format!("Failed to initialize web3: {e:?}"));
+                    return;
+                }
+            };
+
+            let profile = current_network_profile();
+
+            if !wallet_chain_matches(&w3, profile).await {
+                return;
+            }
+
+            let token = match token_contract(&w3) {
+                Ok(t) => t,
+                Err(e) => {
+                    alert(&format!("Failed to load token contract: {e:?}"));
+                    return;
+                }
+            };
+
+            let receipt = match deposit_to_chequebook(&token, chequebook, payer, amount).await {
+                Ok(r) => r,
+                Err(e) => {
+                    alert(&format!("Deposit failed: {e:?}"));
+                    return;
+                }
+            };
+
+            let mut balance_note = String::new();
+            if let Ok(balance) = chequebook_balance(&w3, chequebook).await {
+                balance_note = format!("\nNew balance: {}", balance);
+            }
+
+            alert(&format!(
+                "Deposit submitted.\nTx: 0x{}{}",
+                hex::encode(receipt.transaction_hash.as_bytes()),
+                balance_note
+            ));
+        });
+    });
 
     required_element::<HtmlButtonElement>(&document, "depositCash")
         .set_onclick(Some(deposit_callback.as_ref().unchecked_ref()));
@@ -687,11 +630,6 @@ pub(crate) async fn mount_interface_with_generation(
         let Some(route) = read_route() else {
             return;
         };
-        if initial_result_generation
-            .is_some_and(|generation| !crate::stream::result_view_request_is_current(generation))
-        {
-            return;
-        }
         open_resource(route_node, route).await;
     });
 
@@ -704,6 +642,10 @@ pub(crate) async fn mount_interface_with_generation(
     loop {
         if !interface_mount_can_poll(mount_generation) {
             break;
+        }
+        if document.hidden() {
+            async_std::task::sleep(Duration::from_millis(160)).await;
+            continue;
         }
 
         let Some(snapshot) = snapshot_node.runtime_snapshot(last_progress_revision).await else {

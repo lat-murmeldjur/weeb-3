@@ -2,7 +2,7 @@ use crate::{
     ChunkRetrieveSender, Date, Duration, HashSet, Mutex, OutboundProtocolSession, OverlayPeerMap,
     PROTOCOL_ROUND_TIME, PUSH_CHUNK_CONFIRMATION_PEERS, PeerAccounting, PeerAccountingMap, PeerId,
     PhysicalConnectionMap, PrivateKeySigner, RefreshmentInstruction, StreamControl, apply_credit,
-    cancel_reserve, content_address,
+    bee_replica_address, cancel_reserve, content_address, encryption_segment_key,
     erasure_coding::{
         CHUNK_SIZE, CHUNK_WITH_SPAN_SIZE, FileSlicePlan, HASH_SIZE, ParityEncoder, RedundancyLevel,
         encode_level, encoded_reference_payload_len, reference_layout, replicas,
@@ -26,7 +26,7 @@ use serde_json::json;
 use libp2p::futures::{StreamExt, future::join_all, stream::FuturesUnordered};
 use rand::RngCore;
 
-use std::{collections::VecDeque, future::Future, pin::Pin, sync::atomic::AtomicBool};
+use std::{future::Future, pin::Pin, sync::atomic::AtomicBool};
 
 const BATCH_BUCKET_TRIALS: usize = 1024;
 const STAMP_CHUNK_WINDOW: usize = 64;
@@ -36,11 +36,6 @@ const PUSH_CHUNK_QUEUE_WINDOW: usize = 256;
 const PUSH_CHUNK_RECEIPT_WINDOW: usize = PUSH_CHUNK_QUEUE_WINDOW * 2;
 const PARITY_ENCODE_YIELD_ROWS: usize = 2;
 const SOC_CHUNK_SIZE: usize = CHUNK_WITH_SPAN_SIZE + 32 + 65;
-const REPLICA_OWNER: [u8; 20] = [
-    0xdc, 0x5b, 0x20, 0x84, 0x7f, 0x43, 0xd6, 0x79, 0x28, 0xf4, 0x9c, 0xd4, 0xf8, 0x5d, 0x69, 0x6b,
-    0x5a, 0x76, 0x17, 0xb5,
-];
-
 pub(crate) type ChunkUploadRequest = (
     Vec<u8>,
     bool,
@@ -51,13 +46,6 @@ pub(crate) type ChunkUploadRequest = (
     Option<UploadProgressSender>,
 );
 pub(crate) type ChunkUploadSender = mpsc::Sender<ChunkUploadRequest>;
-pub(crate) type DataUploadRequest = (
-    DataUploadInput,
-    bool,
-    RedundancyLevel,
-    Option<UploadProgressSender>,
-    mpsc::Sender<DataUploadResult>,
-);
 type StampFuture = Pin<Box<dyn Future<Output = (u64, Option<StampedChunk>)>>>;
 type ChunkPushReceiptFuture = Pin<Box<dyn Future<Output = bool>>>;
 type ChunkPushReceipts = FuturesUnordered<ChunkPushReceiptFuture>;
@@ -69,7 +57,7 @@ pub enum ResourceData {
 
 pub(crate) enum DataUploadInput {
     Parts {
-        parts: VecDeque<Vec<u8>>,
+        parts: std::vec::IntoIter<Vec<u8>>,
         data_length: u64,
     },
     BrowserFile {
@@ -85,7 +73,7 @@ impl DataUploadInput {
             sum.checked_add(u64::try_from(part.len()).ok()?)
         })?;
         Some(Self::Parts {
-            parts: parts.into(),
+            parts: parts.into_iter(),
             data_length,
         })
     }
@@ -113,7 +101,7 @@ impl DataUploadInput {
 
     async fn next_part(&mut self) -> Result<Option<Vec<u8>>, String> {
         match self {
-            Self::Parts { parts, .. } => Ok(parts.pop_front()),
+            Self::Parts { parts, .. } => Ok(parts.next()),
             Self::BrowserFile { file, slices, .. } => {
                 let Some((start, end)) = slices.next() else {
                     return Ok(None);
@@ -247,8 +235,8 @@ async fn enqueue_stamped_chunk(
     chunk_upload_chan: &ChunkUploadSender,
     progress: &Option<UploadProgressSender>,
 ) -> Option<TreeChunk> {
-    let (result_chan_out, result_chan_in) = mpsc::unbounded::<bool>();
-    let (slot_chan_out, slot_chan_in) = mpsc::unbounded::<bool>();
+    let (result_chan_out, result_chan_in) = mpsc::bounded::<bool>(1);
+    let (slot_chan_out, slot_chan_in) = mpsc::bounded::<bool>(1);
 
     let StampedChunk {
         reference,
@@ -357,41 +345,40 @@ async fn pushsync_attempt(
 }
 
 pub struct Resource {
-    pub path0: String,
-    pub filename0: String,
-    pub mime0: String,
+    pub path: String,
+    pub filename: String,
+    pub mime: String,
     pub data: ResourceData,
 }
 
 pub async fn upload_resource(
-    resource0: Vec<Resource>,
+    resources: Vec<Resource>,
     encryption: bool,
     redundancy_level: RedundancyLevel,
     mut index: String,
     errordoc: String,
     feed: bool,
     topic: String,
-    data_upload_chan: &mpsc::Sender<DataUploadRequest>,
     chunk_upload_chan: &ChunkUploadSender,
     chunk_retrieve_chan: &ChunkRetrieveSender,
     progress: Option<UploadProgressSender>,
 ) -> Vec<u8> {
-    let mut node0 = Vec::with_capacity(resource0.len());
+    let mut manifest_nodes = Vec::with_capacity(resources.len());
 
-    for mut r0 in resource0 {
-        let input = match r0.data {
+    for mut resource in resources {
+        let input = match resource.data {
             ResourceData::Parts(parts) => DataUploadInput::from_parts(parts),
             ResourceData::BrowserFile(file) => DataUploadInput::from_browser_file(file),
         };
         let Some(input) = input else {
-            render_log_message(&format!("Upload input was invalid for {}", r0.path0));
+            render_log_message(&format!("Upload input was invalid for {}", resource.path));
             return vec![];
         };
-        let core_reference = upload_input_with_root(
+        let core_reference = push_data_input_with_root(
             input,
             encryption,
             redundancy_level,
-            data_upload_chan,
+            chunk_upload_chan,
             progress.clone(),
         )
         .await
@@ -400,38 +387,37 @@ pub async fn upload_resource(
         if core_reference.is_empty() {
             render_log_message(&format!(
                 "Upload failed for {}; refusing to create manifest with empty data reference",
-                r0.path0
+                resource.path
             ));
             return vec![];
         }
 
-        if r0.path0.is_empty() {
-            r0.path0 = hex::encode(&core_reference);
+        if resource.path.is_empty() {
+            resource.path = hex::encode(&core_reference);
         }
 
         if index.is_empty() {
-            index = r0.path0.clone();
+            index = resource.path.clone();
         };
 
-        node0.push(ManifestNode {
+        manifest_nodes.push(ManifestNode {
             data: core_reference,
-            mime: r0.mime0,
-            filename: r0.filename0,
-            path: r0.path0.into_bytes(),
+            mime: resource.mime,
+            filename: resource.filename,
+            path: resource.path.into_bytes(),
         })
     }
 
     let core_manifest = create_manifest(
         encryption,
-        encryption,
         redundancy_level,
-        node0,    // forks
-        vec![],   // data_forks
-        vec![],   // reference
-        true,     // root manifest
-        index,    // index
-        errordoc, // errordoc
-        data_upload_chan,
+        manifest_nodes, // forks
+        vec![],         // data_forks
+        vec![],         // reference
+        true,           // root manifest
+        index,          // index
+        errordoc,       // errordoc
+        chunk_upload_chan,
         progress.clone(),
     )
     .await;
@@ -445,7 +431,7 @@ pub async fn upload_resource(
         vec![core_manifest],
         encryption,
         redundancy_level,
-        data_upload_chan,
+        chunk_upload_chan,
         progress.clone(),
     )
     .await;
@@ -464,9 +450,10 @@ pub async fn upload_resource(
         Some(feed_owner) => feed_owner,
         None => return vec![],
     };
+    let feed_owner = hex::encode(feed_owner);
 
     let feed_metadata = serde_json::to_vec(&json!({
-        "swarm-feed-owner": hex::encode(&feed_owner),
+        "swarm-feed-owner": &feed_owner,
         "swarm-feed-topic": topic,
         "swarm-feed-type": "Sequence",
 
@@ -479,7 +466,7 @@ pub async fn upload_resource(
         vec![create_stub(stub_ref_size, encryption)],
         encryption,
         redundancy_level,
-        data_upload_chan,
+        chunk_upload_chan,
         progress.clone(),
     )
     .await;
@@ -494,7 +481,6 @@ pub async fn upload_resource(
 
     let feed_manifest = create_manifest(
         encryption,
-        encryption,
         redundancy_level,
         vec![],          // forks
         vec![root_fork], // data_forks
@@ -502,7 +488,7 @@ pub async fn upload_resource(
         false,           // root manifest
         "".to_string(),  // index
         "".to_string(),  // errordoc
-        data_upload_chan,
+        chunk_upload_chan,
         progress.clone(),
     )
     .await;
@@ -515,14 +501,13 @@ pub async fn upload_resource(
         vec![feed_manifest],
         encryption,
         redundancy_level,
-        data_upload_chan,
+        chunk_upload_chan,
         progress.clone(),
     )
     .await;
 
     let index_up =
-        seek_next_feed_update_index(hex::encode(&feed_owner), topic.clone(), chunk_retrieve_chan)
-            .await;
+        seek_next_feed_update_index(feed_owner, topic.clone(), chunk_retrieve_chan).await;
 
     // Feed updates must wrap the exact erasure-coded root chunk.
     let soc_wrapped_content = manifest_upload.root_data;
@@ -542,8 +527,8 @@ pub async fn upload_resource(
         return vec![];
     }
 
-    let (result_chan_out, result_chan_in) = mpsc::unbounded::<bool>();
-    let (slot_chan_out, _slot_chan_in) = mpsc::unbounded::<bool>();
+    let (result_chan_out, result_chan_in) = mpsc::bounded::<bool>(1);
+    let (slot_chan_out, _slot_chan_in) = mpsc::bounded::<bool>(1);
 
     if feed_update.stamp.is_empty() {
         return vec![];
@@ -577,10 +562,10 @@ pub async fn upload_data(
     data: Vec<Vec<u8>>,
     enc: bool,
     redundancy_level: RedundancyLevel,
-    data_upload_chan: &mpsc::Sender<DataUploadRequest>,
+    chunk_upload_chan: &ChunkUploadSender,
     progress: Option<UploadProgressSender>,
 ) -> Vec<u8> {
-    upload_data_with_root(data, enc, redundancy_level, data_upload_chan, progress)
+    upload_data_with_root(data, enc, redundancy_level, chunk_upload_chan, progress)
         .await
         .reference
 }
@@ -589,35 +574,13 @@ async fn upload_data_with_root(
     data: Vec<Vec<u8>>,
     enc: bool,
     redundancy_level: RedundancyLevel,
-    data_upload_chan: &mpsc::Sender<DataUploadRequest>,
+    chunk_upload_chan: &ChunkUploadSender,
     progress: Option<UploadProgressSender>,
 ) -> DataUploadResult {
     let Some(input) = DataUploadInput::from_parts(data) else {
         return DataUploadResult::failed();
     };
-    upload_input_with_root(input, enc, redundancy_level, data_upload_chan, progress).await
-}
-
-async fn upload_input_with_root(
-    input: DataUploadInput,
-    enc: bool,
-    redundancy_level: RedundancyLevel,
-    data_upload_chan: &mpsc::Sender<DataUploadRequest>,
-    progress: Option<UploadProgressSender>,
-) -> DataUploadResult {
-    let (chan_out, chan_in) = mpsc::unbounded::<DataUploadResult>();
-
-    if data_upload_chan
-        .try_send((input, enc, redundancy_level, progress, chan_out))
-        .is_err()
-    {
-        return DataUploadResult::failed();
-    }
-
-    chan_in
-        .recv()
-        .await
-        .unwrap_or_else(|_| DataUploadResult::failed())
+    push_data_input_with_root(input, enc, redundancy_level, chunk_upload_chan, progress).await
 }
 
 fn canonical_chunk(span: &[u8; 8], payload: &[u8]) -> Vec<u8> {
@@ -636,7 +599,7 @@ async fn stamp_push_chunk(
     let mut key = Vec::new();
     let canonical_data = canonical_chunk(&span, &payload);
     let (mut raw_data, canonical_data) = if encryption {
-        key = encrey();
+        key = random_encryption_key();
         (
             encrypt_with_span(&span, &payload, &key),
             Some(canonical_data),
@@ -659,7 +622,7 @@ async fn stamp_push_chunk(
 
         render_log_message("Restamping chunk to avoid bucket overflow");
         if encryption {
-            key = encrey();
+            key = random_encryption_key();
             raw_data = encrypt_with_span(&span, &payload, &key);
             address = content_address(&raw_data);
         } else {
@@ -669,7 +632,7 @@ async fn stamp_push_chunk(
     }
 
     Some(StampedChunk {
-        reference: [address.clone(), key].concat(),
+        reference: [address.as_slice(), key.as_slice()].concat(),
         data: raw_data.clone(),
         canonical_data,
         raw_data,
@@ -706,7 +669,7 @@ async fn stamp_parity_chunk(raw_data: Vec<u8>) -> Option<StampedChunk> {
 }
 
 async fn build_parent_chunk(
-    children: Vec<TreeChunk>,
+    mut children: Vec<TreeChunk>,
     encryption: bool,
     redundancy_level: RedundancyLevel,
     chunk_upload_chan: &ChunkUploadSender,
@@ -716,6 +679,10 @@ async fn build_parent_chunk(
 ) -> Option<TreeChunk> {
     if children.len() < 2 {
         return None;
+    }
+
+    for child in &mut children {
+        child.canonical_data = None;
     }
 
     let span = children
@@ -862,12 +829,8 @@ async fn stamp_root_replicas(
         return true;
     }
 
-    let Some(replica_plan) = replicas(&root.reference[..32], redundancy_level, |id| {
-        let mut input = [0u8; HASH_SIZE + REPLICA_OWNER.len()];
-        input[..HASH_SIZE].copy_from_slice(id);
-        input[HASH_SIZE..].copy_from_slice(&REPLICA_OWNER);
-        keccak256(input).into()
-    }) else {
+    let Some(replica_plan) = replicas(&root.reference[..32], redundancy_level, bee_replica_address)
+    else {
         return false;
     };
     report_upload_progress(progress, replica_plan.len() as u64, 0);
@@ -1360,14 +1323,6 @@ pub async fn push_chunk(
     vec![]
 }
 
-#[inline]
-fn encryption_segment_key(key: &[u8], counter: u32) -> [u8; HASH_SIZE] {
-    let mut seed = [0u8; HASH_SIZE + 4];
-    seed[..HASH_SIZE].copy_from_slice(key);
-    seed[HASH_SIZE..].copy_from_slice(&counter.to_le_bytes());
-    keccak256(keccak256(seed)).into()
-}
-
 fn encrypt_with_span(span: &[u8; 8], content: &[u8], key: &[u8]) -> Vec<u8> {
     if content.len() > CHUNK_SIZE || key.len() != HASH_SIZE {
         return vec![];
@@ -1394,7 +1349,7 @@ fn encrypt_with_span(span: &[u8; 8], content: &[u8], key: &[u8]) -> Vec<u8> {
     encrypted
 }
 
-pub fn encrey() -> Vec<u8> {
+pub fn random_encryption_key() -> Vec<u8> {
     let mut key = vec![0; HASH_SIZE];
     rand::thread_rng().fill_bytes(&mut key);
     key

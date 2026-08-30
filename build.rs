@@ -5,8 +5,8 @@ use std::{
 
 fn hash_bytes(mut hash: u64, bytes: &[u8]) -> u64 {
     for byte in bytes {
-        hash ^= *byte as u64;
-        hash = hash.wrapping_mul(1099511628211);
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(1_099_511_628_211);
     }
     hash
 }
@@ -34,7 +34,7 @@ fn version_for_files(mut files: Vec<PathBuf>) -> String {
     files.sort();
     files.dedup();
 
-    let mut hash = 14695981039346656037u64;
+    let mut hash = 14_695_981_039_346_656_037_u64;
     for path in files {
         println!("cargo:rerun-if-changed={}", path.display());
         hash = hash_bytes(hash, path.to_string_lossy().as_bytes());
@@ -43,7 +43,7 @@ fn version_for_files(mut files: Vec<PathBuf>) -> String {
         }
     }
 
-    format!("{:016x}", hash)
+    format!("{hash:016x}")
 }
 
 fn source_build_version() -> String {
@@ -54,12 +54,8 @@ fn source_build_version() -> String {
             "Cargo.toml",
             "Cargo.lock",
             "build.rs",
-            "static/404.html",
-            "static/example.html",
             "static/hls_loader.js",
-            "static/hls-stream-example.html",
             "static/index.html",
-            "static/issue-1-json-sync-example.html",
             "static/service.js",
             "static/worker.js",
         ],

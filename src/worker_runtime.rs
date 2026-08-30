@@ -3,7 +3,8 @@ use std::{
     collections::{HashMap, VecDeque},
 };
 
-use async_std::sync::{Arc, Mutex};
+use async_lock::Mutex;
+use async_std::sync::Arc;
 use js_sys::{Array, Object};
 use wasm_bindgen::{JsCast, JsValue, prelude::*};
 use wasm_bindgen_futures::spawn_local;
@@ -307,13 +308,11 @@ impl Weeb3WorkerRuntime {
             .map_err(|_| error_response(400, "upload requires File"))?;
         let encryption = bool_property(message, "encryption")
             .ok_or_else(|| error_response(400, "upload requires encryption"))?;
-        let redundancy = number_property(message, "redundancyLevel").filter(|value| {
-            value.fract() == 0.0
-                && crate::erasure_coding::validated_upload_redundancy_number(*value).is_some()
-        });
-        let redundancy = redundancy.ok_or_else(|| {
-            error_response(400, "upload requires redundancyLevel from 0 through 4")
-        })?;
+        let redundancy = number_property(message, "redundancyLevel")
+            .and_then(crate::erasure_coding::validated_upload_redundancy_number)
+            .ok_or_else(|| {
+                error_response(400, "upload requires redundancyLevel from 0 through 4")
+            })?;
         let add_to_feed = bool_property(message, "addToFeed").unwrap_or(false);
         let result = self
             .inner
@@ -406,8 +405,8 @@ impl Weeb3WorkerRuntime {
                 }
             }
             include_logs.then(|| {
-                let logs = Array::new();
-                if seen_logs < state.log_sequence {
+                let logs = (seen_logs < state.log_sequence).then(|| {
+                    let logs = Array::new();
                     for (_, log) in state
                         .logs
                         .iter()
@@ -415,26 +414,20 @@ impl Weeb3WorkerRuntime {
                     {
                         logs.push(&JsValue::from_str(log));
                     }
-                }
+                    logs
+                });
                 (state.log_sequence, logs)
             })
         };
 
+        let (connections, ongoing_connections) = self.inner.connection_counts().await;
         let response = ok_response();
-        set_number(
-            &response,
-            "connections",
-            self.inner.get_connections().await as f64,
-        );
-        set_number(
-            &response,
-            "ongoingConnections",
-            self.inner.get_ongoing_connections().await as f64,
-        );
+        set_number(&response, "connections", connections as f64);
+        set_number(&response, "ongoingConnections", ongoing_connections as f64);
         set_bool(&response, "paused", self.inner.transfer_paused());
         if let Some((log_sequence, logs)) = log_snapshot {
             set_number(&response, "logSequence", log_sequence as f64);
-            if logs.length() != 0 {
+            if let Some(logs) = logs {
                 set(&response, "logs", logs.into());
             }
         }

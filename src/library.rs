@@ -2,7 +2,7 @@
 
 use crate::PrivateKeySigner;
 use crate::{
-    decode_resources, encrey,
+    decode_resources,
     erasure_coding::RedundancyLevel,
     erasure_coding::validated_upload_redundancy_number,
     interface::{
@@ -17,25 +17,26 @@ use crate::{
     },
     normalize_feed_topic,
     on_chain::{
-        buy_postage_batch_with_payer, chequebook_balance, chunk_count_for_depth,
-        compute_initial_balance_per_chunk, deploy_chequebook_with_payer, deposit_to_chequebook,
-        get_batch_validity, last_price, postage_contract, token_contract, web3,
+        chequebook_balance, deploy_chequebook_with_payer, deposit_to_chequebook, token_contract,
+        web3,
     },
     persistence::{
         get_chequebook_address, get_chequebook_signer_key, set_chequebook_address,
         set_chequebook_signer_key,
     },
-    secure_vault::{
-        secure_batch_state_for_wallet, secure_commit_batch_purchase_and_verify,
-        secure_ensure_feed_owner_in_window, secure_open_vault_from_user_action,
-        secure_prepare_batch_purchase,
-    },
+    random_encryption_key,
+    secure_vault::{secure_ensure_feed_owner_in_window, secure_open_vault_from_user_action},
     shared_runtime::SharedNodeClient,
     stream_conventions::{HlsStart, StreamShareRoute},
     strip_hex_prefix,
+    wallet_workflows::{
+        BatchPurchaseError, BatchPurchaseOutcome, MissingSecureBatchState, ensure_batch,
+        inspect_batch,
+    },
     worker_protocol::{
-        bytes_to_js, progress_to_js as progress_row_to_js, property, set as set_js,
+        bool_property, bytes_to_js, progress_to_js as progress_row_to_js, property, set as set_js,
         set_bool as set_js_bool, set_number as set_js_number, set_string as set_js_str,
+        string_property,
     },
 };
 use event_listener::Event;
@@ -115,25 +116,22 @@ fn normalize_feed_owner(owner: &str) -> Option<String> {
         return None;
     }
 
-    match hex::decode(strip_hex_prefix(owner)) {
-        Ok(bytes) if bytes.len() == 20 => Some(format!("0x{}", hex::encode(bytes))),
-        _ => None,
-    }
+    let mut bytes = [0_u8; 20];
+    hex::decode_to_slice(strip_hex_prefix(owner), &mut bytes).ok()?;
+    Some(format!("0x{}", hex::encode(bytes)))
 }
 
-async fn feed_owner_for_request(owner: &str) -> Result<Option<String>, String> {
+async fn feed_owner_for_request(owner: &str) -> Result<String, String> {
     let owner = owner.trim();
     if owner.is_empty() {
         return match secure_ensure_feed_owner_in_window().await {
-            Some(owner) if owner.len() == 20 => Ok(Some(format!("0x{}", hex::encode(owner)))),
+            Some(owner) if owner.len() == 20 => Ok(format!("0x{}", hex::encode(owner))),
             Some(owner) => Err(format!("feed owner had invalid length {}", owner.len())),
             None => Err("feed owner unavailable".to_string()),
         };
     }
 
-    normalize_feed_owner(owner)
-        .map(Some)
-        .ok_or_else(|| "invalid feed owner".to_string())
+    normalize_feed_owner(owner).ok_or_else(|| "invalid feed owner".to_string())
 }
 
 fn feed_status(
@@ -165,9 +163,9 @@ fn feed_status(
 }
 
 fn network_mode_from_input(mode: &str) -> Option<NetworkMode> {
-    match mode.trim().to_ascii_lowercase().as_str() {
-        "mainnet" => Some(NetworkMode::Mainnet),
-        "testnet" => Some(NetworkMode::Testnet),
+    match mode.trim() {
+        mode if mode.eq_ignore_ascii_case("mainnet") => Some(NetworkMode::Mainnet),
+        mode if mode.eq_ignore_ascii_case("testnet") => Some(NetworkMode::Testnet),
         _ => None,
     }
 }
@@ -192,11 +190,13 @@ fn network_profile_object(profile: NetworkProfile, current_network_id: u64) -> O
     let browser_bootnodes = Array::new();
     let skipped_bootnodes = Array::new();
     for address in profile.bootnodes {
-        bootnodes.push(&JsValue::from_str(address));
-        if is_browser_dialable_underlay(address) {
-            browser_bootnodes.push(&JsValue::from_str(address));
+        let browser_dialable = is_browser_dialable_underlay(address);
+        let address = JsValue::from_str(address);
+        bootnodes.push(&address);
+        if browser_dialable {
+            browser_bootnodes.push(&address);
         } else {
-            skipped_bootnodes.push(&JsValue::from_str(address));
+            skipped_bootnodes.push(&address);
         }
     }
     set_js(&obj, "bootnodes", bootnodes.into());
@@ -225,13 +225,6 @@ fn profile_bootstrap_nodes(profile: NetworkProfile) -> Vec<StartBootstrapNode> {
         .collect()
 }
 
-fn js_bool_prop(value: &JsValue, name: &str) -> Option<bool> {
-    let prop = property(value, name);
-    (!prop.is_null() && !prop.is_undefined())
-        .then(|| prop.as_bool())
-        .flatten()
-}
-
 fn js_string_prop(value: &JsValue, name: &str) -> Option<String> {
     let prop = property(value, name);
     if prop.is_null() || prop.is_undefined() {
@@ -256,7 +249,7 @@ fn js_string_prop(value: &JsValue, name: &str) -> Option<String> {
 
 fn parse_start_bootstrap_node(value: JsValue) -> Option<StartBootstrapNode> {
     let multiaddr = js_string_prop(&value, "multiaddr")?;
-    let usable = js_bool_prop(&value, "usable").unwrap_or(true);
+    let usable = bool_property(&value, "usable").unwrap_or(true);
     Some(StartBootstrapNode { multiaddr, usable })
 }
 
@@ -281,9 +274,9 @@ fn start_options_from_js(options: Option<JsValue>) -> StartOptions {
         js_string_prop(&options, "networkId")
     };
 
-    let mode = if js_bool_prop(&options, "testnet").unwrap_or(false) {
+    let mode = if bool_property(&options, "testnet").unwrap_or(false) {
         NetworkMode::Testnet
-    } else if js_bool_prop(&options, "mainnet").unwrap_or(false) {
+    } else if bool_property(&options, "mainnet").unwrap_or(false) {
         NetworkMode::Mainnet
     } else if let Some(network_id) = explicit_network_id.as_deref() {
         network_id
@@ -345,14 +338,9 @@ pub(crate) async fn request_wallet_via_shell_connector(
         Err(error) => return Some(Err(error)),
     };
 
-    let ok = Reflect::get(&value, &JsValue::from_str("ok"))
-        .ok()
-        .and_then(|ok| ok.as_bool())
-        .unwrap_or(false);
+    let ok = bool_property(&value, "ok").unwrap_or(false);
     if !ok {
-        let error = Reflect::get(&value, &JsValue::from_str("error"))
-            .ok()
-            .and_then(|error| error.as_string())
+        let error = string_property(&value, "error")
             .unwrap_or_else(|| "wallet connection failed".to_string());
         return Some(Err(error));
     }
@@ -555,6 +543,9 @@ impl Weeb3No103 {
 
     #[wasm_bindgen(js_name = renderInterface)]
     pub fn render_interface(&self, container: Element) -> Object {
+        spawn_local(async {
+            let _ = get_service_worker().await;
+        });
         let mount_generation = begin_interface_mount();
         let initial_result_generation = crate::stream::begin_result_view_request();
         crate::stream::release_current_stream_view();
@@ -870,7 +861,6 @@ impl Weeb3No103 {
         let Some(redundancy_level) = validated_upload_redundancy_number(redundancy_level) else {
             return error_object("redundancy level must be an integer between 0 and 4");
         };
-        let redundancy_level = f64::from(redundancy_level.as_u8());
 
         if let Err(error) = self.boot_runtime().await {
             return error_object(error);
@@ -900,7 +890,7 @@ impl Weeb3No103 {
         };
 
         set_js_str(&obj, "reference", &indx);
-        set_js_number(&obj, "redundancyLevel", redundancy_level);
+        set_js_number(&obj, "redundancyLevel", f64::from(redundancy_level.as_u8()));
         if add_to_feed {
             set_js_str(&obj, "feedTopic", &feed_topic);
             set_js_str(&obj, "feedReference", &indx);
@@ -997,10 +987,9 @@ impl Weeb3No103 {
                 return obj;
             }
         };
-        let owner_for_read = feed_owner.clone().unwrap_or_else(|| owner.clone());
         let raw = self
             .inner
-            .acquire_feed_envelope(owner_for_read, topic.clone())
+            .acquire_feed_envelope(feed_owner.clone(), topic.clone())
             .await;
         let (data, indx) = decode_resources(raw);
         let obj = Object::new();
@@ -1008,9 +997,7 @@ impl Weeb3No103 {
         set_js_str(&obj, "owner", &owner);
         set_js_str(&obj, "topic", &topic);
         set_js_str(&obj, "feedTopic", &feed_topic);
-        if let Some(owner) = feed_owner {
-            set_js_str(&obj, "feedOwner", owner);
-        }
+        set_js_str(&obj, "feedOwner", feed_owner);
         set_js_str(&obj, "index", &indx);
 
         if let Some((status, reason)) = feed_status(&data, self.inner.get_connections().await) {
@@ -1044,18 +1031,9 @@ impl Weeb3No103 {
             Ok(payer) => payer,
             Err(error) => return error_object(error),
         };
-        let secure_state =
-            match secure_batch_state_for_wallet(payer.as_bytes(), profile.swarm_network_id).await {
-                Some(state) => state,
-                None => return error_object("could not check weeb-3-secure batch state"),
-            };
-        let w3 = match web3() {
-            Ok(w3) => w3,
-            Err(error) => return error_object(format!("provider init failed: {error:?}")),
-        };
-        let chain_id = match w3.eth().chain_id().await {
-            Ok(chain_id) => chain_id,
-            Err(error) => return error_object(format!("chain id check failed: {error:?}")),
+        let inspected = match inspect_batch(payer, profile, depth, validity_days as u64).await {
+            Ok(inspected) => inspected,
+            Err(error) => return error_object(error),
         };
 
         let obj = ok_object();
@@ -1064,78 +1042,43 @@ impl Weeb3No103 {
         set_js_number(&obj, "swarmNetworkId", profile.swarm_network_id as f64);
         set_js_number(&obj, "walletChainId", profile.wallet_chain_id as f64);
         set_js_str(&obj, "wallet", hex_address(payer));
-        set_js_str(&obj, "chainId", chain_id.to_string());
-        set_js_bool(&obj, "hasBatch", secure_state.has_batch);
-        set_js_bool(&obj, "usableBatch", secure_state.usable());
-        set_js_str(&obj, "batchId", hex::encode(&secure_state.batch_id));
+        set_js_str(&obj, "chainId", inspected.chain_id.to_string());
+        set_js_bool(&obj, "hasBatch", inspected.secure.has_batch);
+        set_js_bool(&obj, "usableBatch", inspected.secure.usable());
+        set_js_str(&obj, "batchId", hex::encode(&inspected.secure.batch_id));
         set_js_number(
             &obj,
             "batchBucketLimit",
-            secure_state.batch_bucket_limit as f64,
+            inspected.secure.batch_bucket_limit as f64,
         );
         set_js_str(
             &obj,
             "batchValidityStatus",
-            &secure_state.batch_validity_status,
+            &inspected.secure.batch_validity_status,
         );
         set_js_number(&obj, "depth", depth as f64);
         set_js_number(&obj, "validityDays", validity_days as f64);
 
-        if chain_id != U256::from(profile.wallet_chain_id) {
+        let Some(funding) = inspected.funding else {
             set_js_str(&obj, "status", "wrong_network");
             return obj;
-        }
+        };
 
-        let postage = match postage_contract(&w3) {
-            Ok(postage) => postage,
-            Err(error) => return error_object(format!("postage contract failed: {error:?}")),
-        };
-        let token = match token_contract(&w3) {
-            Ok(token) => token,
-            Err(error) => return error_object(format!("token contract failed: {error:?}")),
-        };
-        let last_price = match last_price(&postage).await {
-            Ok(last_price) => last_price,
-            Err(error) => return error_object(format!("last price failed: {error:?}")),
-        };
-        let token_balance: U256 = match token
-            .query(
-                "balanceOf",
-                (payer,),
-                None,
-                web3::contract::Options::default(),
-                None,
-            )
-            .await
-        {
-            Ok(balance) => balance,
-            Err(error) => return error_object(format!("token balance failed: {error:?}")),
-        };
-        let base_balance = match w3.eth().balance(payer, None).await {
-            Ok(balance) => balance,
-            Err(error) => return error_object(format!("base balance failed: {error:?}")),
-        };
-        let required = compute_initial_balance_per_chunk(last_price, validity_days as u64)
-            * chunk_count_for_depth(depth);
-
-        if secure_state.usable() {
-            let remaining = get_batch_validity(&secure_state.batch_id).await;
-            let day_price = last_price * U256::from(7200u64);
-            let days = if day_price.is_zero() {
-                U256::from(0)
-            } else {
-                remaining / day_price
-            };
+        if let Some(days) = funding.remaining_days {
             set_js_str(&obj, "batchRemainingDays", days.to_string());
         }
 
         set_js_str(&obj, "bzzSymbol", profile.bzz_symbol);
         set_js_str(&obj, "baseSymbol", profile.base_symbol);
-        set_js(&obj, "lastPrice", u256_string(last_price));
-        set_js(&obj, "requiredBzz", u256_string(required));
-        set_js(&obj, "tokenBalance", u256_string(token_balance));
-        set_js(&obj, "baseBalance", u256_string(base_balance));
-        set_js_bool(&obj, "hasFunds", token_balance >= required);
+        set_js(&obj, "lastPrice", u256_string(funding.last_price));
+        set_js(&obj, "requiredBzz", u256_string(funding.required_bzz));
+        set_js(&obj, "tokenBalance", u256_string(funding.token_balance));
+        set_js(&obj, "baseBalance", u256_string(funding.base_balance));
+        set_js_bool(
+            &obj,
+            "hasFunds",
+            funding.token_balance >= funding.required_bzz,
+        );
         obj
     }
 
@@ -1149,51 +1092,40 @@ impl Weeb3No103 {
             Ok(payer) => payer,
             Err(error) => return error_object(error),
         };
-        if let Some(state) =
-            secure_batch_state_for_wallet(payer.as_bytes(), profile.swarm_network_id).await
-            && state.usable()
-        {
-            let obj = ok_object();
-            set_js_str(&obj, "status", "already_ready");
-            set_js_str(&obj, "batchId", hex::encode(&state.batch_id));
-            set_js_number(&obj, "batchBucketLimit", state.batch_bucket_limit as f64);
-            return obj;
-        }
-
-        let prepared = match secure_prepare_batch_purchase(
+        let (owner, prepared, purchase) = match ensure_batch(
+            payer,
+            profile,
             depth,
             validity_days as u64,
-            profile.swarm_network_id,
+            MissingSecureBatchState::ContinuePurchase,
         )
         .await
         {
-            Some(prepared) if prepared.owner.len() == 20 => prepared,
-            _ => return error_object("failed to prepare secure batch owner"),
+            Ok(BatchPurchaseOutcome::AlreadyReady(state)) => {
+                let obj = ok_object();
+                set_js_str(&obj, "status", "already_ready");
+                set_js_str(&obj, "batchId", hex::encode(&state.batch_id));
+                set_js_number(&obj, "batchBucketLimit", state.batch_bucket_limit as f64);
+                return obj;
+            }
+            Ok(BatchPurchaseOutcome::Purchased {
+                owner,
+                prepared,
+                purchase,
+            }) => (owner, prepared, purchase),
+            Err(BatchPurchaseError::CheckSecure) => {
+                return error_object("could not check weeb-3-secure batch state");
+            }
+            Err(BatchPurchaseError::PrepareSecure) => {
+                return error_object("failed to prepare secure batch owner");
+            }
+            Err(BatchPurchaseError::OnChain(error)) => {
+                return error_object(format!("batch purchase failed: {error:?}"));
+            }
+            Err(BatchPurchaseError::CommitSecure) => {
+                return error_object("failed to save or verify batch in weeb-3-secure");
+            }
         };
-        let owner = Address::from_slice(&prepared.owner);
-        let purchase = match buy_postage_batch_with_payer(
-            prepared.validity_days,
-            prepared.depth,
-            owner,
-            payer,
-        )
-        .await
-        {
-            Ok(purchase) => purchase,
-            Err(error) => return error_object(format!("batch purchase failed: {error:?}")),
-        };
-
-        if !secure_commit_batch_purchase_and_verify(
-            payer.as_bytes(),
-            &purchase.batch_id,
-            purchase.bucket_limit,
-            prepared.depth,
-            profile.swarm_network_id,
-        )
-        .await
-        {
-            return error_object("failed to save or verify batch in weeb-3-secure");
-        }
 
         let obj = ok_object();
         set_js_str(&obj, "wallet", hex_address(payer));
@@ -1230,7 +1162,7 @@ impl Weeb3No103 {
             Ok(payer) => payer,
             Err(error) => return error_object(error),
         };
-        let cheque_signer_key = encrey();
+        let cheque_signer_key = random_encryption_key();
         let cheque_signer = match PrivateKeySigner::from_slice(&cheque_signer_key) {
             Ok(signer) => signer,
             Err(_) => return error_object("failed to create chequebook signer key"),

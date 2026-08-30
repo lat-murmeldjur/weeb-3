@@ -369,12 +369,11 @@ pub(crate) fn parse_bzz_manifest(mut input: Vec<u8>) -> Option<ParsedBzzManifest
     let ref_size = decrypt_manifest_in_place(&mut input)?;
     let reference_start = MANIFEST_FIXED_HEADER_SIZE;
     let reference_end = reference_start.checked_add(ref_size)?;
-    let wrapped_reference = match input[reference_start..reference_end].to_vec() {
-        reference if !reference.is_empty() && reference.iter().any(|byte| *byte != 0) => {
-            Some(reference)
-        }
-        _ => None,
-    };
+    let reference = &input[reference_start..reference_end];
+    let wrapped_reference = reference
+        .iter()
+        .any(|byte| *byte != 0)
+        .then(|| reference.to_vec());
 
     let index_delimiter = reference_end.checked_add(MANIFEST_INDEX_SIZE)?;
     let fork_count = manifest_fork_count(&input[reference_end..index_delimiter], ref_size)?;

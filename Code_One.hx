@@ -3,13 +3,10 @@ package;
 class Code_One {
    
 	static public function smax_init() {
-		var w1:String = './hax/chronicl.dt';
-		var w2:String = './hax/featuring.dt';
-		var w3:String = './hax/ohio.note';
+		var counter:String = './hax/chronicl.dt';
 
 		clientele('rustup', ['update']);
 		clientele('cargo', ['update']);
-		clientele('cargo', ['fix', '--allow-staged', '--allow-dirty']);
 
 		Sys.putEnv("RUSTFLAGS", "--cfg getrandom_backend=\"wasm_js\"");
 		var wasmBuilt = clientele('wasm-pack', [ '-v', 'build', '--target', 'web', '--out-dir', 'static', '--out-name', 'weeb_3']);
@@ -31,16 +28,14 @@ class Code_One {
 			clientele('mkdir', [ '-p', './docs/snippets' ]);
 			clientele('cp', [ '-R', './static/snippets/.', './docs/snippets/' ]);
 
-			var mist = gitcoal(w1);
-			var dome = gitcoal(w2);
-			temporas(w3);
+			var release = gitcoal(counter);
 
-			clientele('git', ['checkout', '-b', 'feature-$dome']);
+			clientele('git', ['checkout', '-b', 'feature-$release']);
 			clientele('git', ['add', '.']);
-			clientele('git', ['commit', '-m', 'Commit number $mist']);
-			clientele('git', ['push', 'origin', 'feature-$dome']);
+			clientele('git', ['commit', '-m', 'Commit number $release']);
+			clientele('git', ['push', 'origin', 'feature-$release']);
 			clientele('git', ['checkout', 'main']);
-			if (clientele('git', ['merge', 'feature-$dome'])) {
+			if (clientele('git', ['merge', 'feature-$release'])) {
 				clientele('git', ['push', 'origin', 'main']);
 			}
 		}
@@ -59,21 +54,6 @@ class Code_One {
 		}
 		return false;
 	}
-
-	static public function temporas(?oh:String) {
-		var fame = DateTools.format(Date.now(), "Year::%Y::|::Month::%m::|::Day::%d::|::Hour::%H::|::Minute::%M::|::Second::%S::");
-		trace('Current::'+fame);
-		if ( oh != null ) { 
-			if (!sys.FileSystem.exists(oh) ) {
-				sys.io.File.saveContent(oh, '');
-			}
-			if ( sys.FileSystem.exists(oh) ) {
-				var output = sys.io.File.append(oh, false);
-				  output.writeString(fame+'\n');
-				  output.close();
-			}
-		}
-	} 
 
 	static public function gitcoal(jxmd:String) {
 		if (!sys.FileSystem.exists(jxmd)) {

@@ -933,7 +933,6 @@ pub(crate) fn decode_resource_bundle(input: &[u8]) -> Option<(Vec<ResourceEntry>
 
 pub(crate) const FILE_UPLOAD_READ_WINDOW_BYTES: u64 = 4 * 1024 * 1024;
 
-#[derive(Clone, Debug)]
 pub(crate) struct FileSlicePlan {
     size: u64,
     next: u64,

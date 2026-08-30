@@ -123,8 +123,7 @@ fn ensure_style() {
     let Some(document) = document() else {
         return;
     };
-    if let Some(style) = document.get_element_by_id(INTERFACE_STYLE_ID) {
-        style.set_text_content(Some(interface_style()));
+    if document.get_element_by_id(INTERFACE_STYLE_ID).is_some() {
         return;
     }
     let Ok(style) = document.create_element("style") else {

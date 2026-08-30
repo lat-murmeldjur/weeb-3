@@ -22,6 +22,7 @@ const ON_CHAIN: &str = include_str!("../src/on_chain.rs");
 const SECURE_VAULT: &str = include_str!("../src/secure_vault.rs");
 const SHARED_RUNTIME: &str = include_str!("../src/shared_runtime.rs");
 const WORKER_RUNTIME: &str = include_str!("../src/worker_runtime.rs");
+const WALLET_WORKFLOWS: &str = include_str!("../src/wallet_workflows.rs");
 const SHARED_WORKER: &str = include_str!("../static/worker.js");
 const STATIC_IGNORE: &str = include_str!("../static/.gitignore");
 const HAXE_BUILD: &str = include_str!("../Code_One.hx");
@@ -58,6 +59,20 @@ fn rust_source_hits(needle: &str) -> Vec<std::path::PathBuf> {
         needle,
     );
     hits
+}
+
+#[test]
+fn batch_purchase_preserves_interface_and_npm_missing_vault_policies() {
+    let interface = compact(INTERFACE);
+    let library = compact(LIBRARY);
+    let workflows = compact(WALLET_WORKFLOWS);
+
+    assert!(interface.contains("MissingSecureBatchState::Error"));
+    assert!(library.contains("MissingSecureBatchState::ContinuePurchase"));
+    assert!(workflows.contains("Some(state)ifstate.usable()"));
+    assert!(workflows.contains(
+        "Noneifmatches!(missing,MissingSecureBatchState::Error)=>{returnErr(BatchPurchaseError::CheckSecure);"
+    ));
 }
 
 fn numeric_constant(source: &str, name: &str) -> u64 {
@@ -114,6 +129,8 @@ fn replacing_or_remounting_releases_the_previous_result() {
     );
     assert!(clear.contains("release_result_object_url()"));
     assert!(clear.contains("resultActions"));
+    assert!(clear.contains("RESULT_CALLBACKS.with"));
+    assert!(clear.contains("borrow_mut().clear()"));
     assert!(clear.matches("set_inner_html(\"\")").count() >= 2);
 
     let replace = section(
@@ -172,6 +189,7 @@ fn one_shared_worker_owns_the_node_and_unified_wasm() {
     assert!(facade.contains("constSHARED_WORKER_URL:&str=\"/weeb-3/worker.js\";"));
     assert!(facade.contains("requested_url.unwrap_or(SHARED_WORKER_URL)"));
     assert!(facade.contains(".set(\"build\",env!(\"WEEB3_BUILD_VERSION\"))"));
+    assert!(facade.contains("weeb3-shared-runtime-v{SHARED_WORKER_PROTOCOL}:{url}"));
     assert!(facade.contains("SharedWorker::new_with_worker_options(&url,&options)"));
     assert!(compact(LIBRARY).contains("shared_worker_url.as_deref()"));
     assert!(
@@ -184,6 +202,10 @@ fn one_shared_worker_owns_the_node_and_unified_wasm() {
 fn unified_wasm_and_worker_are_in_every_distribution() {
     assert_eq!(HAXE_BUILD.matches("clientele('wasm-pack'").count(), 1);
     assert_eq!(NPM_WORKFLOW.matches("wasm-pack build").count(), 1);
+    assert_in_order(
+        NPM_WORKFLOW,
+        &["wasm-pack build", "git restore static/.gitignore"],
+    );
     assert!(!HAXE_BUILD.contains("--features"));
     assert!(!NPM_WORKFLOW.contains("--features"));
     for asset in ["weeb_3.js", "weeb_3_bg.wasm"] {
@@ -226,7 +248,13 @@ fn secure_vault_stays_lazy_and_window_brokered() {
         "pub fn secure_open_vault_from_user_action()",
         "fn active_network_id()",
     );
-    assert!(user_action.contains("preopen_secure_vault_window(&options)"));
+    assert_in_order(
+        user_action,
+        &[
+            "preopen_secure_vault_window(&options)",
+            "SECURE_CLICK_CONNECT_OPTIONS.with",
+        ],
+    );
 
     let handler = section(
         SECURE_VAULT,
@@ -260,6 +288,8 @@ fn secure_vault_stays_lazy_and_window_brokered() {
     }
     assert!(!CORE.contains("WORKER_CONTEXT"));
     assert!(!CORE.contains("window_context()"));
+    assert!(SECURE_VAULT.contains("SECURE_RESUME_CALLBACK"));
+    assert!(!SECURE_VAULT.contains("let callback = callback.into_js_value()"));
     assert_eq!(
         LIBRARY
             .matches("secure_ensure_feed_owner_in_window().await")
@@ -273,7 +303,9 @@ fn secure_vault_stays_lazy_and_window_brokered() {
     ));
     let vault = compact(SECURE_VAULT);
     assert!(vault.contains("worker_vault_call(\"priceOracle\",|_|{})"));
-    assert!(vault.contains("(bytes.len()==32).then(||U256::from_big_endian(&bytes))"));
+    assert!(vault.contains("bytes_array_prop(value,name).filter(|value|value.length()==32)?"));
+    assert!(vault.contains("value.copy_to(&mutbytes)"));
+    assert!(vault.contains("Some(U256::from_big_endian(&bytes))"));
 
     let gate = section(
         SHARED_WORKER,
@@ -286,7 +318,7 @@ fn secure_vault_stays_lazy_and_window_brokered() {
     let queue = section(
         SHARED_WORKER,
         "function dispatchForClient(message",
-        "async function acquirePlaybackLock()",
+        "function acquirePlaybackLock()",
     );
     assert!(queue.contains("const flight = vaultQueue.then(run, run)"));
     assert!(queue.contains("vaultQueue = flight.then"));
@@ -358,6 +390,7 @@ fn network_switches_preserve_dispatched_transfer_accounting() {
     assert_in_order(
         rust_start,
         &[
+            "self.transition.lock().await",
             "if configured_network_id != Some(network_id)",
             "self.inner.has_unsettled_accounting().await",
             "self.inner.set_network_id(",
@@ -424,6 +457,13 @@ fn log_polling_is_combined_bounded_and_per_client() {
     assert!(CORE.contains("const LOG_DRAIN_BATCH: usize = 64;"));
     assert!(CORE.contains("pub(crate) const LOG_DOM_RETAINED: u32 = 256;"));
     assert!(CORE.contains("mpsc::bounded::<String>(LOG_QUEUE_CAPACITY)"));
+    let log_drain = section(
+        CORE,
+        "pub fn get_current_logs(&self)",
+        "pub async fn get_connections(&self)",
+    );
+    assert!(log_drain.contains("Ok(log_message) => logs.push(log_message)"));
+    assert!(!log_drain.contains("REFRESHMENT"));
     let progress = section(
         SHARED_RUNTIME,
         "pub(crate) async fn get_progress_snapshot(",
@@ -452,6 +492,7 @@ fn web_lock_and_client_state_follow_window_lifecycle() {
             "activeHlsLease?.clientId === id",
             "releasePlaybackLock()",
             "await cancelHlsLease(lease)",
+            "if (clients.size === 0) closeServiceWorkerPort(true)",
         ],
     );
     let connect = section(SHARED_WORKER, "self.addEventListener(\"connect\"", "\n});");
@@ -477,7 +518,7 @@ fn web_lock_and_client_state_follow_window_lifecycle() {
 
     let lock = section(
         SHARED_WORKER,
-        "async function acquirePlaybackLock()",
+        "function acquirePlaybackLock()",
         "async function removeClient(client)",
     );
     assert!(lock.contains("self.navigator.locks.request(\"weeb3-active-playback\""));
@@ -522,7 +563,7 @@ fn optional_two_tab_shared_worker_smoke() -> Result<()> {
     } else {
         format!("{raw_url}?protocol={protocol}")
     };
-    let worker_name = format!("weeb3-shared-runtime-v{protocol}");
+    let worker_name = format!("weeb3-shared-runtime-v{protocol}:{worker_url}");
     let timeout = Duration::from_secs(30);
     let browser = browser::launch(timeout, false)?;
     let first = browser

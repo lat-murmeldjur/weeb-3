@@ -40,13 +40,8 @@ pub(crate) fn pending_generation_relation(
     }
 }
 
-pub(crate) fn cancel_generation_is_current(latest: Option<u64>, candidate: u64) -> bool {
-    latest
-        .map(|generation| generation == candidate || generation_is_newer(candidate, generation))
-        .unwrap_or(true)
-}
-
 use async_lock::{Semaphore, SemaphoreGuardArc};
+use async_std::sync::Mutex;
 use event_listener::Event;
 use futures::{
     future::{Either, select},
@@ -56,9 +51,74 @@ use std::{
     future::pending,
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering},
     },
 };
+
+#[derive(Debug, Default)]
+struct RetrieveCancelScope {
+    latest: AtomicU64,
+    changed: Event,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct RetrieveCancelToken {
+    pub(crate) stream_key: Arc<str>,
+    pub(crate) generation: u64,
+    scope: Arc<RetrieveCancelScope>,
+}
+
+impl RetrieveCancelToken {
+    pub(crate) fn is_current(&self) -> bool {
+        self.scope.latest.load(Ordering::Acquire) == self.generation
+    }
+
+    pub(crate) async fn cancelled(&self) {
+        let changed = self.scope.changed.listen();
+        if self.is_current() {
+            changed.await;
+        }
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct RetrieveCancelRegistry {
+    scopes: Mutex<HashMap<Arc<str>, Arc<RetrieveCancelScope>>>,
+}
+
+impl RetrieveCancelRegistry {
+    pub(crate) async fn register(
+        &self,
+        stream_key: String,
+        generation: u64,
+    ) -> Option<RetrieveCancelToken> {
+        if stream_key.is_empty() || generation == 0 {
+            return None;
+        }
+
+        let stream_key: Arc<str> = stream_key.into();
+        let mut scopes = self.scopes.lock().await;
+        let scope = scopes
+            .entry(stream_key.clone())
+            .or_insert_with(Arc::default)
+            .clone();
+        let current = scope.latest.load(Ordering::Acquire);
+        let latest = latest_registered_generation(current, generation);
+        if latest != current {
+            scope.latest.store(latest, Ordering::Release);
+            scope.changed.notify(usize::MAX);
+        }
+        Some(RetrieveCancelToken {
+            stream_key,
+            generation,
+            scope,
+        })
+    }
+}
+
+pub(crate) fn retrieve_cancel_token_current(cancel: &Option<RetrieveCancelToken>) -> bool {
+    cancel.as_ref().is_none_or(RetrieveCancelToken::is_current)
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
@@ -69,27 +129,45 @@ pub(crate) enum RetrieveHedgeDemand {
 
 /// Shared monotone demand for one raw singleflight. An ordinary waiter may
 /// promote a managed leader, but a later managed waiter can never demote it.
+#[derive(Debug)]
+struct SharedRetrieveHedgeDemandInner {
+    demand: AtomicU8,
+    promoted: Event,
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct SharedRetrieveHedgeDemand {
-    demand: Arc<AtomicU8>,
+    inner: Arc<SharedRetrieveHedgeDemandInner>,
 }
 
 impl SharedRetrieveHedgeDemand {
     pub(crate) fn new(demand: RetrieveHedgeDemand) -> Self {
         Self {
-            demand: Arc::new(AtomicU8::new(demand as u8)),
+            inner: Arc::new(SharedRetrieveHedgeDemandInner {
+                demand: AtomicU8::new(demand as u8),
+                promoted: Event::new(),
+            }),
         }
     }
 
     pub(crate) fn current(&self) -> RetrieveHedgeDemand {
-        match self.demand.load(Ordering::SeqCst) {
+        match self.inner.demand.load(Ordering::Acquire) {
             0 => RetrieveHedgeDemand::DistinctShardManaged,
             _ => RetrieveHedgeDemand::Ordinary,
         }
     }
 
     pub(crate) fn promote(&self, demand: RetrieveHedgeDemand) {
-        self.demand.fetch_max(demand as u8, Ordering::SeqCst);
+        if self.inner.demand.fetch_max(demand as u8, Ordering::AcqRel) < demand as u8 {
+            self.inner.promoted.notify(usize::MAX);
+        }
+    }
+
+    pub(crate) async fn wait_until_ordinary(&self) {
+        let promoted = self.inner.promoted.listen();
+        if self.current() != RetrieveHedgeDemand::Ordinary {
+            promoted.await;
+        }
     }
 }
 
@@ -102,25 +180,23 @@ pub(crate) fn retrieve_attempt_start_allowed(
 }
 
 pub(crate) fn rolling_full_group_eligible(
-    erasure_recovery: bool,
     requested_count: usize,
     data_count: usize,
     parity_count: usize,
     decoded_only_count: usize,
     unresolved_count: usize,
 ) -> bool {
-    rolling_full_group_static_candidate(erasure_recovery, requested_count, data_count, parity_count)
+    rolling_full_group_static_candidate(requested_count, data_count, parity_count)
         && unresolved_count > 0
         && decoded_only_count < parity_count
 }
 
 pub(crate) fn rolling_full_group_static_candidate(
-    erasure_recovery: bool,
     requested_count: usize,
     data_count: usize,
     parity_count: usize,
 ) -> bool {
-    erasure_recovery && data_count > 0 && requested_count == data_count && parity_count > 0
+    data_count > 0 && requested_count == data_count && parity_count > 0
 }
 
 /// One admission per coordinator turn makes the terminal check precede every
@@ -152,6 +228,7 @@ pub(crate) fn rolling_next_parity_index(
 #[derive(Debug)]
 struct RetrieveAdmissionInner {
     open: AtomicBool,
+    returned_cac: AtomicBool,
     attempt_limit: Option<usize>,
     attempts_remaining: Option<AtomicUsize>,
     timed_out_attempts: Option<AtomicUsize>,
@@ -178,6 +255,7 @@ impl RetrieveAdmission {
         Self {
             inner: Arc::new(RetrieveAdmissionInner {
                 open: AtomicBool::new(attempts_remaining != Some(0)),
+                returned_cac: AtomicBool::new(false),
                 attempt_limit: attempts_remaining,
                 attempts_remaining: attempts_remaining.map(AtomicUsize::new),
                 timed_out_attempts: attempts_remaining.map(|_| AtomicUsize::new(0)),
@@ -189,6 +267,14 @@ impl RetrieveAdmission {
 
     pub(crate) fn is_open(&self) -> bool {
         self.inner.open.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn record_returned_cac(&self) {
+        self.inner.returned_cac.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn returned_cac(&self) -> bool {
+        self.inner.returned_cac.load(Ordering::Acquire)
     }
 
     pub(crate) fn close(&self) {
@@ -351,7 +437,7 @@ pub(crate) struct SingleflightRegistry<K, W, A> {
 struct SingleflightEntry<W, A> {
     flight_id: u64,
     shared: A,
-    waiters: HashMap<u64, W>,
+    waiters: Vec<(u64, W)>,
 }
 
 impl<K, W, A> Default for SingleflightRegistry<K, W, A> {
@@ -379,7 +465,7 @@ where
         let waiter_id = self.next_waiter_id;
 
         let (flight_id, shared, leader) = if let Some(flight) = self.flights.get_mut(&key) {
-            flight.waiters.insert(waiter_id, waiter);
+            flight.waiters.push((waiter_id, waiter));
             (flight.flight_id, flight.shared.clone(), false)
         } else {
             self.next_flight_id = next_nonzero_generation(self.next_flight_id);
@@ -390,7 +476,7 @@ where
                 SingleflightEntry {
                     flight_id,
                     shared: shared.clone(),
-                    waiters: HashMap::from([(waiter_id, waiter)]),
+                    waiters: vec![(waiter_id, waiter)],
                 },
             );
             (flight_id, shared, true)
@@ -411,7 +497,8 @@ where
         if flight.flight_id != flight_id {
             return None;
         }
-        flight.waiters.remove(&waiter_id)?;
+        let position = flight.waiters.iter().position(|(id, _)| *id == waiter_id)?;
+        flight.waiters.swap_remove(position);
         if !flight.waiters.is_empty() {
             return None;
         }
@@ -427,7 +514,11 @@ where
         let flight = self.flights.remove(key)?;
         Some(SingleflightFlight {
             shared: flight.shared,
-            waiters: flight.waiters.into_values().collect(),
+            waiters: flight
+                .waiters
+                .into_iter()
+                .map(|(_, waiter)| waiter)
+                .collect(),
         })
     }
 }

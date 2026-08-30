@@ -37,6 +37,7 @@ thread_local! {
     static SECURE_CLICK_CONNECT_OPTIONS: RefCell<Option<JsValue>> = const { RefCell::new(None) };
     static SECURE_VAULT_WINDOW: RefCell<Option<web_sys::Window>> = const { RefCell::new(None) };
     static SECURE_RESUME_REQUIRED: Cell<bool> = const { Cell::new(false) };
+    static SECURE_RESUME_CALLBACK: RefCell<Option<Closure<dyn FnMut(JsValue)>>> = const { RefCell::new(None) };
 }
 
 pub struct SecureBatchState {
@@ -65,7 +66,7 @@ pub struct SecureFeedUpdate {
     pub stamp: Vec<u8>,
 }
 
-async fn worker_vault_call(method: &str, populate: impl FnOnce(&JsValue)) -> Option<JsValue> {
+async fn worker_vault_call(method: &str, populate: impl FnOnce(&Object)) -> Option<JsValue> {
     let request = Object::new();
     set_js_string(&request, "method", method);
     set_js_number(
@@ -73,7 +74,7 @@ async fn worker_vault_call(method: &str, populate: impl FnOnce(&JsValue)) -> Opt
         "networkId",
         active_profile().swarm_network_id as f64,
     );
-    populate(request.as_ref());
+    populate(&request);
     let call = Reflect::get(&js_sys::global(), &JsValue::from_str("weeb3VaultCall"))
         .ok()?
         .dyn_into::<Function>()
@@ -297,7 +298,7 @@ pub async fn secure_commit_batch_purchase_and_verify(
 
 pub async fn secure_stamp_chunk(chunk_address: &[u8]) -> (Vec<u8>, bool) {
     let response = worker_vault_call("stampChunk", |request| {
-        set_prop(request, "chunkAddress", bytes_value(chunk_address)).ok();
+        set_js(request, "chunkAddress", bytes_value(chunk_address));
     })
     .await;
     response.map_or((vec![], false), |response| {
@@ -369,9 +370,9 @@ pub async fn secure_create_feed_update_soc_with_stamp(
 ) -> Option<SecureFeedUpdate> {
     let vault_feed_index = exact_js_feed_index(feed_index)?;
     let response = worker_vault_call("createFeedUpdateSocWithStamp", |request| {
-        set_prop(request, "topic", JsValue::from_str(&topic)).ok();
-        set_prop(request, "feedIndex", JsValue::from_f64(vault_feed_index)).ok();
-        set_prop(request, "wrappedContent", bytes_value(&wrapped_content)).ok();
+        set_js_string(request, "topic", &topic);
+        set_js_number(request, "feedIndex", vault_feed_index);
+        set_js(request, "wrappedContent", bytes_value(&wrapped_content));
     })
     .await?;
     Some(SecureFeedUpdate {
@@ -463,11 +464,11 @@ pub fn secure_open_vault_from_user_action() {
     let Ok(options) = connect_options_with_popup_name(&fresh_popup_name()) else {
         return;
     };
-    SECURE_CLICK_CONNECT_OPTIONS.with(|cell| cell.replace(Some(options.clone())));
     if let Err(error) = preopen_secure_vault_window(&options) {
         log_error("secure vault user-action preopen failed", &error);
         return;
     }
+    SECURE_CLICK_CONNECT_OPTIONS.with(|cell| cell.replace(Some(options.clone())));
 
     if let Some(module) = SECURE_MODULE.with(|cell| cell.borrow().clone()) {
         match start_secure_client_connect(&module, options) {
@@ -825,10 +826,12 @@ fn ensure_resume_connection_prompt(context: &str) {
         });
     });
 
-    let callback = callback.into_js_value();
-    button
-        .add_event_listener_with_callback("click", callback.unchecked_ref())
-        .ok();
+    if button
+        .add_event_listener_with_callback("click", callback.as_ref().unchecked_ref())
+        .is_ok()
+    {
+        SECURE_RESUME_CALLBACK.with(|slot| *slot.borrow_mut() = Some(callback));
+    }
 
     if let Some(result) = result_field(&document) {
         result.prepend_with_node_1(&notice).ok();
@@ -1122,8 +1125,10 @@ fn bytes_array_prop(value: &JsValue, name: &str) -> Option<Uint8Array> {
 }
 
 fn exact_u256_prop(value: &JsValue, name: &str) -> Option<U256> {
-    let bytes = bytes_prop(value, name);
-    (bytes.len() == 32).then(|| U256::from_big_endian(&bytes))
+    let value = bytes_array_prop(value, name).filter(|value| value.length() == 32)?;
+    let mut bytes = [0; 32];
+    value.copy_to(&mut bytes);
+    Some(U256::from_big_endian(&bytes))
 }
 
 fn bytes_value(bytes: &[u8]) -> JsValue {

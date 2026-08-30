@@ -1678,6 +1678,8 @@ mod upload_redundancy {
     const SERVICE_WORKER_JS: &str = include_str!("../static/service.js");
     const LIBRARY_RS: &str = include_str!("../src/library.rs");
     const LIB_RS: &str = include_str!("../src/lib.rs");
+    const UPLOAD_RS: &str = include_str!("../src/upload.rs");
+    const MANIFEST_UPLOAD_RS: &str = include_str!("../src/manifest_upload.rs");
 
     #[test]
     fn strict_validation_accepts_only_bee_levels() {
@@ -1763,8 +1765,41 @@ mod upload_redundancy {
             !LIB_RS
                 .contains(r##"#[wasm_bindgen(unchecked_param_type = "UploadRedundancyLevel")]"##)
         );
-        assert!(LIB_RS.contains("validated_upload_redundancy_number(redundancy_level)"));
+        assert!(LIB_RS.contains("redundancy_level: erasure_coding::RedundancyLevel"));
+        assert!(!LIB_RS.contains("validated_upload_redundancy_number(redundancy_level)"));
         assert!(LIBRARY_RS.contains("validated_upload_redundancy_number(redundancy_level)"));
+    }
+
+    #[test]
+    fn serialized_data_uploads_use_the_chunk_queue_without_a_dispatcher() {
+        for source in [LIB_RS, UPLOAD_RS, MANIFEST_UPLOAD_RS] {
+            assert!(!source.contains("DataUploadRequest"));
+            assert!(!source.contains("data_upload_chan"));
+        }
+        assert!(!LIB_RS.contains("push_data_handle"));
+        assert!(LIB_RS.contains("upload_port: AsyncPort<UploadRequest>"));
+
+        let handler = LIB_RS
+            .split("let push_handle = async")
+            .nth(1)
+            .and_then(|source| source.split("let push_chunk_handle = async").next())
+            .expect("serialized top-level upload handler");
+        let upload = handler
+            .find("let push_reference = upload_resource(")
+            .unwrap();
+        let completion = handler[upload..].find(".await;").unwrap() + upload;
+        let next = handler.find("match self.upload_port.1.try_recv()").unwrap();
+        assert!(upload < completion && completion < next);
+
+        let data = UPLOAD_RS
+            .split("async fn upload_data_with_root(")
+            .nth(1)
+            .and_then(|source| source.split("fn canonical_chunk(").next())
+            .expect("direct data upload entry point");
+        assert!(data.contains(
+            "push_data_input_with_root(input, enc, redundancy_level, chunk_upload_chan, progress)"
+        ));
+        assert!(MANIFEST_UPLOAD_RS.contains("chunk_upload_chan: &'a ChunkUploadSender"));
     }
 
     #[test]

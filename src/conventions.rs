@@ -3,11 +3,30 @@
 use libp2p::multiaddr::Protocol;
 use libp2p::{Multiaddr, PeerId, swarm::ConnectionId};
 
-use crate::erasure_coding::CHUNK_SIZE;
 pub use crate::erasure_coding::SPAN_SIZE;
+use crate::erasure_coding::{CHUNK_SIZE, HASH_SIZE};
 use alloy_primitives::{Signature, keccak256, normalize_v};
 
 pub const MAX_PO: u8 = 31;
+const BEE_REPLICA_OWNER: [u8; 20] = [
+    0xdc, 0x5b, 0x20, 0x84, 0x7f, 0x43, 0xd6, 0x79, 0x28, 0xf4, 0x9c, 0xd4, 0xf8, 0x5d, 0x69, 0x6b,
+    0x5a, 0x76, 0x17, 0xb5,
+];
+
+#[inline]
+pub(crate) fn encryption_segment_key(key: &[u8], counter: u32) -> [u8; HASH_SIZE] {
+    let mut seed = [0u8; HASH_SIZE + 4];
+    seed[..HASH_SIZE].copy_from_slice(key);
+    seed[HASH_SIZE..].copy_from_slice(&counter.to_le_bytes());
+    keccak256(keccak256(seed)).into()
+}
+
+pub(crate) fn bee_replica_address(id: &[u8; HASH_SIZE]) -> [u8; HASH_SIZE] {
+    let mut input = [0u8; HASH_SIZE + BEE_REPLICA_OWNER.len()];
+    input[..HASH_SIZE].copy_from_slice(id);
+    input[HASH_SIZE..].copy_from_slice(&BEE_REPLICA_OWNER);
+    keccak256(input).into()
+}
 
 #[derive(Debug, Clone)]
 pub struct PeerFile {
@@ -196,12 +215,10 @@ pub fn valid_soc(chunk_content: &[u8], address: &[u8]) -> bool {
 }
 
 pub fn get_feed_address(owner: &str, topic: &str, index: u64) -> Vec<u8> {
-    let Ok(owner_bytes) = hex::decode(strip_hex_prefix(owner)) else {
+    let mut owner_bytes = [0_u8; 20];
+    if hex::decode_to_slice(strip_hex_prefix(owner), &mut owner_bytes).is_err() {
         return vec![];
-    };
-    let Ok(owner_bytes): Result<[u8; 20], _> = owner_bytes.try_into() else {
-        return vec![];
-    };
+    }
     let Ok(topic_bytes) = hex::decode(strip_hex_prefix(topic)) else {
         return vec![];
     };
@@ -222,10 +239,12 @@ pub fn encode_resources(data_array: Vec<(Vec<u8>, String, String)>, indx: String
 pub(crate) fn normalize_feed_topic(topic: &str) -> String {
     let trimmed = topic.trim();
     let unprefixed = strip_hex_prefix(trimmed);
+    let mut bytes = [0_u8; 32];
 
-    match hex::decode(unprefixed) {
-        Ok(topic_bytes) if topic_bytes.len() == 32 => hex::encode(topic_bytes),
-        _ => hex::encode(keccak256(trimmed)),
+    if hex::decode_to_slice(unprefixed, &mut bytes).is_ok() {
+        hex::encode(bytes)
+    } else {
+        hex::encode(keccak256(trimmed))
     }
 }
 
@@ -253,7 +272,7 @@ pub fn decode_resources(encoded_data: Vec<u8>) -> (Vec<(Vec<u8>, String, String)
 
 pub async fn read_file(file: web_sys::File) -> Vec<u8> {
     let file_size = file.size();
-    let partition_size = 69001216.0_f64;
+    let partition_size = crate::erasure_coding::FILE_UPLOAD_READ_WINDOW_BYTES as f64;
     if file_size > usize::MAX as f64 {
         return vec![];
     }
