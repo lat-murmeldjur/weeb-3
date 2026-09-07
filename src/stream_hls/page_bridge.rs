@@ -1,13 +1,14 @@
 use std::{cell::RefCell, rc::Rc, time::Duration};
 
 use futures::future::join;
-use js_sys::{Object, Reflect};
-use wasm_bindgen::{JsCast, JsValue};
+use js_sys::Object;
+use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{Element, HtmlMediaElement};
 
 use crate::{
     interface::{service_worker_controls_bzz_requests, service_worker_scope_protocol_error},
+    js_error_message,
     shared_runtime::{SharedNodeClient, SharedRuntime, request_object},
     stream::{
         begin_result_view_request, replace_stream_result_view, result_view_request_is_current,
@@ -15,7 +16,8 @@ use crate::{
     stream_conventions::HlsStart,
     stream_hls::{HlsStartupPlan, PreparedHlsFeed, player, protocol::plan_from_js},
     worker_protocol::{
-        bool_property, integer_property, number_property, set_number, set_string, string_property,
+        bool_property, integer_property, number_property, property, set_number, set_string,
+        string_property,
     },
 };
 
@@ -131,9 +133,7 @@ fn parse_prepare_response(response: Object) -> Result<(String, HlsStartupPlan, u
     }
     let source = string_property(&response, "source")
         .ok_or_else(|| "SharedWorker HLS preparation omitted source".to_string())?;
-    let plan = Reflect::get(&response, &JsValue::from_str("plan"))
-        .ok()
-        .and_then(|value| plan_from_js(&value))
+    let plan = plan_from_js(&property(&response, "plan"))
         .ok_or_else(|| "SharedWorker returned an invalid HLS plan".to_string())?;
     let session = integer_property(&response, "session")
         .ok_or_else(|| "SharedWorker HLS preparation omitted session".to_string())?;
@@ -161,9 +161,7 @@ pub(super) async fn lock_live_plan() -> Option<HlsStartupPlan> {
     if bool_property(&response, "ok") != Some(true) {
         return None;
     }
-    let plan = Reflect::get(&response, &JsValue::from_str("plan"))
-        .ok()
-        .and_then(|value| plan_from_js(&value))?;
+    let plan = plan_from_js(&property(&response, "plan"))?;
     ACTIVE_HLS.with(|active| {
         active.borrow().as_ref().filter(|active| active.id == id)?;
         Some(plan)
@@ -345,12 +343,4 @@ pub(crate) fn release_hls_view() {
 pub(crate) fn release_hls_for_bzz_view(client: &SharedNodeClient) {
     release_hls_view();
     client.clear_hls_cache();
-}
-
-fn js_error_message(error: &JsValue) -> String {
-    Reflect::get(error, &JsValue::from_str("message"))
-        .ok()
-        .and_then(|message| message.as_string())
-        .or_else(|| error.as_string())
-        .unwrap_or_else(|| "unknown browser error".to_string())
 }

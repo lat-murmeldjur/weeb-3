@@ -1,11 +1,30 @@
 #![cfg(target_arch = "wasm32")]
 
+use crate::upload::{Resource, ResourceData};
+use std::io::Read;
+
 use libp2p::multiaddr::Protocol;
 use libp2p::{Multiaddr, PeerId, swarm::ConnectionId};
 
 pub use crate::erasure_coding::SPAN_SIZE;
 use crate::erasure_coding::{CHUNK_SIZE, HASH_SIZE};
-use alloy_primitives::{Signature, keccak256, normalize_v};
+use k256::ecdsa::{RecoveryId, Signature, VerifyingKey};
+use web3::types::Address;
+
+#[inline]
+pub(crate) fn keccak256(input: impl AsRef<[u8]>) -> [u8; 32] {
+    web3::signing::keccak256(input.as_ref())
+}
+
+pub(crate) fn eip191_hash_message(message: &[u8]) -> [u8; 32] {
+    web3::signing::hash_message(message).0
+}
+
+pub(crate) fn public_key_address(key: &k256::ecdsa::VerifyingKey) -> Address {
+    let public_key = key.to_encoded_point(false);
+    let hash = keccak256(&public_key.as_bytes()[1..]);
+    Address::from_slice(&hash[12..])
+}
 
 pub const MAX_PO: u8 = 31;
 const BEE_REPLICA_OWNER: [u8; 20] = [
@@ -18,14 +37,14 @@ pub(crate) fn encryption_segment_key(key: &[u8], counter: u32) -> [u8; HASH_SIZE
     let mut seed = [0u8; HASH_SIZE + 4];
     seed[..HASH_SIZE].copy_from_slice(key);
     seed[HASH_SIZE..].copy_from_slice(&counter.to_le_bytes());
-    keccak256(keccak256(seed)).into()
+    keccak256(keccak256(seed))
 }
 
 pub(crate) fn bee_replica_address(id: &[u8; HASH_SIZE]) -> [u8; HASH_SIZE] {
     let mut input = [0u8; HASH_SIZE + BEE_REPLICA_OWNER.len()];
     input[..HASH_SIZE].copy_from_slice(id);
     input[HASH_SIZE..].copy_from_slice(&BEE_REPLICA_OWNER);
-    keccak256(input).into()
+    keccak256(input)
 }
 
 #[derive(Debug, Clone)]
@@ -77,20 +96,14 @@ const BMT_LEVEL_COUNT: usize = 7;
 
 type BmtHash = [u8; SECTION_SIZE];
 
-#[inline]
-fn hash_pair(left: &BmtHash, right: &BmtHash, input: &mut [u8; SECTION2_SIZE]) -> BmtHash {
-    input[..SECTION_SIZE].copy_from_slice(left);
-    input[SECTION_SIZE..].copy_from_slice(right);
-    keccak256(input.as_slice()).into()
-}
-
 fn zero_bmt_nodes() -> [BmtHash; BMT_LEVEL_COUNT] {
     let mut nodes = [[0u8; SECTION_SIZE]; BMT_LEVEL_COUNT];
     let mut pair = [0u8; SECTION2_SIZE];
-    nodes[0] = keccak256(pair).into();
+    nodes[0] = keccak256(pair);
     for level in 1..BMT_LEVEL_COUNT {
-        let previous = nodes[level - 1];
-        nodes[level] = hash_pair(&previous, &previous, &mut pair);
+        pair[..SECTION_SIZE].copy_from_slice(&nodes[level - 1]);
+        pair[SECTION_SIZE..].copy_from_slice(&nodes[level - 1]);
+        nodes[level] = keccak256(pair);
     }
     nodes
 }
@@ -111,58 +124,37 @@ fn bmt_root(content: &[u8]) -> Option<BmtHash> {
     if effective_len == 0 {
         return Some(ZERO_BMT_NODES.with(|nodes| nodes[BMT_LEVEL_COUNT - 1]));
     }
-    let occupied_leaves = effective_len.div_ceil(SECTION2_SIZE);
     let mut nodes = [[0u8; SECTION_SIZE]; BMT_LEAF_COUNT];
     let mut block = [0u8; SECTION2_SIZE];
-    let mut pair = [0u8; SECTION2_SIZE];
 
     let full_blocks = effective_len / SECTION2_SIZE;
     for (index, section) in content[..full_blocks * SECTION2_SIZE]
         .chunks_exact(SECTION2_SIZE)
         .enumerate()
     {
-        nodes[index] = keccak256(section).into();
+        nodes[index] = keccak256(section);
     }
     if effective_len % SECTION2_SIZE != 0 {
         let start = full_blocks * SECTION2_SIZE;
         block[..effective_len - start].copy_from_slice(&content[start..effective_len]);
-        nodes[full_blocks] = keccak256(block).into();
+        nodes[full_blocks] = keccak256(block);
     }
 
-    let mut reduce = |nodes: &mut [BmtHash; BMT_LEAF_COUNT], zero_nodes: Option<&[BmtHash]>| {
-        if let Some(zero_nodes) = zero_nodes
-            && occupied_leaves % 2 != 0
-        {
-            nodes[occupied_leaves] = zero_nodes[0];
-        }
-
-        let mut width = BMT_LEAF_COUNT;
-        let mut occupied = occupied_leaves;
-        let mut level = 0usize;
-        while width > 1 {
-            let next_width = width / 2;
-            let next_occupied = occupied.div_ceil(2);
-
-            for index in 0..next_occupied {
-                nodes[index] = hash_pair(&nodes[index * 2], &nodes[index * 2 + 1], &mut pair);
+    Some(ZERO_BMT_NODES.with(|zero_nodes| {
+        let mut occupied = effective_len.div_ceil(SECTION2_SIZE);
+        for zero in &zero_nodes[..BMT_LEVEL_COUNT - 1] {
+            if occupied % 2 != 0 {
+                nodes[occupied] = *zero;
             }
-
-            level += 1;
-            if next_occupied < next_width && next_occupied % 2 != 0 {
-                nodes[next_occupied] = zero_nodes.expect("sparse BMT has zero nodes")[level];
+            occupied = occupied.div_ceil(2);
+            for index in 0..occupied {
+                let start = index * SECTION2_SIZE;
+                nodes[index] =
+                    keccak256(&nodes.as_flattened()[start..start + SECTION2_SIZE]);
             }
-
-            width = next_width;
-            occupied = next_occupied;
         }
         nodes[0]
-    };
-
-    if occupied_leaves == BMT_LEAF_COUNT {
-        Some(reduce(&mut nodes, None))
-    } else {
-        Some(ZERO_BMT_NODES.with(|zero_nodes| reduce(&mut nodes, Some(zero_nodes))))
-    }
+    }))
 }
 
 fn content_address_array(chunk_content: &[u8]) -> Option<BmtHash> {
@@ -175,7 +167,7 @@ fn content_address_array(chunk_content: &[u8]) -> Option<BmtHash> {
     let mut hash_input = [0u8; SPAN_SIZE + SECTION_SIZE];
     hash_input[..SPAN_SIZE].copy_from_slice(span);
     hash_input[SPAN_SIZE..].copy_from_slice(&root);
-    Some(keccak256(hash_input).into())
+    Some(keccak256(hash_input))
 }
 
 pub fn content_address(chunk_content: &[u8]) -> Vec<u8> {
@@ -201,16 +193,12 @@ pub fn valid_soc(chunk_content: &[u8], address: &[u8]) -> bool {
     sign_input[..32].copy_from_slice(soc_address);
     sign_input[32..].copy_from_slice(&wrapped_address);
     let to_sign = keccak256(sign_input);
-    let Some(parity) = normalize_v(soc_signature[64] as u64) else {
-        return false;
-    };
-    let sig = Signature::from_bytes_and_parity(&soc_signature[0..64], parity);
-    let Ok(owner) = sig.recover_address_from_msg(to_sign) else {
+    let Some(owner) = recover_address(soc_signature, to_sign.as_slice()) else {
         return false;
     };
     let mut address_input = [0_u8; 52];
     address_input[..32].copy_from_slice(soc_address);
-    address_input[32..].copy_from_slice(owner.as_slice());
+    address_input[32..].copy_from_slice(owner.as_bytes());
     address == keccak256(address_input).as_slice()
 }
 
@@ -227,7 +215,7 @@ pub fn get_feed_address(owner: &str, topic: &str, index: u64) -> Vec<u8> {
     }
 
     crate::feed::sequence_feed_address(&topic_bytes, &owner_bytes, index, |input| {
-        keccak256(input).into()
+        keccak256(input)
     })
     .to_vec()
 }
@@ -268,6 +256,37 @@ pub(crate) fn upload_result(message: &str, index: &str) -> Vec<u8> {
 
 pub fn decode_resources(encoded_data: Vec<u8>) -> (Vec<(Vec<u8>, String, String)>, String) {
     crate::erasure_coding::decode_resource_bundle(&encoded_data).unwrap_or_default()
+}
+
+pub(crate) fn tar_resources(content: &[u8]) -> std::io::Result<Vec<Resource>> {
+    let mut archive = tar::Archive::new(content);
+    Ok(archive
+        .entries()?
+        .filter_map(|entry| {
+            let mut entry = entry.ok()?;
+            if !entry.header().entry_type().is_file() {
+                return None;
+            }
+            let path = entry.path().ok()?.into_owned();
+            let filename = path.file_name()?.to_str()?.to_string();
+            let path = path.into_os_string().into_string().ok()?;
+            let path = path.strip_prefix("./").unwrap_or(&path).to_string();
+            let mime = mime_guess::from_path(&path).first_raw()?;
+            let mime = if mime.starts_with("text/") {
+                format!("{mime}; charset=utf-8")
+            } else {
+                mime.to_string()
+            };
+            let mut data = Vec::new();
+            entry.read_to_end(&mut data).ok()?;
+            Some(Resource {
+                path,
+                filename,
+                mime,
+                data: ResourceData::Parts(vec![data]),
+            })
+        })
+        .collect())
 }
 
 pub async fn read_file(file: web_sys::File) -> Vec<u8> {
@@ -328,15 +347,25 @@ pub fn generate_sign_data(
     out
 }
 
-fn recover_address(signature: &[u8], message: &[u8]) -> Option<alloy_primitives::Address> {
-    if signature.len() != 65 {
-        return None;
+fn recover_address(signature: &[u8], message: &[u8]) -> Option<Address> {
+    let signature: &[u8; 65] = signature.try_into().ok()?;
+    let mut parity = match signature[64] {
+        0 | 1 => signature[64] == 1,
+        27 | 28 | 35.. => signature[64] % 2 == 0,
+        _ => return None,
+    };
+    let mut sig = Signature::from_slice(&signature[..64]).ok()?;
+    if let Some(normalized) = sig.normalize_s() {
+        sig = normalized;
+        parity = !parity;
     }
-
-    let parity = normalize_v(signature[64] as u64)?;
-
-    let sig = Signature::from_bytes_and_parity(&signature[0..64], parity);
-    sig.recover_address_from_msg(message).ok()
+    VerifyingKey::recover_from_prehash(
+        &eip191_hash_message(message),
+        &sig,
+        RecoveryId::new(parity, false),
+    )
+    .ok()
+    .map(|key| public_key_address(&key))
 }
 
 pub fn parse_address(
@@ -356,7 +385,48 @@ pub fn parse_address(
         timestamp,
         chequebook_address,
     );
-    recover_address(signature, &sign_data)
-        .map(|address| web3::types::Address::from_slice(address.as_slice()))
-        .unwrap_or_default()
+    recover_address(signature, &sign_data).unwrap_or_default()
+}
+
+#[cfg(test)]
+mod hash_tests {
+    use super::*;
+    use wasm_bindgen_test::wasm_bindgen_test;
+
+    #[wasm_bindgen_test]
+    fn sparse_bmt_matches_the_full_tree_at_every_section_boundary() {
+        let data: Vec<u8> = (0..CHUNK_SIZE).map(|index| (index % 251) as u8).collect();
+        for boundary in (0..=CHUNK_SIZE).step_by(SECTION2_SIZE) {
+            for length in [
+                boundary.saturating_sub(1),
+                boundary,
+                (boundary + 1).min(CHUNK_SIZE),
+            ] {
+                let mut padded = vec![0; CHUNK_SIZE];
+                padded[..length].copy_from_slice(&data[..length]);
+                let mut level = padded;
+                while level.len() > SECTION_SIZE {
+                    level = level
+                        .chunks_exact(SECTION2_SIZE)
+                        .flat_map(web3::signing::keccak256)
+                        .collect();
+                }
+                assert_eq!(bmt_root(&data[..length]).unwrap().as_slice(), level);
+                let mut zero_tail = data[..length].to_vec();
+                zero_tail.resize(CHUNK_SIZE, 0);
+                assert_eq!(bmt_root(&zero_tail).unwrap().as_slice(), level);
+            }
+        }
+        assert_eq!(bmt_root(&[]), bmt_root(&[0; CHUNK_SIZE]));
+        assert!(bmt_root(&[0; CHUNK_SIZE + 1]).is_none());
+        assert!(!valid_cac(&[0; SPAN_SIZE - 1], &[0; HASH_SIZE]));
+    }
+
+    #[wasm_bindgen_test]
+    fn existing_keccak_backends_agree_at_rate_boundaries() {
+        for length in [0, 32, 40, 64, 135, 136, 137, CHUNK_SIZE] {
+            let input: Vec<u8> = (0..length).map(|index| index as u8).collect();
+            assert_eq!(alloy_primitives::keccak256(&input).0, keccak256(&input));
+        }
+    }
 }

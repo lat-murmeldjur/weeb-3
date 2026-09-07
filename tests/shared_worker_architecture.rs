@@ -24,7 +24,6 @@ const SHARED_RUNTIME: &str = include_str!("../src/shared_runtime.rs");
 const WORKER_RUNTIME: &str = include_str!("../src/worker_runtime.rs");
 const WALLET_WORKFLOWS: &str = include_str!("../src/wallet_workflows.rs");
 const SHARED_WORKER: &str = include_str!("../static/worker.js");
-const STATIC_IGNORE: &str = include_str!("../static/.gitignore");
 const HAXE_BUILD: &str = include_str!("../Code_One.hx");
 const NPM_WORKFLOW: &str = include_str!("../.github/workflows/plain.yml");
 const TRANSFER_NODE_OPERATIONS: [&str; 8] = [
@@ -208,7 +207,7 @@ fn unified_wasm_and_worker_are_in_every_distribution() {
     );
     assert!(!HAXE_BUILD.contains("--features"));
     assert!(!NPM_WORKFLOW.contains("--features"));
-    for asset in ["weeb_3.js", "weeb_3_bg.wasm"] {
+    for asset in ["weeb_3.js", "weeb_3_bg.wasm", "worker.js"] {
         assert!(BUILD.contains(&format!("static/{asset}")));
         assert!(SERVER.contains(&format!("#[include = \"{asset}\"]")));
         assert!(SERVER.contains(&format!("/weeb-3/{asset}")));
@@ -218,16 +217,8 @@ fn unified_wasm_and_worker_are_in_every_distribution() {
     assert!(NPM_WORKFLOW.contains("npm publish ./package/*.tgz"));
 
     assert!(!SHARED_WORKER.trim().is_empty());
-    assert!(
-        STATIC_IGNORE
-            .lines()
-            .any(|line| line.trim() == "!worker.js")
-    );
     assert!(CARGO.contains("'SharedWorker'"));
     assert!(CARGO.contains("'WorkerOptions'"));
-    assert!(BUILD.matches("static/worker.js").count() >= 2);
-    assert!(SERVER.contains("#[include = \"worker.js\"]"));
-    assert!(SERVER.contains("/weeb-3/worker.js"));
     assert!(HAXE_BUILD.contains("'worker.js'"));
     assert!(NPM_WORKFLOW.contains("files[6]=\"worker.js\""));
     assert!(NPM_WORKFLOW.contains("'exports[./worker.js].default=./worker.js'"));
@@ -376,9 +367,9 @@ fn network_switches_preserve_dispatched_transfer_accounting() {
     );
 
     let accounting = section(
-        CORE,
+        include_str!("../src/network_conventions.rs"),
         "pub(crate) async fn has_unsettled_accounting(",
-        "pub async fn set_network_id(",
+        "pub(crate) async fn connection_counts(",
     );
     assert!(accounting.contains("accounting_peer.lock().await.reserve != 0"));
     assert!(accounting.contains("ongoing_cheques.lock().await.is_empty()"));

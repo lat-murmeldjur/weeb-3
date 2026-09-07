@@ -1,8 +1,8 @@
 use crate::{
     ChunkRetrieveSender, Date, Duration, HashSet, Mutex, OutboundProtocolSession, OverlayPeerMap,
     PROTOCOL_ROUND_TIME, PUSH_CHUNK_CONFIRMATION_PEERS, PeerAccounting, PeerAccountingMap, PeerId,
-    PhysicalConnectionMap, PrivateKeySigner, RefreshmentInstruction, StreamControl, apply_credit,
-    bee_replica_address, cancel_reserve, content_address, encryption_segment_key,
+    PhysicalConnectionMap, PrivateKeySigner, RefreshmentInstruction, StreamControl, TransferPause,
+    apply_credit, bee_replica_address, cancel_reserve, content_address, encryption_segment_key,
     erasure_coding::{
         CHUNK_SIZE, CHUNK_WITH_SPAN_SIZE, FileSlicePlan, HASH_SIZE, ParityEncoder, RedundancyLevel,
         encode_level, encoded_reference_payload_len, reference_layout, replicas,
@@ -14,19 +14,19 @@ use crate::{
     secure_vault::{
         secure_create_feed_update_soc_with_stamp, secure_ensure_feed_owner, secure_stamp_chunk,
     },
-    seek_next_feed_update_index, transfer_pause_enabled,
+    seek_next_feed_update_index, transfer_pause_enabled, wait_transfer_unpaused,
 };
 
 use async_std::sync::Arc;
 
-use alloy_primitives::keccak256;
+use crate::conventions::keccak256;
 
 use serde_json::json;
 
 use libp2p::futures::{StreamExt, future::join_all, stream::FuturesUnordered};
 use rand::RngCore;
 
-use std::{future::Future, pin::Pin, sync::atomic::AtomicBool};
+use std::{future::Future, pin::Pin};
 
 const BATCH_BUCKET_TRIALS: usize = 1024;
 const STAMP_CHUNK_WINDOW: usize = 64;
@@ -1105,7 +1105,7 @@ pub async fn push_chunk(
     accounting: &PeerAccountingMap,
     physical_connections: &PhysicalConnectionMap,
     refresh_chan: &mpsc::Sender<RefreshmentInstruction>,
-    transfer_paused: Option<Arc<AtomicBool>>,
+    transfer_paused: Option<Arc<TransferPause>>,
 ) -> Vec<u8> {
     if (!soc && data.len() > CHUNK_WITH_SPAN_SIZE) || data.len() > SOC_CHUNK_SIZE {
         return vec![];
@@ -1142,8 +1142,8 @@ pub async fn push_chunk(
             break;
         }
 
-        while paused() {
-            async_std::task::sleep(Duration::from_millis(100)).await;
+        if let Some(paused) = &transfer_paused {
+            wait_transfer_unpaused(paused).await;
             drain_push_attempt_results(
                 &attempt_in,
                 &mut in_flight,
@@ -1203,7 +1203,7 @@ pub async fn push_chunk(
                     .iter()
                     .filter(|(_, id)| !skiplist.contains(id))
                     .max_by_key(|(overlay, _)| get_proximity(&caddr, overlay))
-                    .map(|(overlay, id)| (*id, price(overlay, &caddr)))
+                    .map(|(overlay, id)| (*id, price(get_proximity(overlay, &caddr))))
             };
 
             let Some((closest_peer_id, req_price)) = closest_peer else {
@@ -1366,7 +1366,7 @@ pub fn make_soc(
 
     let mut address_input = [0; HASH_SIZE + 20];
     address_input[..HASH_SIZE].copy_from_slice(id_bytes);
-    address_input[HASH_SIZE..].copy_from_slice(soc_signer.address().as_slice());
+    address_input[HASH_SIZE..].copy_from_slice(soc_signer.address().as_bytes());
     let soc_address = keccak256(address_input).to_vec();
 
     let wrapped_address = content_address(chunk_content);
@@ -1375,15 +1375,7 @@ pub fn make_soc(
     digest_input[HASH_SIZE..].copy_from_slice(&wrapped_address);
     let digest = keccak256(digest_input);
 
-    let signature = soc_signer
-        .sign_message(digest.as_slice())
-        .unwrap()
-        .as_bytes()
-        .to_vec();
-
-    if signature.len() != 65 {
-        return (vec![], vec![]);
-    }
+    let signature = soc_signer.sign_message(digest.as_slice()).unwrap();
 
     let mut soc_content =
         Vec::with_capacity(id_bytes.len() + signature.len() + chunk_content.len());

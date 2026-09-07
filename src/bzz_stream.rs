@@ -400,9 +400,10 @@ async fn collect_manifest_fork_targets(
         return result;
     }
 
+    let bequeath = child_path(&path_prefix, &fork.prefix);
     let has_edge = fork.fork_type & NODE_TYPE_EDGE == NODE_TYPE_EDGE;
     if fork.fork_type & NODE_TYPE_WITH_METADATA == NODE_TYPE_WITH_METADATA {
-        let Some(metadata) = fork.metadata else {
+        let Some(metadata) = fork.metadata.as_ref() else {
             return result;
         };
 
@@ -444,60 +445,22 @@ async fn collect_manifest_fork_targets(
             result.explicit_index = Some(explicit_index.to_string());
         }
 
-        let bequeath = child_path(&path_prefix, &fork.prefix);
-        let Some(mime) = metadata
+        if let Some(mime) = metadata
             .get("Content-Type")
             .and_then(serde_json::Value::as_str)
             .map(|mime| mime.to_string())
-        else {
-            let (mut child_targets, child_index) = Box::pin(collect_reference_targets(
-                bequeath,
-                fork.reference,
-                &chunk_retrieve_chan,
-                guard,
-            ))
-            .await;
-            result.targets.append(&mut child_targets);
-            if result.fallback_index.is_none() {
-                result.fallback_index = Some(child_index);
-            }
-            return result;
-        };
-
-        let mut data_reference = fork.reference.clone();
-        if let Some(root_manifest) =
-            get_manifest_if_manifest(&fork.reference, &chunk_retrieve_chan).await
-            && let Some(wrapped_reference) = manifest_wrapped_reference(root_manifest)
         {
-            data_reference = wrapped_reference;
-        }
-
-        if guard.reserve_target() {
-            result.targets.push(BzzTarget {
-                data_reference,
-                mime,
-                path: display_bzz_path(&bequeath),
-                raw_fallback: false,
-            });
-        }
-
-        if has_edge {
-            let (mut child_targets, child_index) = Box::pin(collect_reference_targets(
-                bequeath,
-                fork.reference,
-                &chunk_retrieve_chan,
-                guard,
-            ))
-            .await;
-            result.targets.append(&mut child_targets);
-            if result.fallback_index.is_none() {
-                result.fallback_index = Some(child_index);
+            if let Some(target) =
+                metadata_fork_target(&fork, &bequeath, mime, &chunk_retrieve_chan, &guard).await
+            {
+                result.targets.push(target);
+            }
+            if !has_edge {
+                return result;
             }
         }
-        return result;
     }
 
-    let bequeath = child_path(&path_prefix, &fork.prefix);
     let (mut child_targets, child_index) = Box::pin(collect_reference_targets(
         bequeath,
         fork.reference,
@@ -506,7 +469,9 @@ async fn collect_manifest_fork_targets(
     ))
     .await;
     result.targets.append(&mut child_targets);
-    result.fallback_index = Some(child_index);
+    if result.fallback_index.is_none() {
+        result.fallback_index = Some(child_index);
+    }
     result
 }
 
@@ -674,10 +639,10 @@ async fn lazy_manifest_target(
     requested_paths.dedup();
 
     for desired_path in requested_paths {
-        if let Some(target) = Box::pin(lazy_manifest_target_for_path(
+        if let Some(target) = Box::pin(lazy_manifest_fork_target(
             &path_prefix,
             &parsed.forks,
-            &desired_path,
+            Some(&desired_path),
             chunk_retrieve_chan,
             guard.clone(),
         ))
@@ -688,9 +653,10 @@ async fn lazy_manifest_target(
     }
 
     if requested_path.is_empty() {
-        return Box::pin(lazy_first_manifest_target(
+        return Box::pin(lazy_manifest_fork_target(
             &path_prefix,
             &parsed.forks,
+            None,
             chunk_retrieve_chan,
             guard,
         ))
@@ -700,10 +666,10 @@ async fn lazy_manifest_target(
     None
 }
 
-async fn lazy_manifest_target_for_path(
+async fn lazy_manifest_fork_target(
     path_prefix: &[u8],
     forks: &[BzzManifestFork],
-    requested_path: &[u8],
+    requested_path: Option<&[u8]>,
     chunk_retrieve_chan: &ChunkRetrieveSender,
     guard: ResolutionGuard,
 ) -> Option<BzzTarget> {
@@ -712,9 +678,7 @@ async fn lazy_manifest_target_for_path(
             return None;
         }
         let bequeath = child_path(path_prefix, &fork.prefix);
-        let has_edge = fork.fork_type & NODE_TYPE_EDGE == NODE_TYPE_EDGE;
-
-        if !bzz_path_starts_with(requested_path, &bequeath) {
+        if requested_path.is_some_and(|path| !bzz_path_starts_with(path, &bequeath)) {
             continue;
         }
 
@@ -734,12 +698,7 @@ async fn lazy_manifest_target_for_path(
                 .and_then(serde_json::Value::as_str)
                 .map(|mime| mime.to_string())
             {
-                let exact_path = bzz_path_bytes_match(&bequeath, requested_path);
-                if !exact_path && !has_edge {
-                    continue;
-                }
-
-                if exact_path {
+                if requested_path.is_none_or(|path| bzz_path_bytes_match(&bequeath, path)) {
                     return metadata_fork_target(
                         fork,
                         &bequeath,
@@ -749,62 +708,16 @@ async fn lazy_manifest_target_for_path(
                     )
                     .await;
                 }
+                if fork.fork_type & NODE_TYPE_EDGE != NODE_TYPE_EDGE {
+                    continue;
+                }
             }
         }
 
         if let Some(target) = Box::pin(lazy_reference_target(
             bequeath,
             fork.reference.clone(),
-            requested_path,
-            chunk_retrieve_chan,
-            guard.clone(),
-        ))
-        .await
-        {
-            return Some(target);
-        }
-    }
-
-    None
-}
-
-async fn lazy_first_manifest_target(
-    path_prefix: &[u8],
-    forks: &[BzzManifestFork],
-    chunk_retrieve_chan: &ChunkRetrieveSender,
-    guard: ResolutionGuard,
-) -> Option<BzzTarget> {
-    for fork in forks {
-        if !guard.reserve_fork() {
-            return None;
-        }
-        let bequeath = child_path(path_prefix, &fork.prefix);
-
-        if fork.fork_type & NODE_TYPE_WITH_METADATA == NODE_TYPE_WITH_METADATA {
-            let Some(metadata) = fork.metadata.as_ref() else {
-                continue;
-            };
-
-            if metadata.get("swarm-feed-owner").is_some()
-                || metadata.get("swarm-feed-topic").is_some()
-            {
-                continue;
-            }
-
-            if let Some(mime) = metadata
-                .get("Content-Type")
-                .and_then(serde_json::Value::as_str)
-                .map(|mime| mime.to_string())
-            {
-                return metadata_fork_target(fork, &bequeath, mime, chunk_retrieve_chan, &guard)
-                    .await;
-            }
-        }
-
-        if let Some(target) = Box::pin(lazy_reference_target(
-            bequeath,
-            fork.reference.clone(),
-            b"",
+            requested_path.unwrap_or_default(),
             chunk_retrieve_chan,
             guard.clone(),
         ))

@@ -80,15 +80,12 @@ pub(crate) fn browser_dial_address(address: Multiaddr) -> Result<Multiaddr, Mult
             Some(Protocol::Ws(_)),
             Some(Protocol::P2p(peer_id)),
             None,
-        ) => Ok([
-            Protocol::Dns4(hostname),
-            Protocol::Tcp(tcp_port),
-            Protocol::Tls,
-            Protocol::Ws("/".into()),
-            Protocol::P2p(peer_id),
-        ]
-        .into_iter()
-        .collect()),
+        ) => Ok(Multiaddr::empty()
+            .with(Protocol::Dns4(hostname))
+            .with(Protocol::Tcp(tcp_port))
+            .with(Protocol::Tls)
+            .with(Protocol::Ws("/".into()))
+            .with(Protocol::P2p(peer_id))),
         (
             Some(Protocol::Dns4(_)),
             Some(Protocol::Tcp(_)),

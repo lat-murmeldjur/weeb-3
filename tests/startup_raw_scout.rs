@@ -29,24 +29,16 @@ fn edge_anchors() -> Vec<u64> {
 }
 
 fn refinement_indices(lower: u64, upper: u64, width: usize) -> Vec<u64> {
-    let interior = upper - lower - 1;
-    let count = interior.min((width - 1) as u64) as usize;
-    let mut indices = if count as u64 == interior {
-        (lower + 1..upper).collect::<Vec<_>>()
-    } else {
-        let first = lower + 1;
-        let remaining = count - 1;
-        let divisor = (remaining + 1) as u128;
-        let span = u128::from(upper - first);
-        std::iter::once(first)
-            .chain(
-                (1..=remaining)
-                    .map(|position| first + (span * position as u128).div_ceil(divisor) as u64),
-            )
-            .collect()
-    };
-    indices.push(upper);
-    indices
+    let first = lower + 1;
+    let divisor = (width - 1) as u128;
+    let span = u128::from(upper - first);
+    std::iter::once(first)
+        .chain(
+            (1..width - 1)
+                .map(|position| first + (span * position as u128).div_ceil(divisor) as u64),
+        )
+        .chain(std::iter::once(upper))
+        .collect()
 }
 
 fn contiguous_edge_waves(head: u64) -> (usize, usize) {
@@ -63,7 +55,7 @@ fn contiguous_edge_waves(head: u64) -> (usize, usize) {
         .filter(|index| **index > head)
         .min()
         .expect("edge missing anchor");
-    while lower + 1 != upper {
+    while upper - lower > 20 {
         let indices = refinement_indices(lower, upper, 16);
         assert!(indices.windows(2).all(|pair| pair[0] < pair[1]));
         assert!(indices.len() <= 16);
@@ -81,6 +73,15 @@ fn contiguous_edge_waves(head: u64) -> (usize, usize) {
             .filter(|index| *index > head)
             .min()
             .expect("every refinement rechecks a missing upper bound");
+    }
+    // Coarse geometry only selects the starting positive. The existing dense
+    // confirmation advances through positives, then requires all twenty guards.
+    loop {
+        let guards = (1..=20).map(|offset| lower + offset).collect::<Vec<_>>();
+        let Some(latest) = guards.into_iter().filter(|index| *index <= head).max() else {
+            break;
+        };
+        lower = latest;
     }
     assert_eq!(lower, head);
     (waves, probes)
@@ -103,7 +104,7 @@ fn hls_retrieval_ownership_boundary_stays_strict() {
         );
     }
 
-    assert!(HLS_RUNTIME.contains("retrieve_data_range_from_root"));
+    assert!(HLS_RUNTIME.contains("read_cached_hls_range"));
     assert!(HLS_RUNTIME.contains("retrieve_decoded_data_root"));
     assert!(!HLS_RUNTIME.contains("retrieve_data_payload("));
     assert!(!HLS_RUNTIME.contains("retrieve_data_payload_cancellable"));
@@ -111,74 +112,19 @@ fn hls_retrieval_ownership_boundary_stays_strict() {
 }
 
 #[test]
-fn live_autoplay_and_persistent_body_runway_keep_separate_horizons() {
-    assert!(HLS_CORE.contains("pub(crate) const HLS_LIVE_SYNC_SEGMENTS: usize = 3;"));
-    assert!(HLS_CORE.contains("pub(crate) const HLS_LIVE_EDGE_SEGMENTS: usize = 3;"));
-    assert!(HLS_CORE.contains("pub(crate) const HLS_LIVE_BODY_RUNWAY_SEGMENTS: usize = 4;"));
-    assert!(
-        HLS_RUNTIME.contains("const BODY_PREFETCH_HORIZON: usize = HLS_LIVE_BODY_RUNWAY_SEGMENTS;")
-    );
-    assert!(HLS_RUNTIME.contains("const HLS_BODY_PREFETCH_MAX_PARALLEL: usize = 3;"));
-
-    let startup = section(
-        HLS_CORE,
-        "pub(crate) fn startup_plan",
-        "pub(crate) fn merge_tail",
-    );
-    assert!(startup.contains(".filter(|segment| !segment.gap)"));
-    assert!(startup.contains("playable < HLS_LIVE_SYNC_SEGMENTS"));
-    assert!(startup.contains("playable.saturating_sub(HLS_LIVE_EDGE_SEGMENTS)"));
-    assert!(startup.contains("if ordinal == last"));
-    assert!(!startup.contains("collect::<Vec<_>>()"));
-
-    let runway = section(
-        HLS_RUNTIME,
-        "fn live_runway_targets(",
-        "fn prefetch_from_reference(",
-    );
-    assert!(runway.contains("active.live_foreground.as_deref()"));
-    assert!(runway.contains(".rfind(|(position, segment)|"));
-    assert!(runway.contains("live_segment_is_playable(active"));
-    assert!(runway.contains("latest_live_foreground(active)"));
-    assert!(runway.contains(".take(HLS_LIVE_BODY_RUNWAY_SEGMENTS)"));
+fn live_preparation_and_following_share_one_duration_based_owner() {
+    assert!(HLS_CORE.contains("HLS_LIVE_STARTUP_BUFFER_SECONDS: f64 = 8.0"));
+    let runway = section(HLS_RUNTIME, "fn live_runway_targets(", "fn prefetch_from_reference(");
+    assert!(runway.contains("seconds >= HLS_LIVE_STARTUP_BUFFER_SECONDS"));
+    assert!(runway.contains("return Vec::new()"));
     assert!(runway.contains("active.live_runway_running = true"));
-    assert!(runway.contains("body_ready_or_pending(&reference)"));
-    assert!(runway.contains("cache.pending_body_count(id)"));
-    assert!(runway.contains("< HLS_BODY_PREFETCH_MAX_PARALLEL"));
-    assert_eq!(
-        runway
-            .matches("live_runway_context(id).is_some_and(|(_, current)|")
-            .count(),
-        2
-    );
-    assert!(runway.contains("HLS_NEXT_RESERVE_STAGGER"));
-    assert!(runway.contains("let _ = hls_body(client, reference, Some(id)).await"));
-    assert!(runway.contains("Duration::from_millis(25)"));
-    assert!(!runway.contains("buffer_unordered"));
-
-    let body_state = section(HLS_RUNTIME, "fn body_ready_or_pending(", "fn body(");
-    assert!(body_state.contains("self.bodies.contains_key(reference)"));
-    assert!(body_state.contains("self.pending_bodies.contains_key(reference)"));
-
-    let install = section(
-        HLS_RUNTIME,
-        "fn install_snapshot(",
-        "async fn discover_beginning(",
-    );
-    assert!(install.contains("active.live_foreground = latest_live_foreground(active)"));
-    assert!(install.contains("spawn_live_runway(id)"));
-
+    assert!(runway.contains("active.live_runway_running = false"));
+    assert!(runway.contains("hls_body(client.clone(), reference.clone(), Some(id))"));
+    let prepare = section(HLS_RUNTIME, "async fn discover_live_history(", "async fn discover_for_view(");
+    assert!(prepare.find("initialize_live_head(").unwrap() < prepare.find("future::join(").unwrap());
     let update = section(HLS_RUNTIME, "fn apply_update(", "fn apply_full_update(");
-    assert!(update.contains("updated.0 != 0 && updated.1"));
     assert!(update.contains("spawn_live_runway(id)"));
-
-    let foreground = section(
-        HLS_RUNTIME,
-        "fn prefetch_from_reference(",
-        "fn next_feed_id(",
-    );
-    assert!(foreground.contains("active.live_foreground = Some(reference.to_string())"));
-    assert!(foreground.contains("spawn_live_runway(id)"));
+    assert!(!update.contains("active.live_foreground ="));
 }
 
 #[test]
@@ -188,71 +134,85 @@ fn cold_discovery_is_bounded_and_edge_search_is_hls_owned() {
         "async fn discover_beginning(",
         "async fn edge_probe_wave(",
     );
-    assert!(beginning.contains("for index in 0..BEGINNING_DISCOVERY_WIDTH"));
-    assert!(beginning.contains("probe_feed_payload("));
-    assert!(beginning.contains("spawn_local(async move"));
-    assert!(beginning.contains("results.try_send(result)"));
-    assert!(beginning.contains("!feed_is_current(id)"));
-    assert!(beginning.contains("!result_view_request_is_current(view_generation)"));
-    assert!(beginning.contains("playlist.sequence == 0"));
-    assert!(beginning.contains("playlist.startup_plan(HlsStart::Beginning).is_some()"));
-    assert!(beginning.contains("playable >= BEGINNING_PREFIX_TARGET_SEGMENTS"));
-    assert!(beginning.contains("collected_best.borrow_mut()"));
-    assert!(beginning.contains("best.borrow_mut().take()"));
-    assert!(!beginning.contains(".nth(1)"));
-    assert!(beginning.contains("return Some(payload);"));
-    assert!(
-        beginning.contains("async_std::future::timeout(BEGINNING_WAVE_TIMEOUT, collect.as_mut())")
-    );
-    assert!(beginning.contains("Err(_) if best.borrow().is_none()"));
-    assert!(beginning.contains("collect.await"));
-    assert!(
-        HLS_RUNTIME
-            .contains("const BEGINNING_WAVE_TIMEOUT: Duration = Duration::from_millis(1_500);")
-    );
+    for expected in [
+        "stream::iter(0..BEGINNING_DISCOVERY_WIDTH)",
+        ".buffer_unordered(BEGINNING_DISCOVERY_WIDTH as usize)",
+        "probe_feed_payload(",
+        "!feed_is_current(id)",
+        "!result_view_request_is_current(view_generation)",
+        "playlist.sequence == 0",
+        "playlist.startup_plan(HlsStart::Beginning).is_some()",
+        "while let Some(probe) = probes.next().await",
+    ] {
+        assert!(beginning.contains(expected), "{expected}");
+    }
+    let valid = beginning
+        .find("playlist.startup_plan(HlsStart::Beginning).is_some()")
+        .unwrap();
+    let warm = beginning.find("warm_hls_prefix(").unwrap();
+    let accepted = beginning.find("return Some(payload)").unwrap();
+    assert!(valid < warm && warm < accepted);
+    assert!(!beginning[warm..accepted].contains(".await"));
+    assert!(!beginning.contains("spawn_local"));
     assert!(!beginning.contains("FEED_DISCOVERY_TIMEOUT"));
-    assert!(HLS_RUNTIME.contains("const BEGINNING_PREFIX_TARGET_SEGMENTS: usize = 4;"));
-    assert!(HLS_CORE.contains("pub(crate) const HLS_LIVE_SYNC_SEGMENTS: usize = 3;"));
-    assert!(HLS_CORE.contains("pub(crate) const HLS_LIVE_EDGE_SEGMENTS: usize = 3;"));
+    for expected in [
+        "const BEGINNING_PREFIX_TARGET_SEGMENTS: usize = 4;",
+        "const EDGE_ANCHORS: [u64; 16]",
+        "const EDGE_REFINEMENT_WIDTH: usize = 16;",
+        "const EDGE_PROBE_ATTEMPTS: usize = 2;",
+    ] {
+        assert!(HLS_RUNTIME.contains(expected), "{expected}");
+    }
 
     let edge = section(
         HLS_RUNTIME,
         "async fn discover_edge_update(",
         "async fn discover_latest_once(",
     );
-    assert!(HLS_RUNTIME.contains("const EDGE_ANCHORS: [u64; 16]"));
-    assert!(HLS_RUNTIME.contains("const EDGE_REFINEMENT_WIDTH: usize = 16;"));
-    assert!(edge.contains("edge_probe_wave(client, owner, topic, &EDGE_ANCHORS, false, fast)"));
-    assert!(edge.contains("interior.min((EDGE_REFINEMENT_WIDTH - 1) as u64)"));
-    assert!(edge.contains("let first = latest.0 + 1;"));
-    assert!(edge.contains("indices.push(upper);"));
-    assert!(edge.contains("edge_probe_wave(client, owner, topic, &indices, true, fast)"));
-    assert!(edge.contains("if latest.0.saturating_add(1) == upper"));
-    assert!(edge.contains("return Some(latest);"));
+    for expected in [
+        "edge_probe_wave(client, owner, topic, &EDGE_ANCHORS, false, fast)",
+        "(1..EDGE_REFINEMENT_WIDTH - 1)",
+        "let first = latest.0 + 1;",
+        ".chain(std::iter::once(upper))",
+        "edge_probe_wave(client, owner, topic, &indices, true, fast)",
+        "if upper.saturating_sub(latest.0) <= HISTORY_STRIDE * 2",
+        "return Some(latest);",
+        "if latest.0 >= upper || (latest.0, upper) == previous",
+        "if let Some(next_upper)",
+        "*index > latest.0 && missing[slot]",
+    ] {
+        assert!(edge.contains(expected), "{expected}");
+    }
     assert!(!edge.contains("probe_feed_update("));
     assert!(!edge.contains("EDGE_RECOVERY_ANCHORS"));
-    assert!(edge.contains("if (latest.0, upper) == previous"));
-    assert!(edge.contains("return None;"));
 
     let wave = section(
         HLS_RUNTIME,
         "async fn edge_probe_wave(",
         "async fn discover_edge_update(",
     );
-    assert!(wave.contains("let mut completed = vec![false; indices.len()];"));
-    assert!(wave.contains("completed[first_unsettled..=upper]"));
-    assert!(wave.contains("spawn_local(async move"));
-    assert!(wave.contains("probe_feed_update("));
-    assert!(wave.contains("attempt_limit"));
-    assert!(wave.contains("results.try_send((slot, result))"));
-    assert!(wave.contains("EDGE_COLD_WAVE_TIMEOUT"));
-    assert!(wave.contains("EDGE_WAVE_TIMEOUT"));
-    assert!(wave.contains("let mut positive_seen = lower_is_known;"));
-    assert!(wave.contains("deadline = js_sys::Date::now() + EDGE_WAVE_TIMEOUT"));
-    assert!(wave.contains("let Some(upper)"));
-    assert!(wave.contains("break;"));
+    for expected in [
+        "let mut completed = vec![false; indices.len()];",
+        "completed[first_unsettled..=upper]",
+        ".buffer_unordered(indices.len().max(1))",
+        "probe_feed_update(",
+        "attempt_limit",
+        "probes.next()",
+        "EDGE_COLD_WAVE_TIMEOUT",
+        "EDGE_WAVE_TIMEOUT",
+        "let mut positive_seen = lower_is_known;",
+        "future::pending::<()>().left_future()",
+        "future::select(probes.next(), deadline.as_mut()).await",
+        "let Some(upper)",
+        "break;",
+    ] {
+        assert!(wave.contains(expected), "{expected}");
+    }
+    assert!(
+        wave.contains("deadline.set(async_std::task::sleep(EDGE_WAVE_TIMEOUT).right_future())")
+    );
+    assert!(!wave.contains("async_std::future::timeout"));
 
-    assert!(HLS_RUNTIME.contains("const EDGE_PROBE_ATTEMPTS: usize = 2;"));
     let shared_probe = section(
         HLS_RUNTIME,
         "async fn probe_feed_update(",
@@ -265,17 +225,20 @@ fn cold_discovery_is_bounded_and_edge_search_is_hls_owned() {
     let initial = section(
         HLS_RUNTIME,
         "async fn discover_latest_once(",
-        "async fn settled_update_wave(",
+        "async fn retrieve_confirmed_payload(",
     );
-    assert!(initial.contains("discover_edge_update(client, owner, topic).await?"));
+    assert!(initial.contains("discover_edge_update(client, owner, topic, history).await?"));
+    assert!(
+        initial.contains("retrieve_confirmed_payload(client, owner, topic, index, update).await")
+    );
 }
 
 #[test]
 fn beginning_history_and_exact_following_run_concurrently_after_media_is_ready() {
     let history = section(
         HLS_RUNTIME,
-        "fn spawn_beginning_history(",
         "pub(crate) fn start_beginning_history()",
+        "fn spawn_follower(",
     );
     let follow = history.find("spawn_follower(id)").unwrap();
     let discover = history.find("let history = discover_for_view(").unwrap();
@@ -293,11 +256,11 @@ fn underfilled_beginning_prefix_starts_exact_following_immediately() {
         "pub(crate) async fn prepare_hls_feed(",
         "pub(crate) fn release_hls_runtime()",
     );
-    let underfilled = attach.find("let underfilled_beginning = !live").unwrap();
+    let underfilled = attach.find("let underfilled = head").unwrap();
     let install = attach
-        .find("install_snapshot(id, index, playlist)")
+        .find("install_snapshot(id, payload.index, head, None)")
         .unwrap();
-    let follow = attach.find("if underfilled_beginning").unwrap();
+    let follow = attach.find("if underfilled").unwrap();
     assert!(underfilled < install && install < follow);
     assert!(attach[follow..].contains("spawn_follower(id)"));
     assert!(attach.contains("< BEGINNING_PREFIX_TARGET_SEGMENTS"));
@@ -335,40 +298,30 @@ fn commit_337_edge_geometry_stays_small_and_stable() {
 
 #[test]
 fn head_proof_preserves_the_initial_lattice_and_settles_every_probe() {
-    let settled = section(
-        HLS_RUNTIME,
-        "async fn settled_update_wave(",
-        "async fn retrieve_confirmed_payload(",
-    );
-    assert!(settled.contains("spawn_local(async move"));
-    assert!(settled.contains("probe_feed_update("));
-    assert!(settled.contains("Some(FEED_PROBE_ATTEMPTS)"));
-    assert!(settled.contains("while let Ok(result) = input.recv().await"));
-    assert!(settled.contains("settled.sort_by_key"));
-
     let proof = section(
         HLS_RUNTIME,
         "async fn retrieve_confirmed_payload(",
-        "async fn settled_payload_wave(",
+        "fn warm_hls_prefix(",
     );
+    assert!(proof.contains("probe_feed_update("));
+    assert!(proof.contains("Some(FEED_PROBE_ATTEMPTS)"));
+    assert!(proof.contains(".buffered((HISTORY_STRIDE * 2) as usize)"));
+    assert!(proof.contains("while let Some((index, probe)) = probes.next().await"));
     assert!(proof.contains("let lattice_residue = index % HISTORY_STRIDE;"));
-    assert!(proof.contains("index.checked_add(HISTORY_STRIDE)"));
-    assert!(proof.contains("first_guard.checked_add(HISTORY_STRIDE)"));
     assert!(
-        proof.contains("settled_update_wave(client, owner, topic, &[first_guard, second_guard])")
+        proof.contains(
+            "let dense = index.checked_add(1)?..=index.checked_add(HISTORY_STRIDE * 2)?;"
+        )
     );
-    assert!(proof.contains("let dense = (1..HISTORY_STRIDE * 2)"));
-    assert!(proof.contains(".filter(|offset| *offset != HISTORY_STRIDE)"));
-    assert!(proof.contains("if guard_transient || transient"));
+    assert!(proof.contains("if transient"));
     assert!(proof.contains("lattice_residue,"));
-
     let history = section(
         HLS_RUNTIME,
         "async fn hls_history(",
         "async fn discover_raw_for_view(",
     );
     assert!(history.contains("lattice_residue: u64"));
-    assert!(history.contains("let indices = (lattice_residue..head_index)"));
+    assert!(history.contains("history_indices(head_index, lattice_residue)?"));
     assert!(HLS_RUNTIME.contains("const HISTORY_FOREGROUND_PARALLEL: usize = 64;"));
 }
 
@@ -380,20 +333,6 @@ fn live_follower_uses_commit337_sequential_exact_followups_before_frontier_fallb
         HLS_RUNTIME.contains("const FEED_POLL_INTERVAL: Duration = Duration::from_millis(400);")
     );
     assert!(HLS_RUNTIME.contains("const FEED_FRONTIER_REFRESH_INTERVAL: f64 = 15_000.0;"));
-
-    let raw_wave = section(
-        HLS_RUNTIME,
-        "fn payload_probe_wave(",
-        "async fn settled_payload_wave(",
-    );
-    assert!(raw_wave.contains("for (slot, index) in indices.iter().copied().enumerate()"));
-    assert!(raw_wave.contains("spawn_local(async move"));
-    assert!(raw_wave.contains("probe_feed_payload("));
-    assert!(raw_wave.contains("attempt_limit: Option<usize>"));
-    assert!(raw_wave.contains("attempt_limit,"));
-    assert!(raw_wave.contains("results.try_send((slot, index, result))"));
-    assert!(raw_wave.contains("drop(results)"));
-    assert!(raw_wave.contains("input"));
 
     let follower = section(
         HLS_RUNTIME,
@@ -434,7 +373,7 @@ fn live_follower_uses_commit337_sequential_exact_followups_before_frontier_fallb
     assert!(apply < stop && stop < progressed);
 
     assert!(follower.contains("now - last_frontier_check >= FEED_FRONTIER_REFRESH_INTERVAL"));
-    assert!(follower.contains("discover_latest_once(client, owner, topic).await"));
+    assert!(follower.contains("discover_latest_once(client, owner, topic, None).await"));
     assert!(follower.contains("if index == head"));
     assert!(follower.contains("if index < head"));
     assert!(follower.contains("hls_history("));
@@ -478,7 +417,7 @@ fn active_feed_treats_snapshot_endlist_as_tentative() {
         "async fn discover_beginning(",
     );
     assert!(install.contains("playlist.finalized = false"));
-    assert!(install.contains("active.terminal_candidate = terminal.then_some(index)"));
+    assert!(install.contains("active.terminal_candidate = playlist.finalized.then_some(index)"));
 
     let apply = section(HLS_RUNTIME, "fn apply_update(", "fn apply_full_update(");
     assert!(apply.contains("index <= current"));

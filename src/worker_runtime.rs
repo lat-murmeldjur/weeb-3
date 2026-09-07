@@ -13,7 +13,9 @@ use web_sys::File;
 use crate::{
     Weeb3,
     bzz_stream::BzzMetadata,
-    network_profile::{is_browser_dialable_underlay, profile_for_swarm_network_id},
+    network_profile::{
+        INITIAL_BOOTNODE_BURST, is_browser_dialable_underlay, profile_for_swarm_network_id,
+    },
     worker_protocol::{
         array_property, bool_property, bytes_from_js, bytes_to_js, integer_property,
         metadata_from_js, metadata_to_js, number_property, progress_to_js, property, set, set_bool,
@@ -148,7 +150,14 @@ impl Weeb3WorkerRuntime {
                 set_number(
                     &response,
                     "connections",
-                    self.inner.get_connections().await as f64,
+                    self.inner
+                        .wait_for_connections(
+                            integer_property(message, "minimum").unwrap_or(0),
+                            integer_property(message, "waitMs")
+                                .unwrap_or(0)
+                                .min(u32::MAX as u64),
+                        )
+                        .await as f64,
                 );
                 Ok(response)
             }
@@ -267,7 +276,6 @@ impl Weeb3WorkerRuntime {
             .ok_or_else(|| error_response(400, "connectBootnodes requires nodes array"))?;
         let nodes = {
             let mut nodes = Vec::new();
-            let mut state = self.state.borrow_mut();
             for value in values.iter() {
                 let node = value
                     .dyn_into::<Object>()
@@ -281,16 +289,19 @@ impl Weeb3WorkerRuntime {
                     ));
                 }
                 let usable = bool_property(&node, "usable").unwrap_or(true);
-                if state.bootnodes.get(&address) == Some(&usable) {
-                    continue;
-                }
-                state.bootnodes.insert(address.clone(), usable);
-                if state.bootnodes.len() > 512 {
-                    state.bootnodes.clear();
-                    state.bootnodes.insert(address.clone(), usable);
-                }
                 nodes.push((address, usable));
             }
+            let mut state = self.state.borrow_mut();
+            nodes.retain(|(address, usable)| {
+                let configured = state.bootnodes.get(address);
+                if configured == Some(usable)
+                    || configured.is_none() && state.bootnodes.len() >= INITIAL_BOOTNODE_BURST
+                {
+                    return false;
+                }
+                state.bootnodes.insert(address.clone(), *usable);
+                true
+            });
             nodes
         };
         if !nodes.is_empty() {

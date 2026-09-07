@@ -45,7 +45,6 @@ use std::{
     cell::{Cell, RefCell},
     rc::Rc,
     str::FromStr,
-    time::Duration,
 };
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::{JsCast, JsValue};
@@ -759,18 +758,11 @@ impl Weeb3No103 {
             .map_err(|error| JsValue::from_str(&error))?;
 
         let min_connections = min_connections.max(1) as u64;
-        let started = js_sys::Date::now();
-        loop {
-            if self.inner.get_connections().await >= min_connections {
-                return Ok(true);
-            }
-
-            if timeout_ms == 0 || js_sys::Date::now() - started >= timeout_ms as f64 {
-                return Ok(false);
-            }
-
-            async_std::task::sleep(Duration::from_millis(160)).await;
-        }
+        Ok(self
+            .inner
+            .wait_for_connections(min_connections, timeout_ms)
+            .await
+            >= min_connections)
     }
 
     pub async fn logs(&self) -> Array {
@@ -1167,8 +1159,7 @@ impl Weeb3No103 {
             Ok(signer) => signer,
             Err(_) => return error_object("failed to create chequebook signer key"),
         };
-        let issuer_bytes: [u8; 20] = *cheque_signer.address().as_ref();
-        let issuer = Address::from(issuer_bytes);
+        let issuer = cheque_signer.address();
         let deployment = match deploy_chequebook_with_payer(issuer, payer).await {
             Ok(deployment) => deployment,
             Err(error) => return error_object(format!("chequebook deployment failed: {error:?}")),

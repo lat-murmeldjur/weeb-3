@@ -454,7 +454,14 @@ impl SharedNodeClient {
         let response = if transfer_bearing {
             runtime.request_unbounded(&request).await?
         } else {
-            runtime.request(&request, CONTROL_TIMEOUT).await?
+            let wait = if op == "connections" {
+                integer_property(&request, "waitMs").unwrap_or(0)
+            } else {
+                0
+            };
+            runtime
+                .request(&request, CONTROL_TIMEOUT + Duration::from_millis(wait))
+                .await?
         };
         require_ok(&response, op)?;
         Ok(response)
@@ -525,11 +532,18 @@ impl SharedNodeClient {
     }
 
     pub(crate) async fn get_connections(&self) -> u64 {
-        self.node_operation("connections", |_| {})
-            .await
-            .ok()
-            .and_then(|response| integer_property(&response, "connections"))
-            .unwrap_or_default()
+        self.wait_for_connections(0, 0).await
+    }
+
+    pub(crate) async fn wait_for_connections(&self, minimum: u64, timeout_ms: u32) -> u64 {
+        self.node_operation("connections", |request| {
+            set_number(request, "minimum", minimum as f64);
+            set_number(request, "waitMs", timeout_ms as f64);
+        })
+        .await
+        .ok()
+        .and_then(|response| integer_property(&response, "connections"))
+        .unwrap_or_default()
     }
 
     pub(crate) async fn get_current_logs(&self) -> Vec<String> {
@@ -760,8 +774,5 @@ fn require_ok(response: &Object, context: &str) -> Result<(), String> {
 }
 
 fn js_error(context: &str, error: &JsValue) -> String {
-    let message = string_property(error, "message")
-        .or_else(|| error.as_string())
-        .unwrap_or_else(|| "unknown browser error".to_string());
-    format!("{context}: {message}")
+    format!("{context}: {}", crate::js_error_message(error))
 }

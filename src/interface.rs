@@ -21,7 +21,7 @@ use crate::{
     bzz_stream::{BzzMetadata, bzz_reference_hex, canonical_bzz_url, normalize_bzz_path},
     decode_resources,
     erasure_coding::upload_redundancy_from_select,
-    interface_conventions::{install_interface_conventions, set_bracket_button_label},
+    interface_conventions::install_interface_conventions,
     nav::{
         ResourceRoute, clear_hash_route, parse_networked_resource_route, read_route,
         route_network_mode_from_location,
@@ -497,8 +497,7 @@ pub(crate) async fn mount_interface_with_generation(
                     return;
                 }
             };
-            let issuer_h160_bytes: [u8; 20] = *cheque_signer.address().as_ref();
-            let issuer = Address::from(issuer_h160_bytes);
+            let issuer = cheque_signer.address();
 
             let deployment = match deploy_chequebook_with_payer(issuer, payer).await {
                 Ok(d) => d,
@@ -521,7 +520,7 @@ pub(crate) async fn mount_interface_with_generation(
             alert(&format!(
                 "Chequebook deployed at 0x{}.\nIssuer: 0x{}\nDeployment tx: 0x{}",
                 hex::encode(deployment.chequebook.as_bytes()),
-                hex::encode(issuer_h160_bytes),
+                hex::encode(issuer.as_bytes()),
                 hex::encode(deployment.tx.as_bytes())
             ));
         });

@@ -49,6 +49,44 @@ where
     lookup.await.into()
 }
 
+async fn collect_feed_wave<T>(
+    probes: &mut FuturesUnordered<impl Future<Output = (usize, u64, FeedProbe<T>)>>,
+    levels: impl Iterator<Item = usize> + Clone,
+    observe_positive: &mut impl FnMut(u64, &T),
+) -> Option<(usize, (u64, T), Option<u64>)> {
+    let mut completed = [false; FEED_FRONTIER_LOOKAHEAD_LEVELS + 1];
+    let mut missing = [None; FEED_FRONTIER_LOOKAHEAD_LEVELS + 1];
+    let mut found: [Option<(u64, T)>; FEED_FRONTIER_LOOKAHEAD_LEVELS + 1] =
+        std::array::from_fn(|_| None);
+    while let Some((level, index, result)) = probes.next().await {
+        completed[level] = true;
+        match result {
+            FeedProbe::Found(payload) => {
+                observe_positive(index, &payload);
+                found[level] = Some((index, payload));
+            }
+            FeedProbe::Missing => missing[level] = Some(index),
+            FeedProbe::Transient => {}
+        }
+        let Some(highest) = levels.clone().find(|level| found[*level].is_some()) else {
+            continue;
+        };
+        // Lower listeners cannot delay a proven frontier; their dispatched work still drains.
+        if levels
+            .clone()
+            .filter(|level| *level > highest)
+            .all(|level| completed[level])
+        {
+            return Some((
+                highest,
+                found[highest].take().unwrap(),
+                missing.get(highest + 1).copied().flatten(),
+            ));
+        }
+    }
+    None
+}
+
 pub(crate) async fn seek_sequence_feed_frontier<T, Probe, ProbeFuture, ProbeResult>(
     probe: Probe,
 ) -> (Option<(u64, T)>, u64)
@@ -112,57 +150,23 @@ where
             });
         }
 
-        let mut completed = [false; FEED_FRONTIER_LOOKAHEAD_LEVELS + 1];
-        let mut missing = [false; FEED_FRONTIER_LOOKAHEAD_LEVELS + 1];
-        let mut found: [Option<(u64, T)>; FEED_FRONTIER_LOOKAHEAD_LEVELS + 1] =
-            std::array::from_fn(|_| None);
-        let highest_found_level = loop {
-            let Some((level, index, result)) = probes.next().await else {
-                break None;
-            };
-            completed[level] = true;
-            match result {
-                FeedProbe::Found(payload) => {
-                    observe_positive(index, &payload);
-                    found[level] = Some((index, payload));
-                }
-                FeedProbe::Missing => missing[level] = true,
-                FeedProbe::Transient => {}
-            }
-
-            let Some(highest_found_level) = BOUNDED_INITIAL_LEVELS
-                .into_iter()
-                .find(|level| found[*level].is_some())
-            else {
-                continue;
-            };
-            let higher_levels_are_missing = BOUNDED_INITIAL_LEVELS
-                .into_iter()
-                .filter(|level| *level > highest_found_level)
-                .all(|level| completed[level]);
-            if higher_levels_are_missing {
-                break Some(highest_found_level);
-            }
-        };
-
-        let Some(highest_found_level) = highest_found_level else {
+        let Some((highest_found_level, latest, known_missing)) = collect_feed_wave(
+            &mut probes,
+            BOUNDED_INITIAL_LEVELS.into_iter(),
+            &mut observe_positive,
+        )
+        .await
+        else {
             return (None, 0);
         };
-        let latest = found[highest_found_level]
-            .take()
-            .expect("bounded initial feed probe must carry its payload");
 
-        if highest_found_level == 0 || highest_found_level == FEED_FRONTIER_LOOKAHEAD_LEVELS {
+        if highest_found_level == 0
+            || highest_found_level == FEED_FRONTIER_LOOKAHEAD_LEVELS
+            || known_missing.is_none()
+        {
             (latest, FEED_FRONTIER_LOOKAHEAD_LEVELS, None)
         } else {
-            let missing_level = highest_found_level + 1;
-            let known_missing = probe_index(0, missing_level)
-                .filter(|_| completed[missing_level] && missing[missing_level]);
-            if known_missing.is_some() {
-                (latest, highest_found_level, known_missing)
-            } else {
-                (latest, FEED_FRONTIER_LOOKAHEAD_LEVELS, None)
-            }
+            (latest, highest_found_level, known_missing)
         }
     } else {
         let first_payload = match probe(0).await.into() {
@@ -196,40 +200,13 @@ where
             });
         }
 
-        let mut completed = [false; FEED_FRONTIER_LOOKAHEAD_LEVELS + 1];
-        let mut missing = [false; FEED_FRONTIER_LOOKAHEAD_LEVELS + 1];
-        let mut found: [Option<(u64, T)>; FEED_FRONTIER_LOOKAHEAD_LEVELS + 1] =
-            std::array::from_fn(|_| None);
-        let highest_found_level = loop {
-            let Some((level, index, result)) = probes.next().await else {
-                break 0;
-            };
-            completed[level] = true;
-            match result {
-                FeedProbe::Found(payload) => {
-                    observe_positive(index, &payload);
-                    found[level] = Some((index, payload));
-                }
-                FeedProbe::Missing => missing[level] = true,
-                FeedProbe::Transient => {}
-            }
-
-            let Some(highest_found_level) = (1..=effective_level)
-                .rev()
-                .find(|level| found[*level].is_some())
-            else {
-                continue;
-            };
-
-            // Lower listeners cannot delay a proven frontier; their dispatched work still drains.
-            let higher_levels_are_missing =
-                ((highest_found_level + 1)..=effective_level).all(|level| completed[level]);
-            if higher_levels_are_missing {
-                break highest_found_level;
-            }
-        };
-
-        if highest_found_level == 0 {
+        let wave = collect_feed_wave(
+            &mut probes,
+            (1..=effective_level).rev(),
+            &mut observe_positive,
+        )
+        .await;
+        let Some((highest_found_level, found, missing)) = wave else {
             let next = latest.0.saturating_add(1);
             match probe_with_timeout(probe(next), lookahead_timeout).await {
                 FeedProbe::Found(payload) => {
@@ -241,11 +218,9 @@ where
                 }
                 FeedProbe::Missing | FeedProbe::Transient => return (Some(latest), next),
             }
-        }
+        };
 
-        latest = found[highest_found_level]
-            .take()
-            .expect("highest found feed probe must carry its index and payload");
+        latest = found;
 
         if highest_found_level == effective_level {
             if let Some(missing) = known_missing
@@ -270,9 +245,7 @@ where
             continue;
         }
 
-        let missing_level = highest_found_level + 1;
-        known_missing = probe_index(wave_base, missing_level)
-            .filter(|_| completed[missing_level] && missing[missing_level]);
+        known_missing = missing;
         if known_missing.is_none() {
             level_limit = FEED_FRONTIER_LOOKAHEAD_LEVELS;
             continue;

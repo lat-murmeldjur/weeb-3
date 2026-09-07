@@ -1,7 +1,6 @@
-use alloy_primitives::{Address, B256, Signature, eip191_hash_message};
-use k256::ecdsa::{
-    RecoveryId, Signature as K256Signature, SigningKey, signature::hazmat::PrehashSigner,
-};
+use crate::conventions::{eip191_hash_message, public_key_address};
+use k256::ecdsa::SigningKey;
+use web3::types::Address;
 
 #[derive(Clone)]
 pub(crate) struct PrivateKeySigner {
@@ -12,8 +11,7 @@ pub(crate) struct PrivateKeySigner {
 impl PrivateKeySigner {
     pub(crate) fn from_slice(bytes: &[u8]) -> Result<Self, k256::ecdsa::Error> {
         let key = SigningKey::from_slice(bytes)?;
-        let public_key = key.verifying_key().to_encoded_point(false);
-        let address = Address::from_raw_public_key(&public_key.as_bytes()[1..]);
+        let address = public_key_address(key.verifying_key());
         Ok(Self { key, address })
     }
 
@@ -21,13 +19,16 @@ impl PrivateKeySigner {
         self.address
     }
 
-    pub(crate) fn sign_message(&self, message: &[u8]) -> Result<Signature, k256::ecdsa::Error> {
+    pub(crate) fn sign_message(&self, message: &[u8]) -> Result<[u8; 65], k256::ecdsa::Error> {
         self.sign_hash_sync(&eip191_hash_message(message))
     }
 
-    pub(crate) fn sign_hash_sync(&self, hash: &B256) -> Result<Signature, k256::ecdsa::Error> {
-        let signature: (K256Signature, RecoveryId) = self.key.sign_prehash(hash.as_slice())?;
-        Ok(signature.into())
+    pub(crate) fn sign_hash_sync(&self, hash: &[u8; 32]) -> Result<[u8; 65], k256::ecdsa::Error> {
+        let (signature, recovery_id) = self.key.sign_prehash_recoverable(hash)?;
+        let mut bytes = [0; 65];
+        bytes[..64].copy_from_slice(&signature.to_bytes());
+        bytes[64] = 27 + u8::from(recovery_id.is_y_odd());
+        Ok(bytes)
     }
 }
 
@@ -43,14 +44,16 @@ mod tests {
         let signature = signer.sign_message(message).expect("sign fixture");
 
         assert_eq!(
-            hex::encode(signature.as_bytes()),
+            hex::encode(signature),
             "e681a6ac3223272ccd5a24cc94799dda749e9983c9153ee226bd3a682993ed42460e63138750648a287c0a04624721a5cbfa141f7d507e58ad4e9cc294c73e061c"
         );
         assert_eq!(
-            signature
+            alloy_primitives::Signature::from_raw(&signature)
+                .expect("parse fixture signature")
                 .recover_address_from_msg(message)
-                .expect("recover fixture signer"),
-            signer.address()
+                .expect("recover fixture signer")
+                .as_slice(),
+            signer.address().as_bytes()
         );
         assert_eq!(
             hex::encode(signer.address()),

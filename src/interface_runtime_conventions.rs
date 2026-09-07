@@ -2,12 +2,12 @@ use super::*;
 use js_sys::{Object, Reflect};
 use web_sys::{MessageChannel, MessageEvent, MessagePort};
 
-use crate::worker_protocol::{number_property, set as set_js, string_property};
+use crate::worker_protocol::{bool_property, number_property, set as set_js, string_property};
 
 const SERVICE_WORKER_PROTOCOL: f64 = 10.0;
 const SERVICE_WORKER_MARKER: &str = "forwarder-default29";
 const SERVICE_WORKER_CONTROL_TOTAL_TIMEOUT_MS: u64 = 30_000;
-const SERVICE_WORKER_SETUP_RETRY_MS: f64 = 1_500.0;
+const SERVICE_WORKER_SETUP_RETRY: Duration = Duration::from_millis(1_500);
 const DOWNLOAD_URL_REVOKE_DELAY_MS: i32 = 1_000;
 static SERVICE_WORKER_SETUP_LOCK: async_lock::Mutex<()> = async_lock::Mutex::new(());
 
@@ -15,6 +15,7 @@ thread_local! {
     static SERVICE_WORKER_MISSING_VISIBLE: Cell<bool> = const { Cell::new(false) };
     static ACTIVE_RESULT_OBJECT_URL: RefCell<Option<String>> = const { RefCell::new(None) };
     static RESULT_CALLBACKS: RefCell<Vec<Closure<dyn FnMut(Event)>>> = const { RefCell::new(Vec::new()) };
+    static READY_SERVICE_WORKER: RefCell<Option<web_sys::ServiceWorker>> = const { RefCell::new(None) };
 }
 
 pub(super) async fn check_upload_prerequisites(weeb3: InterfaceNode) {
@@ -339,19 +340,6 @@ pub(super) async fn connect_all_bootnode_settings(
     let mut dial_requests = Vec::<(String, bool)>::new();
 
     let profile = profile_for_swarm_network_id(expected_network_id);
-    if let Some(profile) = profile {
-        for address in initial_bootnodes(profile) {
-            let address = address.to_string();
-            if !is_browser_dialable_underlay(&address) {
-                weeb3.interface_log(format!(
-                    "Skipped non-browser bootnode for network {network_id}: {address}"
-                ));
-            } else if seen.insert(address.clone()) {
-                dial_requests.push((address, true));
-            }
-        }
-    }
-
     for (index, element_id) in BOOTNODE_INPUT_IDS.iter().enumerate() {
         let address = bootnode_setting(element_id);
         if address.trim().is_empty() {
@@ -374,6 +362,21 @@ pub(super) async fn connect_all_bootnode_settings(
             dial_requests.push((address, true));
         }
     }
+
+    if let Some(profile) = profile {
+        for address in initial_bootnodes(profile) {
+            let address = address.to_string();
+            if !is_browser_dialable_underlay(&address) {
+                weeb3.interface_log(format!(
+                    "Skipped non-browser bootnode for network {network_id}: {address}"
+                ));
+            } else if seen.insert(address.clone()) {
+                dial_requests.push((address, true));
+            }
+        }
+    }
+
+    dial_requests.truncate(crate::network_profile::INITIAL_BOOTNODE_BURST);
 
     weeb3.interface_log(format!(
         "Connecting {} configured bootnodes for network {}",
@@ -403,13 +406,10 @@ pub(super) fn update_network_mode_toggle(mode: NetworkMode) {
         return;
     };
 
-    set_bracket_button_label(
-        button.unchecked_ref::<Element>(),
-        match mode {
-            NetworkMode::Testnet => " Testnet ",
-            NetworkMode::Mainnet => " Mainnet ",
-        },
-    );
+    button.set_text_content(Some(match mode {
+        NetworkMode::Testnet => " Testnet ",
+        NetworkMode::Mainnet => " Mainnet ",
+    }));
 }
 
 pub(super) async fn open_resource_input(weeb3: InterfaceNode, input: String) {
@@ -610,7 +610,7 @@ pub(super) fn render_single_result_with_download((bytes, mime, path): &(Vec<u8>,
     };
 
     let filename = result_filename(path, "download");
-    set_bracket_button_label(&button, &format!("Download {}", filename));
+    button.set_text_content(Some(&format!("Download {}", filename)));
     let blob = create_blob(bytes, mime);
     let download_blob = blob.clone();
     let callback = Closure::<dyn FnMut(Event)>::new(move |_event| {
@@ -670,7 +670,7 @@ pub(super) fn render_collection_download_button(entries: RenderedEntries, index:
         Err(_) => return,
     };
     let filename = format!("{}.tar", result_filename(index, "collection"));
-    set_bracket_button_label(&button, &format!("Download {}", filename));
+    button.set_text_content(Some(&format!("Download {}", filename)));
     let callback = Closure::<dyn FnMut(Event)>::new(move |_event| {
         if let Some(bytes) = tar_entries(&entries)
             && let Some(url) = blob_url(&bytes, "application/x-tar")
@@ -1031,7 +1031,7 @@ pub(super) fn render_canonical_bzz_frame(
     } else {
         result_filename(filename, "download")
     };
-    set_bracket_button_label(&download, &format!("Download {}", download_filename));
+    download.set_text_content(Some(&format!("Download {}", download_filename)));
     let frame_url = url.to_string();
     let resource = resource.to_string();
     let callback = Closure::<dyn FnMut(Event)>::new(move |_event| {
@@ -1118,7 +1118,7 @@ pub(super) fn update_transfer_pause_button(paused: bool) {
     } else {
         " Pause retrieve / push "
     };
-    set_bracket_button_label(button.unchecked_ref::<Element>(), label);
+    button.set_text_content(Some(label));
 }
 
 pub(super) fn create_element_wmt(mime: &str, blob_url: &str) -> Element {
@@ -1258,12 +1258,7 @@ fn bootnode_setting(id: &str) -> String {
 
 pub(super) fn service_worker_container() -> Option<web_sys::ServiceWorkerContainer> {
     let window = web_sys::window()?;
-    let is_secure_context =
-        js_sys::Reflect::get(window.as_ref(), &JsValue::from_str("isSecureContext"))
-            .ok()
-            .and_then(|value| value.as_bool())
-            .unwrap_or(false);
-    if !is_secure_context {
+    if bool_property(window.as_ref(), "isSecureContext") != Some(true) {
         return None;
     }
 
@@ -1364,24 +1359,21 @@ pub async fn get_service_worker() -> Option<web_sys::ServiceWorker> {
         return None;
     };
     let _setup_guard = SERVICE_WORKER_SETUP_LOCK.lock().await;
-    get_service_worker_locked(&service0).await
-}
-
-fn start_service_worker_setup_if_idle() -> bool {
-    let Some(service0) = service_worker_container() else {
-        service_worker_missing();
-        return false;
-    };
-    let Some(setup_guard) = SERVICE_WORKER_SETUP_LOCK.try_lock() else {
-        // A setup attempt already owns registration/update. Readiness keeps
-        // polling the exact implementation and retries after the lock is free.
-        return false;
-    };
-    spawn_local(async move {
-        let _setup_guard = setup_guard;
-        let _ = get_service_worker_locked(&service0).await;
+    // Startup and playback share the same completed setup. A new controller
+    // must still pass the update, scope and forwarding-protocol checks below.
+    let ready = READY_SERVICE_WORKER.with(|ready| {
+        ready.borrow().clone().filter(|worker| {
+            service0
+                .controller()
+                .is_some_and(|controller| Object::is(worker.as_ref(), controller.as_ref()))
+        })
     });
-    true
+    if ready.is_some() {
+        return ready;
+    }
+    let ready = get_service_worker_locked(&service0).await;
+    READY_SERVICE_WORKER.with(|cached| *cached.borrow_mut() = ready.clone());
+    ready
 }
 
 async fn get_service_worker_locked(
@@ -1393,8 +1385,8 @@ async fn get_service_worker_locked(
     if let Some(controller) = controlled_service_worker()
         && controller.script_url() != expected_worker_url
     {
-        if service_worker_forwarder_ready_with_timeout(1_500).await {
-            return Some(controller);
+        if let Some(ready) = service_worker_forwarder_ready_with_timeout(1_500).await {
+            return Some(ready);
         }
         warn_about_worker_conflict(&controller.script_url(), &expected_scope_url);
         return None;
@@ -1487,20 +1479,18 @@ fn controlled_service_worker() -> Option<web_sys::ServiceWorker> {
     service_worker_container()?.controller()
 }
 
-async fn service_worker_forwarder_ready() -> bool {
-    for _ in 0..3 {
-        if service_worker_forwarder_ready_with_timeout(500).await {
-            return true;
-        }
+async fn service_worker_forwarder_ready_with_timeout(
+    timeout_ms: u64,
+) -> Option<web_sys::ServiceWorker> {
+    let controller = controlled_service_worker()?;
+    if service_worker_protocol_request(&controller, "WEEB3_PING", "WEEB3_PONG", timeout_ms).await
+        && controlled_service_worker()
+            .is_some_and(|current| Object::is(controller.as_ref(), current.as_ref()))
+    {
+        Some(controller)
+    } else {
+        None
     }
-    false
-}
-
-async fn service_worker_forwarder_ready_with_timeout(timeout_ms: u64) -> bool {
-    let Some(controller) = controlled_service_worker() else {
-        return false;
-    };
-    service_worker_protocol_request(&controller, "WEEB3_PING", "WEEB3_PONG", timeout_ms).await
 }
 
 async fn request_service_worker_claim(worker: &web_sys::ServiceWorker) -> bool {
@@ -1510,10 +1500,10 @@ async fn request_service_worker_claim(worker: &web_sys::ServiceWorker) -> bool {
 async fn claim_exact_service_worker(
     worker: &web_sys::ServiceWorker,
 ) -> Option<web_sys::ServiceWorker> {
-    if !request_service_worker_claim(worker).await || !service_worker_forwarder_ready().await {
+    if !request_service_worker_claim(worker).await {
         return None;
     }
-    controlled_service_worker()
+    service_worker_forwarder_ready_with_timeout(1_500).await
 }
 
 struct ServiceWorkerProtocolPort {
@@ -1600,58 +1590,53 @@ async fn wait_for_service_worker_control(
     purpose: &str,
     still_needed: &impl Fn() -> bool,
 ) -> bool {
-    if service_worker_container().is_none() {
+    let Some(container) = service_worker_container() else {
         weeb3.interface_log(format!("service worker unavailable for {}", purpose));
+        return false;
+    };
+    let (sender, changed) = async_std::channel::bounded(1);
+    let callback = Closure::<dyn FnMut(Event)>::new(move |_| {
+        let _ = sender.try_send(());
+    });
+    let listener = ServiceWorkerControlListener {
+        container,
+        callback,
+    };
+    if listener
+        .container
+        .add_event_listener_with_callback(
+            "controllerchange",
+            listener.callback.as_ref().unchecked_ref(),
+        )
+        .is_err()
+    {
         return false;
     }
 
     weeb3.interface_log(format!("service worker activating for {}", purpose));
-    // Serialize behind any startup registration so a stale same-URL controller
-    // cannot satisfy readiness before its registration has been updated.
-    let _ = get_service_worker().await;
-    if !still_needed() {
-        return false;
-    }
-    if service_worker_forwarder_ready().await {
-        weeb3.interface_log(format!("service worker controls {}", purpose));
-        return true;
-    }
-
-    let mut next_setup_retry_ms = js_sys::Date::now() + SERVICE_WORKER_SETUP_RETRY_MS;
-    let mut activation_retry_logged = false;
-    loop {
-        if !still_needed() {
-            return false;
-        }
-
-        let now = js_sys::Date::now();
-        if (!next_setup_retry_ms.is_finite()
-            || next_setup_retry_ms <= 0.0
-            || now < next_setup_retry_ms - SERVICE_WORKER_CONTROL_TOTAL_TIMEOUT_MS as f64
-            || now >= next_setup_retry_ms)
-            && start_service_worker_setup_if_idle()
-        {
-            // The setup lock prevents overlap. Retrying after it is released lets a transient
-            // registration/update failure recover even when a stale same-URL controller exists.
-            next_setup_retry_ms = now + SERVICE_WORKER_SETUP_RETRY_MS;
-        }
-        if controlled_service_worker().is_none() {
-            if !activation_retry_logged {
-                activation_retry_logged = true;
-                weeb3.interface_log(format!(
-                    "service worker still activating for {}; retrying without a reload",
-                    purpose
-                ));
-            }
-            async_std::task::sleep(Duration::from_millis(100)).await;
-            continue;
-        }
-
-        if service_worker_forwarder_ready_with_timeout(500).await {
+    while still_needed() {
+        // Await serialized setup, including validation of the actual controller.
+        if get_service_worker().await.is_some() && still_needed() {
             weeb3.interface_log(format!("service worker controls {}", purpose));
             return true;
         }
-        async_std::task::sleep(Duration::from_millis(100)).await;
+        // Wake on activation; back off only when registration itself failed.
+        let _ = async_std::future::timeout(SERVICE_WORKER_SETUP_RETRY, changed.recv()).await;
+    }
+    false
+}
+
+struct ServiceWorkerControlListener {
+    container: web_sys::ServiceWorkerContainer,
+    callback: Closure<dyn FnMut(Event)>,
+}
+
+impl Drop for ServiceWorkerControlListener {
+    fn drop(&mut self) {
+        let _ = self.container.remove_event_listener_with_callback(
+            "controllerchange",
+            self.callback.as_ref().unchecked_ref(),
+        );
     }
 }
 

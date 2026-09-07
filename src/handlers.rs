@@ -1,5 +1,3 @@
-use alloy_primitives::keccak256;
-
 use prost::Message;
 
 use crate::mpsc;
@@ -143,51 +141,35 @@ async fn handshake_exchange(
     observed_underlay: &libp2p::core::Multiaddr,
     signer: &PrivateKeySigner,
     connected_peers: &mpsc::Sender<PeerFile>,
-) -> bool {
+) -> Option<()> {
     let syn = etiquette_1::Syn {
         observed_underlay: observed_underlay.to_vec(),
     };
 
     let syn_frame = syn.encode_length_delimited_to_vec();
-    if stream.write_all(&syn_frame).await.is_err() {
-        return false;
-    }
-    if stream.flush().await.is_err() {
-        return false;
-    }
+    stream.write_all(&syn_frame).await.ok()?;
+    stream.flush().await.ok()?;
 
-    let Some(handshake_frame) = read_control_protocol_frame(&mut stream).await else {
-        return false;
-    };
-
-    let Ok(syn_ack) = etiquette_1::SynAck::decode(handshake_frame.as_slice()) else {
-        return false;
-    };
-
-    let Some(syn) = syn_ack.syn else {
-        return false;
-    };
+    let handshake_frame = read_control_protocol_frame(&mut stream).await?;
+    let syn_ack = etiquette_1::SynAck::decode(handshake_frame.as_slice()).ok()?;
+    let syn = syn_ack.syn?;
     let observed_underlays = crate::addresses::deserialize_underlays(&syn.observed_underlay);
     if observed_underlays.is_empty()
         || observed_underlays
             .iter()
             .any(|underlay| try_from_multiaddr(underlay).as_ref() != Some(&local_peer))
     {
-        return false;
+        return None;
     }
     let underlay = syn.observed_underlay;
 
-    let Some(ack) = syn_ack.ack else {
-        return false;
-    };
+    let ack = syn_ack.ack?;
     if ack.network_id != network_id {
-        return false;
+        return None;
     }
-    let Some(peer_address) = ack.address else {
-        return false;
-    };
+    let peer_address = ack.address?;
     if peer_address.overlay.len() != 32 {
-        return false;
+        return None;
     }
 
     let beneficiary = parse_address(
@@ -200,7 +182,7 @@ async fn handshake_exchange(
         &peer_address.chequebook_address,
     );
     if beneficiary == web3::types::Address::zero() {
-        return false;
+        return None;
     }
     let peer_overlay = peer_address.overlay;
 
@@ -208,7 +190,7 @@ async fn handshake_exchange(
     let timestamp = (js_sys::Date::now() / 1000.0).floor() as i64;
     let chequebook_address = EMPTY_CHEQUEBOOK_ADDRESS.to_vec();
     let mut overlay_input = [0_u8; 60];
-    overlay_input[..20].copy_from_slice(signer.address().as_slice());
+    overlay_input[..20].copy_from_slice(signer.address().as_bytes());
     overlay_input[20..28].copy_from_slice(&network_id.to_le_bytes());
     overlay_input[28..].copy_from_slice(&nonce);
     let overlay = keccak256(overlay_input);
@@ -220,15 +202,13 @@ async fn handshake_exchange(
         timestamp,
         &chequebook_address,
     );
-    let Ok(signature) = signer.sign_message(&sign_data) else {
-        return false;
-    };
+    let signature = signer.sign_message(&sign_data).ok()?;
 
     let ack = etiquette_1::Ack {
         address: Some(etiquette_1::BzzAddress {
             overlay: overlay.to_vec(),
             underlay,
-            signature: signature.as_bytes().to_vec(),
+            signature: signature.to_vec(),
             nonce: nonce.to_vec(),
             timestamp,
             chequebook_address,
@@ -239,12 +219,8 @@ async fn handshake_exchange(
     };
 
     let ack_frame = ack.encode_length_delimited_to_vec();
-    if stream.write_all(&ack_frame).await.is_err() {
-        return false;
-    }
-    if stream.flush().await.is_err() {
-        return false;
-    }
+    stream.write_all(&ack_frame).await.ok()?;
+    stream.flush().await.ok()?;
 
     let _ = stream.close().await;
 
@@ -256,7 +232,7 @@ async fn handshake_exchange(
             connection_attempt_id,
             connection_id,
         })
-        .is_ok()
+        .ok()
 }
 
 pub async fn pricing_handler(
@@ -384,21 +360,15 @@ async fn cheque_exchange(
     beneficiary: Address,
     price: U256,
     deduction: U256,
-) -> bool {
+) -> Option<()> {
     let signer_key = get_chequebook_signer_key().await;
     if signer_key.len() != 32 {
-        return false;
+        return None;
     }
 
-    let Ok(wallet) = PrivateKeySigner::from_slice(&signer_key) else {
-        return false;
-    };
-
-    let Some(cheque_state) =
-        prepare_outgoing_cheque_state(beneficiary, amount, price, deduction).await
-    else {
-        return false;
-    };
+    let wallet = PrivateKeySigner::from_slice(&signer_key).ok()?;
+    let cheque_state =
+        prepare_outgoing_cheque_state(beneficiary, amount, price, deduction).await?;
 
     let mut buf = [0u8; 32];
     price.to_big_endian(&mut buf);
@@ -419,14 +389,10 @@ async fn cheque_exchange(
 
     let buf_non_empty = non_empty.encode_length_delimited_to_vec();
 
-    if stream.write_all(&buf_non_empty).await.is_err() {
-        return false;
-    }
+    stream.write_all(&buf_non_empty).await.ok()?;
     let _ = stream.flush().await;
 
-    if read_control_protocol_frame(&mut stream).await.is_none() {
-        return false;
-    }
+    read_control_protocol_frame(&mut stream).await?;
 
     let client = ChequebookClient::new(
         cheque_state.chequebook,
@@ -434,11 +400,8 @@ async fn cheque_exchange(
         active_profile().wallet_chain_id,
     );
 
-    let Some(cheque_json) =
-        client.prepare_emit_cheque_bytes(cheque_state.beneficiary, cheque_state.cumulative_payout)
-    else {
-        return false;
-    };
+    let cheque_json =
+        client.prepare_emit_cheque_bytes(cheque_state.beneficiary, cheque_state.cumulative_payout)?;
 
     let msg = etiquette_8::EmitCheque {
         cheque: cheque_json,
@@ -446,9 +409,7 @@ async fn cheque_exchange(
 
     let bufw = msg.encode_length_delimited_to_vec();
 
-    if stream.write_all(&bufw).await.is_err() {
-        return false;
-    }
+    stream.write_all(&bufw).await.ok()?;
 
     let _ = stream.flush().await;
 
@@ -456,19 +417,14 @@ async fn cheque_exchange(
     cheque_state
         .cumulative_payout
         .to_big_endian(&mut cumulative_payout_bytes);
-    if !set_chequebook_last_issued_cheque_payout(
+    let saved = set_chequebook_last_issued_cheque_payout(
         cheque_state.chequebook.as_bytes(),
         cheque_state.beneficiary.as_bytes(),
         &cumulative_payout_bytes,
     )
-    .await
-    {
-        let _ = stream.close().await;
-        return false;
-    }
-
+    .await;
     let _ = stream.close().await;
-    true
+    saved.then_some(())
 }
 
 async fn retrieval_exchange(chunk_address: Vec<u8>, mut stream: Stream) -> Option<Vec<u8>> {
@@ -530,6 +486,7 @@ pub async fn connection_handler(
         connected_peers,
     )
     .await
+    .is_some()
 }
 
 async fn open_current_outbound_stream(
@@ -580,7 +537,9 @@ pub async fn issue_handler(
         return false;
     };
 
-    cheque_exchange(amount, stream, beneficiary, price, deduction).await
+    cheque_exchange(amount, stream, beneficiary, price, deduction)
+        .await
+        .is_some()
 }
 
 pub async fn retrieve_handler(
@@ -607,7 +566,9 @@ pub async fn pushsync_handler(
         return false;
     };
 
-    pushsync_exchange(chunk_address, chunk_content, chunk_stamp, stream).await
+    pushsync_exchange(chunk_address, chunk_content, chunk_stamp, stream)
+        .await
+        .is_some()
 }
 
 async fn pushsync_exchange(
@@ -615,15 +576,11 @@ async fn pushsync_exchange(
     chunk_content: Vec<u8>,
     chunk_stamp: Vec<u8>,
     mut stream: Stream,
-) -> bool {
-    if stream.write_all(EMPTY_HEADERS_FRAME).await.is_err() {
-        return false;
-    }
+) -> Option<()> {
+    stream.write_all(EMPTY_HEADERS_FRAME).await.ok()?;
     let _ = stream.flush().await;
 
-    if read_control_protocol_frame(&mut stream).await.is_none() {
-        return false;
-    }
+    read_control_protocol_frame(&mut stream).await?;
 
     let delivery = etiquette_7::Delivery {
         address: chunk_address,
@@ -632,18 +589,14 @@ async fn pushsync_exchange(
     };
 
     let delivery_frame = delivery.encode_length_delimited_to_vec();
-    if stream.write_all(&delivery_frame).await.is_err() || stream.flush().await.is_err() {
-        return false;
-    }
+    stream.write_all(&delivery_frame).await.ok()?;
+    stream.flush().await.ok()?;
 
     let _ = stream.close().await;
 
-    let Some(receipt_frame) = read_control_protocol_frame(&mut stream).await else {
-        return false;
-    };
-    let Ok(receipt) = etiquette_7::Receipt::decode(receipt_frame.as_slice()) else {
-        return false;
-    };
+    let receipt_frame = read_control_protocol_frame(&mut stream).await?;
+    let receipt = etiquette_7::Receipt::decode(receipt_frame.as_slice()).ok()?;
 
-    receipt.err.is_empty() && receipt.address == delivery.address && !receipt.signature.is_empty()
+    (receipt.err.is_empty() && receipt.address == delivery.address && !receipt.signature.is_empty())
+        .then_some(())
 }

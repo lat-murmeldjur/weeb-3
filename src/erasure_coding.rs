@@ -564,18 +564,12 @@ pub fn reconstruct_data_indices(
         .collect();
 
     let decode_rows = inverse_rows_for_selected(&matrix, &selected, &missing_indices)?;
-    let recovered = missing_indices
+    let recovered = decode_rows
         .into_iter()
-        .zip(decode_rows)
-        .map(|(data_index, decode_row)| {
-            (
-                data_index,
-                code_row_slices(&decode_row, &selected_shards, shard_size),
-            )
-        })
+        .map(|decode_row| code_row_slices(&decode_row, &selected_shards, shard_size))
         .collect::<Vec<_>>();
     drop(selected_shards);
-    for (data_index, shard) in recovered {
+    for (data_index, shard) in missing_indices.into_iter().zip(recovered) {
         shards[data_index] = Some(shard);
     }
     Ok(())

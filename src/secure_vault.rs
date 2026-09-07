@@ -399,7 +399,7 @@ async fn secure_create_feed_update_soc_with_stamp_in_window(
         }
     };
     let expected_id = sequence_feed_id(&topic_bytes, feed_index, |input| {
-        alloy_primitives::keccak256(input).into()
+        crate::conventions::keccak256(input).into()
     });
     let Some(vault_feed_index) = exact_js_feed_index(feed_index) else {
         log_error(

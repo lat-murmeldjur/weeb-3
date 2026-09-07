@@ -161,10 +161,6 @@ fn html_element(id: &str) -> Option<HtmlElement> {
     element(id)?.dyn_into::<HtmlElement>().ok()
 }
 
-pub(crate) fn set_bracket_button_label(button: &Element, label: &str) {
-    button.set_text_content(Some(label));
-}
-
 fn set_menu_button_label(button: &Element, label: &str) {
     button.set_text_content(Some(&format!("[ {} ]", label)));
 }

@@ -1784,12 +1784,17 @@ mod upload_redundancy {
             .nth(1)
             .and_then(|source| source.split("let push_chunk_handle = async").next())
             .expect("serialized top-level upload handler");
-        let upload = handler
+        let iteration = handler
+            .split("for incoming_request in")
+            .nth(1)
+            .expect("serialized upload iteration");
+        assert!(!iteration.contains("spawn_local("));
+        let upload = iteration
             .find("let push_reference = upload_resource(")
             .unwrap();
-        let completion = handler[upload..].find(".await;").unwrap() + upload;
-        let next = handler.find("match self.upload_port.1.try_recv()").unwrap();
-        assert!(upload < completion && completion < next);
+        let completion = iteration[upload..].find(".await;").unwrap() + upload;
+        let feedback = iteration.find("chan.try_send(push_reference)").unwrap();
+        assert!(upload < completion && completion < feedback);
 
         let data = UPLOAD_RS
             .split("async fn upload_data_with_root(")

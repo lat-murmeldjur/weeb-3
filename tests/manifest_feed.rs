@@ -549,7 +549,7 @@ mod feed_frontier {
             .and_then(|source| source.split("fn chunk_address_parts").next())
             .expect("retrieve attempt should remain inspectable");
         assert!(attempt.contains("settle_retrieve_attempt("));
-        assert!(attempt.contains("spawn_local(async move"));
+        assert!(!attempt.contains("spawn_local(async move"));
     }
 
     #[test]

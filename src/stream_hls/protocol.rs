@@ -3,17 +3,13 @@ use wasm_bindgen::JsValue;
 
 use crate::{
     stream_hls::HlsStartupPlan,
-    worker_protocol::{bool_property, number_property, set, set_number},
+    worker_protocol::{bool_property, number_property, set_bool, set_number},
 };
 
 pub(crate) fn plan_to_js(plan: &HlsStartupPlan) -> Object {
     let object = Object::new();
     set_number(&object, "bootstrapPosition", plan.bootstrap_position);
-    set(
-        &object,
-        "codecBootstrap",
-        JsValue::from_bool(plan.codec_bootstrap),
-    );
+    set_bool(&object, "codecBootstrap", plan.codec_bootstrap);
     set_number(&object, "playPosition", plan.play_position);
     set_number(&object, "runwayEnd", plan.runway_end);
     set_number(&object, "duration", plan.duration);

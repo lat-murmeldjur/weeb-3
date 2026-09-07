@@ -1,10 +1,10 @@
-//! Minimal append-only HLS feed reader with a three-segment live startup runway.
+//! Minimal append-only HLS feed reader with a duration-based live startup runway.
 
 use std::fmt::Write;
 
 use crate::stream_conventions::HlsStart;
 
-pub(crate) const HLS_LIVE_SYNC_SEGMENTS: usize = 3;
+pub(crate) const HLS_LIVE_STARTUP_BUFFER_SECONDS: f64 = 8.0;
 pub(crate) const HLS_LIVE_EDGE_SEGMENTS: usize = 3;
 pub(crate) const HLS_LIVE_BODY_RUNWAY_SEGMENTS: usize = 4;
 pub(crate) const MAX_STREAM_FEED_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
@@ -141,45 +141,33 @@ impl HlsPlaylist {
         })
     }
 
-    #[cfg(test)]
     pub(crate) fn duration(&self) -> f64 {
         self.segments.iter().map(|segment| segment.duration).sum()
     }
 
     pub(crate) fn startup_plan(&self, start: HlsStart) -> Option<HlsStartupPlan> {
-        let playable = self.segments.iter().filter(|segment| !segment.gap).count();
-        if playable == 0 || start == HlsStart::Live && playable < HLS_LIVE_SYNC_SEGMENTS {
-            return None;
+        if start == HlsStart::Live {
+            let (position, segment) = self
+                .segments
+                .iter()
+                .enumerate()
+                .rfind(|(_, segment)| !segment.gap)?;
+            let sequence = self.sequence.checked_add(u64::try_from(position).ok()?)?;
+            return self
+                .anchored_startup_plan(sequence, &segment.reference)
+                .map(|(plan, _)| plan);
         }
-        let first = match start {
-            HlsStart::Beginning => 0,
-            HlsStart::Live => playable.saturating_sub(HLS_LIVE_EDGE_SEGMENTS),
-        };
-        let last = first.checked_add(match start {
-            HlsStart::Beginning => 0,
-            HlsStart::Live => HLS_LIVE_SYNC_SEGMENTS - 1,
-        })?;
-        let mut offset = 0.0;
-        let mut ordinal = 0;
-        let mut first_playable = None;
-        let mut play_position = None;
-        let mut runway_end = None;
-        for segment in &self.segments {
-            if !segment.gap {
-                first_playable.get_or_insert(offset);
-                if ordinal == first {
-                    play_position = Some(offset);
-                }
-                if ordinal == last {
-                    runway_end = Some(offset + segment.duration);
-                }
-                ordinal += 1;
-            }
-            offset += segment.duration;
-        }
-        let play_position = play_position?;
-        let runway_end = runway_end?;
-        let duration = offset;
+        let (first, segment) = self
+            .segments
+            .iter()
+            .enumerate()
+            .find(|(_, segment)| !segment.gap)?;
+        let play_position = self.segments[..first]
+            .iter()
+            .map(|segment| segment.duration)
+            .sum::<f64>();
+        let runway_end = play_position + segment.duration;
+        let duration = self.duration();
         if !play_position.is_finite()
             || !runway_end.is_finite()
             || !duration.is_finite()
@@ -187,18 +175,57 @@ impl HlsPlaylist {
         {
             return None;
         }
-        let has_bootstrap = start == HlsStart::Live && first != 0;
         Some(HlsStartupPlan {
-            bootstrap_position: if has_bootstrap {
-                first_playable?
-            } else {
-                play_position
-            },
-            codec_bootstrap: has_bootstrap && self.sequence == 0,
+            bootstrap_position: play_position,
+            codec_bootstrap: false,
             play_position,
             runway_end,
             duration,
         })
+    }
+
+    pub(crate) fn anchored_startup_plan(
+        &self,
+        anchor_sequence: u64,
+        anchor_reference: &str,
+    ) -> Option<(HlsStartupPlan, usize)> {
+        let anchor = usize::try_from(anchor_sequence.checked_sub(self.sequence)?).ok()?;
+        let segment = self.segments.get(anchor)?;
+        if segment.gap || segment.reference != anchor_reference {
+            return None;
+        }
+        let mut first = anchor;
+        let mut last = anchor;
+        let mut seconds = segment.duration;
+        while seconds < HLS_LIVE_STARTUP_BUFFER_SECONDS
+            && let Some(next) = self.segments.get(last + 1).filter(|segment| !segment.gap)
+        {
+            seconds += next.duration;
+            last += 1;
+        }
+        while seconds < HLS_LIVE_STARTUP_BUFFER_SECONDS && first > 0 {
+            let previous = &self.segments[first - 1];
+            if previous.gap {
+                break;
+            }
+            seconds += previous.duration;
+            first -= 1;
+        }
+        if !seconds.is_finite() || seconds < HLS_LIVE_STARTUP_BUFFER_SECONDS {
+            return None;
+        }
+        let mut plan = self.startup_plan(HlsStart::Beginning)?;
+        plan.play_position = self.segments[..first]
+            .iter()
+            .map(|segment| segment.duration)
+            .sum();
+        plan.runway_end = self.segments[..=last]
+            .iter()
+            .map(|segment| segment.duration)
+            .sum();
+        plan.codec_bootstrap = self.sequence == 0 && plan.play_position > plan.bootstrap_position;
+        (plan.runway_end.is_finite() && plan.runway_end > plan.play_position)
+            .then_some((plan, first))
     }
 
     pub(crate) fn merge_tail(&mut self, bytes: &[u8]) -> Option<usize> {
@@ -214,9 +241,13 @@ impl HlsPlaylist {
 
     pub(crate) fn merge_playlist(&mut self, candidate: Self) -> Option<usize> {
         let (appended, first) = self.merge_extension(&candidate)?;
-        if appended != 0 {
+        if candidate.sequence < self.sequence {
+            self.sequence = candidate.sequence;
+            self.discontinuity_sequence = candidate.discontinuity_sequence;
+            self.segments = candidate.segments;
+        } else if appended != 0 {
             self.segments
-                .extend_from_slice(candidate.segments.get(first..)?);
+                .extend(candidate.segments.into_iter().skip(first));
         }
         self.finalized = candidate.finalized;
         self.target_duration = self.target_duration.max(candidate.target_duration);
@@ -230,14 +261,11 @@ impl HlsPlaylist {
         let candidate_end = candidate
             .sequence
             .checked_add(u64::try_from(candidate.segments.len()).ok()?)?;
-        if candidate.sequence < self.sequence
-            || candidate.sequence > current_end
-            || candidate_end < current_end
-        {
+        if candidate.sequence > current_end || candidate_end < current_end {
             return None;
         }
         let overlap_end = current_end.min(candidate_end);
-        for sequence in candidate.sequence..overlap_end {
+        for sequence in self.sequence.max(candidate.sequence)..overlap_end {
             let current = usize::try_from(sequence.checked_sub(self.sequence)?).ok()?;
             let incoming = usize::try_from(sequence.checked_sub(candidate.sequence)?).ok()?;
             if !self
@@ -341,6 +369,15 @@ impl HlsPlaylist {
     }
 
     pub(crate) fn render(&self, local_bytes_base: &str, start: HlsStart) -> Vec<u8> {
+        self.render_with_plan(local_bytes_base, start, self.startup_plan(start).as_ref())
+    }
+
+    pub(crate) fn render_with_plan(
+        &self,
+        local_bytes_base: &str,
+        start: HlsStart,
+        plan: Option<&HlsStartupPlan>,
+    ) -> Vec<u8> {
         let mut output = String::with_capacity(self.segments.len().saturating_mul(112) + 160);
         output.push_str(HLS_HEADER);
         output.push_str(if self.segments.iter().any(|segment| segment.gap) {
@@ -365,21 +402,15 @@ impl HlsPlaylist {
         match start {
             HlsStart::Beginning => output.push_str("\n#EXT-X-START:TIME-OFFSET=0,PRECISE=YES"),
             HlsStart::Live => {
-                let tail = self
-                    .segments
-                    .iter()
-                    .rev()
-                    .filter(|segment| !segment.gap)
-                    .take(HLS_LIVE_EDGE_SEGMENTS)
-                    .map(|segment| segment.duration)
-                    .sum::<f64>();
-                let _ = write!(output, "\n#EXT-X-START:TIME-OFFSET=-{tail:.6},PRECISE=NO");
+                let position = plan.map_or(0.0, |plan| plan.play_position);
+                let _ = write!(
+                    output,
+                    "\n#EXT-X-START:TIME-OFFSET={position:.6},PRECISE=NO"
+                );
             }
         }
         let mut discontinuity_sequence = self.discontinuity_sequence;
         let mut beginning_startup = start == HlsStart::Beginning;
-        let mut live_bootstrap = start == HlsStart::Live
-            && self.segments.iter().filter(|segment| !segment.gap).count() > HLS_LIVE_EDGE_SEGMENTS;
         let local_bytes_base = local_bytes_base.trim_end_matches('/');
         for segment in &self.segments {
             let discontinuity = segment.discontinuity_sequence > discontinuity_sequence;
@@ -397,13 +428,10 @@ impl HlsPlaylist {
             output.push_str(&segment.reference);
             let startup = beginning_startup && !segment.gap;
             beginning_startup &= !startup;
-            let bootstrap = live_bootstrap && !segment.gap;
-            live_bootstrap &= !bootstrap;
-            output.push_str(match (start, startup, bootstrap) {
-                (HlsStart::Live, _, true) => "?start=live&bootstrap=1",
-                (HlsStart::Live, _, false) => "?start=live",
-                (HlsStart::Beginning, true, _) => "?start=beginning&startup=1",
-                (HlsStart::Beginning, false, _) => "?start=beginning",
+            output.push_str(match (start, startup) {
+                (HlsStart::Live, _) => "?start=live",
+                (HlsStart::Beginning, true) => "?start=beginning&startup=1",
+                (HlsStart::Beginning, false) => "?start=beginning",
             });
         }
         if self.finalized {

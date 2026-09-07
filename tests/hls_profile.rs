@@ -234,7 +234,7 @@ const PROFILE_SCRIPT: &str = r#"
                 if (profile.refreshment_logs.length > 2048) profile.refreshment_logs.shift();
             }
             if (
-                /(?:Disconnected from|Connection closed|Queued reconnect|Closed unowned|ambiguous|not dispatched)/i.test(text)
+                /(?:HLS |Disconnected from|Connection closed|Queued reconnect|Closed unowned|ambiguous|not dispatched)/i.test(text)
             ) {
                 profile.lifecycle_logs.push(text);
                 if (profile.lifecycle_logs.length > 1024) profile.lifecycle_logs.shift();
@@ -469,6 +469,7 @@ struct BrowserResourcePhaseSummary {
     peak_private_equivalent_bytes: Option<u64>,
     accumulated_cpu_ms: u64,
     average_cpu_cores: Option<f64>,
+    peak_cpu_cores: Option<f64>,
     average_cpu_percent_of_machine: Option<f64>,
     maximum_process_count: Option<usize>,
 }
@@ -480,6 +481,7 @@ struct BrowserResourceSummary {
     logical_cpu_count: usize,
     memory_scope: &'static str,
     private_equivalent_metric: &'static str,
+    steady_peak_cpu_scope: &'static str,
     startup: BrowserResourcePhaseSummary,
     steady_playback: BrowserResourcePhaseSummary,
     samples: Vec<BrowserResourceSample>,
@@ -662,8 +664,8 @@ fn sample_browser_process_tree(
     loop {
         match receiver.recv_timeout(RESOURCE_SAMPLE_INTERVAL) {
             Ok(ResourceSamplerCommand::MarkSteadyPlayback) => {
-                // Close the startup interval before changing phases so startup
-                // CPU is not charged to steady playback.
+                // Keep phase means separate; peak CPU also includes this closing
+                // sample because playback already started before the command arrived.
                 take_sample(phase);
                 phase = ResourcePhase::SteadyPlayback;
             }
@@ -703,7 +705,11 @@ fn browser_process_tree(system: &System, root: Pid) -> HashSet<Pid> {
         for (pid, process) in system.processes() {
             if process
                 .parent()
-                .is_some_and(|parent| tree.contains(&parent))
+                .filter(|parent| tree.contains(parent))
+                .and_then(|parent| system.process(parent))
+                // An orphan can retain a parent PID that Windows later gives
+                // to Chrome. It is not a child of that newer process.
+                .is_some_and(|parent| process.start_time() >= parent.start_time())
             {
                 changed |= tree.insert(*pid);
             }
@@ -729,6 +735,7 @@ fn summarize_browser_resources(
         } else {
             "process virtual memory"
         },
+        steady_peak_cpu_scope: "Maximum whole-sample rate across steady samples and the immediately preceding forced startup-closing sample; that boundary sample overlaps playback and may include pre-playback CPU. Means and memory retain their recorded phase scope.",
         startup: summarize_resource_phase(&samples, ResourcePhase::Startup, logical_cpu_count),
         steady_playback: summarize_resource_phase(
             &samples,
@@ -779,6 +786,12 @@ fn summarize_resource_phase(
         }
     };
     let average_cpu_cores = (observed_ms > 0.0).then_some(accumulated_cpu_ms as f64 / observed_ms);
+    let playback_boundary = samples.windows(2).find_map(|pair| {
+        (phase == ResourcePhase::SteadyPlayback
+            && pair[0].phase == ResourcePhase::Startup
+            && pair[1].phase == ResourcePhase::SteadyPlayback)
+            .then_some(&pair[0])
+    });
 
     BrowserResourcePhaseSummary {
         sample_count: phase_samples.len(),
@@ -797,6 +810,13 @@ fn summarize_resource_phase(
             .max(),
         accumulated_cpu_ms,
         average_cpu_cores,
+        peak_cpu_cores: phase_samples
+            .iter()
+            .copied()
+            .chain(playback_boundary)
+            .filter(|sample| sample.interval_ms > 0.0)
+            .map(|sample| sample.cpu_delta_ms as f64 / sample.interval_ms)
+            .reduce(f64::max),
         average_cpu_percent_of_machine: average_cpu_cores
             .map(|cores| cores * 100.0 / logical_cpu_count as f64),
         maximum_process_count: phase_samples
@@ -976,8 +996,8 @@ fn weeb3_hls_profile() -> Result<()> {
     tab.set_default_timeout(timeout);
 
     tab.call_method(EnableNetwork {
-        max_total_buffer_size: None,
-        max_resource_buffer_size: None,
+        max_total_buffer_size: Some(0),
+        max_resource_buffer_size: Some(0),
         max_post_data_size: None,
         report_direct_socket_traffic: None,
         enable_durable_messages: None,
@@ -1158,6 +1178,11 @@ fn weeb3_hls_profile() -> Result<()> {
         "playlist_at_start": startup_playlist,
         "playlist_at_end": final_playlist,
         "hls_network": hls_network,
+        "network_body_retention": {
+            "max_total_buffer_size": 0,
+            "max_resource_buffer_size": 0,
+            "note": "CDP observes timing events without retaining response bodies; use matching settings for baseline and candidate."
+        },
         "browser_process_tree": resource_usage,
         "browser_targets": browser_targets,
         "browser": browser_metrics,
@@ -2193,8 +2218,8 @@ mod tests {
                 process_count: 3,
                 resident_bytes: 100,
                 private_equivalent_bytes: 200,
-                accumulated_cpu_ms: 10,
-                cpu_delta_ms: 10,
+                accumulated_cpu_ms: 20,
+                cpu_delta_ms: 20,
                 processes: Vec::new(),
             },
             BrowserResourceSample {
@@ -2204,7 +2229,7 @@ mod tests {
                 process_count: 4,
                 resident_bytes: 300,
                 private_equivalent_bytes: 400,
-                accumulated_cpu_ms: 40,
+                accumulated_cpu_ms: 50,
                 cpu_delta_ms: 30,
                 processes: Vec::new(),
             },
@@ -2215,7 +2240,7 @@ mod tests {
                 process_count: 4,
                 resident_bytes: 500,
                 private_equivalent_bytes: 600,
-                accumulated_cpu_ms: 50,
+                accumulated_cpu_ms: 60,
                 cpu_delta_ms: 10,
                 processes: Vec::new(),
             },
@@ -2225,10 +2250,23 @@ mod tests {
         assert_eq!(summary.average_resident_bytes, Some(250.0));
         assert_eq!(summary.average_private_equivalent_bytes, Some(350.0));
         assert_eq!(summary.peak_resident_bytes, Some(300));
-        assert_eq!(summary.accumulated_cpu_ms, 40);
-        assert_eq!(summary.average_cpu_cores, Some(0.1));
-        assert_eq!(summary.average_cpu_percent_of_machine, Some(1.25));
+        assert_eq!(summary.accumulated_cpu_ms, 50);
+        assert_eq!(summary.average_cpu_cores, Some(0.125));
+        assert_eq!(summary.peak_cpu_cores, Some(0.2));
+        assert_eq!(summary.average_cpu_percent_of_machine, Some(1.5625));
         assert_eq!(summary.maximum_process_count, Some(4));
+        assert_eq!(summarize_resource_phase(&[], ResourcePhase::Startup, 8).peak_cpu_cores, None);
+        let steady = summarize_resource_phase(&samples, ResourcePhase::SteadyPlayback, 8);
+        // Include the adjacent 0.1-core boundary, excluding the earlier 0.2-core startup spike.
+        assert_eq!(steady.peak_cpu_cores, Some(0.1));
+        assert_eq!(steady.observed_ms, 500.0);
+        assert_eq!(steady.accumulated_cpu_ms, 10);
+        assert_eq!(steady.average_cpu_cores, Some(0.02));
+        assert_eq!(steady.average_resident_bytes, Some(500.0));
+        assert_eq!(steady.average_private_equivalent_bytes, Some(600.0));
+        assert_eq!(steady.peak_private_equivalent_bytes, Some(600));
+        assert_eq!(summarize_resource_phase(&samples[..2], ResourcePhase::SteadyPlayback, 8).peak_cpu_cores, None);
+        assert_eq!(summarize_resource_phase(&samples[2..], ResourcePhase::SteadyPlayback, 8).peak_cpu_cores, Some(0.02));
     }
 
     #[test]
@@ -2322,6 +2360,7 @@ mod tests {
             peak_private_equivalent_bytes: None,
             accumulated_cpu_ms: 10_000,
             average_cpu_cores: Some(10.0),
+            peak_cpu_cores: None,
             average_cpu_percent_of_machine: None,
             maximum_process_count: None,
         };

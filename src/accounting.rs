@@ -45,10 +45,7 @@ pub(crate) fn bee_reconnect_delay_seconds(
 }
 
 #[cfg(target_arch = "wasm32")]
-use crate::{
-    conventions::{PeerAccounting, get_proximity},
-    mpsc,
-};
+use crate::{conventions::PeerAccounting, mpsc};
 #[cfg(target_arch = "wasm32")]
 use async_std::sync::{Arc, Mutex};
 #[cfg(target_arch = "wasm32")]
@@ -102,7 +99,11 @@ pub(crate) async fn apply_credit(
     } else {
         None
     };
+    let drained = account.reserve == 0;
     drop(account);
+    if drained {
+        crate::ACCOUNTING_DRAINED.notify(usize::MAX);
+    }
 
     if let Some(instruction) = instruction {
         match refreshments.try_send(instruction) {
@@ -135,12 +136,14 @@ pub(crate) async fn apply_refreshment(
 pub(crate) async fn cancel_reserve(accounting: &Mutex<PeerAccounting>, amount: u64) {
     let mut account = accounting.lock().await;
     account.reserve = account.reserve.saturating_sub(amount);
+    let drained = account.reserve == 0;
+    drop(account);
+    if drained {
+        crate::ACCOUNTING_DRAINED.notify(usize::MAX);
+    }
 }
 
 #[cfg(target_arch = "wasm32")]
-pub(crate) fn price(peer_overlay: &[u8], chunk_address: &[u8]) -> u64 {
-    (u64::from(crate::conventions::MAX_PO)
-        - u64::from(get_proximity(peer_overlay, chunk_address).min(crate::conventions::MAX_PO))
-        + 1)
-        * PO_PRICE
+pub(crate) fn price(proximity: u8) -> u64 {
+    (u64::from(crate::conventions::MAX_PO.saturating_sub(proximity)) + 1) * PO_PRICE
 }

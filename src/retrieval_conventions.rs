@@ -55,6 +55,49 @@ use std::{
     },
 };
 
+#[derive(Default)]
+pub(crate) struct TransferPause {
+    paused: AtomicBool,
+    changed: Event,
+}
+
+impl TransferPause {
+    pub(crate) fn toggle(&self) -> bool {
+        let paused = !self.paused.fetch_xor(true, Ordering::AcqRel);
+        self.changed.notify(usize::MAX);
+        paused
+    }
+}
+
+pub(crate) fn transfer_pause_enabled(paused: &Arc<TransferPause>) -> bool {
+    paused.paused.load(Ordering::Acquire)
+}
+
+pub(crate) async fn wait_transfer_unpaused(paused: &Arc<TransferPause>) {
+    while transfer_pause_enabled(paused) {
+        let changed = paused.changed.listen();
+        if transfer_pause_enabled(paused) {
+            changed.await;
+        }
+    }
+}
+
+pub(crate) async fn wait_transfer_unpaused_for_admission(
+    paused: &Arc<TransferPause>,
+    admission: &Option<RetrieveAdmission>,
+) -> bool {
+    let unpaused = wait_transfer_unpaused(paused);
+    if let Some(admission) = admission {
+        let closed = admission.wait_closed();
+        pin_mut!(unpaused, closed);
+        let _ = select(unpaused, closed).await;
+    } else {
+        unpaused.await;
+    }
+
+    retrieve_admission_current(true, admission)
+}
+
 #[derive(Debug, Default)]
 struct RetrieveCancelScope {
     latest: AtomicU64,

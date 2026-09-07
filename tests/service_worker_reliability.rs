@@ -122,42 +122,26 @@ fn npm_release_contains_the_worker_required_by_the_runtime_protocol() {
 
 #[test]
 fn playback_readiness_updates_before_accepting_a_controller() {
-    let nonblocking_setup = between(
+    let setup = between(
         RUNTIME,
-        "fn start_service_worker_setup_if_idle()",
+        "pub async fn get_service_worker()",
         "async fn get_service_worker_locked(",
     );
-    assert!(nonblocking_setup.contains("SERVICE_WORKER_SETUP_LOCK.try_lock()"));
-    assert!(nonblocking_setup.contains("spawn_local(async move"));
-    assert!(nonblocking_setup.contains("get_service_worker_locked(&service0).await"));
-    assert!(RUNTIME.contains("fn start_service_worker_setup_if_idle() -> bool"));
-    assert!(nonblocking_setup.contains("return false;"));
-    assert!(nonblocking_setup.trim_end().ends_with("true\n}"));
-
-    let readiness = playback_readiness();
-    assert!(readiness.contains("start_service_worker_setup_if_idle()"));
-    let setup = readiness
-        .find("let _ = get_service_worker().await")
-        .unwrap();
-    let ready = readiness
-        .find("if service_worker_forwarder_ready().await")
-        .unwrap();
-    assert!(setup < ready);
-    assert!(readiness.contains("controlled_service_worker().is_none()"));
-    assert!(readiness.contains("service_worker_forwarder_ready_with_timeout(500).await"));
-    assert!(!readiness.contains("MAX_FOLLOWUP_PROBES"));
+    assert!(setup.contains("SERVICE_WORKER_SETUP_LOCK.lock().await"));
+    assert!(setup.contains("Object::is(worker.as_ref(), controller.as_ref())"));
+    assert!(setup.contains("get_service_worker_locked(&service0).await"));
+    assert!(playback_readiness().contains("get_service_worker().await.is_some()"));
 }
 
 #[test]
 fn busy_or_failed_setup_remains_retryable_without_overlap() {
     let readiness = playback_readiness();
-    assert!(readiness.contains(
-        "let mut next_setup_retry_ms = js_sys::Date::now() + SERVICE_WORKER_SETUP_RETRY_MS;"
-    ));
-    assert!(readiness.contains("&& start_service_worker_setup_if_idle()"));
-    assert!(readiness.contains("next_setup_retry_ms = now + SERVICE_WORKER_SETUP_RETRY_MS;"));
-    assert!(readiness.contains("now >= next_setup_retry_ms"));
-    assert!(!readiness.contains("let mut setup_started"));
+    assert!(readiness.contains("while still_needed()"));
+    assert!(readiness.contains("timeout(SERVICE_WORKER_SETUP_RETRY, changed.recv()).await"));
+    assert!(readiness.contains("\"controllerchange\""));
+    assert!(readiness.contains("remove_event_listener_with_callback"));
+    assert!(!readiness.contains("task::sleep"));
+    assert!(!readiness.contains("Date::now"));
 }
 
 #[test]
@@ -561,8 +545,21 @@ fn setup_validates_scope_and_every_registration_state() {
         "struct ServiceWorkerProtocolPort",
     );
     assert!(exact_claim.contains("request_service_worker_claim(worker).await"));
-    assert!(exact_claim.contains("service_worker_forwarder_ready().await"));
-    assert!(exact_claim.contains("controlled_service_worker()"));
+    assert!(exact_claim.contains("service_worker_forwarder_ready_with_timeout(1_500).await"));
+    let ready = between(
+        RUNTIME,
+        "async fn service_worker_forwarder_ready_with_timeout(",
+        "async fn request_service_worker_claim(",
+    );
+    assert_in_order(
+        ready,
+        &[
+            "let controller = controlled_service_worker()?",
+            "service_worker_protocol_request(&controller",
+            "Object::is(controller.as_ref(), current.as_ref())",
+            "Some(controller)",
+        ],
+    );
     assert!(setup.contains("JsValue::from_str(\"updateViaCache\")"));
     assert!(setup.contains("JsValue::from_str(\"none\")"));
 }
