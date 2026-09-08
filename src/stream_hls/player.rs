@@ -505,8 +505,8 @@ fn apply_media_action(media: &HtmlMediaElement, action: MediaAction) {
         MediaAction::None => {}
         MediaAction::Begin(position) => begin_playback(media.clone(), position),
         MediaAction::Pause => {
-            set_state(media, "buffering", "Buffering playback...");
             let _ = media.pause();
+            set_state(media, "buffering", "Buffering playback...");
         }
     }
 }
@@ -986,6 +986,7 @@ fn begin_playback(media: HtmlMediaElement, position: f64) {
 fn resume_playback(media: HtmlMediaElement) {
     set_state(&media, "starting", "Starting playback...");
     let position = media.current_time();
+    media.set_hidden(false);
     let result = media.play();
     spawn_local(async move {
         let result = match result {
@@ -1291,8 +1292,10 @@ fn position_buffered(media: &HtmlMediaElement) -> bool {
 }
 
 fn playback_intent(media: &HtmlMediaElement, requested: Option<bool>) -> bool {
-    if requested == Some(false) {
-        set_state(media, "paused", "Paused");
+    match requested {
+        Some(true) => set_state(media, "starting", "Starting playback..."),
+        Some(false) => set_state(media, "paused", "Paused"),
+        None => {}
     }
     let update = |intent: &mut PlaybackIntent| {
         match requested {
@@ -1310,7 +1313,7 @@ fn playback_intent(media: &HtmlMediaElement, requested: Option<bool>) -> bool {
                 .borrow_mut()
                 .as_mut()
                 .filter(|player| player.media == *media)
-                .map(|player| update(&mut player.intent))
+                .map(|player| update(&mut player.intent) && player.ready)
         })
         .or_else(|| {
             NATIVE.with(|active| {
@@ -1318,7 +1321,7 @@ fn playback_intent(media: &HtmlMediaElement, requested: Option<bool>) -> bool {
                     .borrow_mut()
                     .as_mut()
                     .filter(|player| player.media == *media)
-                    .map(|player| update(&mut player.intent))
+                    .map(|player| update(&mut player.intent) && player.ready)
             })
         })
         .unwrap_or(false)
@@ -1639,6 +1642,8 @@ pub(super) fn set_state(media: &HtmlMediaElement, state: &str, message: &str) {
         return;
     }
     media.set_attribute("data-weeb3-hls-state", state).ok();
+    let busy = !matches!(state, "playing" | "ready" | "paused" | "error");
+    media.set_hidden(busy && media.paused());
     let Some(parent) = media.parent_element() else {
         return;
     };
@@ -1647,11 +1652,8 @@ pub(super) fn set_state(media: &HtmlMediaElement, state: &str, message: &str) {
     };
     status.set_text_content(Some(message));
     status.set_attribute("data-state", state).ok();
-    let busy = !matches!(state, "playing" | "ready" | "paused" | "error");
+    status.toggle_attribute_with_force("hidden", busy).ok();
     status
         .set_attribute("aria-busy", if busy { "true" } else { "false" })
         .ok();
-    if let Ok(Some(progress)) = parent.query_selector("progress") {
-        progress.toggle_attribute_with_force("hidden", !busy).ok();
-    }
 }

@@ -298,6 +298,7 @@ pub(crate) async fn open_hls_feed_view(
     let document = web_sys::window().unwrap().document().unwrap();
     let wrapper = document.create_element("section").unwrap();
     let player: HtmlMediaElement = document.create_element("video").unwrap().unchecked_into();
+    player.set_hidden(true);
     player.set_controls(true);
     player.set_autoplay(true);
     player.set_preload("auto");
@@ -313,18 +314,12 @@ pub(crate) async fn open_hls_feed_view(
     let status = document.create_element("div").unwrap();
     status.set_class_name("weeb3-hls-status");
     status.set_attribute("role", "status").ok();
-    status.set_attribute("aria-busy", "true").ok();
-    status.set_text_content(Some("Opening stream..."));
-    let progress = document.create_element("progress").unwrap();
-    progress
-        .set_attribute("aria-label", "Buffering playback")
-        .ok();
     wrapper.append_child(&player).ok();
-    wrapper.append_child(&progress).ok();
     wrapper.append_child(&status).ok();
     if !replace_stream_result_view(&wrapper, view_generation) {
         return;
     }
+    player::set_state(&player, "opening", "Opening stream...");
     if let Err(error) =
         attach_hls_feed_player(client, &player, owner, topic, start, view_generation).await
         && result_view_request_is_current(view_generation)
