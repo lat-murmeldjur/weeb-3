@@ -1010,11 +1010,11 @@ pub(crate) struct Behaviour {
 impl Behaviour {
     pub(crate) fn new(local_public_key: identity::PublicKey) -> Self {
         Self {
-            identify: identify::Behaviour::new(identify::Config::new(
-                "/weeb-3".into(),
-                local_public_key,
-            )),
-            ping: ping::Behaviour::new(ping::Config::new().with_interval(Duration::from_secs(15))),
+            identify: identify::Behaviour::new(
+                identify::Config::new("/weeb-3".into(), local_public_key)
+                    .with_interval(Duration::from_secs(3600)),
+            ),
+            ping: ping::Behaviour::default(),
             stream: StreamBehaviour::new(),
         }
     }
