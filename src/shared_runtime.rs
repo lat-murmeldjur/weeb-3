@@ -75,12 +75,11 @@ fn create_runtime(
     status: Rc<RuntimeStatus>,
     requested_url: Option<&str>,
 ) -> Result<SharedRuntime, String> {
-    let window =
-        web_sys::window().ok_or_else(|| "SharedWorker requires a window client".to_string())?;
+    let window = web_sys::window().ok_or("SharedWorker requires a window client")?;
     let base = window
-        .location()
-        .href()
-        .map_err(|error| js_error("could not read the page URL", &error))?;
+        .document()
+        .and_then(|document| document.base_uri().ok().flatten())
+        .ok_or("could not read the document base URL")?;
     let url = Url::new_with_base(requested_url.unwrap_or(SHARED_WORKER_URL), &base)
         .map_err(|error| js_error("invalid SharedWorker URL", &error))?;
     url.search_params()
@@ -90,6 +89,7 @@ fn create_runtime(
     let url = url.href();
     let options = WorkerOptions::new();
     options.set_type(WorkerType::Module);
+    set(options.as_ref(), "extendedLifetime", JsValue::TRUE);
     options.set_name(&format!(
         "weeb3-shared-runtime-v{SHARED_WORKER_PROTOCOL}:{url}"
     ));
@@ -137,7 +137,7 @@ fn register_service_worker_relay(port: &MessagePort) -> Result<u64, String> {
             let ports = Rc::new(RefCell::new(Vec::<(u64, MessagePort)>::new()));
             let listener_ports = ports.clone();
             let service_workers = web_sys::window()
-                .ok_or_else(|| "SharedWorker requires a window client".to_string())?
+                .ok_or("SharedWorker requires a window client")?
                 .navigator()
                 .service_worker();
             let listener_service_workers = service_workers.clone();
@@ -300,7 +300,7 @@ impl SharedRuntime {
         reply.set_onmessage(None);
         reply.close();
         response?
-            .map_err(|_| "SharedWorker reply channel closed".to_string())?
+            .map_err(|_| "SharedWorker reply channel closed")?
             .dyn_into::<Object>()
             .map_err(|_| "SharedWorker returned a non-object response".to_string())
     }
@@ -310,7 +310,7 @@ impl SharedRuntime {
         let response = self.request(&request, START_TIMEOUT).await?;
         require_ok(&response, "SharedWorker startup")?;
         let actual = integer_property(&response, "networkId")
-            .ok_or_else(|| "SharedWorker startup omitted networkId".to_string())?;
+            .ok_or("SharedWorker startup omitted networkId")?;
         if actual != network_id {
             return Err(format!(
                 "SharedWorker started network {actual}, expected {network_id}"

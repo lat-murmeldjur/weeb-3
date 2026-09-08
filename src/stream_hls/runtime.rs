@@ -307,7 +307,7 @@ async fn hls_range(
     span: u64,
     start: u64,
     end: u64,
-    generation: Option<u64>,
+    admitted: &dyn Fn() -> bool,
 ) -> Option<Bytes> {
     let epoch = BODY_CACHE.with(|cache| cache.borrow().epoch);
     if let Some(bytes) = BODY_CACHE.with(|cache| cache.borrow().get(reference, start, end)) {
@@ -317,7 +317,7 @@ async fn hls_range(
         BODY_CACHE.with(|cache| {
             let cache = cache.borrow();
             cache.epoch == epoch
-                && (generation.is_none_or(feed_is_current)
+                && (admitted()
                     || cache.pending_bodies.get(reference).is_some_and(|pending| {
                         pending.epoch == epoch
                             && pending.waiters.iter().any(|waiter| !waiter.is_closed())
@@ -325,6 +325,18 @@ async fn hls_range(
         })
     };
     read_cached_hls_range(client, reference, span, start, end, &current).await
+}
+
+fn live_body_is_current(id: u64, reference: &str) -> bool {
+    FEED.with(|feed| {
+        feed.borrow().as_ref().is_some_and(|active| {
+            active.id == id
+                && (active.start != HlsStart::Live
+                    || live_runway_targets(active)
+                        .iter()
+                        .any(|target| target.reference == reference))
+        })
+    })
 }
 
 async fn hls_body(client: Arc<Weeb3>, reference: String, generation: Option<u64>) -> Option<Bytes> {
@@ -346,7 +358,10 @@ async fn hls_body(client: Arc<Weeb3>, reference: String, generation: Option<u64>
             return None;
         }
         let end = root.span.checked_sub(1)?;
-        hls_range(&client, &reference, root.span, 0, end, generation).await
+        hls_range(&client, &reference, root.span, 0, end, &|| {
+            generation.is_none_or(|id| live_body_is_current(id, &reference))
+        })
+        .await
     }
     .await;
     BODY_CACHE.with(|cache| cache.borrow_mut().finish_body(reference, epoch, body))
@@ -410,25 +425,24 @@ fn latest_live_position(active: &FeedSession) -> Option<usize> {
         .map(|(_, first)| first)
 }
 
-fn live_runway_targets(active: &FeedSession) -> Vec<String> {
+fn live_runway_targets(active: &FeedSession) -> &[super::HlsSegment] {
     let Some(playlist) = active.playlist.as_ref() else {
-        return Vec::new();
+        return &[];
     };
     let foreground = active.live_foreground.as_deref().and_then(|reference| {
         playlist
             .segments
             .iter()
             .enumerate()
-            .rfind(|(position, segment)| {
-                live_segment_is_playable(active, *position) && segment.reference == reference
+            .rposition(|(position, segment)| {
+                segment.reference == reference && live_segment_is_playable(active, position)
             })
-            .map(|(position, _)| position)
     });
     let Some(position) = foreground.or_else(|| latest_live_position(active)) else {
-        return Vec::new();
+        return &[];
     };
     let mut seconds = 0.0;
-    playlist.segments[position..]
+    let length = playlist.segments[position..]
         .iter()
         .enumerate()
         .take_while(|(offset, segment)| {
@@ -442,8 +456,8 @@ fn live_runway_targets(active: &FeedSession) -> Vec<String> {
             }
             true
         })
-        .map(|(_, segment)| segment.reference.clone())
-        .collect()
+        .count();
+    &playlist.segments[position..position + length]
 }
 
 fn presentation_playlist(active: &FeedSession) -> Option<std::borrow::Cow<'_, HlsPlaylist>> {
@@ -486,7 +500,13 @@ fn spawn_live_runway(id: u64) {
             let Some((changed, references)) = FEED.with(|feed| {
                 let feed = feed.borrow();
                 let active = feed.as_ref().filter(|active| active.id == id)?;
-                Some((active.changed.listen(), live_runway_targets(active)))
+                Some((
+                    active.changed.listen(),
+                    live_runway_targets(active)
+                        .iter()
+                        .map(|segment| segment.reference.clone())
+                        .collect::<Vec<_>>(),
+                ))
             }) else {
                 break;
             };
@@ -516,7 +536,10 @@ fn spawn_live_runway(id: u64) {
                     loaded.insert(reference, true);
                 } else {
                     loaded.remove(&reference);
-                    async_std::task::sleep(Duration::from_millis(HLS_BODY_RETRY_DELAY_MS)).await;
+                    if live_body_is_current(id, &reference) {
+                        async_std::task::sleep(Duration::from_millis(HLS_BODY_RETRY_DELAY_MS))
+                            .await;
+                    }
                 }
             }
         }
@@ -541,7 +564,7 @@ fn prefetch_from_reference(reference: &str, cached: bool) -> (Option<u64>, Optio
                 .iter()
                 .enumerate()
                 .rfind(|(position, segment)| {
-                    live_segment_is_playable(active, *position) && matches(segment)
+                    matches(segment) && live_segment_is_playable(active, *position)
                 })?;
             if active.live_startup_plan.is_some() {
                 active.live_foreground = Some(reference.to_string());
@@ -1026,7 +1049,7 @@ fn warm_hls_prefix(client: Arc<Weeb3>, id: u64, playlist: &HlsPlaylist, start: H
                         root.span,
                         offset,
                         (offset + width).min(maximum) - 1,
-                        Some(id),
+                        &|| feed_is_current(id),
                     )
                     .await
                     .is_none()
@@ -1825,7 +1848,7 @@ async fn fetch_hls_body_response(
                 None,
             );
         };
-        let Some(bytes) = hls_range(&client, &reference, span, start, end, None).await else {
+        let Some(bytes) = hls_range(&client, &reference, span, start, end, &|| true).await else {
             return FetchResponse::error(503, "HLS segment range was unavailable");
         };
         let headers = hls_body_headers(
@@ -1843,7 +1866,7 @@ async fn fetch_hls_body_response(
 
     let mime = if codec_bootstrap {
         let prefix_end = span.saturating_sub(1).min(188);
-        hls_range(&client, &reference, span, 0, prefix_end, None)
+        hls_range(&client, &reference, span, 0, prefix_end, &|| true)
             .await
             .map_or("application/octet-stream", |prefix| {
                 hls_payload_mime(&prefix)

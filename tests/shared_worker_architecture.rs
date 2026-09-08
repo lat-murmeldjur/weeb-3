@@ -187,6 +187,7 @@ fn one_shared_worker_owns_the_node_and_unified_wasm() {
     let facade = compact(SHARED_RUNTIME);
     assert!(facade.contains("constSHARED_WORKER_URL:&str=\"/weeb-3/worker.js\";"));
     assert!(facade.contains("requested_url.unwrap_or(SHARED_WORKER_URL)"));
+    assert!(facade.contains("document.base_uri().ok().flatten()"));
     assert!(facade.contains(".set(\"build\",env!(\"WEEB3_BUILD_VERSION\"))"));
     assert!(facade.contains("weeb3-shared-runtime-v{SHARED_WORKER_PROTOCOL}:{url}"));
     assert!(facade.contains("SharedWorker::new_with_worker_options(&url,&options)"));

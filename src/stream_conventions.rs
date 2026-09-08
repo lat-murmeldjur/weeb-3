@@ -95,36 +95,17 @@ pub(crate) fn parse_stream_share_link(input: &str) -> Result<StreamShareRoute, S
 }
 
 fn decode_path_segment(value: &str) -> Result<String, String> {
-    let bytes = value.as_bytes();
-    let mut decoded = Vec::with_capacity(bytes.len());
-    let mut cursor = 0;
-    while cursor < bytes.len() {
-        if bytes[cursor] != b'%' {
-            decoded.push(bytes[cursor]);
-            cursor += 1;
-            continue;
-        }
-        let high = bytes
-            .get(cursor + 1)
-            .and_then(|byte| hex_value(*byte))
-            .ok_or_else(|| "stream topic has an invalid percent escape".to_string())?;
-        let low = bytes
-            .get(cursor + 2)
-            .and_then(|byte| hex_value(*byte))
-            .ok_or_else(|| "stream topic has an invalid percent escape".to_string())?;
-        decoded.push((high << 4) | low);
-        cursor += 3;
+    let mut decoded = Vec::with_capacity(value.len());
+    let mut parts = value.as_bytes().split(|byte| *byte == b'%');
+    decoded.extend_from_slice(parts.next().unwrap_or_default());
+    for part in parts {
+        let mut byte = [0];
+        hex::decode_to_slice(part.get(..2).unwrap_or_default(), &mut byte)
+            .map_err(|_| "stream topic has an invalid percent escape".to_string())?;
+        decoded.push(byte[0]);
+        decoded.extend_from_slice(&part[2..]);
     }
     String::from_utf8(decoded).map_err(|_| "stream topic is not valid UTF-8".to_string())
-}
-
-fn hex_value(byte: u8) -> Option<u8> {
-    match byte {
-        b'0'..=b'9' => Some(byte - b'0'),
-        b'a'..=b'f' => Some(byte - b'a' + 10),
-        b'A'..=b'F' => Some(byte - b'A' + 10),
-        _ => None,
-    }
 }
 
 pub(crate) fn parse_single_range(range: Option<&str>, size: u64) -> Option<Result<(u64, u64), ()>> {

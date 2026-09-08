@@ -57,7 +57,8 @@ fn whole_hls_bodies_are_singleflight_and_share_the_bounded_range_budget() {
 
     let load = section(HLS_RUNTIME, "async fn hls_body(", "fn prefetch_bodies(");
     assert!(load.contains("BodyLoad::Cached(body)"));
-    assert!(load.contains("hls_range(&client, &reference, root.span, 0, end, generation).await"));
+    assert!(load.contains("hls_range(&client, &reference, root.span, 0, end, &|| {"));
+    assert!(load.contains("generation.is_none_or(|id| live_body_is_current(id, &reference))"));
     assert!(!load.contains("Arc::from(body)"));
 
     let range = section(HLS_RUNTIME, "async fn hls_range(", "async fn hls_body(");
@@ -68,6 +69,8 @@ fn whole_hls_bodies_are_singleflight_and_share_the_bounded_range_budget() {
     );
     assert!(cache.contains("body.slice(start..end)"));
     assert!(!range.contains("Arc::from"));
+    assert!(range.contains("admitted: &dyn Fn() -> bool"));
+    assert!(HLS_RUNTIME.contains("&|| feed_is_current(id)"));
     assert!(load.contains("BodyLoad::Wait(waiter)"));
     assert!(load.contains("BodyLoad::Lead"));
     assert!(load.contains("root.span > HLS_BODY_MAX_BYTES"));
@@ -289,7 +292,7 @@ fn hls_service_streams_whole_bodies_through_exact_inclusive_ranges() {
     );
     let parsed = response.find("parse_hls_range(range, span)").unwrap();
     let retrieved = response
-        .find("hls_range(&client, &reference, span, start, end, None).await")
+        .find("hls_range(&client, &reference, span, start, end, &|| true).await")
         .unwrap();
     let content_range = response
         .find("let headers = hls_body_headers(")

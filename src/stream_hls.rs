@@ -47,7 +47,6 @@ pub(crate) struct PreparedHlsFeed {
 #[derive(Default)]
 pub(crate) struct HlsTailFailure {
     key: Option<(u64, u64, String)>,
-    count: u8,
 }
 
 impl HlsTailFailure {
@@ -59,18 +58,14 @@ impl HlsTailFailure {
                     (*current_snapshot, *current_sequence, current.as_str())
                         == (snapshot, sequence, reference)
                 });
-        if matches {
-            self.count = self.count.saturating_add(1);
-        } else {
+        if !matches {
             self.key = Some((snapshot, sequence, reference.to_string()));
-            self.count = 1;
         }
-        self.count >= 2
+        matches
     }
 
     pub(crate) fn clear(&mut self) {
         self.key = None;
-        self.count = 0;
     }
 }
 
@@ -100,23 +95,19 @@ impl HlsPlaylist {
         let mut discontinuity_sequence = None;
         let mut target_duration = None;
         for line in text.lines().map(str::trim) {
-            if let Some(value) = line.strip_prefix("#EXT-X-MEDIA-SEQUENCE:") {
-                if sequence.replace(value.trim().parse().ok()?).is_some() {
-                    return None;
-                }
-            } else if let Some(value) = line.strip_prefix("#EXT-X-DISCONTINUITY-SEQUENCE:") {
-                if discontinuity_sequence
-                    .replace(value.trim().parse().ok()?)
-                    .is_some()
+            for (prefix, field) in [
+                ("#EXT-X-MEDIA-SEQUENCE:", &mut sequence),
+                (
+                    "#EXT-X-DISCONTINUITY-SEQUENCE:",
+                    &mut discontinuity_sequence,
+                ),
+                ("#EXT-X-TARGETDURATION:", &mut target_duration),
+            ] {
+                if let Some(value) = line.strip_prefix(prefix)
+                    && field.replace(value.trim().parse::<u64>().ok()?).is_some()
                 {
                     return None;
                 }
-            } else if let Some(value) = line.strip_prefix("#EXT-X-TARGETDURATION:")
-                && target_duration
-                    .replace(value.trim().parse::<u64>().ok()?.max(1))
-                    .is_some()
-            {
-                return None;
             }
         }
         let discontinuity_sequence = discontinuity_sequence.unwrap_or(0);
@@ -143,6 +134,11 @@ impl HlsPlaylist {
 
     pub(crate) fn duration(&self) -> f64 {
         self.segments.iter().map(|segment| segment.duration).sum()
+    }
+
+    fn end_sequence(&self) -> Option<u64> {
+        self.sequence
+            .checked_add(self.segments.len().try_into().ok()?)
     }
 
     pub(crate) fn startup_plan(&self, start: HlsStart) -> Option<HlsStartupPlan> {
@@ -255,12 +251,8 @@ impl HlsPlaylist {
     }
 
     fn merge_extension(&self, candidate: &Self) -> Option<(usize, usize)> {
-        let current_end = self
-            .sequence
-            .checked_add(u64::try_from(self.segments.len()).ok()?)?;
-        let candidate_end = candidate
-            .sequence
-            .checked_add(u64::try_from(candidate.segments.len()).ok()?)?;
+        let current_end = self.end_sequence()?;
+        let candidate_end = candidate.end_sequence()?;
         if candidate.sequence > current_end || candidate_end < current_end {
             return None;
         }
@@ -319,9 +311,7 @@ impl HlsPlaylist {
     ) -> Option<Self> {
         snapshots.retain(|(index, _)| *index < head_index);
         snapshots.sort_by_key(|(index, _)| *index);
-        let expected_end = head
-            .sequence
-            .checked_add(u64::try_from(head.segments.len()).ok()?)?;
+        let expected_end = head.end_sequence()?;
         snapshots.push((head_index, head));
         let mut snapshots = snapshots.into_iter();
         let (_, mut archive) = snapshots.next()?;
@@ -331,9 +321,7 @@ impl HlsPlaylist {
         for (_, snapshot) in snapshots {
             archive.merge_playlist(snapshot)?;
         }
-        let archive_end = archive
-            .sequence
-            .checked_add(u64::try_from(archive.segments.len()).ok()?)?;
+        let archive_end = archive.end_sequence()?;
         (archive_end == expected_end).then_some(archive)
     }
 

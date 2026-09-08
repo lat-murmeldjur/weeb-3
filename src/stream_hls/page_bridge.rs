@@ -132,11 +132,11 @@ fn parse_prepare_response(response: Object) -> Result<(String, HlsStartupPlan, u
             .unwrap_or_else(|| "SharedWorker HLS preparation failed".to_string()));
     }
     let source = string_property(&response, "source")
-        .ok_or_else(|| "SharedWorker HLS preparation omitted source".to_string())?;
+        .ok_or("SharedWorker HLS preparation omitted source")?;
     let plan = plan_from_js(&property(&response, "plan"))
-        .ok_or_else(|| "SharedWorker returned an invalid HLS plan".to_string())?;
+        .ok_or("SharedWorker returned an invalid HLS plan")?;
     let session = integer_property(&response, "session")
-        .ok_or_else(|| "SharedWorker HLS preparation omitted session".to_string())?;
+        .ok_or("SharedWorker HLS preparation omitted session")?;
     Ok((source, plan, session))
 }
 
@@ -297,10 +297,10 @@ pub(crate) async fn open_hls_feed_view(
     let view_generation = begin_result_view_request();
     let document = web_sys::window().unwrap().document().unwrap();
     let wrapper = document.create_element("section").unwrap();
-    let player = document.create_element("video").unwrap();
-    player.set_attribute("controls", "").ok();
-    player.set_attribute("autoplay", "").ok();
-    player.set_attribute("preload", "auto").ok();
+    let player: HtmlMediaElement = document.create_element("video").unwrap().unchecked_into();
+    player.set_controls(true);
+    player.set_autoplay(true);
+    player.set_preload("auto");
     player.set_attribute("playsinline", "").ok();
     player
         .set_attribute("style", "width:90%;max-height:75vh;")
@@ -308,30 +308,28 @@ pub(crate) async fn open_hls_feed_view(
     player
         .set_attribute("aria-label", "Swarm HLS video stream")
         .ok();
-    if let Some(media) = player.dyn_ref::<HtmlMediaElement>() {
-        media.set_default_muted(true);
-        media.set_muted(true);
-    }
+    player.set_default_muted(true);
+    player.set_muted(true);
     let status = document.create_element("div").unwrap();
     status.set_class_name("weeb3-hls-status");
     status.set_attribute("role", "status").ok();
-    status.set_text_content(Some("Discovering the HLS feed edge..."));
+    status.set_attribute("aria-busy", "true").ok();
+    status.set_text_content(Some("Opening stream..."));
+    let progress = document.create_element("progress").unwrap();
+    progress
+        .set_attribute("aria-label", "Buffering playback")
+        .ok();
     wrapper.append_child(&player).ok();
+    wrapper.append_child(&progress).ok();
     wrapper.append_child(&status).ok();
     if !replace_stream_result_view(&wrapper, view_generation) {
         return;
     }
-    match attach_hls_feed_player(client, &player, owner, topic, start, view_generation).await {
-        Ok(mode) if result_view_request_is_current(view_generation) => {
-            status.set_text_content(Some(&format!(
-                "HLS player attached with {mode}; buffering through weeb-3."
-            )))
-        }
-        Err(error) if result_view_request_is_current(view_generation) => {
-            status.set_text_content(Some(&error));
-            status.set_attribute("data-state", "error").ok();
-        }
-        _ => {}
+    if let Err(error) =
+        attach_hls_feed_player(client, &player, owner, topic, start, view_generation).await
+        && result_view_request_is_current(view_generation)
+    {
+        player::set_state(&player, "error", &error);
     }
 }
 

@@ -461,29 +461,39 @@ mod hls_minimal {
     #[test]
     fn network_recovery_and_native_fallback_keep_the_planned_gate() {
         const PLAYER: &str = include_str!("../src/stream_hls/player.rs");
-        assert!(PLAYER.contains("RecoverNetwork(Hls, f64)"));
-        assert!(PLAYER.contains("ReloadSource(Hls, String)"));
-        assert!(PLAYER.contains("HardRestart(String)"));
-        assert!(PLAYER.contains("const MAX_HARD_RESTARTS: u8 = 2"));
-        assert!(PLAYER.contains("hard_restarts: u8"));
-        assert!(PLAYER.contains("callback: Closure<dyn FnMut(JsValue, JsValue)>"));
-        assert!(PLAYER.contains("hls_class: JsValue"));
-        assert!(PLAYER.contains("player.plan.play_position"));
-        assert!(PLAYER.contains("Action::RecoverNetwork(hls, position)"));
-        assert!(PLAYER.contains("hls.start_load_at(position)"));
-        assert!(PLAYER.contains("finish_hls_action(id"));
-        assert!(PLAYER.contains("Action::ReloadSource(hls, source) =>"));
-        assert!(PLAYER.contains("hls.load_source(&source)"));
+        for needle in [
+            "RecoverNetwork(Hls, f64)",
+            "ReloadSource(Hls, String)",
+            "HardRestart(String)",
+            "const MAX_HARD_RESTARTS: u8 = 2",
+            "hard_restarts: u8",
+            "callback: Closure<dyn FnMut(JsValue, JsValue)>",
+            "hls_class: JsValue",
+            "player.plan.play_position",
+            "Action::RecoverNetwork(hls, position)",
+            "hls.start_load_at(position)",
+            "finish_hls_action(id",
+            "Action::ReloadSource(hls, source) =>",
+            "hls.load_source(&source)",
+            "player.codec_bootstrap_pending = player.plan.codec_bootstrap",
+            "fn hard_restart(id: u64, message: String)",
+            "construct_hls(&player.hls_class",
+            "std::mem::replace(&mut player.hls",
+            "remove_hls_events(&player.hls",
+            "let _ = retired.destroy()",
+            "hls.attach_media(&media)",
+            "fn is_current_hls(id: u64, hls: &Hls)",
+            "return play_native(id, media, source, plan, start)",
+            "media.set_src(source)",
+            "handle_native_event",
+            "buffered_covers(",
+            ".load_source(source)",
+            ".and_then(|_| hls.attach_media(&media))",
+        ] {
+            assert!(PLAYER.contains(needle), "{needle}");
+        }
         assert!(!PLAYER.contains("missing_video_source_buffer_error"));
         assert!(!PLAYER.contains("RestartAfterEvent"));
-        assert!(PLAYER.contains("player.codec_bootstrap_pending = player.plan.codec_bootstrap"));
-        assert!(PLAYER.contains("fn hard_restart(id: u64, message: String)"));
-        assert!(PLAYER.contains("construct_hls(&player.hls_class"));
-        assert!(PLAYER.contains("std::mem::replace(&mut player.hls"));
-        assert!(PLAYER.contains("remove_hls_events(&player.hls"));
-        assert!(PLAYER.contains("let _ = retired.destroy()"));
-        assert!(PLAYER.contains("hls.attach_media(&media)"));
-        assert!(PLAYER.contains("fn is_current_hls(id: u64, hls: &Hls)"));
         let restart = PLAYER
             .split_once("fn hard_restart(id: u64, message: String)")
             .unwrap()
@@ -498,12 +508,6 @@ mod hls_minimal {
         assert!(restart.find("std::mem::replace") < restart.find("reload_position = None"));
         assert!(!restart.contains("player.seek"));
         assert!(!restart.contains("tail_failure.clear()"));
-        assert!(PLAYER.contains("return play_native(id, media, source, plan, start)"));
-        assert!(PLAYER.contains("media.set_src(source)"));
-        assert!(PLAYER.contains("handle_native_event"));
-        assert!(PLAYER.contains("buffered_covers("));
-        assert!(PLAYER.contains(".load_source(source)"));
-        assert!(PLAYER.contains(".and_then(|_| hls.attach_media(&media))"));
     }
 
     #[test]
@@ -536,7 +540,7 @@ mod hls_minimal {
             .0;
         assert!(body.contains("BodyLoad::Wait(waiter) => return waiter.recv().await"));
         assert!(body.contains("BodyLoad::Lead(epoch) => epoch"));
-        assert!(body.contains("hls_range(&client, &reference, root.span, 0, end, generation).await"));
+        assert!(body.contains("generation.is_none_or(|id| live_body_is_current(id, &reference))"));
         assert!(body.contains("finish_body(reference, epoch, body)"));
 
         let range = RUNTIME
@@ -574,7 +578,9 @@ mod hls_minimal {
             suppress < attach,
             "autoplay must be disabled before MSE attach"
         );
-        assert!(PLAYER.contains("media.remove_attribute(\"autoplay\")"));
+        assert!(PLAYER.contains("let requested = media.autoplay()"));
+        assert!(PLAYER.contains("media.set_autoplay(false)"));
+        assert!(PLAYER.contains("media.set_autoplay(true)"));
         assert!(
             PLAYER.contains(
                 "playback_start_position(&player.media, &player.plan, player.live, false)"
@@ -613,15 +619,12 @@ mod hls_minimal {
             "timeupdate",
             "durationchange",
             "seeking",
+            "seeked",
+            "waiting",
         ] {
             assert!(events.contains(&format!("\"{event}\"")));
         }
-        for pause_gate in [
-            "\"seeked\"",
-            "SeekGate",
-            "settle_seek",
-            "HLS seek runway",
-        ] {
+        for pause_gate in ["SeekGate", "settle_seek", "HLS seek runway"] {
             assert!(!PLAYER.contains(pause_gate));
         }
         let lifecycle = PLAYER
@@ -633,7 +636,10 @@ mod hls_minimal {
             .0;
         assert!(lifecycle.contains("event == \"play\" && !ready"));
         assert!(lifecycle.contains("event == \"timeupdate\""));
-        assert!(lifecycle.contains("*clock_origin + CLOCK_ADVANCE_EPSILON_SECONDS"));
+        assert!(lifecycle.contains("position + CLOCK_ADVANCE_EPSILON_SECONDS"));
+        assert!(lifecycle.contains("*clock_position = Some(media.current_time())"));
+        assert!(lifecycle.contains("&& !media.seeking()"));
+        assert!(!PLAYER.contains("clock_origin"));
     }
 
     #[test]
@@ -641,22 +647,40 @@ mod hls_minimal {
         const PLAYER: &str = include_str!("../src/stream_hls/player.rs");
         const RUNTIME: &str = include_str!("../src/stream_hls/runtime.rs");
         const WORKER_BRIDGE: &str = include_str!("../src/stream_hls/worker_bridge.rs");
-        assert!(PLAYER.contains("hlsBufferCreated"));
-        assert!(PLAYER.contains("codec_bootstrap_pending"));
+        for needle in [
+            "hlsBufferCreated",
+            "codec_bootstrap_pending",
+            "is_main_fragment(data)",
+            "player.plan.bootstrap_position",
+            "player.plan.play_position",
+            "hlsBufferAppended",
+            "const MAX_CONSECUTIVE_MEDIA_RECOVERIES: u8 = 1",
+            "fragLoadError",
+            "fragLoadTimeOut",
+            "fragParsingError",
+            "failed_media_identity(data)",
+            "resolve_remote_tail_failure(",
+            "super::page_bridge::resolve_live_tail_failure(sequence, &reference)",
+            "player.source.clone()",
+            "Action::ReloadSource(",
+            "player.reload_position = Some(target)",
+            "fatal_recovery_action(player, error_type.as_deref(), details, restart)",
+            "if player.reload_position.is_some()",
+            "return Action::HardRestart(details)",
+            "player.consecutive_media_recoveries += 1",
+            "player.consecutive_media_recoveries = 0",
+            "if event == \"hlsFragBuffered\"",
+            "player.media.set_current_time(position)",
+            "Action::Retarget(hls, media, position) =>",
+            "hls.stop_load()",
+            "let target = position + BUFFER_EPSILON_SECONDS",
+            "media.set_current_time(target)",
+            "hls.start_load_at(target)",
+            "if start == HlsStart::Live {\n        LIVE_RUNWAY_BUFFER",
+        ] {
+            assert!(PLAYER.contains(needle), "{needle}");
+        }
         assert!(!PLAYER.contains("has_video_track"));
-        assert!(PLAYER.contains("is_main_fragment(data)"));
-        assert!(PLAYER.contains("player.plan.bootstrap_position"));
-        assert!(PLAYER.contains("player.plan.play_position"));
-        assert!(PLAYER.contains("hlsBufferAppended"));
-        assert!(PLAYER.contains("const MAX_CONSECUTIVE_MEDIA_RECOVERIES: u8 = 1"));
-        assert!(PLAYER.contains("fragLoadError"));
-        assert!(PLAYER.contains("fragLoadTimeOut"));
-        assert!(PLAYER.contains("fragParsingError"));
-        assert!(PLAYER.contains("failed_media_identity(data)"));
-        assert!(PLAYER.contains("resolve_remote_tail_failure("));
-        assert!(
-            PLAYER.contains("super::page_bridge::resolve_live_tail_failure(sequence, &reference)")
-        );
         assert!(WORKER_BRIDGE.contains(".record(snapshot, sequence, &reference)"));
         assert!(RUNTIME.contains("pub(crate) fn live_tail_failure_identity("));
         assert!(RUNTIME.contains("pub(crate) fn install_live_tail_fallback("));
@@ -672,19 +696,7 @@ mod hls_minimal {
         assert!(RUNTIME.contains("playlist.render(local_bytes_base, start)"));
         assert!(RUNTIME.contains("presentation.mark_gap(*sequence, reference)"));
         assert!(RUNTIME.contains(".take(HLS_LIVE_EDGE_SEGMENTS)"));
-        assert!(PLAYER.contains("player.source.clone()"));
-        assert!(PLAYER.contains("Action::ReloadSource("));
-        assert!(PLAYER.contains("player.reload_position = Some(target)"));
-        assert!(
-            PLAYER
-                .contains("fatal_recovery_action(player, error_type.as_deref(), details, restart)")
-        );
-        assert!(PLAYER.contains("if player.reload_position.is_some()"));
-        assert!(PLAYER.contains("return Action::HardRestart(details)"));
         assert!(!PLAYER.contains("internal_seek"));
-        assert!(PLAYER.contains("player.consecutive_media_recoveries += 1"));
-        assert!(PLAYER.contains("player.consecutive_media_recoveries = 0"));
-        assert!(PLAYER.contains("if event == \"hlsFragBuffered\""));
 
         let manifest = PLAYER.find("\"hlsManifestParsed\" =>").unwrap();
         let bootstrap = PLAYER[manifest..]
@@ -713,7 +725,6 @@ mod hls_minimal {
         assert!(reload.contains("hls.stop_load()"));
         assert!(reload.contains("hls.load_source(&source)"));
         assert!(!reload.contains("media.set_current_time(position)"));
-        assert!(PLAYER.contains("player.media.set_current_time(position)"));
         assert!(reload.contains("finish_hls_action("));
         assert!(!reload.contains("start_load_at"));
 
@@ -727,6 +738,13 @@ mod hls_minimal {
         assert!(lifecycle.contains("player_fragment_loader(player)"));
         assert!(!lifecycle.contains("set_current_time"));
         assert!(!lifecycle.contains("seeked"));
+        assert!(lifecycle.contains("&& !player.codec_bootstrap_pending"));
+        assert!(
+            lifecycle.find("apply_media_action(media, action)").unwrap()
+                < lifecycle
+                    .find("hls.start_load_at(media.current_time())")
+                    .unwrap()
+        );
         let duration_retry = PLAYER
             .split_once("if event == \"durationchange\"")
             .unwrap()
@@ -740,9 +758,7 @@ mod hls_minimal {
         let cleared = handoff_path
             .find("player.codec_bootstrap_pending = false")
             .unwrap();
-        let recheck = handoff_path
-            .find("finish_buffering(player)")
-            .unwrap();
+        let recheck = handoff_path.find("finish_buffering(player)").unwrap();
         let play = handoff_path
             .find("Action::Play(player.media.clone(), position)")
             .unwrap();
@@ -750,12 +766,6 @@ mod hls_minimal {
         assert!(
             handoff_path.contains("Action::Retarget(\n                        player.hls.clone()")
         );
-        assert!(PLAYER.contains("Action::Retarget(hls, media, position) =>"));
-        assert!(PLAYER.contains("hls.stop_load()"));
-        assert!(PLAYER.contains("let target = position + BUFFER_EPSILON_SECONDS"));
-        assert!(PLAYER.contains("media.set_current_time(target)"));
-        assert!(PLAYER.contains("hls.start_load_at(target)"));
-        assert!(PLAYER.contains("if start == HlsStart::Live {\n        LIVE_RUNWAY_BUFFER"));
         assert!(PLAYER.matches("media.set_current_time(position)").count() >= 1);
         let play_gate = &PLAYER[PLAYER.find("fn begin_playback(").unwrap()
             ..PLAYER.find("fn resume_playback(").unwrap()];

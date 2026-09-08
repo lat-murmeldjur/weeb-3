@@ -116,7 +116,8 @@ fn live_preparation_and_following_share_one_duration_based_owner() {
     assert!(HLS_CORE.contains("HLS_LIVE_STARTUP_BUFFER_SECONDS: f64 = 8.0"));
     let runway = section(HLS_RUNTIME, "fn live_runway_targets(", "fn prefetch_from_reference(");
     assert!(runway.contains("seconds >= HLS_LIVE_STARTUP_BUFFER_SECONDS"));
-    assert!(runway.contains("return Vec::new()"));
+    assert!(runway.contains("-> &[super::HlsSegment]"));
+    assert!(runway.contains("&playlist.segments[position..position + length]"));
     assert!(runway.contains("active.live_runway_running = true"));
     assert!(runway.contains("active.live_runway_running = false"));
     assert!(runway.contains("hls_body(client.clone(), reference.clone(), Some(id))"));
