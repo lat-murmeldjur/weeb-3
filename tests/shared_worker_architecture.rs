@@ -454,7 +454,7 @@ fn log_polling_is_combined_bounded_and_per_client() {
         "pub fn get_current_logs(&self)",
         "pub async fn get_connections(&self)",
     );
-    assert!(log_drain.contains("Ok(log_message) => logs.push(log_message)"));
+    assert!(log_drain.contains("drain_ready(None, &self.log_port.1).take(LOG_DRAIN_BATCH)"));
     assert!(!log_drain.contains("REFRESHMENT"));
     let progress = section(
         SHARED_RUNTIME,

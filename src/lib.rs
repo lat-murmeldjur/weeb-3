@@ -108,7 +108,7 @@ pub(crate) use retrieval_conventions::{
 };
 
 mod secure_vault;
-use secure_vault::{secure_ensure_authorized, secure_ensure_feed_owner, secure_reset_stamp};
+use secure_vault::{secure_ensure_authorized, secure_reset_stamp};
 
 mod wallet_workflows;
 
@@ -244,6 +244,7 @@ impl Weeb3 {
         index_string: String,
         add_to_feed: bool,
         feed_topic: String,
+        wallet_owner: Option<String>,
     ) -> Vec<u8> {
         let (chan_out, chan_in) = mpsc::bounded::<Vec<u8>>(1);
         let (progress_out, progress_in) = mpsc::unbounded::<UploadProgressDelta>();
@@ -319,6 +320,7 @@ impl Weeb3 {
                 index_document,
                 add_to_feed,
                 topic_safe,
+                wallet_owner,
                 Some(progress_out),
                 chan_out,
             ))
@@ -399,18 +401,14 @@ impl Weeb3 {
                 return acquire_bzz_collection(resource.reference, &self.chunk_port.0).await;
             }
             if let Some(metadata) = self.resolve_bzz(address.clone()).await {
-                if metadata.size == 0 {
-                    return encode_resources(
-                        vec![(vec![], metadata.mime, metadata.path.clone())],
-                        metadata.path,
-                    );
-                }
-
-                let end_inclusive = metadata.size - 1;
-                if let Some((bytes, metadata)) = self
-                    .acquire_resolved_range(metadata, 0, end_inclusive)
-                    .await
-                {
+                let result = if metadata.size == 0 {
+                    Some((vec![], metadata))
+                } else {
+                    let end_inclusive = metadata.size - 1;
+                    self.acquire_resolved_range(metadata, 0, end_inclusive)
+                        .await
+                };
+                if let Some((bytes, metadata)) = result {
                     return encode_resources(
                         vec![(bytes, metadata.mime, metadata.path.clone())],
                         metadata.path,
@@ -428,59 +426,11 @@ impl Weeb3 {
     }
 
     pub async fn retrieve_bytes(&self, address: String) -> Vec<u8> {
-        let progress_id = self
-            .start_progress("bytes", address.clone(), "retrieve", None, "starting")
-            .await;
-        let valaddr = match hex::decode(&address) {
-            Ok(hex) => hex,
-            Err(_) => {
-                self.finish_progress(&progress_id, "failed", "invalid reference", false)
-                    .await;
-                return vec![];
-            }
-        };
-
-        let bytes = retrieve_data(&valaddr, &self.chunk_port.0).await;
-        let ok = !bytes.is_empty();
-        self.finish_progress(
-            &progress_id,
-            if ok { "complete" } else { "failed" },
-            format!("{} bytes", bytes.len()),
-            ok,
-        )
-        .await;
-        bytes
+        self.retrieve_raw(address, false).await
     }
 
     pub async fn retrieve_chunk_bytes(&self, address: String) -> Vec<u8> {
-        let progress_id = self
-            .start_progress("chunk", address.clone(), "retrieve", None, "starting")
-            .await;
-        let valaddr = match hex::decode(&address) {
-            Ok(hex) => hex,
-            Err(_) => {
-                self.finish_progress(&progress_id, "failed", "invalid reference", false)
-                    .await;
-                return vec![];
-            }
-        };
-
-        let (chan_out, chan_in) = mpsc::bounded::<Vec<u8>>(1);
-        let _ = self
-            .chunk_port
-            .0
-            .try_send(chunk_retrieve_request(valaddr, chan_out));
-
-        let bytes = chan_in.recv().await.unwrap_or_default();
-        let ok = !bytes.is_empty();
-        self.finish_progress(
-            &progress_id,
-            if ok { "complete" } else { "failed" },
-            format!("{} bytes", bytes.len()),
-            ok,
-        )
-        .await;
-        bytes
+        self.retrieve_raw(address, true).await
     }
 
     pub async fn reset_stamp(&self) -> Vec<u8> {
@@ -549,12 +499,7 @@ impl Weeb3 {
     pub fn get_current_logs(&self) -> Vec<String> {
         let mut logs = Vec::with_capacity(self.log_port.1.len().min(LOG_DRAIN_BATCH));
 
-        for _ in 0..LOG_DRAIN_BATCH {
-            match self.log_port.1.try_recv() {
-                Ok(log_message) => logs.push(log_message),
-                Err(_) => break,
-            }
-        }
+        logs.extend(drain_ready(None, &self.log_port.1).take(LOG_DRAIN_BATCH));
 
         logs
     }
@@ -707,11 +652,7 @@ impl Weeb3 {
                     };
                     let public_gossip_only = self.service_worker_network_id() != 0
                         && !self.allow_private_gossip.load(Ordering::Acquire);
-                    for instruction in instruction
-                        .into_iter()
-                        .chain(std::iter::from_fn(|| {
-                            peers_instructions_chan_incoming.try_recv().ok()
-                        }))
+                    for instruction in drain_ready(instruction, &peers_instructions_chan_incoming)
                         .take(PEER_DIAL_INGEST_BATCH)
                     {
                         let current_generation = self.current_connection_generation();
@@ -1429,9 +1370,7 @@ impl Weeb3 {
 
         let accounting_event_handle = async {
             while let Ok(peer_file) = accounting_peer_chan_incoming.recv().await {
-                for peer_file in std::iter::once(peer_file).chain(std::iter::from_fn(|| {
-                    accounting_peer_chan_incoming.try_recv().ok()
-                })) {
+                for peer_file in drain_ready(Some(peer_file), &accounting_peer_chan_incoming) {
                     let peer = peer_file.peer_id;
                     let connection_attempt_id = peer_file.connection_attempt_id;
                     let mut connected_peers = wings.connected_peers.lock().await;
@@ -1546,9 +1485,7 @@ impl Weeb3 {
 
         let pricing_event_handle = async {
             while let Ok(pricing) = pricing_chan_incoming.recv().await {
-                for pricing in std::iter::once(pricing)
-                    .chain(std::iter::from_fn(|| pricing_chan_incoming.try_recv().ok()))
-                {
+                for pricing in drain_ready(Some(pricing), &pricing_chan_incoming) {
                     let (peer, amount, pricing_session) = pricing;
                     let connected_peers = wings.connected_peers.lock().await;
                     let expected_connection = if let Some(peer_file) = connected_peers.get(&peer) {
@@ -1786,9 +1723,7 @@ impl Weeb3 {
                 let mut cheque_joiner = Vec::new();
 
                 for cheque_instruction in
-                    std::iter::once(cheque_instruction).chain(std::iter::from_fn(|| {
-                        cheque_instructions_chan_incoming.try_recv().ok()
-                    }))
+                    drain_ready(Some(cheque_instruction), &cheque_instructions_chan_incoming)
                 {
                     let swap_price_0 = &swap_price;
                     let swap_deduction_0 = &swap_deduction;
@@ -1887,11 +1822,7 @@ impl Weeb3 {
 
         let cheque_apply_handle = async {
             while let Ok(cheque_result) = cheque_send_chan_incoming.recv().await {
-                for cheque_result in
-                    std::iter::once(cheque_result).chain(std::iter::from_fn(|| {
-                        cheque_send_chan_incoming.try_recv().ok()
-                    }))
-                {
+                for cheque_result in drain_ready(Some(cheque_result), &cheque_send_chan_incoming) {
                     let (peer, ok, cheque_generation) = cheque_result;
                     let current_cheque = wings.ongoing_cheques.lock().await.get(&peer).copied();
                     if let Some((amount, generation)) = current_cheque
@@ -1925,9 +1856,7 @@ impl Weeb3 {
         let acquire_range_handle = async {
             let range_sem = Arc::new(Semaphore::new(RANGE_REQUEST_CONCURRENCY));
             while let Ok(incoming_request) = self.range_port.1.recv().await {
-                for request in std::iter::once(incoming_request)
-                    .chain(std::iter::from_fn(|| self.range_port.1.try_recv().ok()))
-                {
+                for request in drain_ready(Some(incoming_request), &self.range_port.1) {
                     let chunk_retrieve_chan = chunk_retrieve_chan_outgoing.clone();
                     let range_permit = range_sem.acquire_arc().await;
 
@@ -1959,11 +1888,18 @@ impl Weeb3 {
 
         let push_handle = async {
             while let Ok(incoming_request) = self.upload_port.1.recv().await {
-                for incoming_request in std::iter::once(incoming_request)
-                    .chain(std::iter::from_fn(|| self.upload_port.1.try_recv().ok()))
-                {
-                    let (file0, enc, redundancy_level, index, feed, topic, progress, chan) =
-                        incoming_request;
+                for incoming_request in drain_ready(Some(incoming_request), &self.upload_port.1) {
+                    let (
+                        file0,
+                        enc,
+                        redundancy_level,
+                        index,
+                        feed,
+                        topic,
+                        wallet_owner,
+                        progress,
+                        chan,
+                    ) = incoming_request;
 
                     if !secure_ensure_authorized().await {
                         self.interface_log(
@@ -1979,6 +1915,7 @@ impl Weeb3 {
                             "404.html".to_string(),
                             feed,
                             topic,
+                            wallet_owner,
                             &chunk_upload_chan_outgoing,
                             &chunk_retrieve_chan_outgoing,
                             progress,
@@ -1996,10 +1933,7 @@ impl Weeb3 {
             let push_sem = Arc::new(Semaphore::new(PUSH_CHUNK_CONCURRENCY));
 
             while let Ok(incoming_request) = self.chunk_push_port.1.recv().await {
-                for incoming_request in
-                    std::iter::once(incoming_request).chain(std::iter::from_fn(|| {
-                        self.chunk_push_port.1.try_recv().ok()
-                    }))
+                for incoming_request in drain_ready(Some(incoming_request), &self.chunk_push_port.1)
                 {
                     let (d, soc, checkad, stamp, feedback, slot_feedback, progress) =
                         incoming_request;
@@ -2124,9 +2058,7 @@ impl Weeb3 {
             let mut retrieve_dispatches_since_browser_yield = 0usize;
 
             while let Ok(incoming_request) = self.chunk_port.1.recv().await {
-                for request in std::iter::once(incoming_request)
-                    .chain(std::iter::from_fn(|| self.chunk_port.1.try_recv().ok()))
-                {
+                for request in drain_ready(Some(incoming_request), &self.chunk_port.1) {
                     retrieve_dispatches_since_browser_yield += 1;
                     if retrieve_dispatches_since_browser_yield >= retrieve_dispatch_yield_every {
                         retrieve_dispatches_since_browser_yield = 0;
@@ -2221,11 +2153,10 @@ impl Weeb3 {
                 let (mut current_generation, mut network_id) =
                     self.current_connection_context().await;
 
-                for connection_instruction in
-                    std::iter::once(connection_instruction).chain(std::iter::from_fn(|| {
-                        connections_instructions_chan_incoming.try_recv().ok()
-                    }))
-                {
+                for connection_instruction in drain_ready(
+                    Some(connection_instruction),
+                    &connections_instructions_chan_incoming,
+                ) {
                     let (
                         underlay_address,
                         bootnode,
@@ -2410,78 +2341,6 @@ impl Weeb3 {
 }
 
 impl Weeb3 {
-    pub(crate) async fn acquire_feed_envelope(&self, owner: String, topic: String) -> Vec<u8> {
-        let failed_feed_result = |message: &str| {
-            encode_resources(
-                vec![(
-                    message.as_bytes().to_vec(),
-                    "not found".to_string(),
-                    "not found".to_string(),
-                )],
-                "not found".to_string(),
-            )
-        };
-        let progress_id = self
-            .start_progress(
-                "feed",
-                format!(
-                    "{} topic {}",
-                    if owner.trim().is_empty() {
-                        "current-wallet"
-                    } else {
-                        owner.trim()
-                    },
-                    topic.trim()
-                ),
-                "resolve",
-                None,
-                "seeking latest feed update",
-            )
-            .await;
-        let owner_bytes = if owner.trim().is_empty() {
-            secure_ensure_feed_owner()
-                .await
-                .ok_or("feed owner unavailable")
-        } else {
-            hex::decode(strip_hex_prefix(owner.trim())).map_err(|_| "invalid feed owner")
-        };
-        let owner_bytes = match owner_bytes.and_then(|owner| {
-            (owner.len() == 20)
-                .then_some(owner)
-                .ok_or("invalid feed owner")
-        }) {
-            Ok(owner) => owner,
-            Err(message) => {
-                self.finish_progress(&progress_id, "failed", message, false)
-                    .await;
-                return failed_feed_result(message);
-            }
-        };
-
-        let topic_safe = normalize_feed_topic(&topic);
-
-        match acquire_latest_feed(hex::encode(owner_bytes), topic_safe, &self.chunk_port.0).await {
-            Some((bytes, metadata)) => {
-                self.finish_progress(
-                    &progress_id,
-                    "complete",
-                    format!("{} bytes", bytes.len()),
-                    true,
-                )
-                .await;
-                encode_resources(
-                    vec![(bytes, metadata.mime, metadata.path.clone())],
-                    metadata.path,
-                )
-            }
-            None => {
-                self.finish_progress(&progress_id, "failed", "feed update not found", false)
-                    .await;
-                failed_feed_result("")
-            }
-        }
-    }
-
     pub async fn resolve_bzz(&self, resource: String) -> Option<BzzMetadata> {
         bzz_stream::resolve_bzz(&resource, &self.chunk_port.0).await
     }

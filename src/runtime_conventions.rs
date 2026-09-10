@@ -5,6 +5,46 @@ impl Weeb3 {
         self.runtime_started.load(Ordering::Acquire)
     }
 
+    pub(super) async fn retrieve_raw(&self, address: String, chunk: bool) -> Vec<u8> {
+        let progress_id = self
+            .start_progress(
+                if chunk { "chunk" } else { "bytes" },
+                address.clone(),
+                "retrieve",
+                None,
+                "starting",
+            )
+            .await;
+        let valaddr = match hex::decode(&address) {
+            Ok(hex) => hex,
+            Err(_) => {
+                self.finish_progress(&progress_id, "failed", "invalid reference", false)
+                    .await;
+                return vec![];
+            }
+        };
+
+        let bytes = if chunk {
+            let (chan_out, chan_in) = mpsc::bounded::<Vec<u8>>(1);
+            let _ = self
+                .chunk_port
+                .0
+                .try_send(chunk_retrieve_request(valaddr, chan_out));
+            chan_in.recv().await.unwrap_or_default()
+        } else {
+            retrieve_data(&valaddr, &self.chunk_port.0).await
+        };
+        let ok = !bytes.is_empty();
+        self.finish_progress(
+            &progress_id,
+            if ok { "complete" } else { "failed" },
+            format!("{} bytes", bytes.len()),
+            ok,
+        )
+        .await;
+        bytes
+    }
+
     pub(crate) async fn start_progress(
         &self,
         kind: impl Into<String>,
@@ -133,6 +173,16 @@ pub(crate) async fn cheques_active_in_window() -> bool {
 }
 
 pub(crate) type AsyncPort<T> = (mpsc::Sender<T>, mpsc::Receiver<T>);
+
+pub(crate) fn drain_ready<T>(
+    first: Option<T>,
+    receiver: &mpsc::Receiver<T>,
+) -> impl Iterator<Item = T> {
+    first
+        .into_iter()
+        .chain(std::iter::from_fn(|| receiver.try_recv().ok()))
+}
+
 pub(crate) type UploadRequest = (
     Vec<Resource>,
     bool,
@@ -140,6 +190,7 @@ pub(crate) type UploadRequest = (
     String,
     bool,
     String,
+    Option<String>,
     Option<UploadProgressSender>,
     mpsc::Sender<Vec<u8>>,
 );

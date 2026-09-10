@@ -3,6 +3,9 @@ use wasm_bindgen::{JsCast, JsValue};
 
 use crate::{bzz_stream::BzzMetadata, events::ProgressRow};
 
+pub(crate) const FEED_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+pub(crate) const REQUEST_TIMEOUT: &str = "request timed out";
+
 pub(crate) fn property(value: &JsValue, name: &str) -> JsValue {
     Reflect::get(value, &JsValue::from_str(name)).unwrap_or(JsValue::UNDEFINED)
 }

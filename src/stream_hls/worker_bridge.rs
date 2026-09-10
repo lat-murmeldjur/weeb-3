@@ -77,6 +77,9 @@ async fn prepare_hls_response(runtime: &Weeb3WorkerRuntime, message: &Object) ->
         Ok(prepared) => {
             let response = ok_response();
             set(&response, "source", JsValue::from_str(&prepared.source));
+            if let Some(source) = prepared.initial_source {
+                set(&response, "initialSource", JsValue::from_str(&source));
+            }
             set(&response, "plan", plan_to_js(&prepared.plan).into());
             set_number(&response, "session", view_generation as f64);
             response

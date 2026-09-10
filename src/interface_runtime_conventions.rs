@@ -707,7 +707,7 @@ pub(super) async fn open_bzz_resource(weeb3: InterfaceNode, resource: String) {
     let view_generation = crate::stream::begin_result_view_request();
     let stream_files = stream_files_when_available();
     let progress_id = weeb3
-        .start_progress("bzz", resource.clone(), "resolve", None, "resolving")
+        .start_progress("bzz", &resource, "resolve", None, "resolving")
         .await;
     if !bzz_view_request_is_current(&weeb3, &progress_id, view_generation).await {
         return;
@@ -747,7 +747,7 @@ pub(super) async fn open_bzz_resource(weeb3: InterfaceNode, resource: String) {
                 &progress_id,
                 "retrieve",
                 Some(0),
-                format!("{} bytes", metadata.size),
+                &format!("{} bytes", metadata.size),
             )
             .await;
         if !bzz_view_request_is_current(&weeb3, &progress_id, view_generation).await {
@@ -868,7 +868,7 @@ async fn preload_canonical_bzz_frame(
     let progress_id = weeb3
         .start_progress(
             "bzz",
-            resource.to_string(),
+            resource,
             "index",
             Some(0),
             "retrieving website index",
@@ -929,7 +929,7 @@ pub(super) async fn download_bzz_resource(
     let progress_id = weeb3
         .start_progress(
             "download",
-            resource.clone(),
+            &resource,
             "retrieve",
             Some(0),
             "preparing download",
@@ -952,7 +952,7 @@ pub(super) async fn download_bzz_resource(
                 &progress_id,
                 "pack",
                 Some(80),
-                format!("{} files", entries.len()),
+                &format!("{} files", entries.len()),
             )
             .await;
         if let Some(bytes) = tar_entries(&entries)
@@ -963,7 +963,7 @@ pub(super) async fn download_bzz_resource(
                 .finish_progress(
                     &progress_id,
                     "complete",
-                    format!("{} bytes", bytes.len()),
+                    &format!("{} bytes", bytes.len()),
                     true,
                 )
                 .await;
@@ -986,7 +986,7 @@ pub(super) async fn download_bzz_resource(
                 .finish_progress(
                     &progress_id,
                     "complete",
-                    format!("{} bytes", bytes.len()),
+                    &format!("{} bytes", bytes.len()),
                     true,
                 )
                 .await;

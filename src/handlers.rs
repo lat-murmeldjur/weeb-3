@@ -431,7 +431,6 @@ async fn retrieval_exchange(chunk_address: Vec<u8>, mut stream: Stream) -> Optio
     if stream.write_all(EMPTY_HEADERS_FRAME).await.is_err() {
         return None;
     }
-    let _ = stream.flush().await;
 
     read_control_protocol_frame(&mut stream).await?;
 
@@ -443,7 +442,6 @@ async fn retrieval_exchange(chunk_address: Vec<u8>, mut stream: Stream) -> Optio
     if stream.write_all(&request_frame).await.is_err() {
         return None;
     }
-    let _ = stream.flush().await;
     let _ = stream.close().await;
 
     let delivery = read_control_protocol_frame(&mut stream).await?;

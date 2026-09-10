@@ -689,8 +689,8 @@ fn complete_raw_fetch(key: &RawFetchKey, flight_id: u64, chunk: Vec<u8>) -> bool
     // logical waiters. A retired caller may have zero waiters when a canonical
     // late result arrives, and that result must still benefit a later caller.
     if canonical_cac {
-        for reference in flight.shared.cache_references.borrow().iter() {
-            remember_raw_chunk(reference.clone(), delivered.clone());
+        for reference in flight.shared.cache_references.borrow_mut().drain(..) {
+            remember_raw_chunk(reference, delivered.clone());
         }
     }
 
@@ -928,8 +928,8 @@ pub(crate) fn requested_shard_cache(reference: &[u8]) -> RequestedShardCache {
 }
 
 fn dispatch_group_recovery(
-    data_references: &[Vec<u8>],
-    parity_references: &[Vec<u8>],
+    data_references: &[Bytes],
+    parity_references: &[Bytes],
     dispatched_shards: &mut [bool],
     raw_fetches: &mut RawFetchQueue<'_>,
     limit: usize,
@@ -959,7 +959,7 @@ fn dispatch_group_recovery(
 
 fn dispatch_group_parity(
     data_count: usize,
-    parity_references: &[Vec<u8>],
+    parity_references: &[Bytes],
     dispatched_shards: &mut [bool],
     raw_fetches: &mut RawFetchQueue<'_>,
     limit: usize,
@@ -982,7 +982,7 @@ fn dispatch_group_parity(
 
 fn dispatch_one_rolling_group_parity(
     data_count: usize,
-    parity_references: &[Vec<u8>],
+    parity_references: &[Bytes],
     dispatched_shards: &mut [bool],
     raw_fetches: &mut RawFetchQueue<'_>,
 ) -> Option<()> {
@@ -1010,7 +1010,7 @@ fn settle_data_group_result(
     result: RawFetchResult,
     rolling: bool,
     data_count: usize,
-    data_references: &[Vec<u8>],
+    data_references: &[Bytes],
     parity_present: bool,
     requested_mask: &[bool],
     requested_ready: &mut [bool],
@@ -1041,7 +1041,7 @@ fn settle_data_group_result(
         let reference = data_references.get(result_index)?;
         let chunk = if result.canonical_cac {
             cached_decoded_chunk(reference).or_else(|| {
-                remember_raw_chunk(reference.clone(), result_chunk.clone());
+                remember_raw_chunk(reference.to_vec(), result_chunk.clone());
                 cached_decoded_chunk(reference)
             })?
         } else {
@@ -1055,8 +1055,8 @@ fn settle_data_group_result(
 }
 
 async fn fetch_data_group_indices_streaming(
-    data_references: Vec<Vec<u8>>,
-    parity_references: Vec<Vec<u8>>,
+    data_references: Vec<Bytes>,
+    parity_references: Vec<Bytes>,
     encrypted: bool,
     requested_indices: Vec<usize>,
     chunk_retrieve_chan: &ChunkRetrieveSender,
@@ -1372,7 +1372,7 @@ async fn fetch_data_group_indices_streaming(
         if authenticated_shards[index]
             && let Some(raw) = raw
         {
-            remember_raw_chunk(data_references[index].clone(), raw.clone());
+            remember_raw_chunk(data_references[index].to_vec(), raw.clone());
         }
     }
 
@@ -1396,7 +1396,7 @@ async fn fetch_data_group_indices_streaming(
         if !valid_cac(&raw, &reference[..HASH_SIZE]) {
             return None;
         }
-        remember_raw_chunk(reference.clone(), raw.into());
+        remember_raw_chunk(reference.to_vec(), raw.into());
         child_emitter.emit(index, cached_decoded_chunk(reference)?);
     }
     Some(())
@@ -1567,11 +1567,6 @@ async fn retrieve_data_range_from_root_with_prefix_cancellable(
                 node.chunk.level,
                 encrypted,
             )?;
-            if data_references.len() != layout.data_shards
-                || parity_references.len() != layout.parity_shards
-            {
-                return None;
-            }
             let relative_start = payload_start.saturating_sub(node.start);
             let relative_end = payload_end_inclusive.checked_sub(node.start)?;
             let last_data_index = layout.data_shards.checked_sub(1)?;

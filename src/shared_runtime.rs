@@ -19,8 +19,8 @@ use crate::{
     erasure_coding::RedundancyLevel,
     events::ProgressRow,
     worker_protocol::{
-        array_property, bool_property, bytes_from_js, integer_property, metadata_from_js,
-        metadata_to_js, progress_from_js, property, set, set_bool, set_number,
+        REQUEST_TIMEOUT, array_property, bool_property, bytes_from_js, integer_property,
+        metadata_from_js, metadata_to_js, progress_from_js, property, set, set_bool, set_number,
         set_optional_percent, set_string, string_property,
     },
 };
@@ -29,6 +29,15 @@ pub(crate) const SHARED_WORKER_PROTOCOL: u64 = 5;
 const SHARED_WORKER_URL: &str = "/weeb-3/worker.js";
 const START_TIMEOUT: Duration = Duration::from_secs(15);
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(15);
+
+struct ReplyPort(MessagePort);
+
+impl Drop for ReplyPort {
+    fn drop(&mut self) {
+        self.0.set_onmessage(None);
+        self.0.close();
+    }
+}
 
 pub(crate) struct SharedRuntime {
     _worker: SharedWorker,
@@ -284,21 +293,18 @@ impl SharedRuntime {
             let _ = sender.try_send(event.data());
         });
         reply.set_onmessage(Some(callback.as_ref().unchecked_ref()));
+        let _close_reply = ReplyPort(reply.clone());
         let transfer = Array::new();
         transfer.push(channel.port2().as_ref());
         if let Err(error) = self.port.post_message_with_transferable(request, &transfer) {
-            reply.set_onmessage(None);
-            reply.close();
             return Err(js_error("could not post SharedWorker request", &error));
         }
         let response = match timeout {
             Some(timeout) => async_std::future::timeout(timeout, receiver.recv())
                 .await
-                .map_err(|_| "SharedWorker request timed out".to_string()),
+                .map_err(|_| REQUEST_TIMEOUT.to_string()),
             None => Ok(receiver.recv().await),
         };
-        reply.set_onmessage(None);
-        reply.close();
         response?
             .map_err(|_| "SharedWorker reply channel closed")?
             .dyn_into::<Object>()
@@ -531,10 +537,6 @@ impl SharedNodeClient {
         })
     }
 
-    pub(crate) async fn get_connections(&self) -> u64 {
-        self.wait_for_connections(0, 0).await
-    }
-
     pub(crate) async fn wait_for_connections(&self, minimum: u64, timeout_ms: u32) -> u64 {
         self.node_operation("connections", |request| {
             set_number(request, "minimum", minimum as f64);
@@ -572,11 +574,11 @@ impl SharedNodeClient {
 
     pub(crate) async fn start_progress(
         &self,
-        kind: impl AsRef<str>,
-        subject: impl AsRef<str>,
-        phase: impl AsRef<str>,
+        kind: &str,
+        subject: &str,
+        phase: &str,
         percent: Option<u8>,
-        detail: impl AsRef<str>,
+        detail: &str,
     ) -> String {
         self.node_operation("progressStart", |request| {
             set_string(request, "kind", kind);
@@ -594,9 +596,9 @@ impl SharedNodeClient {
     pub(crate) async fn update_progress(
         &self,
         id: &str,
-        phase: impl AsRef<str>,
+        phase: &str,
         percent: Option<u8>,
-        detail: impl AsRef<str>,
+        detail: &str,
     ) {
         let _ = self
             .node_operation("progressUpdate", |request| {
@@ -608,13 +610,7 @@ impl SharedNodeClient {
             .await;
     }
 
-    pub(crate) async fn finish_progress(
-        &self,
-        id: &str,
-        phase: impl AsRef<str>,
-        detail: impl AsRef<str>,
-        ok: bool,
-    ) {
+    pub(crate) async fn finish_progress(&self, id: &str, phase: &str, detail: &str, ok: bool) {
         let _ = self
             .node_operation("progressFinish", |request| {
                 set_string(request, "id", id);
@@ -644,10 +640,16 @@ impl SharedNodeClient {
         .await
     }
 
-    pub(crate) async fn acquire_feed_envelope(&self, owner: String, topic: String) -> Vec<u8> {
-        self.bytes_operation("acquireFeed", |request| {
+    pub(crate) async fn acquire_feed(
+        &self,
+        owner: &str,
+        topic: &str,
+        deadline: f64,
+    ) -> Result<Object, String> {
+        self.node_operation("acquireFeed", |request| {
             set_string(request, "owner", owner);
             set_string(request, "topic", topic);
+            set_number(request, "deadline", deadline);
         })
         .await
     }
@@ -689,6 +691,7 @@ impl SharedNodeClient {
         index_string: String,
         add_to_feed: bool,
         feed_topic: String,
+        wallet_owner: Option<&str>,
     ) -> Vec<u8> {
         self.bytes_operation("upload", |request| {
             set(request, "file", file.into());
@@ -701,6 +704,9 @@ impl SharedNodeClient {
             set_string(request, "indexString", index_string);
             set_bool(request, "addToFeed", add_to_feed);
             set_string(request, "feedTopic", feed_topic);
+            if let Some(owner) = wallet_owner {
+                set_string(request, "walletOwner", owner);
+            }
         })
         .await
     }

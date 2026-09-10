@@ -419,6 +419,7 @@ pub(crate) async fn mount_interface_with_generation(
                     index_string,
                     upload_to_feed,
                     feed_topic,
+                    None,
                 )
                 .await;
 

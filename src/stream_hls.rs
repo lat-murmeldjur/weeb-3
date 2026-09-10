@@ -4,6 +4,7 @@ use std::fmt::Write;
 
 use crate::stream_conventions::HlsStart;
 
+pub(crate) const HLS_BEGINNING_STARTUP_BUFFER_SECONDS: f64 = 1.5;
 pub(crate) const HLS_LIVE_STARTUP_BUFFER_SECONDS: f64 = 8.0;
 pub(crate) const HLS_LIVE_EDGE_SEGMENTS: usize = 3;
 pub(crate) const HLS_LIVE_BODY_RUNWAY_SEGMENTS: usize = 4;
@@ -13,12 +14,259 @@ const HLS_HEADER: &str = "#EXTM3U";
 const HLS_ENDLIST: &str = "#EXT-X-ENDLIST";
 const HLS_GAP: &str = "#EXT-X-GAP";
 
+pub(crate) enum HlsManifest {
+    Media(HlsPlaylist),
+    Master(HlsMasterPlaylist),
+}
+
+impl HlsManifest {
+    pub(crate) fn parse(bytes: &[u8]) -> Option<Self> {
+        HlsPlaylist::parse(bytes)
+            .map(Self::Media)
+            .or_else(|| HlsMasterPlaylist::parse(bytes).map(Self::Master))
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct HlsMasterPlaylist {
+    text: String,
+    uris: Vec<(std::ops::Range<usize>, bool)>,
+}
+
+impl HlsMasterPlaylist {
+    pub(crate) fn sources(&self) -> impl Iterator<Item = &str> {
+        self.uris
+            .iter()
+            .filter(|(_, source)| *source)
+            .map(|(range, _)| &self.text[range.clone()])
+    }
+
+    pub(crate) fn initial_source(&self) -> Option<&str> {
+        self.uris
+            .iter()
+            .find(|(range, _)| self.text[..range.start].ends_with('\n'))
+            .map(|(range, _)| &self.text[range.clone()])
+    }
+
+    fn parse(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() > MAX_STREAM_FEED_PAYLOAD_BYTES || !is_hls_manifest(bytes) {
+            return None;
+        }
+        let text: String = std::str::from_utf8(bytes)
+            .ok()?
+            .trim_start_matches('\u{feff}')
+            .lines()
+            .flat_map(|line| [line.trim(), "\n"])
+            .collect();
+        let mut uris = Vec::new();
+        let mut pending = false;
+        let mut header = false;
+        let mut offset = 0;
+        for line in text.lines() {
+            let attributes = uri_attribute_ranges(line)?;
+            let mut source = false;
+            if pending {
+                if line.is_empty() || line.starts_with('#') || line.chars().any(char::is_control) {
+                    return None;
+                }
+                uris.push((offset..offset + line.len(), true));
+                pending = false;
+            } else if line == HLS_HEADER {
+                if header {
+                    return None;
+                }
+                header = true;
+            } else if let Some(attributes) = line.strip_prefix("#EXT-X-STREAM-INF:") {
+                if attributes.is_empty() {
+                    return None;
+                }
+                pending = true;
+            } else if is_master_tag(line) {
+                if line.ends_with(':')
+                    || attributes.len() > 1
+                    || (line.starts_with("#EXT-X-I-FRAME-STREAM-INF:") && attributes.is_empty())
+                {
+                    return None;
+                }
+                source = true;
+            } else if [
+                "#EXTINF:",
+                "#EXT-X-MEDIA-SEQUENCE:",
+                "#EXT-X-TARGETDURATION:",
+                "#EXT-X-BYTERANGE:",
+                "#EXT-X-MAP:",
+                "#EXT-X-KEY:",
+                "#EXT-X-PROGRAM-DATE-TIME:",
+                "#EXT-X-PLAYLIST-TYPE:",
+                "#EXT-X-DISCONTINUITY-SEQUENCE:",
+            ]
+            .iter()
+            .any(|prefix| line.starts_with(prefix))
+                || matches!(line, HLS_ENDLIST | HLS_GAP | "#EXT-X-DISCONTINUITY")
+                || (!line.is_empty() && !line.starts_with('#'))
+            {
+                return None;
+            }
+            uris.extend(
+                attributes
+                    .into_iter()
+                    .map(|range| (offset + range.start..offset + range.end, source)),
+            );
+            offset += line.len() + 1;
+        }
+        (header && !pending && uris.iter().any(|(_, source)| *source))
+            .then_some(Self { text, uris })
+    }
+
+    pub(crate) fn render(&self, mut rewrite: impl FnMut(&str, bool) -> Option<String>) -> String {
+        let mut output = String::with_capacity(self.text.len());
+        let mut copied = 0;
+        for (range, playlist) in &self.uris {
+            output.push_str(&self.text[copied..range.start]);
+            let uri = &self.text[range.clone()];
+            output.push_str(rewrite(uri, *playlist).as_deref().unwrap_or(uri));
+            copied = range.end;
+        }
+        output.push_str(&self.text[copied..]);
+        output
+    }
+}
+
+fn is_master_tag(line: &str) -> bool {
+    [
+        "#EXT-X-STREAM-INF:",
+        "#EXT-X-I-FRAME-STREAM-INF:",
+        "#EXT-X-MEDIA:",
+    ]
+    .iter()
+    .any(|prefix| line.starts_with(prefix))
+}
+
+fn uri_attribute_ranges(line: &str) -> Option<Vec<std::ops::Range<usize>>> {
+    let mut ranges = Vec::new();
+    if !line.starts_with("#EXT-") {
+        return Some(ranges);
+    }
+    let Some(colon) = line.find(':') else {
+        return Some(ranges);
+    };
+    let mut start = colon + 1;
+    let mut quoted = false;
+    for (end, byte) in line
+        .bytes()
+        .enumerate()
+        .skip(start)
+        .chain(std::iter::once((line.len(), b',')))
+    {
+        if byte == b'"' {
+            quoted = !quoted;
+        }
+        if byte != b',' || quoted {
+            continue;
+        }
+        let attribute = line[start..end].trim();
+        if let Some(value) = attribute.strip_prefix("URI=") {
+            let uri = value.strip_prefix('"')?.strip_suffix('"')?;
+            if uri.is_empty() || uri.chars().any(char::is_control) {
+                return None;
+            }
+            let offset = start + line[start..end].find(attribute)? + 5;
+            ranges.push(offset..offset + uri.len());
+        }
+        start = end + 1;
+    }
+    (!quoted).then_some(ranges)
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum HlsSource {
+    Reference(String),
+    Feed {
+        owner: String,
+        topic: String,
+        topic_is_hash: bool,
+        index: Option<u64>,
+    },
+}
+
+impl HlsSource {
+    pub(crate) fn parse(uri: &str) -> Option<Self> {
+        if uri != uri.trim() || uri.contains('#') || uri.chars().any(char::is_control) {
+            return None;
+        }
+        let path = uri.split('?').next()?;
+        let swarm = path
+            .get(..8)
+            .is_some_and(|scheme| scheme.eq_ignore_ascii_case("swarm://"));
+        let bare_feed = !path.contains("://")
+            && path
+                .trim_start_matches('/')
+                .split_once('/')
+                .is_some_and(|(owner, topic)| owner.len() == 40 && !topic.contains('/'));
+        if !swarm
+            && !path
+                .split('/')
+                .any(|part| part.eq_ignore_ascii_case("feeds"))
+            && !bare_feed
+        {
+            return swarm_reference(uri)
+                .map(|reference| Self::Reference(reference.to_ascii_lowercase()));
+        }
+        let (path, index) = match uri.split_once('?') {
+            Some((path, query)) => {
+                let value = query.strip_prefix("index=")?;
+                if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+                    return None;
+                }
+                (path, Some(value.parse().ok()?))
+            }
+            None => (uri, None),
+        };
+        let (owner, topic, topic_is_hash) = if swarm {
+            let (owner, topic) = path[8..].split_once('/')?;
+            (owner, topic, false)
+        } else {
+            let path = if let Some((scheme, remainder)) = path.split_once("://") {
+                if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
+                    return None;
+                }
+                &remainder[remainder.find('/')?..]
+            } else {
+                path
+            };
+            let mut parts = path.trim_start_matches('/').rsplit('/');
+            let topic = parts.next()?;
+            let owner = parts.next()?;
+            let hashed = match parts.next() {
+                Some(part) if part.eq_ignore_ascii_case("feeds") => true,
+                None => false,
+                _ => return None,
+            };
+            (owner, topic, hashed)
+        };
+        if topic.contains('/')
+            || (topic_is_hash
+                && (topic.len() != 64 || !topic.bytes().all(|byte| byte.is_ascii_hexdigit())))
+        {
+            return None;
+        }
+        let route = crate::stream_conventions::StreamShareRoute::new(owner, topic).ok()?;
+        Some(Self::Feed {
+            owner: route.owner,
+            topic: route.topic,
+            topic_is_hash,
+            index,
+        })
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct HlsSegment {
     pub(crate) reference: String,
     pub(crate) duration: f64,
     pub(crate) gap: bool,
     pub(crate) discontinuity_sequence: u64,
+    pub(crate) program_date_time: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -42,6 +290,7 @@ pub(crate) struct HlsStartupPlan {
 pub(crate) struct PreparedHlsFeed {
     pub(crate) source: String,
     pub(crate) plan: HlsStartupPlan,
+    pub(crate) initial_source: Option<String>,
 }
 
 #[derive(Default)]
@@ -95,6 +344,9 @@ impl HlsPlaylist {
         let mut discontinuity_sequence = None;
         let mut target_duration = None;
         for line in text.lines().map(str::trim) {
+            if is_master_tag(line) {
+                return None;
+            }
             for (prefix, field) in [
                 ("#EXT-X-MEDIA-SEQUENCE:", &mut sequence),
                 (
@@ -162,7 +414,7 @@ impl HlsPlaylist {
             .iter()
             .map(|segment| segment.duration)
             .sum::<f64>();
-        let runway_end = play_position + segment.duration;
+        let runway_end = play_position + segment.duration.min(HLS_BEGINNING_STARTUP_BUFFER_SECONDS);
         let duration = self.duration();
         if !play_position.is_finite()
             || !runway_end.is_finite()
@@ -235,8 +487,30 @@ impl HlsPlaylist {
         self.merge_segments(candidates, hls_has_terminal_endlist(text))
     }
 
-    pub(crate) fn merge_playlist(&mut self, candidate: Self) -> Option<usize> {
+    pub(crate) fn merge_playlist(&mut self, mut candidate: Self) -> Option<usize> {
         let (appended, first) = self.merge_extension(&candidate)?;
+        let overlap = self.sequence.max(candidate.sequence);
+        for (current, incoming) in self
+            .segments
+            .iter_mut()
+            .skip((overlap - self.sequence) as usize)
+            .zip(
+                candidate
+                    .segments
+                    .iter_mut()
+                    .skip((overlap - candidate.sequence) as usize),
+            )
+        {
+            if candidate.sequence < self.sequence {
+                if current.program_date_time.is_some() {
+                    incoming
+                        .program_date_time
+                        .clone_from(&current.program_date_time);
+                }
+            } else if current.program_date_time.is_none() {
+                current.program_date_time = incoming.program_date_time.take();
+            }
+        }
         if candidate.sequence < self.sequence {
             self.sequence = candidate.sequence;
             self.discontinuity_sequence = candidate.discontinuity_sequence;
@@ -406,9 +680,13 @@ impl HlsPlaylist {
                 output.push_str("\n#EXT-X-DISCONTINUITY");
             }
             discontinuity_sequence = segment.discontinuity_sequence;
+            if let Some(date) = &segment.program_date_time {
+                let _ = write!(output, "\n#EXT-X-PROGRAM-DATE-TIME:{date}");
+            }
             let _ = write!(output, "\n#EXTINF:{:.6},", segment.duration);
             if segment.gap {
-                output.push_str("\n#EXT-X-GAP");
+                let _ = write!(output, "\n#EXT-X-GAP\n{}", segment.reference);
+                continue;
             }
             output.push('\n');
             output.push_str(local_bytes_base);
@@ -475,6 +753,7 @@ fn parse_segment_lines(text: &str, mut discontinuity_sequence: u64) -> Option<Ve
     let mut duration = None;
     let mut gap = false;
     let mut discontinuity = false;
+    let mut program_date_time = None;
     for original in text.lines() {
         let line = original.trim();
         if let Some(value) = line.strip_prefix("#EXTINF:") {
@@ -487,8 +766,14 @@ fn parse_segment_lines(text: &str, mut discontinuity_sequence: u64) -> Option<Ve
             }
             duration = Some(value);
         } else if line == HLS_GAP {
-            duration?;
+            if gap {
+                return None;
+            }
             gap = true;
+        } else if let Some(date) = line.strip_prefix("#EXT-X-PROGRAM-DATE-TIME:") {
+            if date.is_empty() || program_date_time.replace(date.to_string()).is_some() {
+                return None;
+            }
         } else if line == "#EXT-X-DISCONTINUITY" {
             if discontinuity {
                 return None;
@@ -497,17 +782,23 @@ fn parse_segment_lines(text: &str, mut discontinuity_sequence: u64) -> Option<Ve
             discontinuity_sequence = discontinuity_sequence.checked_add(1)?;
         } else if line.is_empty() || line.starts_with('#') {
         } else if let Some(segment_duration) = duration.take() {
+            let reference = if gap {
+                (!line.chars().any(char::is_control)).then_some(line.to_string())?
+            } else {
+                swarm_reference(line)?.to_ascii_lowercase()
+            };
             segments.push(HlsSegment {
-                reference: swarm_reference(line)?.to_ascii_lowercase(),
+                reference,
                 duration: segment_duration,
                 gap,
                 discontinuity_sequence,
+                program_date_time: program_date_time.take(),
             });
             gap = false;
             discontinuity = false;
         }
     }
-    if duration.is_some() || gap {
+    if duration.is_some() || gap || program_date_time.is_some() {
         return None;
     }
     Some(segments)

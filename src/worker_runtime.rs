@@ -17,9 +17,9 @@ use crate::{
         INITIAL_BOOTNODE_BURST, is_browser_dialable_underlay, profile_for_swarm_network_id,
     },
     worker_protocol::{
-        array_property, bool_property, bytes_from_js, bytes_to_js, integer_property,
-        metadata_from_js, metadata_to_js, number_property, progress_to_js, property, set, set_bool,
-        set_number, set_string, string_property,
+        FEED_TIMEOUT, REQUEST_TIMEOUT, array_property, bool_property, bytes_from_js, bytes_to_js,
+        integer_property, metadata_from_js, metadata_to_js, number_property, progress_to_js,
+        property, set, set_bool, set_number, set_string, string_property,
     },
 };
 
@@ -241,15 +241,7 @@ impl Weeb3WorkerRuntime {
                     _ => unreachable!(),
                 }))
             }
-            "acquireFeed" => {
-                let owner = string_property(message, "owner")
-                    .ok_or_else(|| error_response(400, "acquireFeed requires owner"))?;
-                let topic = string_property(message, "topic")
-                    .ok_or_else(|| error_response(400, "acquireFeed requires topic"))?;
-                Ok(bytes_response(
-                    self.inner.acquire_feed_envelope(owner, topic).await,
-                ))
-            }
+            "acquireFeed" => self.acquire_feed_response(message).await,
             "upload" => self.upload_response(message).await,
             "pushChunk" => self.push_chunk_response(message).await,
             "resetStamp" => Ok(bytes_response(self.inner.reset_stamp().await)),
@@ -265,6 +257,76 @@ impl Weeb3WorkerRuntime {
             "acquireRange" => self.acquire_range_response(message).await,
             _ => Err(error_response(400, format!("unsupported node op: {op}"))),
         }
+    }
+
+    async fn acquire_feed_response(&self, message: &Object) -> Result<Object, Object> {
+        let owner = string_property(message, "owner")
+            .filter(|owner| {
+                hex::decode_to_slice(crate::strip_hex_prefix(owner), &mut [0; 20]).is_ok()
+            })
+            .ok_or_else(|| error_response(400, "invalid feed owner"))?;
+        let topic = string_property(message, "topic")
+            .ok_or_else(|| error_response(400, "acquireFeed requires topic"))?;
+        let deadline = number_property(message, "deadline")
+            .ok_or_else(|| error_response(400, "acquireFeed requires deadline"))?;
+        let progress = self
+            .inner
+            .start_progress(
+                "feed",
+                format!("{owner} topic {}", topic.trim()),
+                "resolve",
+                None,
+                "seeking latest feed update",
+            )
+            .await;
+        let timeout = std::time::Duration::from_secs_f64(
+            ((deadline - js_sys::Date::now()) / 1000.0).clamp(0.0, FEED_TIMEOUT.as_secs_f64()),
+        );
+        let result = if timeout.is_zero() {
+            Err(REQUEST_TIMEOUT)
+        } else {
+            async_std::future::timeout(
+                timeout,
+                crate::bzz_stream::acquire_latest_feed(
+                    owner,
+                    crate::normalize_feed_topic(&topic),
+                    &self.inner.chunk_port.0,
+                ),
+            )
+            .await
+            .map_err(|_| REQUEST_TIMEOUT)
+        };
+        let response = bytes_response(vec![]);
+        set_string(&response, "index", "not found");
+        let (status, detail) = match result {
+            Ok(Some((body, metadata))) => {
+                let detail = format!("{} bytes", body.len());
+                set(&response, "body", bytes_to_js(&body).into());
+                set_string(&response, "index", &metadata.path);
+                set_string(&response, "path", metadata.path);
+                set_string(&response, "mime", metadata.mime);
+                ("ok", detail)
+            }
+            Ok(None) if self.inner.get_connections().await == 0 => {
+                ("network_error", "no connected peers".into())
+            }
+            Ok(None) => ("not_found", "feed update not found".into()),
+            Err(reason) => ("timeout", reason.into()),
+        };
+        set_string(&response, "status", status);
+        let ok = status == "ok";
+        if !ok {
+            set_string(&response, "reason", &detail);
+        }
+        self.inner
+            .finish_progress(
+                &progress,
+                if ok { "complete" } else { "failed" },
+                detail,
+                ok,
+            )
+            .await;
+        Ok(response)
     }
 
     async fn connect_bootnodes_response(
@@ -334,6 +396,7 @@ impl Weeb3WorkerRuntime {
                 string_property(message, "indexString").unwrap_or_default(),
                 add_to_feed,
                 string_property(message, "feedTopic").unwrap_or_default(),
+                string_property(message, "walletOwner"),
             )
             .await;
         if string_property(message, "type").as_deref() == Some("UPLOAD_REQUEST") {

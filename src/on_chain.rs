@@ -3,11 +3,10 @@ use std::str::FromStr;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use wasm_bindgen::JsError;
 use web3::{
-    contract::{Contract, Options},
+    contract::{Contract, Options, tokens::Tokenize},
     ethabi::{
         ParamType::{Address as AbiAddress, Bool, FixedBytes, Uint},
         StateMutability::{NonPayable, View},
-        Token, encode,
     },
     transports::eip_1193::{Eip1193, Provider},
     types::{Address, H160, H256, TransactionReceipt, U256},
@@ -17,7 +16,7 @@ use crate::{
     PrivateKeySigner,
     conventions::keccak256,
     network_profile::{NetworkMode, active_profile},
-    on_chain_conventions::{abi_contract, abi_function},
+    on_chain_conventions::{abi_contract, abi_function, add_buffer, confirmed_call},
 };
 
 #[derive(Clone, Debug)]
@@ -41,30 +40,24 @@ impl ChequeSigner {
     }
 
     fn domain_separator(&self) -> [u8; 32] {
-        let type_hash = keccak256(b"EIP712Domain(string name,string version,uint256 chainId)");
-        let name_hash = keccak256(b"Chequebook");
-        let version_hash = keccak256(b"1.0");
-        let tokens = [
-            Token::FixedBytes(type_hash.to_vec()),
-            Token::FixedBytes(name_hash.to_vec()),
-            Token::FixedBytes(version_hash.to_vec()),
-            Token::Uint(self.chain_id),
+        let mut words = [
+            keccak256(b"EIP712Domain(string name,string version,uint256 chainId)"),
+            keccak256(b"Chequebook"),
+            keccak256(b"1.0"),
+            [0; 32],
         ];
-        let encoded = encode(&tokens);
-        keccak256(encoded)
+        self.chain_id.to_big_endian(&mut words[3]);
+        keccak256(words.as_flattened())
     }
 
     fn cheque_struct_hash(&self, cheque: &Cheque) -> [u8; 32] {
-        let type_hash =
+        let mut words = [[0; 32]; 4];
+        words[0] =
             keccak256(b"Cheque(address chequebook,address beneficiary,uint256 cumulativePayout)");
-        let tokens = [
-            Token::FixedBytes(type_hash.to_vec()),
-            Token::Address(cheque.chequebook),
-            Token::Address(cheque.beneficiary),
-            Token::Uint(cheque.cumulative_payout),
-        ];
-        let encoded = encode(&tokens);
-        keccak256(encoded)
+        words[1][12..].copy_from_slice(cheque.chequebook.as_bytes());
+        words[2][12..].copy_from_slice(cheque.beneficiary.as_bytes());
+        cheque.cumulative_payout.to_big_endian(&mut words[3]);
+        keccak256(words.as_flattened())
     }
 
     fn digest(&self, cheque: &Cheque) -> [u8; 32] {
@@ -400,20 +393,16 @@ pub async fn buy_postage_batch_with_payer(
             .map_err(|e| JsError::new(&format!("expireLimited() failed: {e}")))?;
     }
 
-    let mut approve_opts = Options::default();
     let spender = ensure_addr(select_postage_contract_addr())?;
+    let approve_receipt = confirmed_call(
+        &token,
+        "approve",
+        (spender, approval).into_tokens(),
+        payer,
+        Some(100_000),
+    )
+    .await?;
 
-    let approve_gas = token
-        .estimate_gas("approve", (spender, approval), payer, Options::default())
-        .await
-        .unwrap_or(U256::from(100_000u64));
-    approve_opts.gas = Some(add_buffer(approve_gas));
-    let approve_receipt = token
-        .call_with_confirmations("approve", (spender, approval), payer, approve_opts, 1usize)
-        .await
-        .map_err(|e| JsError::new(&format!("approve() failed: {e}")))?;
-
-    let mut create_batch_options = Options::default();
     let nonce_rand: [u8; 32] = crate::random_encryption_key()
         .try_into()
         .map_err(|_| JsError::new("nonce gen"))?;
@@ -425,21 +414,14 @@ pub async fn buy_postage_batch_with_payer(
         nonce_rand,
         false,
     );
-    let create_batch_gas = postage
-        .estimate_gas("createBatch", parameters, payer, Options::default())
-        .await
-        .unwrap_or(U256::from(1_500_000u64));
-    create_batch_options.gas = Some(add_buffer(create_batch_gas));
-    let create_receipt = postage
-        .call_with_confirmations(
-            "createBatch",
-            parameters,
-            payer,
-            create_batch_options,
-            1usize,
-        )
-        .await
-        .map_err(|e| JsError::new(&format!("createBatch() failed: {e}")))?;
+    let create_receipt = confirmed_call(
+        &postage,
+        "createBatch",
+        parameters.into_tokens(),
+        payer,
+        Some(1_500_000),
+    )
+    .await?;
 
     let batch_id = parse_batch_id_from_receipt(&create_receipt)
         .ok_or_else(|| JsError::new("BatchCreated event not found in receipt"))?;
@@ -494,16 +476,14 @@ pub async fn deposit_to_chequebook(
     from: Address,
     amount: U256,
 ) -> Result<TransactionReceipt, JsError> {
-    token
-        .call_with_confirmations(
-            "transfer",
-            (chequebook, amount),
-            from,
-            Options::default(),
-            1usize,
-        )
-        .await
-        .map_err(|e| JsError::new(&format!("transfer() failed: {e}")))
+    confirmed_call(
+        token,
+        "transfer",
+        (chequebook, amount).into_tokens(),
+        from,
+        None,
+    )
+    .await
 }
 
 #[derive(Debug, Clone)]
@@ -525,28 +505,14 @@ pub async fn deploy_chequebook_with_payer(
         .try_into()
         .map_err(|_| JsError::new("nonce gen"))?;
 
-    let mut opts = Options::default();
-    let gas_est = factory
-        .estimate_gas(
-            "deploySimpleSwap",
-            (issuer, U256::from(0u64), salt),
-            payer,
-            Options::default(),
-        )
-        .await
-        .unwrap_or(U256::from(175_000u64));
-    opts.gas = Some(add_buffer(gas_est));
-
-    let receipt = factory
-        .call_with_confirmations(
-            "deploySimpleSwap",
-            (issuer, U256::from(0u64), salt),
-            payer,
-            opts,
-            1usize,
-        )
-        .await
-        .map_err(|e| JsError::new(&format!("deploySimpleSwap() failed: {e}")))?;
+    let receipt = confirmed_call(
+        &factory,
+        "deploySimpleSwap",
+        (issuer, U256::from(0u64), salt).into_tokens(),
+        payer,
+        Some(175_000),
+    )
+    .await?;
 
     let chequebook = parse_chequebook_address_from_receipt(&receipt)
         .ok_or_else(|| JsError::new("SimpleSwapDeployed event not found in receipt"))?;
@@ -555,10 +521,6 @@ pub async fn deploy_chequebook_with_payer(
         tx: receipt.transaction_hash,
         chequebook,
     })
-}
-
-fn add_buffer(g: U256) -> U256 {
-    g + (g / U256::from(5u8))
 }
 
 fn price_oracle_contract(w3: &Web3Inst) -> Result<PriceOracleContract, JsError> {
@@ -590,6 +552,7 @@ mod tests {
     use super::*;
     use alloy_primitives::Signature;
     use wasm_bindgen_test::wasm_bindgen_test;
+    use web3::ethabi::{Token, encode};
 
     #[wasm_bindgen_test]
     fn typed_abis_preserve_contract_schemas_and_wire_values() {

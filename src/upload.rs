@@ -14,7 +14,7 @@ use crate::{
     secure_vault::{
         secure_create_feed_update_soc_with_stamp, secure_ensure_feed_owner, secure_stamp_chunk,
     },
-    seek_next_feed_update_index, transfer_pause_enabled, wait_transfer_unpaused,
+    seek_next_feed_update_index, strip_hex_prefix, transfer_pause_enabled, wait_transfer_unpaused,
 };
 
 use async_std::sync::Arc;
@@ -359,6 +359,7 @@ pub async fn upload_resource(
     errordoc: String,
     feed: bool,
     topic: String,
+    wallet_owner: Option<String>,
     chunk_upload_chan: &ChunkUploadSender,
     chunk_retrieve_chan: &ChunkRetrieveSender,
     progress: Option<UploadProgressSender>,
@@ -446,7 +447,13 @@ pub async fn upload_resource(
         return manifest_reference;
     }
 
-    let feed_owner = match secure_ensure_feed_owner().await {
+    let owner = match wallet_owner.as_deref() {
+        Some(owner) => hex::decode(strip_hex_prefix(owner))
+            .ok()
+            .filter(|owner| owner.len() == 20),
+        None => secure_ensure_feed_owner().await,
+    };
+    let feed_owner = match owner {
         Some(feed_owner) => feed_owner,
         None => return vec![],
     };
@@ -516,6 +523,7 @@ pub async fn upload_resource(
         topic,
         index_up,
         soc_wrapped_content,
+        wallet_owner,
     )
     .await
     {

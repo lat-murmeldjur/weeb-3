@@ -55,10 +55,10 @@ fn whole_hls_bodies_are_singleflight_and_share_the_bounded_range_budget() {
     assert!(trim.contains("self.body_order.pop_front()"));
     assert!(trim.contains("set_auxiliary_media_cache_bytes(self.bytes)"));
 
-    let load = section(HLS_RUNTIME, "async fn hls_body(", "fn prefetch_bodies(");
+    let load = section(HLS_RUNTIME, "async fn hls_body(", "async fn foreground_hls_body(");
     assert!(load.contains("BodyLoad::Cached(body)"));
     assert!(load.contains("hls_range(&client, &reference, root.span, 0, end, &|| {"));
-    assert!(load.contains("generation.is_none_or(|id| live_body_is_current(id, &reference))"));
+    assert!(load.contains("generation.is_none_or(|id| body_is_current(id, &reference))"));
     assert!(!load.contains("Arc::from(body)"));
 
     let range = section(HLS_RUNTIME, "async fn hls_range(", "async fn hls_body(");
@@ -90,17 +90,18 @@ fn foreground_windows_and_whole_body_assembly_share_the_aligned_cache() {
 }
 #[test]
 fn live_duration_window_keeps_owned_bodies_and_beginning_seek_delivery() {
-    let runway = section(HLS_RUNTIME, "fn live_runway_targets(", "fn prefetch_from_reference(");
+    let runway = section(HLS_RUNTIME, "fn body_runway_targets(", "fn prefetch_from_reference(");
     assert!(runway.contains("seconds >= HLS_LIVE_STARTUP_BUFFER_SECONDS"));
     assert!(runway.contains("!live_segment_is_playable(active, position + offset)"));
     assert!(runway.contains("!*complete || references.contains(reference)"));
     assert!(runway.contains("hls_body(client.clone(), reference.clone(), Some(id))"));
-    assert!(runway.find("loads.next().await").unwrap() < runway.find("live_runway_running = false").unwrap());
+    assert!(runway.find("loads.next().await").unwrap() < runway.find("body_runway_running = false").unwrap());
+    assert!(runway.contains("!active.body_runway_running"));
+    assert!(runway.contains("active.start == HlsStart::Live || active.beginning_history_started"));
     let cursor = section(HLS_RUNTIME, "fn prefetch_from_reference(", "fn next_feed_id(");
     assert!(cursor.contains("hls_progressive_foreground_transition"));
-    assert!(cursor.contains("let successor = transition"));
-    assert!(cursor.contains("if !active.beginning_history_started"));
-    assert!(cursor.contains("spawn_live_runway(id)"));
+    assert!(cursor.contains("Some((active.id, active.beginning_history_started, transition))"));
+    assert!(cursor.find("if follow {").unwrap() < cursor.find("spawn_body_runway(id)").unwrap());
 }
 
 #[test]
@@ -154,7 +155,8 @@ fn follower_settles_commit337_successors_sequentially_and_tolerates_one_gap() {
     assert!(remember_gap < failed && failed < progressed && progressed < idle_sleep);
     assert!(!follower.contains("pace_next"));
     assert!(!follower.contains("Duration::try_from_secs_f64"));
-    assert!(follower.contains("FEED_TAIL_PROBE_BYTES, None)"));
+    assert!(follower[dispatched..settled].contains("FEED_TAIL_PROBE_BYTES"));
+    assert!(follower[dispatched..settled].contains("None"));
     assert!(!follower.contains("payload_probe_wave("));
     assert!(!follower.contains("settled_payload_wave("));
     assert!(follower.contains("skipped_missing_index"));
@@ -171,14 +173,13 @@ fn follower_settles_commit337_successors_sequentially_and_tolerates_one_gap() {
     );
 
     let publish = section(HLS_RUNTIME, "fn apply_update(", "fn apply_full_update(");
-    assert!(publish.contains("Some((appended, active.start == HlsStart::Live))"));
-    assert!(publish.contains("if updated.0 != 0 && updated.1"));
-    assert!(publish.contains("spawn_live_runway(id)"));
+    assert!(publish.contains("Some(appended)"));
+    assert!(publish.find("if appended != 0 {").unwrap() < publish.find("spawn_body_runway(id)").unwrap());
 
     let runway = section(
         HLS_RUNTIME,
         "fn live_segment_is_playable(",
-        "fn spawn_live_runway(",
+        "fn spawn_body_runway(",
     );
     assert!(runway.contains("presentation_gaps"));
     assert!(runway.contains("live_segment_is_playable(active"));
@@ -237,10 +238,10 @@ fn media_delivery_shares_windows_and_seeks_retain_whole_body_retries() {
     let foreground = section(
         HLS_RUNTIME,
         "async fn foreground_hls_body(",
-        "fn prefetch_bodies(",
+        "fn live_segment_is_playable(",
     );
     assert!(foreground.contains("for attempt in 0..HLS_BODY_ATTEMPTS"));
-    assert!(foreground.contains("hls_body(client.clone(), reference.clone(), generation).await"));
+    assert!(foreground.contains("hls_body(client.clone(), reference.clone(), None).await"));
     assert!(foreground.contains("HLS_BODY_RETRY_DELAY_MS * (attempt + 1) as u64"));
 
     let response = section(
@@ -248,7 +249,7 @@ fn media_delivery_shares_windows_and_seeks_retain_whole_body_retries() {
         "async fn fetch_hls_body_response(",
         "fn parse_hls_range(",
     );
-    let seek = response.find("if seek_successor.is_some()").unwrap();
+    let seek = response.find("if seek_transition {").unwrap();
     let joined = response[seek..].find("foreground_hls_body(").unwrap() + seek;
     let shared = response[joined..].find("hls_body_response(body,").unwrap() + joined;
     let root = response.find("retrieve_decoded_data_root(").unwrap();
@@ -258,27 +259,24 @@ fn media_delivery_shares_windows_and_seeks_retain_whole_body_retries() {
 }
 
 #[test]
-fn commit337_seek_waits_for_the_current_body_and_successor_only_on_a_discontinuity() {
+fn seek_returns_the_current_body_without_a_duplicate_successor_barrier() {
     let response = section(
         HLS_RUNTIME,
         "async fn fetch_hls_body_response(",
         "fn parse_hls_range(",
     );
-    let seek = response.find("if seek_successor.is_some()").unwrap();
+    let seek = response.find("if seek_transition {").unwrap();
     let current = response[seek..].find("foreground_hls_body(").unwrap() + seek;
-    let successor = response[current..]
-        .find("hls_body(client.clone(), successor, None).await")
-        .unwrap()
-        + current;
-    let release = response[successor..]
+    let release = response[current..]
         .find("hls_body_response(body,")
         .unwrap()
-        + successor;
-    let ordinary_fast_path = response.find("if seek_successor.is_none()").unwrap();
+        + current;
+    let ordinary_fast_path = response.find("if !seek_transition").unwrap();
     let progressive = response
         .find("FetchResponse::stream(200, headers)")
         .unwrap();
-    assert!(seek < current && current < successor && successor < release);
+    assert!(seek < current && current < release);
+    assert!(!response.contains("hls_body(client.clone(), successor"));
     assert!(ordinary_fast_path < seek && release < progressive);
     assert!(response[seek..current].contains("let Some(body) ="));
 }

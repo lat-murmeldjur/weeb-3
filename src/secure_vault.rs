@@ -157,8 +157,13 @@ pub(crate) async fn handle_worker_vault_request(request: &Object) -> Object {
             let index = u64_prop(request, "feedIndex");
             match bytes_array_prop(request, "wrappedContent") {
                 Some(content) => {
-                    match secure_create_feed_update_soc_with_stamp_in_window(topic, index, content)
-                        .await
+                    match secure_create_feed_update_soc_with_stamp_in_window(
+                        topic,
+                        index,
+                        content,
+                        string_prop(request, "walletOwner"),
+                    )
+                    .await
                     {
                         Some(update) => {
                             set_js_bool(&response, "bucketFull", update.bucket_full);
@@ -367,12 +372,16 @@ pub async fn secure_create_feed_update_soc_with_stamp(
     topic: String,
     feed_index: u64,
     wrapped_content: Vec<u8>,
+    wallet_owner: Option<String>,
 ) -> Option<SecureFeedUpdate> {
     let vault_feed_index = exact_js_feed_index(feed_index)?;
     let response = worker_vault_call("createFeedUpdateSocWithStamp", |request| {
         set_js_string(request, "topic", &topic);
         set_js_number(request, "feedIndex", vault_feed_index);
         set_js(request, "wrappedContent", bytes_value(&wrapped_content));
+        if let Some(owner) = wallet_owner {
+            set_js_string(request, "walletOwner", owner);
+        }
     })
     .await?;
     Some(SecureFeedUpdate {
@@ -387,6 +396,7 @@ async fn secure_create_feed_update_soc_with_stamp_in_window(
     topic: String,
     feed_index: u64,
     wrapped_content: Uint8Array,
+    wallet_owner: Option<String>,
 ) -> Option<SecureFeedUpdate> {
     let topic_bytes = match hex::decode(strip_hex_prefix(&topic)) {
         Ok(topic_bytes) if !topic_bytes.is_empty() => topic_bytes,
@@ -408,6 +418,10 @@ async fn secure_create_feed_update_soc_with_stamp_in_window(
         );
         return None;
     };
+
+    if let Some(owner) = wallet_owner {
+        return create_wallet_feed_update(&owner, &expected_id, wrapped_content).await;
+    }
 
     let client = secure_client_or_resume("createFeedUpdateSocWithStamp").await?;
     let options = auth_options_for_network(active_network_id()).ok()?;
@@ -450,6 +464,59 @@ async fn secure_create_feed_update_soc_with_stamp_in_window(
         soc_chunk,
         soc_address,
         stamp: hex_prop(&signed, "stampHex"),
+    })
+}
+
+async fn create_wallet_feed_update(
+    owner: &str,
+    id: &[u8; 32],
+    content: Uint8Array,
+) -> Option<SecureFeedUpdate> {
+    let mut wallet = [0_u8; 20];
+    hex::decode_to_slice(strip_hex_prefix(owner), &mut wallet).ok()?;
+    let content = content.to_vec();
+    let wrapped = crate::content_address(&content);
+    if wrapped.len() != 32 {
+        return None;
+    }
+    let network = active_network_id();
+    secure_client_for_wallet(&wallet).await?;
+    let current = || {
+        active_network_id() == network
+            && SECURE_NETWORK_ID.with(Cell::get) == Some(network)
+            && SECURE_WALLET.with(|cell| cell.borrow().as_deref() == Some(wallet.as_slice()))
+    };
+    if !current() {
+        return None;
+    }
+    let digest = crate::keccak256([id.as_slice(), &wrapped].concat());
+    let params = Array::new();
+    params.push(&JsValue::from_str(&format!("0x{}", hex::encode(digest))));
+    params.push(&JsValue::from_str(&format!("0x{}", hex::encode(wallet))));
+    let signature = match crate::library::ethereum_request("personal_sign", Some(params)).await {
+        Ok(signature) => hex::decode(strip_hex_prefix(&signature.as_string()?)).ok()?,
+        Err(error) => {
+            log_error("wallet feed signature rejected", &JsValue::from_str(&error));
+            return None;
+        }
+    };
+    if signature.len() != 65 || !current() {
+        return None;
+    }
+    let soc_chunk = [id.as_slice(), &signature, &content].concat();
+    let soc_address = crate::keccak256([id.as_slice(), &wallet].concat()).to_vec();
+    if !valid_soc(&soc_chunk, &soc_address) {
+        return None;
+    }
+    let (stamp, bucket_full) = secure_stamp_chunk_in_window(bytes_to_js(&soc_address)).await;
+    if !current() {
+        return None;
+    }
+    Some(SecureFeedUpdate {
+        bucket_full,
+        soc_chunk,
+        soc_address,
+        stamp,
     })
 }
 

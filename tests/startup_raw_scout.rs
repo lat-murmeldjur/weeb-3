@@ -95,7 +95,7 @@ fn hls_retrieval_ownership_boundary_stays_strict() {
         "RawFetchLeaderCompletion",
         "crate::stream_hls",
         "HLS_LIVE_BODY_RUNWAY_SEGMENTS",
-        "live_runway_targets",
+        "body_runway_targets",
         "payload_probe_wave",
     ] {
         assert!(
@@ -114,18 +114,18 @@ fn hls_retrieval_ownership_boundary_stays_strict() {
 #[test]
 fn live_preparation_and_following_share_one_duration_based_owner() {
     assert!(HLS_CORE.contains("HLS_LIVE_STARTUP_BUFFER_SECONDS: f64 = 8.0"));
-    let runway = section(HLS_RUNTIME, "fn live_runway_targets(", "fn prefetch_from_reference(");
+    let runway = section(HLS_RUNTIME, "fn body_runway_targets(", "fn prefetch_from_reference(");
     assert!(runway.contains("seconds >= HLS_LIVE_STARTUP_BUFFER_SECONDS"));
     assert!(runway.contains("-> &[super::HlsSegment]"));
     assert!(runway.contains("&playlist.segments[position..position + length]"));
-    assert!(runway.contains("active.live_runway_running = true"));
-    assert!(runway.contains("active.live_runway_running = false"));
+    assert!(runway.contains("active.body_runway_running = true"));
+    assert!(runway.contains("active.body_runway_running = false"));
     assert!(runway.contains("hls_body(client.clone(), reference.clone(), Some(id))"));
     let prepare = section(HLS_RUNTIME, "async fn discover_live_history(", "async fn discover_for_view(");
     assert!(prepare.find("initialize_live_head(").unwrap() < prepare.find("future::join(").unwrap());
     let update = section(HLS_RUNTIME, "fn apply_update(", "fn apply_full_update(");
-    assert!(update.contains("spawn_live_runway(id)"));
-    assert!(!update.contains("active.live_foreground ="));
+    assert!(update.contains("spawn_body_runway(id)"));
+    assert!(!update.contains("active.foreground ="));
 }
 
 #[test]
@@ -151,7 +151,7 @@ fn cold_discovery_is_bounded_and_edge_search_is_hls_owned() {
         .find("playlist.startup_plan(HlsStart::Beginning).is_some()")
         .unwrap();
     let warm = beginning.find("warm_hls_prefix(").unwrap();
-    let accepted = beginning.find("return Some(payload)").unwrap();
+    let accepted = beginning[warm..].find("return Some(payload)").unwrap() + warm;
     assert!(valid < warm && warm < accepted);
     assert!(!beginning[warm..accepted].contains(".await"));
     assert!(!beginning.contains("spawn_local"));
@@ -242,11 +242,12 @@ fn beginning_history_and_exact_following_run_concurrently_after_media_is_ready()
         "fn spawn_follower(",
     );
     let follow = history.find("spawn_follower(id)").unwrap();
+    let successor = history.find("hls_body(client.clone(), successor, Some(id)).await").unwrap();
     let discover = history.find("let history = discover_for_view(").unwrap();
     let apply = history
         .find("apply_full_update(id, index, history)")
         .unwrap();
-    assert!(follow < discover && discover < apply);
+    assert!(follow < successor && successor < discover && discover < apply);
     assert_eq!(history.matches("spawn_follower(id)").count(), 1);
 }
 
@@ -259,7 +260,7 @@ fn underfilled_beginning_prefix_starts_exact_following_immediately() {
     );
     let underfilled = attach.find("let underfilled = head").unwrap();
     let install = attach
-        .find("install_snapshot(id, payload.index, head, None)")
+        .find("install_snapshot(id, index, head, None)")
         .unwrap();
     let follow = attach.find("if underfilled").unwrap();
     assert!(underfilled < install && install < follow);
@@ -344,7 +345,6 @@ fn live_follower_uses_commit337_sequential_exact_followups_before_frontier_fallb
     assert!(follower.contains("head.checked_add(offset)"));
     assert!(follower.contains("let candidate ="));
     assert!(follower.contains("probe_feed_payload("));
-    assert!(follower.contains("FEED_TAIL_PROBE_BYTES, None)"));
     assert!(!follower.contains("settled_payload_wave("));
     assert!(!follower.contains("payload_probe_wave("));
     assert!(!follower.contains("Vec<Option<(u64, FeedPayloadProbe)>>"));
@@ -361,6 +361,8 @@ fn live_follower_uses_commit337_sequential_exact_followups_before_frontier_fallb
         .unwrap();
     let dispatched = follower[indices..].find("probe_feed_payload(").unwrap() + indices;
     let settled = follower[dispatched..].find(".await;").unwrap() + dispatched;
+    assert!(follower[dispatched..settled].contains("FEED_TAIL_PROBE_BYTES"));
+    assert!(follower[dispatched..settled].contains("None"));
     let apply = follower[settled..]
         .find("apply_full_update(id, payload.index, playlist)")
         .unwrap()

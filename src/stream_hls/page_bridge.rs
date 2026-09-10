@@ -94,7 +94,7 @@ async fn prepare_hls(
         .request(&request, HLS_PREPARE_TIMEOUT)
         .await
         .and_then(parse_prepare_response);
-    let (source, plan, worker_session) = match prepared {
+    let (prepared, worker_session) = match prepared {
         Ok(parsed) => parsed,
         Err(error) => {
             abandon_hls_attempt(view_generation, &runtime, network_id);
@@ -123,10 +123,10 @@ async fn prepare_hls(
             beginning_history_started: false,
         });
     });
-    Ok(PreparedHlsFeed { source, plan })
+    Ok(prepared)
 }
 
-fn parse_prepare_response(response: Object) -> Result<(String, HlsStartupPlan, u64), String> {
+fn parse_prepare_response(response: Object) -> Result<(PreparedHlsFeed, u64), String> {
     if bool_property(&response, "ok") != Some(true) {
         return Err(string_property(&response, "error")
             .unwrap_or_else(|| "SharedWorker HLS preparation failed".to_string()));
@@ -137,7 +137,14 @@ fn parse_prepare_response(response: Object) -> Result<(String, HlsStartupPlan, u
         .ok_or("SharedWorker returned an invalid HLS plan")?;
     let session = integer_property(&response, "session")
         .ok_or("SharedWorker HLS preparation omitted session")?;
-    Ok((source, plan, session))
+    Ok((
+        PreparedHlsFeed {
+            source,
+            plan,
+            initial_source: string_property(&response, "initialSource"),
+        },
+        session,
+    ))
 }
 
 fn active_target(live: bool) -> Option<(u64, Rc<SharedRuntime>, u64, u64)> {
@@ -275,14 +282,7 @@ pub(crate) async fn attach_hls_feed_player(
             "HLS feed and segment requests",
         ));
     }
-    player::play_hls(
-        player_element,
-        &prepared.source,
-        hls_class,
-        prepared.plan,
-        start,
-    )
-    .map_err(|error| {
+    player::play_hls(player_element, prepared, hls_class, start).map_err(|error| {
         release_hls_view();
         format!("Could not initialize HLS: {}", js_error_message(&error))
     })

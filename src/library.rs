@@ -34,9 +34,9 @@ use crate::{
         inspect_batch,
     },
     worker_protocol::{
-        bool_property, bytes_to_js, progress_to_js as progress_row_to_js, property, set as set_js,
-        set_bool as set_js_bool, set_number as set_js_number, set_string as set_js_str,
-        string_property,
+        FEED_TIMEOUT, REQUEST_TIMEOUT, bool_property, bytes_to_js,
+        progress_to_js as progress_row_to_js, property, set as set_js, set_bool as set_js_bool,
+        set_number as set_js_number, set_string as set_js_str, string_property,
     },
 };
 use event_listener::Event;
@@ -131,34 +131,6 @@ async fn feed_owner_for_request(owner: &str) -> Result<String, String> {
     }
 
     normalize_feed_owner(owner).ok_or_else(|| "invalid feed owner".to_string())
-}
-
-fn feed_status(
-    data: &[(Vec<u8>, String, String)],
-    connected: u64,
-) -> Option<(&'static str, String)> {
-    if !data.is_empty()
-        && !data
-            .iter()
-            .all(|(_bytes, mime, path)| mime == "not found" || path == "not found")
-    {
-        return None;
-    }
-
-    let reason = data
-        .first()
-        .map(|(bytes, _mime, _path)| String::from_utf8_lossy(bytes).trim().to_string())
-        .filter(|text| !text.is_empty());
-
-    if let Some(reason) = reason {
-        return Some(("error", reason));
-    }
-
-    if connected == 0 {
-        Some(("network_error", "no connected peers".to_string()))
-    } else {
-        Some(("not_found", "feed update not found".to_string()))
-    }
 }
 
 fn network_mode_from_input(mode: &str) -> Option<NetworkMode> {
@@ -355,7 +327,10 @@ pub(crate) async fn request_wallet_via_shell_connector(
     )
 }
 
-async fn ethereum_request(method: &str, params: Option<Array>) -> Result<JsValue, String> {
+pub(crate) async fn ethereum_request(
+    method: &str,
+    params: Option<Array>,
+) -> Result<JsValue, String> {
     let window = web_sys::window().ok_or_else(|| "window is not available".to_string())?;
     let ethereum = Reflect::get(&window, &JsValue::from_str("ethereum"))
         .map_err(|_| "window.ethereum is not available".to_string())?;
@@ -719,14 +694,11 @@ impl Weeb3No103 {
             obj.into()
         }
 
-        if let Some(pos) = data.iter().position(|(_, _, p)| *p == indx) {
-            let (bytes, mime, path) = data.remove(pos);
-            let file = make_js_file(bytes_to_js(&bytes), &mime, &path);
-            let entry = make_entry(&path, &file);
-            out.push(&entry);
-        }
-
-        for (bytes, mime, path) in data {
+        let first = data
+            .iter()
+            .position(|(_, _, path)| *path == indx)
+            .map(|position| data.remove(position));
+        for (bytes, mime, path) in first.into_iter().chain(data) {
             let file = make_js_file(bytes_to_js(&bytes), &mime, &path);
             let entry = make_entry(&path, &file);
             out.push(&entry);
@@ -836,6 +808,7 @@ impl Weeb3No103 {
             index_string,
             add_to_feed,
             feed_topic,
+            None,
         )
         .await
     }
@@ -849,9 +822,17 @@ impl Weeb3No103 {
         index_string: String,
         add_to_feed: bool,
         feed_topic: String,
+        wallet_owner: Option<String>,
     ) -> Object {
         let Some(redundancy_level) = validated_upload_redundancy_number(redundancy_level) else {
             return error_object("redundancy level must be an integer between 0 and 4");
+        };
+        let wallet_owner = match wallet_owner {
+            Some(owner) => match normalize_feed_owner(&owner).filter(|_| add_to_feed) {
+                Some(owner) => Some(owner),
+                None => return error_object("walletOwner requires a feed and a 20-byte address"),
+            },
+            None => None,
         };
 
         if let Err(error) = self.boot_runtime().await {
@@ -871,6 +852,7 @@ impl Weeb3No103 {
                 index_string,
                 add_to_feed,
                 feed_topic.clone(),
+                wallet_owner.as_deref(),
             )
             .await;
 
@@ -886,7 +868,11 @@ impl Weeb3No103 {
         if add_to_feed {
             set_js_str(&obj, "feedTopic", &feed_topic);
             set_js_str(&obj, "feedReference", &indx);
-            match secure_ensure_feed_owner_in_window().await {
+            let owner = match wallet_owner {
+                Some(owner) => hex::decode(strip_hex_prefix(&owner)).ok(),
+                None => secure_ensure_feed_owner_in_window().await,
+            };
+            match owner {
                 Some(owner) if owner.len() == 20 => {
                     set_js_str(&obj, "feedOwner", format!("0x{}", hex::encode(owner)));
                 }
@@ -943,10 +929,15 @@ impl Weeb3No103 {
             String::new(),
             add_to_feed,
             feed_topic,
+            None,
         )
         .await
     }
 
+    /// Omit walletOwner to use the existing stored vault identity. An explicit EOA
+    /// address uses that wallet as the portable owner and prompts for each update.
+    /// Example: await node.postFeedBytes(topic, bytes, "text/plain", "captions", false, account).
+    /// Contract-wallet signatures and rejected/mismatched signatures fail; no key is derived or imported.
     #[wasm_bindgen(js_name = postFeedBytes)]
     pub async fn post_feed_bytes(
         &self,
@@ -955,61 +946,57 @@ impl Weeb3No103 {
         mime: String,
         filename: String,
         encryption: bool,
+        wallet_owner: Option<String>,
     ) -> Object {
-        self.post_upload_bytes(bytes, mime, filename, encryption, true, topic)
-            .await
+        self.upload_with_redundancy(
+            make_upload_file(bytes, mime, filename),
+            encryption,
+            f64::from(RedundancyLevel::DEFAULT_UPLOAD.as_u8()),
+            String::new(),
+            true,
+            topic,
+            wallet_owner,
+        )
+        .await
     }
 
+    /// The complete read, including startup, has a 30-second budget; expiry returns status="timeout".
     #[wasm_bindgen(js_name = acquireFeedBytes)]
     pub async fn acquire_feed_bytes(&self, owner: String, topic: String) -> Object {
-        if let Err(error) = self.boot_runtime().await {
-            return error_object(error);
-        }
+        let deadline = js_sys::Date::now() + FEED_TIMEOUT.as_secs_f64() * 1000.0;
         let feed_topic = normalize_feed_topic(&topic);
-        let feed_owner = match feed_owner_for_request(&owner).await {
-            Ok(feed_owner) => feed_owner,
-            Err(reason) => {
-                let obj = Object::new();
-                set_js_str(&obj, "status", "error");
-                set_js_str(&obj, "reason", reason);
-                set_js_str(&obj, "owner", &owner);
-                set_js_str(&obj, "topic", &topic);
-                set_js_str(&obj, "feedTopic", &feed_topic);
-                set_js(&obj, "body", bytes_to_js(&[]).into());
-                return obj;
-            }
-        };
-        let raw = self
-            .inner
-            .acquire_feed_envelope(feed_owner.clone(), topic.clone())
-            .await;
-        let (data, indx) = decode_resources(raw);
         let obj = Object::new();
-
         set_js_str(&obj, "owner", &owner);
         set_js_str(&obj, "topic", &topic);
         set_js_str(&obj, "feedTopic", &feed_topic);
-        set_js_str(&obj, "feedOwner", feed_owner);
-        set_js_str(&obj, "index", &indx);
-
-        if let Some((status, reason)) = feed_status(&data, self.inner.get_connections().await) {
-            set_js_str(&obj, "status", status);
+        set_js_str(&obj, "index", "");
+        set_js(&obj, "body", bytes_to_js(&[]).into());
+        let result = async_std::future::timeout(FEED_TIMEOUT, async {
+            self.boot_runtime().await?;
+            let feed_owner = feed_owner_for_request(&owner).await?;
+            set_js_str(&obj, "feedOwner", &feed_owner);
+            let response = self
+                .inner
+                .acquire_feed(&feed_owner, &topic, deadline)
+                .await?;
+            Object::assign(&obj, &response);
+            Reflect::delete_property(&obj, &JsValue::from_str("ok")).ok();
+            Ok::<_, String>(())
+        })
+        .await
+        .unwrap_or_else(|_| Err(REQUEST_TIMEOUT.to_string()));
+        if let Err(reason) = result {
+            set_js_str(
+                &obj,
+                "status",
+                if reason == REQUEST_TIMEOUT {
+                    "timeout"
+                } else {
+                    "error"
+                },
+            );
             set_js_str(&obj, "reason", reason);
-            set_js(&obj, "body", bytes_to_js(&[]).into());
-            return obj;
         }
-
-        if let Some((bytes, mime, path)) = data.into_iter().next() {
-            set_js_str(&obj, "status", "ok");
-            set_js(&obj, "body", bytes_to_js(&bytes).into());
-            set_js_str(&obj, "mime", mime);
-            set_js_str(&obj, "path", path);
-        } else {
-            set_js_str(&obj, "status", "not_found");
-            set_js_str(&obj, "reason", "feed update not found");
-            set_js(&obj, "body", bytes_to_js(&[]).into());
-        }
-
         obj
     }
 

@@ -269,13 +269,18 @@ pub(crate) fn rolling_next_parity_index(
 }
 
 #[derive(Debug)]
+struct RetrieveAttemptBudget {
+    limit: usize,
+    remaining: AtomicUsize,
+    timed_out: AtomicUsize,
+    confirmed_empty: AtomicUsize,
+}
+
+#[derive(Debug)]
 struct RetrieveAdmissionInner {
     open: AtomicBool,
     returned_cac: AtomicBool,
-    attempt_limit: Option<usize>,
-    attempts_remaining: Option<AtomicUsize>,
-    timed_out_attempts: Option<AtomicUsize>,
-    confirmed_empty_attempts: Option<AtomicUsize>,
+    attempts: Option<RetrieveAttemptBudget>,
     closed: Event,
 }
 
@@ -299,10 +304,12 @@ impl RetrieveAdmission {
             inner: Arc::new(RetrieveAdmissionInner {
                 open: AtomicBool::new(attempts_remaining != Some(0)),
                 returned_cac: AtomicBool::new(false),
-                attempt_limit: attempts_remaining,
-                attempts_remaining: attempts_remaining.map(AtomicUsize::new),
-                timed_out_attempts: attempts_remaining.map(|_| AtomicUsize::new(0)),
-                confirmed_empty_attempts: attempts_remaining.map(|_| AtomicUsize::new(0)),
+                attempts: attempts_remaining.map(|limit| RetrieveAttemptBudget {
+                    limit,
+                    remaining: AtomicUsize::new(limit),
+                    timed_out: AtomicUsize::new(0),
+                    confirmed_empty: AtomicUsize::new(0),
+                }),
                 closed: Event::new(),
             }),
         }
@@ -328,74 +335,67 @@ impl RetrieveAdmission {
 
     pub(crate) fn physical_attempt_available(&self) -> bool {
         self.inner
-            .attempts_remaining
+            .attempts
             .as_ref()
-            .is_none_or(|remaining| remaining.load(Ordering::SeqCst) != 0)
+            .is_none_or(|attempts| attempts.remaining.load(Ordering::SeqCst) != 0)
     }
 
     pub(crate) fn claimed_physical_attempts(&self) -> Option<usize> {
-        self.inner
-            .attempt_limit
-            .zip(self.inner.attempts_remaining.as_ref())
-            .map(|(limit, remaining)| limit.saturating_sub(remaining.load(Ordering::SeqCst)))
+        self.inner.attempts.as_ref().map(|attempts| {
+            attempts
+                .limit
+                .saturating_sub(attempts.remaining.load(Ordering::SeqCst))
+        })
     }
 
     pub(crate) fn record_physical_attempt_timeout(&self) {
-        if let Some(timed_out) = self.inner.timed_out_attempts.as_ref() {
-            timed_out.fetch_add(1, Ordering::SeqCst);
+        if let Some(attempts) = self.inner.attempts.as_ref() {
+            attempts.timed_out.fetch_add(1, Ordering::SeqCst);
         }
     }
 
     pub(crate) fn timed_out_physical_attempts(&self) -> Option<usize> {
         self.inner
-            .timed_out_attempts
+            .attempts
             .as_ref()
-            .map(|timed_out| timed_out.load(Ordering::SeqCst))
+            .map(|attempts| attempts.timed_out.load(Ordering::SeqCst))
     }
 
     pub(crate) fn record_confirmed_empty_physical_attempt(&self) {
-        if let Some(confirmed_empty) = self.inner.confirmed_empty_attempts.as_ref() {
-            confirmed_empty.fetch_add(1, Ordering::SeqCst);
+        if let Some(attempts) = self.inner.attempts.as_ref() {
+            attempts.confirmed_empty.fetch_add(1, Ordering::SeqCst);
         }
     }
 
     pub(crate) fn confirmed_empty_physical_attempts(&self) -> Option<usize> {
         self.inner
-            .confirmed_empty_attempts
+            .attempts
             .as_ref()
-            .map(|confirmed_empty| confirmed_empty.load(Ordering::SeqCst))
+            .map(|attempts| attempts.confirmed_empty.load(Ordering::SeqCst))
     }
 
     /// Atomically claim one physical exchange before it is dispatched. An exhausted finite
     /// budget closes only future admission; exchanges that already claimed a slot still settle.
     pub(crate) fn try_claim_physical_attempt(&self) -> bool {
-        let Some(attempts_remaining) = self.inner.attempts_remaining.as_ref() else {
+        let Some(attempts) = self.inner.attempts.as_ref() else {
             return true;
         };
         if !self.is_open() {
             return false;
         }
 
-        let mut remaining = attempts_remaining.load(Ordering::SeqCst);
-        loop {
-            if remaining == 0 {
-                return false;
-            }
-
-            match attempts_remaining.compare_exchange_weak(
-                remaining,
-                remaining - 1,
-                Ordering::SeqCst,
-                Ordering::SeqCst,
-            ) {
-                Ok(_) => {
-                    if remaining == 1 {
-                        self.close();
-                    }
-                    return true;
+        match attempts
+            .remaining
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                remaining.checked_sub(1)
+            }) {
+            Ok(remaining) => {
+                if remaining == 1 {
+                    self.close();
                 }
-                Err(current) => remaining = current,
+                true
             }
+            Err(_) => false,
         }
     }
 

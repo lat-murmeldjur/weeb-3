@@ -411,7 +411,7 @@ mod bee_compatibility {
                 .into_iter()
                 .zip(shards.into_iter().take(data_count))
                 .map(|(reference, raw)| {
-                    raw.map(|raw| (reference, raw))
+                    raw.map(|raw| (reference.to_vec(), raw))
                         .ok_or_else(|| "data shard remains unavailable".to_string())
                 })
                 .collect()
@@ -491,7 +491,7 @@ mod bee_compatibility {
             join_range(tree, 0, tree.root.span)
         }
 
-        fn immediate_references(tree: &SimTree) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
+        fn immediate_references(tree: &SimTree) -> erasure_coding::SplitReferences {
             let decoded = root_decoded(tree).unwrap();
             assert!(decoded.span > CHUNK_SIZE as u64);
             erasure_coding::split_references(
@@ -505,8 +505,8 @@ mod bee_compatibility {
 
         fn remove_shards(
             tree: &mut SimTree,
-            data_references: &[Vec<u8>],
-            parity_references: &[Vec<u8>],
+            data_references: &[bytes::Bytes],
+            parity_references: &[bytes::Bytes],
             indices: impl IntoIterator<Item = usize>,
         ) {
             let data_count = data_references.len();

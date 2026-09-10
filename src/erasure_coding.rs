@@ -1,3 +1,4 @@
+use bytes::Bytes;
 use std::{cell::RefCell, collections::VecDeque, fmt, rc::Rc};
 
 pub const SPAN_SIZE: usize = 8;
@@ -304,7 +305,7 @@ pub fn encoded_reference_payload_len(
         .checked_add(parity_shards.checked_mul(HASH_SIZE)?)
 }
 
-pub type SplitReferences = (Vec<Vec<u8>>, Vec<Vec<u8>>);
+pub type SplitReferences = (Vec<Bytes>, Vec<Bytes>);
 
 pub fn split_references(
     payload: &[u8],
@@ -324,15 +325,14 @@ pub fn split_references(
         return None;
     }
 
+    let payload = Bytes::copy_from_slice(payload);
     let data = payload[..data_bytes]
         .chunks_exact(data_reference_size)
-        .map(<[u8]>::to_vec)
+        .map(|reference| payload.slice_ref(reference))
         .collect();
     let parity = payload[data_bytes..]
-        .as_chunks::<HASH_SIZE>()
-        .0
-        .iter()
-        .map(|reference| reference.to_vec())
+        .chunks_exact(HASH_SIZE)
+        .map(|reference| payload.slice_ref(reference))
         .collect();
     Some((data, parity))
 }
@@ -645,8 +645,11 @@ fn coding_matrix(data_count: usize, total_count: usize) -> Result<Vec<Vec<u8>>, 
 
     let mut vandermonde = vec![vec![0; data_count]; total_count];
     for (row_index, row) in vandermonde.iter_mut().enumerate() {
-        for (column_index, value) in row.iter_mut().enumerate() {
-            *value = gf_pow(row_index as u8, column_index);
+        let products = &GF_MUL[row_index];
+        let mut power = 1;
+        for value in row {
+            *value = power;
+            power = products[power as usize];
         }
     }
 
@@ -677,20 +680,10 @@ fn code_row_slices(coefficients: &[u8], inputs: &[&[u8]], shard_size: usize) -> 
 }
 
 fn matrix_multiply(left: &[Vec<u8>], right: &[Vec<u8>]) -> Vec<Vec<u8>> {
-    let rows = left.len();
-    let columns = right[0].len();
-    let inner = right.len();
-    let mut result = vec![vec![0; columns]; rows];
-    for row in 0..rows {
-        for column in 0..columns {
-            let mut value = 0;
-            for index in 0..inner {
-                value ^= gf_mul(left[row][index], right[index][column]);
-            }
-            result[row][column] = value;
-        }
-    }
-    result
+    let inputs: Vec<_> = right.iter().map(Vec::as_slice).collect();
+    left.iter()
+        .map(|row| code_row_slices(row, &inputs, right[0].len()))
+        .collect()
 }
 
 fn invert(matrix: Vec<Vec<u8>>) -> Result<Vec<Vec<u8>>, ReedSolomonError> {
@@ -732,9 +725,9 @@ fn gauss_jordan(work: &mut [Vec<u8>], size: usize) -> Result<(), ReedSolomonErro
 
         let pivot = work[diagonal][diagonal];
         if pivot != 1 {
-            let scale = gf_div(1, pivot);
+            let products = &GF_MUL[gf_inverse(pivot) as usize];
             for value in &mut work[diagonal] {
-                *value = gf_mul(*value, scale);
+                *value = products[*value as usize];
             }
         }
 
@@ -743,11 +736,12 @@ fn gauss_jordan(work: &mut [Vec<u8>], size: usize) -> Result<(), ReedSolomonErro
             if scale == 0 {
                 continue;
             }
+            let products = &GF_MUL[scale as usize];
             let (before_target, target_and_after) = work.split_at_mut(row);
             let source = &before_target[diagonal];
             let target = &mut target_and_after[0];
             for (target, source) in target.iter_mut().zip(source) {
-                *target ^= gf_mul(scale, *source);
+                *target ^= products[*source as usize];
             }
         }
     }
@@ -758,11 +752,12 @@ fn gauss_jordan(work: &mut [Vec<u8>], size: usize) -> Result<(), ReedSolomonErro
             if scale == 0 {
                 continue;
             }
+            let products = &GF_MUL[scale as usize];
             let (before_source, source_and_after) = work.split_at_mut(diagonal);
             let target = &mut before_source[row];
             let source = &source_and_after[0];
             for (target, source) in target.iter_mut().zip(source) {
-                *target ^= gf_mul(scale, *source);
+                *target ^= products[*source as usize];
             }
         }
     }
@@ -770,34 +765,21 @@ fn gauss_jordan(work: &mut [Vec<u8>], size: usize) -> Result<(), ReedSolomonErro
     Ok(())
 }
 
-fn gf_pow(value: u8, exponent: usize) -> u8 {
-    let mut result = 1u8;
-    for _ in 0..exponent {
-        result = gf_mul(result, value);
+fn gf_inverse(value: u8) -> u8 {
+    assert!(value != 0, "division by zero in GF(256)");
+    let mut inverse = value;
+    // Six steps yield value^127; its square is value^254 = value^-1.
+    for _ in 0..6 {
+        inverse = gf_mul(gf_mul(inverse, inverse), value);
     }
-    result
+    gf_mul(inverse, inverse)
 }
 
-fn gf_div(numerator: u8, denominator: u8) -> u8 {
-    assert!(denominator != 0, "division by zero in GF(256)");
-    if numerator == 0 {
-        return 0;
-    }
-
-    let mut inverse = 1u8;
-    let mut base = denominator;
-    let mut exponent = 254u16;
-    while exponent > 0 {
-        if exponent & 1 != 0 {
-            inverse = gf_mul(inverse, base);
-        }
-        base = gf_mul(base, base);
-        exponent >>= 1;
-    }
-    gf_mul(numerator, inverse)
+fn gf_mul(left: u8, right: u8) -> u8 {
+    GF_MUL[left as usize][right as usize]
 }
 
-const fn gf_mul(mut left: u8, mut right: u8) -> u8 {
+const fn gf_mul_polynomial(mut left: u8, mut right: u8) -> u8 {
     let mut result = 0u8;
     let mut bit = 0;
     while bit < 8 {
@@ -821,7 +803,7 @@ const fn multiplication_table() -> [[u8; 256]; 256] {
     while left < 256 {
         let mut right = 0;
         while right < 256 {
-            table[left][right] = gf_mul(left as u8, right as u8);
+            table[left][right] = gf_mul_polynomial(left as u8, right as u8);
             right += 1;
         }
         left += 1;
@@ -829,7 +811,15 @@ const fn multiplication_table() -> [[u8; 256]; 256] {
     table
 }
 
-static GF_MUL: [[u8; 256]; 256] = multiplication_table();
+static GF_MUL: std::sync::LazyLock<[[u8; 256]; 256]> =
+    std::sync::LazyLock::new(multiplication_table);
+
+#[test]
+fn nonzero_field_elements_have_multiplicative_inverses() {
+    for value in 1..=u8::MAX {
+        assert_eq!(gf_mul(value, gf_inverse(value)), 1);
+    }
+}
 
 pub(crate) fn validated_upload_redundancy(value: u8) -> Option<RedundancyLevel> {
     RedundancyLevel::from_u8(value)

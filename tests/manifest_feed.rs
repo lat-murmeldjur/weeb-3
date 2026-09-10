@@ -4,6 +4,292 @@
 mod feed;
 #[path = "../src/manifest.rs"]
 mod manifest;
+#[path = "../src/stream_conventions.rs"]
+mod stream_conventions;
+#[path = "../src/stream_hls.rs"]
+mod stream_hls;
+
+mod hls_formats {
+    use crate::{
+        stream_conventions::HlsStart,
+        stream_hls::{HlsManifest, HlsPlaylist, HlsSource},
+    };
+
+    fn reference(byte: char) -> String {
+        byte.to_string().repeat(64)
+    }
+
+    #[test]
+    fn producer_master_preserves_every_rendition_and_quoted_attribute() {
+        let owner = "ab".repeat(20);
+        let text = format!(
+            "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-INDEPENDENT-SEGMENTS\n\
+             #EXT-X-STREAM-INF:BANDWIDTH=700000,AVERAGE-BANDWIDTH=600000,RESOLUTION=640x360\n\
+             swarm://{owner}/lower-topic\n\
+             #EXT-X-STREAM-INF:BANDWIDTH=2800000,CODECS=\"avc1.64001f,mp4a.40.2\",RESOLUTION=1280x720\n\
+             swarm://{owner}/higher-topic\n"
+        );
+        let Some(HlsManifest::Master(master)) = HlsManifest::parse(text.as_bytes()) else {
+            panic!("master");
+        };
+        assert_eq!(
+            master.sources().collect::<Vec<_>>(),
+            [
+                format!("swarm://{owner}/lower-topic"),
+                format!("swarm://{owner}/higher-topic")
+            ]
+        );
+        assert!(HlsPlaylist::parse(text.as_bytes()).is_none());
+        assert_eq!(
+            master.render(|uri, _| Some(uri.replace("swarm://", "/weeb-3/feeds/"))),
+            text.replace("swarm://", "/weeb-3/feeds/")
+        );
+        assert_eq!(master.render(|_, _| None), text);
+        assert_eq!(
+            master.initial_source(),
+            Some(format!("swarm://{owner}/lower-topic").as_str())
+        );
+    }
+
+    #[test]
+    fn master_audio_iframe_and_session_key_uris_are_rewritten_without_touching_labels() {
+        let r = reference('a');
+        let text = format!(
+            "#EXTM3U\n\
+            #EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"a\",NAME=\"URI=not,a,url\",URI=\"/bytes/{r}\"\n\
+            #EXT-X-I-FRAME-STREAM-INF:BANDWIDTH=100,URI=\"{r}\"\n\
+            #EXT-X-SESSION-KEY:METHOD=AES-128,URI=\"https://keys.example/key\"\n\
+            #EXT-X-STREAM-INF:BANDWIDTH=1000,AUDIO=\"a\"\nhttps://example.org/main.m3u8\n"
+        );
+        let Some(HlsManifest::Master(master)) = HlsManifest::parse(text.as_bytes()) else {
+            panic!("master");
+        };
+        assert_eq!(master.sources().count(), 3);
+        assert_eq!(
+            master.initial_source(),
+            Some("https://example.org/main.m3u8")
+        );
+        let mut seen = Vec::new();
+        let rewritten = master.render(|uri, playlist| {
+            seen.push((uri.to_string(), playlist));
+            match HlsSource::parse(uri) {
+                Some(HlsSource::Reference(reference)) => Some(format!("/local/{reference}")),
+                _ => None,
+            }
+        });
+        assert_eq!(
+            seen.iter()
+                .map(|(_, playlist)| *playlist)
+                .collect::<Vec<_>>(),
+            [true, true, false, true]
+        );
+        assert_eq!(rewritten.matches(&format!("URI=\"/local/{r}\"")).count(), 2);
+        assert!(rewritten.contains("NAME=\"URI=not,a,url\""));
+        assert!(rewritten.contains("URI=\"https://keys.example/key\""));
+        assert!(rewritten.ends_with("https://example.org/main.m3u8\n"));
+    }
+
+    #[test]
+    fn malformed_or_mixed_master_cannot_be_mistaken_for_media() {
+        let r = reference('1');
+        for text in [
+            "#EXTM3U\n#EXT-X-STREAM-INF:\nchild\n".to_string(),
+            "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1\n".to_string(),
+            "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1\n#comment\nchild\n".to_string(),
+            "#EXTM3U\n#EXT-X-I-FRAME-STREAM-INF:BANDWIDTH=1\n".to_string(),
+            "#EXTM3U\n#EXT-X-MEDIA:TYPE=AUDIO,URI=\"unclosed\n".to_string(),
+            "#EXTM3U\n#EXT-X-MEDIA:TYPE=AUDIO,URI=\"a\",URI=\"b\"\n".to_string(),
+            format!("#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1\nchild\n#EXTINF:4,\n{r}\n"),
+            "#EXTM3U\n#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1\nchild\n".to_string(),
+        ] {
+            assert!(HlsManifest::parse(text.as_bytes()).is_none(), "{text}");
+            assert!(HlsPlaylist::parse(text.as_bytes()).is_none(), "{text}");
+        }
+    }
+
+    #[test]
+    fn feed_topic_encoding_index_and_content_roots_are_distinct() {
+        let owner = "ab".repeat(20);
+        let topic = reference('c');
+        for uri in [
+            format!("swarm://{owner}/{topic}"),
+            format!("{owner}/{topic}"),
+        ] {
+            assert_eq!(
+                HlsSource::parse(&uri),
+                Some(HlsSource::Feed {
+                    owner: owner.clone(),
+                    topic: topic.clone(),
+                    topic_is_hash: false,
+                    index: None
+                })
+            );
+        }
+        for uri in [
+            format!("/feeds/{owner}/{topic}?index=19"),
+            format!("https://bee.example/feeds/{owner}/{topic}?index=19"),
+            format!("/weeb-3/testnet/feeds/{owner}/{topic}?index=19"),
+        ] {
+            assert_eq!(
+                HlsSource::parse(&uri),
+                Some(HlsSource::Feed {
+                    owner: owner.clone(),
+                    topic: topic.clone(),
+                    topic_is_hash: true,
+                    index: Some(19)
+                })
+            );
+        }
+        for r in [topic, "AD".repeat(64)] {
+            for uri in [
+                r.clone(),
+                format!("/bytes/{r}"),
+                format!("https://old-gateway/bytes/{r}"),
+                format!("/weeb-3/hls/bytes/{r}?start=live"),
+            ] {
+                assert_eq!(
+                    HlsSource::parse(&uri),
+                    Some(HlsSource::Reference(r.to_ascii_lowercase()))
+                );
+            }
+        }
+        for uri in [
+            format!("/feeds/bad/{owner}"),
+            format!("/feeds/{owner}/{}?index=-1", reference('a')),
+            format!("swarm://{owner}/a/b"),
+            format!("swarm://{owner}/a#index"),
+            format!("swarm://{owner}/a?index=18446744073709551616"),
+        ] {
+            assert!(HlsSource::parse(&uri).is_none(), "{uri}");
+        }
+    }
+
+    #[test]
+    fn new_gap_and_dates_round_trip_with_exact_timeline_and_no_fake_reference() {
+        let a = reference('a');
+        let b = reference('b');
+        let text = format!(
+            "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:0\n\
+            #EXT-X-PROGRAM-DATE-TIME:2026-09-09T10:00:00.000Z\n#EXTINF:4,\n{a}\n\
+            #EXT-X-GAP\n#EXT-X-PROGRAM-DATE-TIME:2026-09-09T10:00:04.000Z\n#EXTINF:4,\ngap-1\n\
+            #EXT-X-DISCONTINUITY\n#EXT-X-PROGRAM-DATE-TIME:2026-09-09T10:01:00.000+00:00\n#EXTINF:4.125,\n{b}\n#EXT-X-ENDLIST\n"
+        );
+        let Some(HlsManifest::Media(playlist)) = HlsManifest::parse(text.as_bytes()) else {
+            panic!("media");
+        };
+        assert_eq!(playlist.duration(), 12.125);
+        assert_eq!(playlist.segments[1].reference, "gap-1");
+        assert!(playlist.segments[1].gap);
+        assert_eq!(playlist.segments[2].discontinuity_sequence, 1);
+        assert_eq!(
+            playlist.segments[2].program_date_time.as_deref(),
+            Some("2026-09-09T10:01:00.000+00:00")
+        );
+        let rendered = playlist.render("/weeb-3/hls/bytes", HlsStart::Beginning);
+        let text = std::str::from_utf8(&rendered).unwrap();
+        assert!(text.contains("#EXT-X-GAP\ngap-1\n"));
+        assert!(!text.contains("/bytes/gap-1"));
+        assert_eq!(text.matches("#EXT-X-PROGRAM-DATE-TIME:").count(), 3);
+        assert_eq!(HlsPlaylist::parse(&rendered), Some(playlist));
+        assert!(HlsSource::parse("gap-1").is_none());
+    }
+
+    #[test]
+    fn old_gap_order_and_undated_bare_or_gateway_media_remain_supported() {
+        let a = reference('a');
+        let b = reference('b');
+        let text =
+            format!("#EXTM3U\n#EXTINF:4,\nhttps://old/bytes/{a}\n#EXTINF:4,\n#EXT-X-GAP\n{b}\n");
+        let playlist = HlsPlaylist::parse(text.as_bytes()).unwrap();
+        assert_eq!(playlist.duration(), 8.0);
+        assert!(
+            playlist
+                .segments
+                .iter()
+                .all(|segment| segment.program_date_time.is_none())
+        );
+        assert_eq!(playlist.segments[0].reference, a);
+        assert_eq!(playlist.segments[1].reference, b);
+        assert!(playlist.segments[1].gap);
+        assert_eq!(
+            HlsPlaylist::parse(&playlist.render("/local", HlsStart::Beginning)),
+            Some(playlist)
+        );
+    }
+
+    #[test]
+    fn gap_placeholders_never_make_ordinary_media_or_an_eight_second_runway() {
+        let a = reference('a');
+        assert!(HlsPlaylist::parse(b"#EXTM3U\n#EXTINF:4,\ngap-1\n").is_none());
+        for pending in [
+            "#EXT-X-GAP\n",
+            "#EXT-X-PROGRAM-DATE-TIME:2026-09-09T10:00:00Z\n",
+        ] {
+            assert!(
+                HlsPlaylist::parse(format!("#EXTM3U\n#EXTINF:4,\n{a}\n{pending}").as_bytes())
+                    .is_none()
+            );
+        }
+        let playlist = HlsPlaylist::parse(
+            format!("#EXTM3U\n#EXTINF:4,\n{a}\n#EXT-X-GAP\n#EXTINF:4,\ngap-1\n").as_bytes(),
+        )
+        .unwrap();
+        assert!(playlist.anchored_startup_plan(0, &a).is_none());
+    }
+
+    #[test]
+    fn dates_enrich_undated_overlap_without_replacing_known_authenticated_dates() {
+        let a = reference('a');
+        let b = reference('b');
+        let base = format!("#EXTM3U\n#EXTINF:4,\n{a}\n");
+        let dated =
+            format!("#EXTM3U\n#EXT-X-PROGRAM-DATE-TIME:2026-09-09T10:00:00Z\n#EXTINF:4,\n{a}\n");
+        let mut playlist = HlsPlaylist::parse(base.as_bytes()).unwrap();
+        assert_eq!(
+            playlist.merge_playlist(HlsPlaylist::parse(dated.as_bytes()).unwrap()),
+            Some(0)
+        );
+        assert_eq!(
+            playlist.segments[0].program_date_time.as_deref(),
+            Some("2026-09-09T10:00:00Z")
+        );
+        let appended = dated.replace("10:00:00Z", "10:00:00+00:00")
+            + &format!("#EXT-X-PROGRAM-DATE-TIME:2026-09-09T10:00:04Z\n#EXTINF:4,\n{b}\n");
+        assert_eq!(
+            playlist.merge_playlist(HlsPlaylist::parse(appended.as_bytes()).unwrap()),
+            Some(1)
+        );
+        assert_eq!(
+            playlist.segments[0].program_date_time.as_deref(),
+            Some("2026-09-09T10:00:00Z")
+        );
+        let mut suffix = HlsPlaylist::parse(format!("#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:1\n#EXT-X-PROGRAM-DATE-TIME:2026-09-09T10:00:04+00:00\n#EXTINF:4,\n{b}\n").as_bytes()).unwrap();
+        assert_eq!(suffix.merge_playlist(playlist), Some(0));
+        assert_eq!(suffix.sequence, 0);
+        assert_eq!(
+            suffix.segments[1].program_date_time.as_deref(),
+            Some("2026-09-09T10:00:04+00:00")
+        );
+        assert_eq!(suffix.duration(), 8.0);
+    }
+
+    #[test]
+    fn legacy_feed_scheme_and_marker_case_remain_accepted() {
+        let owner = "AB".repeat(20);
+        let topic = "CD".repeat(32);
+        assert!(matches!(
+            HlsSource::parse(&format!("HTTPS://gateway/FEEDS/{owner}/{topic}?index=7")),
+            Some(HlsSource::Feed {
+                topic_is_hash: true,
+                index: Some(7),
+                ..
+            })
+        ));
+        assert!(
+            matches!(HlsSource::parse(&format!("SWARM://{owner}/RawTopic")), Some(HlsSource::Feed { topic_is_hash: false, topic, .. }) if topic == "RawTopic")
+        );
+    }
+}
 
 mod bzz_manifest {
     #![allow(dead_code)]

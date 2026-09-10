@@ -8,7 +8,7 @@ use std::{
 use async_std::sync::Arc;
 use bytes::Bytes;
 use js_sys::{Array, Object, Reflect};
-use libp2p::futures::future::join_all;
+use libp2p::futures::{StreamExt, future::join_all, stream};
 use wasm_bindgen::{JsCast, JsValue, closure::Closure};
 use wasm_bindgen_futures::spawn_local;
 use web_sys::{Element, HtmlMediaElement};
@@ -1131,52 +1131,46 @@ async fn read_cached_range(
 
     let body_len = inclusive_range_len(start, end)
         .ok_or_else(|| "requested range is too large".to_string())?;
-    let mut body = vec![0; body_len];
+    let mut body = Vec::with_capacity(body_len);
 
-    for batch in windows.chunks(MEDIA_PREFETCH_MAX_PARALLEL) {
-        if current.is_some_and(|current| !current()) {
-            return Err("range admission was retired".into());
-        }
-        let loads = batch.iter().map(|(window_start, window_end)| {
-            read_range_window(
-                weeb3,
-                resource,
-                metadata,
-                *window_start,
-                *window_end,
-                generation,
-            )
-        });
-        let responses = join_all(loads).await;
-        if current.is_some_and(|current| !current()) {
-            return Err("range admission was retired".into());
-        }
-
-        for (index, response) in responses.into_iter().enumerate() {
-            let (window_start, window_end) = batch[index];
-            let storage_body = response?;
-            let expected_len = inclusive_range_len(window_start, window_end)
-                .ok_or_else(|| "storage window is too large".to_string())?;
-            if storage_body.len() != expected_len {
-                return Err(RangeReadError::terminal(format!(
-                    "weeb-3 returned {} bytes for {} byte storage window",
-                    storage_body.len(),
-                    expected_len
-                )));
+    let admitting = Cell::new(true);
+    let responses = stream::iter(windows)
+        .map(|(window_start, window_end)| {
+            let admitting = &admitting;
+            async move {
+                let response = if !admitting.get() || current.is_some_and(|current| !current()) {
+                    Err("range admission was retired".into())
+                } else {
+                    read_range_window(
+                        weeb3,
+                        resource,
+                        metadata,
+                        window_start,
+                        window_end,
+                        generation,
+                    )
+                    .await
+                };
+                if response.is_err() {
+                    admitting.set(false);
+                }
+                (window_start, window_end, response)
             }
-
-            let overlap_start = start.max(window_start);
-            let overlap_end = end.min(window_end);
-            let local_start = usize::try_from(overlap_start - window_start)
-                .map_err(|_| "storage window offset overflow".to_string())?;
-            let local_end = usize::try_from(overlap_end - window_start)
-                .map_err(|_| "storage window offset overflow".to_string())?;
-            let destination_start = usize::try_from(overlap_start - start)
-                .map_err(|_| "range destination offset overflow".to_string())?;
-            let slice = &storage_body[local_start..=local_end];
-            let destination_end = destination_start + slice.len();
-            body[destination_start..destination_end].copy_from_slice(slice);
+        })
+        .buffered(MEDIA_PREFETCH_MAX_PARALLEL);
+    futures::pin_mut!(responses);
+    while let Some((window_start, window_end, response)) = responses.next().await {
+        if current.is_some_and(|current| !current()) {
+            return Err("range admission was retired".into());
         }
+        let storage_body = response?;
+        let overlap_start = start.max(window_start);
+        let overlap_end = end.min(window_end);
+        let local_start = usize::try_from(overlap_start - window_start)
+            .map_err(|_| "storage window offset overflow".to_string())?;
+        let local_end = usize::try_from(overlap_end - window_start)
+            .map_err(|_| "storage window offset overflow".to_string())?;
+        body.extend_from_slice(&storage_body[local_start..=local_end]);
     }
 
     Ok(Bytes::from(body))
