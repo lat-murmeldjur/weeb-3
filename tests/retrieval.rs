@@ -19,7 +19,7 @@ pub mod source;
 mod connection {
     use crate::accounting::{
         CONNECTION_BUILDUP_LIMIT, REFRESH_RATE, bee_reconnect_delay_seconds,
-        connection_dial_capacity_available, connection_population_deficit, refreshment_due,
+        connection_dial_capacity_available, connection_population_deficit, price, refreshment_due,
     };
     #[test]
     fn first_usable_connections_do_not_wait_for_the_population_target() {
@@ -818,15 +818,58 @@ mod connection {
     }
 
     #[test]
-    fn first_refresh_accumulates_two_seconds_then_the_normal_rate_applies() {
-        assert!(!refreshment_due(0, 0.0, REFRESH_RATE * 3));
-        assert!(!refreshment_due(REFRESH_RATE, 0.0, REFRESH_RATE * 3));
-        assert!(refreshment_due(REFRESH_RATE * 2, 0.0, REFRESH_RATE * 3));
-        assert!(refreshment_due(REFRESH_RATE, 0.0, REFRESH_RATE));
-        assert!(!refreshment_due(REFRESH_RATE, 0.0, REFRESH_RATE + 123));
-        assert!(refreshment_due(REFRESH_RATE + 123, 0.0, REFRESH_RATE + 123));
-        assert!(!refreshment_due(REFRESH_RATE - 1, 1.0, REFRESH_RATE * 3));
-        assert!(refreshment_due(REFRESH_RATE, 1.0, REFRESH_RATE * 3));
+    fn refresh_cadence_is_unchanged_when_the_peer_limit_leaves_headroom() {
+        let threshold = REFRESH_RATE * 3;
+        assert!(!refreshment_due(0, 0.0, threshold));
+        assert!(!refreshment_due(REFRESH_RATE, 0.0, threshold));
+        assert!(!refreshment_due(REFRESH_RATE * 2 - 1, 0.0, threshold));
+        assert!(refreshment_due(REFRESH_RATE * 2, 0.0, threshold));
+        assert!(!refreshment_due(REFRESH_RATE - 1, 1.0, threshold));
+        assert!(refreshment_due(REFRESH_RATE, 1.0, threshold));
+    }
+
+    #[test]
+    fn refresh_starts_before_debt_blocks_the_next_chunk() {
+        // These balances cannot reach the old refresh target: another 260k
+        // reservation already exceeds the announced limit.
+        for (balance, threshold) in [(260_000, 450_000), (260_000, 450_123),
+            (780_000, 900_000), (780_000, 1_000_000)] {
+            assert!(balance + 260_000 > threshold);
+            assert!(refreshment_due(balance, 0.0, threshold));
+        }
+        for threshold in [10_000, 260_000, 320_000, 450_000, 450_123,
+            900_000, 1_000_000, 1_350_000] {
+            for proximity in 0..=31 {
+                let amount = price(proximity);
+                if amount > threshold { continue; }
+                let first_blocking_balance = threshold - amount + 1;
+                for last in [0.0, 1.0] {
+                    assert!(refreshment_due(first_blocking_balance, last, threshold),
+                        "unscheduled debt at threshold {threshold}, price {amount}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn zero_debt_never_refreshes_even_with_a_tiny_peer_limit() {
+        for threshold in [0, 1, 10_000, 260_000, 320_000, 450_000, 1_350_000] {
+            for last in [0.0, 1.0] {
+                assert!(!refreshment_due(0, last, threshold));
+            }
+        }
+    }
+
+    #[test]
+    fn chunk_prices_preserve_every_existing_proximity_value() {
+        assert_eq!(price(0), 320_000);
+        assert_eq!(price(31), 10_000);
+        assert_eq!(price(u8::MAX), 10_000);
+        for proximity in u8::MIN..=u8::MAX {
+            // Historical price schedule, including its saturated tail.
+            let previous = (u64::from(31_u8.saturating_sub(proximity)) + 1) * 10_000;
+            assert_eq!(price(proximity), previous);
+        }
     }
 
     #[test]
@@ -890,11 +933,6 @@ mod connection {
         assert!(refresh.contains("refresh_dispatches % 8 == 0"));
         assert!(refresh.contains("async_std::task::sleep(Duration::ZERO).await;"));
 
-        let accounting = include_str!("../src/accounting.rs");
-        assert!(
-            accounting.contains("async_std::task::sleep(std::time::Duration::ZERO).await"),
-            "a threshold-crossing completion must return to the browser event loop"
-        );
     }
 
     #[test]
@@ -959,7 +997,14 @@ mod connection {
             .nth(1)
             .and_then(|source| source.split("pub async fn issue_handler(").next())
             .expect("refresh dispatch");
-        assert!(!refresh_handler.contains("timeout("));
+        // Expiry may close an ambiguous refresh only after its physical work drains.
+        assert!(refresh_handler.contains("Duration::from_secs(10)"));
+        crate::source::assert_in_order(refresh_handler, &[
+            "RefreshmentOutcome::NotDispatched",
+            "async_std::future::timeout(",
+            "open_current_outbound_stream(",
+            "refreshment_exchange(",
+        ]);
         let pricing = handlers
             .split("pub async fn pricing_handler(")
             .nth(1)
@@ -982,6 +1027,11 @@ mod connection {
                 .count(),
             2
         );
+        crate::source::assert_in_order(refresh, &[
+            "read_control_protocol_frame(&mut stream).await",
+            "timeout_outcome.set(RefreshmentOutcome::AmbiguousAfterPayment)",
+            "stream.write_all(&payment_frame).await",
+        ]);
         assert!(!handlers.contains("syn_ack.ack.clone().unwrap()"));
 
         assert!(runtime.contains("cheques.insert("));

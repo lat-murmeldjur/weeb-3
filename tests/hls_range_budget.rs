@@ -97,10 +97,8 @@ fn live_duration_window_keeps_owned_bodies_and_beginning_seek_delivery() {
     assert!(runway.contains("hls_body(client.clone(), reference.clone(), Some(id))"));
     assert!(runway.find("loads.next().await").unwrap() < runway.find("body_runway_running = false").unwrap());
     assert!(runway.contains("!active.body_runway_running"));
-    assert!(runway.contains("active.start == HlsStart::Live || active.beginning_history_started"));
     let cursor = section(HLS_RUNTIME, "fn prefetch_from_reference(", "fn next_feed_id(");
     assert!(cursor.contains("hls_progressive_foreground_transition"));
-    assert!(cursor.contains("Some((active.id, active.beginning_history_started, transition))"));
     assert!(cursor.find("if follow {").unwrap() < cursor.find("spawn_body_runway(id)").unwrap());
 }
 
@@ -166,7 +164,6 @@ fn follower_applies_commit337_successors_in_order_and_tolerates_one_gap() {
     assert!(!follower.contains("Vec<Option<(u64, FeedPayloadProbe)>>"));
     assert!(follower.contains("now - last_frontier_check >= FEED_FRONTIER_REFRESH_INTERVAL"));
     assert!(follower.contains("discover_latest_once(client, owner, topic, None).await"));
-    assert!(follower.contains("if index == head"));
     assert!(follower.contains("if index < head"));
     assert!(follower.contains("hls_history("));
     assert!(
@@ -251,11 +248,11 @@ fn media_delivery_shares_windows_and_seeks_retain_whole_body_retries() {
         "async fn fetch_hls_body_response(",
         "fn parse_hls_range(",
     );
-    let seek = response.find("if seek_transition {").unwrap();
+    let seek = response.find("if complete_body && root.as_ref()").unwrap();
     let joined = response[seek..].find("foreground_hls_body(").unwrap() + seek;
     let shared = response[joined..].find("hls_body_response(body,").unwrap() + joined;
     let root = response.find("retrieve_decoded_data_root(").unwrap();
-    assert!(seek < joined && joined < shared && shared < root);
+    assert!(root < seek && seek < joined && joined < shared);
     assert!(!response.contains("live && whole_media_get"));
     assert!(response.contains("FetchResponse::stream(200, headers)"));
 }
@@ -267,13 +264,13 @@ fn seek_returns_the_current_body_without_a_duplicate_successor_barrier() {
         "async fn fetch_hls_body_response(",
         "fn parse_hls_range(",
     );
-    let seek = response.find("if seek_transition {").unwrap();
+    let seek = response.find("if complete_body && root.as_ref()").unwrap();
     let current = response[seek..].find("foreground_hls_body(").unwrap() + seek;
     let release = response[current..]
         .find("hls_body_response(body,")
         .unwrap()
         + current;
-    let ordinary_fast_path = response.find("if !seek_transition").unwrap();
+    let ordinary_fast_path = response.find("if let Some(body) = BODY_CACHE").unwrap();
     let progressive = response
         .find("FetchResponse::stream(200, headers)")
         .unwrap();

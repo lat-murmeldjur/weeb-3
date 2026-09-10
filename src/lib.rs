@@ -1501,7 +1501,12 @@ impl Weeb3 {
                     if physical_session_current {
                         let accounting_peer_lock =
                             get_or_create_accounting_peer(&wings, peer).await;
-                        set_payment_threshold(&accounting_peer_lock, amount).await;
+                        set_payment_threshold(
+                            &accounting_peer_lock,
+                            amount,
+                            &refreshment_instructions_chan_outgoing,
+                        )
+                        .await;
                     }
                     drop(connected_peers);
                     if physical_session_current {

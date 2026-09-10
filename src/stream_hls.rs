@@ -4,7 +4,7 @@ use std::fmt::Write;
 
 use crate::stream_conventions::HlsStart;
 
-pub(crate) const HLS_BEGINNING_STARTUP_BUFFER_SECONDS: f64 = 1.5;
+pub(crate) const HLS_BEGINNING_STARTUP_BUFFER_SECONDS: f64 = 3.0;
 pub(crate) const HLS_LIVE_STARTUP_BUFFER_SECONDS: f64 = 8.0;
 pub(crate) const HLS_LIVE_EDGE_SEGMENTS: usize = 3;
 pub(crate) const HLS_LIVE_BODY_RUNWAY_SEGMENTS: usize = 4;
@@ -865,6 +865,6 @@ pub(crate) use page_bridge::{
 #[cfg(target_arch = "wasm32")]
 pub(crate) use runtime::{
     clear_hls_runtime_cache, install_live_tail_fallback, live_tail_failure_identity,
-    prepare_hls_feed, release_hls_runtime, start_beginning_history,
+    prepare_hls_feed, release_hls_runtime,
     try_fetch_response,
 };

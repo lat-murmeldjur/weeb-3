@@ -156,7 +156,6 @@ struct NativePlayer {
     plan: HlsStartupPlan,
     restore_autoplay: bool,
     intent: PlaybackIntent,
-    live: bool,
     ready: bool,
     clock_position: Option<f64>,
 }
@@ -292,7 +291,7 @@ pub(super) async fn play_hls(
     let Some(hls_class) = hls_class else {
         opening.restore_autoplay = false;
         drop(opening);
-        return play_native(id, media, &source, plan, start, restore_autoplay, intent);
+        return play_native(id, media, &source, plan, restore_autoplay, intent);
     };
     let hls = opening.hls.as_ref().unwrap().clone();
     let callback = Closure::new(move |event: JsValue, data: JsValue| {
@@ -372,7 +371,6 @@ fn play_native(
     media: HtmlMediaElement,
     source: &str,
     plan: HlsStartupPlan,
-    start: HlsStart,
     restore_autoplay: bool,
     intent: PlaybackIntent,
 ) -> Result<&'static str, JsValue> {
@@ -409,7 +407,6 @@ fn play_native(
             plan,
             restore_autoplay,
             intent,
-            live: start == HlsStart::Live,
             ready: false,
             clock_position: None,
         });
@@ -621,7 +618,6 @@ fn handle_native_event(id: u64, event: &str) {
             set_state(&player.media, "error", "Native HLS playback failed");
             return None;
         }
-        start_beginning_history_when_safe(&player.media, &player.plan, player.live);
         if player.ready {
             return None;
         }
@@ -646,9 +642,6 @@ fn handle_event(id: u64, event: &str, data: &JsValue) {
         let Some(player) = active.as_mut().filter(|player| player.id == id) else {
             return Action::None;
         };
-        if matches!(event, "hlsBufferAppended" | "hlsFragBuffered") {
-            start_beginning_history_when_safe(&player.media, &player.plan, player.live);
-        }
         if event == "hlsBufferAppended" {
             schedule_decoder_recovery(player);
         }
@@ -1094,12 +1087,6 @@ fn hard_restart(id: u64, message: String) {
             set_state(&media, "error", &format!("HLS recovery failed: {error}"));
         }
         None => {}
-    }
-}
-
-fn start_beginning_history_when_safe(media: &HtmlMediaElement, plan: &HlsStartupPlan, live: bool) {
-    if !live && buffered_covers(media, plan.play_position, plan.runway_end) {
-        let _ = super::page_bridge::start_beginning_history();
     }
 }
 
@@ -1558,23 +1545,6 @@ fn playback_intent(media: &HtmlMediaElement, requested: Option<bool>) -> bool {
 
 #[rustfmt::skip]
 fn playback_runway(plan: &HlsStartupPlan) -> f64 { plan.runway_end - plan.play_position }
-
-fn buffered_covers(media: &HtmlMediaElement, start: f64, end: f64) -> bool {
-    if !start.is_finite() || !end.is_finite() || end <= start {
-        return false;
-    }
-    let ranges = media.buffered();
-    (0..ranges.length()).any(|index| {
-        ranges
-            .start(index)
-            .ok()
-            .zip(ranges.end(index).ok())
-            .is_some_and(|(range_start, range_end)| {
-                range_start <= start + BUFFER_EPSILON_SECONDS
-                    && range_end + BUFFER_EPSILON_SECONDS >= end
-            })
-    })
-}
 
 fn suspend_autoplay(media: &HtmlMediaElement) -> bool {
     let requested = media.autoplay();

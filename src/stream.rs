@@ -23,7 +23,8 @@ use crate::{
     },
     shared_runtime::SharedNodeClient,
     stream_conventions::{
-        MEDIA_PREFETCH_BATCH_YIELD_MS, MEDIA_PREFETCH_MAX_PARALLEL, MEDIA_STARTUP_RESPONSE_BYTES,
+        MEDIA_PREFETCH_BATCH_YIELD_MS, MEDIA_PREFETCH_MAX_PARALLEL, MEDIA_RANGE_READ_MAX_PARALLEL,
+        MEDIA_STARTUP_RESPONSE_BYTES,
         MEDIA_STORAGE_WINDOW_BYTES, MIB_BYTES, decode_component, if_none_match_matches,
         if_range_allows_range, immutable_metadata_identity, is_swarm_reference_hex,
         media_cache_budget_bytes, media_prefetch_ahead_limit_bytes, media_prefetch_stage_targets,
@@ -1100,7 +1101,15 @@ async fn read_cached_range(
     if metadata.size == 0 || start > end || start >= metadata.size || end >= metadata.size {
         return Err("range lies outside the resolved resource".into());
     }
-    let windows = range_storage_windows_for_span(start, end, metadata.size);
+    let windows = if current.is_some()
+        && start == 0
+        && end == metadata.size - 1
+        && metadata.size <= MEDIA_STARTUP_RESPONSE_BYTES
+    {
+        vec![(start, end)]
+    } else {
+        range_storage_windows_for_span(start, end, metadata.size)
+    };
     if windows.is_empty() {
         return Err("range did not produce storage windows".into());
     }
@@ -1131,7 +1140,7 @@ async fn read_cached_range(
 
     let body_len = inclusive_range_len(start, end)
         .ok_or_else(|| "requested range is too large".to_string())?;
-    let mut body = Vec::with_capacity(body_len);
+    let mut body = vec![0; body_len];
 
     let admitting = Cell::new(true);
     let responses = stream::iter(windows)
@@ -1157,7 +1166,7 @@ async fn read_cached_range(
                 (window_start, window_end, response)
             }
         })
-        .buffered(MEDIA_PREFETCH_MAX_PARALLEL);
+        .buffer_unordered(MEDIA_RANGE_READ_MAX_PARALLEL);
     futures::pin_mut!(responses);
     while let Some((window_start, window_end, response)) = responses.next().await {
         if current.is_some_and(|current| !current()) {
@@ -1170,7 +1179,10 @@ async fn read_cached_range(
             .map_err(|_| "storage window offset overflow".to_string())?;
         let local_end = usize::try_from(overlap_end - window_start)
             .map_err(|_| "storage window offset overflow".to_string())?;
-        body.extend_from_slice(&storage_body[local_start..=local_end]);
+        let offset = usize::try_from(overlap_start - start)
+            .map_err(|_| "storage window offset overflow".to_string())?;
+        let bytes = &storage_body[local_start..=local_end];
+        body[offset..offset + bytes.len()].copy_from_slice(bytes);
     }
 
     Ok(Bytes::from(body))

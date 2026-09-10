@@ -35,7 +35,6 @@ struct RemoteHlsSession {
     runtime: Rc<SharedRuntime>,
     network_id: u64,
     live: bool,
-    beginning_history_started: bool,
 }
 
 struct PendingHlsAttempt {
@@ -109,7 +108,6 @@ async fn prepare_hls(
             runtime,
             network_id,
             live: start == HlsStart::Live,
-            beginning_history_started: false,
         });
     });
     Ok(prepared)
@@ -134,22 +132,6 @@ fn parse_prepare_response(response: Object) -> Result<(PreparedHlsFeed, u64), St
         },
         session,
     ))
-}
-
-pub(super) fn start_beginning_history() -> bool {
-    ACTIVE_HLS.with(|active| {
-        let mut active = active.borrow_mut();
-        let Some(active) = active
-            .as_mut()
-            .filter(|active| !active.live && !active.beginning_history_started)
-        else {
-            return false;
-        };
-        let request = request_object("WEEB3_HLS_BEGINNING_READY", active.network_id);
-        set_number(&request, "session", active.worker_session as f64);
-        active.beginning_history_started = active.runtime.notify(&request).is_ok();
-        active.beginning_history_started
-    })
 }
 
 fn release_hls() {

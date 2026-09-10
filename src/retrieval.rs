@@ -1015,7 +1015,6 @@ fn settle_data_group_result(
     requested_mask: &[bool],
     requested_ready: &mut [bool],
     received_shards: &mut [Option<Bytes>],
-    authenticated_shards: &mut [bool],
     successes: &mut usize,
     child_emitter: &GroupChildEmitter,
 ) -> Option<bool> {
@@ -1031,7 +1030,6 @@ fn settle_data_group_result(
     let result_index = result.index;
     let result_chunk = result.chunk.clone();
     *received_shards.get_mut(result_index)? = Some(result.chunk);
-    *authenticated_shards.get_mut(result_index)? = result.canonical_cac;
     *successes = successes.checked_add(1)?;
 
     if result_index < data_count
@@ -1096,7 +1094,6 @@ async fn fetch_data_group_indices_streaming(
     let mut dispatched_shards = vec![false; total_count];
     let mut requested_ready = vec![false; data_count];
     let mut received_shards: Vec<Option<Bytes>> = vec![None; total_count];
-    let mut authenticated_shards = vec![false; total_count];
     let static_rolling_candidate =
         rolling_full_group_static_candidate(requested_count, data_count, parity_references.len());
     let mut cached_requested = Vec::new();
@@ -1137,7 +1134,6 @@ async fn fetch_data_group_indices_streaming(
                     requested_ready[index] = true;
                     if rolling {
                         received_shards[index] = Some(raw);
-                        authenticated_shards[index] = true;
                         dispatched_shards[index] = true;
                         successes += 1;
                     }
@@ -1198,7 +1194,6 @@ async fn fetch_data_group_indices_streaming(
                     &requested_mask,
                     &mut requested_ready,
                     &mut received_shards,
-                    &mut authenticated_shards,
                     &mut successes,
                     &child_emitter,
                 )?;
@@ -1354,7 +1349,6 @@ async fn fetch_data_group_indices_streaming(
             &requested_mask,
             &mut requested_ready,
             &mut received_shards,
-            &mut authenticated_shards,
             &mut successes,
             &child_emitter,
         );
@@ -1365,14 +1359,6 @@ async fn fetch_data_group_indices_streaming(
             }
             recovery_dispatched = true;
             continue;
-        }
-    }
-
-    for (index, raw) in received_shards.iter().take(data_count).enumerate() {
-        if authenticated_shards[index]
-            && let Some(raw) = raw
-        {
-            remember_raw_chunk(data_references[index].to_vec(), raw.clone());
         }
     }
 

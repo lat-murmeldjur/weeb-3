@@ -121,8 +121,6 @@ fn live_preparation_and_following_share_one_duration_based_owner() {
     assert!(runway.contains("active.body_runway_running = true"));
     assert!(runway.contains("active.body_runway_running = false"));
     assert!(runway.contains("hls_body(client.clone(), reference.clone(), Some(id))"));
-    let prepare = section(HLS_RUNTIME, "async fn discover_live_history(", "async fn discover_for_view(");
-    assert!(prepare.find("initialize_live_head(").unwrap() < prepare.find("future::join(").unwrap());
     let update = section(HLS_RUNTIME, "fn apply_update(", "fn apply_full_update(");
     assert!(update.contains("spawn_body_runway(id)"));
     assert!(!update.contains("active.foreground ="));
@@ -157,7 +155,6 @@ fn cold_discovery_is_bounded_and_edge_search_is_hls_owned() {
     assert!(!beginning.contains("spawn_local"));
     assert!(!beginning.contains("FEED_DISCOVERY_TIMEOUT"));
     for expected in [
-        "const BEGINNING_PREFIX_TARGET_SEGMENTS: usize = 4;",
         "const EDGE_ANCHORS: [u64; 16]",
         "const EDGE_REFINEMENT_WIDTH: usize = 16;",
         "const EDGE_PROBE_ATTEMPTS: usize = 2;",
@@ -228,44 +225,44 @@ fn cold_discovery_is_bounded_and_edge_search_is_hls_owned() {
         "async fn discover_latest_once(",
         "async fn retrieve_confirmed_payload(",
     );
-    assert!(initial.contains("discover_edge_update(client, owner, topic, history).await?"));
+    assert!(initial.contains("discover_edge_update(client, owner, topic, lattice).await?"));
     assert!(
         initial.contains("retrieve_confirmed_payload(client, owner, topic, index, update).await")
     );
 }
 
 #[test]
-fn beginning_history_and_exact_following_run_concurrently_after_media_is_ready() {
+fn beginning_history_and_exact_following_run_after_the_worker_warms_a() {
     let history = section(
         HLS_RUNTIME,
-        "pub(crate) fn start_beginning_history()",
+        "fn start_beginning_history(id: u64)",
         "fn spawn_follower(",
     );
     let follow = history.find("spawn_follower(id)").unwrap();
     let successor = history.find("hls_body(client.clone(), successor, Some(id)).await").unwrap();
     let discover = history.find("let history = discover_for_view(").unwrap();
     let apply = history
-        .find("apply_full_update(id, index, history)")
+        .find("apply_confirmed_snapshot(id, index, history, None)")
         .unwrap();
     assert!(follow < successor && successor < discover && discover < apply);
     assert_eq!(history.matches("spawn_follower(id)").count(), 1);
 }
 
 #[test]
-fn underfilled_beginning_prefix_starts_exact_following_immediately() {
+fn beginning_without_a_successor_starts_exact_following_immediately() {
     let attach = section(
         HLS_RUNTIME,
         "pub(crate) async fn prepare_hls_feed(",
         "pub(crate) fn release_hls_runtime()",
     );
-    let underfilled = attach.find("let underfilled = head").unwrap();
+    let needs_successor = attach.find("let needs_successor = head").unwrap();
     let install = attach
         .find("install_snapshot(id, index, head, None)")
         .unwrap();
-    let follow = attach.find("if underfilled").unwrap();
-    assert!(underfilled < install && install < follow);
+    let follow = attach.find("if needs_successor").unwrap();
+    assert!(needs_successor < install && install < follow);
     assert!(attach[follow..].contains("spawn_follower(id)"));
-    assert!(attach.contains("< BEGINNING_PREFIX_TARGET_SEGMENTS"));
+    assert!(attach.contains("filter(|segment| !segment.gap).nth(1).is_none()"));
 }
 
 #[test]
@@ -377,7 +374,6 @@ fn live_follower_applies_commit337_followups_in_order_with_one_lookup_ahead() {
 
     assert!(follower.contains("now - last_frontier_check >= FEED_FRONTIER_REFRESH_INTERVAL"));
     assert!(follower.contains("discover_latest_once(client, owner, topic, None).await"));
-    assert!(follower.contains("if index == head"));
     assert!(follower.contains("if index < head"));
     assert!(follower.contains("hls_history("));
     assert!(
@@ -421,13 +417,11 @@ fn active_feed_treats_snapshot_endlist_as_tentative() {
         "async fn discover_beginning(",
     );
     assert!(install.contains("playlist.finalized = false"));
-    assert!(install.contains("active.terminal_candidate = playlist.finalized.then_some(index)"));
 
     let apply = section(HLS_RUNTIME, "fn apply_update(", "fn apply_full_update(");
     assert!(apply.contains("index <= current"));
     assert!(apply.contains("let appended = merge(playlist)?"));
     assert!(apply.contains("playlist.finalized = false"));
-    assert!(apply.contains("active.terminal_candidate = terminal.then_some(index)"));
 
     let follow = section(
         HLS_RUNTIME,
@@ -436,14 +430,6 @@ fn active_feed_treats_snapshot_endlist_as_tentative() {
     );
     assert!(follow.contains("if feed.playlist.as_ref()?.finalized"));
 
-    let confirmation = section(
-        HLS_RUNTIME,
-        "fn confirm_terminal(",
-        "fn live_tail_position(",
-    );
-    assert!(confirmation.contains("active.terminal_candidate == Some(index)"));
-    assert!(confirmation.contains("playlist.merge_playlist(candidate)"));
-    assert!(confirmation.contains("active.terminal_candidate = None"));
 }
 
 #[test]

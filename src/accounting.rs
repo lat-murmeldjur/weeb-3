@@ -1,6 +1,8 @@
 pub(crate) const CONNECTION_BUILDUP_LIMIT: u64 = 200;
 pub(crate) const REFRESH_RATE: u64 = 450000;
 const PO_PRICE: u64 = 10000;
+// Bee has 32 chunk-price tiers, decreasing by PO_PRICE per proximity bit.
+const MAX_CHUNK_PRICE: u64 = 32 * PO_PRICE;
 pub(crate) fn refreshment_due(balance: u64, last_refreshment: f64, payment_threshold: u64) -> bool {
     let target = if last_refreshment == 0.0 {
         REFRESH_RATE.saturating_mul(2)
@@ -11,7 +13,7 @@ pub(crate) fn refreshment_due(balance: u64, last_refreshment: f64, payment_thres
         >= if payment_threshold == 0 {
             target
         } else {
-            target.min(payment_threshold)
+            target.min(payment_threshold.saturating_sub(MAX_CHUNK_PRICE).max(1))
         }
 }
 
@@ -55,8 +57,19 @@ use libp2p::{PeerId, swarm::ConnectionId};
 pub(crate) type RefreshmentInstruction = (PeerId, Arc<Mutex<PeerAccounting>>, ConnectionId);
 
 #[cfg(target_arch = "wasm32")]
-pub(crate) async fn set_payment_threshold(accounting: &Mutex<PeerAccounting>, amount: u64) {
-    accounting.lock().await.threshold = amount;
+pub(crate) async fn set_payment_threshold(
+    accounting: &Arc<Mutex<PeerAccounting>>,
+    amount: u64,
+    refreshments: &mpsc::Sender<RefreshmentInstruction>,
+) {
+    let has_debt = {
+        let mut account = accounting.lock().await;
+        account.threshold = amount;
+        account.balance > 0
+    };
+    if has_debt {
+        apply_credit(accounting, 0, refreshments).await;
+    }
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -105,11 +118,10 @@ pub(crate) async fn apply_credit(
         crate::ACCOUNTING_DRAINED.notify(usize::MAX);
     }
 
-    if let Some(instruction) = instruction {
-        match refreshments.try_send(instruction) {
-            Ok(()) => async_std::task::sleep(std::time::Duration::ZERO).await,
-            Err(error) => error.into_inner().1.lock().await.refresh_scheduled = false,
-        }
+    if let Some(instruction) = instruction
+        && let Err(error) = refreshments.try_send(instruction)
+    {
+        error.into_inner().1.lock().await.refresh_scheduled = false;
     }
 }
 
@@ -143,7 +155,8 @@ pub(crate) async fn cancel_reserve(accounting: &Mutex<PeerAccounting>, amount: u
     }
 }
 
-#[cfg(target_arch = "wasm32")]
 pub(crate) fn price(proximity: u8) -> u64 {
-    (u64::from(crate::conventions::MAX_PO.saturating_sub(proximity)) + 1) * PO_PRICE
+    MAX_CHUNK_PRICE
+        .saturating_sub(u64::from(proximity) * PO_PRICE)
+        .max(PO_PRICE)
 }

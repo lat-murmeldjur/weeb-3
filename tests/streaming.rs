@@ -101,26 +101,26 @@ mod hls_minimal {
     }
 
     #[test]
-    fn beginning_plan_primes_one_and_a_half_seconds_of_the_first_segment() {
+    fn beginning_plan_primes_three_seconds_of_the_first_segment() {
         let parsed = HlsPlaylist::parse(&playlist(6, false)).unwrap();
         let plan = parsed.startup_plan(HlsStart::Beginning).unwrap();
         assert_eq!(plan.bootstrap_position, 0.0);
         assert!(!plan.codec_bootstrap);
         assert_eq!(plan.play_position, 0.0);
-        assert_eq!(plan.runway_end, 1.5);
+        assert_eq!(plan.runway_end, 3.0);
         assert!((plan.duration - parsed.duration()).abs() < 0.000_01);
-        for seconds in [0.5, 1.0, 1.49, 1.5, 1.51, 2.0, 4.166667] {
+        for seconds in [0.5, 1.0, 2.0, 2.99, 3.0, 3.01, 4.166667] {
             let mut short = parsed.clone();
             short.segments[0].duration = seconds;
-            assert_eq!(short.startup_plan(HlsStart::Beginning).unwrap().runway_end, seconds.min(1.5));
+            assert_eq!(short.startup_plan(HlsStart::Beginning).unwrap().runway_end, seconds.min(3.0));
             let mut final_segment = short.clone();
             final_segment.segments.truncate(1);
             final_segment.finalized = true;
-            assert_eq!(final_segment.startup_plan(HlsStart::Beginning).unwrap().runway_end, seconds.min(1.5));
+            assert_eq!(final_segment.startup_plan(HlsStart::Beginning).unwrap().runway_end, seconds.min(3.0));
             short.segments[0].gap = true;
             let gap = short.startup_plan(HlsStart::Beginning).unwrap();
             assert_eq!(gap.play_position, seconds);
-            assert_eq!(gap.runway_end, seconds + 1.5);
+            assert_eq!(gap.runway_end, seconds + 3.0);
         }
     }
 
@@ -496,10 +496,9 @@ mod hls_minimal {
             "let _ = retired.destroy()",
             "hls.attach_media(&media)",
             "fn is_current_hls(id: u64, hls: &Hls)",
-            "return play_native(id, media, &source, plan, start, restore_autoplay, intent)",
+            "return play_native(id, media, &source, plan, restore_autoplay, intent)",
             "media.set_src(source)",
             "handle_native_event",
-            "buffered_covers(",
             ".load_source(&source)",
             "hls.attach_media(&media).and_then(|_|",
         ] {
@@ -511,7 +510,7 @@ mod hls_minimal {
             .split_once("fn hard_restart(id: u64, message: String)")
             .unwrap()
             .1
-            .split_once("fn start_beginning_history_when_safe(")
+            .split_once("fn begin_playback(")
             .unwrap()
             .0;
         assert!(restart.contains("player.ready.then(|| player.media.current_time())"));
@@ -833,23 +832,15 @@ mod hls_minimal {
             .split_once("\n}\n\nfn next_feed_id(")
             .unwrap()
             .0;
-        assert!(successor.contains(".position(matches)"));
-        assert!(successor.contains(".rfind(|(position, segment)|"));
-        assert!(successor.contains("live_segment_is_playable(active, *position)"));
-        assert!(successor.contains("let mut playable = playlist.segments.iter().filter"));
-        assert!(successor.contains(".position(|segment| &segment.reference == last)"));
         assert!(successor.contains("active.foreground = Some(reference.to_string())"));
-        assert!(successor.contains("Some((active.id, true, false))"));
         assert!(successor.contains("hls_progressive_foreground_transition"));
-        assert!(successor.contains(".nth(position)"));
         assert!(successor.contains("if follow {"));
         assert!(successor.contains("spawn_body_runway(id)"));
         let runway = RUNTIME.split_once("fn body_runway_targets(").unwrap().1
             .split_once("fn prefetch_from_reference(").unwrap().0;
         assert!(runway.contains(".take(BODY_PREFETCH_HORIZON)"));
-        assert!(runway.contains(".skip(usize::from(active.start == HlsStart::Beginning))"));
-        assert!(runway.contains("if active.start == HlsStart::Beginning {\n                        1\n"));
-        assert!(runway.contains("HLS_BODY_PREFETCH_MAX_PARALLEL"));
+        assert!(RUNTIME.contains("const HLS_BODY_PREFETCH_MAX_PARALLEL: usize = 2;"));
+        assert!(runway.contains("if loads.len() == HLS_BODY_PREFETCH_MAX_PARALLEL"));
 
         let response = RUNTIME
             .split_once("async fn fetch_hls_body_response(")
@@ -860,7 +851,7 @@ mod hls_minimal {
             .0;
         assert!(response.contains("method == \"GET\" && range.is_none() && !codec_bootstrap"));
         assert!(response.contains("prefetch_from_reference(&reference, cached)"));
-        assert!(response.contains("if seek_transition {"));
+        assert!(response.contains("if complete_body && root.as_ref()"));
         assert!(
             response.contains(
                 "foreground_hls_body(client.clone(), reference.clone())"

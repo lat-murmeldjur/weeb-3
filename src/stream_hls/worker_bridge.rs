@@ -8,7 +8,7 @@ use crate::{
     stream_hls::{
         HlsTailFailure, clear_hls_runtime_cache, install_live_tail_fallback,
         live_tail_failure_identity, prepare_hls_feed, protocol::plan_to_js,
-        release_hls_runtime, start_beginning_history,
+        release_hls_runtime,
     },
     worker_protocol::{integer_property, set, set_number, string_property},
     worker_runtime::{Weeb3WorkerRuntime, error_response, ok_response},
@@ -33,9 +33,7 @@ pub(crate) async fn dispatch(
     Some(match kind {
         "WEEB3_HLS_PREPARE" => prepare_hls_response(runtime, message).await,
         "WEEB3_HLS_CANCEL_PREPARE" => cancel_hls_prepare_response(message),
-        "WEEB3_HLS_BEGINNING_READY"
-        | "WEEB3_HLS_RELEASE"
-        | "WEEB3_HLS_TAIL_FAILURE" => hls_control_response(kind, message),
+        "WEEB3_HLS_RELEASE" | "WEEB3_HLS_TAIL_FAILURE" => hls_control_response(kind, message),
         "WEEB3_HLS_CLEAR_CACHE" => {
             clear_hls_runtime_cache();
             ok_response()
@@ -95,10 +93,6 @@ fn hls_control_response(kind: &str, message: &Object) -> Object {
         return error_response(409, "HLS session is no longer active");
     }
     match kind {
-        "WEEB3_HLS_BEGINNING_READY" => {
-            start_beginning_history();
-            ok_response()
-        }
         "WEEB3_HLS_RELEASE" => {
             REMOTE_HLS_PREPARE_KEY.with(|current| *current.borrow_mut() = None);
             release_remote_hls_runtime();

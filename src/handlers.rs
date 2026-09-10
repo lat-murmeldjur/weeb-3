@@ -1,3 +1,5 @@
+use std::{cell::Cell, time::Duration};
+
 use prost::Message;
 
 use crate::mpsc;
@@ -313,7 +315,11 @@ pub(crate) enum RefreshmentOutcome {
     AmbiguousAfterPayment,
 }
 
-async fn refreshment_exchange(amount: u64, mut stream: Stream) -> RefreshmentOutcome {
+async fn refreshment_exchange(
+    amount: u64,
+    mut stream: Stream,
+    timeout_outcome: &Cell<RefreshmentOutcome>,
+) -> RefreshmentOutcome {
     if stream.write_all(EMPTY_HEADERS_FRAME).await.is_err() {
         return RefreshmentOutcome::NotDispatched;
     }
@@ -330,6 +336,7 @@ async fn refreshment_exchange(amount: u64, mut stream: Stream) -> RefreshmentOut
     };
 
     let payment_frame = payment.encode_length_delimited_to_vec();
+    timeout_outcome.set(RefreshmentOutcome::AmbiguousAfterPayment);
     if stream.write_all(&payment_frame).await.is_err() {
         return RefreshmentOutcome::AmbiguousAfterPayment;
     }
@@ -512,13 +519,17 @@ pub async fn refresh_handler(
     control: StreamControl,
     session: OutboundProtocolSession,
 ) -> RefreshmentOutcome {
-    let Some(stream) =
-        open_current_outbound_stream(peer, control, PSEUDOSETTLE_PROTOCOL, &session).await
-    else {
-        return RefreshmentOutcome::NotDispatched;
-    };
-
-    refreshment_exchange(amount, stream).await
+    let timeout_outcome = Cell::new(RefreshmentOutcome::NotDispatched);
+    async_std::future::timeout(Duration::from_secs(10), async {
+        let Some(stream) =
+            open_current_outbound_stream(peer, control, PSEUDOSETTLE_PROTOCOL, &session).await
+        else {
+            return RefreshmentOutcome::NotDispatched;
+        };
+        refreshment_exchange(amount, stream, &timeout_outcome).await
+    })
+    .await
+    .unwrap_or_else(|_| timeout_outcome.get())
 }
 
 pub async fn issue_handler(
