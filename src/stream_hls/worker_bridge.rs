@@ -6,8 +6,8 @@ use wasm_bindgen::JsValue;
 use crate::{
     stream_conventions::HlsStart,
     stream_hls::{
-        HlsStartupPlan, HlsTailFailure, clear_hls_runtime_cache, install_live_tail_fallback,
-        live_tail_failure_identity, lock_live_startup_plan, prepare_hls_feed, protocol::plan_to_js,
+        HlsTailFailure, clear_hls_runtime_cache, install_live_tail_fallback,
+        live_tail_failure_identity, prepare_hls_feed, protocol::plan_to_js,
         release_hls_runtime, start_beginning_history,
     },
     worker_protocol::{integer_property, set, set_number, string_property},
@@ -33,8 +33,7 @@ pub(crate) async fn dispatch(
     Some(match kind {
         "WEEB3_HLS_PREPARE" => prepare_hls_response(runtime, message).await,
         "WEEB3_HLS_CANCEL_PREPARE" => cancel_hls_prepare_response(message),
-        "WEEB3_HLS_LOCK"
-        | "WEEB3_HLS_BEGINNING_READY"
+        "WEEB3_HLS_BEGINNING_READY"
         | "WEEB3_HLS_RELEASE"
         | "WEEB3_HLS_TAIL_FAILURE" => hls_control_response(kind, message),
         "WEEB3_HLS_CLEAR_CACHE" => {
@@ -96,7 +95,6 @@ fn hls_control_response(kind: &str, message: &Object) -> Object {
         return error_response(409, "HLS session is no longer active");
     }
     match kind {
-        "WEEB3_HLS_LOCK" => hls_plan_response(lock_live_startup_plan()),
         "WEEB3_HLS_BEGINNING_READY" => {
             start_beginning_history();
             ok_response()
@@ -122,17 +120,6 @@ fn cancel_hls_prepare_response(message: &Object) -> Object {
         release_remote_hls_runtime();
     }
     ok_response()
-}
-
-fn hls_plan_response(plan: Option<HlsStartupPlan>) -> Object {
-    let response = ok_response();
-    set(
-        &response,
-        "plan",
-        plan.as_ref()
-            .map_or(JsValue::NULL, |plan| plan_to_js(plan).into()),
-    );
-    response
 }
 
 fn release_remote_hls_runtime() {

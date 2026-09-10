@@ -105,7 +105,7 @@ fn live_duration_window_keeps_owned_bodies_and_beginning_seek_delivery() {
 }
 
 #[test]
-fn follower_settles_commit337_successors_sequentially_and_tolerates_one_gap() {
+fn follower_applies_commit337_successors_in_order_and_tolerates_one_gap() {
     assert!(HLS_RUNTIME.contains("const FEED_FOLLOW_AHEAD: u64 = 4;"));
     assert!(HLS_RUNTIME.contains("const FEED_FRONTIER_REFRESH_INTERVAL: f64 = 15_000.0;"));
     let initial = section(HLS_RUNTIME, "fn initialize_live_head(", "async fn prepare_live_plan(");
@@ -118,12 +118,13 @@ fn follower_settles_commit337_successors_sequentially_and_tolerates_one_gap() {
         "async fn fetch_hls_body_response(",
     );
     let indices = follower
-        .find("for offset in 1..=FEED_FOLLOW_AHEAD")
+        .find("stream::iter(1..=FEED_FOLLOW_AHEAD)")
         .unwrap();
     let index = follower.find("head.checked_add(offset)").unwrap();
-    let candidate = follower.find("let candidate =").unwrap();
-    let dispatched = follower[candidate..].find("probe_feed_payload(").unwrap() + candidate;
-    let settled = follower[dispatched..].find(".await;").unwrap() + dispatched;
+    let dispatched = follower[index..].find("probe_feed_payload(").unwrap() + index;
+    let settled = follower[dispatched..].find(".await").unwrap() + dispatched;
+    let candidate = follower.find("while let Some(candidate) = probes.next().await").unwrap();
+    assert!(follower.contains(".buffered(2)"));
     let applied = follower
         .find("apply_full_update(id, payload.index, playlist)")
         .unwrap();
@@ -146,13 +147,14 @@ fn follower_settles_commit337_successors_sequentially_and_tolerates_one_gap() {
         + progressed;
     assert!(
         indices < index
-            && index < candidate
-            && candidate < dispatched
+            && index < dispatched
             && dispatched < settled
-            && settled < applied
+            && settled < candidate
+            && candidate < applied
     );
     assert!(applied < missing && missing < skip_once && skip_once < remember_gap);
     assert!(remember_gap < failed && failed < progressed && progressed < idle_sleep);
+    assert!(follower.find("drop(probes)").unwrap() < idle_sleep);
     assert!(!follower.contains("pace_next"));
     assert!(!follower.contains("Duration::try_from_secs_f64"));
     assert!(follower[dispatched..settled].contains("FEED_TAIL_PROBE_BYTES"));

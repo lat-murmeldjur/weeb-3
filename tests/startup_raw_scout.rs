@@ -201,7 +201,7 @@ fn cold_discovery_is_bounded_and_edge_search_is_hls_owned() {
         "probes.next()",
         "EDGE_COLD_WAVE_TIMEOUT",
         "EDGE_WAVE_TIMEOUT",
-        "let mut positive_seen = lower_is_known;",
+        "let mut positive_seen = false;",
         "future::pending::<()>().left_future()",
         "future::select(probes.next(), deadline.as_mut()).await",
         "let Some(upper)",
@@ -308,13 +308,12 @@ fn head_proof_preserves_the_initial_lattice_and_settles_every_probe() {
     assert!(proof.contains("probe_feed_update("));
     assert!(proof.contains("Some(FEED_PROBE_ATTEMPTS)"));
     assert!(proof.contains(".buffered((HISTORY_STRIDE * 2) as usize)"));
-    assert!(proof.contains("while let Some((index, probe)) = probes.next().await"));
+    assert!(proof.contains("while let Some((candidate, probe)) = probes.next().await"));
     assert!(proof.contains("let lattice_residue = index % HISTORY_STRIDE;"));
-    assert!(
-        proof.contains(
-            "let dense = index.checked_add(1)?..=index.checked_add(HISTORY_STRIDE * 2)?;"
-        )
-    );
+    assert!(proof.contains("let mut next = index.checked_add(1)?;"));
+    assert!(proof.contains("let mut probes = stream::iter(next..=end)"));
+    assert!(proof.contains("if end == index.checked_add(HISTORY_STRIDE * 2)?"));
+    assert!(proof.contains("next = end.checked_add(1)?;"));
     assert!(proof.contains("if transient"));
     assert!(proof.contains("lattice_residue,"));
     let history = section(
@@ -328,7 +327,7 @@ fn head_proof_preserves_the_initial_lattice_and_settles_every_probe() {
 }
 
 #[test]
-fn live_follower_uses_commit337_sequential_exact_followups_before_frontier_fallback() {
+fn live_follower_applies_commit337_followups_in_order_with_one_lookup_ahead() {
     assert!(HLS_RUNTIME.contains("const FEED_TAIL_PROBE_BYTES: usize = 4 * 1024;"));
     assert!(HLS_RUNTIME.contains("const FEED_FOLLOW_AHEAD: u64 = 4;"));
     assert!(
@@ -341,9 +340,10 @@ fn live_follower_uses_commit337_sequential_exact_followups_before_frontier_fallb
         "fn spawn_follower(",
         "async fn fetch_hls_body_response(",
     );
-    assert!(follower.contains("for offset in 1..=FEED_FOLLOW_AHEAD"));
+    assert!(follower.contains("stream::iter(1..=FEED_FOLLOW_AHEAD)"));
     assert!(follower.contains("head.checked_add(offset)"));
-    assert!(follower.contains("let candidate ="));
+    assert!(follower.contains("while let Some(candidate) = probes.next().await"));
+    assert!(follower.contains(".buffered(2)"));
     assert!(follower.contains("probe_feed_payload("));
     assert!(!follower.contains("settled_payload_wave("));
     assert!(!follower.contains("payload_probe_wave("));
@@ -357,10 +357,10 @@ fn live_follower_uses_commit337_sequential_exact_followups_before_frontier_fallb
     assert!(follower.contains("if progressed"));
 
     let indices = follower
-        .find("for offset in 1..=FEED_FOLLOW_AHEAD")
+        .find("stream::iter(1..=FEED_FOLLOW_AHEAD)")
         .unwrap();
     let dispatched = follower[indices..].find("probe_feed_payload(").unwrap() + indices;
-    let settled = follower[dispatched..].find(".await;").unwrap() + dispatched;
+    let settled = follower[dispatched..].find(".await").unwrap() + dispatched;
     assert!(follower[dispatched..settled].contains("FEED_TAIL_PROBE_BYTES"));
     assert!(follower[dispatched..settled].contains("None"));
     let apply = follower[settled..]
@@ -389,6 +389,7 @@ fn live_follower_uses_commit337_sequential_exact_followups_before_frontier_fallb
         .find("async_std::task::sleep(FEED_POLL_INTERVAL).await")
         .unwrap();
     assert!(progressed < idle_sleep);
+    assert!(follower.find("drop(probes)").unwrap() < idle_sleep);
     assert!(!follower[progressed..idle_sleep].contains("recover_feed_frontier"));
     assert!(!follower.contains("pace_next"));
     assert!(!follower.contains("Duration::try_from_secs_f64"));

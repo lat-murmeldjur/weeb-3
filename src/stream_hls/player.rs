@@ -1,6 +1,10 @@
 use event_listener::Listener;
 use js_sys::{Array, Function, Object, Promise, Reflect};
-use std::{cell::RefCell, rc::Rc};
+use std::{
+    cell::{Cell, RefCell},
+    future::Future,
+    rc::Rc,
+};
 use wasm_bindgen::{JsCast, JsValue, closure::Closure, prelude::wasm_bindgen};
 use wasm_bindgen_futures::{JsFuture, spawn_local};
 use web_sys::{Element, Event, HtmlMediaElement, HtmlSelectElement};
@@ -107,7 +111,6 @@ struct Player {
     codec_bootstrap_pending: bool,
     codec_recovery: Option<CodecRecovery>,
     initial_live: bool,
-    live_lock_pending: bool,
     ready: bool,
     consecutive_media_recoveries: u8,
     hard_restarts: u8,
@@ -154,9 +157,34 @@ struct NativePlayer {
     restore_autoplay: bool,
     intent: PlaybackIntent,
     live: bool,
-    positioned: bool,
     ready: bool,
     clock_position: Option<f64>,
+}
+
+// Own the empty media source and user intent while the worker prepares the feed.
+struct OpeningPlayer {
+    id: u64,
+    media: HtmlMediaElement,
+    hls: Option<Hls>,
+    restore_autoplay: bool,
+    intent: Rc<Cell<PlaybackIntent>>,
+    callback: Closure<dyn FnMut(Event)>,
+}
+
+impl Drop for OpeningPlayer {
+    fn drop(&mut self) {
+        for event in ["play", "pause"] {
+            let _ = self
+                .media
+                .remove_event_listener_with_callback(event, self.callback.as_ref().unchecked_ref());
+        }
+        if let Some(hls) = self.hls.take() {
+            let _ = hls.destroy();
+        }
+        if NEXT_ID.with(|next| next.get() == self.id) {
+            restore_autoplay(&self.media, self.restore_autoplay);
+        }
+    }
 }
 
 enum Action {
@@ -178,22 +206,12 @@ enum Action {
     },
 }
 
-enum MediaAction {
-    None,
-    Begin(f64),
-}
-
-pub(super) fn play_hls(
+pub(super) async fn play_hls(
     element: &Element,
-    prepared: PreparedHlsFeed,
-    hls_class: Result<JsValue, JsValue>,
+    prepared: impl Future<Output = Result<PreparedHlsFeed, String>>,
+    hls_class: impl Future<Output = Result<JsValue, JsValue>>,
     start: HlsStart,
 ) -> Result<&'static str, JsValue> {
-    let PreparedHlsFeed {
-        source,
-        plan,
-        initial_source,
-    } = prepared;
     destroy_current_hls();
     let media = element
         .clone()
@@ -201,29 +219,82 @@ pub(super) fn play_hls(
         .map_err(|_| "HLS requires an HTML media element")?;
     let id = next_player_id();
     let native_supported = supports_native_hls(&media);
-    let hls_class = match hls_class {
-        Ok(hls_class) => hls_class,
-        Err(_) if native_supported => return play_native(id, media, &source, plan, start),
-        Err(error) => return Err(error),
+    let intent = Rc::new(Cell::new(PlaybackIntent::Play));
+    let opening_intent = intent.clone();
+    let opening_media = media.clone();
+    let callback = Closure::new(move |event: Event| {
+        if !NEXT_ID.with(|next| next.get() == id)
+            || event.type_() == "pause" && !opening_media.paused()
+            || event.type_() == "play" && opening_media.paused()
+        {
+            return;
+        }
+        let mut intent = opening_intent.get();
+        intent.event(&event.type_());
+        opening_intent.set(intent);
+    });
+    let restore_autoplay = suspend_autoplay(&media);
+    let mut opening = OpeningPlayer {
+        id,
+        media: media.clone(),
+        hls: None,
+        restore_autoplay,
+        intent,
+        callback,
     };
-
-    match hls_is_supported(&hls_class) {
-        Ok(true) => {}
-        Ok(false) | Err(_) if native_supported => {
-            return play_native(id, media, &source, plan, start);
-        }
-        Ok(false) => {
-            return Err("This browser supports neither hls.js/MSE nor native HLS playback".into());
-        }
-        Err(error) => return Err(error),
+    for event in ["play", "pause"] {
+        media.add_event_listener_with_callback(event, opening.callback.as_ref().unchecked_ref())?;
     }
-
-    let config = hls_config(start);
-    // Incremental TS appends can silently leave video gaps after a live seek.
-    if start == HlsStart::Live || plan.codec_bootstrap {
-        fragment_loader(&hls_class, &config)?;
+    media.set_hidden(false);
+    set_state(&media, "loading-manifest", "Loading stream...");
+    let initialize = async {
+        let hls_class = match hls_class.await {
+            Ok(class) => match hls_is_supported(&class) {
+                Ok(true) => class,
+                Ok(false) | Err(_) if native_supported => return Ok(None),
+                Ok(false) => {
+                    return Err(
+                        "This browser supports neither hls.js/MSE nor native HLS playback".into(),
+                    );
+                }
+                Err(error) => return Err(error),
+            },
+            Err(_) if native_supported => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        if !NEXT_ID.with(|next| next.get() == id) {
+            return Err("HLS open was superseded".into());
+        }
+        let config = hls_config(start);
+        // Incremental TS appends can silently leave video gaps after a live seek.
+        if start == HlsStart::Live {
+            fragment_loader(&hls_class, &config)?;
+        }
+        let hls = construct_hls(&hls_class, &config)?;
+        opening.hls = Some(hls.clone());
+        hls.attach_media(&media)?;
+        if opening.intent.get() == PlaybackIntent::Play {
+            resume_playback(media.clone());
+        }
+        Ok(Some(hls_class))
+    };
+    let (initialized, prepared) = futures::future::join(initialize, prepared).await;
+    let hls_class = initialized?;
+    let PreparedHlsFeed {
+        source,
+        plan,
+        initial_source,
+    } = prepared.map_err(JsValue::from)?;
+    if !NEXT_ID.with(|next| next.get() == id) {
+        return Err("HLS open was superseded".into());
     }
-    let hls = construct_hls(&hls_class, &config)?;
+    let intent = opening.intent.get();
+    let Some(hls_class) = hls_class else {
+        opening.restore_autoplay = false;
+        drop(opening);
+        return play_native(id, media, &source, plan, start, restore_autoplay, intent);
+    };
+    let hls = opening.hls.as_ref().unwrap().clone();
     let callback = Closure::new(move |event: JsValue, data: JsValue| {
         handle_event(id, event.as_string().as_deref().unwrap_or_default(), &data);
     });
@@ -247,10 +318,8 @@ pub(super) fn play_hls(
         remove_hls_events(&hls, &callback);
         return Err(error);
     }
-    let restore_autoplay = suspend_autoplay(&media);
-    set_state(&media, "loading-manifest", "Loading stream...");
-
     let live = start == HlsStart::Live;
+    let play_position = plan.play_position;
     ACTIVE.with(|active| {
         *active.borrow_mut() = Some(Player {
             id,
@@ -263,13 +332,12 @@ pub(super) fn play_hls(
             callback,
             lifecycle,
             restore_autoplay,
-            intent: PlaybackIntent::Play,
+            intent,
             live,
             codec_bootstrap_pending: plan.codec_bootstrap,
             codec_recovery: None,
             plan,
             initial_live: live,
-            live_lock_pending: false,
             ready: false,
             consecutive_media_recoveries: 0,
             hard_restarts: 0,
@@ -279,11 +347,12 @@ pub(super) fn play_hls(
         });
     });
 
+    opening.hls = None;
+    opening.restore_autoplay = false;
+    drop(opening);
     let _ = install_media_session(&media);
-    if let Err(error) = hls
-        .load_source(&source)
-        .and_then(|_| hls.attach_media(&media))
-    {
+    media.set_current_time(play_position);
+    if let Err(error) = hls.load_source(&source) {
         destroy_current_hls();
         return Err(error);
     }
@@ -304,6 +373,8 @@ fn play_native(
     source: &str,
     plan: HlsStartupPlan,
     start: HlsStart,
+    restore_autoplay: bool,
+    intent: PlaybackIntent,
 ) -> Result<&'static str, JsValue> {
     let callback = Closure::<dyn FnMut(Event)>::new(move |event: Event| {
         handle_native_event(id, &event.type_());
@@ -329,7 +400,6 @@ fn play_native(
         remove_native_events(&media, &callback);
         return Err(error);
     }
-    let restore_autoplay = suspend_autoplay(&media);
     NATIVE.with(|active| {
         *active.borrow_mut() = Some(NativePlayer {
             id,
@@ -338,9 +408,8 @@ fn play_native(
             lifecycle,
             plan,
             restore_autoplay,
-            intent: PlaybackIntent::Play,
+            intent,
             live: start == HlsStart::Live,
-            positioned: false,
             ready: false,
             clock_position: None,
         });
@@ -349,6 +418,9 @@ fn play_native(
     let _ = install_media_session(&media);
     media.set_src(source);
     media.load();
+    if intent == PlaybackIntent::Play {
+        resume_playback(media.clone());
+    }
     Ok("native HLS")
 }
 
@@ -408,11 +480,11 @@ fn handle_media_event(id: u64, media: &HtmlMediaElement, event: &str, native: bo
         let _ = update_media_session(media);
     }
     let mut seek = None;
-    let action = if native {
+    let position = if native {
         NATIVE.with(|active| {
             let mut active = active.borrow_mut();
             let Some(player) = active.as_mut().filter(|player| player.id == id) else {
-                return MediaAction::None;
+                return None;
             };
             media_action(
                 media,
@@ -420,13 +492,14 @@ fn handle_media_event(id: u64, media: &HtmlMediaElement, event: &str, native: bo
                 player.ready,
                 &mut player.intent,
                 &mut player.clock_position,
-            )
+            );
+            None
         })
     } else {
         ACTIVE.with(|active| {
             let mut active = active.borrow_mut();
             let Some(player) = active.as_mut().filter(|player| player.id == id) else {
-                return MediaAction::None;
+                return None;
             };
             if matches!(
                 event,
@@ -471,17 +544,15 @@ fn handle_media_event(id: u64, media: &HtmlMediaElement, event: &str, native: bo
                     if !player.ready {
                         player.reload_position = Some(media.current_time());
                     }
-                    player.live_lock_pending = false;
                     player.clock_position = None;
                 }
             }
             if matches!(event, "durationchange" | "seeked" | "canplay")
                 && !player.ready
                 && !player.codec_bootstrap_pending
-                && !lock_latest_live_plan(player)
                 && let Some(position) = finish_buffering(player)
             {
-                return MediaAction::Begin(position);
+                return Some(position);
             }
             media_action(
                 media,
@@ -489,10 +560,13 @@ fn handle_media_event(id: u64, media: &HtmlMediaElement, event: &str, native: bo
                 player.ready,
                 &mut player.intent,
                 &mut player.clock_position,
-            )
+            );
+            None
         })
     };
-    apply_media_action(media, action);
+    if let Some(position) = position {
+        begin_playback(media.clone(), position);
+    }
     if let Some(hls) = seek {
         let result = hls.start_load_at(media.current_time());
         finish_hls_action(id, &hls, "seeking", result);
@@ -505,13 +579,11 @@ fn media_action(
     ready: bool,
     intent: &mut PlaybackIntent,
     clock_position: &mut Option<f64>,
-) -> MediaAction {
-    if event == "play" && media.paused() {
-        return MediaAction::None;
+) {
+    if event == "play" && media.paused() || event == "pause" && !media.paused() {
+        return;
     }
-    if intent.event(event, ready) && media.paused() {
-        return MediaAction::Begin(media.current_time());
-    }
+    intent.event(event);
     if matches!(event, "seeking" | "waiting") {
         *clock_position = None;
         set_state(media, "buffering", "Buffering playback...");
@@ -537,14 +609,6 @@ fn media_action(
         *clock_position = None;
         set_state(media, "playing", "Playing");
     }
-    MediaAction::None
-}
-
-fn apply_media_action(media: &HtmlMediaElement, action: MediaAction) {
-    match action {
-        MediaAction::None => {}
-        MediaAction::Begin(position) => begin_playback(media.clone(), position),
-    }
 }
 
 fn handle_native_event(id: u64, event: &str) {
@@ -557,19 +621,11 @@ fn handle_native_event(id: u64, event: &str) {
             set_state(&player.media, "error", "Native HLS playback failed");
             return None;
         }
-        if !player.positioned && player.media.ready_state() > 0 {
-            player.media.set_current_time(player.plan.play_position);
-            player.positioned = true;
-        }
         start_beginning_history_when_safe(&player.media, &player.plan, player.live);
         if player.ready {
             return None;
         }
-        let position = if player.live {
-            initial_live_position(&player.media, &player.plan, true)
-        } else {
-            playback_start_position(&player.media, &player.plan, false, true)
-        };
+        let position = playback_start_position(&player.media, &player.plan);
         if let Some(position) = position {
             player.ready = true;
             Some((player.media.clone(), position))
@@ -688,9 +744,6 @@ fn handle_event(id: u64, event: &str, data: &JsValue) {
                 }
                 player.codec_bootstrap_pending = false;
                 resume_bootstrap = Some(player.hls.clone());
-                if lock_latest_live_plan(player) {
-                    return Action::None;
-                }
                 if let Some(position) = finish_buffering(player) {
                     Action::Play(player.media.clone(), position)
                 } else {
@@ -714,7 +767,6 @@ fn handle_event(id: u64, event: &str, data: &JsValue) {
                     return Action::HardRestart("The live presentation was unavailable".into());
                 };
                 if !player.codec_bootstrap_pending
-                    && !lock_latest_live_plan(player)
                     && let Some(position) = finish_buffering(player)
                 {
                     Action::Play(player.media.clone(), position)
@@ -723,10 +775,6 @@ fn handle_event(id: u64, event: &str, data: &JsValue) {
                 }
             }
             "hlsBufferAppended" | "hlsFragBuffered" if !player.ready => {
-                lock_latest_live_plan(player);
-                if player.live_lock_pending {
-                    return Action::None;
-                }
                 if let Some(position) = finish_buffering(player) {
                     Action::Play(player.media.clone(), position)
                 } else {
@@ -948,7 +996,7 @@ fn is_current_hls(id: u64, hls: &Hls) -> bool {
 }
 
 fn hard_restart(id: u64, message: String) {
-    type Launch = (Hls, Hls, String, HtmlMediaElement);
+    type Launch = (Hls, Hls, String, HtmlMediaElement, f64);
     type Failure = (HtmlMediaElement, String, bool);
     let replacement: Option<Result<Launch, Failure>> = ACTIVE.with(|active| {
         let mut active = active.borrow_mut();
@@ -1010,7 +1058,6 @@ fn hard_restart(id: u64, message: String) {
         }
         remove_hls_events(&player.hls, &player.callback);
         let retired = std::mem::replace(&mut player.hls, hls.clone());
-        player.live_lock_pending = false;
         player.reload_position = None;
         player.ready = false;
         player.codec_bootstrap_pending = player.plan.codec_bootstrap;
@@ -1019,24 +1066,26 @@ fn hard_restart(id: u64, message: String) {
         }
         player.consecutive_media_recoveries = 0;
         player.clock_position = None;
-        player.intent.pause_internally(player.media.paused());
         player.media.remove_attribute("data-weeb3-hls-error").ok();
         Some(Ok((
             hls,
             retired,
             player.source.clone(),
             player.media.clone(),
+            player.plan.play_position,
         )))
     });
     match replacement {
-        Some(Ok((hls, retired, source, media))) => {
+        Some(Ok((hls, retired, source, media, position))) => {
             let _ = retired.destroy();
             set_state(&media, "recovering", "Recovering playback...");
-            if let Err(error) = hls
-                .load_source(&source)
-                .and_then(|_| hls.attach_media(&media))
-            {
+            if let Err(error) = hls.attach_media(&media).and_then(|_| {
+                media.set_current_time(position);
+                hls.load_source(&source)
+            }) {
                 hard_restart(id, js_error_message(&error));
+            } else if playback_intent(&media, None) {
+                resume_playback(media);
             }
         }
         Some(Err((_, error, false))) => hard_restart(id, error),
@@ -1057,11 +1106,11 @@ fn start_beginning_history_when_safe(media: &HtmlMediaElement, plan: &HlsStartup
 fn begin_playback(media: HtmlMediaElement, position: f64) {
     let current = media.current_time();
     if !current.is_finite()
-        || (current - position).abs() > BUFFER_EPSILON_SECONDS + CLOCK_ADVANCE_EPSILON_SECONDS
+        || current + BUFFER_EPSILON_SECONDS + CLOCK_ADVANCE_EPSILON_SECONDS < position
     {
         media.set_current_time(position);
     }
-    if playback_intent(&media, None) {
+    if media.paused() && playback_intent(&media, None) {
         resume_playback(media);
     }
 }
@@ -1093,59 +1142,18 @@ fn resume_playback(media: HtmlMediaElement) {
     });
 }
 
-fn playback_start_position(
-    media: &HtmlMediaElement,
-    plan: &HlsStartupPlan,
-    live: bool,
-    allow_infinite_duration: bool,
-) -> Option<f64> {
-    let duration = media.duration();
-    let duration_ready = if live {
-        (allow_infinite_duration && duration.is_infinite())
-            || (duration.is_finite() && duration + BUFFER_EPSILON_SECONDS >= plan.runway_end)
-    } else {
-        duration.is_finite() && duration + BUFFER_EPSILON_SECONDS >= plan.duration
-    };
-    if !duration_ready {
+fn playback_start_position(media: &HtmlMediaElement, plan: &HlsStartupPlan) -> Option<f64> {
+    if media.ready_state() == 0 || media.seeking() {
         return None;
     }
-    let buffer_end = plan.runway_end;
-    if buffered_covers(media, plan.play_position, buffer_end) {
-        if !live {
-            let current = media.current_time();
-            if !current.is_finite()
-                || (current - plan.play_position).abs()
-                    > BUFFER_EPSILON_SECONDS + CLOCK_ADVANCE_EPSILON_SECONDS
-            {
-                media.set_current_time(plan.play_position);
-                return None;
-            }
-            if media.ready_state() < 3 {
-                return None;
-            }
-        }
-        return Some(plan.play_position);
-    }
-    if !live {
+    let position = media.current_time();
+    if !position.is_finite()
+        || position + BUFFER_EPSILON_SECONDS + CLOCK_ADVANCE_EPSILON_SECONDS < plan.play_position
+    {
+        media.set_current_time(plan.play_position);
         return None;
     }
-    let runway = plan.runway_end - plan.play_position;
-    if !runway.is_finite() || runway <= 0.0 {
-        return None;
-    }
-    let ranges = media.buffered();
-    (0..ranges.length()).rev().find_map(|index| {
-        ranges
-            .start(index)
-            .ok()
-            .zip(ranges.end(index).ok())
-            .and_then(|(range_start, range_end)| {
-                let candidate = range_start.max(plan.play_position);
-                (range_end > plan.play_position + BUFFER_EPSILON_SECONDS
-                    && range_end + BUFFER_EPSILON_SECONDS >= candidate + runway)
-                    .then_some(candidate)
-            })
-    })
+    (media.ready_state() >= 3).then_some(position)
 }
 
 fn recovery_plan(
@@ -1278,8 +1286,8 @@ fn consumed_playlist_finalized(hls: &Hls) -> Option<bool> {
 }
 
 fn codec_fragment_url(hls: &Hls, bootstrap: bool) -> Result<(), JsValue> {
-    let fragment = level_details(hls)
-        .and_then(|details| js_property(&details, "fragments"))
+    let details = level_details(hls).ok_or("HLS codec playlist is unavailable")?;
+    let fragment = js_property(&details, "fragments")
         .and_then(|fragments| {
             Array::from(&fragments)
                 .iter()
@@ -1291,6 +1299,7 @@ fn codec_fragment_url(hls: &Hls, bootstrap: bool) -> Result<(), JsValue> {
     if bootstrap {
         url.search_params().set("bootstrap", "1");
     } else {
+        restore_codec_timeline(&details, &fragment)?;
         url.search_params().delete("bootstrap");
     }
     Reflect::set(
@@ -1302,47 +1311,86 @@ fn codec_fragment_url(hls: &Hls, bootstrap: bool) -> Result<(), JsValue> {
     .ok_or_else(|| "HLS codec URL could not be changed".into())
 }
 
+fn restore_codec_timeline(details: &JsValue, codec: &JsValue) -> Result<(), JsValue> {
+    if integer_property(details, "startSN") != Some(0) {
+        return Err("HLS codec timeline has no origin".into());
+    }
+    let duration = fragment_declared_duration(codec)?;
+    let parsed = number_property(codec, "endPTS")
+        .zip(number_property(codec, "startPTS"))
+        .map(|(end, start)| end - start)
+        .ok_or("HLS codec timing is unavailable")?;
+    if parsed + BUFFER_EPSILON_SECONDS >= duration {
+        return Ok(());
+    }
+    let fragments = js_property(details, "fragments").ok_or("HLS fragments are unavailable")?;
+    let offset = number_property(details, "appliedTimelineOffset").unwrap_or_default();
+    for name in [
+        "startPTS",
+        "endPTS",
+        "startDTS",
+        "endDTS",
+        "minEndPTS",
+        "maxStartPTS",
+        "deltaPTS",
+    ] {
+        Reflect::set(codec, &JsValue::from_str(name), &JsValue::UNDEFINED)?;
+    }
+    // The codec response contains only a prefix. Its duration must not shift
+    // unparsed segments, or be reused as timing evidence on a playlist refresh.
+    for fragment in Array::from(&fragments).iter() {
+        if number_property(&fragment, "startPTS").is_some() {
+            break;
+        }
+        let start = number_property(&fragment, "playlistOffset")
+            .ok_or("HLS fragment offset is unavailable")?
+            + offset;
+        let duration = fragment_declared_duration(&fragment)?;
+        for (method, value) in [("setStart", start), ("setDuration", duration)] {
+            js_function(&fragment, method)
+                .ok_or("HLS fragment timing method is unavailable")?
+                .call1(&fragment, &JsValue::from_f64(value))?;
+        }
+    }
+    Ok(())
+}
+
+fn fragment_declared_duration(fragment: &JsValue) -> Result<f64, JsValue> {
+    js_property(fragment, "tagList")
+        .and_then(|tags| {
+            Array::from(&tags).iter().find_map(|tag| {
+                let tag = Array::from(&tag);
+                (tag.get(0).as_string().as_deref() == Some("INF"))
+                    .then(|| tag.get(1).as_string()?.parse::<f64>().ok())?
+            })
+        })
+        .filter(|duration| duration.is_finite() && *duration > 0.0)
+        .ok_or_else(|| "HLS fragment duration is unavailable".into())
+}
+
 fn player_fragment_loader(player: &Player) -> Result<(), JsValue> {
     let config =
         js_property(player.hls.as_ref(), "config").ok_or("HLS configuration is unavailable")?;
     fragment_loader(&player.hls_class, &config.unchecked_into())
 }
 
-fn initial_live_position(
-    media: &HtmlMediaElement,
-    plan: &HlsStartupPlan,
-    native: bool,
-) -> Option<f64> {
-    let duration = media.duration();
-    let duration = if native && duration.is_infinite() {
-        let seekable = media.seekable();
-        seekable
-            .length()
-            .checked_sub(1)
-            .and_then(|last| seekable.end(last).ok())?
-    } else {
-        duration
-    };
-    if !duration.is_finite()
-        || duration + BUFFER_EPSILON_SECONDS < plan.duration
-        || !buffered_covers(media, plan.play_position, plan.runway_end)
-    {
-        return None;
-    }
-    Some(plan.play_position)
-}
-
 fn player_start_position(player: &Player) -> Option<f64> {
-    if player.media.seeking() {
+    if let Some(position) = playback_start_position(&player.media, &player.plan) {
+        return Some(position);
+    }
+    if !player.live || player.initial_live && player.hard_restarts == 0 || player.media.seeking() {
         return None;
     }
-    if player.reload_position.is_some()
-        || (player.live && player.initial_live && player.hard_restarts == 0)
-    {
-        initial_live_position(&player.media, &player.plan, false)
-    } else {
-        playback_start_position(&player.media, &player.plan, player.live, false)
-    }
+    let ranges = player.media.buffered();
+    let runway = playback_runway(&player.plan);
+    (0..ranges.length()).rev().find_map(|index| {
+        let (start, end) = (ranges.start(index).ok()?, ranges.end(index).ok()?);
+        let position = start
+            .max(player.plan.play_position)
+            .max(player.media.current_time());
+        (runway.is_finite() && runway > 0.0 && end + BUFFER_EPSILON_SECONDS >= position + runway)
+            .then_some(position)
+    })
 }
 
 fn finish_buffering(player: &mut Player) -> Option<f64> {
@@ -1360,89 +1408,18 @@ fn finish_buffering(player: &mut Player) -> Option<f64> {
     Some(position)
 }
 
-fn lock_latest_live_plan(player: &mut Player) -> bool {
-    if !player.live
-        || player.reload_position.is_some()
-        || (player.initial_live && player.hard_restarts == 0)
-    {
-        return false;
-    }
-    if player.live_lock_pending {
-        return true;
-    }
-    if !buffered_covers(
-        &player.media,
-        player.plan.play_position,
-        player.plan.runway_end,
-    ) {
-        return false;
-    }
-    player.live_lock_pending = true;
-    let initial = player.initial_live;
-    let id = player.id;
-    let hls = player.hls.clone();
-    spawn_local(async move {
-        let plan = super::page_bridge::lock_live_plan().await;
-        if !is_current_hls(id, &hls) {
-            return;
-        }
-        let action = ACTIVE.with(|active| {
-            let mut active = active.borrow_mut();
-            let player = active.as_mut().filter(|player| player.id == id)?;
-            player.live_lock_pending = false;
-            if player.ready || player.reload_position.is_some() || player.initial_live != initial {
-                return None;
-            }
-            if let Some(plan) = plan
-                && plan.play_position > player.plan.play_position + BUFFER_EPSILON_SECONDS
-                && buffered_covers(&player.media, plan.play_position, plan.runway_end)
-            {
-                player.plan = plan;
-            }
-            finish_buffering(player).map(|position| Action::Play(player.media.clone(), position))
-        });
-        if let Some(action) = action {
-            apply_action(id, action);
-        }
-    });
-    true
-}
-
 #[derive(Clone, Copy, PartialEq)]
 enum PlaybackIntent {
     Play,
     Paused,
-    InternalPause,
 }
 
 impl PlaybackIntent {
-    fn pause_internally(&mut self, paused: bool) -> bool {
-        if paused {
-            return false;
-        }
-        if *self != Self::Paused {
-            *self = Self::InternalPause;
-        }
-        true
-    }
-
-    fn event(&mut self, event: &str, ready: bool) -> bool {
+    fn event(&mut self, event: &str) {
         match event {
-            "pause" if *self == Self::InternalPause => {
-                *self = Self::Play;
-                ready
-            }
-            "pause" | "ended" => {
-                *self = Self::Paused;
-                false
-            }
-            "play" => {
-                if *self != Self::InternalPause {
-                    *self = Self::Play;
-                }
-                false
-            }
-            _ => false,
+            "pause" | "ended" => *self = Self::Paused,
+            "play" => *self = Self::Play,
+            _ => {}
         }
     }
 }
@@ -1497,8 +1474,10 @@ fn decoder_recovery_allowed(player: &Player, position: f64) -> bool {
             .is_some_and(|document| !document.hidden())
         && {
             let ranges = player.media.buffered();
-            (0..ranges.length()).any(|index| matches!((ranges.start(index), ranges.end(index)),
-                (Ok(start), Ok(end)) if start <= position && end >= position + 2.0))
+            (0..ranges.length()).any(|index| {
+                matches!((ranges.start(index), ranges.end(index)),
+                (Ok(start), Ok(end)) if start <= position && end >= position + 2.0)
+            })
         }
 }
 
@@ -1552,9 +1531,7 @@ fn playback_intent(media: &HtmlMediaElement, requested: Option<bool>) -> bool {
     let update = |intent: &mut PlaybackIntent| {
         match requested {
             Some(false) => *intent = PlaybackIntent::Paused,
-            Some(true) if *intent != PlaybackIntent::InternalPause => {
-                *intent = PlaybackIntent::Play
-            }
+            Some(true) => *intent = PlaybackIntent::Play,
             _ => {}
         }
         *intent == PlaybackIntent::Play
@@ -1565,7 +1542,7 @@ fn playback_intent(media: &HtmlMediaElement, requested: Option<bool>) -> bool {
                 .borrow_mut()
                 .as_mut()
                 .filter(|player| player.media == *media)
-                .map(|player| update(&mut player.intent) && player.ready)
+                .map(|player| update(&mut player.intent))
         })
         .or_else(|| {
             NATIVE.with(|active| {
@@ -1573,7 +1550,7 @@ fn playback_intent(media: &HtmlMediaElement, requested: Option<bool>) -> bool {
                     .borrow_mut()
                     .as_mut()
                     .filter(|player| player.media == *media)
-                    .map(|player| update(&mut player.intent) && player.ready)
+                    .map(|player| update(&mut player.intent))
             })
         })
         .unwrap_or(false)
@@ -1612,6 +1589,7 @@ fn restore_autoplay(media: &HtmlMediaElement, restore: bool) {
 }
 
 pub(super) fn destroy_current_hls() {
+    next_player_id();
     release_screen_lock();
     if let Some((session, _callback)) = MEDIA_SESSION.with(|session| session.borrow_mut().take()) {
         if let Some(handler) = js_function(&session, "setActionHandler") {
@@ -1896,7 +1874,6 @@ pub(super) fn set_state(media: &HtmlMediaElement, state: &str, message: &str) {
     }
     media.set_attribute("data-weeb3-hls-state", state).ok();
     let busy = !matches!(state, "playing" | "ready" | "paused" | "error");
-    media.set_hidden(busy && (media.hidden() || state == "loading-manifest"));
     let Some(parent) = media.parent_element() else {
         return;
     };

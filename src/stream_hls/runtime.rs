@@ -481,13 +481,32 @@ fn body_runway_targets(active: &FeedSession) -> &[super::HlsSegment] {
             {
                 return false;
             }
-            if *offset != 0 {
+            if !active.ready || *offset != 0 {
                 seconds += segment.duration;
             }
             true
         })
         .count();
     &playlist.segments[position..position + length]
+}
+
+async fn prepare_live_bodies(client: Arc<Weeb3>, id: u64) -> Vec<Option<Bytes>> {
+    let references = FEED.with(|feed| {
+        feed.borrow()
+            .get(id)
+            .map(body_runway_targets)
+            .unwrap_or_default()
+            .iter()
+            .map(|segment| segment.reference.clone())
+            .collect::<Vec<_>>()
+    });
+    spawn_body_runway(id);
+    // Keep every result; failed bodies retain the streaming fallback.
+    let mut bodies = Vec::new();
+    for reference in references {
+        bodies.push(hls_body(client.clone(), reference, Some(id)).await);
+    }
+    bodies
 }
 
 fn presentation_playlist(active: &FeedSession) -> Option<std::borrow::Cow<'_, HlsPlaylist>> {
@@ -500,16 +519,6 @@ fn presentation_playlist(active: &FeedSession) -> Option<std::borrow::Cow<'_, Hl
         presentation.mark_gap(*sequence, reference);
     }
     Some(std::borrow::Cow::Owned(presentation))
-}
-
-pub(crate) fn lock_live_startup_plan() -> Option<super::HlsStartupPlan> {
-    FEED.with(|feed| {
-        let feed = feed.borrow();
-        let active = feed.active().filter(|active| {
-            active.start == HlsStart::Live && active.live_startup_plan.is_some()
-        })?;
-        presentation_playlist(active)?.startup_plan(HlsStart::Live)
-    })
 }
 
 fn spawn_body_runway(id: u64) {
@@ -901,7 +910,7 @@ async fn edge_probe_wave(
         async_std::task::sleep(EDGE_COLD_WAVE_TIMEOUT).right_future()
     };
     futures::pin_mut!(deadline);
-    let mut positive_seen = lower_is_known;
+    let mut positive_seen = false;
     while let future::Either::Left((Some((slot, result)), _)) =
         future::select(probes.next(), deadline.as_mut()).await
     {
@@ -1012,11 +1021,12 @@ async fn retrieve_confirmed_payload(
     mut update: Vec<u8>,
 ) -> Option<RawFeedPayload> {
     let lattice_residue = index % HISTORY_STRIDE;
+    let mut next = index.checked_add(1)?;
     loop {
-        // Confirm the entire frontier together, including both history-stride guards.
-        // A transient probe never establishes the end of the feed.
-        let dense = index.checked_add(1)?..=index.checked_add(HISTORY_STRIDE * 2)?;
-        let mut probes = stream::iter(dense)
+        // Keep completed guard observations while extending beyond a new positive.
+        // Reprobing them would chase an advancing publisher before playback starts.
+        let end = index.checked_add(HISTORY_STRIDE * 2)?;
+        let mut probes = stream::iter(next..=end)
             .map(|index| async move {
                 (
                     index,
@@ -1025,22 +1035,23 @@ async fn retrieve_confirmed_payload(
             })
             .buffered((HISTORY_STRIDE * 2) as usize);
         let mut transient = false;
-        let mut newest = None;
-        while let Some((index, probe)) = probes.next().await {
+        while let Some((candidate, probe)) = probes.next().await {
             match probe {
-                FeedProbe::Found(update) => newest = Some((index, update)),
+                FeedProbe::Found(found) => {
+                    (index, update) = (candidate, found);
+                    transient = false;
+                }
                 FeedProbe::Transient => transient = true,
                 FeedProbe::Missing => {}
             }
         }
-        if let Some((next, next_update)) = newest {
-            (index, update) = (next, next_update);
-            continue;
-        }
         if transient {
             return None;
         }
-        break;
+        if end == index.checked_add(HISTORY_STRIDE * 2)? {
+            break;
+        }
+        next = end.checked_add(1)?;
     }
     let root = decode_feed_payload_root(index, update)?;
     let bytes =
@@ -1685,19 +1696,15 @@ fn spawn_follower(id: u64) {
                 };
                 let mut progressed = false;
                 let mut skipped_missing_index = false;
-                for offset in 1..=FEED_FOLLOW_AHEAD {
-                    let Some(index) = head.checked_add(offset) else {
-                        return;
-                    };
-                    let candidate = probe_feed_payload(
-                        &client,
-                        &owner,
-                        &topic,
-                        index,
-                        FEED_TAIL_PROBE_BYTES,
-                        None,
-                    )
-                    .await;
+                let mut probes = stream::iter(1..=FEED_FOLLOW_AHEAD)
+                    .map(async |offset| {
+                        let index = head.checked_add(offset)?;
+                        Some((index, probe_feed_payload(&client, &owner, &topic, index,
+                            FEED_TAIL_PROBE_BYTES, None).await))
+                    })
+                    .buffered(2);
+                while let Some(candidate) = probes.next().await {
+                    let Some((index, candidate)) = candidate else { return };
                     if !FEED
                         .with(|feed| feed.borrow().active == id && feed.borrow().get(id).is_some())
                     {
@@ -1727,6 +1734,7 @@ fn spawn_follower(id: u64) {
                         ));
                     }
                 }
+                drop(probes);
                 if progressed {
                     last_frontier_check = js_sys::Date::now();
                     continue;
@@ -2509,6 +2517,14 @@ pub(crate) async fn prepare_hls_feed(
                 if underfilled && !immutable { spawn_follower(id); }
                 (index, plan, 0)
             };
+            let _startup_bodies = if start == HlsStart::Live {
+                prepare_live_bodies(client.clone(), id).await
+            } else {
+                Vec::new()
+            };
+            if !feed_is_current(id) || !result_view_request_is_current(view_generation) {
+                return Err("HLS open was superseded".to_string());
+            }
             let elapsed = plan.duration;
             FEED.with(|feed| {
                 if let Some(active) = feed.borrow_mut().get_mut(id) {

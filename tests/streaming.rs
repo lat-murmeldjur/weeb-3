@@ -472,7 +472,7 @@ mod hls_minimal {
     }
 
     #[test]
-    fn network_recovery_and_native_fallback_keep_the_planned_gate() {
+    fn network_recovery_and_native_fallback_keep_the_planned_position() {
         const PLAYER: &str = include_str!("../src/stream_hls/player.rs");
         for needle in [
             "RecoverNetwork(Hls, f64)",
@@ -496,12 +496,12 @@ mod hls_minimal {
             "let _ = retired.destroy()",
             "hls.attach_media(&media)",
             "fn is_current_hls(id: u64, hls: &Hls)",
-            "return play_native(id, media, &source, plan, start)",
+            "return play_native(id, media, &source, plan, start, restore_autoplay, intent)",
             "media.set_src(source)",
             "handle_native_event",
             "buffered_covers(",
             ".load_source(&source)",
-            ".and_then(|_| hls.attach_media(&media))",
+            "hls.attach_media(&media).and_then(|_|",
         ] {
             assert!(PLAYER.contains(needle), "{needle}");
         }
@@ -579,38 +579,38 @@ mod hls_minimal {
     }
 
     #[test]
-    fn player_has_one_gated_autoplay_path_and_room_for_a_growing_buffer() {
+    fn player_requests_native_play_while_preparing_and_keeps_room_for_buffering() {
         const PLAYER: &str = include_str!("../src/stream_hls/player.rs");
         let suppress = PLAYER
             .find("let restore_autoplay = suspend_autoplay(&media);")
             .unwrap();
         let attach = PLAYER
-            .find(".and_then(|_| hls.attach_media(&media))")
+            .find("hls.attach_media(&media)?")
             .unwrap();
         assert!(
             suppress < attach,
-            "autoplay must be disabled before MSE attach"
+            "native play intent must be owned before MSE attach"
         );
         assert!(PLAYER.contains("let requested = media.autoplay()"));
         assert!(PLAYER.contains("media.set_autoplay(false)"));
         assert!(PLAYER.contains("media.set_autoplay(true)"));
         assert!(
             PLAYER.contains(
-                "playback_start_position(&player.media, &player.plan, player.live, false)"
+                "playback_start_position(&player.media, &player.plan)"
             )
         );
         assert!(PLAYER.contains("matches!(event, \"durationchange\" | \"seeked\" | \"canplay\")"));
-        assert!(PLAYER.contains("MediaAction::Begin(position) => begin_playback"));
+        assert!(PLAYER.contains("begin_playback(media.clone(), position)"));
         assert!(PLAYER.contains("event == \"timeupdate\""));
         assert!(!PLAYER.contains("Ok(_) => set_state(&media, \"playing\""));
         assert!(PLAYER.contains("(180.0, 600.0)"));
         assert!(PLAYER.contains("const LIVE_RUNWAY_BUFFER: (f64, f64) = (90.0, 120.0)"));
         assert!(PLAYER.contains("set(&config, \"autoStartLoad\", JsValue::FALSE)"));
         assert!(PLAYER.contains("set(&config, \"startFragPrefetch\", JsValue::FALSE)"));
-        assert!(PLAYER.contains(
-            "duration.is_finite() && duration + BUFFER_EPSILON_SECONDS >= plan.duration"
-        ));
-        assert!(PLAYER.contains("buffered_covers(media, plan.play_position, buffer_end)"));
+        assert!(PLAYER.contains("futures::future::join(initialize, prepared).await"));
+        assert!(PLAYER.contains("if media.paused() && playback_intent(&media, None)"));
+        assert!(!PLAYER.contains("media.set_hidden(true)"));
+        assert!(!PLAYER.contains("fn initial_live_position("));
         assert_eq!(PLAYER.matches("media.play()").count(), 1);
     }
 
@@ -644,10 +644,10 @@ mod hls_minimal {
             .split_once("fn media_action(")
             .unwrap()
             .1
-            .split_once("fn apply_media_action(")
+            .split_once("fn handle_native_event(")
             .unwrap()
             .0;
-        assert!(!PLAYER.contains("MediaAction::Pause"));
+        assert!(!PLAYER.contains("enum MediaAction"));
         assert!(lifecycle.contains("event == \"timeupdate\""));
         assert!(lifecycle.contains("position + CLOCK_ADVANCE_EPSILON_SECONDS"));
         assert!(lifecycle.contains("*clock_position = Some(media.current_time())"));
@@ -704,7 +704,7 @@ mod hls_minimal {
         assert!(RUNTIME.contains("Some(target)"));
         assert!(RUNTIME.contains("presentation_gaps"));
         assert!(RUNTIME.contains("presentation_playlist(feed)?.render_with_plan("));
-        assert!(RUNTIME.contains("presentation_playlist(active)?.startup_plan(HlsStart::Live)"));
+        assert!(RUNTIME.contains("active.live_startup_plan = Some(plan.clone())"));
         assert!(RUNTIME.contains("let mut presentation = playlist.clone()"));
         assert!(RUNTIME.contains("playlist.render(local_bytes_base, start)"));
         assert!(RUNTIME.contains("presentation.mark_gap(*sequence, reference)"));
@@ -753,7 +753,7 @@ mod hls_minimal {
         assert!(lifecycle.contains("matches!(event, \"durationchange\" | \"seeked\" | \"canplay\")"));
         assert!(lifecycle.contains("&& !player.codec_bootstrap_pending"));
         assert!(
-            lifecycle.find("apply_media_action(media, action)").unwrap()
+            lifecycle.find("begin_playback(media.clone(), position)").unwrap()
                 < lifecycle
                     .find("hls.start_load_at(media.current_time())")
                     .unwrap()
@@ -783,19 +783,15 @@ mod hls_minimal {
         let play_gate = &PLAYER[PLAYER.find("fn begin_playback(").unwrap()
             ..PLAYER.find("fn resume_playback(").unwrap()];
         assert!(play_gate.contains("!current.is_finite()"));
-        assert!(play_gate.contains("> BUFFER_EPSILON_SECONDS + CLOCK_ADVANCE_EPSILON_SECONDS"));
+        assert!(play_gate.contains("current + BUFFER_EPSILON_SECONDS + CLOCK_ADVANCE_EPSILON_SECONDS < position"));
     }
 
     #[test]
     fn live_follow_extends_history_without_moving_the_initial_start() {
         const PLAYER: &str = include_str!("../src/stream_hls/player.rs");
         const RUNTIME: &str = include_str!("../src/stream_hls/runtime.rs");
-        let lock = &PLAYER[PLAYER.find("fn lock_latest_live_plan(").unwrap()
-            ..PLAYER.find("enum PlaybackIntent").unwrap()];
-        assert!(lock.find("player.initial_live").unwrap()
-            < lock.find("super::page_bridge::lock_live_plan().await").unwrap());
-        assert!(lock.contains("buffered_covers(&player.media, plan.play_position, plan.runway_end)"));
-        assert!(lock.contains("player.reload_position.is_some()"));
+        assert!(!PLAYER.contains("lock_latest_live_plan"));
+        assert!(!PLAYER.contains("lock_live_plan().await"));
         let install = &RUNTIME[RUNTIME.find("fn install_snapshot(").unwrap()
             ..RUNTIME.find("async fn discover_beginning(").unwrap()];
         assert!(install.contains("!anchor.2 || *first == position"));
@@ -807,18 +803,19 @@ mod hls_minimal {
     fn exceptional_live_recovery_accepts_a_complete_buffered_alternative() {
         const PLAYER: &str = include_str!("../src/stream_hls/player.rs");
         let gate = PLAYER
-            .split_once("fn playback_start_position(")
+            .split_once("fn player_start_position(")
             .unwrap()
             .1
-            .split_once("fn playback_runway(")
+            .split_once("fn finish_buffering(")
             .unwrap()
             .0;
-        assert!(gate.contains("let buffer_end = plan.runway_end"));
-        assert!(gate.contains("let runway = plan.runway_end - plan.play_position"));
+        assert!(gate.contains("player.initial_live && player.hard_restarts == 0"));
+        assert!(gate.contains("let runway = playback_runway(&player.plan)"));
         assert!(gate.contains("(0..ranges.length()).rev().find_map"));
-        assert!(gate.contains("let candidate = range_start.max(plan.play_position)"));
-        assert!(gate.contains("range_end + BUFFER_EPSILON_SECONDS >= candidate + runway"));
-        assert!(gate.contains(".then_some(candidate)"));
+        assert!(gate.contains(".max(player.plan.play_position)"));
+        assert!(gate.contains(".max(player.media.current_time())"));
+        assert!(gate.contains("end + BUFFER_EPSILON_SECONDS >= position + runway"));
+        assert!(gate.contains(".then_some(position)"));
     }
 
     #[test]

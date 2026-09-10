@@ -865,6 +865,6 @@ pub(crate) use page_bridge::{
 #[cfg(target_arch = "wasm32")]
 pub(crate) use runtime::{
     clear_hls_runtime_cache, install_live_tail_fallback, live_tail_failure_identity,
-    lock_live_startup_plan, prepare_hls_feed, release_hls_runtime, start_beginning_history,
+    prepare_hls_feed, release_hls_runtime, start_beginning_history,
     try_fetch_response,
 };

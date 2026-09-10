@@ -14,7 +14,7 @@ use crate::{
         begin_result_view_request, replace_stream_result_view, result_view_request_is_current,
     },
     stream_conventions::HlsStart,
-    stream_hls::{HlsStartupPlan, PreparedHlsFeed, player, protocol::plan_from_js},
+    stream_hls::{PreparedHlsFeed, player, protocol::plan_from_js},
     worker_protocol::{
         bool_property, integer_property, number_property, property, set_number, set_string,
         string_property,
@@ -42,17 +42,6 @@ struct PendingHlsAttempt {
     id: u64,
     runtime: Rc<SharedRuntime>,
     network_id: u64,
-}
-
-async fn control(
-    runtime: &SharedRuntime,
-    network_id: u64,
-    kind: &str,
-    session: u64,
-) -> Result<Object, String> {
-    let request = request_object(kind, network_id);
-    set_number(&request, "session", session as f64);
-    runtime.request(&request, HLS_CONTROL_TIMEOUT).await
 }
 
 async fn prepare_hls(
@@ -147,34 +136,6 @@ fn parse_prepare_response(response: Object) -> Result<(PreparedHlsFeed, u64), St
     ))
 }
 
-fn active_target(live: bool) -> Option<(u64, Rc<SharedRuntime>, u64, u64)> {
-    ACTIVE_HLS.with(|active| {
-        let active = active.borrow();
-        let active = active.as_ref().filter(|active| active.live == live)?;
-        Some((
-            active.id,
-            active.runtime.clone(),
-            active.network_id,
-            active.worker_session,
-        ))
-    })
-}
-
-pub(super) async fn lock_live_plan() -> Option<HlsStartupPlan> {
-    let (id, runtime, network_id, session) = active_target(true)?;
-    let response = control(&runtime, network_id, "WEEB3_HLS_LOCK", session)
-        .await
-        .ok()?;
-    if bool_property(&response, "ok") != Some(true) {
-        return None;
-    }
-    let plan = plan_from_js(&property(&response, "plan"))?;
-    ACTIVE_HLS.with(|active| {
-        active.borrow().as_ref().filter(|active| active.id == id)?;
-        Some(plan)
-    })
-}
-
 pub(super) fn start_beginning_history() -> bool {
     ACTIVE_HLS.with(|active| {
         let mut active = active.borrow_mut();
@@ -239,9 +200,13 @@ fn notify_abandon(id: u64, runtime: &SharedRuntime, network_id: u64) {
 }
 
 pub(super) async fn resolve_live_tail_failure(sequence: u64, reference: &str) -> Option<f64> {
-    let (_, runtime, network_id, session) = active_target(true)?;
-    let request = request_object("WEEB3_HLS_TAIL_FAILURE", network_id);
-    set_number(&request, "session", session as f64);
+    let (runtime, request) = ACTIVE_HLS.with(|active| {
+        let active = active.borrow();
+        let active = active.as_ref().filter(|active| active.live)?;
+        let request = request_object("WEEB3_HLS_TAIL_FAILURE", active.network_id);
+        set_number(&request, "session", active.worker_session as f64);
+        Some((active.runtime.clone(), request))
+    })?;
     set_number(&request, "sequence", sequence as f64);
     set_string(&request, "reference", reference);
     let response = runtime.request(&request, HLS_CONTROL_TIMEOUT).await.ok()?;
@@ -269,23 +234,25 @@ pub(crate) async fn attach_hls_feed_player(
         )
         .await
     };
-    let prepare = prepare_hls(client, &owner, &topic, start, view_generation);
-    let (hls_class, (worker_ready, prepared)) = join(loader, join(worker, prepare)).await;
-    if !result_view_request_is_current(view_generation) {
-        release_hls_for_view(view_generation);
-        return Err("HLS open was superseded".to_string());
-    }
-    let prepared = prepared?;
-    if !worker_ready {
-        release_hls_view();
-        return Err(service_worker_scope_protocol_error(
-            "HLS feed and segment requests",
-        ));
-    }
-    player::play_hls(player_element, prepared, hls_class, start).map_err(|error| {
-        release_hls_view();
-        format!("Could not initialize HLS: {}", js_error_message(&error))
-    })
+    let prepare = async {
+        let prepare = prepare_hls(client, &owner, &topic, start, view_generation);
+        let (worker_ready, prepared) = join(worker, prepare).await;
+        if !result_view_request_is_current(view_generation) {
+            return Err("HLS open was superseded".to_string());
+        }
+        if !worker_ready {
+            return Err(service_worker_scope_protocol_error(
+                "HLS feed and segment requests",
+            ));
+        }
+        prepared
+    };
+    player::play_hls(player_element, prepare, loader, start)
+        .await
+        .map_err(|error| {
+            release_hls_for_view(view_generation);
+            format!("Could not initialize HLS: {}", js_error_message(&error))
+        })
 }
 
 pub(crate) async fn open_hls_feed_view(
@@ -298,7 +265,6 @@ pub(crate) async fn open_hls_feed_view(
     let document = web_sys::window().unwrap().document().unwrap();
     let wrapper = document.create_element("section").unwrap();
     let player: HtmlMediaElement = document.create_element("video").unwrap().unchecked_into();
-    player.set_hidden(true);
     player.set_controls(true);
     player.set_autoplay(true);
     player.set_preload("auto");
