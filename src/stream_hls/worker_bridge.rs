@@ -27,7 +27,7 @@ pub(crate) async fn dispatch(
     if !kind.starts_with("WEEB3_HLS_") {
         return None;
     }
-    if let Err(response) = runtime.request_network(message).await {
+    if let Err(response) = runtime.request_network(message) {
         return Some(response);
     }
     Some(match kind {

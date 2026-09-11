@@ -434,29 +434,6 @@ async fn cheque_exchange(
     saved.then_some(())
 }
 
-async fn retrieval_exchange(chunk_address: Vec<u8>, mut stream: Stream) -> Option<Vec<u8>> {
-    if stream.write_all(EMPTY_HEADERS_FRAME).await.is_err() {
-        return None;
-    }
-
-    read_control_protocol_frame(&mut stream).await?;
-
-    let request = etiquette_6::Request {
-        addr: chunk_address,
-    };
-
-    let request_frame = request.encode_length_delimited_to_vec();
-    if stream.write_all(&request_frame).await.is_err() {
-        return None;
-    }
-    let _ = stream.close().await;
-
-    let delivery = read_control_protocol_frame(&mut stream).await?;
-    etiquette_6::Delivery::decode(delivery.as_slice())
-        .ok()
-        .map(|message| message.data)
-}
-
 pub async fn connection_handler(
     peer: PeerId,
     local_peer: PeerId,
@@ -553,12 +530,27 @@ pub async fn issue_handler(
 
 pub async fn retrieve_handler(
     peer: PeerId,
-    chunk_address: Vec<u8>,
+    request: &etiquette_6::Request,
     control: StreamControl,
     session: OutboundProtocolSession,
 ) -> Option<Vec<u8>> {
-    let stream = open_current_outbound_stream(peer, control, RETRIEVAL_PROTOCOL, &session).await?;
-    retrieval_exchange(chunk_address, stream).await
+    let mut stream = open_current_outbound_stream(peer, control, RETRIEVAL_PROTOCOL, &session).await?;
+    if stream.write_all(EMPTY_HEADERS_FRAME).await.is_err() {
+        return None;
+    }
+
+    read_control_protocol_frame(&mut stream).await?;
+
+    let request_frame = request.encode_length_delimited_to_vec();
+    if stream.write_all(&request_frame).await.is_err() {
+        return None;
+    }
+    let _ = stream.close().await;
+
+    let delivery = read_control_protocol_frame(&mut stream).await?;
+    etiquette_6::Delivery::decode(delivery.as_slice())
+        .ok()
+        .map(|message| message.data)
 }
 
 pub async fn pushsync_handler(

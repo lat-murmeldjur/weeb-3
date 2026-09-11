@@ -1640,7 +1640,7 @@ impl Weeb3 {
 
                         let amount = match outcome {
                             RefreshmentOutcome::NotDispatched => {
-                                interface_log(format!("Refreshment attempt cleared {}", 0));
+                                interface_log("Refreshment attempt cleared 0".into());
                                 async_std::task::sleep(Duration::from_secs(1)).await;
                                 continue;
                             }
@@ -1649,7 +1649,7 @@ impl Weeb3 {
                                 account.refreshment = Date::now();
                                 account.balance = 0;
                                 account.refresh_scheduled = false;
-                                interface_log(format!("Refreshment attempt cleared {}", 0));
+                                interface_log("Refreshment attempt cleared 0".into());
                                 return;
                             }
                             RefreshmentOutcome::Acknowledged(amount) => {
@@ -1657,7 +1657,7 @@ impl Weeb3 {
                                 amount
                             }
                             RefreshmentOutcome::AmbiguousAfterPayment => {
-                                interface_log(format!("Refreshment attempt cleared {}", 0));
+                                interface_log("Refreshment attempt cleared 0".into());
                                 quiesce_drain_and_close_accounting_session(
                                     &refreshment_wings,
                                     &refreshment_swarm,
@@ -1863,7 +1863,14 @@ impl Weeb3 {
             while let Ok(incoming_request) = self.range_port.1.recv().await {
                 for request in drain_ready(Some(incoming_request), &self.range_port.1) {
                     let chunk_retrieve_chan = chunk_retrieve_chan_outgoing.clone();
-                    let range_permit = range_sem.acquire_arc().await;
+                    let Some(range_permit) = retrieval_conventions::acquire_retrieve_permit(
+                        &range_sem,
+                        request.admission.as_ref(),
+                    )
+                    .await
+                    else {
+                        continue;
+                    };
 
                     spawn_local(async move {
                         // Closing admission never cancels dispatched accounting work.
@@ -1873,16 +1880,26 @@ impl Weeb3 {
                             start,
                             end_inclusive,
                             cancel,
+                            admission,
                             chan,
                         } = request;
-                        let data = bzz_stream::acquire_resolved_range_cancellable(
+                        let retrieve = bzz_stream::acquire_resolved_range_cancellable(
                             metadata,
                             start,
                             end_inclusive,
                             &chunk_retrieve_chan,
                             cancel,
-                        )
-                        .await;
+                        );
+                        let data = if let Some(admission) = admission {
+                            let closed = admission.wait_closed();
+                            futures::pin_mut!(retrieve, closed);
+                            match select(closed, retrieve).await {
+                                Either::Left(_) => None,
+                                Either::Right((data, _)) => data,
+                            }
+                        } else {
+                            retrieve.await
+                        };
                         let _ = chan.try_send(data);
                     });
                 }
@@ -2356,47 +2373,7 @@ impl Weeb3 {
         start: u64,
         end_inclusive: u64,
     ) -> Option<(Vec<u8>, BzzMetadata)> {
-        let (chan_out, chan_in) = mpsc::bounded::<Option<(Vec<u8>, BzzMetadata)>>(1);
-        self.range_port
-            .0
-            .try_send(BzzRangeRequest {
-                metadata,
-                start,
-                end_inclusive,
-                cancel: None,
-                chan: chan_out,
-            })
-            .ok()?;
-
-        chan_in.recv().await.unwrap_or(None)
-    }
-
-    pub(crate) async fn acquire_resolved_stream_range(
-        &self,
-        metadata: BzzMetadata,
-        start: u64,
-        end_inclusive: u64,
-        stream_key: String,
-        stream_generation: u64,
-    ) -> Option<(Vec<u8>, BzzMetadata)> {
-        let (chan_out, chan_in) = mpsc::bounded::<Option<(Vec<u8>, BzzMetadata)>>(1);
-        // Superseded ranges stop admission without cancelling dispatched work.
-        let cancel = self
-            .retrieve_cancel_registry
-            .register(stream_key, stream_generation)
-            .await;
-
-        self.range_port
-            .0
-            .try_send(BzzRangeRequest {
-                metadata,
-                start,
-                end_inclusive,
-                cancel,
-                chan: chan_out,
-            })
-            .ok()?;
-
-        chan_in.recv().await.unwrap_or(None)
+        self.request_resolved_range(metadata, start, end_inclusive, None, None)
+            .await
     }
 }

@@ -308,7 +308,7 @@ pub fn encoded_reference_payload_len(
 pub type SplitReferences = (Vec<Bytes>, Vec<Bytes>);
 
 pub fn split_references(
-    payload: &[u8],
+    payload: Bytes,
     span: u64,
     level: RedundancyLevel,
     encrypted: bool,
@@ -325,7 +325,6 @@ pub fn split_references(
         return None;
     }
 
-    let payload = Bytes::copy_from_slice(payload);
     let data = payload[..data_bytes]
         .chunks_exact(data_reference_size)
         .map(|reference| payload.slice_ref(reference))

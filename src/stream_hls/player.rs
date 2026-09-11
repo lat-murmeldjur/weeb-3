@@ -102,7 +102,8 @@ struct Player {
     initial_source: Option<String>,
     quality: Option<QualityControl>,
     media: HtmlMediaElement,
-    callback: Closure<dyn FnMut(JsValue, JsValue)>,
+    callback: Closure<dyn Fn(JsValue, JsValue)>,
+    xhr_setup: Closure<dyn Fn(JsValue, String) -> Result<(), JsValue>>,
     lifecycle: Closure<dyn FnMut(Event)>,
     plan: HlsStartupPlan,
     restore_autoplay: bool,
@@ -294,6 +295,13 @@ pub(super) async fn play_hls(
         return play_native(id, media, &source, plan, restore_autoplay, intent);
     };
     let hls = opening.hls.as_ref().unwrap().clone();
+    let xhr_setup = Closure::new(move |xhr: JsValue, url: String| {
+        open_codec_request(id, &xhr, &url)
+    });
+    let config = js_property(hls.as_ref(), "config").ok_or("HLS configuration is unavailable")?;
+    Reflect::set(&config, &JsValue::from_str("xhrSetup"), xhr_setup.as_ref())?
+        .then_some(())
+        .ok_or("HLS request setup could not be installed")?;
     let callback = Closure::new(move |event: JsValue, data: JsValue| {
         handle_event(id, event.as_string().as_deref().unwrap_or_default(), &data);
     });
@@ -329,6 +337,7 @@ pub(super) async fn play_hls(
             quality: None,
             media: media.clone(),
             callback,
+            xhr_setup,
             lifecycle,
             restore_autoplay,
             intent,
@@ -460,7 +469,7 @@ fn remove_media_listeners(media: &HtmlMediaElement, listener: &Closure<dyn FnMut
     }
 }
 
-fn remove_hls_events(hls: &Hls, callback: &Closure<dyn FnMut(JsValue, JsValue)>) {
+fn remove_hls_events(hls: &Hls, callback: &Closure<dyn Fn(JsValue, JsValue)>) {
     for event in HLS_EVENTS {
         let _ = hls.off(event, callback.as_ref().unchecked_ref());
     }
@@ -688,12 +697,6 @@ fn handle_event(id: u64, event: &str, data: &JsValue) {
                         Err(error) => return Action::HardRestart(js_error_message(&error)),
                     }
                 }
-                if player.codec_bootstrap_pending
-                    && level_details(&player.hls).is_some()
-                    && let Err(error) = codec_fragment_url(&player.hls, true)
-                {
-                    return Action::HardRestart(js_error_message(&error));
-                }
                 if let Some(position) = player.reload_position.take() {
                     set_state(&player.media, "recovering", "Resuming playback...");
                     player.media.set_current_time(position);
@@ -732,9 +735,6 @@ fn handle_event(id: u64, event: &str, data: &JsValue) {
                         Some(true) => {}
                     }
                 }
-                if let Err(error) = codec_fragment_url(&player.hls, false) {
-                    return Action::HardRestart(js_error_message(&error));
-                }
                 player.codec_bootstrap_pending = false;
                 resume_bootstrap = Some(player.hls.clone());
                 if let Some(position) = finish_buffering(player) {
@@ -748,11 +748,6 @@ fn handle_event(id: u64, event: &str, data: &JsValue) {
                 }
             }
             "hlsLevelUpdated" if !player.ready => {
-                if player.codec_bootstrap_pending
-                    && let Err(error) = codec_fragment_url(&player.hls, true)
-                {
-                    return Action::HardRestart(js_error_message(&error));
-                }
                 if !player.initial_live {
                     return Action::None;
                 }
@@ -897,11 +892,11 @@ fn apply_action(id: u64, action: Action) {
         }
         Action::ReloadSource(hls, source) => {
             let result = hls.stop_load().and_then(|_| hls.load_source(&source));
-            finish_hls_action(id, &hls, "HLS source reload failed", result);
+            finish_media_reset(id, &hls, "HLS source reload failed", result);
         }
         Action::RecoverMedia(hls) => {
             let result = hls.recover_media_error();
-            finish_hls_action(id, &hls, "HLS media recovery failed", result);
+            finish_media_reset(id, &hls, "HLS media recovery failed", result);
         }
         Action::ResolveRemoteTail {
             sequence,
@@ -972,6 +967,27 @@ fn resolve_remote_tail_failure(
     });
 }
 
+fn finish_media_reset(id: u64, hls: &Hls, context: &str, result: Result<(), JsValue>) {
+    if result.is_ok() {
+        let media = ACTIVE.with(|active| {
+            active
+                .borrow()
+                .as_ref()
+                .filter(|player| {
+                    player.id == id
+                        && Object::is(player.hls.as_ref(), hls.as_ref())
+                        && player.intent == PlaybackIntent::Play
+                })
+                .map(|player| player.media.clone())
+        });
+        if let Some(media) = media {
+            // Resetting MSE queues a native pause; keep the user's play intent.
+            resume_playback(media);
+        }
+    }
+    finish_hls_action(id, hls, context, result);
+}
+
 fn finish_hls_action(id: u64, hls: &Hls, context: &str, result: Result<(), JsValue>) {
     let Err(error) = result else { return };
     if is_current_hls(id, hls) {
@@ -1023,6 +1039,7 @@ fn hard_restart(id: u64, message: String) {
             HlsStart::Beginning
         };
         let config = hls_config(start);
+        set(&config, "xhrSetup", player.xhr_setup.as_ref().clone());
         if (player.live || player.codec_recovery.is_some())
             && let Err(error) = fragment_loader(&player.hls_class, &config)
         {
@@ -1272,87 +1289,34 @@ fn consumed_playlist_finalized(hls: &Hls) -> Option<bool> {
     (integer_property(&details, "startSN")? == 0).then_some(finalized)
 }
 
-fn codec_fragment_url(hls: &Hls, bootstrap: bool) -> Result<(), JsValue> {
-    let details = level_details(hls).ok_or("HLS codec playlist is unavailable")?;
-    let fragment = js_property(&details, "fragments")
-        .and_then(|fragments| {
-            Array::from(&fragments)
-                .iter()
-                .find(|fragment| js_bool(fragment, "gap") != Some(true))
-        })
-        .ok_or("HLS codec fragment is unavailable")?;
-    let url = js_string(&fragment, "url").ok_or("HLS codec URL is unavailable")?;
-    let url = web_sys::Url::new(&url)?;
+fn open_codec_request(id: u64, xhr: &JsValue, request_url: &str) -> Result<(), JsValue> {
+    let bootstrap = ACTIVE.with(|active| {
+        let active = active.borrow();
+        let Some(player) = active
+            .as_ref()
+            .filter(|player| player.id == id && player.codec_bootstrap_pending)
+        else {
+            return false;
+        };
+        level_details(&player.hls)
+            .and_then(|details| js_property(&details, "fragments"))
+            .and_then(|fragments| {
+                Array::from(&fragments)
+                    .iter()
+                    .find(|fragment| js_bool(fragment, "gap") != Some(true))
+            })
+            .and_then(|fragment| js_string(&fragment, "url"))
+            .is_some_and(|url| url == request_url)
+    });
     if bootstrap {
+        // Mark the transport request without changing the playlist's identity.
+        let url = web_sys::Url::new(request_url)?;
         url.search_params().set("bootstrap", "1");
-    } else {
-        restore_codec_timeline(&details, &fragment)?;
-        url.search_params().delete("bootstrap");
-    }
-    Reflect::set(
-        &fragment,
-        &JsValue::from_str("url"),
-        &JsValue::from_str(&url.href()),
-    )?
-    .then_some(())
-    .ok_or_else(|| "HLS codec URL could not be changed".into())
-}
-
-fn restore_codec_timeline(details: &JsValue, codec: &JsValue) -> Result<(), JsValue> {
-    if integer_property(details, "startSN") != Some(0) {
-        return Err("HLS codec timeline has no origin".into());
-    }
-    let duration = fragment_declared_duration(codec)?;
-    let parsed = number_property(codec, "endPTS")
-        .zip(number_property(codec, "startPTS"))
-        .map(|(end, start)| end - start)
-        .ok_or("HLS codec timing is unavailable")?;
-    if parsed + BUFFER_EPSILON_SECONDS >= duration {
-        return Ok(());
-    }
-    let fragments = js_property(details, "fragments").ok_or("HLS fragments are unavailable")?;
-    let offset = number_property(details, "appliedTimelineOffset").unwrap_or_default();
-    for name in [
-        "startPTS",
-        "endPTS",
-        "startDTS",
-        "endDTS",
-        "minEndPTS",
-        "maxStartPTS",
-        "deltaPTS",
-    ] {
-        Reflect::set(codec, &JsValue::from_str(name), &JsValue::UNDEFINED)?;
-    }
-    // The codec response contains only a prefix. Its duration must not shift
-    // unparsed segments, or be reused as timing evidence on a playlist refresh.
-    for fragment in Array::from(&fragments).iter() {
-        if number_property(&fragment, "startPTS").is_some() {
-            break;
-        }
-        let start = number_property(&fragment, "playlistOffset")
-            .ok_or("HLS fragment offset is unavailable")?
-            + offset;
-        let duration = fragment_declared_duration(&fragment)?;
-        for (method, value) in [("setStart", start), ("setDuration", duration)] {
-            js_function(&fragment, method)
-                .ok_or("HLS fragment timing method is unavailable")?
-                .call1(&fragment, &JsValue::from_f64(value))?;
-        }
+        js_function(xhr, "open")
+            .ok_or("HLS request could not be opened")?
+            .call3(xhr, &"GET".into(), &url.href().into(), &JsValue::TRUE)?;
     }
     Ok(())
-}
-
-fn fragment_declared_duration(fragment: &JsValue) -> Result<f64, JsValue> {
-    js_property(fragment, "tagList")
-        .and_then(|tags| {
-            Array::from(&tags).iter().find_map(|tag| {
-                let tag = Array::from(&tag);
-                (tag.get(0).as_string().as_deref() == Some("INF"))
-                    .then(|| tag.get(1).as_string()?.parse::<f64>().ok())?
-            })
-        })
-        .filter(|duration| duration.is_finite() && *duration > 0.0)
-        .ok_or_else(|| "HLS fragment duration is unavailable".into())
 }
 
 fn player_fragment_loader(player: &Player) -> Result<(), JsValue> {

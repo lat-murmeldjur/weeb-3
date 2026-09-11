@@ -885,7 +885,7 @@ mod connection {
         assert!(instruction.contains("interface_log_to("));
         for marker in [
             "Applied refreshment {}",
-            "Refreshment attempt cleared {}",
+            "Refreshment attempt cleared 0",
             "Surplus balance increased for peer {} by {} to {}",
         ] {
             assert!(
@@ -1101,9 +1101,9 @@ mod connection {
         let handlers = include_str!("../src/handlers.rs");
         assert!(handlers.contains("const EMPTY_HEADERS_FRAME: &[u8] = &[0];"));
         let retrieval = handlers
-            .split("async fn retrieval_exchange(")
+            .split("pub async fn retrieve_handler(")
             .nth(1)
-            .and_then(|source| source.split("pub async fn connection_handler(").next())
+            .and_then(|source| source.split("pub async fn pushsync_handler(").next())
             .expect("retrieval protocol handler");
 
         assert_eq!(
@@ -1578,7 +1578,7 @@ mod rolling_erasure_tail {
             .nth(1)
             .and_then(|source| source.split("fn chunk_address_parts(").next())
             .expect("physical retrieve attempt");
-        assert!(physical_attempt.contains("retrieve_handler(peer, caddr.clone(), control, session)"));
+        assert!(physical_attempt.contains("retrieve_handler(peer, &request, control, session)"));
         assert!(!physical_attempt.contains("spawn_local"));
         assert!(
             physical_attempt.find("settle_retrieve_attempt(").unwrap()

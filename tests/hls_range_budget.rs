@@ -23,58 +23,43 @@ fn ordinary_media_keeps_its_existing_range_retry_policy() {
 }
 
 #[test]
-fn whole_hls_bodies_are_singleflight_and_share_the_bounded_range_budget() {
+fn complete_hls_bodies_use_shared_ranges_and_respect_cache_epoch_and_budget() {
     assert!(HLS_RUNTIME.contains("const HLS_BODY_CACHE_MAX_BYTES: u64 = 32 * 1024 * 1024;"));
-    assert!(HLS_RUNTIME.contains("const HLS_BODY_MAX_BYTES: u64 = 96 * 1024 * 1024;"));
+    assert!(HLS_CORE.contains("const HLS_BODY_MAX_BYTES: u64 = 96 * 1024 * 1024;"));
+    assert!(STREAM.contains("pending_ranges: SingleflightRegistry<"));
+
+    let load = section(HLS_RUNTIME, "async fn hls_body(", "async fn foreground_hls_body(");
+    assert!(load.contains("root.span == 0"));
+    assert!(load.contains("root.span > HLS_BODY_MAX_BYTES"));
+    assert!(load.contains("hls_range(&client, &reference, root.span, 0, end, generation, &|| {"));
+    assert!(load.contains("generation.is_none_or(|id| body_is_current(id, &reference))"));
+    assert!(HLS_RUNTIME.contains("feed_is_current(id) && result_view_request_is_current(view_generation)"));
+    assert!(load.find("hls_range(").unwrap() < load.find("finish_body(reference, epoch, body)").unwrap());
 
     let cache = section(HLS_RUNTIME, "struct BodyCache {", "struct FeedSession");
-    assert!(cache.contains("bodies: HashMap<String, Bytes>"));
-    assert!(cache.contains("body_order: VecDeque<String>"));
-    assert!(cache.contains("pending_bodies: HashMap<String, PendingBody>"));
-    assert!(!cache.contains("generation: Option<u64>"));
-    assert!(cache.contains("waiters: Vec<mpsc::Sender<Option<Bytes>>>"));
-    assert!(cache.contains("enum BodyLoad"));
-
-    let admission = section(cache, "fn body_load(", "fn body_cached(");
-    assert!(admission.contains("BodyLoad::Cached(body.clone())"));
-    assert!(admission.contains("self.pending_bodies.get_mut(reference)"));
-    assert!(admission.contains("pending.waiters.push(sender)"));
-    assert!(admission.contains("mpsc::bounded(1)"));
-    assert!(admission.contains("BodyLoad::Wait(receiver)"));
-    assert!(admission.contains("BodyLoad::Lead"));
-
     let settlement = section(cache, "fn finish_body(", "fn trim(");
-    assert!(settlement.contains(".pending_bodies"));
-    assert!(settlement.contains(".remove(&reference)"));
-    assert!(settlement.contains("self.bodies.insert(reference.clone(), body.clone())"));
+    let insert = settlement.find("self.bodies.insert(").unwrap();
+    assert!(settlement.find("if epoch != self.epoch").unwrap() < insert);
+    assert!(settlement.find("if let Some(body) = &body").unwrap() < insert);
+    assert!(settlement.contains("body.len() as u64 <= media_cache_max_bytes().min(HLS_BODY_CACHE_MAX_BYTES)"));
+    assert!(settlement.contains("!self.bodies.contains_key(&reference)"));
     assert!(settlement.contains("self.trim()"));
-    assert!(settlement.contains("waiter.try_send(delivered.clone())"));
+    assert!(settlement.find("forget_completed_reference_ranges(&reference)").unwrap() < insert);
 
     let trim = section(cache, "fn trim(", "fn clear(");
     assert!(trim.contains(".min(HLS_BODY_CACHE_MAX_BYTES)"));
     assert!(trim.contains("self.body_order.pop_front()"));
     assert!(trim.contains("set_auxiliary_media_cache_bytes(self.bytes)"));
-
-    let load = section(HLS_RUNTIME, "async fn hls_body(", "async fn foreground_hls_body(");
-    assert!(load.contains("BodyLoad::Cached(body)"));
-    assert!(load.contains("hls_range(&client, &reference, root.span, 0, end, &|| {"));
-    assert!(load.contains("generation.is_none_or(|id| body_is_current(id, &reference))"));
-    assert!(!load.contains("Arc::from(body)"));
-
-    let range = section(HLS_RUNTIME, "async fn hls_range(", "async fn hls_body(");
-    assert!(
-        range.contains(
-            "read_cached_hls_range(client, reference, span, start, end, &current)"
-        )
-    );
+    assert!(cache.contains("self.epoch = self.epoch.wrapping_add(1)"));
     assert!(cache.contains("body.slice(start..end)"));
-    assert!(!range.contains("Arc::from"));
-    assert!(range.contains("admitted: &dyn Fn() -> bool"));
-    assert!(HLS_RUNTIME.contains("&|| feed_is_current(id)"));
-    assert!(load.contains("BodyLoad::Wait(waiter)"));
-    assert!(load.contains("BodyLoad::Lead"));
-    assert!(load.contains("root.span > HLS_BODY_MAX_BYTES"));
-    assert!(load.contains("finish_body(reference, epoch, body)"));
+
+    let window = section(STREAM, "async fn read_range_window(", "pub(crate) async fn read_cached_hls_range(");
+    let validated = window.find("if body.len() == expected_len").unwrap();
+    let remembered = window.find("cache.remember_range(").unwrap();
+    assert!(window.find("if registration.leader").unwrap() < window.find("spawn_local(async move").unwrap());
+    assert!(validated < remembered);
+    assert!(window.find("if cache.epoch == epoch").unwrap() < remembered);
+    assert!(window.contains("registration.shared.admission"));
 }
 
 #[test]
@@ -93,9 +78,7 @@ fn live_duration_window_keeps_owned_bodies_and_beginning_seek_delivery() {
     let runway = section(HLS_RUNTIME, "fn body_runway_targets(", "fn prefetch_from_reference(");
     assert!(runway.contains("seconds >= HLS_LIVE_STARTUP_BUFFER_SECONDS"));
     assert!(runway.contains("!live_segment_is_playable(active, position + offset)"));
-    assert!(runway.contains("!*complete || references.contains(reference)"));
     assert!(runway.contains("hls_body(client.clone(), reference.clone(), Some(id))"));
-    assert!(runway.find("loads.next().await").unwrap() < runway.find("body_runway_running = false").unwrap());
     assert!(runway.contains("!active.body_runway_running"));
     let cursor = section(HLS_RUNTIME, "fn prefetch_from_reference(", "fn next_feed_id(");
     assert!(cursor.contains("hls_progressive_foreground_transition"));
@@ -258,29 +241,6 @@ fn media_delivery_shares_windows_and_seeks_retain_whole_body_retries() {
 }
 
 #[test]
-fn seek_returns_the_current_body_without_a_duplicate_successor_barrier() {
-    let response = section(
-        HLS_RUNTIME,
-        "async fn fetch_hls_body_response(",
-        "fn parse_hls_range(",
-    );
-    let seek = response.find("if complete_body && root.as_ref()").unwrap();
-    let current = response[seek..].find("foreground_hls_body(").unwrap() + seek;
-    let release = response[current..]
-        .find("hls_body_response(body,")
-        .unwrap()
-        + current;
-    let ordinary_fast_path = response.find("if let Some(body) = BODY_CACHE").unwrap();
-    let progressive = response
-        .find("FetchResponse::stream(200, headers)")
-        .unwrap();
-    assert!(seek < current && current < release);
-    assert!(!response.contains("hls_body(client.clone(), successor"));
-    assert!(ordinary_fast_path < seek && release < progressive);
-    assert!(response[seek..current].contains("let Some(body) ="));
-}
-
-#[test]
 fn hls_service_streams_whole_bodies_through_exact_inclusive_ranges() {
     let response = section(
         HLS_RUNTIME,
@@ -289,7 +249,7 @@ fn hls_service_streams_whole_bodies_through_exact_inclusive_ranges() {
     );
     let parsed = response.find("parse_hls_range(range, span)").unwrap();
     let retrieved = response
-        .find("hls_range(&client, &reference, span, start, end, &|| true).await")
+        .find("hls_range(&client, &reference, span, start, end, None, &|| true).await")
         .unwrap();
     let content_range = response
         .find("let headers = hls_body_headers(")

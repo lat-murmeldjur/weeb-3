@@ -202,10 +202,7 @@ fn register_service_worker_relay(port: &MessagePort) -> Result<u64, String> {
 }
 
 fn reply_relay_error(reply: &MessagePort, message: &str) {
-    let response = Object::new();
-    set(&response, "ok", JsValue::FALSE);
-    set_number(&response, "status", 503.0);
-    set_string(&response, "error", message);
+    let response = crate::worker_runtime::error_response(503, message);
     let _ = reply.post_message(&response);
     reply.close();
 }
@@ -273,10 +270,6 @@ impl SharedRuntime {
         timeout: Duration,
     ) -> Result<Object, String> {
         self.request_inner(request, Some(timeout)).await
-    }
-
-    async fn request_unbounded(&self, request: &Object) -> Result<Object, String> {
-        self.request_inner(request, None).await
     }
 
     async fn request_inner(
@@ -458,7 +451,7 @@ impl SharedNodeClient {
                 | "acquireRange"
         );
         let response = if transfer_bearing {
-            runtime.request_unbounded(&request).await?
+            runtime.request_inner(&request, None).await?
         } else {
             let wait = if op == "connections" {
                 integer_property(&request, "waitMs").unwrap_or(0)
@@ -474,14 +467,6 @@ impl SharedNodeClient {
     }
 
     pub(crate) async fn runtime_snapshot(
-        &self,
-        seen_progress_revision: u64,
-    ) -> Option<RuntimeSnapshot> {
-        self.runtime_snapshot_options(seen_progress_revision, true, true)
-            .await
-    }
-
-    async fn runtime_snapshot_options(
         &self,
         seen_progress_revision: u64,
         include_logs: bool,
@@ -503,20 +488,14 @@ impl SharedNodeClient {
         );
         let response = runtime.request(&request, CONTROL_TIMEOUT).await.ok()?;
         require_ok(&response, "SharedWorker snapshot").ok()?;
-        let logs = if include_logs {
+        let mut logs = Vec::new();
+        if include_logs {
             let log_sequence = integer_property(&response, "logSequence")?;
             self.seen_log_sequence.set(log_sequence);
             if let Some(values) = array_property(&response, "logs") {
-                values
-                    .iter()
-                    .filter_map(|value| value.as_string())
-                    .collect()
-            } else {
-                Vec::new()
+                logs.extend(values.iter().filter_map(|value| value.as_string()));
             }
-        } else {
-            Vec::new()
-        };
+        }
         let progress =
             if include_progress && bool_property(&response, "progressChanged") == Some(true) {
                 let revision = integer_property(&response, "progressRevision")?;
@@ -549,7 +528,7 @@ impl SharedNodeClient {
     }
 
     pub(crate) async fn get_current_logs(&self) -> Vec<String> {
-        self.runtime_snapshot_options(0, true, false)
+        self.runtime_snapshot(0, true, false)
             .await
             .map(|snapshot| snapshot.logs)
             .unwrap_or_default()
@@ -559,7 +538,7 @@ impl SharedNodeClient {
         &self,
         seen_revision: u64,
     ) -> Option<(u64, Vec<ProgressRow>)> {
-        self.runtime_snapshot_options(seen_revision, false, true)
+        self.runtime_snapshot(seen_revision, false, true)
             .await?
             .progress
     }

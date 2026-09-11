@@ -126,7 +126,7 @@ impl Weeb3WorkerRuntime {
         }
     }
 
-    pub(crate) async fn request_network(&self, message: &Object) -> Result<u64, Object> {
+    pub(crate) fn request_network(&self, message: &Object) -> Result<u64, Object> {
         let network_id = required_network_id(message)
             .ok_or_else(|| error_response(400, "weeb-3 request requires a supported networkId"))?;
         if self.configured_network_id.get() != Some(network_id)
@@ -139,7 +139,7 @@ impl Weeb3WorkerRuntime {
     }
 
     async fn node_response(&self, message: &Object) -> Result<Object, Object> {
-        let network_id = self.request_network(message).await?;
+        let network_id = self.request_network(message)?;
         let op = string_property(message, "op")
             .ok_or_else(|| error_response(400, "node request requires op"))?;
 
@@ -375,7 +375,7 @@ impl Weeb3WorkerRuntime {
     }
 
     async fn upload_response(&self, message: &Object) -> Result<Object, Object> {
-        self.request_network(message).await?;
+        self.request_network(message)?;
         let file = property(message, "file")
             .dyn_into::<File>()
             .map_err(|_| error_response(400, "upload requires File"))?;
@@ -455,14 +455,14 @@ impl Weeb3WorkerRuntime {
     }
 
     async fn fetch_response(&self, message: &Object) -> Result<Object, Object> {
-        self.request_network(message).await?;
+        self.request_network(message)?;
         crate::stream::service_worker_message_response(message, self.inner.clone())
             .await
             .ok_or_else(|| error_response(400, "unsupported service-worker request"))
     }
 
     async fn runtime_snapshot_response(&self, message: &Object) -> Result<Object, Object> {
-        self.request_network(message).await?;
+        self.request_network(message)?;
         let seen_logs = integer_property(message, "seenLogSequence").unwrap_or(0);
         let seen_progress = integer_property(message, "seenProgressRevision").unwrap_or(0);
         let include_logs = bool_property(message, "includeLogs").unwrap_or(true);

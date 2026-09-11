@@ -648,7 +648,12 @@ pub(crate) async fn mount_interface_with_generation(
             continue;
         }
 
-        let Some(snapshot) = snapshot_node.runtime_snapshot(last_progress_revision).await else {
+        let Some(snapshot) = snapshot_node.runtime_snapshot(
+            last_progress_revision,
+            document.get_element_by_id("logsPanel")
+                .is_none_or(|panel| !panel.has_attribute("hidden")),
+            true,
+        ).await else {
             async_std::task::sleep(Duration::from_millis(160)).await;
             continue;
         };

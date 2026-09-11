@@ -50,9 +50,7 @@ pub(crate) fn array_property(value: &JsValue, name: &str) -> Option<Array> {
 }
 
 pub(crate) fn bytes_to_js(bytes: &[u8]) -> Uint8Array {
-    let value = Uint8Array::new_with_length(bytes.len() as u32);
-    value.copy_from(bytes);
-    value
+    Uint8Array::from(bytes)
 }
 
 pub(crate) fn bytes_from_js(value: &JsValue, name: &str) -> Option<Vec<u8>> {

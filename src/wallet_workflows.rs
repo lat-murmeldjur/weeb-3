@@ -76,7 +76,7 @@ pub(crate) async fn inspect_batch(
         Some(if day_price.is_zero() {
             U256::zero()
         } else {
-            get_batch_validity(&secure.batch_id).await / day_price
+            get_batch_validity(&postage, &secure.batch_id).await / day_price
         })
     } else {
         None

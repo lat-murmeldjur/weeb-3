@@ -91,6 +91,37 @@ impl Weeb3 {
             .await
             .snapshot_if_changed(seen_revision)
     }
+
+    pub(crate) async fn request_resolved_range(
+        &self,
+        metadata: BzzMetadata,
+        start: u64,
+        end_inclusive: u64,
+        stream: Option<(String, u64)>,
+        admission: Option<retrieval_conventions::RetrieveAdmission>,
+    ) -> Option<(Vec<u8>, BzzMetadata)> {
+        let cancel = match stream {
+            Some((key, generation)) => {
+                self.retrieve_cancel_registry
+                    .register(key, generation)
+                    .await
+            }
+            None => None,
+        };
+        let (chan, result) = mpsc::bounded(1);
+        self.range_port
+            .0
+            .try_send(BzzRangeRequest {
+                metadata,
+                start,
+                end_inclusive,
+                cancel,
+                admission,
+                chan,
+            })
+            .ok()?;
+        result.recv().await.unwrap_or(None)
+    }
 }
 
 pub(crate) fn js_error_message(error: &JsValue) -> String {
@@ -257,5 +288,6 @@ pub(crate) struct BzzRangeRequest {
     pub(crate) start: u64,
     pub(crate) end_inclusive: u64,
     pub(crate) cancel: Option<RetrieveCancelToken>,
+    pub(crate) admission: Option<retrieval_conventions::RetrieveAdmission>,
     pub(crate) chan: mpsc::Sender<Option<(Vec<u8>, BzzMetadata)>>,
 }

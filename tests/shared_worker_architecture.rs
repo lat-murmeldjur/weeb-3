@@ -392,10 +392,9 @@ fn network_switches_preserve_dispatched_transfer_accounting() {
     assert!(!SHARED_RUNTIME.contains("NODE_OPERATION_TIMEOUT"));
     let request = section(
         SHARED_RUNTIME,
-        "async fn request_unbounded(&self, request: &Object)",
+        "async fn request_inner(",
         "async fn start(&self, network_id: u64)",
     );
-    assert!(request.contains("self.request_inner(request, None).await"));
     assert!(request.contains("None => Ok(receiver.recv().await)"));
     let dispatch = section(
         SHARED_RUNTIME,
@@ -409,7 +408,7 @@ fn network_switches_preserve_dispatched_transfer_accounting() {
         dispatch,
         &[
             "let transfer_bearing = matches!",
-            "runtime.request_unbounded(&request)",
+            "runtime.request_inner(&request, None)",
         ],
     );
 }
@@ -461,7 +460,7 @@ fn log_polling_is_combined_bounded_and_per_client() {
         "pub(crate) async fn get_progress_snapshot(",
         "pub(crate) async fn toggle_transfer_pause(",
     );
-    assert!(progress.contains("runtime_snapshot_options(seen_revision, false, true)"));
+    assert!(progress.contains("runtime_snapshot(seen_revision, false, true)"));
 }
 
 #[test]

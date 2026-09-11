@@ -480,7 +480,7 @@ mod hls_minimal {
             "HardRestart(String)",
             "const MAX_HARD_RESTARTS: u8 = 2",
             "hard_restarts: u8",
-            "callback: Closure<dyn FnMut(JsValue, JsValue)>",
+            "callback: Closure<dyn Fn(JsValue, JsValue)>",
             "hls_class: JsValue",
             "player.plan.play_position",
             "Action::RecoverNetwork(hls, position)",
@@ -523,56 +523,15 @@ mod hls_minimal {
     }
 
     #[test]
-    fn rust_body_prefetch_singleflights_the_live_runway() {
+    fn rust_body_prefetch_uses_the_shared_range_owner_and_retires_with_the_feed() {
         const RUNTIME: &str = include_str!("../src/stream_hls/runtime.rs");
-        assert!(
-            RUNTIME.contains("const BODY_PREFETCH_HORIZON: usize = HLS_LIVE_BODY_RUNWAY_SEGMENTS;")
-        );
-        assert!(RUNTIME.contains("pending_bodies: HashMap<String, PendingBody>"));
-        assert!(RUNTIME.contains("generation: Option<u64>"));
-
-        let ownership = RUNTIME
-            .split_once("fn body_load(")
-            .unwrap()
-            .1
-            .split_once("\n    fn body_cached(")
-            .unwrap()
-            .0;
-        assert!(ownership.contains("BodyLoad::Cached(body.clone())"));
-        assert!(ownership.contains("pending.waiters.push(sender)"));
-        assert!(ownership.contains("BodyLoad::Wait(receiver)"));
-        assert!(ownership.contains("BodyLoad::Lead(self.epoch)"));
-
-        let body = RUNTIME
-            .split_once("async fn hls_body(")
-            .unwrap()
-            .1
-            .split_once("\n}\n\nasync fn foreground_hls_body(")
-            .unwrap()
-            .0;
-        assert!(body.contains("BodyLoad::Wait(waiter) => return waiter.recv().await"));
-        assert!(body.contains("BodyLoad::Lead(epoch) => epoch"));
-        assert!(body.contains("generation.is_none_or(|id| body_is_current(id, &reference))"));
-        assert!(body.contains("finish_body(reference, epoch, body)"));
-
-        let range = RUNTIME
-            .split_once("async fn hls_range(")
-            .unwrap()
-            .1
-            .split_once("\n}\n\nasync fn hls_body(")
-            .unwrap()
-            .0;
-        assert!(!range.contains("pending_body(&reference)"));
+        let range = crate::source::between(RUNTIME, "async fn hls_range(", "fn body_is_current(");
         assert!(range.contains("read_cached_hls_range("));
         assert!(range.contains("cache.borrow().get(reference, start, end)"));
+        assert!(range.find("feed.changed.listen()").unwrap() < range.find("if !current()").unwrap());
+        assert!(range.contains("future::select(read.as_mut(), changed).await"));
 
-        let install = RUNTIME
-            .split_once("fn install_snapshot(")
-            .unwrap()
-            .1
-            .split_once("async fn discover_beginning(")
-            .unwrap()
-            .0;
+        let install = crate::source::between(RUNTIME, "fn install_snapshot(", "async fn discover_beginning(");
         assert!(install.find("active.playlist").unwrap() < install.find("spawn_body_runway(id)").unwrap());
         assert!(!RUNTIME.contains("prefetch_live_startup"));
     }
@@ -737,7 +696,7 @@ mod hls_minimal {
         assert!(reload.contains("hls.stop_load()"));
         assert!(reload.contains("hls.load_source(&source)"));
         assert!(!reload.contains("media.set_current_time(position)"));
-        assert!(reload.contains("finish_hls_action("));
+        assert!(reload.contains("finish_media_reset("));
         assert!(!reload.contains("start_load_at"));
 
         let lifecycle = PLAYER
@@ -793,7 +752,7 @@ mod hls_minimal {
         assert!(!PLAYER.contains("lock_live_plan().await"));
         let install = &RUNTIME[RUNTIME.find("fn install_snapshot(").unwrap()
             ..RUNTIME.find("async fn discover_beginning(").unwrap()];
-        assert!(install.contains("!anchor.2 || *first == position"));
+        assert!(install.contains("!anchor.2 || playlist.finalized || *first == position"));
         assert!(install.contains("active.live_startup_plan = Some(plan.clone())"));
         assert!(!PLAYER.contains("same_live_presentation"));
     }
@@ -839,8 +798,6 @@ mod hls_minimal {
         let runway = RUNTIME.split_once("fn body_runway_targets(").unwrap().1
             .split_once("fn prefetch_from_reference(").unwrap().0;
         assert!(runway.contains(".take(BODY_PREFETCH_HORIZON)"));
-        assert!(RUNTIME.contains("const HLS_BODY_PREFETCH_MAX_PARALLEL: usize = 2;"));
-        assert!(runway.contains("if loads.len() == HLS_BODY_PREFETCH_MAX_PARALLEL"));
 
         let response = RUNTIME
             .split_once("async fn fetch_hls_body_response(")
@@ -849,7 +806,7 @@ mod hls_minimal {
             .split_once("\n}\n\nfn parse_hls_range(")
             .unwrap()
             .0;
-        assert!(response.contains("method == \"GET\" && range.is_none() && !codec_bootstrap"));
+        assert!(response.contains("method == \"GET\" && range.is_none()"));
         assert!(response.contains("prefetch_from_reference(&reference, cached)"));
         assert!(response.contains("if complete_body && root.as_ref()"));
         assert!(
@@ -1606,7 +1563,11 @@ mod stream_reader_concurrency {
             "fn spawn_prefetch_media_stages(",
         );
         assert!(window.contains("RangeReadError::waiter_timeout(error)"));
-        assert!(window.contains("Keep the shared slot while its detached transport drains."));
+        let timeout = window.split_once("Err(_) => {").unwrap().1;
+        assert!(timeout.find("waiter.retain_owner()").unwrap() < timeout.find("RangeReadError::waiter_timeout(error)").unwrap());
+        assert!(!timeout.contains("finish_pending_range("));
+        let retain = source_section("impl RangeWaiterGuard {", "impl Drop for RangeWaiterGuard {");
+        assert!(retain.contains("shared.admission = None"));
 
         let response = source_section(
             "async fn fetch_bzz_response(",
@@ -1675,7 +1636,7 @@ mod stream_reader_concurrency {
             "async fn read_range_window(",
             "fn spawn_prefetch_media_stages(",
         );
-        assert!(window.contains("range_load_role(&cache_key, &pending_key, generation)"));
+        assert!(window.contains("range_load_role(&cache_key, pending_key, generation, cancel_when_unused)"));
         let moved_key = window.find("let leader_cache_key = cache_key;").unwrap();
         let remembered = window.find("remember_range(").unwrap();
         let completed = window.find("finish_pending_range(").unwrap();

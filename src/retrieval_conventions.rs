@@ -498,6 +498,29 @@ where
     K: Clone + Eq + Hash,
     A: Clone,
 {
+    pub(crate) fn len(&self) -> usize {
+        self.flights.len()
+    }
+
+    pub(crate) fn inspect_waiters(
+        &mut self,
+        key: &K,
+        mut keep: impl FnMut(&W) -> bool,
+    ) -> Option<(u64, A, usize)> {
+        let flight = self.flights.get_mut(key)?;
+        flight.waiters.retain(|(_, waiter)| keep(waiter));
+        Some((
+            flight.flight_id,
+            flight.shared.clone(),
+            flight.waiters.len(),
+        ))
+    }
+
+    pub(crate) fn shared_mut(&mut self, key: &K, flight_id: u64) -> Option<&mut A> {
+        let flight = self.flights.get_mut(key)?;
+        (flight.flight_id == flight_id).then_some(&mut flight.shared)
+    }
+
     pub(crate) fn register(
         &mut self,
         key: K,

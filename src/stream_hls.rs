@@ -2,12 +2,13 @@
 
 use std::fmt::Write;
 
-use crate::stream_conventions::HlsStart;
+use crate::stream_conventions::{HlsStart, is_swarm_reference_hex as is_hex_reference};
 
 pub(crate) const HLS_BEGINNING_STARTUP_BUFFER_SECONDS: f64 = 3.0;
 pub(crate) const HLS_LIVE_STARTUP_BUFFER_SECONDS: f64 = 8.0;
 pub(crate) const HLS_LIVE_EDGE_SEGMENTS: usize = 3;
 pub(crate) const HLS_LIVE_BODY_RUNWAY_SEGMENTS: usize = 4;
+pub(crate) const HLS_BODY_MAX_BYTES: u64 = 96 * 1024 * 1024;
 pub(crate) const MAX_STREAM_FEED_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
 
 const HLS_HEADER: &str = "#EXTM3U";
@@ -831,10 +832,6 @@ fn swarm_reference(uri: &str) -> Option<&str> {
     };
     let reference = path.rsplit('/').next()?;
     is_hex_reference(reference).then_some(reference)
-}
-
-fn is_hex_reference(value: &str) -> bool {
-    matches!(value.len(), 64 | 128) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 #[cfg(target_arch = "wasm32")]

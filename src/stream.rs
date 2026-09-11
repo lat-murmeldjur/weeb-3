@@ -19,7 +19,8 @@ use crate::{
     interface::service_worker_controls_bzz_requests,
     mpsc,
     retrieval_conventions::{
-        PendingGenerationRelation, next_nonzero_generation, pending_generation_relation,
+        PendingGenerationRelation, RetrieveAdmission, SingleflightRegistration,
+        SingleflightRegistry, next_nonzero_generation, pending_generation_relation,
     },
     shared_runtime::SharedNodeClient,
     stream_conventions::{
@@ -30,6 +31,7 @@ use crate::{
         media_cache_budget_bytes, media_prefetch_ahead_limit_bytes, media_prefetch_stage_targets,
         parse_single_range, window_key,
     },
+    stream_hls::HLS_BODY_MAX_BYTES,
     worker_protocol::{bytes_to_js, set as set_js, string_property},
 };
 
@@ -111,8 +113,7 @@ struct FetchCache {
     metadata: HashMap<String, BzzMetadata>,
     range_order: VecDeque<String>,
     ranges: HashMap<String, Bytes>,
-    pending_ranges: HashMap<String, PendingRange>,
-    next_range_load_id: u64,
+    pending_ranges: SingleflightRegistry<String, mpsc::Sender<Result<Bytes, String>>, RangeFlight>,
     range_bytes: u64,
     media_states: HashMap<String, MediaState>,
 }
@@ -154,6 +155,9 @@ impl FetchCache {
             return;
         }
         let body_len = body.len() as u64;
+        if body_len > range_cache_capacity_bytes() {
+            return;
+        }
         if let Some(old) = self.ranges.insert(key.clone(), body) {
             self.range_bytes = self.range_bytes.saturating_sub(old.len() as u64);
         }
@@ -189,69 +193,87 @@ impl FetchCache {
     fn range_load_role(
         &mut self,
         cache_key: &str,
-        pending_key: &str,
+        pending_key: String,
         generation: u64,
+        cancel_when_unused: bool,
     ) -> RangeLoadRole {
         if let Some(body) = self.range(cache_key) {
             return RangeLoadRole::Cached(body);
         }
-
-        if let Some(pending) = self.pending_ranges.get_mut(pending_key) {
-            match pending_generation_relation(pending.generation, generation) {
-                PendingGenerationRelation::Join => {
-                    pending.waiters.retain(|waiter| !waiter.is_closed());
-                    if pending.waiters.len() >= RANGE_SINGLEFLIGHT_MAX_WAITERS {
+        let mut joining = false;
+        if let Some((flight_id, shared, waiters)) = self
+            .pending_ranges
+            .inspect_waiters(&pending_key, |waiter| !waiter.is_closed())
+        {
+            match pending_generation_relation(shared.generation, generation) {
+                PendingGenerationRelation::RejectStale => {
+                    return RangeLoadRole::Reject("stale range generation".to_string());
+                }
+                PendingGenerationRelation::Join
+                    if shared
+                        .admission
+                        .as_ref()
+                        .is_none_or(RetrieveAdmission::is_open) =>
+                {
+                    if waiters >= RANGE_SINGLEFLIGHT_MAX_WAITERS {
                         return RangeLoadRole::Reject(
                             "range already has too many waiting requests".to_string(),
                         );
                     }
-                    let (sender, receiver) = mpsc::bounded(1);
-                    pending.waiters.push(sender);
-                    return RangeLoadRole::Wait(receiver);
+                    joining = true;
                 }
-                PendingGenerationRelation::RejectStale => {
-                    return RangeLoadRole::Reject("stale range generation".to_string());
+                _ => {
+                    if let Some(stale) = self.pending_ranges.take(&pending_key, flight_id) {
+                        if let Some(admission) = stale.shared.admission {
+                            admission.close();
+                        }
+                        finish_range_waiters(
+                            stale.waiters,
+                            Err("stale range generation replaced".to_string()),
+                        );
+                    }
                 }
-                PendingGenerationRelation::Replace => {}
             }
         }
-        if let Some(stale) = self.pending_ranges.remove(pending_key) {
-            stale.finish(Err("stale range generation replaced".to_string()));
-        }
-        if self.pending_ranges.len() >= RANGE_SINGLEFLIGHT_MAX_LOADS {
+        if !joining && self.pending_ranges.len() >= RANGE_SINGLEFLIGHT_MAX_LOADS {
             return RangeLoadRole::Reject("too many range loads are already pending".to_string());
         }
-
         let (sender, receiver) = mpsc::bounded(1);
-        self.next_range_load_id = next_nonzero_generation(self.next_range_load_id);
-        let load_id = self.next_range_load_id;
-        self.pending_ranges.insert(
-            pending_key.to_string(),
-            PendingRange {
+        let mut registration = self
+            .pending_ranges
+            .register(pending_key, sender, || RangeFlight {
                 generation,
-                load_id,
-                waiters: vec![sender],
-            },
-        );
-        RangeLoadRole::Lead(receiver, load_id)
+                admission: cancel_when_unused.then(RetrieveAdmission::new),
+            });
+        // Stable readers retain the original completion/cache behavior even if they leave.
+        if !cancel_when_unused {
+            if let Some(shared) = self
+                .pending_ranges
+                .shared_mut(&registration.key, registration.flight_id)
+            {
+                shared.admission = None;
+            }
+            registration.shared.admission = None;
+        }
+        RangeLoadRole::Read(receiver, registration)
     }
 
     fn finish_pending_range(
         &mut self,
-        key: &str,
+        key: &String,
         generation: u64,
         load_id: u64,
         result: Result<Bytes, String>,
     ) {
         if !self
             .pending_ranges
-            .get(key)
-            .is_some_and(|pending| pending.generation == generation && pending.load_id == load_id)
+            .shared_mut(key, load_id)
+            .is_some_and(|shared| shared.generation == generation)
         {
             return;
         }
-        if let Some(pending) = self.pending_ranges.remove(key) {
-            pending.finish(result);
+        if let Some(pending) = self.pending_ranges.take(key, load_id) {
+            finish_range_waiters(pending.waiters, result);
         }
     }
 
@@ -298,30 +320,62 @@ impl FetchCache {
     }
 }
 
-struct PendingRange {
+#[derive(Clone)]
+struct RangeFlight {
     generation: u64,
-    load_id: u64,
-    waiters: Vec<mpsc::Sender<Result<Bytes, String>>>,
+    admission: Option<RetrieveAdmission>,
 }
 
-impl PendingRange {
-    fn finish(self, result: Result<Bytes, String>) {
-        let mut waiters = self.waiters;
-        waiters.retain(|waiter| !waiter.is_closed());
-        let Some(last) = waiters.pop() else {
-            return;
-        };
-        for waiter in waiters {
-            let _ = waiter.try_send(result.clone());
+struct RangeWaiterGuard {
+    key: String,
+    flight_id: u64,
+    waiter_id: u64,
+}
+
+impl RangeWaiterGuard {
+    fn retain_owner(&self) {
+        FETCH_CACHE.with(|cache| {
+            if let Some(shared) = cache
+                .borrow_mut()
+                .pending_ranges
+                .shared_mut(&self.key, self.flight_id)
+            {
+                shared.admission = None;
+            }
+        });
+    }
+}
+
+impl Drop for RangeWaiterGuard {
+    fn drop(&mut self) {
+        let shared = FETCH_CACHE.with(|cache| {
+            cache.borrow_mut().pending_ranges.remove_waiter(
+                &self.key,
+                self.flight_id,
+                self.waiter_id,
+            )
+        });
+        if let Some(admission) = shared.and_then(|shared| shared.admission) {
+            admission.close();
         }
-        let _ = last.try_send(result);
+    }
+}
+
+fn finish_range_waiters(
+    waiters: Vec<mpsc::Sender<Result<Bytes, String>>>,
+    result: Result<Bytes, String>,
+) {
+    for waiter in waiters {
+        let _ = waiter.try_send(result.clone());
     }
 }
 
 enum RangeLoadRole {
     Cached(Bytes),
-    Wait(mpsc::Receiver<Result<Bytes, String>>),
-    Lead(mpsc::Receiver<Result<Bytes, String>>, u64),
+    Read(
+        mpsc::Receiver<Result<Bytes, String>>,
+        SingleflightRegistration<String, RangeFlight>,
+    ),
     Reject(String),
 }
 
@@ -1104,7 +1158,7 @@ async fn read_cached_range(
     let windows = if current.is_some()
         && start == 0
         && end == metadata.size - 1
-        && metadata.size <= MEDIA_STARTUP_RESPONSE_BYTES
+        && metadata.size <= HLS_BODY_MAX_BYTES
     {
         vec![(start, end)]
     } else {
@@ -1121,6 +1175,7 @@ async fn read_cached_range(
             *window_start,
             *window_end,
             generation,
+            current.is_some(),
         )
         .await?;
         if current.is_some_and(|current| !current()) {
@@ -1157,6 +1212,7 @@ async fn read_cached_range(
                         window_start,
                         window_end,
                         generation,
+                        current.is_some(),
                     )
                     .await
                 };
@@ -1195,6 +1251,7 @@ async fn read_range_window(
     start: u64,
     end: u64,
     generation: u64,
+    cancel_when_unused: bool,
 ) -> Result<Bytes, RangeReadError> {
     if metadata.size == 0 || start > end || start >= metadata.size || end >= metadata.size {
         return Err("range window lies outside the resolved resource".into());
@@ -1205,14 +1262,18 @@ async fn read_range_window(
         let mut cache = cache.borrow_mut();
         (
             cache.epoch,
-            cache.range_load_role(&cache_key, &pending_key, generation),
+            cache.range_load_role(&cache_key, pending_key, generation, cancel_when_unused),
         )
     });
-    let (receiver, leader_load_id) = match role {
+    let (receiver, registration) = match role {
         RangeLoadRole::Cached(body) => return Ok(body),
-        RangeLoadRole::Wait(receiver) => (receiver, None),
-        RangeLoadRole::Lead(receiver, load_id) => (receiver, Some(load_id)),
+        RangeLoadRole::Read(receiver, registration) => (receiver, registration),
         RangeLoadRole::Reject(error) => return Err(error.into()),
+    };
+    let waiter = RangeWaiterGuard {
+        key: registration.key.clone(),
+        flight_id: registration.flight_id,
+        waiter_id: registration.waiter_id,
     };
 
     let timeout_ms = if generation > 0 {
@@ -1220,26 +1281,23 @@ async fn read_range_window(
     } else {
         RANGE_REQUEST_TIMEOUT_MS
     };
-    if let Some(load_id) = leader_load_id {
+    if registration.leader {
+        let load_id = registration.flight_id;
         let weeb3 = weeb3.clone();
         let metadata = metadata.clone();
         let media_key = media_state_key(resource, &metadata);
         let leader_cache_key = cache_key;
-        let leader_pending_key = pending_key;
+        let leader_pending_key = registration.key;
         spawn_local(async move {
-            let result = if generation > 0 {
-                weeb3
-                    .acquire_resolved_stream_range(
-                        metadata,
-                        start,
-                        end,
-                        media_key.clone(),
-                        generation,
-                    )
-                    .await
-            } else {
-                weeb3.acquire_resolved_range(metadata, start, end).await
-            };
+            let result = weeb3
+                .request_resolved_range(
+                    metadata,
+                    start,
+                    end,
+                    (generation > 0).then(|| (media_key.clone(), generation)),
+                    registration.shared.admission,
+                )
+                .await;
             let expected_len = inclusive_range_len(start, end);
             let load_result = match (result, expected_len) {
                 (Some((body, _metadata)), Some(expected_len)) if body.len() == expected_len => {
@@ -1283,11 +1341,10 @@ async fn read_range_window(
         Ok(Ok(result)) => result.map_err(RangeReadError::terminal),
         Ok(Err(_)) => Err(RangeReadError::terminal("range load was canceled")),
         Err(_) => {
+            waiter.retain_owner();
             let error = format!("timed out retrieving range {}-{}", start, end);
-            // Keep the shared slot while its detached transport drains. This waiter
-            // closes when we return, and a retry joins the same load instead of
-            // launching duplicate chunk/accounting work. Completion still removes
-            // only the exact generation/load id, so a seek may replace it safely.
+            // A timeout retains the owner for retry; explicit retirement only closes
+            // unused admission. Completion still requires the exact generation/load id.
             Err(RangeReadError::waiter_timeout(error))
         }
     }

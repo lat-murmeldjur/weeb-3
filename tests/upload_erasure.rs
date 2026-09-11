@@ -237,7 +237,7 @@ mod bee_compatibility {
             );
 
             let (split_data, split_parity) =
-                erasure_coding::split_references(&payload, span, level, encrypted).unwrap();
+                erasure_coding::split_references(payload.clone().into(), span, level, encrypted).unwrap();
             assert_eq!(
                 split_data,
                 children
@@ -377,7 +377,7 @@ mod bee_compatibility {
             encrypted: bool,
         ) -> Result<Vec<RecoveredChild>, String> {
             let (data_references, parity_references) = erasure_coding::split_references(
-                &decoded.payload,
+                decoded.payload.clone().into(),
                 decoded.span,
                 decoded.level,
                 encrypted,
@@ -495,7 +495,7 @@ mod bee_compatibility {
             let decoded = root_decoded(tree).unwrap();
             assert!(decoded.span > CHUNK_SIZE as u64);
             erasure_coding::split_references(
-                &decoded.payload,
+                decoded.payload.into(),
                 decoded.span,
                 decoded.level,
                 tree.encrypted,
@@ -1349,7 +1349,7 @@ mod erasure_contracts {
                     payload.len(),
                     encoded_reference_payload_len(span, *level, encrypted).unwrap()
                 );
-                let (data, parity) = split_references(&payload, span, *level, encrypted).unwrap();
+                let (data, parity) = split_references(payload.clone().into(), span, *level, encrypted).unwrap();
                 assert_eq!(data.len(), data_count);
                 assert_eq!(parity.len(), parity_count);
                 for (index, reference) in data.iter().enumerate() {
@@ -1361,9 +1361,9 @@ mod erasure_contracts {
 
                 let mut too_long = payload.clone();
                 too_long.push(0);
-                assert!(split_references(&too_long, span, *level, encrypted).is_none());
+                assert!(split_references(too_long.into(), span, *level, encrypted).is_none());
                 assert!(
-                    split_references(&payload[..payload.len() - 1], span, *level, encrypted)
+                    split_references(payload[..payload.len() - 1].to_vec().into(), span, *level, encrypted)
                         .is_none()
                 );
             }

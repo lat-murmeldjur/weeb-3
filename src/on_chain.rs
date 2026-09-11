@@ -9,7 +9,7 @@ use web3::{
         StateMutability::{NonPayable, View},
     },
     transports::eip_1193::{Eip1193, Provider},
-    types::{Address, H160, H256, TransactionReceipt, U256},
+    types::{Address, H256, TransactionReceipt, U256},
 };
 
 use crate::{
@@ -113,20 +113,8 @@ impl ChequebookClient {
     }
 }
 
-const TESTNET_POSTAGE_CONTRACT_ADDR: &str = "cdfdC3752caaA826fE62531E0000C40546eC56A6";
-const MAINNET_POSTAGE_CONTRACT_ADDR: &str = "45a1502382541Cd610CC9068e88727426b696293";
-
-const TESTNET_TOKEN_CONTRACT_ADDR: &str = "543dDb01Ba47acB11de34891cD86B675F04840db";
-const MAINNET_TOKEN_CONTRACT_ADDR: &str = "dBF3Ea6F5beE45c02255B2c26a16F300502F68da";
-
 const BATCH_CREATED_TOPIC: &str =
     "9b088e2c89b322a3c1d81515e1c88db3d386d022926f0e2d0b9b5813b7413d58";
-
-const TESTNET_PRICE_ORACLE_ADDR: &str = "1814e9b3951Df0CB8e12b2bB99c5594514588936";
-const TESTNET_CHEQUEBOOK_FACTORY_ADDR: &str = "0fF044F6bB4F684a5A149B46D7eC03ea659F98A1";
-
-const MAINNET_PRICE_ORACLE_ADDR: &str = "A57A50a831B31c904A770edBCb706E03afCdbd94";
-const MAINNET_CHEQUEBOOK_FACTORY_ADDR: &str = "c2d5a532cf69aa9a1378737d8ccdef884b6e7420";
 
 const BUCKET_DEPTH: u8 = 16;
 
@@ -138,21 +126,30 @@ fn select_network_address(mainnet: &'static str, testnet: &'static str) -> &'sta
 }
 
 fn select_postage_contract_addr() -> &'static str {
-    select_network_address(MAINNET_POSTAGE_CONTRACT_ADDR, TESTNET_POSTAGE_CONTRACT_ADDR)
+    select_network_address(
+        "45a1502382541Cd610CC9068e88727426b696293",
+        "cdfdC3752caaA826fE62531E0000C40546eC56A6",
+    )
 }
 
 fn select_token_contract_addr() -> &'static str {
-    select_network_address(MAINNET_TOKEN_CONTRACT_ADDR, TESTNET_TOKEN_CONTRACT_ADDR)
+    select_network_address(
+        "dBF3Ea6F5beE45c02255B2c26a16F300502F68da",
+        "543dDb01Ba47acB11de34891cD86B675F04840db",
+    )
 }
 
 fn select_price_oracle_addr() -> &'static str {
-    select_network_address(MAINNET_PRICE_ORACLE_ADDR, TESTNET_PRICE_ORACLE_ADDR)
+    select_network_address(
+        "A57A50a831B31c904A770edBCb706E03afCdbd94",
+        "1814e9b3951Df0CB8e12b2bB99c5594514588936",
+    )
 }
 
 fn select_chequebook_factory_addr() -> &'static str {
     select_network_address(
-        MAINNET_CHEQUEBOOK_FACTORY_ADDR,
-        TESTNET_CHEQUEBOOK_FACTORY_ADDR,
+        "c2d5a532cf69aa9a1378737d8ccdef884b6e7420",
+        "0fF044F6bB4F684a5A149B46D7eC03ea659F98A1",
     )
 }
 
@@ -288,13 +285,7 @@ pub async fn expired_batches_exist(postage: &PostageContract) -> Result<bool, Js
         .map_err(|e| JsError::new(&format!("expiredBatchesExist() failed: {e}")))
 }
 
-pub async fn get_batch_validity(batch_id: &[u8]) -> U256 {
-    let Ok(w3) = web3() else {
-        return U256::zero();
-    };
-    let Ok(contract) = postage_contract(&w3) else {
-        return U256::zero();
-    };
+pub async fn get_batch_validity(contract: &PostageContract, batch_id: &[u8]) -> U256 {
     let Ok(batch_id): Result<[u8; 32], _> = batch_id.try_into() else {
         return U256::zero();
     };
@@ -312,8 +303,8 @@ pub async fn get_batch_validity(batch_id: &[u8]) -> U256 {
 }
 
 pub fn parse_batch_id_from_receipt(receipt: &TransactionReceipt) -> Option<Vec<u8>> {
-    let topic = H256::from_slice(&hex::decode(BATCH_CREATED_TOPIC).ok()?);
-    let contract = H160::from_slice(&hex::decode(select_postage_contract_addr()).ok()?);
+    let topic = H256::from_str(BATCH_CREATED_TOPIC).ok()?;
+    let contract = Address::from_str(select_postage_contract_addr()).ok()?;
 
     for log in receipt.logs.iter() {
         if log.topics.first() == Some(&topic)
@@ -447,8 +438,7 @@ pub struct BatchPurchaseResult {
 pub fn parse_chequebook_address_from_receipt(receipt: &TransactionReceipt) -> Option<Address> {
     let topic_bytes = keccak256(b"SimpleSwapDeployed(address)");
     let topic = H256::from_slice(topic_bytes.as_slice());
-    let addr_str = select_chequebook_factory_addr();
-    let factory = H160::from_slice(&hex::decode(addr_str).ok()?);
+    let factory = Address::from_str(select_chequebook_factory_addr()).ok()?;
 
     for log in receipt.logs.iter() {
         if log.address == factory && log.topics.first() == Some(&topic) {

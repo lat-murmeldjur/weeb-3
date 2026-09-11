@@ -21,7 +21,7 @@ use crate::{
         rolling_parity_admission_count,
     },
     retrieve_cancel_token_current, retrieve_handler, transfer_pause_enabled, valid_cac, valid_soc,
-    wait_transfer_unpaused, wait_transfer_unpaused_for_admission,
+    wait_transfer_unpaused, wait_transfer_unpaused_for_admission, weeb_3::etiquette_6,
 };
 
 use async_std::sync::Arc;
@@ -39,7 +39,7 @@ const RETRIEVE_RECOVERY_PROGRESSIVE_BATCH: usize = 2;
 const RETRIEVE_ATTEMPT_TIMEOUT_MS: u64 = 10_000;
 const RETRIEVE_CHECK_RETRY_WAIT_MS: u64 = 160;
 const RETRIEVE_CHUNK_MAX_ATTEMPT_ERRORS: usize = 20;
-const RETRIEVE_DATA_GROUP_CONCURRENCY: usize = 4;
+const RETRIEVE_DATA_GROUP_CONCURRENCY: usize = 8;
 const RETRIEVE_DECODED_CHUNK_CACHE_ENTRIES: usize = 2048;
 
 struct RetrieveAttemptResult {
@@ -177,9 +177,10 @@ async fn retrieve_attempt(
         accounting: accounting_peer,
         session,
     } = selected;
+    let request = etiquette_6::Request { addr: caddr };
     let retrieve_result = async_std::future::timeout(
         Duration::from_millis(RETRIEVE_ATTEMPT_TIMEOUT_MS),
-        retrieve_handler(peer, caddr.clone(), control, session),
+        retrieve_handler(peer, &request, control, session),
     )
     .await;
 
@@ -202,7 +203,7 @@ async fn retrieve_attempt(
     // Consumer cancellation never drops this owned attempt. Its original deadline ends
     // the exchange; every outcome settles the reserve before logical completion.
     settle_retrieve_attempt(
-        caddr,
+        request.addr,
         req_price,
         accounting_peer,
         refresh_chan,
@@ -1548,7 +1549,7 @@ async fn retrieve_data_range_from_root_with_prefix_cancellable(
 
             let layout = reference_layout(node.chunk.span, node.chunk.level, encrypted)?;
             let (data_references, parity_references) = split_references(
-                node.chunk.payload.as_ref(),
+                node.chunk.payload,
                 node.chunk.span,
                 node.chunk.level,
                 encrypted,

@@ -11,10 +11,10 @@ use futures::{FutureExt, StreamExt, future, stream};
 use wasm_bindgen_futures::spawn_local;
 
 use super::{
-    HLS_BEGINNING_STARTUP_BUFFER_SECONDS, HLS_LIVE_BODY_RUNWAY_SEGMENTS, HLS_LIVE_EDGE_SEGMENTS,
-    HLS_LIVE_STARTUP_BUFFER_SECONDS, HlsManifest, HlsMasterPlaylist, HlsPlaylist, HlsSource,
-    HlsStart, MAX_STREAM_FEED_PAYLOAD_BYTES, PreparedHlsFeed, hls_payload_mime,
-    hls_progressive_foreground_transition, is_hex_reference,
+    HLS_BEGINNING_STARTUP_BUFFER_SECONDS, HLS_BODY_MAX_BYTES, HLS_LIVE_BODY_RUNWAY_SEGMENTS,
+    HLS_LIVE_EDGE_SEGMENTS, HLS_LIVE_STARTUP_BUFFER_SECONDS, HlsManifest, HlsMasterPlaylist,
+    HlsPlaylist, HlsSource, HlsStart, MAX_STREAM_FEED_PAYLOAD_BYTES, PreparedHlsFeed,
+    hls_payload_mime, hls_progressive_foreground_transition, is_hex_reference,
 };
 use crate::{
     ChunkRetrieveRequest, Weeb3,
@@ -38,9 +38,7 @@ use crate::{
 };
 
 const HLS_BODY_CACHE_MAX_BYTES: u64 = 32 * 1024 * 1024;
-const HLS_BODY_MAX_BYTES: u64 = 96 * 1024 * 1024;
 const BODY_PREFETCH_HORIZON: usize = HLS_LIVE_BODY_RUNWAY_SEGMENTS;
-const HLS_BODY_PREFETCH_MAX_PARALLEL: usize = 2;
 const BEGINNING_DISCOVERY_WIDTH: u64 = 8;
 const BEGINNING_PAYLOAD_BYTES: usize = 64 * 1024;
 const EDGE_COLD_WAVE_TIMEOUT: Duration = Duration::from_millis(4_000);
@@ -62,7 +60,6 @@ const LIVE_TAIL_FALLBACK_WINDOW_MS: f64 = 300_000.0;
 const INITIAL_DISCOVERY_RETRY_DELAY: Duration = Duration::from_millis(100);
 const HLS_BODY_ATTEMPTS: usize = 6;
 const HLS_BODY_RETRY_DELAY_MS: u64 = 75;
-const HLS_CODEC_BOOTSTRAP_BYTES: u64 = (320 * 1024 / 188) * 188;
 const HISTORY_STRIDE: u64 = 10;
 const HISTORY_MAX_PROBES: usize = 4_096;
 const HISTORY_MAX_REPAIRS: usize = 4_096;
@@ -80,19 +77,7 @@ struct BodyCache {
     epoch: u64,
     bodies: HashMap<String, Bytes>,
     body_order: VecDeque<String>,
-    pending_bodies: HashMap<String, PendingBody>,
     bytes: u64,
-}
-
-struct PendingBody {
-    epoch: u64,
-    waiters: Vec<mpsc::Sender<Option<Bytes>>>,
-}
-
-enum BodyLoad {
-    Cached(Bytes),
-    Wait(mpsc::Receiver<Option<Bytes>>),
-    Lead(u64),
 }
 
 impl BodyCache {
@@ -104,25 +89,6 @@ impl BodyCache {
         Some(body.slice(start..end))
     }
 
-    fn body_load(&mut self, reference: &str) -> BodyLoad {
-        if let Some(body) = self.bodies.get(reference) {
-            return BodyLoad::Cached(body.clone());
-        }
-        if let Some(pending) = self.pending_bodies.get_mut(reference) {
-            let (sender, receiver) = mpsc::bounded(1);
-            pending.waiters.push(sender);
-            return BodyLoad::Wait(receiver);
-        }
-        self.pending_bodies.insert(
-            reference.to_string(),
-            PendingBody {
-                epoch: self.epoch,
-                waiters: Vec::new(),
-            },
-        );
-        BodyLoad::Lead(self.epoch)
-    }
-
     fn body_cached(&self, reference: &str) -> bool {
         self.bodies.contains_key(reference)
     }
@@ -132,18 +98,12 @@ impl BodyCache {
     }
 
     fn finish_body(&mut self, reference: String, epoch: u64, body: Option<Bytes>) -> Option<Bytes> {
-        let matches = self
-            .pending_bodies
-            .get(&reference)
-            .is_some_and(|pending| pending.epoch == epoch);
-        if !matches {
+        if epoch != self.epoch {
             return None;
-        };
-        let pending = self.pending_bodies.remove(&reference)?;
-        let current = pending.epoch == self.epoch;
-        let delivered = current.then_some(body).flatten();
-        if let Some(body) = &delivered
+        }
+        if let Some(body) = &body
             && body.len() as u64 <= media_cache_max_bytes().min(HLS_BODY_CACHE_MAX_BYTES)
+            && !self.bodies.contains_key(&reference)
         {
             forget_completed_reference_ranges(&reference);
             self.bodies.insert(reference.clone(), body.clone());
@@ -151,10 +111,7 @@ impl BodyCache {
             self.bytes = self.bytes.saturating_add(body.len() as u64);
             self.trim();
         }
-        for waiter in pending.waiters {
-            let _ = waiter.try_send(delivered.clone());
-        }
-        delivered
+        body
     }
 
     fn trim(&mut self) {
@@ -173,11 +130,6 @@ impl BodyCache {
 
     fn clear(&mut self) {
         self.epoch = self.epoch.wrapping_add(1);
-        for (_, pending) in self.pending_bodies.drain() {
-            for waiter in pending.waiters {
-                let _ = waiter.try_send(None);
-            }
-        }
         self.bodies.clear();
         self.body_order.clear();
         self.bytes = 0;
@@ -230,6 +182,7 @@ struct FeedSession {
     ready: bool,
     beginning_history_started: bool,
     body_runway_running: bool,
+    refilling: bool,
     live_startup_plan: Option<super::HlsStartupPlan>,
     foreground: Option<String>,
     index: Option<u64>,
@@ -338,24 +291,30 @@ async fn hls_range(
     span: u64,
     start: u64,
     end: u64,
+    feed: Option<u64>,
     admitted: &dyn Fn() -> bool,
 ) -> Option<Bytes> {
     let epoch = BODY_CACHE.with(|cache| cache.borrow().epoch);
     if let Some(bytes) = BODY_CACHE.with(|cache| cache.borrow().get(reference, start, end)) {
         return Some(bytes);
     }
-    let current = || {
-        BODY_CACHE.with(|cache| {
-            let cache = cache.borrow();
-            cache.epoch == epoch
-                && (admitted()
-                    || cache.pending_bodies.get(reference).is_some_and(|pending| {
-                        pending.epoch == epoch
-                            && pending.waiters.iter().any(|waiter| !waiter.is_closed())
-                    }))
-        })
-    };
-    read_cached_hls_range(client, reference, span, start, end, &current).await
+    let current = || BODY_CACHE.with(|cache| cache.borrow().epoch == epoch) && admitted();
+    let read = read_cached_hls_range(client, reference, span, start, end, &current);
+    futures::pin_mut!(read);
+    loop {
+        let changed = feed.and_then(|id| {
+            FEED.with(|feeds| feeds.borrow().get(id).map(|feed| feed.changed.listen()))
+        });
+        if !current() {
+            return None;
+        }
+        let Some(changed) = changed else {
+            return read.await;
+        };
+        if let future::Either::Left((body, _)) = future::select(read.as_mut(), changed).await {
+            return body;
+        }
+    }
 }
 
 fn body_is_current(id: u64, reference: &str) -> bool {
@@ -373,11 +332,10 @@ async fn hls_body(client: Arc<Weeb3>, reference: String, generation: Option<u64>
     if generation.is_some_and(|id| !body_is_current(id, &reference)) {
         return None;
     }
-    let epoch = match BODY_CACHE.with(|cache| cache.borrow_mut().body_load(&reference)) {
-        BodyLoad::Cached(body) => return Some(body),
-        BodyLoad::Wait(waiter) => return waiter.recv().await.ok().flatten(),
-        BodyLoad::Lead(epoch) => epoch,
-    };
+    if let Some(body) = BODY_CACHE.with(|cache| cache.borrow().body(&reference)) {
+        return Some(body);
+    }
+    let epoch = BODY_CACHE.with(|cache| cache.borrow().epoch);
     let body = async {
         let decoded = hex::decode(&reference).ok()?;
         let root = retrieve_decoded_data_root(&decoded, &client.chunk_port.0).await?;
@@ -388,7 +346,7 @@ async fn hls_body(client: Arc<Weeb3>, reference: String, generation: Option<u64>
             return None;
         }
         let end = root.span.checked_sub(1)?;
-        hls_range(&client, &reference, root.span, 0, end, &|| {
+        hls_range(&client, &reference, root.span, 0, end, generation, &|| {
             generation.is_none_or(|id| body_is_current(id, &reference))
         })
         .await
@@ -458,7 +416,7 @@ fn body_runway_targets(active: &FeedSession) -> &[super::HlsSegment] {
     }) else {
         return &[];
     };
-    if active.start == HlsStart::Beginning {
+    if active.start == HlsStart::Beginning && !active.refilling {
         let length = playlist.segments[position..]
             .iter()
             .enumerate()
@@ -487,23 +445,59 @@ fn body_runway_targets(active: &FeedSession) -> &[super::HlsSegment] {
     &playlist.segments[position..position + length]
 }
 
-async fn prepare_live_bodies(client: Arc<Weeb3>, id: u64) -> Vec<Option<Bytes>> {
-    let references = FEED.with(|feed| {
-        feed.borrow()
-            .get(id)
-            .map(body_runway_targets)
-            .unwrap_or_default()
-            .iter()
-            .map(|segment| segment.reference.clone())
-            .collect::<Vec<_>>()
-    });
+async fn prepare_live_bodies(client: Arc<Weeb3>, id: u64) -> Option<()> {
+    let (references, mut complete, refilling) = FEED.with(|feed| {
+        let feed = feed.borrow();
+        let active = feed.get(id)?;
+        let playlist = active.playlist.as_ref()?;
+        let targets = body_runway_targets(active);
+        // A seek can land at the end of its first segment.
+        let complete = !targets.is_empty()
+            && (!active.refilling
+                || (playlist.finalized
+                    && targets.as_ptr_range().end == playlist.segments.as_ptr_range().end)
+                || targets
+                    .iter()
+                    .skip(1)
+                    .map(|segment| segment.duration)
+                    .sum::<f64>()
+                    >= HLS_LIVE_STARTUP_BUFFER_SECONDS);
+        Some((
+            targets
+                .iter()
+                .map(|segment| segment.reference.clone())
+                .collect::<Vec<_>>(),
+            complete,
+            active.refilling,
+        ))
+    })?;
     spawn_body_runway(id);
-    // Keep every result; failed bodies retain the streaming fallback.
-    let mut bodies = Vec::new();
-    for reference in references {
-        bodies.push(hls_body(client.clone(), reference, Some(id)).await);
+    let mut bytes = 0u64;
+    for reference in &references {
+        if refilling {
+            if !body_is_current(id, reference) {
+                return None;
+            }
+            let address = hex::decode(reference).ok()?;
+            let root = retrieve_decoded_data_root(&address, &client.chunk_port.0).await?;
+            bytes = bytes.saturating_add(root.span);
+            if bytes > media_cache_max_bytes().min(HLS_BODY_CACHE_MAX_BYTES) {
+                return Some(());
+            }
+        }
+        complete &= hls_body(client.clone(), reference.clone(), Some(id))
+            .await
+            .is_some();
     }
-    bodies
+    if refilling {
+        complete &= BODY_CACHE.with(|cache| {
+            let cache = cache.borrow();
+            references
+                .iter()
+                .all(|reference| cache.body_cached(reference))
+        });
+    }
+    complete.then_some(())
 }
 
 fn presentation_playlist(active: &FeedSession) -> Option<std::borrow::Cow<'_, HlsPlaylist>> {
@@ -532,59 +526,33 @@ fn spawn_body_runway(id: u64) {
         return;
     };
     spawn_local(async move {
-        let mut loads = stream::FuturesUnordered::new();
-        let mut loaded = HashMap::<_, bool>::new();
+        let mut loaded = HashSet::new();
         loop {
-            let Some((changed, references)) = FEED.with(|feed| {
+            let reference = FEED.with(|feed| {
                 let feed = feed.borrow();
-                let active = feed.get(id)?;
-                Some((
-                    active.changed.listen(),
-                    (feed.active == id)
-                        .then(|| body_runway_targets(active))
-                        .unwrap_or_default()
-                        .iter()
-                        .filter(|segment| !segment.gap)
-                        .map(|segment| segment.reference.clone())
-                        .collect::<Vec<_>>(),
-                ))
-            }) else {
+                let active = feed.active().filter(|active| active.id == id)?;
+                let targets = body_runway_targets(active);
+                loaded.retain(|reference| {
+                    targets.iter().any(|segment| !segment.gap && &segment.reference == reference)
+                });
+                targets
+                    .iter()
+                    .find(|segment| {
+                        !segment.gap
+                            && !loaded.contains(&segment.reference)
+                            && !BODY_CACHE.with(|cache| cache.borrow().body_cached(&segment.reference))
+                    })
+                    .map(|segment| segment.reference.clone())
+            });
+            let Some(reference) = reference else {
                 break;
             };
-            loaded.retain(|reference, complete| !*complete || references.contains(reference));
-            for reference in references {
-                if loads.len() == HLS_BODY_PREFETCH_MAX_PARALLEL {
-                    break;
-                }
-                if BODY_CACHE.with(|cache| cache.borrow().body_cached(&reference))
-                    || loaded.contains_key(&reference)
-                {
-                    continue;
-                }
-                loaded.insert(reference.clone(), false);
-                loads.push(
-                    hls_body(client.clone(), reference.clone(), Some(id))
-                        .map(move |body| (reference, body.is_some())),
-                );
-            }
-            if loads.is_empty() {
-                break;
-            }
-            if let future::Either::Left((Some((reference, complete)), _)) =
-                future::select(loads.next(), changed).await
-            {
-                if complete {
-                    loaded.insert(reference, true);
-                } else {
-                    loaded.remove(&reference);
-                    if body_is_current(id, &reference) {
-                        async_std::task::sleep(Duration::from_millis(HLS_BODY_RETRY_DELAY_MS))
-                            .await;
-                    }
-                }
+            if hls_body(client.clone(), reference.clone(), Some(id)).await.is_some() {
+                loaded.insert(reference);
+            } else if body_is_current(id, &reference) {
+                async_std::task::sleep(Duration::from_millis(HLS_BODY_RETRY_DELAY_MS)).await;
             }
         }
-        while loads.next().await.is_some() {}
         FEED.with(|feed| {
             if let Some(active) = feed.borrow_mut().get_mut(id) {
                 active.body_runway_running = false;
@@ -593,7 +561,7 @@ fn spawn_body_runway(id: u64) {
     });
 }
 
-fn prefetch_from_reference(reference: &str, cached: bool) -> bool {
+async fn prefetch_from_reference(reference: &str, cached: bool) -> Option<bool> {
     let runway = FEED.with(|feed| {
         let mut feed = feed.borrow_mut();
         if feed.feeds.len() > 1 {
@@ -640,17 +608,34 @@ fn prefetch_from_reference(reference: &str, cached: bool) -> bool {
         if foreground == position {
             active.foreground = Some(reference.to_string());
         }
+        active.refilling |= transition;
         active.changed.notify(usize::MAX);
-        Some((active.id, live || active.beginning_history_started, transition || live || position != 0))
+        Some((
+            active.id,
+            live || active.beginning_history_started,
+            transition || live || position != 0,
+            (active.refilling && foreground == position).then(|| active.client.clone()),
+        ))
     });
-    let Some((id, follow, transition)) = runway else {
-        return false;
+    let Some((id, follow, transition, refill)) = runway else {
+        return Some(false);
     };
     if follow {
         spawn_follower(id);
         spawn_body_runway(id);
     }
-    transition
+    if let Some(client) = refill {
+        prepare_live_bodies(client, id).await?;
+        FEED.with(|feed| {
+            let mut feed = feed.borrow_mut();
+            let active = feed.active_mut().filter(|active| {
+                active.id == id && active.foreground.as_deref() == Some(reference)
+            })?;
+            active.refilling = false;
+            Some(())
+        })?;
+    }
+    Some(transition)
 }
 
 fn next_feed_id() -> u64 {
@@ -689,6 +674,7 @@ fn begin_feed(
             ready: false,
             beginning_history_started: false,
             body_runway_running: false,
+            refilling: false,
             live_startup_plan: None,
             foreground: None,
             index: None,
@@ -789,7 +775,7 @@ async fn prepare_live_plan(
                 .ok_or("The initial HLS edge no longer matches its history.")?;
             let selected = playlist
                 .anchored_startup_plan(anchor.0, &anchor.1)
-                .filter(|(_, first)| !anchor.2 || *first == position);
+                .filter(|(_, first)| !anchor.2 || playlist.finalized || *first == position);
             let prepared = if let Some((plan, first)) = selected {
                 active.foreground = Some(playlist.segments[first].reference.clone());
                 active.live_startup_plan = Some(plan.clone());
@@ -853,7 +839,7 @@ async fn discover_beginning(
                         if playlist.sequence == 0
                             && playlist.startup_plan(HlsStart::Beginning).is_some() =>
                     {
-                        warm_hls_prefix(client.clone(), id, &playlist, HlsStart::Beginning);
+                        warm_hls_prefix(client.clone(), id, view_generation, &playlist, HlsStart::Beginning);
                         return Some(payload);
                     }
                     _ => {}
@@ -1047,7 +1033,13 @@ async fn retrieve_confirmed_payload(
     })
 }
 
-fn warm_hls_prefix(client: Arc<Weeb3>, id: u64, playlist: &HlsPlaylist, start: HlsStart) {
+fn warm_hls_prefix(
+    client: Arc<Weeb3>,
+    id: u64,
+    view_generation: u64,
+    playlist: &HlsPlaylist,
+    start: HlsStart,
+) {
     let Some(segment) = playlist
         .segments
         .iter()
@@ -1057,22 +1049,26 @@ fn warm_hls_prefix(client: Arc<Weeb3>, id: u64, playlist: &HlsPlaylist, start: H
         return;
     };
     spawn_local(async move {
-        let _ = async {
-            if !feed_is_current(id) {
+        let current = || feed_is_current(id) && result_view_request_is_current(view_generation);
+        let epoch = BODY_CACHE.with(|cache| cache.borrow().epoch);
+        let body = async {
+            if !current() {
                 return None;
             }
             let decoded = hex::decode(&segment.reference).ok()?;
             let root = retrieve_decoded_data_root(&decoded, &client.chunk_port.0).await?;
-            if !feed_is_current(id) || root.span == 0 {
+            if !current() || root.span == 0 {
                 return None;
             }
             let maximum = if start == HlsStart::Beginning {
                 ((root.span as f64
                     * (HLS_BEGINNING_STARTUP_BUFFER_SECONDS / segment.duration).min(1.0))
-                    .ceil() as u64)
+                .ceil() as u64)
                     .clamp(1, root.span.min(MEDIA_STARTUP_RESPONSE_BYTES))
+            } else if root.span <= HLS_BODY_MAX_BYTES {
+                root.span
             } else {
-                root.span.min(HLS_CODEC_BOOTSTRAP_BYTES)
+                return None;
             };
             hls_range(
                 &client,
@@ -1080,13 +1076,18 @@ fn warm_hls_prefix(client: Arc<Weeb3>, id: u64, playlist: &HlsPlaylist, start: H
                 root.span,
                 0,
                 maximum - 1,
-                &|| feed_is_current(id),
+                Some(id),
+                &current,
             )
             .await
         }
         .await;
         if start == HlsStart::Beginning {
             start_beginning_history(id);
+        } else {
+            let _ = BODY_CACHE.with(|cache| {
+                cache.borrow_mut().finish_body(segment.reference, epoch, body)
+            });
         }
     });
 }
@@ -1130,7 +1131,7 @@ async fn history_snapshots(
                 && result_view_request_is_current(view_generation)
             {
                 *warm_pending = false;
-                warm_hls_prefix(client.clone(), id, playlist, HlsStart::Live);
+                warm_hls_prefix(client.clone(), id, view_generation, playlist, HlsStart::Live);
             }
         })
         .collect()
@@ -1199,7 +1200,7 @@ async fn hls_history(
 ) -> Option<HlsPlaylist> {
     if head.sequence == 0 {
         if warm_pending {
-            warm_hls_prefix(client.clone(), id, &head, HlsStart::Live);
+            warm_hls_prefix(client.clone(), id, view_generation, &head, HlsStart::Live);
         }
         return Some(head);
     }
@@ -1549,8 +1550,6 @@ fn start_beginning_history(id: u64) {
         }
         let history = discover_for_view(id, view_generation, &client, &owner, &topic).await;
         if let Some((index, history)) = history
-            && feed_is_current(id)
-            && result_view_request_is_current(view_generation)
             && apply_confirmed_snapshot(id, index, history, None).is_some()
         {
             client.interface_log(format!("HLS history reached index {index}"));
@@ -1747,12 +1746,7 @@ fn hls_body_response(
         if codec_bootstrap {
             mime = hls_payload_mime(&body);
         }
-        let end = if codec_bootstrap && mime == "video/mp2t" {
-            body.len().min(HLS_CODEC_BOOTSTRAP_BYTES as usize)
-        } else {
-            body.len()
-        };
-        (200, 0, end, None)
+        (200, 0, body.len(), None)
     };
     let headers = hls_body_headers(etag, mime, (end - start) as u64, range);
     Some(if method == "HEAD" {
@@ -1776,10 +1770,16 @@ async fn fetch_hls_body_response(
     if if_none_match_matches(if_none_match, &etag) {
         return FetchResponse::ok(304, vec![("ETag".to_string(), etag)], None);
     }
-    let whole_media_get = method == "GET" && range.is_none() && !codec_bootstrap;
-    let cached = whole_media_get && BODY_CACHE.with(|cache| cache.borrow().body_cached(&reference));
-    let complete_body = whole_media_get && prefetch_from_reference(&reference, cached);
-    if let Some(body) = BODY_CACHE.with(|cache| cache.borrow().body(&reference))
+    let whole_media_get = method == "GET" && range.is_none();
+    let body = BODY_CACHE.with(|cache| cache.borrow().body(&reference));
+    let cached = whole_media_get && body.is_some();
+    let complete_body = whole_media_get
+        && (codec_bootstrap
+            || match prefetch_from_reference(&reference, cached).await {
+                Some(complete) => complete,
+                None => return FetchResponse::error(503, "HLS seek buffer was unavailable"),
+            });
+    if let Some(body) = body
         && let Some(response) =
             hls_body_response(body, codec_bootstrap, method, range, etag.clone())
     {
@@ -1795,7 +1795,7 @@ async fn fetch_hls_body_response(
         let Some(body) = foreground_hls_body(client.clone(), reference.clone()).await else {
             return FetchResponse::error(503, "HLS segment body was unavailable");
         };
-        return hls_body_response(body, false, method, None, etag)
+        return hls_body_response(body, codec_bootstrap, method, None, etag)
             .unwrap_or_else(|| FetchResponse::error(503, "HLS segment body was unavailable"));
     }
 
@@ -1815,7 +1815,8 @@ async fn fetch_hls_body_response(
                 None,
             );
         };
-        let Some(bytes) = hls_range(&client, &reference, span, start, end, &|| true).await else {
+        let Some(bytes) = hls_range(&client, &reference, span, start, end, None, &|| true).await
+        else {
             return FetchResponse::error(503, "HLS segment range was unavailable");
         };
         let headers = hls_body_headers(
@@ -1833,7 +1834,7 @@ async fn fetch_hls_body_response(
 
     let mime = if codec_bootstrap {
         let prefix_end = span.saturating_sub(1).min(188);
-        hls_range(&client, &reference, span, 0, prefix_end, &|| true)
+        hls_range(&client, &reference, span, 0, prefix_end, None, &|| true)
             .await
             .map_or("application/octet-stream", |prefix| {
                 hls_payload_mime(&prefix)
@@ -1841,12 +1842,7 @@ async fn fetch_hls_body_response(
     } else {
         "application/octet-stream"
     };
-    let response_span = if codec_bootstrap && mime == "video/mp2t" {
-        span.min(HLS_CODEC_BOOTSTRAP_BYTES)
-    } else {
-        span
-    };
-    let headers = hls_body_headers(etag, mime, response_span, None);
+    let headers = hls_body_headers(etag, mime, span, None);
     if method == "HEAD" {
         FetchResponse::ok(200, headers, None)
     } else {
@@ -2400,11 +2396,9 @@ pub(crate) async fn prepare_hls_feed(
                 if needs_successor && !immutable { spawn_follower(id); }
                 (index, plan, 0)
             };
-            let _startup_bodies = if start == HlsStart::Live {
-                prepare_live_bodies(client.clone(), id).await
-            } else {
-                Vec::new()
-            };
+            if start == HlsStart::Live {
+                let _ = prepare_live_bodies(client.clone(), id).await;
+            }
             if !feed_is_current(id) || !result_view_request_is_current(view_generation) {
                 return Err("HLS open was superseded".to_string());
             }

@@ -483,34 +483,19 @@ pub(super) fn download_raw_bytes(bytes: Uint8Array, filename: String, label: &st
 }
 
 pub(super) fn click_download_url(url: String, filename: &str) {
-    let document = match web_sys::window().and_then(|window| window.document()) {
-        Some(document) => document,
-        None => {
-            revoke_object_url_later(url);
-            return;
+    if let Some(document) = web_sys::window().and_then(|window| window.document())
+        && let Ok(anchor) = document.create_element("a")
+    {
+        let _ = anchor.set_attribute("href", &url);
+        let _ = anchor.set_attribute("download", filename);
+        let _ = anchor.set_attribute("style", "display:none");
+        if let Some(body) = document.body() {
+            let _ = body.append_child(&anchor);
         }
-    };
-    let anchor = match document.create_element("a") {
-        Ok(anchor) => anchor,
-        Err(_) => {
-            revoke_object_url_later(url);
-            return;
+        if let Some(anchor) = anchor.dyn_ref::<HtmlElement>() {
+            anchor.click();
         }
-    };
-    let _ = anchor.set_attribute("href", &url);
-    let _ = anchor.set_attribute("download", filename);
-    let _ = anchor.set_attribute("style", "display:none");
-
-    if let Some(body) = document.body() {
-        let _ = body.append_child(&anchor);
-    }
-
-    if let Some(anchor) = anchor.dyn_ref::<HtmlElement>() {
-        anchor.click();
-    }
-
-    if let Some(parent) = anchor.parent_node() {
-        let _ = parent.remove_child(&anchor);
+        anchor.remove();
     }
     revoke_object_url_later(url);
 }
@@ -536,9 +521,7 @@ fn revoke_object_url_later(url: String) {
 fn create_blob_part(part: &JsValue, mime: &str) -> Option<Blob> {
     let props = BlobPropertyBag::new();
     props.set_type(mime);
-    let parts = Array::new();
-    parts.push(part);
-    Blob::new_with_u8_array_sequence_and_options(&parts, &props).ok()
+    Blob::new_with_u8_array_sequence_and_options(&Array::of1(part), &props).ok()
 }
 
 fn create_blob(bytes: &[u8], mime: &str) -> Option<Blob> {
@@ -600,13 +583,11 @@ type RenderedEntries = Rc<Vec<(Vec<u8>, String, String)>>;
 
 pub(super) fn render_single_result_with_download((bytes, mime, path): &(Vec<u8>, String, String)) {
     let document = interface_document();
-    let wrapper = match document.create_element("div") {
-        Ok(wrapper) => wrapper,
-        Err(_) => return,
+    let Ok(wrapper) = document.create_element("div") else {
+        return;
     };
-    let button = match document.create_element("button") {
-        Ok(button) => button,
-        Err(_) => return,
+    let Ok(button) = document.create_element("button") else {
+        return;
     };
 
     let filename = result_filename(path, "download");
@@ -665,9 +646,8 @@ pub(super) fn tar_entries(entries: &[(Vec<u8>, String, String)]) -> Option<Vec<u
 
 pub(super) fn render_collection_download_button(entries: RenderedEntries, index: &str) {
     let document = interface_document();
-    let button = match document.create_element("button") {
-        Ok(button) => button,
-        Err(_) => return,
+    let Ok(button) = document.create_element("button") else {
+        return;
     };
     let filename = format!("{}.tar", result_filename(index, "collection"));
     button.set_text_content(Some(&format!("Download {}", filename)));
@@ -883,7 +863,7 @@ async fn preload_canonical_bzz_frame(
         .acquire_resolved_range(metadata.clone(), 0, metadata.size - 1)
         .await;
 
-    match retrieved {
+    let reason = match retrieved {
         Some((bytes, _)) if bytes.len() == metadata.size as usize => {
             weeb3
                 .finish_progress(&progress_id, "complete", "website index retrieved", true)
@@ -892,7 +872,7 @@ async fn preload_canonical_bzz_frame(
                 "website index retrieved for {}; rendering iframe",
                 resource
             ));
-            Some(bytes)
+            return Some(bytes);
         }
         Some((bytes, _)) => {
             weeb3.interface_log(format!(
@@ -901,19 +881,17 @@ async fn preload_canonical_bzz_frame(
                 bytes.len(),
                 metadata.size
             ));
-            weeb3
-                .finish_progress(&progress_id, "failed", "short website index", false)
-                .await;
-            None
+            "short website index"
         }
         None => {
             weeb3.interface_log(format!("website index retrieval failed for {}", resource));
-            weeb3
-                .finish_progress(&progress_id, "failed", "website index not retrieved", false)
-                .await;
-            None
+            "website index not retrieved"
         }
-    }
+    };
+    weeb3
+        .finish_progress(&progress_id, "failed", reason, false)
+        .await;
+    None
 }
 
 pub(super) fn should_render_canonical_bzz_frame(metadata: &BzzMetadata) -> bool {
@@ -946,7 +924,8 @@ pub(super) async fn download_bzz_resource(
         return;
     }
 
-    if entries.len() > 1 {
+    let collection = entries.len() > 1;
+    let (bytes, mime, filename) = if collection {
         weeb3
             .update_progress(
                 &progress_id,
@@ -955,48 +934,37 @@ pub(super) async fn download_bzz_resource(
                 &format!("{} files", entries.len()),
             )
             .await;
-        if let Some(bytes) = tar_entries(&entries)
-            && let Some(url) = blob_url(&bytes, "application/x-tar")
-        {
-            click_download_url(url, &fallback_filename);
-            weeb3
-                .finish_progress(
-                    &progress_id,
-                    "complete",
-                    &format!("{} bytes", bytes.len()),
-                    true,
-                )
-                .await;
-            return;
-        }
-
+        (
+            tar_entries(&entries),
+            "application/x-tar".to_string(),
+            fallback_filename,
+        )
+    } else {
+        let (bytes, mime, path) = entries.into_iter().next().unwrap();
+        (Some(bytes), mime, result_filename(&path, &fallback_filename))
+    };
+    if let Some(bytes) = bytes
+        && let Some(url) = blob_url(&bytes, &mime)
+    {
+        click_download_url(url, &filename);
         weeb3
-            .finish_progress(&progress_id, "failed", "tar creation failed", false)
+            .finish_progress(
+                &progress_id,
+                "complete",
+                &format!("{} bytes", bytes.len()),
+                true,
+            )
             .await;
-        render_text_result("Could not create collection download");
-        return;
-    }
-
-    let (bytes, mime, path) = entries.into_iter().next().unwrap();
-    let filename = result_filename(&path, &fallback_filename);
-    match blob_url(&bytes, &mime) {
-        Some(url) => {
-            click_download_url(url, &filename);
-            weeb3
-                .finish_progress(
-                    &progress_id,
-                    "complete",
-                    &format!("{} bytes", bytes.len()),
-                    true,
-                )
-                .await;
-        }
-        None => {
-            weeb3
-                .finish_progress(&progress_id, "failed", "blob creation failed", false)
-                .await;
-            render_text_result("Could not create file download");
-        }
+    } else {
+        let (detail, message) = if collection {
+            ("tar creation failed", "Could not create collection download")
+        } else {
+            ("blob creation failed", "Could not create file download")
+        };
+        weeb3
+            .finish_progress(&progress_id, "failed", detail, false)
+            .await;
+        render_text_result(message);
     }
 }
 
@@ -1009,14 +977,12 @@ pub(super) fn render_canonical_bzz_frame(
 ) {
     let document = interface_document();
 
-    let wrapper = match document.create_element("div") {
-        Ok(wrapper) => wrapper,
-        Err(_) => return,
+    let Ok(wrapper) = document.create_element("div") else {
+        return;
     };
 
-    let download = match document.create_element("button") {
-        Ok(download) => download,
-        Err(_) => return,
+    let Ok(download) = document.create_element("button") else {
+        return;
     };
     let filename = if metadata.path.is_empty() {
         "index.html"
@@ -1043,9 +1009,8 @@ pub(super) fn render_canonical_bzz_frame(
         });
     });
     let _ = download.add_event_listener_with_callback("click", callback.as_ref().unchecked_ref());
-    let frame = match document.create_element("iframe") {
-        Ok(frame) => frame,
-        Err(_) => return,
+    let Ok(frame) = document.create_element("iframe") else {
+        return;
     };
     let _ = frame.set_attribute("srcdoc", &srcdoc_with_base(index_html, &frame_url));
     let _ = frame.set_attribute("data-src", &frame_url);
