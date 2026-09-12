@@ -66,15 +66,13 @@ pub struct SecureFeedUpdate {
     pub stamp: Vec<u8>,
 }
 
-async fn worker_vault_call(method: &str, populate: impl FnOnce(&Object)) -> Option<JsValue> {
-    let request = Object::new();
+async fn worker_vault_call(method: &str, request: Object) -> Option<JsValue> {
     set_js_string(&request, "method", method);
     set_js_number(
         &request,
         "networkId",
         active_profile().swarm_network_id as f64,
     );
-    populate(&request);
     let call = Reflect::get(&js_sys::global(), &JsValue::from_str("weeb3VaultCall"))
         .ok()?
         .dyn_into::<Function>()
@@ -89,13 +87,13 @@ async fn worker_vault_call(method: &str, populate: impl FnOnce(&Object)) -> Opti
 }
 
 pub(crate) async fn worker_cheques_active() -> bool {
-    worker_vault_call("chequesActive", |_| {})
+    worker_vault_call("chequesActive", Object::new())
         .await
         .is_some_and(|response| bool_prop(&response, "active"))
 }
 
 pub(crate) async fn worker_price_oracle() -> Option<(U256, U256)> {
-    let response = worker_vault_call("priceOracle", |_| {}).await?;
+    let response = worker_vault_call("priceOracle", Object::new()).await?;
     let price = exact_u256_prop(&response, "price")?;
     let deduction = exact_u256_prop(&response, "chequeDeduction")?;
     (!price.is_zero()).then_some((price, deduction))
@@ -196,7 +194,7 @@ pub async fn secure_batch_state_for_wallet(
 }
 
 pub async fn secure_ensure_authorized() -> bool {
-    worker_vault_call("ensureAuthorized", |_| {})
+    worker_vault_call("ensureAuthorized", Object::new())
         .await
         .is_some_and(|response| bool_prop(&response, "authorized"))
 }
@@ -302,10 +300,9 @@ pub async fn secure_commit_batch_purchase_and_verify(
 }
 
 pub async fn secure_stamp_chunk(chunk_address: &[u8]) -> (Vec<u8>, bool) {
-    let response = worker_vault_call("stampChunk", |request| {
-        set_js(request, "chunkAddress", bytes_value(chunk_address));
-    })
-    .await;
+    let request = Object::new();
+    set_js(&request, "chunkAddress", bytes_value(chunk_address));
+    let response = worker_vault_call("stampChunk", request).await;
     response.map_or((vec![], false), |response| {
         (
             bytes_prop(&response, "stamp"),
@@ -337,7 +334,7 @@ async fn secure_stamp_chunk_in_window(chunk_address: Uint8Array) -> (Vec<u8>, bo
 }
 
 pub async fn secure_reset_stamp() -> bool {
-    worker_vault_call("resetStamp", |_| {}).await.is_some()
+    worker_vault_call("resetStamp", Object::new()).await.is_some()
 }
 
 async fn secure_reset_stamp_in_window() -> bool {
@@ -354,7 +351,7 @@ async fn secure_reset_stamp_in_window() -> bool {
 }
 
 pub async fn secure_ensure_feed_owner() -> Option<Vec<u8>> {
-    let response = worker_vault_call("ensureFeedOwner", |_| {}).await?;
+    let response = worker_vault_call("ensureFeedOwner", Object::new()).await?;
     let owner = bytes_prop(&response, "feedOwnerAddress");
     (!owner.is_empty()).then_some(owner)
 }
@@ -375,15 +372,14 @@ pub async fn secure_create_feed_update_soc_with_stamp(
     wallet_owner: Option<String>,
 ) -> Option<SecureFeedUpdate> {
     let vault_feed_index = exact_js_feed_index(feed_index)?;
-    let response = worker_vault_call("createFeedUpdateSocWithStamp", |request| {
-        set_js_string(request, "topic", &topic);
-        set_js_number(request, "feedIndex", vault_feed_index);
-        set_js(request, "wrappedContent", bytes_value(&wrapped_content));
-        if let Some(owner) = wallet_owner {
-            set_js_string(request, "walletOwner", owner);
-        }
-    })
-    .await?;
+    let request = Object::new();
+    set_js_string(&request, "topic", &topic);
+    set_js_number(&request, "feedIndex", vault_feed_index);
+    set_js(&request, "wrappedContent", bytes_value(&wrapped_content));
+    if let Some(owner) = wallet_owner {
+        set_js_string(&request, "walletOwner", owner);
+    }
+    let response = worker_vault_call("createFeedUpdateSocWithStamp", request).await?;
     Some(SecureFeedUpdate {
         bucket_full: bool_prop(&response, "bucketFull"),
         soc_chunk: bytes_prop(&response, "socChunk"),

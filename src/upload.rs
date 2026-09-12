@@ -1210,7 +1210,7 @@ pub async fn push_chunk(
                 peers_map
                     .iter()
                     .filter(|(_, id)| !skiplist.contains(id))
-                    .max_by_key(|(overlay, _)| get_proximity(&caddr, overlay))
+                    .max_by_key(|(overlay, _)| get_proximity(&caddr, *overlay))
                     .map(|(overlay, id)| (*id, price(get_proximity(overlay, &caddr))))
             };
 

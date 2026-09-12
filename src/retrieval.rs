@@ -12,7 +12,7 @@ use crate::{
         FeedProbe, seek_sequence_feed_frontier,
         seek_sequence_feed_frontier_bounded_observing_positive,
     },
-    get_feed_address, get_proximity, mpsc, price, reserve,
+    get_feed_address, mpsc, oneshot, price, reserve,
     retrieval_conventions::SingleflightRegistry,
     retrieval_conventions::{
         RetrieveAdmission, RetrieveHedgeDemand, SharedRetrieveHedgeDemand,
@@ -29,6 +29,7 @@ use bytes::Bytes;
 use std::{
     cell::RefCell,
     collections::{VecDeque, hash_map::Entry},
+    ops::Range,
     rc::Rc,
 };
 
@@ -42,11 +43,7 @@ const RETRIEVE_CHUNK_MAX_ATTEMPT_ERRORS: usize = 20;
 const RETRIEVE_DATA_GROUP_CONCURRENCY: usize = 8;
 const RETRIEVE_DECODED_CHUNK_CACHE_ENTRIES: usize = 2048;
 
-struct RetrieveAttemptResult {
-    chunk: Vec<u8>,
-    valid: bool,
-    soc: bool,
-}
+type RetrieveAttemptResult = Option<(Vec<u8>, bool)>;
 
 struct ReservedRetrievePeer {
     peer: PeerId,
@@ -69,14 +66,8 @@ async fn select_retrieve_peer(
     physical_connections: &PhysicalConnectionMap,
     skiplist: &mut HashMap<PeerId, bool>,
 ) -> Option<ReservedRetrievePeer> {
-    let mut candidates: Vec<_> = peers
-        .lock()
-        .await
-        .iter()
-        .map(|(overlay, id)| (*id, get_proximity(caddr, overlay)))
-        .collect();
-    candidates.sort_unstable_by_key(|(_, proximity)| std::cmp::Reverse(*proximity));
-    for (peer, proximity) in candidates {
+    let peers = peers.lock().await.clone();
+    for (peer, proximity) in crate::closest_overlay_peers(&peers, caddr) {
         let Entry::Vacant(entry) = skiplist.entry(peer) else {
             continue;
         };
@@ -119,26 +110,16 @@ fn reset_overdraft(skiplist: &mut HashMap<PeerId, bool>) -> bool {
     previous_len != skiplist.len()
 }
 
-fn failed_retrieve_attempt() -> RetrieveAttemptResult {
-    RetrieveAttemptResult {
-        chunk: vec![],
-        valid: false,
-        soc: false,
-    }
-}
-
 fn record_retrieve_attempt_result(
     result: RetrieveAttemptResult,
     in_flight: &mut usize,
     error_count: &mut usize,
 ) -> Option<(Vec<u8>, bool)> {
     *in_flight = in_flight.saturating_sub(1);
-    if result.valid {
-        Some((result.chunk, result.soc))
-    } else {
+    if result.is_none() {
         *error_count += 1;
-        None
     }
+    result
 }
 
 async fn settle_retrieve_attempt(
@@ -152,16 +133,12 @@ async fn settle_retrieve_attempt(
         let (chunk_valid, soc) = verify_chunk(&caddr, &chunk);
         if chunk_valid {
             apply_credit(&accounting_peer, req_price, &refresh_chan).await;
-            return RetrieveAttemptResult {
-                chunk,
-                valid: true,
-                soc,
-            };
+            return Some((chunk, soc));
         }
     }
 
     cancel_reserve(&accounting_peer, req_price).await;
-    failed_retrieve_attempt()
+    None
 }
 
 async fn retrieve_attempt(
@@ -270,16 +247,20 @@ struct DecodedChunkCache {
 }
 
 impl DecodedChunkCache {
+    fn touch(&mut self, reference: &[u8]) -> Option<(Bytes, &mut CachedJoinChunk)> {
+        self.generation = self.generation.wrapping_add(1);
+        let cache_key = self.chunks.get_key_value(reference)?.0.clone();
+        let entry = self.chunks.get_mut(reference)?;
+        entry.generation = self.generation;
+        Some((cache_key, entry))
+    }
+
     fn get_decoded(
         &mut self,
         reference: &[u8],
         include_raw: bool,
     ) -> Option<(DecodedJoinChunk, Option<Bytes>)> {
-        self.generation = self.generation.wrapping_add(1);
-        let generation = self.generation;
-        let cache_key = self.chunks.get_key_value(reference)?.0.clone();
-        let entry = self.chunks.get_mut(reference)?;
-        entry.generation = generation;
+        let (cache_key, entry) = self.touch(reference)?;
         if entry.decoded.is_none() {
             entry.decoded = entry
                 .raw
@@ -288,18 +269,14 @@ impl DecodedChunkCache {
         }
         let decoded = entry.decoded.clone();
         let raw = include_raw.then(|| entry.raw.clone()).flatten();
-        self.finish_touch(cache_key, generation);
+        self.finish_touch(cache_key);
         Some((decoded?, raw))
     }
 
     fn get_raw(&mut self, reference: &[u8]) -> Option<Bytes> {
-        self.generation = self.generation.wrapping_add(1);
-        let generation = self.generation;
-        let cache_key = self.chunks.get_key_value(reference)?.0.clone();
-        let entry = self.chunks.get_mut(reference)?;
-        entry.generation = generation;
+        let (cache_key, entry) = self.touch(reference)?;
         let raw = entry.raw.clone();
-        self.finish_touch(cache_key, generation);
+        self.finish_touch(cache_key);
         raw
     }
 
@@ -318,30 +295,27 @@ impl DecodedChunkCache {
         decoded: Option<DecodedJoinChunk>,
     ) {
         self.generation = self.generation.wrapping_add(1);
-        let generation = self.generation;
         let entry = self.chunks.entry(Bytes::from(reference));
         let cache_key = entry.key().clone();
         let cached = entry.or_default();
         cached.raw = cached.raw.take().or(raw);
         cached.decoded = decoded.or(cached.decoded.take());
-        cached.generation = generation;
-        self.finish_touch(cache_key, generation);
+        cached.generation = self.generation;
+        self.finish_touch(cache_key);
     }
 
-    fn finish_touch(&mut self, reference: Bytes, generation: u64) {
+    fn finish_touch(&mut self, reference: Bytes) {
         self.compact_order_if_needed();
-        self.order.push_back((reference, generation));
+        self.order.push_back((reference, self.generation));
 
         while self.chunks.len() > RETRIEVE_DECODED_CHUNK_CACHE_ENTRIES {
             let Some((expired, expired_generation)) = self.order.pop_front() else {
                 break;
             };
-            if self
-                .chunks
-                .get(&expired)
-                .is_some_and(|entry| entry.generation == expired_generation)
+            if let Entry::Occupied(entry) = self.chunks.entry(expired)
+                && entry.get().generation == expired_generation
             {
-                self.chunks.remove(&expired);
+                entry.remove();
             }
         }
     }
@@ -639,7 +613,7 @@ impl<'a> RawFetchQueue<'a> {
             return;
         }
 
-        let (chan_out, chan_in) = mpsc::bounded::<Vec<u8>>(1);
+        let (chan_out, chan_in) = oneshot::channel();
         let completion_key = registration.key;
         if self
             .chunks
@@ -658,7 +632,7 @@ impl<'a> RawFetchQueue<'a> {
 
         // The detached producer lets dispatched exchanges settle after callers leave.
         wasm_bindgen_futures::spawn_local(async move {
-            let chunk = chan_in.recv().await.unwrap_or_default();
+            let chunk = chan_in.await.unwrap_or_default();
             complete_raw_fetch(&completion_key, flight_id, chunk);
         });
     }
@@ -900,11 +874,11 @@ pub(crate) async fn retrieve_decoded_data_root_cancellable(
     Some(root)
 }
 
-fn padded_rs_shard(chunk: &[u8]) -> Option<Vec<u8>> {
+fn padded_rs_shard(chunk: Bytes) -> Option<Vec<u8>> {
     if !(erasure_coding::SPAN_SIZE..=CHUNK_WITH_SPAN_SIZE).contains(&chunk.len()) {
         return None;
     }
-    let mut chunk = chunk.to_vec();
+    let mut chunk = Vec::from(chunk);
     chunk.resize(CHUNK_WITH_SPAN_SIZE, 0);
     Some(chunk)
 }
@@ -1013,7 +987,7 @@ fn settle_data_group_result(
     data_count: usize,
     data_references: &[Bytes],
     parity_present: bool,
-    requested_mask: &[bool],
+    requested_indices: &Range<usize>,
     requested_ready: &mut [bool],
     received_shards: &mut [Option<Bytes>],
     successes: &mut usize,
@@ -1029,12 +1003,11 @@ fn settle_data_group_result(
     }
 
     let result_index = result.index;
-    let result_chunk = result.chunk.clone();
-    *received_shards.get_mut(result_index)? = Some(result.chunk);
+    let result_chunk = received_shards.get_mut(result_index)?.insert(result.chunk);
     *successes = successes.checked_add(1)?;
 
     if result_index < data_count
-        && *requested_mask.get(result_index)?
+        && requested_indices.contains(&result_index)
         && !*requested_ready.get(result_index)?
     {
         let reference = data_references.get(result_index)?;
@@ -1044,7 +1017,7 @@ fn settle_data_group_result(
                 cached_decoded_chunk(reference)
             })?
         } else {
-            decode_shared_raw_join_chunk(result_chunk, reference)?
+            decode_shared_raw_join_chunk(result_chunk.clone(), reference)?
         };
         child_emitter.emit(result_index, chunk);
         requested_ready[result_index] = true;
@@ -1057,7 +1030,7 @@ async fn fetch_data_group_indices_streaming(
     data_references: Vec<Bytes>,
     parity_references: Vec<Bytes>,
     encrypted: bool,
-    requested_indices: Vec<usize>,
+    requested_indices: Range<usize>,
     chunk_retrieve_chan: &ChunkRetrieveSender,
     cancel: Option<RetrieveCancelToken>,
     child_emitter: GroupChildEmitter,
@@ -1085,10 +1058,6 @@ async fn fetch_data_group_indices_streaming(
     }
 
     let requested_count = requested_indices.len();
-    let mut requested_mask = vec![false; data_count];
-    for &index in &requested_indices {
-        requested_mask[index] = true;
-    }
 
     let (result_out, result_in) = mpsc::unbounded::<RawFetchResult>();
     let mut raw_fetches = RawFetchQueue::new(chunk_retrieve_chan, &result_out, &cancel);
@@ -1102,7 +1071,7 @@ async fn fetch_data_group_indices_streaming(
     let mut unresolved_count = 0usize;
     if static_rolling_candidate {
         cached_requested.reserve(requested_count);
-        for &index in &requested_indices {
+        for index in requested_indices.clone() {
             let cached = requested_shard_cache(&data_references[index]);
             match &cached {
                 RequestedShardCache::DecodedAndRaw { .. } => {}
@@ -1154,7 +1123,7 @@ async fn fetch_data_group_indices_streaming(
     } else {
         // Partial groups inspect, emit, and dispatch each requested child in order without
         // cloning or validating an unneeded cached raw basis.
-        for &index in &requested_indices {
+        for index in requested_indices.clone() {
             let reference = &data_references[index];
             if let Some(chunk) = cached_decoded_chunk(reference) {
                 child_emitter.emit(index, chunk);
@@ -1192,7 +1161,7 @@ async fn fetch_data_group_indices_streaming(
                     data_count,
                     &data_references,
                     !parity_references.is_empty(),
-                    &requested_mask,
+                    &requested_indices,
                     &mut requested_ready,
                     &mut received_shards,
                     &mut successes,
@@ -1204,8 +1173,8 @@ async fn fetch_data_group_indices_streaming(
         }
 
         let all_requested_ready = requested_indices
-            .iter()
-            .all(|&index| requested_ready[index]);
+            .clone()
+            .all(|index| requested_ready[index]);
         let terminal = all_requested_ready || (recovery_dispatched && successes >= data_count);
         if terminal {
             raw_fetches.close();
@@ -1347,7 +1316,7 @@ async fn fetch_data_group_indices_streaming(
             data_count,
             &data_references,
             !parity_references.is_empty(),
-            &requested_mask,
+            &requested_indices,
             &mut requested_ready,
             &mut received_shards,
             &mut successes,
@@ -1364,8 +1333,6 @@ async fn fetch_data_group_indices_streaming(
     }
 
     let missing_indices = requested_indices
-        .iter()
-        .copied()
         .filter(|&index| !requested_ready[index])
         .collect::<Vec<_>>();
     if missing_indices.is_empty() {
@@ -1373,7 +1340,7 @@ async fn fetch_data_group_indices_streaming(
     }
     let mut reconstructed_shards = received_shards
         .into_iter()
-        .map(|chunk| chunk.as_ref().and_then(|chunk| padded_rs_shard(chunk)))
+        .map(|chunk| chunk.and_then(padded_rs_shard))
         .collect::<Vec<_>>();
     reconstruct_data_indices(&mut reconstructed_shards, data_count, &missing_indices).ok()?;
 
@@ -1566,7 +1533,7 @@ async fn retrieve_data_range_from_root_with_prefix_cancellable(
             if first_index > last_index {
                 return None;
             }
-            let requested_indices = (first_index..=last_index).collect::<Vec<_>>();
+            let requested_indices = first_index..last_index + 1;
             let sender = chunk_retrieve_chan.clone();
             let group_cancel = cancel.clone();
             let emitter = GroupChildEmitter {
@@ -1961,11 +1928,9 @@ pub async fn retrieve_check_chunk(
             None,
         )
         .await;
-        if result.valid {
+        if let Some(result) = result {
             successes += 1;
-            if retrieved.is_none() {
-                retrieved = Some((result.chunk, result.soc));
-            }
+            retrieved.get_or_insert(result);
         } else {
             error_count += 1;
         }
@@ -2026,7 +1991,7 @@ async fn get_feed_probe_chunk(
 ) -> FeedProbe<Vec<u8>> {
     let admission = RetrieveAdmission::new();
     let _close_admission = admission.close_on_drop();
-    let (chan_out, chan_in) = mpsc::bounded::<Vec<u8>>(1);
+    let (chan_out, chan_in) = oneshot::channel();
     if chunk_retrieve_chan
         .try_send(crate::ChunkRetrieveRequest {
             address: data_address,
@@ -2040,7 +2005,7 @@ async fn get_feed_probe_chunk(
         return FeedProbe::Transient;
     }
 
-    match chan_in.recv().await {
+    match chan_in.await {
         Ok(payload) if !payload.is_empty() => FeedProbe::Found(payload),
         Ok(_) => FeedProbe::Missing,
         Err(_) => FeedProbe::Transient,

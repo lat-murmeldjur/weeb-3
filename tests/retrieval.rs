@@ -50,11 +50,11 @@ mod connection {
             .expect("retrieve peer selector end");
         let selection = &retrieval[selection_start..selection_end];
         let runtime = crate::RUNTIME_SOURCE;
-        assert!(runtime.contains("type OverlayPeerMap = Arc<Mutex<HashMap<Vec<u8>, PeerId>>>"));
+        assert!(runtime.contains("type OverlayPeerMap = Arc<Mutex<Arc<BTreeMap<[u8; 32], PeerId>>>>"));
         assert!(runtime.contains("overlay_peers: OverlayPeerMap"));
-        assert!(selection.contains("(*id, get_proximity(caddr, overlay))"));
+        assert!(selection.contains("let peers = peers.lock().await.clone();"));
         assert!(selection.contains("let req_price = price(proximity);"));
-        assert!(selection.contains("std::cmp::Reverse(*proximity)"));
+        assert!(selection.contains("closest_overlay_peers(&peers, caddr)"));
         assert!(selection.contains("let Entry::Vacant(entry) = skiplist.entry(peer) else"));
         assert!(selection.contains("let permanent_skip = entry.insert(true);"));
         assert!(!selection.contains("task::sleep"));
@@ -245,7 +245,7 @@ mod connection {
             .and_then(|source| source.split("let swarm_event_loop = async").next())
             .expect("peer dial feeder");
         assert!(feeder.contains("peers_instructions_chan_incoming.recv()"));
-        assert!(feeder.contains("unavailable.contains(&candidate.peer)"));
+        assert!(feeder.contains("cooldowns.contains(&candidate.peer)"));
         assert!(feeder.contains("queue.push_front(candidate)"));
         assert!(feeder.find("changed.listen()").unwrap()
             < feeder.find("try_reserve_connection_capacity(").unwrap());
@@ -498,7 +498,7 @@ mod connection {
         let private_check = runtime
             .split("fn is_private_or_local_bootnode(")
             .nth(1)
-            .and_then(|source| source.split("pub(crate) fn chunk_retrieve_request(").next())
+            .and_then(|source| source.split("pub(crate) struct BzzRangeRequest").next())
             .expect("private bootnode classification");
         for classification in [
             "address.is_private()",
@@ -574,7 +574,7 @@ mod connection {
             .find("remove_connection_attempt(wings, &peer, peer_file.connection_attempt_id)")
             .expect("owned reservation transfer");
         let overlay_publish = promotion
-            .find("overlay_peers_map.insert(peer_file.overlay.clone(), peer)")
+            .find("Arc::make_mut(&mut overlay_peers_map).insert(peer_file.overlay, peer)")
             .expect("overlay publication");
         let population_transfer = promotion
             .find("complete_connection_reservation(")

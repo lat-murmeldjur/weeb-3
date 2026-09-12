@@ -825,7 +825,8 @@ mod feed_frontier {
         assert!(feed_probe.contains("admission: Some(admission.clone()),"));
         assert!(feed_probe.contains(".is_err()"));
         assert!(feed_probe.contains("return FeedProbe::Transient;"));
-        assert!(feed_probe.contains("chan_in.recv().await"));
+        assert!(feed_probe.contains("let (chan_out, chan_in) = oneshot::channel();"));
+        assert!(feed_probe.contains("match chan_in.await {"));
         assert!(feed_probe.contains("Ok(_) => FeedProbe::Missing"));
         assert!(feed_probe.contains("Err(_) => FeedProbe::Transient"));
         assert!(!feed_probe.contains("retained"));

@@ -15,6 +15,7 @@ use libp2p::{
     },
 };
 use std::{
+    collections::BTreeMap,
     ops::{Deref, DerefMut},
     task::{Context, Poll},
 };
@@ -167,7 +168,7 @@ impl Weeb3 {
         }
 
         wings.connected_peers.lock().await.clear();
-        wings.overlay_peers.lock().await.clear();
+        *wings.overlay_peers.lock().await = Arc::default();
         wings.connection_attempts.lock().await.clear();
         wings.connection_cooldowns.lock().await.clear();
         wings.accounting_peers.lock().await.clear();
@@ -208,7 +209,7 @@ impl Weeb3 {
             let mut overlay_peers_map = wings.overlay_peers.lock().await;
             match overlay_peers_map.get(&peer_file.overlay) {
                 None => {
-                    overlay_peers_map.insert(peer_file.overlay.clone(), peer);
+                    Arc::make_mut(&mut overlay_peers_map).insert(peer_file.overlay, peer);
                     (true, None)
                 }
                 Some(owner) if owner == &peer => (false, None),
@@ -504,7 +505,30 @@ impl Drop for SharedSwarmGuard<'_> {
     }
 }
 
-pub(crate) type OverlayPeerMap = Arc<Mutex<HashMap<Vec<u8>, PeerId>>>;
+pub(crate) type OverlayPeerMap = Arc<Mutex<Arc<BTreeMap<[u8; 32], PeerId>>>>;
+
+pub(crate) fn closest_overlay_peers<'a>(
+    peers: &'a BTreeMap<[u8; 32], PeerId>,
+    address: &'a [u8],
+) -> impl Iterator<Item = (PeerId, u8)> + 'a {
+    use std::ops::Bound::{Excluded, Included, Unbounded};
+
+    let candidate = move |(overlay, peer): (&[u8; 32], &PeerId)| {
+        (*peer, get_proximity(address, overlay))
+    };
+    let mut before = peers
+        .range::<[u8], _>((Unbounded, Included(address)))
+        .rev().map(candidate).peekable();
+    let mut after = peers
+        .range::<[u8], _>((Excluded(address), Unbounded))
+        .map(candidate).peekable();
+    std::iter::from_fn(move || match (before.peek(), after.peek()) {
+        (Some(left), Some(right)) if left.1 >= right.1 => before.next(),
+        (Some(_), None) => before.next(),
+        _ => after.next(),
+    })
+}
+
 pub(crate) type PeerAccountingMap = Arc<Mutex<HashMap<PeerId, Arc<Mutex<PeerAccounting>>>>>;
 pub(crate) type PhysicalConnectionMap =
     Arc<std::sync::Mutex<HashMap<PeerId, HashSet<ConnectionId>>>>;

@@ -6,80 +6,50 @@ impl Weeb3 {
     }
 
     pub(super) async fn retrieve_raw(&self, address: String, chunk: bool) -> Vec<u8> {
-        let progress_id = self
-            .start_progress(
-                if chunk { "chunk" } else { "bytes" },
-                address.clone(),
-                "retrieve",
-                None,
-                "starting",
-            )
-            .await;
+        let progress_id = self.progress.lock().await.start(
+            if chunk { "chunk" } else { "bytes" },
+            address.clone(),
+            "retrieve",
+            None,
+            "starting",
+        );
         let valaddr = match hex::decode(&address) {
             Ok(hex) => hex,
             Err(_) => {
-                self.finish_progress(&progress_id, "failed", "invalid reference", false)
-                    .await;
+                self.progress.lock().await.finish(
+                    &progress_id,
+                    "failed",
+                    "invalid reference",
+                    false,
+                );
                 return vec![];
             }
         };
 
         let bytes = if chunk {
-            let (chan_out, chan_in) = mpsc::bounded::<Vec<u8>>(1);
+            let (chan_out, chan_in) = oneshot::channel();
             let _ = self
                 .chunk_port
                 .0
-                .try_send(chunk_retrieve_request(valaddr, chan_out));
-            chan_in.recv().await.unwrap_or_default()
+                .try_send(ChunkRetrieveRequest {
+                    address: valaddr,
+                    chan: chan_out,
+                    cancel: None,
+                    admission: None,
+                    hedge_demand: None,
+                });
+            chan_in.await.unwrap_or_default()
         } else {
             retrieve_data(&valaddr, &self.chunk_port.0).await
         };
         let ok = !bytes.is_empty();
-        self.finish_progress(
+        self.progress.lock().await.finish(
             &progress_id,
             if ok { "complete" } else { "failed" },
             format!("{} bytes", bytes.len()),
             ok,
-        )
-        .await;
+        );
         bytes
-    }
-
-    pub(crate) async fn start_progress(
-        &self,
-        kind: impl Into<String>,
-        subject: impl Into<String>,
-        phase: impl Into<String>,
-        percent: Option<u8>,
-        detail: impl Into<String>,
-    ) -> String {
-        self.progress
-            .lock()
-            .await
-            .start(kind, subject, phase, percent, detail)
-    }
-
-    pub(crate) async fn update_progress(
-        &self,
-        id: &str,
-        phase: impl Into<String>,
-        percent: Option<u8>,
-        detail: impl Into<String>,
-    ) {
-        self.progress
-            .lock()
-            .await
-            .update(id, phase, percent, detail);
-    }
-
-    pub(crate) async fn finish_progress(
-        &self,
-        id: &str,
-        phase: impl Into<String>,
-        detail: impl Into<String>,
-        ok: bool,
-    ) {
-        self.progress.lock().await.finish(id, phase, detail, ok);
     }
 
     pub(crate) async fn get_progress_snapshot(
@@ -264,23 +234,10 @@ pub(crate) fn chunk_retrieve_channel() -> (ChunkRetrieveSender, ChunkRetrieveRec
 
 pub(crate) struct ChunkRetrieveRequest {
     pub address: Vec<u8>,
-    pub chan: mpsc::Sender<Vec<u8>>,
+    pub chan: oneshot::Sender<Vec<u8>>,
     pub cancel: Option<RetrieveCancelToken>,
     pub admission: Option<retrieval_conventions::RetrieveAdmission>,
     pub hedge_demand: Option<retrieval_conventions::SharedRetrieveHedgeDemand>,
-}
-
-pub(crate) fn chunk_retrieve_request(
-    address: Vec<u8>,
-    chan: mpsc::Sender<Vec<u8>>,
-) -> ChunkRetrieveRequest {
-    ChunkRetrieveRequest {
-        address,
-        chan,
-        cancel: None,
-        admission: None,
-        hedge_demand: None,
-    }
 }
 
 pub(crate) struct BzzRangeRequest {

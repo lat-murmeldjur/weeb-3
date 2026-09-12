@@ -132,27 +132,20 @@ pub fn fork_prefix(fork: &[u8]) -> &[u8] {
 }
 
 pub fn ordered_indexed_forks(mut forks: Vec<Vec<u8>>) -> Option<(Vec<Vec<u8>>, [u8; 32])> {
-    if forks.iter().any(|fork| {
-        let prefix = fork_prefix(fork);
-        prefix.is_empty() || prefix.len() > MANTARAY_PREFIX_MAX_BYTES
-    }) {
-        return None;
-    }
-
-    forks.sort_by(|left, right| fork_prefix(left).cmp(fork_prefix(right)));
-    if forks
-        .windows(2)
-        .any(|pair| fork_prefix(&pair[0])[0] == fork_prefix(&pair[1])[0])
-    {
-        return None;
-    }
-
+    let mut ordered = [const { None }; 256];
     let mut index = [0_u8; 32];
-    for fork in &forks {
-        let key = fork_prefix(fork)[0];
-        index[(key / 8) as usize] |= 1 << (key % 8);
+    for fork in forks.drain(..) {
+        let prefix = fork_prefix(&fork);
+        if prefix.is_empty() || prefix.len() > MANTARAY_PREFIX_MAX_BYTES {
+            return None;
+        }
+        let key = prefix[0] as usize;
+        if ordered[key].replace(fork).is_some() {
+            return None;
+        }
+        index[key / 8] |= 1 << (key % 8);
     }
-
+    forks.extend(ordered.into_iter().flatten());
     Some((forks, index))
 }
 

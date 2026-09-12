@@ -13,11 +13,120 @@ use web3::types::Address;
 
 #[inline]
 pub(crate) fn keccak256(input: impl AsRef<[u8]>) -> [u8; 32] {
-    web3::signing::keccak256(input.as_ref())
+    keccak256_bytes(input.as_ref())
 }
 
 pub(crate) fn eip191_hash_message(message: &[u8]) -> [u8; 32] {
-    web3::signing::hash_message(message).0
+    let mut prefixed = format!("\x19Ethereum Signed Message:\n{}", message.len()).into_bytes();
+    prefixed.extend_from_slice(message);
+    keccak256(prefixed)
+}
+
+pub(crate) fn namehash(name: &str) -> [u8; 32] {
+    if name.is_empty() {
+        return [0; 32];
+    }
+    name.rsplit('.').fold([0; 32], |node, label| {
+        keccak256([node, keccak256(label.as_bytes())].as_flattened())
+    })
+}
+
+// Keccak-f[1600] steps follow the Keccak Team summary:
+// https://keccak.team/keccak_specs_summary.html
+// Rotation cycle and round constants cross-checked with tiny-keccak 2.0.2 (CC0).
+const KECCAK_ROUND: [u64; 24] = [
+    0x0000000000000001,
+    0x0000000000008082,
+    0x800000000000808a,
+    0x8000000080008000,
+    0x000000000000808b,
+    0x0000000080000001,
+    0x8000000080008081,
+    0x8000000000008009,
+    0x000000000000008a,
+    0x0000000000000088,
+    0x0000000080008009,
+    0x000000008000000a,
+    0x000000008000808b,
+    0x800000000000008b,
+    0x8000000000008089,
+    0x8000000000008003,
+    0x8000000000008002,
+    0x8000000000000080,
+    0x000000000000800a,
+    0x800000008000000a,
+    0x8000000080008081,
+    0x8000000000008080,
+    0x0000000080000001,
+    0x8000000080008008,
+];
+const KECCAK_ROTATION: [u32; 24] = [
+    1, 3, 6, 10, 15, 21, 28, 36, 45, 55, 2, 14, 27, 41, 56, 8, 25, 43, 62, 18, 39, 61, 20, 44,
+];
+const KECCAK_POSITION: [usize; 24] = [
+    10, 7, 11, 17, 18, 3, 5, 16, 8, 21, 24, 4, 15, 23, 19, 13, 12, 2, 20, 14, 22, 9, 6, 1,
+];
+
+#[inline(never)]
+fn keccak_permute(state: &mut [u64; 25]) {
+    for &constant in &KECCAK_ROUND {
+        let mut columns = [0; 5];
+        for x in 0..5 {
+            columns[x] = state[x] ^ state[x + 5] ^ state[x + 10] ^ state[x + 15] ^ state[x + 20];
+        }
+        for row in state.chunks_exact_mut(5) {
+            for x in 0..5 {
+                row[x] ^= columns[(x + 4) % 5] ^ columns[(x + 1) % 5].rotate_left(1);
+            }
+        }
+        let mut previous = state[1];
+        macro_rules! rotate {
+            ($($index:literal),*) => {$({
+                let next = state[KECCAK_POSITION[$index]];
+                state[KECCAK_POSITION[$index]] = previous.rotate_left(KECCAK_ROTATION[$index]);
+                previous = next;
+            })*};
+        }
+        rotate!(
+            0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22,
+            23
+        );
+        let _ = previous;
+        for row in state.chunks_exact_mut(5) {
+            let original = [row[0], row[1], row[2], row[3], row[4]];
+            for x in 0..5 {
+                row[x] = original[x] ^ (!original[(x + 1) % 5] & original[(x + 2) % 5]);
+            }
+        }
+        state[0] ^= constant;
+    }
+}
+
+fn keccak256_bytes(input: &[u8]) -> [u8; 32] {
+    let mut state = [0; 25];
+    let mut blocks = input.chunks_exact(136);
+    for block in &mut blocks {
+        for (lane, bytes) in state.iter_mut().zip(block.chunks_exact(8)) {
+            *lane ^= u64::from_le_bytes(bytes.try_into().unwrap());
+        }
+        keccak_permute(&mut state);
+    }
+    let tail = blocks.remainder();
+    let full_lanes = tail.len() / 8;
+    for (lane, bytes) in state.iter_mut().zip(tail.chunks_exact(8)) {
+        *lane ^= u64::from_le_bytes(bytes.try_into().unwrap());
+    }
+    for (index, byte) in tail[full_lanes * 8..].iter().enumerate() {
+        state[full_lanes] ^= u64::from(*byte) << (index * 8);
+    }
+    state[tail.len() / 8] ^= 1u64 << ((tail.len() % 8) * 8);
+    state[16] ^= 1u64 << 63;
+    keccak_permute(&mut state);
+    let mut output = [0; 32];
+    for (bytes, lane) in output.chunks_exact_mut(8).zip(state) {
+        bytes.copy_from_slice(&lane.to_le_bytes());
+    }
+    output
 }
 
 pub(crate) fn public_key_address(key: &k256::ecdsa::VerifyingKey) -> Address {
@@ -50,7 +159,7 @@ pub(crate) fn bee_replica_address(id: &[u8; HASH_SIZE]) -> [u8; HASH_SIZE] {
 #[derive(Debug, Clone)]
 pub struct PeerFile {
     pub peer_id: PeerId,
-    pub overlay: Vec<u8>,
+    pub overlay: [u8; 32],
     pub beneficiary: web3::types::Address,
     pub connection_attempt_id: usize,
     pub connection_id: ConnectionId,
@@ -76,7 +185,7 @@ pub fn try_from_multiaddr(address: &Multiaddr) -> Option<PeerId> {
 }
 
 pub fn get_proximity(one: &[u8], other: &[u8]) -> u8 {
-    let compared_bytes = usize::from(MAX_PO / 4 + 1).min(one.len()).min(other.len());
+    let compared_bytes = usize::from(MAX_PO / 8 + 1).min(one.len()).min(other.len());
     if compared_bytes == 0 {
         return 0;
     }
@@ -98,12 +207,9 @@ type BmtHash = [u8; SECTION_SIZE];
 
 fn zero_bmt_nodes() -> [BmtHash; BMT_LEVEL_COUNT] {
     let mut nodes = [[0u8; SECTION_SIZE]; BMT_LEVEL_COUNT];
-    let mut pair = [0u8; SECTION2_SIZE];
-    nodes[0] = keccak256(pair);
+    nodes[0] = keccak256([0u8; SECTION2_SIZE]);
     for level in 1..BMT_LEVEL_COUNT {
-        pair[..SECTION_SIZE].copy_from_slice(&nodes[level - 1]);
-        pair[SECTION_SIZE..].copy_from_slice(&nodes[level - 1]);
-        nodes[level] = keccak256(pair);
+        nodes[level] = keccak256([nodes[level - 1]; 2].as_flattened());
     }
     nodes
 }
@@ -424,9 +530,26 @@ mod hash_tests {
 
     #[wasm_bindgen_test]
     fn existing_keccak_backends_agree_at_rate_boundaries() {
-        for length in [0, 32, 40, 64, 135, 136, 137, CHUNK_SIZE] {
-            let input: Vec<u8> = (0..length).map(|index| index as u8).collect();
-            assert_eq!(alloy_primitives::keccak256(&input).0, keccak256(&input));
+        for length in (0..=3 * 136).chain([CHUNK_SIZE]) {
+            for input in [
+                (0..length).map(|index| index as u8).collect::<Vec<_>>(),
+                vec![0xff; length],
+            ] {
+                assert_eq!(alloy_primitives::keccak256(&input).0, keccak256(&input));
+                assert_eq!(
+                    web3::signing::hash_message(&input).0,
+                    eip191_hash_message(&input)
+                );
+            }
+        }
+        for (input, expected) in [
+            ("", "c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470"),
+            ("abc", "4e03657aea45a94fc7d47ba826c8d667c0d1e6e33a64a036ec44f58fa12d6c45"),
+        ] {
+            assert_eq!(hex::encode(keccak256(input)), expected);
+        }
+        for name in ["", "eth", "swarm.eth", "a..ETH", "é.eth", "\0.eth", "."] {
+            assert_eq!(namehash(name), web3::signing::namehash(name));
         }
     }
 }

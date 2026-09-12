@@ -1,8 +1,5 @@
 use wasm_bindgen::JsError;
-use web3::{
-    contract::Options,
-    types::{Address, U256},
-};
+use web3::types::{Address, U256};
 
 use crate::{
     network_profile::NetworkProfile,
@@ -11,6 +8,7 @@ use crate::{
         compute_initial_balance_per_chunk, get_batch_validity, last_price, postage_contract,
         token_contract, web3,
     },
+    on_chain_conventions::address_word,
     secure_vault::{
         SecureBatchState, SecurePreparedBatch, secure_batch_state_for_wallet,
         secure_commit_batch_purchase_and_verify, secure_prepare_batch_purchase,
@@ -61,7 +59,7 @@ pub(crate) async fn inspect_batch(
         .await
         .map_err(|error| format!("last price failed: {error:?}"))?;
     let token_balance = token
-        .query("balanceOf", (payer,), None, Options::default(), None)
+        .uint("balanceOf(address)", &[address_word(payer)])
         .await
         .map_err(|error| format!("token balance failed: {error:?}"))?;
     let base_balance = w3

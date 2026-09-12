@@ -3,11 +3,6 @@ use std::str::FromStr;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use wasm_bindgen::JsError;
 use web3::{
-    contract::{Contract, Options, tokens::Tokenize},
-    ethabi::{
-        ParamType::{Address as AbiAddress, Bool, FixedBytes, Uint},
-        StateMutability::{NonPayable, View},
-    },
     transports::eip_1193::{Eip1193, Provider},
     types::{Address, H256, TransactionReceipt, U256},
 };
@@ -16,7 +11,9 @@ use crate::{
     PrivateKeySigner,
     conventions::keccak256,
     network_profile::{NetworkMode, active_profile},
-    on_chain_conventions::{abi_contract, abi_function, add_buffer, confirmed_call},
+    on_chain_conventions::{
+        ChainContract, abi_bool, abi_uint, address_word, confirmed_call, uint_word,
+    },
 };
 
 #[derive(Clone, Debug)]
@@ -154,11 +151,11 @@ fn select_chequebook_factory_addr() -> &'static str {
 }
 
 pub type Web3Inst = web3::Web3<Eip1193>;
-pub type PostageContract = Contract<Eip1193>;
-pub type TokenContract = Contract<Eip1193>;
-pub type ChequebookFactory = Contract<Eip1193>;
-pub type ChequebookContract = Contract<Eip1193>;
-pub type PriceOracleContract = Contract<Eip1193>;
+pub type PostageContract = ChainContract;
+pub type TokenContract = ChainContract;
+pub type ChequebookFactory = ChainContract;
+pub type ChequebookContract = ChainContract;
+pub type PriceOracleContract = ChainContract;
 
 fn ensure_addr(s: &str) -> Result<Address, JsError> {
     Address::from_str(s).map_err(|_| JsError::new("Invalid address constant"))
@@ -199,89 +196,42 @@ async fn ensure_wallet_chain(w3: &Web3Inst) -> Result<(), JsError> {
 }
 
 pub fn postage_contract(w3: &Web3Inst) -> Result<PostageContract, JsError> {
-    let addr = ensure_addr(select_postage_contract_addr())?;
-    let abi = abi_contract([
-        abi_function("lastPrice", &[], &[Uint(64)], View),
-        abi_function("expiredBatchesExist", &[], &[Bool], View),
-        abi_function("expireLimited", &[("limit", Uint(256))], &[], NonPayable),
-        abi_function(
-            "remainingBalance",
-            &[("_batchId", FixedBytes(32))],
-            &[Uint(256)],
-            View,
-        ),
-        abi_function(
-            "createBatch",
-            &[
-                ("_owner", AbiAddress),
-                ("_initialBalancePerChunk", Uint(256)),
-                ("_depth", Uint(8)),
-                ("_bucketDepth", Uint(8)),
-                ("_nonce", FixedBytes(32)),
-                ("_immutable", Bool),
-            ],
-            &[FixedBytes(32)],
-            NonPayable,
-        ),
-    ]);
-    Ok(Contract::new(w3.eth(), addr, abi))
+    Ok(ChainContract::new(
+        w3.eth(),
+        ensure_addr(select_postage_contract_addr())?,
+    ))
 }
 
 pub fn token_contract(w3: &Web3Inst) -> Result<TokenContract, JsError> {
-    let addr = ensure_addr(select_token_contract_addr())?;
-    let abi = abi_contract([
-        abi_function("balanceOf", &[("account", AbiAddress)], &[Uint(256)], View),
-        abi_function(
-            "approve",
-            &[("spender", AbiAddress), ("amount", Uint(256))],
-            &[Bool],
-            NonPayable,
-        ),
-        abi_function(
-            "transfer",
-            &[("to", AbiAddress), ("amount", Uint(256))],
-            &[Bool],
-            NonPayable,
-        ),
-    ]);
-    Ok(Contract::new(w3.eth(), addr, abi))
+    Ok(ChainContract::new(
+        w3.eth(),
+        ensure_addr(select_token_contract_addr())?,
+    ))
 }
 
 pub fn chequebook_factory(w3: &Web3Inst) -> Result<ChequebookFactory, JsError> {
-    let addr = ensure_addr(select_chequebook_factory_addr())?;
-
-    let abi = abi_contract([abi_function(
-        "deploySimpleSwap",
-        &[
-            ("issuer", AbiAddress),
-            ("defaultHardDepositTimeoutDuration", Uint(256)),
-            ("salt", FixedBytes(32)),
-        ],
-        &[AbiAddress],
-        NonPayable,
-    )]);
-    Ok(Contract::new(w3.eth(), addr, abi))
+    Ok(ChainContract::new(
+        w3.eth(),
+        ensure_addr(select_chequebook_factory_addr())?,
+    ))
 }
 
 pub fn chequebook_contract(w3: &Web3Inst, addr: Address) -> Result<ChequebookContract, JsError> {
-    Ok(Contract::new(
-        w3.eth(),
-        addr,
-        abi_contract([abi_function("balance", &[], &[Uint(256)], View)]),
-    ))
+    Ok(ChainContract::new(w3.eth(), addr))
 }
 
 pub async fn last_price(postage: &PostageContract) -> Result<U256, JsError> {
     postage
-        .query("lastPrice", (), None, Options::default(), None)
+        .uint("lastPrice()", &[])
         .await
         .map_err(|e| JsError::new(&format!("lastPrice() failed: {e}")))
 }
 
 pub async fn expired_batches_exist(postage: &PostageContract) -> Result<bool, JsError> {
     postage
-        .query("expiredBatchesExist", (), None, Options::default(), None)
+        .query("expiredBatchesExist()", &[])
         .await
+        .and_then(|bytes| abi_bool(&bytes))
         .map_err(|e| JsError::new(&format!("expiredBatchesExist() failed: {e}")))
 }
 
@@ -291,13 +241,7 @@ pub async fn get_batch_validity(contract: &PostageContract, batch_id: &[u8]) -> 
     };
 
     contract
-        .query(
-            "remainingBalance",
-            (batch_id,),
-            None,
-            Options::default(),
-            None,
-        )
+        .uint("remainingBalance(bytes32)", &[batch_id])
         .await
         .unwrap_or_default()
 }
@@ -353,8 +297,8 @@ pub async fn buy_postage_batch_with_payer(
     let initial_per_chunk = compute_initial_balance_per_chunk(current_price, validity_days);
     let approval = total_approve_amount(initial_per_chunk, depth);
 
-    let bzz_balance: U256 = token
-        .query("balanceOf", (payer,), None, Options::default(), None)
+    let bzz_balance = token
+        .uint("balanceOf(address)", &[address_word(payer)])
         .await
         .map_err(|e| JsError::new(&format!("balanceOf() failed: {e}")))?;
     if bzz_balance < approval {
@@ -367,28 +311,26 @@ pub async fn buy_postage_batch_with_payer(
     }
 
     while expired_batches_exist(&postage).await? {
-        let mut exp_opts = Options::default();
-        let gas_est = postage
-            .estimate_gas(
-                "expireLimited",
-                (U256::from(5u64),),
+        let transaction = postage
+            .transaction(
+                "expireLimited(uint256)",
+                &[uint_word(5u64.into())],
                 payer,
-                Options::default(),
+                Some(200_000),
             )
-            .await
-            .unwrap_or(U256::from(200_000u64));
-        exp_opts.gas = Some(add_buffer(gas_est));
+            .await;
         let _ = postage
-            .call("expireLimited", (U256::from(5u64),), payer, exp_opts)
+            .eth
+            .send_transaction(transaction)
             .await
-            .map_err(|e| JsError::new(&format!("expireLimited() failed: {e}")))?;
+            .map_err(|e| JsError::new(&format!("expireLimited() failed: Api error: {e}")))?;
     }
 
     let spender = ensure_addr(select_postage_contract_addr())?;
     let approve_receipt = confirmed_call(
         &token,
-        "approve",
-        (spender, approval).into_tokens(),
+        "approve(address,uint256)",
+        &[address_word(spender), uint_word(approval)],
         payer,
         Some(100_000),
     )
@@ -397,18 +339,18 @@ pub async fn buy_postage_batch_with_payer(
     let nonce_rand: [u8; 32] = crate::random_encryption_key()
         .try_into()
         .map_err(|_| JsError::new("nonce gen"))?;
-    let parameters = (
-        owner,
-        initial_per_chunk,
-        depth,
-        BUCKET_DEPTH,
+    let parameters = [
+        address_word(owner),
+        uint_word(initial_per_chunk),
+        uint_word(depth.into()),
+        uint_word(BUCKET_DEPTH.into()),
         nonce_rand,
-        false,
-    );
+        [0; 32],
+    ];
     let create_receipt = confirmed_call(
         &postage,
-        "createBatch",
-        parameters.into_tokens(),
+        "createBatch(address,uint256,uint8,uint8,bytes32,bool)",
+        &parameters,
         payer,
         Some(1_500_000),
     )
@@ -455,7 +397,7 @@ pub fn parse_chequebook_address_from_receipt(receipt: &TransactionReceipt) -> Op
 pub async fn chequebook_balance(w3: &Web3Inst, chequebook_addr: Address) -> Result<U256, JsError> {
     let contract = chequebook_contract(w3, chequebook_addr)?;
     contract
-        .query("balance", (), None, Options::default(), None)
+        .uint("balance()", &[])
         .await
         .map_err(|e| JsError::new(&format!("balance() failed: {e}")))
 }
@@ -468,8 +410,8 @@ pub async fn deposit_to_chequebook(
 ) -> Result<TransactionReceipt, JsError> {
     confirmed_call(
         token,
-        "transfer",
-        (chequebook, amount).into_tokens(),
+        "transfer(address,uint256)",
+        &[address_word(chequebook), uint_word(amount)],
         from,
         None,
     )
@@ -497,8 +439,8 @@ pub async fn deploy_chequebook_with_payer(
 
     let receipt = confirmed_call(
         &factory,
-        "deploySimpleSwap",
-        (issuer, U256::from(0u64), salt).into_tokens(),
+        "deploySimpleSwap(address,uint256,bytes32)",
+        &[address_word(issuer), [0; 32], salt],
         payer,
         Some(175_000),
     )
@@ -514,12 +456,9 @@ pub async fn deploy_chequebook_with_payer(
 }
 
 fn price_oracle_contract(w3: &Web3Inst) -> Result<PriceOracleContract, JsError> {
-    let addr = ensure_addr(select_price_oracle_addr())?;
-
-    Ok(Contract::new(
+    Ok(ChainContract::new(
         w3.eth(),
-        addr,
-        abi_contract([abi_function("getPrice", &[], &[Uint(256), Uint(256)], View)]),
+        ensure_addr(select_price_oracle_addr())?,
     ))
 }
 
@@ -530,10 +469,9 @@ pub async fn get_price_from_oracle() -> Option<(U256, U256)> {
 pub(crate) async fn get_price_from_oracle_in_window() -> Option<(U256, U256)> {
     let web3 = web3().ok()?;
     let oracle = price_oracle_contract(&web3).ok()?;
-    let (price, deduction) = oracle
-        .query::<(U256, U256), _, _, _>("getPrice", (), None, Options::default(), None)
-        .await
-        .ok()?;
+    let bytes = oracle.query("getPrice()", &[]).await.ok()?;
+    let price = abi_uint(&bytes, 0).ok()?;
+    let deduction = abi_uint(&bytes, 32).ok()?;
     (!price.is_zero()).then_some((price, deduction))
 }
 
@@ -542,71 +480,55 @@ mod tests {
     use super::*;
     use alloy_primitives::Signature;
     use wasm_bindgen_test::wasm_bindgen_test;
-    use web3::ethabi::{Token, encode};
+    use web3::ethabi::Token;
 
     #[wasm_bindgen_test]
-    fn typed_abis_preserve_contract_schemas_and_wire_values() {
-        use wasm_bindgen::{JsCast, JsValue, closure::Closure};
-
-        let ignore = Closure::<dyn FnMut()>::new(|| {});
-        let provider = js_sys::Object::new();
-        for method in ["on", "removeListener"] {
-            js_sys::Reflect::set(&provider, &JsValue::from_str(method), ignore.as_ref()).unwrap();
-        }
-        let w3 = web3::Web3::new(Eip1193::new(provider.unchecked_into()));
-        for (contract, json) in [
-            (
-                postage_contract(&w3).unwrap(),
-                &include_bytes!("postagestamp.json")[..],
-            ),
-            (
-                token_contract(&w3).unwrap(),
-                &include_bytes!("sbzz.json")[..],
-            ),
-            (
-                chequebook_factory(&w3).unwrap(),
-                &include_bytes!("factory.json")[..],
-            ),
-            (
-                chequebook_contract(&w3, Address::zero()).unwrap(),
-                &include_bytes!("simple_swap.json")[..],
-            ),
-            (
-                price_oracle_contract(&w3).unwrap(),
-                &include_bytes!("priceoracle.json")[..],
-            ),
+    fn fixed_word_calls_preserve_contract_calldata() {
+        use crate::on_chain_conventions::abi_call;
+        use web3::ethabi::ParamType;
+        for json in [
+            &include_bytes!("postagestamp.json")[..],
+            &include_bytes!("sbzz.json")[..],
+            &include_bytes!("factory.json")[..],
+            &include_bytes!("simple_swap.json")[..],
+            &include_bytes!("priceoracle.json")[..],
         ] {
             let original = web3::ethabi::Contract::load(json).unwrap();
-            assert_eq!(contract.abi(), &original);
-            let token = |param: &web3::ethabi::Param| match param.kind {
-                AbiAddress => Token::Address(web3::types::Address::from([0x12; 20])),
-                Uint(_) => Token::Uint(123.into()),
-                Bool => Token::Bool(true),
-                FixedBytes(size) => Token::FixedBytes(vec![0xab; size]),
-                _ => panic!("unexpected fixture parameter"),
-            };
-            for function in contract.abi().functions() {
-                let expected = original.function(&function.name).unwrap();
-                let input: Vec<_> = function.inputs.iter().map(token).collect();
-                assert_eq!(
-                    function.encode_input(&input).unwrap(),
-                    expected.encode_input(&input).unwrap()
+            for function in original.functions() {
+                let input: Vec<_> = function
+                    .inputs
+                    .iter()
+                    .map(|param| match param.kind {
+                        ParamType::Address => Token::Address(Address::from([0x12; 20])),
+                        ParamType::Uint(_) => Token::Uint(123.into()),
+                        ParamType::Bool => Token::Bool(true),
+                        ParamType::FixedBytes(32) => Token::FixedBytes(vec![0xab; 32]),
+                        _ => panic!("unexpected fixed-word input"),
+                    })
+                    .collect();
+                let words = input
+                    .iter()
+                    .map(|token| match token {
+                        Token::Address(address) => address_word(*address),
+                        Token::Uint(value) => uint_word(*value),
+                        Token::Bool(value) => uint_word(U256::from(u8::from(*value))),
+                        Token::FixedBytes(bytes) => bytes.as_slice().try_into().unwrap(),
+                        _ => unreachable!(),
+                    })
+                    .collect::<Vec<_>>();
+                let signature = format!(
+                    "{}({})",
+                    function.name,
+                    function
+                        .inputs
+                        .iter()
+                        .map(|param| param.kind.to_string())
+                        .collect::<Vec<_>>()
+                        .join(",")
                 );
-                let output = encode(&function.outputs.iter().map(token).collect::<Vec<_>>());
                 assert_eq!(
-                    function.decode_output(&output).unwrap(),
-                    expected.decode_output(&output).unwrap()
-                );
-                for malformed in [vec![], vec![0; 1], vec![0xff; 31], vec![0xff; 64]] {
-                    assert_eq!(
-                        format!("{:?}", function.decode_output(&malformed)),
-                        format!("{:?}", expected.decode_output(&malformed))
-                    );
-                }
-                let invalid = [Token::String("invalid input".into())];
-                assert_eq!(
-                    function.encode_input(&invalid).unwrap_err().to_string(),
-                    expected.encode_input(&invalid).unwrap_err().to_string()
+                    abi_call(&signature, &words),
+                    function.encode_input(&input).unwrap()
                 );
             }
         }

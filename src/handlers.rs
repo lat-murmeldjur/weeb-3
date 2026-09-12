@@ -170,9 +170,7 @@ async fn handshake_exchange(
         return None;
     }
     let peer_address = ack.address?;
-    if peer_address.overlay.len() != 32 {
-        return None;
-    }
+    let peer_overlay: [u8; 32] = peer_address.overlay.as_slice().try_into().ok()?;
 
     let beneficiary = parse_address(
         &peer_address.underlay,
@@ -186,7 +184,6 @@ async fn handshake_exchange(
     if beneficiary == web3::types::Address::zero() {
         return None;
     }
-    let peer_overlay = peer_address.overlay;
 
     let nonce: [u8; 32] = [0; 32];
     let timestamp = (js_sys::Date::now() / 1000.0).floor() as i64;
@@ -550,7 +547,7 @@ pub async fn retrieve_handler(
     let delivery = read_control_protocol_frame(&mut stream).await?;
     etiquette_6::Delivery::decode(delivery.as_slice())
         .ok()
-        .map(|message| message.data)
+        .map(|message| Vec::from(message.data))
 }
 
 pub async fn pushsync_handler(

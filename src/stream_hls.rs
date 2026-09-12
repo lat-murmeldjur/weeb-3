@@ -504,9 +504,7 @@ impl HlsPlaylist {
         {
             if candidate.sequence < self.sequence {
                 if current.program_date_time.is_some() {
-                    incoming
-                        .program_date_time
-                        .clone_from(&current.program_date_time);
+                    incoming.program_date_time = current.program_date_time.take();
                 }
             } else if current.program_date_time.is_none() {
                 current.program_date_time = incoming.program_date_time.take();

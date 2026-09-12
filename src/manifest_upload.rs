@@ -107,7 +107,7 @@ impl ManifestUploadContext<'_> {
 pub async fn create_manifest(
     encrypted: bool,
     redundancy_level: RedundancyLevel,
-    input_forks: Vec<ManifestNode>,
+    mut input_forks: Vec<ManifestNode>,
     data_forks: Vec<Vec<u8>>,
     reference: Vec<u8>,
     root_manifest: bool,
@@ -116,6 +116,7 @@ pub async fn create_manifest(
     chunk_upload_chan: &ChunkUploadSender,
     progress: Option<UploadProgressSender>,
 ) -> Vec<u8> {
+    input_forks.sort_by(|a, b| a.path.cmp(&b.path));
     let context = ManifestUploadContext {
         encrypted,
         redundancy_level,
@@ -138,15 +139,13 @@ pub async fn create_manifest(
 
 async fn create_manifest_bytes(
     context: &ManifestUploadContext<'_>,
-    input_forks: Vec<ManifestNode>,
+    forks: Vec<ManifestNode>,
     data_forks: Vec<Vec<u8>>,
     reference: Vec<u8>,
     root_manifest: bool,
     first_node_cutoff: usize,
 ) -> Vec<u8> {
     let mut prefix_offset = first_node_cutoff;
-    let mut forks = input_forks;
-    forks.sort_by(|a, b| a.path.cmp(&b.path));
     let fork_count = forks.len();
     if !matches!(reference.len(), 0 | 32 | 64) {
         return vec![];
@@ -238,14 +237,10 @@ async fn create_manifest_bytes(
                     }
                 }
             } else {
-                let paths = group
-                    .iter()
-                    .map(|fork| fork.path.as_slice())
-                    .collect::<Vec<_>>();
-                let Some(common_prefix) = common_prefix_bytes(&paths) else {
-                    return vec![];
-                };
-                let Some(separator_path) = group.last().map(|fork| fork.path.clone()) else {
+                let separator_path = group[group.len() - 1].path.clone();
+                let Some(common_prefix) =
+                    common_prefix_bytes(&[&group[0].path, &separator_path])
+                else {
                     return vec![];
                 };
                 let mut exact_value = None;

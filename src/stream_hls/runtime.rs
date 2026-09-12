@@ -23,7 +23,7 @@ use crate::{
         retrieve_feed_payload_tail,
     },
     feed::FeedProbe,
-    get_feed_address, mpsc, normalize_feed_topic,
+    get_feed_address, normalize_feed_topic, oneshot,
     retrieval::retrieve_decoded_data_root,
     retrieval_conventions::RetrieveAdmission,
     stream::{
@@ -226,7 +226,7 @@ async fn probe_feed_update(
         RetrieveAdmission::new_with_attempt_limit(limit)
     });
     let _close_admission = admission.close_on_drop();
-    let (output, input) = mpsc::unbounded();
+    let (output, input) = oneshot::channel();
     if client
         .chunk_port
         .0
@@ -241,7 +241,7 @@ async fn probe_feed_update(
     {
         return FeedProbe::Transient;
     }
-    match input.recv().await {
+    match input.await {
         Ok(update) if !update.is_empty() => FeedProbe::Found(update),
         Ok(_)
             if attempt_limit.is_none_or(|attempt_limit| {
@@ -1140,16 +1140,10 @@ async fn history_snapshots(
 
 fn history_repairs(
     attempted: &[u64],
-    snapshots: &[(u64, HlsPlaylist)],
+    snapshots: &mut [(u64, HlsPlaylist)],
     head_index: u64,
-    head: &HlsPlaylist,
 ) -> Option<Vec<u64>> {
-    let mut ordered = snapshots
-        .iter()
-        .map(|(index, playlist)| (*index, playlist))
-        .collect::<Vec<_>>();
-    ordered.push((head_index, head));
-    ordered.sort_by_key(|(index, _)| *index);
+    snapshots.sort_by_key(|(index, _)| *index);
     let mut repairs = Vec::new();
     let mut add = |range: std::ops::Range<u64>| -> Option<()> {
         for index in range {
@@ -1162,11 +1156,11 @@ fn history_repairs(
         }
         Some(())
     };
-    let (first_index, first) = ordered.first().copied()?;
+    let (first_index, first) = snapshots.first()?;
     if first.sequence != 0 {
-        add(0..first_index)?;
+        add(0..*first_index)?;
     }
-    for pair in ordered.windows(2) {
+    for pair in snapshots.windows(2) {
         if !pair[0].1.joins(&pair[1].1) {
             add(pair[0].0.saturating_add(1)..pair[1].0)?;
         }
@@ -1207,7 +1201,10 @@ async fn hls_history(
     let indices = history_indices(head_index, lattice_residue)?;
     #[rustfmt::skip]
     let mut snapshots = history_snapshots(id, view_generation, client, owner, topic, &indices, parallel, &mut warm_pending).await;
-    let repairs = history_repairs(&indices, &snapshots, head_index, &head)?;
+    snapshots.push((head_index, head));
+    let repairs = history_repairs(&indices, &mut snapshots, head_index)?;
+    // Every requested snapshot precedes the head, which sorts last.
+    let (_, head) = snapshots.pop()?;
     #[rustfmt::skip]
     snapshots.extend(history_snapshots(id, view_generation, client, owner, topic, &repairs, parallel, &mut warm_pending).await);
     HlsPlaylist::reconstruct(snapshots, head_index, head)

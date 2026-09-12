@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use wasm_bindgen_futures::spawn_local;
 
 pub(crate) use async_std::channel as mpsc;
+pub(crate) use futures::channel::oneshot;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::num::NonZero;
 use std::time::Duration;
@@ -251,9 +252,13 @@ impl Weeb3 {
 
         let f_size = file.size();
         let f_name = file.name();
-        let progress_id = self
-            .start_progress("upload", f_name.clone(), "read", Some(0), "reading input")
-            .await;
+        let progress_id = self.progress.lock().await.start(
+            "upload",
+            f_name.clone(),
+            "read",
+            Some(0),
+            "reading input",
+        );
         spawn_upload_progress_listener(self.progress.clone(), progress_id.clone(), progress_in);
         let f_type0 = file.type_();
         let f_type = if f_type0.starts_with("text/") {
@@ -274,19 +279,31 @@ impl Weeb3 {
 
             let content = read_file(file).await;
             if content.is_empty() && f_size > 0.0 {
-                self.finish_progress(&progress_id, "failed", "file read failed", false)
-                    .await;
+                self.progress.lock().await.finish(
+                    &progress_id,
+                    "failed",
+                    "file read failed",
+                    false,
+                );
                 return upload_result("upload result: failed to read file", "");
             }
 
-            self.update_progress(&progress_id, "parse", Some(20), "reading tar archive")
-                .await;
+            self.progress.lock().await.update(
+                &progress_id,
+                "parse",
+                Some(20),
+                "reading tar archive",
+            );
 
             fvec0 = match tar_resources(&content) {
                 Ok(resources) => resources,
                 Err(_) => {
-                    self.finish_progress(&progress_id, "failed", "invalid tar archive", false)
-                        .await;
+                    self.progress.lock().await.finish(
+                        &progress_id,
+                        "failed",
+                        "invalid tar archive",
+                        false,
+                    );
                     return upload_result("upload result: invalid tar archive", "");
                 }
             };
@@ -300,15 +317,19 @@ impl Weeb3 {
         }
 
         if fvec0.is_empty() {
-            self.finish_progress(&progress_id, "failed", "no uploadable files", false)
-                .await;
+            self.progress
+                .lock()
+                .await
+                .finish(&progress_id, "failed", "no uploadable files", false);
             return upload_result("upload result: no uploadable files", "");
         }
 
         let topic_safe = normalize_feed_topic(&feed_topic);
 
-        self.update_progress(&progress_id, "push", None, "upload queued")
-            .await;
+        self.progress
+            .lock()
+            .await
+            .update(&progress_id, "push", None, "upload queued");
 
         if self
             .upload_port
@@ -326,27 +347,32 @@ impl Weeb3 {
             ))
             .is_err()
         {
-            self.finish_progress(&progress_id, "failed", "upload queue unavailable", false)
-                .await;
+            self.progress.lock().await.finish(
+                &progress_id,
+                "failed",
+                "upload queue unavailable",
+                false,
+            );
             return upload_result("upload result: upload queue unavailable", "");
         }
 
         let result = chan_in.recv().await.unwrap_or_default();
 
         if result.is_empty() {
-            self.finish_progress(&progress_id, "failed", "upload failed", false)
-                .await;
+            self.progress
+                .lock()
+                .await
+                .finish(&progress_id, "failed", "upload failed", false);
             return upload_result("upload result: failure", "");
         }
 
         let reference_hex = hex::encode(&result);
-        self.finish_progress(
+        self.progress.lock().await.finish(
             &progress_id,
             "complete",
             format!("reference {}", reference_hex),
             true,
-        )
-        .await;
+        );
 
         upload_result(
             &format!(
@@ -675,38 +701,37 @@ impl Weeb3 {
                     }
                     // Listen before inspecting eligibility, without reserving a slot we may release.
                     let capacity_changed = self.connection_population.lock().await.changed.listen();
-                    let connected = wings
-                        .connected_peers
-                        .lock()
-                        .await
-                        .keys()
-                        .copied()
-                        .collect::<HashSet<_>>();
-                    let rejected = wings.rejected_duplicate_peers.lock().await.clone();
-                    let mut unavailable = wings.connection_cooldowns.lock().await.clone();
-                    unavailable.extend(wings.connection_attempts.lock().await.keys().copied());
-                    unavailable.extend(wings.delayed_peer_retries.lock().await.iter().filter_map(
-                        |(peer, retry)| (retry.0 == queue_generation).then_some(*peer),
-                    ));
-                    let mut next_candidate = None;
-                    for _ in 0..queue.len() {
-                        let candidate = queue.pop_front().unwrap();
-                        if candidate.generation != self.current_connection_generation()
-                            || connected.contains(&candidate.peer)
-                            || rejected.contains_key(&candidate.peer)
-                        {
-                            queued_underlays.remove(&(candidate.peer, candidate.dial_addr));
-                        } else if unavailable.contains(&candidate.peer) {
-                            queue.push_back(candidate);
-                        } else {
-                            next_candidate = Some(candidate);
-                            break;
-                        }
-                    }
+                    let next_candidate = {
+                        let connected = wings.connected_peers.lock().await;
+                        let rejected = wings.rejected_duplicate_peers.lock().await;
+                        let cooldowns = wings.connection_cooldowns.lock().await;
+                        let retries = wings.delayed_peer_retries.lock().await;
+                        let attempts = wings.connection_attempts.lock().await;
+                        (0..queue.len()).find_map(|_| {
+                            let candidate = queue.pop_front().unwrap();
+                            if candidate.generation != self.current_connection_generation()
+                                || connected.contains_key(&candidate.peer)
+                                || rejected.contains_key(&candidate.peer)
+                            {
+                                queued_underlays.remove(&(candidate.peer, candidate.dial_addr));
+                                None
+                            } else if cooldowns.contains(&candidate.peer)
+                                || attempts.contains_key(&candidate.peer)
+                                || retries
+                                    .get(&candidate.peer)
+                                    .is_some_and(|retry| retry.0 == queue_generation)
+                            {
+                                queue.push_back(candidate);
+                                None
+                            } else {
+                                Some(candidate)
+                            }
+                        })
+                    };
                     let candidate = if next_candidate.is_some()
                         && try_reserve_connection_capacity(&self.connection_population).await
                     {
-                        next_candidate.take().unwrap()
+                        next_candidate.unwrap()
                     } else {
                         if let Some(candidate) = next_candidate {
                             queue.push_front(candidate);
@@ -1121,7 +1146,7 @@ impl Weeb3 {
                                 removed_owned_overlay = {
                                     let mut overlay_peers_map = wings.overlay_peers.lock().await;
                                     if overlay_peers_map.get(overlay) == Some(&peer_id) {
-                                        overlay_peers_map.remove(overlay);
+                                        Arc::make_mut(&mut overlay_peers_map).remove(overlay);
                                         true
                                     } else {
                                         false
@@ -2103,7 +2128,7 @@ impl Weeb3 {
                             &admission,
                         )
                     {
-                        let _ = chan.try_send(vec![]);
+                        let _ = chan.send(vec![]);
                         continue;
                     }
 
@@ -2160,7 +2185,7 @@ impl Weeb3 {
                         }
                         .await;
 
-                        let _ = chan.try_send(chunk_data);
+                        let _ = chan.send(chunk_data);
                     });
                 }
 

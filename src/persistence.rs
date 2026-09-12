@@ -100,15 +100,7 @@ pub async fn set_batch_field(field: &str, value: &[u8]) -> bool {
         return false;
     }
 
-    match transaction.commit().await {
-        Ok(_) => true,
-        Err(error) => {
-            web_sys::console::log_1(&JsValue::from(format!(
-                "Failed to commit batch metadata {field}: {error:?}"
-            )));
-            false
-        }
-    }
+    log_failure(transaction.commit().await, "commit", field).is_some()
 }
 
 pub async fn get_chequebook_signer_key() -> Vec<u8> {

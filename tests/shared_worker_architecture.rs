@@ -294,7 +294,7 @@ fn secure_vault_stays_lazy_and_window_brokered() {
         "pubasyncfnget_price_from_oracle()->Option<(U256,U256)>{crate::secure_vault::worker_price_oracle().await}"
     ));
     let vault = compact(SECURE_VAULT);
-    assert!(vault.contains("worker_vault_call(\"priceOracle\",|_|{})"));
+    assert!(vault.contains("worker_vault_call(\"priceOracle\",Object::new())"));
     assert!(vault.contains("bytes_array_prop(value,name).filter(|value|value.length()==32)?"));
     assert!(vault.contains("value.copy_to(&mutbytes)"));
     assert!(vault.contains("Some(U256::from_big_endian(&bytes))"));
@@ -395,7 +395,7 @@ fn network_switches_preserve_dispatched_transfer_accounting() {
         "async fn request_inner(",
         "async fn start(&self, network_id: u64)",
     );
-    assert!(request.contains("None => Ok(receiver.recv().await)"));
+    assert!(request.contains("None => Ok(receiver.await)"));
     let dispatch = section(
         SHARED_RUNTIME,
         "async fn send_node_operation(&self, op: &str, request: Object)",

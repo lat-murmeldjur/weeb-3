@@ -184,18 +184,16 @@ impl Weeb3WorkerRuntime {
                 let phase = string_property(message, "phase")
                     .ok_or_else(|| error_response(400, "progressStart requires phase"))?;
                 let response = ok_response();
+                let percent = percent_property(message);
+                let detail = string_property(message, "detail").unwrap_or_default();
                 set_string(
                     &response,
                     "id",
                     self.inner
-                        .start_progress(
-                            kind,
-                            subject,
-                            phase,
-                            percent_property(message),
-                            string_property(message, "detail").unwrap_or_default(),
-                        )
-                        .await,
+                        .progress
+                        .lock()
+                        .await
+                        .start(kind, subject, phase, percent, detail),
                 );
                 Ok(response)
             }
@@ -204,14 +202,13 @@ impl Weeb3WorkerRuntime {
                     .ok_or_else(|| error_response(400, "progressUpdate requires id"))?;
                 let phase = string_property(message, "phase")
                     .ok_or_else(|| error_response(400, "progressUpdate requires phase"))?;
+                let percent = percent_property(message);
+                let detail = string_property(message, "detail").unwrap_or_default();
                 self.inner
-                    .update_progress(
-                        &id,
-                        phase,
-                        percent_property(message),
-                        string_property(message, "detail").unwrap_or_default(),
-                    )
-                    .await;
+                    .progress
+                    .lock()
+                    .await
+                    .update(&id, phase, percent, detail);
                 Ok(ok_response())
             }
             "progressFinish" => {
@@ -221,14 +218,12 @@ impl Weeb3WorkerRuntime {
                     .ok_or_else(|| error_response(400, "progressFinish requires phase"))?;
                 let ok = bool_property(message, "ok")
                     .ok_or_else(|| error_response(400, "progressFinish requires ok"))?;
+                let detail = string_property(message, "detail").unwrap_or_default();
                 self.inner
-                    .finish_progress(
-                        &id,
-                        phase,
-                        string_property(message, "detail").unwrap_or_default(),
-                        ok,
-                    )
-                    .await;
+                    .progress
+                    .lock()
+                    .await
+                    .finish(&id, phase, detail, ok);
                 Ok(ok_response())
             }
             op @ ("acquire" | "retrieveBytes" | "retrieveChunk") => {
@@ -269,16 +264,13 @@ impl Weeb3WorkerRuntime {
             .ok_or_else(|| error_response(400, "acquireFeed requires topic"))?;
         let deadline = number_property(message, "deadline")
             .ok_or_else(|| error_response(400, "acquireFeed requires deadline"))?;
-        let progress = self
-            .inner
-            .start_progress(
-                "feed",
-                format!("{owner} topic {}", topic.trim()),
-                "resolve",
-                None,
-                "seeking latest feed update",
-            )
-            .await;
+        let progress = self.inner.progress.lock().await.start(
+            "feed",
+            format!("{owner} topic {}", topic.trim()),
+            "resolve",
+            None,
+            "seeking latest feed update",
+        );
         let timeout = std::time::Duration::from_secs_f64(
             ((deadline - js_sys::Date::now()) / 1000.0).clamp(0.0, FEED_TIMEOUT.as_secs_f64()),
         );
@@ -318,14 +310,12 @@ impl Weeb3WorkerRuntime {
         if !ok {
             set_string(&response, "reason", &detail);
         }
-        self.inner
-            .finish_progress(
-                &progress,
-                if ok { "complete" } else { "failed" },
-                detail,
-                ok,
-            )
-            .await;
+        self.inner.progress.lock().await.finish(
+            &progress,
+            if ok { "complete" } else { "failed" },
+            detail,
+            ok,
+        );
         Ok(response)
     }
 

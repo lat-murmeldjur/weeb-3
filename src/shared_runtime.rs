@@ -281,9 +281,12 @@ impl SharedRuntime {
             .map_err(|error| js_error("could not create SharedWorker reply channel", &error))?;
         let reply = channel.port1();
         reply.start();
-        let (sender, receiver) = async_std::channel::bounded::<JsValue>(1);
+        let (sender, receiver) = futures::channel::oneshot::channel();
+        let mut sender = Some(sender);
         let callback = Closure::<dyn FnMut(MessageEvent)>::new(move |event: MessageEvent| {
-            let _ = sender.try_send(event.data());
+            if let Some(sender) = sender.take() {
+                let _ = sender.send(event.data());
+            }
         });
         reply.set_onmessage(Some(callback.as_ref().unchecked_ref()));
         let _close_reply = ReplyPort(reply.clone());
@@ -293,10 +296,10 @@ impl SharedRuntime {
             return Err(js_error("could not post SharedWorker request", &error));
         }
         let response = match timeout {
-            Some(timeout) => async_std::future::timeout(timeout, receiver.recv())
+            Some(timeout) => async_std::future::timeout(timeout, receiver)
                 .await
                 .map_err(|_| REQUEST_TIMEOUT.to_string()),
-            None => Ok(receiver.recv().await),
+            None => Ok(receiver.await),
         };
         response?
             .map_err(|_| "SharedWorker reply channel closed")?
