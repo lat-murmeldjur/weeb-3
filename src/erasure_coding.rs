@@ -190,12 +190,7 @@ pub fn upload_tree_chunk_count(
     level: RedundancyLevel,
     encrypted: bool,
 ) -> Option<u64> {
-    let chunk_size = CHUNK_SIZE as u64;
-    let mut input_chunks = data_length / chunk_size;
-    if !data_length.is_multiple_of(chunk_size) {
-        input_chunks = input_chunks.checked_add(1)?;
-    }
-    input_chunks = input_chunks.max(1);
+    let mut input_chunks = data_length.div_ceil(CHUNK_SIZE as u64).max(1);
 
     let max_shards = u64::try_from(level.max_shards(encrypted)).ok()?;
     if max_shards < 2 {
@@ -258,16 +253,13 @@ pub fn reference_layout(
     }
 
     let branching = max_shards as u64;
-    let mut branch_size = CHUNK_SIZE as u64;
-    let mut branch_level = 1usize;
-    while branch_size < span {
-        branch_size = branch_size.checked_mul(branching)?;
-        branch_level += 1;
-    }
-
     let mut reference_size = CHUNK_SIZE as u64;
-    for _ in 1..branch_level.saturating_sub(1) {
-        reference_size = reference_size.checked_mul(branching)?;
+    loop {
+        let branch_size = reference_size.checked_mul(branching)?;
+        if branch_size >= span {
+            break;
+        }
+        reference_size = branch_size;
     }
 
     let data_shards_u64 = span.checked_add(reference_size - 1)? / reference_size;
@@ -504,10 +496,12 @@ impl fmt::Display for ReedSolomonError {
     }
 }
 
-pub fn reconstruct_data_indices(
-    shards: &mut [Option<Vec<u8>>],
+/// Missing bytes at the end of a shard are zero, as in `ParityEncoder::new_padded`.
+pub fn reconstruct_data_indices<T: AsRef<[u8]> + From<Vec<u8>>>(
+    shards: &mut [Option<T>],
     data_count: usize,
     requested_indices: &[usize],
+    shard_size: usize,
 ) -> Result<(), ReedSolomonError> {
     if data_count == 0 || shards.len() <= data_count || shards.len() > 256 {
         return Err(ReedSolomonError::InvalidShardCount);
@@ -521,15 +515,11 @@ pub fn reconstruct_data_indices(
         *requested = true;
     }
 
-    let shard_size = shards
-        .iter()
-        .find_map(|shard| shard.as_ref().map(Vec::len))
-        .ok_or(ReedSolomonError::TooFewShards)?;
     if shard_size == 0
         || shards
             .iter()
             .flatten()
-            .any(|shard| shard.len() != shard_size)
+            .any(|shard| shard.as_ref().is_empty() || shard.as_ref().len() > shard_size)
     {
         return Err(ReedSolomonError::InvalidShardSize);
     }
@@ -558,7 +548,7 @@ pub fn reconstruct_data_indices(
             shards[index]
                 .as_ref()
                 .expect("selected shard exists")
-                .as_slice()
+                .as_ref()
         })
         .collect();
 
@@ -569,7 +559,7 @@ pub fn reconstruct_data_indices(
         .collect::<Vec<_>>();
     drop(selected_shards);
     for (data_index, shard) in missing_indices.into_iter().zip(recovered) {
-        shards[data_index] = Some(shard);
+        shards[data_index] = Some(shard.into());
     }
     Ok(())
 }

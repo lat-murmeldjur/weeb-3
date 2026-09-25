@@ -33,7 +33,7 @@ impl Weeb3 {
                 .0
                 .try_send(ChunkRetrieveRequest {
                     address: valaddr,
-                    chan: chan_out,
+                    chan: ChunkRetrieveReply::Channel(chan_out),
                     cancel: None,
                     admission: None,
                     hedge_demand: None,
@@ -232,9 +232,25 @@ pub(crate) fn chunk_retrieve_channel() -> (ChunkRetrieveSender, ChunkRetrieveRec
     )
 }
 
+pub(crate) enum ChunkRetrieveReply {
+    Channel(oneshot::Sender<Vec<u8>>),
+    Raw(retrieval::RawFetchCompletion),
+}
+
+impl ChunkRetrieveReply {
+    pub(crate) fn send(self, chunk: bytes::Bytes) {
+        match self {
+            Self::Channel(chan) => {
+                let _ = chan.send(Vec::from(chunk));
+            }
+            Self::Raw(completion) => completion.send(chunk),
+        }
+    }
+}
+
 pub(crate) struct ChunkRetrieveRequest {
     pub address: Vec<u8>,
-    pub chan: oneshot::Sender<Vec<u8>>,
+    pub chan: ChunkRetrieveReply,
     pub cancel: Option<RetrieveCancelToken>,
     pub admission: Option<retrieval_conventions::RetrieveAdmission>,
     pub hedge_demand: Option<retrieval_conventions::SharedRetrieveHedgeDemand>,

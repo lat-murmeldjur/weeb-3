@@ -1,5 +1,8 @@
 #![allow(dead_code)]
 
+#[path = "support/source.rs"]
+mod source;
+
 #[path = "../src/erasure_coding.rs"]
 mod erasure_coding;
 mod erasure_test_support {
@@ -26,7 +29,8 @@ mod erasure_test_support {
         let requested = (0..data_count)
             .filter(|&index| shards.get(index).is_some_and(Option::is_none))
             .collect::<Vec<_>>();
-        reconstruct_data_indices(shards, data_count, &requested)
+        let shard_size = shards.iter().flatten().next().map_or(0, Vec::len);
+        reconstruct_data_indices(shards, data_count, &requested, shard_size)
     }
 
     pub(crate) fn padded_chunk(data: &[u8]) -> Option<Vec<u8>> {
@@ -1482,15 +1486,15 @@ mod erasure_contracts {
             Err(ReedSolomonError::InvalidShardSize)
         );
         assert_eq!(
-            reconstruct_data_indices(&mut [Some(vec![1]), Some(vec![2])], 1, &[1]),
+            reconstruct_data_indices(&mut [Some(vec![1]), Some(vec![2])], 1, &[1], 1),
             Err(ReedSolomonError::InvalidShardCount)
         );
         assert_eq!(
-            reconstruct_data_indices(&mut [Some(vec![1]), None, None], 2, &[1]),
+            reconstruct_data_indices(&mut [Some(vec![1]), None, None], 2, &[1], 1),
             Err(ReedSolomonError::TooFewShards)
         );
         assert_eq!(
-            reconstruct_data_indices(&mut [Some(vec![1]), Some(vec![2, 3]), None], 2, &[0]),
+            reconstruct_data_indices(&mut [Some(vec![1]), Some(vec![2, 3]), None], 2, &[0], 1),
             Err(ReedSolomonError::InvalidShardSize)
         );
     }
@@ -1511,6 +1515,33 @@ mod erasure_contracts {
             .collect::<Vec<_>>();
 
         assert_eq!(actual, expected);
+
+        for erased in 0u8..64 {
+            if erased.count_ones() > 3 {
+                continue;
+            }
+            let mut shards = short
+                .iter()
+                .chain(&actual)
+                .enumerate()
+                .map(|(index, shard)| {
+                    (erased & (1 << index) == 0).then(|| bytes::Bytes::copy_from_slice(shard))
+                })
+                .collect::<Vec<_>>();
+            let retained = shards.clone();
+            reconstruct_data_indices(&mut shards, 3, &[0, 1, 2], CHUNK_WITH_SPAN_SIZE).unwrap();
+            for (index, (shard, original)) in shards.iter().zip(&retained).enumerate() {
+                if let Some(original) = original {
+                    let shard = shard.as_ref().unwrap();
+                    assert_eq!(shard.as_ptr(), original.as_ptr());
+                    assert_eq!(shard, original);
+                } else if index < 3 {
+                    assert_eq!(shard.as_deref(), Some(explicit[index].as_slice()));
+                } else {
+                    assert!(shard.is_none());
+                }
+            }
+        }
     }
 
     #[test]
@@ -1585,7 +1616,7 @@ mod erasure_contracts {
                             .filter(|&index| requested_mask & (1usize << index) != 0)
                             .collect::<Vec<_>>();
                         let mut targeted = unavailable.clone();
-                        reconstruct_data_indices(&mut targeted, data_count, &requested).unwrap();
+                        reconstruct_data_indices(&mut targeted, data_count, &requested, 31).unwrap();
 
                         for index in 0..data_count {
                             let should_exist = unavailable[index].is_some()
@@ -1639,7 +1670,7 @@ mod erasure_contracts {
             reconstruct_data(&mut fully_recovered, data.len())
                 .unwrap_or_else(|error| panic!("{} full recovery failed: {error}", case.name));
             let mut targeted = unavailable.clone();
-            reconstruct_data_indices(&mut targeted, data.len(), &requested)
+            reconstruct_data_indices(&mut targeted, data.len(), &requested, 19)
                 .unwrap_or_else(|error| panic!("{} targeted recovery failed: {error}", case.name));
 
             for &index in &requested {
@@ -1779,11 +1810,11 @@ mod upload_redundancy {
         assert!(!LIB_RS.contains("push_data_handle"));
         assert!(LIB_RS.contains("upload_port: AsyncPort<UploadRequest>"));
 
-        let handler = LIB_RS
-            .split("let push_handle = async")
-            .nth(1)
-            .and_then(|source| source.split("let push_chunk_handle = async").next())
-            .expect("serialized top-level upload handler");
+        let handler = crate::source::between(
+            LIB_RS,
+            "let push_handle = async",
+            "let push_chunk_handle = async",
+        );
         let iteration = handler
             .split("for incoming_request in")
             .nth(1)
@@ -1796,11 +1827,11 @@ mod upload_redundancy {
         let feedback = iteration.find("chan.try_send(push_reference)").unwrap();
         assert!(upload < completion && completion < feedback);
 
-        let data = UPLOAD_RS
-            .split("async fn upload_data_with_root(")
-            .nth(1)
-            .and_then(|source| source.split("fn canonical_chunk(").next())
-            .expect("direct data upload entry point");
+        let data = crate::source::between(
+            UPLOAD_RS,
+            "async fn upload_data_with_root(",
+            "fn canonical_chunk(",
+        );
         assert!(data.contains(
             "push_data_input_with_root(input, enc, redundancy_level, chunk_upload_chan, progress)"
         ));

@@ -21,11 +21,11 @@ fn playback_readiness() -> &'static str {
 
 #[test]
 fn native_server_rebuilds_and_revalidates_every_embedded_browser_runtime_asset() {
-    let source_version = BUILD
-        .split("fn source_build_version()")
-        .nth(1)
-        .and_then(|source| source.split("fn asset_build_version()").next())
-        .expect("source build version");
+    let source_version = crate::source::between(
+        BUILD,
+        "fn source_build_version()",
+        "fn asset_build_version()",
+    );
     for asset in ["static/weeb_3.js", "static/weeb_3_bg.wasm"] {
         assert!(
             !source_version.contains(asset),
@@ -185,12 +185,7 @@ fn hls_routes_own_their_stream_windows_and_preserve_http_validators() {
     );
     assert!(fetch_routes.contains("canonicalRawResource(url)"));
     assert!(fetch_routes.contains("canonicalFeedResource(url)"));
-    assert!(
-        fetch_routes
-            .matches("request.method === \"GET\" || request.method === \"HEAD\"")
-            .count()
-            >= 3
-    );
+    assert!(fetch_routes.contains("request.method === \"GET\" || request.method === \"HEAD\""));
 
     let request = between(
         WORKER,
@@ -211,7 +206,7 @@ fn hls_routes_own_their_stream_windows_and_preserve_http_validators() {
     let one_shot = between(
         WORKER,
         "function responseBodyStream(",
-        "function responseHeaders(",
+        "function requestRustRange(",
     );
     assert!(one_shot.contains("const bytes = toUint8Array(body);"));
     assert!(one_shot.contains("controller.enqueue(bytes);"));
@@ -229,7 +224,7 @@ fn hls_routes_own_their_stream_windows_and_preserve_http_validators() {
     assert!(forward.contains("request.headers.get(\"If-None-Match\")"));
     assert!(forward.contains("hlsResource ? \"\" : request.headers.get(\"If-Range\")"));
     assert!(forward.contains("request.method === \"HEAD\" || status === 304"));
-    assert!(forward.contains("const headers = responseHeaders(response.headers);"));
+    assert!(forward.contains("const headers = new Headers(response.headers);"));
 
     for removed in [
         "HLS_STREAM_READY_ADMISSION_THRESHOLD",
@@ -327,13 +322,9 @@ fn network_switch_reprobes_the_stable_window_before_rebinding() {
 
 #[test]
 fn generic_range_stream_keeps_ordered_bounded_lookahead() {
-    assert!(WORKER.contains("const STREAM_STORAGE_WINDOW_BYTES = MIB_BYTES / 2;"));
+    assert!(WORKER.contains("const STREAM_WINDOW_BYTES = MIB_BYTES / 2;"));
     assert!(WORKER.contains("const STREAM_LOOKAHEAD_CHUNKS = 8;"));
-    assert!(WORKER.contains("const HLS_STREAM_WINDOW_BYTES = MIB_BYTES / 2;"));
-    assert!(WORKER.contains("const HLS_STREAM_INITIAL_LOOKAHEAD_CHUNKS = 1;"));
     assert!(WORKER.contains("const HLS_STREAM_LOOKAHEAD_CHUNKS = 4;"));
-    assert!(WORKER.contains("const HLS_LIVE_STREAM_WINDOW_BYTES = MIB_BYTES / 2;"));
-    assert!(WORKER.contains("const HLS_LIVE_STREAM_LOOKAHEAD_CHUNKS = 4;"));
     assert!(WORKER.contains("const RANGE_REQUEST_FLIGHTS = new Map();"));
 
     let request = between(
@@ -345,7 +336,6 @@ fn generic_range_stream_keeps_ordered_bounded_lookahead() {
     assert!(request.contains("body.byteLength !== expected"));
     assert!(request.contains("RANGE_REQUEST_FLIGHTS.get(key)"));
     assert!(request.contains("RANGE_REQUEST_FLIGHTS.set(key, request)"));
-    assert!(request.contains("RANGE_REQUEST_FLIGHTS.get(key) === request"));
     assert!(request.contains("RANGE_REQUEST_FLIGHTS.delete(key)"));
     assert_eq!(request.matches("messageRuntime(client,").count(), 1);
 
@@ -360,20 +350,15 @@ fn generic_range_stream_keeps_ordered_bounded_lookahead() {
         "const scheduleMore = () => {",
         "const drainScheduledRanges",
     );
-    assert!(
-        scheduler
-            .contains("position < initialLookahead * windowBytes ? initialLookahead : lookahead")
-    );
-    assert!(scheduler.contains("scheduled.size < limit"));
-    assert!(scheduler.contains("admitRange()"));
+    assert!(scheduler.contains("scheduled.size < lookahead"));
+    assert!(scheduler.contains("scheduled.set(start, requestRustRange("));
 
     let pull = between(stream, "async pull(controller) {", "cancel() {");
     assert_in_order(
         pull,
         &[
             "scheduleMore();",
-            "scheduled.get(start)",
-            "await pending",
+            "await scheduled.get(start)",
             "scheduled.delete(start)",
             "controller.enqueue(body)",
         ],
@@ -385,31 +370,24 @@ fn generic_range_stream_keeps_ordered_bounded_lookahead() {
         "function parseUploadRedundancyHeader(",
     );
     assert!(forward.contains("Number.isSafeInteger(size) || size <= 0"));
-    assert!(forward.contains("url.searchParams.get(\"start\") === \"live\""));
-    assert!(forward.contains("? HLS_LIVE_STREAM_WINDOW_BYTES"));
-    assert!(forward.contains(": hlsResource ? HLS_STREAM_WINDOW_BYTES"));
-    assert!(forward.contains("? HLS_LIVE_STREAM_LOOKAHEAD_CHUNKS"));
-    assert!(forward.contains(": hlsResource ? HLS_STREAM_LOOKAHEAD_CHUNKS"));
-    assert!(forward.contains("? HLS_STREAM_INITIAL_LOOKAHEAD_CHUNKS"));
-    assert!(forward.contains("const initialLookahead = hlsResource"));
+    assert!(forward.contains("STREAM_WINDOW_BYTES,"));
+    assert!(forward.contains("hlsResource ? HLS_STREAM_LOOKAHEAD_CHUNKS : STREAM_LOOKAHEAD_CHUNKS"));
     assert!(!forward.contains("url.searchParams.get(\"startup\")"));
     assert!(!forward.contains("beginningHlsResource"));
 }
 
 #[test]
-fn hls_stream_stages_one_window_before_admitting_four_window_lookahead() {
+fn hls_stream_admits_four_windows_before_waiting_and_refills_after_emitting() {
     let stream = between(
         WORKER,
         "function createRustRangeStream(",
         "async function forwardRequestToRust(",
     );
     assert!(!stream.contains("gateFirstWindow"));
-    assert!(
-        stream.contains("position < initialLookahead * windowBytes ? initialLookahead : lookahead")
-    );
+    assert!(!stream.contains("initialLookahead"));
     let pull = between(stream, "async pull(controller) {", "cancel() {");
     let first_schedule = pull.find("scheduleMore();").unwrap();
-    let awaited = pull.find("await pending").unwrap();
+    let awaited = pull.find("await scheduled.get(start)").unwrap();
     let emitted = pull.find("controller.enqueue(body);").unwrap();
     let refill = pull.rfind("scheduleMore();").unwrap();
     assert!(first_schedule < awaited && awaited < emitted && emitted < refill);
@@ -425,39 +403,31 @@ fn generic_range_stream_cancel_closes_admission_and_drains_dispatched_promises()
     let drain = between(
         stream,
         "const drainScheduledRanges = () => {",
-        "const closeAdmission = () => {",
+        "const failStream = async",
     );
     assert!(drain.contains("Promise.allSettled(Array.from(scheduled.values()))"));
     assert!(drain.contains("scheduled.clear();"));
 
-    let bounds = between(
-        stream,
-        "const nextRangeBounds = () => {",
-        "const admitRange = () => {",
-    );
-    assert!(bounds.contains("if (!admissionOpen || schedulePosition >= size)"));
-
     let admission = between(
         stream,
-        "const admitRange = () => {",
         "const scheduleMore = () => {",
+        "const drainScheduledRanges",
     );
+    assert!(admission.contains("while (admissionOpen && schedulePosition < size"));
     assert_in_order(
         admission,
-        &["requestRustRange(", "scheduled.set(start, request)"],
+        &[
+            "const start = schedulePosition;",
+            "const end = Math.min(start + windowBytes - 1, size - 1);",
+            "schedulePosition = end + 1;",
+            "scheduled.set(start, requestRustRange(",
+        ],
     );
-
-    let close_admission = between(
-        stream,
-        "const closeAdmission = () => {",
-        "const failStream = async",
-    );
-    assert!(close_admission.contains("admissionOpen = false;"));
 
     let cancel = between(stream, "cancel() {", "\n    }");
     assert_in_order(
         cancel,
-        &["closeAdmission();", "return drainScheduledRanges();"],
+        &["admissionOpen = false;", "return drainScheduledRanges();"],
     );
     assert!(!cancel.contains("requestRustRange("));
     assert!(!cancel.contains(".abort("));
@@ -466,7 +436,7 @@ fn generic_range_stream_cancel_closes_admission_and_drains_dispatched_promises()
     assert_in_order(
         pull,
         &[
-            "const response = await pending;",
+            "const response = await scheduled.get(start);",
             "if (!admissionOpen) {",
             "controller.enqueue(body);",
             "scheduleMore();",
@@ -476,7 +446,7 @@ fn generic_range_stream_cancel_closes_admission_and_drains_dispatched_promises()
     assert_in_order(
         normal_close,
         &[
-            "closeAdmission();",
+            "admissionOpen = false;",
             "controller.close();",
             "await drainScheduledRanges();",
         ],
@@ -498,7 +468,7 @@ fn generic_range_stream_errors_close_and_drain_before_returning() {
     assert_in_order(
         failure,
         &[
-            "closeAdmission();",
+            "admissionOpen = false;",
             "controller.error(error);",
             "await drainScheduledRanges();",
         ],

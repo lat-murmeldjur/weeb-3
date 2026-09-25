@@ -17,12 +17,16 @@ pub(crate) fn refreshment_due(balance: u64, last_refreshment: f64, payment_thres
         }
 }
 
-pub(crate) fn connection_dial_capacity_available(connected: u64, ongoing: u64) -> bool {
-    connection_population_deficit(connected, ongoing) > 0
+pub(crate) fn connection_dial_capacity_available(connected: u64, ongoing: u64, lost: u16) -> bool {
+    connection_population_deficit(connected, ongoing, lost) > 0
 }
 
-pub(crate) fn connection_population_deficit(connected: u64, ongoing: u64) -> u64 {
-    CONNECTION_BUILDUP_LIMIT.saturating_sub(connected.saturating_add(ongoing))
+pub(crate) fn connection_population_deficit(connected: u64, ongoing: u64, lost: u16) -> u64 {
+    let mut target = CONNECTION_BUILDUP_LIMIT;
+    for _ in 0..lost / 100 {
+        target = (target * 4 / 5).max(30);
+    }
+    target.saturating_sub(connected.saturating_add(ongoing))
 }
 
 pub(crate) fn bee_reconnect_delay_seconds(

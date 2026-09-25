@@ -108,14 +108,14 @@ Below is a piece-by-piece overview of the current component logic.
 
 The default browser application is instantiated by `static/index.html`, which loads the generated Wasm module and calls `interweeb` from `src/interface.rs`.
 
-`interweeb` first converts the GitHub Pages `404.html` `#/` handoff into its canonical path, then creates a `Weeb3` node, selects the network from that route, and delegates the rest of the UI setup to `mount_interface`. `mount_interface` can either start the runtime itself or attach the interface to a runtime that has already been started by the package wrapper.
+`interweeb` converts the GitHub Pages `404.html` `#/` handoff into its canonical path, selects the network from that route, and creates a `SharedNodeClient` that starts or attaches to the node in `static/worker.js`. It configures bootnodes and delegates UI setup to `mount_interface`. The `Weeb3No103` package wrapper uses the same shared client when mounting the interface.
 
 The interface layer currently has the following roles:
 
-- Starting the libp2p / Swarm runtime in an async browser task when requested.
+- Starting or attaching to the libp2p / Swarm runtime in the SharedWorker.
 - Installing UI conventions and rendering the interface shell.
 - Preloading the secure vault module before sensitive upload, feed, stamp, or cheque operations are requested.
-- Registering the Service Worker and routing Service Worker messages back to the Rust runtime.
+- Registering the Service Worker and establishing its request forwarding path to the SharedWorker.
 - Reading the configured network profile, network id, and browser-dialable bootnodes, then passing bootnode connection requests to the `Weeb3` node.
 - Wiring the navigation input so BZZ references, raw byte routes, chunk routes, and exact `/stream/{owner}/{topic}` or `/live/stream/{owner}/{topic}` HLS share routes can be opened from the UI.
 - Wiring upload controls for single files, tar-based collections, optional encryption, Bee redundancy levels, index document selection, optional feed publishing, and postage-stamp reuse or reset.
@@ -123,7 +123,7 @@ The interface layer currently has the following roles:
 - Providing runtime controls such as pausing and resuming transfers.
 - Rendering retrieved resources, website iframes, streaming media, raw downloads, logs, connection status, network state, and progress rows.
 
-The current interface no longer assumes that requests are handled by a shared worker. The tab owns the `Weeb3` runtime, while the Service Worker acts as a request forwarder between browser fetch events and the active controlled client.
+The tab owns the interface and a `SharedNodeClient`; the SharedWorker owns the `Weeb3` runtime shared by connected tabs. The Service Worker forwards fetches through a direct port to the SharedWorker, using a controlled window to establish that connection or relay requests when needed.
 
 #### The weeb process
 
@@ -193,7 +193,7 @@ Every Rust source file belongs to one of the runtime areas below. None of the `.
 
 ##### Connections and Swarm protocols
 
-- `src/accounting.rs` contains connection-scoped debt, reserve, credit and refreshment accounting, proximity pricing, the 200-peer buildup and dial-concurrency limits, and Bee-compatible reconnect delay calculations.
+- `src/accounting.rs` contains connection-scoped debt, reserve, credit and refreshment accounting, proximity pricing, the initial 200-peer connection target, and Bee-compatible reconnect delay calculations. Every 100 established connection losses reduces the attempted target to four fifths, down to 30; healthy connections stay open, and a network reset starts a new count.
 - `src/addresses.rs` decodes Bee underlay lists, validates their WSS address forms, and converts Bee IP/SNI addresses into browser-dialable DNS WebSocket multiaddresses.
 - `src/handlers.rs` implements framing and stream exchanges for handshake, pricing, hive gossip, pseudosettle refreshment, SWAP cheques, retrieval, and pushsync. It binds protocol work to physical connection sessions and reports completion to accounting and the data pipelines.
 - `src/conventions.rs` contains shared Swarm protocol primitives, including peer and accounting records, proximity order, BMT / CAC addressing, CAC and SOC validation, cryptographic signing and recovery, handshake helpers, and common reference and resource encodings.
@@ -217,7 +217,7 @@ Every Rust source file belongs to one of the runtime areas below. None of the `.
 
 - `src/stream.rs` is the generic browser resource layer. It translates Service Worker messages into BZZ and raw responses, implements HTTP Range, ETag, metadata, response and singleflight caches, and drives ordinary audio or video range retrieval, seek handling, staged prefetch, retries, and result-view lifetime.
 - `src/stream_conventions.rs` contains exact beginning and live share-route validation, their HLS start value, HTTP range and validator helpers, immutable cache identities, device-aware cache limits, and staged regular-media lookahead budgets shared at the browser boundary.
-- `src/stream_hls.rs` and `src/stream_hls/` contain the separate, nonstandard HLS dapp integration rather than generic Bee retrieval logic. They parse the append-only playlist, discover and follow its authenticated feed edge, expose accurate elapsed duration, serve local playlist and byte-range responses, and gate playback on three contiguous segments. Live playback initializes the decoder from the first segment when the tail lacks codec headers, then retargets once to the exact three-segment live runway. Startup warms only that planned three-fragment runway in parallel; after it, hls.js chooses ongoing media fragments while the Service Worker performs bounded intra-fragment range lookahead. The hls.js module load, Service Worker activation, and feed discovery run concurrently during cold startup; `static/hls_loader.js` remains only a dynamic import hook.
+- `src/stream_hls.rs` and `src/stream_hls/` parse Swarm HLS playlists, discover their authenticated feed edge, and serve manifests and media through the SharedWorker. Old live playback keeps its eight-second runway and first-segment codec bootstrap. Timestamped live playlists select twelve seconds within the published window. With hls.js, a bounded read of the first playlist restores the broadcast clock without downloading its history; rewind covers the joined window. Beginning routes reconstruct the archive for seeking. Segment prefetch runs in the background, and the media element supplies the buffering indicator without artificial pauses. Multiresolution streams initially keep the prepared resolution; the selector offers the other resolutions and explicit Auto mode. HLS loading, Service Worker activation, and feed discovery run concurrently; `static/hls_loader.js` is only the module import hook.
 
 ##### Persistence, identity, networks, and contracts
 
@@ -244,7 +244,7 @@ Batch state held by `weeb-3-secure` is requested with the active Swarm network i
 
 The browser runtime maintains a mix of ephemeral and persistent state.
 
-The libp2p identity used by a `Weeb3` runtime is generated when the node is created. That makes the live peer identity tab-local and runtime-local. Peer maps, connection attempts, active streams, and accounting state are kept in memory by the `Weeb3` and `Wings` structures.
+The libp2p identity is generated when the SharedWorker creates its `Weeb3` node. Connected tabs share that node's peer identity, connections, active streams, and accounting state, held by the `Weeb3` and `Wings` structures.
 
 `src/persistence.rs` stores the chequebook signer and address and last issued payouts across browser sessions. Network-scoped postage state, upload and feed identities, and other sensitive state are routed through the secure vault module instead of being handled directly by ordinary UI code.
 
@@ -267,7 +267,7 @@ The Service Worker solves this by providing deterministic application-scoped rou
 - HLS playback uses `/feeds/<owner>/<topic-hash>` and `/hls/bytes/<reference>` internally for rewritten playlists and segment fetches. These are transport paths between the media loader, Service Worker, and Rust runtime, not additional share-link APIs.
 - `POST` requests to the scoped `/bzz` endpoint are forwarded as upload requests, including upload headers such as encryption, collection, and index-document hints.
 - Ordinary fetch forwarding selects a top-level client through a fresh, network-aware runtime probe, with concurrent probes for the same client coalesced. Direct HLS feed and segment requests from an in-scope top-level client use that client immediately to avoid repeating the probe on the playback path.
-- Startup prewarms only the exact three references selected by the HLS plan; hls.js owns fragment demand after that bounded runway, and the Service Worker streams bounded ordered byte ranges through the Rust runtime. A Service Worker response timeout detaches its `MessagePort` without replaying the request; while the page runtime remains alive, already dispatched Rust work can continue and settle its peer response and accounting once.
+- Rust prefetches a bounded runway while hls.js requests media fragments. A Service Worker response timeout detaches its `MessagePort` without replaying the request; while the SharedWorker remains alive, already dispatched Rust work continues to settle its peer response and accounting once.
 - BZZ resources can be answered as full responses, byte-range responses, or streaming responses depending on MIME type, request headers, and resource size.
 - Requests outside the explicit weeb-3 route set remain under the host application's normal fetch and cache policy; the packaged worker does not precache or delete host assets.
 
@@ -282,7 +282,7 @@ The weeb-3 project uses the following main Rust crates and browser bindings:
 - `libp2p` and `libp2p-stream` for peer identity, transport, multiplexing, stream protocols, identify, ping, and browser WebSocket transport.
 - `async-std` and `async-lock` for async runtime primitives that work in the browser Wasm target.
 - `wasm-bindgen`, `wasm-bindgen-futures`, `js-sys`, and `web-sys` for JavaScript, DOM, Service Worker, browser API, and Promise integration.
-- `web3`, `alloy`, and `ethers` for wallet, signing, ABI, ENS, and on-chain contract interaction.
+- `web3` and `k256` for wallet, signing, ABI, ENS, and on-chain contract interaction; `alloy-primitives` supplies independent cryptographic test vectors.
 - `indexed_db_futures` for browser IndexedDB persistence.
 - `tar` and `mime_guess` for collection upload handling and MIME inference.
 - `getrandom` with the `wasm_js` backend for browser-compatible randomness.
@@ -293,9 +293,7 @@ The weeb-3 project uses the following main Rust crates and browser bindings:
 
 The browser runtime enables a high level of concurrency between Swarm tasks by combining libp2p streams, async channels, local futures, bounded upload and retrieval concurrency, and protocol-specific retry loops. This allows many protocol messages and chunk operations to be in flight at the same time even though the Wasm runtime itself is not using native threads.
 
-The current browser architecture is still constrained by the WebAssembly execution environment. A tab-local runtime shares the browser's single-threaded Wasm event loop unless browser and build settings enable more advanced worker-based execution. Memory is also constrained by the WebAssembly address space and by practical browser limits.
-
-Moving parts of the runtime into dedicated workers could improve isolation, memory headroom, and CPU parallelism in the future. That change would need to preserve browser transport support, Service Worker communication, secure vault boundaries, and compatibility with mobile browsers.
+The SharedWorker runs the Swarm node on its own event loop, separate from page rendering and playback controls. The Service Worker forwards media requests directly to it. Connected tabs share the node and its caches, while wallet and vault interactions remain in the requesting window. Memory is constrained by the WebAssembly address space and practical browser limits.
 
 ## [Planned development]
 

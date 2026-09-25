@@ -134,14 +134,6 @@ fn parse_prepare_response(response: Object) -> Result<(PreparedHlsFeed, u64), St
     ))
 }
 
-fn release_hls() {
-    release_hls_matching(None);
-}
-
-fn release_hls_for_view(view_generation: u64) {
-    release_hls_matching(Some(view_generation));
-}
-
 fn release_hls_matching(view_generation: Option<u64>) {
     let active = ACTIVE_HLS.with(|active| {
         active
@@ -181,20 +173,32 @@ fn notify_abandon(id: u64, runtime: &SharedRuntime, network_id: u64) {
     let _ = runtime.notify(&request);
 }
 
-pub(super) async fn resolve_live_tail_failure(sequence: u64, reference: &str) -> Option<f64> {
+async fn live_control(kind: &str, timeout: Duration, configure: impl FnOnce(&Object)) -> Option<Object> {
     let (runtime, request) = ACTIVE_HLS.with(|active| {
         let active = active.borrow();
         let active = active.as_ref().filter(|active| active.live)?;
-        let request = request_object("WEEB3_HLS_TAIL_FAILURE", active.network_id);
+        let request = request_object(kind, active.network_id);
         set_number(&request, "session", active.worker_session as f64);
         Some((active.runtime.clone(), request))
     })?;
-    set_number(&request, "sequence", sequence as f64);
-    set_string(&request, "reference", reference);
-    let response = runtime.request(&request, HLS_CONTROL_TIMEOUT).await.ok()?;
-    if bool_property(&response, "ok") != Some(true) {
-        return None;
-    }
+    configure(&request);
+    let response = runtime.request(&request, timeout).await.ok()?;
+    (bool_property(&response, "ok") == Some(true)).then_some(response)
+}
+
+pub(super) async fn prepare_history(source: &str, position: f64) -> Option<f64> {
+    let response = live_control("WEEB3_HLS_HISTORY", HLS_PREPARE_TIMEOUT, |request| {
+        set_string(request, "source", source);
+        set_number(request, "position", position);
+    }).await?;
+    number_property(&response, "timelineOffset")
+}
+
+pub(super) async fn resolve_live_tail_failure(sequence: u64, reference: &str) -> Option<f64> {
+    let response = live_control("WEEB3_HLS_TAIL_FAILURE", HLS_CONTROL_TIMEOUT, |request| {
+        set_number(request, "sequence", sequence as f64);
+        set_string(request, "reference", reference);
+    }).await?;
     number_property(&response, "target").filter(|target| target.is_finite() && *target >= 0.0)
 }
 
@@ -232,7 +236,7 @@ pub(crate) async fn attach_hls_feed_player(
     player::play_hls(player_element, prepare, loader, start)
         .await
         .map_err(|error| {
-            release_hls_for_view(view_generation);
+            release_hls_matching(Some(view_generation));
             format!("Could not initialize HLS: {}", js_error_message(&error))
         })
 }
@@ -277,7 +281,7 @@ pub(crate) async fn open_hls_feed_view(
 }
 
 pub(crate) fn release_hls_view() {
-    release_hls();
+    release_hls_matching(None);
     player::destroy_current_hls();
 }
 

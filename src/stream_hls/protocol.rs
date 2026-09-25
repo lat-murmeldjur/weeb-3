@@ -8,6 +8,7 @@ use crate::{
 
 pub(crate) fn plan_to_js(plan: &HlsStartupPlan) -> Object {
     let object = Object::new();
+    set_number(&object, "timelineOffset", plan.timeline_offset);
     set_number(&object, "bootstrapPosition", plan.bootstrap_position);
     set_bool(&object, "codecBootstrap", plan.codec_bootstrap);
     set_number(&object, "playPosition", plan.play_position);
@@ -18,13 +19,15 @@ pub(crate) fn plan_to_js(plan: &HlsStartupPlan) -> Object {
 
 pub(crate) fn plan_from_js(value: &JsValue) -> Option<HlsStartupPlan> {
     let plan = HlsStartupPlan {
+        timeline_offset: number_property(value, "timelineOffset").unwrap_or(0.0),
         bootstrap_position: number_property(value, "bootstrapPosition")?,
         codec_bootstrap: bool_property(value, "codecBootstrap")?,
         play_position: number_property(value, "playPosition")?,
         runway_end: number_property(value, "runwayEnd")?,
         duration: number_property(value, "duration")?,
     };
-    (plan.bootstrap_position >= 0.0
+    (plan.timeline_offset >= 0.0
+        && plan.bootstrap_position >= plan.timeline_offset
         && plan.play_position >= 0.0
         && plan.runway_end > plan.play_position
         && plan.duration >= plan.runway_end

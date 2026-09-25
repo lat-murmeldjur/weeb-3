@@ -2,6 +2,7 @@
 
 use async_lock::Semaphore;
 use async_std::sync::{Arc, Mutex};
+use bytes::Bytes;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use wasm_bindgen_futures::spawn_local;
 
@@ -865,7 +866,9 @@ impl Weeb3 {
                 if !matches!(
                     &event,
                     SwarmEvent::ConnectionEstablished { .. }
-                        | SwarmEvent::Behaviour(BehaviourEvent::Identify(_))
+                        | SwarmEvent::Behaviour(BehaviourEvent::Identify(
+                            identify::Event::Received { .. } | identify::Event::Error { .. },
+                        ))
                         | SwarmEvent::OutgoingConnectionError { .. }
                         | SwarmEvent::ConnectionClosed { .. }
                 ) {
@@ -927,85 +930,80 @@ impl Weeb3 {
                                 ));
                             }
                         }
-                        SwarmEvent::Behaviour(BehaviourEvent::Identify(identify_event)) => {
-                            match identify_event {
-                                identify::Event::Received {
-                                    peer_id,
-                                    connection_id,
-                                    info,
-                                } => {
-                                    let physical_session_current = wings
-                                        .physical_connections
-                                        .lock()
-                                        .unwrap_or_else(|error| error.into_inner())
-                                        .get(&peer_id)
-                                        .is_some_and(|connections| {
-                                            connections.contains(&connection_id)
-                                        });
-                                    if !physical_session_current {
-                                        return;
-                                    }
-                                    if wings
-                                        .handshake_ready_connections
-                                        .lock()
-                                        .unwrap_or_else(|error| error.into_inner())
-                                        .contains(&(peer_id, connection_id))
-                                    {
-                                        return;
-                                    }
-                                    if info.observed_addr.is_empty()
-                                        || try_from_multiaddr(&info.observed_addr)
-                                            .is_some_and(|peer| peer != identify_local_peer_id)
-                                    {
-                                        let _ = close_failed_identify_connection(
-                                            &wings,
-                                            &swarm,
-                                            &peer_id,
-                                            connection_id,
-                                        )
-                                        .await;
-                                        return;
-                                    }
-                                    let observed_addr = info.observed_addr;
-                                    let mut swarm = swarm.lock().await;
-                                    let canonical = {
-                                        let mut canonical = wings
-                                            .canonical_identify_address
-                                            .lock()
-                                            .unwrap_or_else(|error| error.into_inner());
-                                        if canonical.is_none() {
-                                            *canonical = Some(observed_addr.clone());
-                                            Some(observed_addr)
-                                        } else {
-                                            None
-                                        }
-                                    };
-                                    if let Some(canonical) = canonical {
-                                        swarm.add_external_address(canonical);
-                                    }
-                                    swarm
-                                        .behaviour_mut()
-                                        .identify
-                                        .push(std::iter::once(peer_id));
-                                    drop(swarm);
-                                    mark_handshake_ready_connection(&wings, peer_id, connection_id)
-                                        .await;
-                                }
-                                identify::Event::Error {
-                                    peer_id,
-                                    connection_id,
-                                    ..
-                                } => {
-                                    let _ = close_failed_identify_connection(
-                                        &wings,
-                                        &swarm,
-                                        &peer_id,
-                                        connection_id,
-                                    )
-                                    .await;
-                                }
-                                _ => {}
+                        SwarmEvent::Behaviour(BehaviourEvent::Identify(identify::Event::Received {
+                            peer_id,
+                            connection_id,
+                            info,
+                        })) => {
+                            let physical_session_current = wings
+                                .physical_connections
+                                .lock()
+                                .unwrap_or_else(|error| error.into_inner())
+                                .get(&peer_id)
+                                .is_some_and(|connections| {
+                                    connections.contains(&connection_id)
+                                });
+                            if !physical_session_current {
+                                return;
                             }
+                            if wings
+                                .handshake_ready_connections
+                                .lock()
+                                .unwrap_or_else(|error| error.into_inner())
+                                .contains(&(peer_id, connection_id))
+                            {
+                                return;
+                            }
+                            if info.observed_addr.is_empty()
+                                || try_from_multiaddr(&info.observed_addr)
+                                    .is_some_and(|peer| peer != identify_local_peer_id)
+                            {
+                                let _ = close_failed_identify_connection(
+                                    &wings,
+                                    &swarm,
+                                    &peer_id,
+                                    connection_id,
+                                )
+                                .await;
+                                return;
+                            }
+                            let observed_addr = info.observed_addr;
+                            let mut swarm = swarm.lock().await;
+                            let canonical = {
+                                let mut canonical = wings
+                                    .canonical_identify_address
+                                    .lock()
+                                    .unwrap_or_else(|error| error.into_inner());
+                                if canonical.is_none() {
+                                    *canonical = Some(observed_addr.clone());
+                                    Some(observed_addr)
+                                } else {
+                                    None
+                                }
+                            };
+                            if let Some(canonical) = canonical {
+                                swarm.add_external_address(canonical);
+                            }
+                            swarm
+                                .behaviour_mut()
+                                .identify
+                                .push(std::iter::once(peer_id));
+                            drop(swarm);
+                            mark_handshake_ready_connection(&wings, peer_id, connection_id)
+                                .await;
+                        }
+                        SwarmEvent::Behaviour(BehaviourEvent::Identify(identify::Event::Error {
+                            peer_id,
+                            connection_id,
+                            ..
+                        })) => {
+                            let _ = close_failed_identify_connection(
+                                &wings,
+                                &swarm,
+                                &peer_id,
+                                connection_id,
+                            )
+                            .await;
                         }
                         SwarmEvent::OutgoingConnectionError {
                             peer_id,
@@ -1221,7 +1219,8 @@ impl Weeb3 {
                                 release_connection_reservation(&connection_population).await;
                                 "Ongoing"
                             } else if removed_owned_overlay || tracked_bootnode {
-                                release_connected_peer(&connection_population).await;
+                                release_connected_peer(&connection_population, retry_is_current)
+                                    .await;
                                 "Connected"
                             } else {
                                 "None"
@@ -2078,13 +2077,13 @@ impl Weeb3 {
                                 .await;
                                 if !feedback.is_closed() {
                                     let _ = chunk_upload_chan_outgoing.try_send((
-                                        d.clone(),
+                                        d,
                                         soc,
-                                        checkad.clone(),
-                                        stamp.clone(),
-                                        feedback.clone(),
-                                        slot_feedback.clone(),
-                                        progress.clone(),
+                                        checkad,
+                                        stamp,
+                                        feedback,
+                                        slot_feedback,
+                                        progress,
                                     ));
                                 }
                             }
@@ -2128,7 +2127,7 @@ impl Weeb3 {
                             &admission,
                         )
                     {
-                        let _ = chan.send(vec![]);
+                        chan.send(Bytes::new());
                         continue;
                     }
 
@@ -2143,7 +2142,7 @@ impl Weeb3 {
                             if !wait_transfer_unpaused_for_admission(&transfer_paused, &admission)
                                 .await
                             {
-                                return vec![];
+                                return Bytes::new();
                             }
 
                             let Some(_permit) = retrieval_conventions::acquire_retrieve_permit(
@@ -2152,13 +2151,13 @@ impl Weeb3 {
                             )
                             .await
                             else {
-                                return vec![];
+                                return Bytes::new();
                             };
 
                             if !wait_transfer_unpaused_for_admission(&transfer_paused, &admission)
                                 .await
                             {
-                                return vec![];
+                                return Bytes::new();
                             }
 
                             let stream_generation_current = retrieve_cancel_token_current(&cancel);
@@ -2166,7 +2165,7 @@ impl Weeb3 {
                                 stream_generation_current,
                                 &admission,
                             ) {
-                                return vec![];
+                                return Bytes::new();
                             }
 
                             retrieve_chunk(
@@ -2185,7 +2184,7 @@ impl Weeb3 {
                         }
                         .await;
 
-                        let _ = chan.send(chunk_data);
+                        chan.send(chunk_data);
                     });
                 }
 

@@ -29,16 +29,14 @@ use crate::{
         MEDIA_STORAGE_WINDOW_BYTES, MIB_BYTES, decode_component, if_none_match_matches,
         if_range_allows_range, immutable_metadata_identity, is_swarm_reference_hex,
         media_cache_budget_bytes, media_prefetch_ahead_limit_bytes, media_prefetch_stage_targets,
-        parse_single_range, window_key,
+        parse_single_range, route_resource, window_key,
     },
     stream_hls::HLS_BODY_MAX_BYTES,
     worker_protocol::{bytes_to_js, set as set_js, string_property},
 };
 
-const STREAM_RESPONSE_BUFFER_BYTES: u64 = MEDIA_STARTUP_RESPONSE_BYTES;
 const STREAM_ACTIVE_RESPONSE_BUFFER_BYTES: u64 = 2 * MIB_BYTES;
 const STREAM_SEEK_KEEP_AHEAD_BYTES: u64 = 16 * MIB_BYTES;
-const STREAM_SEEK_RESET_GAP_BYTES: u64 = STREAM_SEEK_KEEP_AHEAD_BYTES;
 const STREAM_SEEK_REQUEST_GAP_BYTES: u64 = 6 * MIB_BYTES;
 const METADATA_CACHE_MAX_ENTRIES: usize = 1024;
 const MEDIA_STREAM_STATE_MAX_ENTRIES: usize = 64;
@@ -46,7 +44,6 @@ const RANGE_SINGLEFLIGHT_MAX_LOADS: usize = 256;
 const RANGE_SINGLEFLIGHT_MAX_WAITERS: usize = 64;
 const RANGE_RETRY_DELAY_MS: u64 = 700;
 const RANGE_REQUEST_TIMEOUT_MS: u64 = 210_000;
-const STREAM_RANGE_RETRY_COUNT: usize = 1;
 const STREAM_RANGE_REQUEST_TIMEOUT_MS: u64 = 15_000;
 const MEDIA_RETRY_DELAYS_MS: [u64; 6] = [1_000, 2_000, 4_000, 8_000, 16_000, 30_000];
 thread_local! {
@@ -193,13 +190,13 @@ impl FetchCache {
     fn range_load_role(
         &mut self,
         cache_key: &str,
-        pending_key: String,
         generation: u64,
         cancel_when_unused: bool,
     ) -> RangeLoadRole {
         if let Some(body) = self.range(cache_key) {
             return RangeLoadRole::Cached(body);
         }
+        let pending_key = pending_range_key(cache_key, generation);
         let mut joining = false;
         if let Some((flight_id, shared, waiters)) = self
             .pending_ranges
@@ -543,17 +540,6 @@ impl FetchResponse {
         }
     }
 
-    pub(crate) fn ok_shared_slice(
-        status: u16,
-        headers: Vec<(String, String)>,
-        body: Bytes,
-        start: usize,
-        end: usize,
-    ) -> Option<Self> {
-        body.get(start..end)?;
-        Some(Self::ok_shared(status, headers, body.slice(start..end)))
-    }
-
     pub(crate) fn stream(status: u16, headers: Vec<(String, String)>) -> Self {
         Self {
             stream: true,
@@ -596,14 +582,10 @@ impl FetchResponse {
     }
 }
 
-/// SharedWorker equivalent of the page message bridge.
 pub(crate) async fn service_worker_message_response(
     obj: &js_sys::Object,
     weeb3: Arc<Weeb3>,
-) -> Option<Object> {
-    if string_property(obj.as_ref(), "type").as_deref() != Some("WEEB3_FETCH_REQUEST") {
-        return None;
-    }
+) -> Object {
     let url = string_property(obj.as_ref(), "url").unwrap_or_default();
     let mut method = string_property(obj.as_ref(), "method").unwrap_or_else(|| "GET".into());
     method.make_ascii_uppercase();
@@ -612,21 +594,16 @@ pub(crate) async fn service_worker_message_response(
         string_property(obj.as_ref(), "ifNoneMatch").filter(|value| !value.trim().is_empty());
     let if_range =
         string_property(obj.as_ref(), "ifRange").filter(|value| !value.trim().is_empty());
-    let stream_token =
-        string_property(obj.as_ref(), "streamToken").filter(|value| !value.trim().is_empty());
-    Some(
-        fetch_request_response(
-            weeb3,
-            url,
-            method,
-            range,
-            if_none_match,
-            if_range,
-            stream_token,
-        )
-        .await
-        .into_js(),
+    fetch_request_response(
+        weeb3,
+        url,
+        method,
+        range,
+        if_none_match,
+        if_range,
     )
+    .await
+    .into_js()
 }
 
 async fn fetch_request_response(
@@ -636,7 +613,6 @@ async fn fetch_request_response(
     range: Option<String>,
     if_none_match: Option<String>,
     if_range: Option<String>,
-    stream_token: Option<String>,
 ) -> FetchResponse {
     if method != "GET" && method != "HEAD" {
         return FetchResponse::error(405, "method not allowed");
@@ -659,8 +635,6 @@ async fn fetch_request_response(
         &method,
         range.as_deref(),
         if_none_match.as_deref(),
-        if_range.as_deref(),
-        stream_token.as_deref(),
     )
     .await
     {
@@ -748,28 +722,19 @@ async fn fetch_bzz_response(
         return FetchResponse::ok(200, metadata_headers(&metadata, 0), Some(vec![]));
     }
 
-    let streamable = is_streamable_mime(&metadata.mime) && metadata.size > 0;
-    let range_validator_mismatch =
-        range.is_some() && !if_range_allows_range(if_range.as_deref(), &metadata.etag);
-    if range_validator_mismatch {
-        // A failed If-Range condition changes the request into a complete 200
-        // representation. Large bodies retain the ordered range stream, while
-        // already-dispatched retrieval/accounting work keeps its lifecycle.
-        if should_inline_non_streamable_response(&metadata) {
-            return full_bzz_response(weeb3, resource, metadata).await;
-        }
-        return FetchResponse::stream(200, metadata_headers(&metadata, metadata.size));
-    }
-
+    let streamable = is_streamable_mime(&metadata.mime);
     let parsed_range = parse_single_range(range.as_deref(), metadata.size);
-    if !streamable && parsed_range.is_none() {
+    if (range.is_some() && !if_range_allows_range(if_range.as_deref(), &metadata.etag))
+        || (!streamable && parsed_range.is_none())
+    {
+        // Failed If-Range and un-ranged non-media requests return the whole resource.
         if should_inline_non_streamable_response(&metadata) {
             return full_bzz_response(weeb3, resource, metadata).await;
         }
         return FetchResponse::stream(200, metadata_headers(&metadata, metadata.size));
     }
 
-    let (start, end, partial, media_state) = match parsed_range {
+    let (start, end, media_state) = match parsed_range {
         Some(Err(_)) => {
             return FetchResponse::ok(
                 416,
@@ -793,16 +758,15 @@ async fn fetch_bzz_response(
                 streamable,
                 &media_state,
             );
-            (start, end, true, media_state)
+            (start, end, media_state)
         }
-        None if streamable => {
+        None => {
             let media_state = begin_media_range(&resource, &metadata, 0);
-            let end = STREAM_RESPONSE_BUFFER_BYTES
+            let end = MEDIA_STARTUP_RESPONSE_BYTES
                 .saturating_sub(1)
                 .min(metadata.size - 1);
-            (0, end, true, Some(media_state))
+            (0, end, Some(media_state))
         }
-        None => (0, metadata.size - 1, false, None),
     };
 
     mark_range_windows_scheduled(&resource, &metadata, start, end, &media_state);
@@ -832,28 +796,23 @@ async fn fetch_bzz_response(
         return FetchResponse::error(502, "weeb-3 returned a short range");
     }
 
+    let mut headers = metadata_headers(&metadata, bytes.len() as u64);
+    headers.push((
+        "Content-Range".to_string(),
+        format!("bytes {}-{}/{}", start, end, metadata.size),
+    ));
     if let Some(media_state) = &media_state {
         mark_media_range_complete(&resource, &metadata, start, end, media_state);
         spawn_prefetch_media_stages(
-            weeb3.clone(),
-            resource.clone(),
-            metadata.clone(),
+            weeb3,
+            resource,
+            metadata,
             end,
-            metadata.size - 1,
             media_state.generation,
         );
     }
 
-    let mut headers = metadata_headers(&metadata, bytes.len() as u64);
-    if partial {
-        headers.push((
-            "Content-Range".to_string(),
-            format!("bytes {}-{}/{}", start, end, metadata.size),
-        ));
-        FetchResponse::ok_shared(206, headers, bytes)
-    } else {
-        FetchResponse::ok_shared(200, headers, bytes)
-    }
+    FetchResponse::ok_shared(206, headers, bytes)
 }
 
 async fn resolve_bzz_cached(weeb3: Arc<Weeb3>, resource: String) -> Option<BzzMetadata> {
@@ -949,29 +908,6 @@ fn inclusive_range_len(start: u64, end: u64) -> Option<usize> {
     end.checked_sub(start)?.checked_add(1)?.try_into().ok()
 }
 
-fn range_storage_windows_for_span(start: u64, end: u64, size: u64) -> Vec<(u64, u64)> {
-    if size == 0 || start > end || start >= size || end >= size {
-        return Vec::new();
-    }
-
-    let mut windows = Vec::new();
-    let mut position = start;
-
-    while position <= end {
-        let window = range_storage_window_for_start(position, size);
-        if window.0 > window.1 || window.1 < position {
-            return Vec::new();
-        }
-        windows.push(window);
-        if window.1 == u64::MAX {
-            break;
-        }
-        position = window.1.saturating_add(1);
-    }
-
-    windows
-}
-
 fn begin_media_range(resource: &str, metadata: &BzzMetadata, start: u64) -> MediaRangeState {
     let key = media_state_key(resource, metadata);
 
@@ -986,23 +922,23 @@ fn begin_media_range(resource: &str, metadata: &BzzMetadata, start: u64) -> Medi
             && start.saturating_add(STREAM_SEEK_REQUEST_GAP_BYTES) < previous_request_start;
         let is_seek = previous_anchor.is_some()
             && (is_request_jump
-                || start.saturating_add(STREAM_SEEK_RESET_GAP_BYTES)
+                || start.saturating_add(STREAM_SEEK_KEEP_AHEAD_BYTES)
                     < previous_anchor.unwrap_or(0)
-                || start as i64 > previous_high_water + STREAM_SEEK_RESET_GAP_BYTES as i64);
+                || start as i64 > previous_high_water + STREAM_SEEK_KEEP_AHEAD_BYTES as i64);
         let is_prefetch_runaway = previous_anchor.is_some()
             && previous_high_water
                 > start
-                    .saturating_add(STREAM_RESPONSE_BUFFER_BYTES)
+                    .saturating_add(MEDIA_STARTUP_RESPONSE_BYTES)
                     .saturating_add(stream_prefetch_ahead_limit_bytes()) as i64;
 
         if is_seek || is_prefetch_runaway {
             state.generation = next_media_generation();
+            state.completed_ranges.clear();
+        }
+        if is_startup || is_seek || is_prefetch_runaway {
             state.anchor_start = Some(start);
             state.high_water_end = start as i64 - 1;
             state.scheduled_high_water_end = start as i64 - 1;
-            state.completed_ranges.clear();
-        } else if is_startup {
-            state.anchor_start = Some(start);
         }
 
         state.last_request_start = start;
@@ -1028,7 +964,7 @@ fn response_range_for_request(
         .as_ref()
         .is_some_and(|state| state.last_range_was_startup)
     {
-        STREAM_RESPONSE_BUFFER_BYTES
+        MEDIA_STARTUP_RESPONSE_BYTES
     } else {
         STREAM_ACTIVE_RESPONSE_BUFFER_BYTES
     };
@@ -1100,44 +1036,21 @@ async fn read_cached_range_with_retry(
     end: u64,
     generation: u64,
 ) -> Result<Bytes, RangeReadError> {
-    let expected_len =
-        inclusive_range_len(start, end).ok_or_else(|| "invalid or oversized range".to_string())?;
+    inclusive_range_len(start, end).ok_or_else(|| "invalid or oversized range".to_string())?;
     if metadata.size == 0 || start >= metadata.size || end >= metadata.size {
         return Err("range lies outside the resolved resource".into());
     }
 
-    let mut last_error = RangeReadError::terminal("range retry did not run");
     // Generation-zero reads already retry inside the Bee range retriever. A second
     // outer retry would start after the 210s timeout and outlive the service
     // worker's request budget, while its detached first attempt still drains.
-    let retry_count = if generation == 0 {
-        0
-    } else {
-        STREAM_RANGE_RETRY_COUNT
-    };
-
-    for attempt in 0..=retry_count {
-        match read_cached_range(weeb3, resource, metadata, start, end, generation, None).await {
-            Ok(bytes) if bytes.len() == expected_len => return Ok(bytes),
-            Ok(bytes) => {
-                last_error = RangeReadError::terminal(format!(
-                    "weeb-3 returned {} bytes for {} byte range",
-                    bytes.len(),
-                    expected_len
-                ));
-            }
-            Err(error) => last_error = error,
-        }
-
-        if attempt < retry_count {
-            async_std::task::sleep(Duration::from_millis(
-                RANGE_RETRY_DELAY_MS * (attempt as u64 + 1),
-            ))
-            .await;
-        }
+    let mut result =
+        read_cached_range(weeb3, resource, metadata, start, end, generation, None).await;
+    if generation != 0 && result.is_err() {
+        async_std::task::sleep(Duration::from_millis(RANGE_RETRY_DELAY_MS)).await;
+        result = read_cached_range(weeb3, resource, metadata, start, end, generation, None).await;
     }
-
-    Err(last_error)
+    result
 }
 
 async fn read_cached_range(
@@ -1155,25 +1068,22 @@ async fn read_cached_range(
     if metadata.size == 0 || start > end || start >= metadata.size || end >= metadata.size {
         return Err("range lies outside the resolved resource".into());
     }
-    let windows = if current.is_some()
+    let (window_start, window_end) = if current.is_some()
         && start == 0
         && end == metadata.size - 1
         && metadata.size <= HLS_BODY_MAX_BYTES
     {
-        vec![(start, end)]
+        (start, end)
     } else {
-        range_storage_windows_for_span(start, end, metadata.size)
+        range_storage_window_for_start(start, metadata.size)
     };
-    if windows.is_empty() {
-        return Err("range did not produce storage windows".into());
-    }
-    if let [(window_start, window_end)] = windows.as_slice() {
+    if end <= window_end {
         let body = read_range_window(
             weeb3,
             resource,
             metadata,
-            *window_start,
-            *window_end,
+            window_start,
+            window_end,
             generation,
             current.is_some(),
         )
@@ -1197,6 +1107,10 @@ async fn read_cached_range(
         .ok_or_else(|| "requested range is too large".to_string())?;
     let mut body = vec![0; body_len];
 
+    let windows =
+        (start / MEDIA_STORAGE_WINDOW_BYTES..=end / MEDIA_STORAGE_WINDOW_BYTES).map(|index| {
+            range_storage_window_for_start(index * MEDIA_STORAGE_WINDOW_BYTES, metadata.size)
+        });
     let admitting = Cell::new(true);
     let responses = stream::iter(windows)
         .map(|(window_start, window_end)| {
@@ -1257,12 +1171,11 @@ async fn read_range_window(
         return Err("range window lies outside the resolved resource".into());
     }
     let cache_key = range_cache_key(resource, metadata, start, end);
-    let pending_key = pending_range_key(&cache_key, generation);
     let (epoch, role) = FETCH_CACHE.with(|cache| {
         let mut cache = cache.borrow_mut();
         (
             cache.epoch,
-            cache.range_load_role(&cache_key, pending_key, generation, cancel_when_unused),
+            cache.range_load_role(&cache_key, generation, cancel_when_unused),
         )
     });
     let (receiver, registration) = match role {
@@ -1380,7 +1293,6 @@ fn spawn_prefetch_media_stages(
     resource: String,
     metadata: BzzMetadata,
     response_end: u64,
-    requested_end: u64,
     generation: u64,
 ) {
     let key = media_state_key(&resource, &metadata);
@@ -1411,7 +1323,6 @@ fn spawn_prefetch_media_stages(
             &metadata,
             &key,
             response_end,
-            requested_end,
             generation,
         )
         .await;
@@ -1434,12 +1345,11 @@ async fn prefetch_media_stages(
     metadata: &BzzMetadata,
     media_key: &str,
     response_end: u64,
-    requested_end: u64,
     generation: u64,
 ) {
     let ahead_limit_bytes = stream_prefetch_ahead_limit_bytes();
-    let prefetch_limit_end = requested_end
-        .min(response_end.saturating_add(ahead_limit_bytes))
+    let prefetch_limit_end = response_end
+        .saturating_add(ahead_limit_bytes)
         .min(metadata.size.saturating_sub(1));
 
     for stage_target_bytes in media_prefetch_stage_targets(ahead_limit_bytes) {
@@ -1610,15 +1520,6 @@ fn canonical_raw_resource(pathname: &str) -> Option<(&'static str, String)> {
     None
 }
 
-fn route_resource<'a>(pathname: &'a str, route: &str) -> Option<&'a str> {
-    let path = pathname.strip_prefix("/weeb-3/")?;
-    let path = path
-        .strip_prefix("mainnet/")
-        .or_else(|| path.strip_prefix("testnet/"))
-        .unwrap_or(path);
-    path.strip_prefix(route)
-}
-
 pub async fn try_render_streaming_player(
     weeb3: Rc<SharedNodeClient>,
     resource: String,
@@ -1684,16 +1585,12 @@ fn replace_bzz_result_view(
     }
     crate::stream_hls::release_hls_for_bzz_view(weeb3);
     release_bzz_view();
-    replace_result_view_dom(new_element);
+    crate::interface::replace_result_view(new_element);
     true
 }
 
 pub(crate) fn replace_result_view_contents(new_element: &Element) {
     release_current_stream_view();
-    replace_result_view_dom(new_element);
-}
-
-fn replace_result_view_dom(new_element: &Element) {
     crate::interface::replace_result_view(new_element);
 }
 
@@ -1915,5 +1812,34 @@ fn media_current_time(player: &Element) -> Option<f64> {
 fn navigate_to_bzz_url(src: &str) {
     if let Some(location) = web_sys::window().map(|window| window.location()) {
         let _ = location.assign(src);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[wasm_bindgen_test::wasm_bindgen_test]
+    fn first_unaligned_nonzero_range_advances_prefetch() {
+        let resource = "nonzero-prefetch-start";
+        let metadata = BzzMetadata {
+            data_reference: vec![0; 32],
+            mime: "video/mp4".into(),
+            size: 32 * MIB_BYTES,
+            etag: resource.into(),
+            path: resource.into(),
+            target_count: 1,
+        };
+        let start = 10 * MIB_BYTES + 1;
+        let end = start + MEDIA_STARTUP_RESPONSE_BYTES - 1;
+        let range = begin_media_range(resource, &metadata, start);
+        let key = media_state_key(resource, &metadata);
+        for (start, end) in [
+            (start, end),
+            range_storage_window_for_start(end + 1, metadata.size),
+        ] {
+            mark_media_window_complete(&key, start, end, range.generation);
+            assert_eq!(media_high_water_end(&key, range.generation), Some(end));
+        }
     }
 }

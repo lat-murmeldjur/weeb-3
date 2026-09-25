@@ -182,6 +182,7 @@ impl Weeb3 {
         let mut population = self.connection_population.lock().await;
         population.connected = 0;
         population.ongoing = 0;
+        population.lost = 0;
         population.changed.notify(usize::MAX);
     }
 
@@ -338,6 +339,7 @@ impl NetworkBehaviour for StreamBehaviour {
 pub(crate) struct ConnectionPopulation {
     pub(crate) connected: u64,
     pub(crate) ongoing: u64,
+    pub(crate) lost: u16,
     pub(crate) changed: Event,
 }
 
@@ -345,9 +347,16 @@ pub(crate) async fn release_connection_reservation(population: &Arc<Mutex<Connec
     complete_connection_reservation(population, false).await;
 }
 
-pub(crate) async fn release_connected_peer(population: &Arc<Mutex<ConnectionPopulation>>) {
+pub(crate) async fn release_connected_peer(
+    population: &Arc<Mutex<ConnectionPopulation>>,
+    replacement: bool,
+) {
     let mut population = population.lock().await;
     population.connected = population.connected.saturating_sub(1);
+    if replacement {
+        // Nine reductions reach the 30-peer floor.
+        population.lost = (population.lost + 1).min(900);
+    }
     population.changed.notify(usize::MAX);
 }
 
@@ -384,7 +393,7 @@ pub(crate) async fn try_reserve_connection_capacity(
     population: &Arc<Mutex<ConnectionPopulation>>,
 ) -> bool {
     let mut population = population.lock().await;
-    if connection_dial_capacity_available(population.connected, population.ongoing) {
+    if connection_dial_capacity_available(population.connected, population.ongoing, population.lost) {
         population.ongoing = population.ongoing.saturating_add(1);
         true
     } else {
@@ -510,11 +519,11 @@ pub(crate) type OverlayPeerMap = Arc<Mutex<Arc<BTreeMap<[u8; 32], PeerId>>>>;
 pub(crate) fn closest_overlay_peers<'a>(
     peers: &'a BTreeMap<[u8; 32], PeerId>,
     address: &'a [u8],
-) -> impl Iterator<Item = (PeerId, u8)> + 'a {
+) -> impl Iterator<Item = (&'a PeerId, u8)> + 'a {
     use std::ops::Bound::{Excluded, Included, Unbounded};
 
-    let candidate = move |(overlay, peer): (&[u8; 32], &PeerId)| {
-        (*peer, get_proximity(address, overlay))
+    let candidate = move |(overlay, peer): (&'a [u8; 32], &'a PeerId)| {
+        (peer, get_proximity(address, overlay))
     };
     let mut before = peers
         .range::<[u8], _>((Unbounded, Included(address)))

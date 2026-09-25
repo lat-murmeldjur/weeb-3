@@ -10,7 +10,7 @@ use crate::{
         live_tail_failure_identity, prepare_hls_feed, protocol::plan_to_js,
         release_hls_runtime,
     },
-    worker_protocol::{integer_property, set, set_number, string_property},
+    worker_protocol::{integer_property, number_property, set, set_number, string_property},
     worker_runtime::{Weeb3WorkerRuntime, error_response, ok_response},
 };
 
@@ -33,7 +33,8 @@ pub(crate) async fn dispatch(
     Some(match kind {
         "WEEB3_HLS_PREPARE" => prepare_hls_response(runtime, message).await,
         "WEEB3_HLS_CANCEL_PREPARE" => cancel_hls_prepare_response(message),
-        "WEEB3_HLS_RELEASE" | "WEEB3_HLS_TAIL_FAILURE" => hls_control_response(kind, message),
+        "WEEB3_HLS_RELEASE" | "WEEB3_HLS_TAIL_FAILURE" | "WEEB3_HLS_HISTORY" =>
+            hls_control_response(kind, message).await,
         "WEEB3_HLS_CLEAR_CACHE" => {
             clear_hls_runtime_cache();
             ok_response()
@@ -62,14 +63,6 @@ async fn prepare_hls_response(runtime: &Weeb3WorkerRuntime, message: &Object) ->
     REMOTE_HLS_PREPARE_KEY.with(|current| *current.borrow_mut() = Some(prepare_key.clone()));
     let prepared =
         prepare_hls_feed(runtime.inner.clone(), owner, topic, start, view_generation).await;
-    if prepared.is_err() {
-        REMOTE_HLS_PREPARE_KEY.with(|current| {
-            let mut current = current.borrow_mut();
-            if current.as_deref() == Some(&prepare_key) {
-                *current = None;
-            }
-        });
-    }
     match prepared {
         Ok(prepared) => {
             let response = ok_response();
@@ -81,11 +74,16 @@ async fn prepare_hls_response(runtime: &Weeb3WorkerRuntime, message: &Object) ->
             set_number(&response, "session", view_generation as f64);
             response
         }
-        Err(error) => error_response(502, error),
+        Err(error) => {
+            REMOTE_HLS_PREPARE_KEY.with(|current| {
+                current.borrow_mut().take_if(|current| current == &prepare_key);
+            });
+            error_response(502, error)
+        }
     }
 }
 
-fn hls_control_response(kind: &str, message: &Object) -> Object {
+async fn hls_control_response(kind: &str, message: &Object) -> Object {
     let Some(session) = integer_property(message, "session") else {
         return error_response(400, "HLS control requires session");
     };
@@ -94,11 +92,24 @@ fn hls_control_response(kind: &str, message: &Object) -> Object {
     }
     match kind {
         "WEEB3_HLS_RELEASE" => {
-            REMOTE_HLS_PREPARE_KEY.with(|current| *current.borrow_mut() = None);
             release_remote_hls_runtime();
             ok_response()
         }
         "WEEB3_HLS_TAIL_FAILURE" => hls_tail_failure_response(message),
+        "WEEB3_HLS_HISTORY" => {
+            let (Some(source), Some(position)) =
+                (string_property(message, "source"), number_property(message, "position")) else {
+                return error_response(400, "HLS history requires a source and playback position");
+            };
+            match super::runtime::prepare_history(&source, position).await {
+                Some(offset) => {
+                    let response = ok_response();
+                    set_number(&response, "timelineOffset", offset);
+                    response
+                }
+                None => error_response(502, "The requested HLS history could not be loaded"),
+            }
+        }
         _ => unreachable!(),
     }
 }

@@ -8,7 +8,8 @@ use crate::{
     },
     retrieval::{
         DecodedJoinChunk, retrieve_data, retrieve_data_range_from_root,
-        retrieve_data_range_from_root_cancellable, retrieve_decoded_data_root,
+        retrieve_data_range_from_root_cancellable,
+        retrieve_data_range_from_root_with_prefix_cancellable, retrieve_decoded_data_root,
         retrieve_decoded_data_root_cancellable, seek_latest_feed_update,
     },
     retrieve_cancel_token_current,
@@ -186,39 +187,21 @@ pub(crate) async fn retrieve_embedded_data(
     encrypted: bool,
     chunk_retrieve_chan: &ChunkRetrieveSender,
 ) -> Option<Vec<u8>> {
-    let (span, payload) =
-        retrieve_embedded_payload_with_span(data, encrypted, chunk_retrieve_chan).await?;
-    let capacity = usize::try_from(span.checked_add(8)?).ok()?;
-    let mut joined = Vec::with_capacity(capacity);
-    joined.extend_from_slice(&span.to_le_bytes());
-    joined.extend_from_slice(&payload);
-    (joined.len() == capacity).then_some(joined)
-}
-
-async fn retrieve_embedded_payload_with_span(
-    data: &[u8],
-    encrypted: bool,
-    chunk_retrieve_chan: &ChunkRetrieveSender,
-) -> Option<(u64, Vec<u8>)> {
     let root = embedded_join_root(data, encrypted)?;
     let span = root.span;
     if !manifest_payload_size_allowed(span) {
         return None;
     }
-    let payload = if span == 0 {
-        Vec::new()
-    } else {
-        retrieve_data_range_from_root(
-            root,
-            0,
-            span.checked_sub(1)?,
-            encrypted,
-            chunk_retrieve_chan,
-        )
-        .await?
-    };
-
-    (u64::try_from(payload.len()).ok()? == span).then_some((span, payload))
+    retrieve_data_range_from_root_with_prefix_cancellable(
+        root,
+        0,
+        span.saturating_sub(1),
+        encrypted,
+        chunk_retrieve_chan,
+        &span.to_le_bytes(),
+        None,
+    )
+    .await
 }
 
 #[derive(Clone, Debug)]
@@ -307,23 +290,16 @@ async fn retrieve_data_head(
     let root = retrieve_decoded_data_root(reference, chunk_retrieve_chan).await?;
     let span = root.span;
     let head_len = span.min(CHUNK_SIZE as u64);
-    let payload = if head_len == 0 {
-        Vec::new()
-    } else {
-        retrieve_data_range_from_root(
-            root,
-            0,
-            head_len.checked_sub(1)?,
-            encrypted,
-            chunk_retrieve_chan,
-        )
-        .await?
-    };
-
-    let mut head = Vec::with_capacity(8 + payload.len());
-    head.extend_from_slice(&span.to_le_bytes());
-    head.extend_from_slice(&payload);
-    Some(head)
+    retrieve_data_range_from_root_with_prefix_cancellable(
+        root,
+        0,
+        head_len.saturating_sub(1),
+        encrypted,
+        chunk_retrieve_chan,
+        &span.to_le_bytes(),
+        None,
+    )
+    .await
 }
 
 async fn get_manifest_if_manifest(

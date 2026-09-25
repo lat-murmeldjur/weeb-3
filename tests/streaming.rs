@@ -1,5 +1,7 @@
 #![allow(dead_code)]
 
+#[path = "../src/feed.rs"]
+mod feed;
 #[path = "../src/retrieval_conventions.rs"]
 mod retrieval_conventions;
 #[path = "../src/stream_conventions.rs"]
@@ -25,7 +27,7 @@ mod hls_minimal {
         stream_conventions::HlsStart,
         stream_hls::{
             HLS_LIVE_STARTUP_BUFFER_SECONDS, HlsPlaylist, HlsTailFailure,
-            hls_payload_mime, hls_progressive_foreground_transition, is_hls_manifest,
+            history_indices, hls_payload_mime, hls_progressive_foreground_transition, is_hls_manifest,
         },
     };
 
@@ -158,6 +160,32 @@ mod hls_minimal {
             hls_progressive_foreground_transition(5, 2, true),
             (false, 5)
         );
+    }
+
+    #[test]
+    fn recent_history_keeps_bounded_tail_without_truncating_archives() {
+        for (head, residue, first, last) in [
+            (40_960, 0, 0, 40_950),
+            (40_961, 0, 10, 40_960),
+            (100_000, 7, 59_047, 99_997),
+            (u64::MAX, 0, u64::MAX - 40_955, u64::MAX - 5),
+            (u64::MAX, 5, u64::MAX - 40_960, u64::MAX - 10),
+        ] {
+            let indices = history_indices(head, residue, true).unwrap();
+            assert_eq!(
+                (indices.len(), indices[0], indices[4_095]),
+                (4_096, first, last)
+            );
+            assert!(indices.windows(2).all(|pair| pair[1] - pair[0] == 10));
+            assert_eq!(
+                history_indices(head, residue, false),
+                (head == 40_960).then_some(indices)
+            );
+        }
+        for (head, residue) in [(0, 0), (7, 7), (1, 7)] {
+            assert!(history_indices(head, residue, true).is_none());
+            assert!(history_indices(head, residue, false).is_none());
+        }
     }
 
     #[test]
@@ -359,14 +387,14 @@ mod hls_minimal {
         let middle = window(3, &REFERENCES[3..7]);
         let head = window(5, &REFERENCES[5..]);
         let history =
-            HlsPlaylist::reconstruct(vec![(5, first.clone()), (15, middle)], 25, head.clone())
+            HlsPlaylist::reconstruct(vec![(5, first.clone()), (15, middle)], 25, head.clone(), 0)
                 .unwrap();
         assert_eq!(history.sequence, 0);
         assert_eq!(history.segments.len(), 8);
         assert_eq!(history.duration(), 32.0);
 
         let disconnected = window(5, &[REFERENCES[7]]);
-        assert!(HlsPlaylist::reconstruct(vec![(5, first)], 25, disconnected).is_none());
+        assert!(HlsPlaylist::reconstruct(vec![(5, first)], 25, disconnected, 0).is_none());
     }
 
     #[test]
@@ -450,11 +478,11 @@ mod hls_minimal {
             .split_once("async fn discover_raw_for_view(")
             .unwrap()
             .0;
-        assert!(history.contains("HlsPlaylist::reconstruct(snapshots, head_index, head)"));
+        assert!(history.contains("HlsPlaylist::reconstruct(snapshots, head_index, latest, start)"));
         assert!(!history.contains("snapshots.clone()"));
         assert!(
             history.find("let repairs = history_repairs(")
-                < history.find("HlsPlaylist::reconstruct(snapshots, head_index, head)")
+                < history.find("HlsPlaylist::reconstruct(snapshots, head_index, latest, start)")
         );
         assert!(!RUNTIME.contains("snapshots.to_vec()"));
         assert!(!CORE.contains("candidate.clone()).is_some()"));
@@ -496,7 +524,7 @@ mod hls_minimal {
             "let _ = retired.destroy()",
             "hls.attach_media(&media)",
             "fn is_current_hls(id: u64, hls: &Hls)",
-            "return play_native(id, media, &source, plan, restore_autoplay, intent)",
+            "return play_native(id, media, &source, plan.with_offset(0.0), restore_autoplay, intent)",
             "media.set_src(source)",
             "handle_native_event",
             ".load_source(&source)",
@@ -564,7 +592,6 @@ mod hls_minimal {
         assert!(PLAYER.contains("(180.0, 600.0)"));
         assert!(PLAYER.contains("const LIVE_RUNWAY_BUFFER: (f64, f64) = (90.0, 120.0)"));
         assert!(PLAYER.contains("set(&config, \"autoStartLoad\", JsValue::FALSE)"));
-        assert!(PLAYER.contains("set(&config, \"startFragPrefetch\", JsValue::FALSE)"));
         assert!(PLAYER.contains("futures::future::join(initialize, prepared).await"));
         assert!(PLAYER.contains("if media.paused() && playback_intent(&media, None)"));
         assert!(!PLAYER.contains("media.set_hidden(true)"));
@@ -640,7 +667,7 @@ mod hls_minimal {
             "return Action::HardRestart(details)",
             "player.consecutive_media_recoveries += 1",
             "player.consecutive_media_recoveries = 0",
-            "if event == \"hlsFragBuffered\"",
+            "\"hlsFragBuffered\" =>",
             "player.media.set_current_time(position)",
             "Action::Retarget(hls, media, position) =>",
             "hls.stop_load()",
@@ -661,10 +688,12 @@ mod hls_minimal {
         assert!(RUNTIME.contains("active.tail_fallbacks.len() >= LIVE_TAIL_FALLBACK_LIMIT"));
         assert!(RUNTIME.contains("Some(target)"));
         assert!(RUNTIME.contains("presentation_gaps"));
-        assert!(RUNTIME.contains("presentation_playlist(feed)?.render_with_plan("));
+        assert!(RUNTIME.contains("presentation_playlist(feed)?"));
         assert!(RUNTIME.contains("active.live_startup_plan = Some(plan.clone())"));
         assert!(RUNTIME.contains("let mut presentation = playlist.clone()"));
-        assert!(RUNTIME.contains("playlist.render(local_bytes_base, start)"));
+        assert!(RUNTIME.contains(
+            "playlist.render_with_plan(local_bytes_base, start, feed.live_startup_plan.as_ref())"
+        ));
         assert!(RUNTIME.contains("presentation.mark_gap(*sequence, reference)"));
         assert!(RUNTIME.contains(".take(HLS_LIVE_EDGE_SEGMENTS)"));
         assert!(!PLAYER.contains("internal_seek"));
@@ -706,14 +735,14 @@ mod hls_minimal {
             .split_once("fn media_action(")
             .unwrap()
             .0;
-        assert!(lifecycle.contains("player_fragment_loader(player)"));
+        assert!(lifecycle.contains("fragment_loader(&player.hls_class, &config.unchecked_into())"));
         assert!(!lifecycle.contains("set_current_time"));
         assert!(lifecycle.contains("matches!(event, \"durationchange\" | \"seeked\" | \"canplay\")"));
         assert!(lifecycle.contains("&& !player.codec_bootstrap_pending"));
         assert!(
             lifecycle.find("begin_playback(media.clone(), position)").unwrap()
                 < lifecycle
-                    .find("hls.start_load_at(media.current_time())")
+                    .find("seek_hls(id, hls, media.current_time())")
                     .unwrap()
         );
         let duration_retry = PLAYER
@@ -768,7 +797,7 @@ mod hls_minimal {
             .unwrap()
             .0;
         assert!(gate.contains("player.initial_live && player.hard_restarts == 0"));
-        assert!(gate.contains("let runway = playback_runway(&player.plan)"));
+        assert!(gate.contains("let runway = player.plan.runway_end - player.plan.play_position"));
         assert!(gate.contains("(0..ranges.length()).rev().find_map"));
         assert!(gate.contains(".max(player.plan.play_position)"));
         assert!(gate.contains(".max(player.media.current_time())"));
@@ -782,7 +811,6 @@ mod hls_minimal {
         const RUNTIME: &str = include_str!("../src/stream_hls/runtime.rs");
         assert!(PLAYER.contains("\"hlsFragLoading\" if player.codec_bootstrap_pending"));
         assert!(!PLAYER.contains("fragment_reference("));
-        assert!(PLAYER.contains("set(&config, \"startFragPrefetch\", JsValue::FALSE)"));
 
         let successor = RUNTIME
             .split_once("fn prefetch_from_reference(")
@@ -795,6 +823,7 @@ mod hls_minimal {
         assert!(successor.contains("hls_progressive_foreground_transition"));
         assert!(successor.contains("if follow {"));
         assert!(successor.contains("spawn_body_runway(id)"));
+        assert!(!successor.contains(".await"), "a seek must return its fragment without waiting for later media");
         let runway = RUNTIME.split_once("fn body_runway_targets(").unwrap().1
             .split_once("fn prefetch_from_reference(").unwrap().0;
         assert!(runway.contains(".take(BODY_PREFETCH_HORIZON)"));
@@ -1140,7 +1169,7 @@ mod share_links {
 mod routes {
     use crate::stream_conventions::{
         STREAMING_ROUTE_BASE, STREAMING_SERVICE_WORKER_SCOPE, STREAMING_SERVICE_WORKER_URL,
-        streaming_route_path,
+        route_resource, streaming_route_path,
     };
 
     #[test]
@@ -1150,6 +1179,17 @@ mod routes {
         assert_eq!(streaming_route_path("/feeds"), "/weeb-3/feeds");
         assert_eq!(STREAMING_SERVICE_WORKER_URL, "/weeb-3/service.js");
         assert_eq!(STREAMING_SERVICE_WORKER_SCOPE, "/weeb-3/");
+        for (scope, expected) in [
+            ("", Some("%2FABC/")),
+            ("mainnet/", Some("%2FABC/")),
+            ("testnet/", Some("%2FABC/")),
+            ("/", None),
+            ("MAINNET/", None),
+            ("mainnet/testnet/", None),
+        ] {
+            let path = format!("/weeb-3/{scope}hls/bytes/%2FABC/");
+            assert_eq!(route_resource(&path, "hls/bytes/"), expected);
+        }
     }
 }
 
@@ -1636,7 +1676,7 @@ mod stream_reader_concurrency {
             "async fn read_range_window(",
             "fn spawn_prefetch_media_stages(",
         );
-        assert!(window.contains("range_load_role(&cache_key, pending_key, generation, cancel_when_unused)"));
+        assert!(window.contains("range_load_role(&cache_key, generation, cancel_when_unused)"));
         let moved_key = window.find("let leader_cache_key = cache_key;").unwrap();
         let remembered = window.find("remember_range(").unwrap();
         let completed = window.find("finish_pending_range(").unwrap();

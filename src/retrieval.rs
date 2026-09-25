@@ -17,8 +17,7 @@ use crate::{
     retrieval_conventions::{
         RetrieveAdmission, RetrieveHedgeDemand, SharedRetrieveHedgeDemand,
         retrieve_admission_current, retrieve_attempt_start_allowed, rolling_full_group_eligible,
-        rolling_full_group_static_candidate, rolling_next_parity_index,
-        rolling_parity_admission_count,
+        rolling_full_group_static_candidate,
     },
     retrieve_cancel_token_current, retrieve_handler, transfer_pause_enabled, valid_cac, valid_soc,
     wait_transfer_unpaused, wait_transfer_unpaused_for_admission, weeb_3::etiquette_6,
@@ -43,7 +42,7 @@ const RETRIEVE_CHUNK_MAX_ATTEMPT_ERRORS: usize = 20;
 const RETRIEVE_DATA_GROUP_CONCURRENCY: usize = 8;
 const RETRIEVE_DECODED_CHUNK_CACHE_ENTRIES: usize = 2048;
 
-type RetrieveAttemptResult = Option<(Vec<u8>, bool)>;
+type RetrieveAttemptResult = Option<(Bytes, bool)>;
 
 struct ReservedRetrievePeer {
     peer: PeerId,
@@ -65,61 +64,49 @@ async fn select_retrieve_peer(
     accounting: &PeerAccountingMap,
     physical_connections: &PhysicalConnectionMap,
     skiplist: &mut HashMap<PeerId, bool>,
-) -> Option<ReservedRetrievePeer> {
+) -> (Option<ReservedRetrievePeer>, bool) {
     let peers = peers.lock().await.clone();
-    for (peer, proximity) in crate::closest_overlay_peers(&peers, caddr) {
-        let Entry::Vacant(entry) = skiplist.entry(peer) else {
+    let accounting = accounting.lock().await;
+    let mut overdraft = false;
+    for (&peer, proximity) in crate::closest_overlay_peers(&peers, caddr) {
+        if skiplist.contains_key(&peer) {
+            continue;
+        }
+        let Some(accounting_peer) = accounting.get(&peer) else {
+            skiplist.insert(peer, true);
             continue;
         };
-        // Reserve failures retry; selected peers, missing accounts and stale sessions stay skipped.
-        let permanent_skip = entry.insert(true);
-
-        let accounting_peer = {
-            let accounting_peers = accounting.lock().await;
-            accounting_peers.get(&peer).cloned()
+        let req_price = price(proximity);
+        let Some(connection_id) = reserve(accounting_peer, req_price).await else {
+            overdraft = true;
+            continue;
         };
-
-        if let Some(accounting_peer) = accounting_peer {
-            let req_price = price(proximity);
-            if let Some(connection_id) = reserve(&accounting_peer, req_price).await {
-                if let Some(session) = OutboundProtocolSession::capture(
-                    peer,
-                    connection_id,
-                    physical_connections.clone(),
-                ) {
-                    return Some(ReservedRetrievePeer {
-                        peer,
-                        price: req_price,
-                        accounting: accounting_peer,
-                        session,
-                    });
+        skiplist.insert(peer, true);
+        if let Some(session) =
+            OutboundProtocolSession::capture(peer, connection_id, physical_connections.clone())
+        {
+            // Remember denied peers only when the sweep continues.
+            if overdraft {
+                for (&skipped, _) in crate::closest_overlay_peers(&peers, caddr) {
+                    if skipped == peer {
+                        break;
+                    }
+                    skiplist.entry(skipped).or_insert(false);
                 }
-                cancel_reserve(&accounting_peer, req_price).await;
-                continue;
             }
-
-            *permanent_skip = false;
+            let selected = ReservedRetrievePeer {
+                peer,
+                price: req_price,
+                accounting: accounting_peer.clone(),
+                session,
+            };
+            return (Some(selected), false);
         }
+        cancel_reserve(accounting_peer, req_price).await;
     }
-    None
-}
-
-fn reset_overdraft(skiplist: &mut HashMap<PeerId, bool>) -> bool {
     let previous_len = skiplist.len();
     skiplist.retain(|_, permanent| *permanent);
-    previous_len != skiplist.len()
-}
-
-fn record_retrieve_attempt_result(
-    result: RetrieveAttemptResult,
-    in_flight: &mut usize,
-    error_count: &mut usize,
-) -> Option<(Vec<u8>, bool)> {
-    *in_flight = in_flight.saturating_sub(1);
-    if result.is_none() {
-        *error_count += 1;
-    }
-    result
+    (None, overdraft || previous_len != skiplist.len())
 }
 
 async fn settle_retrieve_attempt(
@@ -127,7 +114,7 @@ async fn settle_retrieve_attempt(
     req_price: u64,
     accounting_peer: Arc<Mutex<PeerAccounting>>,
     refresh_chan: mpsc::Sender<RefreshmentInstruction>,
-    retrieve_result: Option<Vec<u8>>,
+    retrieve_result: Option<Bytes>,
 ) -> RetrieveAttemptResult {
     if let Some(chunk) = retrieve_result {
         let (chunk_valid, soc) = verify_chunk(&caddr, &chunk);
@@ -198,29 +185,22 @@ fn chunk_address_parts(chunk_address: &[u8]) -> (&[u8], &[u8], bool) {
 }
 
 fn decode_retrieved_chunk(
-    chunk: Vec<u8>,
+    chunk: Bytes,
     soc: bool,
     encryption_key: &[u8],
     encrypted: bool,
-) -> Vec<u8> {
+) -> Bytes {
     if encrypted {
-        if soc {
-            if chunk.len() < 97 {
-                return vec![];
-            }
-
-            let decrypted = decrypt(&chunk[97..], encryption_key);
-            if decrypted.len() >= 8 {
-                return decrypted;
-            }
-            return vec![];
-        }
-
-        return decrypt(&chunk, encryption_key);
+        let ciphertext = if soc {
+            chunk.get(97..).unwrap_or_default()
+        } else {
+            &chunk
+        };
+        return decrypt(ciphertext, encryption_key).into();
     }
 
     if soc && chunk.len() >= 97 + 8 {
-        return chunk[97..].to_vec();
+        return Bytes::copy_from_slice(&chunk[97..]);
     }
     chunk
 }
@@ -414,11 +394,11 @@ struct RawFetchKey {
 impl RawFetchKey {
     fn new(
         runtime_scope: usize,
-        request_address: Vec<u8>,
+        request_address: &[u8],
         expected_cac: &[u8],
         cancel: &Option<RetrieveCancelToken>,
     ) -> Self {
-        let request_address = Bytes::from(request_address);
+        let request_address = Bytes::copy_from_slice(request_address);
         let expected_cac = if request_address.as_ref() == expected_cac {
             request_address.clone()
         } else {
@@ -524,7 +504,7 @@ impl<'a> RawFetchQueue<'a> {
     ) {
         self.queue_drained_raw_chunk(
             index,
-            reference[..HASH_SIZE].to_vec(),
+            &reference[..HASH_SIZE],
             &reference[..HASH_SIZE],
             Some(reference),
             hedge_demand,
@@ -537,7 +517,7 @@ impl<'a> RawFetchQueue<'a> {
         reference: &[u8],
         hedge_demand: RetrieveHedgeDemand,
     ) {
-        self.queue_drained_raw_chunk(index, reference.to_vec(), reference, None, hedge_demand)
+        self.queue_drained_raw_chunk(index, reference, reference, None, hedge_demand)
     }
 
     fn queue_root_batch(
@@ -546,27 +526,25 @@ impl<'a> RawFetchQueue<'a> {
         expected_cac: &[u8],
         cache_reference: &[u8],
         next: &mut usize,
-        dispatched: &mut usize,
         batch: usize,
     ) {
         let end = next.saturating_add(batch).min(requests.len());
         while *next < end {
             self.queue_drained_raw_chunk(
                 *next,
-                requests[*next].clone(),
+                &requests[*next],
                 expected_cac,
                 Some(cache_reference),
                 RetrieveHedgeDemand::Ordinary,
             );
             *next += 1;
-            *dispatched += 1;
         }
     }
 
     fn queue_drained_raw_chunk(
         &mut self,
         index: usize,
-        request_address: Vec<u8>,
+        request_address: &[u8],
         expected_cac: &[u8],
         cache_reference: Option<&[u8]>,
         hedge_demand: RetrieveHedgeDemand,
@@ -613,27 +591,16 @@ impl<'a> RawFetchQueue<'a> {
             return;
         }
 
-        let (chan_out, chan_in) = oneshot::channel();
         let completion_key = registration.key;
-        if self
-            .chunks
-            .try_send(crate::ChunkRetrieveRequest {
-                address: completion_key.request_address.to_vec(),
-                chan: chan_out,
-                cancel: self.cancel.clone(),
-                admission: Some(registration.shared.admission.clone()),
-                hedge_demand: registration.shared.hedge_demand.clone(),
-            })
-            .is_err()
-        {
-            complete_raw_fetch(&completion_key, flight_id, Vec::new());
-            return;
-        }
-
-        // The detached producer lets dispatched exchanges settle after callers leave.
-        wasm_bindgen_futures::spawn_local(async move {
-            let chunk = chan_in.await.unwrap_or_default();
-            complete_raw_fetch(&completion_key, flight_id, chunk);
+        let _ = self.chunks.try_send(crate::ChunkRetrieveRequest {
+            address: completion_key.request_address.to_vec(),
+            chan: crate::ChunkRetrieveReply::Raw(RawFetchCompletion {
+                key: completion_key,
+                flight_id,
+            }),
+            cancel: self.cancel.clone(),
+            admission: Some(registration.shared.admission.clone()),
+            hedge_demand: registration.shared.hedge_demand.clone(),
         });
     }
 }
@@ -644,7 +611,28 @@ impl Drop for RawFetchQueue<'_> {
     }
 }
 
-fn complete_raw_fetch(key: &RawFetchKey, flight_id: u64, chunk: Vec<u8>) -> bool {
+// The detached dispatcher owns completion, including a dropped queued request.
+pub(crate) struct RawFetchCompletion {
+    key: RawFetchKey,
+    flight_id: u64,
+}
+
+impl RawFetchCompletion {
+    pub(crate) fn send(mut self, chunk: Bytes) {
+        let flight_id = std::mem::replace(&mut self.flight_id, 0);
+        complete_raw_fetch(&self.key, flight_id, chunk);
+    }
+}
+
+impl Drop for RawFetchCompletion {
+    fn drop(&mut self) {
+        if self.flight_id != 0 {
+            complete_raw_fetch(&self.key, self.flight_id, Bytes::new());
+        }
+    }
+}
+
+fn complete_raw_fetch(key: &RawFetchKey, flight_id: u64, chunk: Bytes) -> bool {
     let flight = RAW_FETCH_FLIGHTS.with(|flights| flights.borrow_mut().take(key, flight_id));
     let Some(flight) = flight else {
         return false;
@@ -657,7 +645,6 @@ fn complete_raw_fetch(key: &RawFetchKey, flight_id: u64, chunk: Vec<u8>) -> bool
             && key.request_address == key.expected_cac
             && flight.shared.admission.returned_cac())
             || valid_cac(&chunk, &key.expected_cac));
-    let chunk = Bytes::from(chunk);
     let delivered = if usable { chunk } else { Bytes::new() };
 
     // Cache ownership belongs to the physical flight, not to its current
@@ -755,7 +742,6 @@ async fn retrieve_raw_root_cancellable(
     let (result_out, result_in) = mpsc::unbounded::<RawFetchResult>();
     let mut raw_fetches = RawFetchQueue::new(chunk_retrieve_chan, &result_out, cancel);
     let mut next = 0usize;
-    let mut dispatched = 0usize;
     let mut completed = 0usize;
     let mut next_batch = 2usize;
 
@@ -768,7 +754,6 @@ async fn retrieve_raw_root_cancellable(
         &root_cac,
         reference,
         &mut next,
-        &mut dispatched,
         initial,
     );
     let mut hedge_started = Date::now();
@@ -777,7 +762,7 @@ async fn retrieve_raw_root_cancellable(
         if !retrieve_cancel_token_current(cancel) {
             return None;
         }
-        if completed == dispatched {
+        if completed == next {
             if next == requests.len() {
                 return None;
             }
@@ -786,7 +771,6 @@ async fn retrieve_raw_root_cancellable(
                 &root_cac,
                 reference,
                 &mut next,
-                &mut dispatched,
                 next_batch,
             );
             next_batch = next_batch.saturating_mul(2);
@@ -809,7 +793,6 @@ async fn retrieve_raw_root_cancellable(
                         &root_cac,
                         reference,
                         &mut next,
-                        &mut dispatched,
                         next_batch,
                     );
                     next_batch = next_batch.saturating_mul(2);
@@ -874,34 +857,6 @@ pub(crate) async fn retrieve_decoded_data_root_cancellable(
     Some(root)
 }
 
-fn padded_rs_shard(chunk: Bytes) -> Option<Vec<u8>> {
-    if !(erasure_coding::SPAN_SIZE..=CHUNK_WITH_SPAN_SIZE).contains(&chunk.len()) {
-        return None;
-    }
-    let mut chunk = Vec::from(chunk);
-    chunk.resize(CHUNK_WITH_SPAN_SIZE, 0);
-    Some(chunk)
-}
-
-pub(crate) enum RequestedShardCache {
-    DecodedAndRaw {
-        decoded: DecodedJoinChunk,
-        raw: Bytes,
-    },
-    DecodedOnly(DecodedJoinChunk),
-    Miss,
-}
-
-pub(crate) fn requested_shard_cache(reference: &[u8]) -> RequestedShardCache {
-    let Some((decoded, raw)) = cached_decoded_and_raw_chunk(reference) else {
-        return RequestedShardCache::Miss;
-    };
-    match raw {
-        Some(raw) => RequestedShardCache::DecodedAndRaw { decoded, raw },
-        None => RequestedShardCache::DecodedOnly(decoded),
-    }
-}
-
 fn dispatch_group_recovery(
     data_references: &[Bytes],
     parity_references: &[Bytes],
@@ -929,6 +884,7 @@ fn dispatch_group_recovery(
             dispatched_shards,
             raw_fetches,
             limit.saturating_sub(count),
+            RetrieveHedgeDemand::Ordinary,
         )
 }
 
@@ -938,6 +894,7 @@ fn dispatch_group_parity(
     dispatched_shards: &mut [bool],
     raw_fetches: &mut RawFetchQueue<'_>,
     limit: usize,
+    hedge_demand: RetrieveHedgeDemand,
 ) -> usize {
     let mut count = 0usize;
     for (parity_index, reference) in parity_references.iter().enumerate() {
@@ -948,24 +905,11 @@ fn dispatch_group_parity(
         if dispatched_shards[index] {
             continue;
         }
-        raw_fetches.queue_parity_shard(index, reference, RetrieveHedgeDemand::Ordinary);
+        raw_fetches.queue_parity_shard(index, reference, hedge_demand);
         dispatched_shards[index] = true;
         count += 1;
     }
     count
-}
-
-fn dispatch_one_rolling_group_parity(
-    data_count: usize,
-    parity_references: &[Bytes],
-    dispatched_shards: &mut [bool],
-    raw_fetches: &mut RawFetchQueue<'_>,
-) -> Option<()> {
-    let index = rolling_next_parity_index(data_count, dispatched_shards)?;
-    let reference = parity_references.get(index.checked_sub(data_count)?)?;
-    raw_fetches.queue_parity_shard(index, reference, RetrieveHedgeDemand::DistinctShardManaged);
-    dispatched_shards[index] = true;
-    Some(())
 }
 
 fn recovery_top_up_count(
@@ -983,7 +927,6 @@ fn recovery_top_up_count(
 #[allow(clippy::too_many_arguments)]
 fn settle_data_group_result(
     result: RawFetchResult,
-    rolling: bool,
     data_count: usize,
     data_references: &[Bytes],
     parity_present: bool,
@@ -993,10 +936,6 @@ fn settle_data_group_result(
     successes: &mut usize,
     child_emitter: &GroupChildEmitter,
 ) -> Option<bool> {
-    if rolling {
-        received_shards.get(result.index)?;
-    }
-
     let canonical_for_group = result.canonical_cac || !parity_present;
     if result.chunk.is_empty() || !canonical_for_group {
         return Some(false);
@@ -1072,13 +1011,13 @@ async fn fetch_data_group_indices_streaming(
     if static_rolling_candidate {
         cached_requested.reserve(requested_count);
         for index in requested_indices.clone() {
-            let cached = requested_shard_cache(&data_references[index]);
+            let cached = cached_decoded_and_raw_chunk(&data_references[index]);
             match &cached {
-                RequestedShardCache::DecodedAndRaw { .. } => {}
-                RequestedShardCache::DecodedOnly(_) => decoded_only_count += 1,
-                RequestedShardCache::Miss => unresolved_count += 1,
+                Some((_, Some(_))) => {}
+                Some((_, None)) => decoded_only_count += 1,
+                None => unresolved_count += 1,
             }
-            cached_requested.push((index, cached));
+            cached_requested.push(cached);
         }
     }
     let rolling = static_rolling_candidate
@@ -1096,52 +1035,37 @@ async fn fetch_data_group_indices_streaming(
     };
     let mut successes = 0usize;
     let mut dispatched = 0usize;
-    if static_rolling_candidate {
-        for (index, cached) in cached_requested {
-            match cached {
-                RequestedShardCache::DecodedAndRaw { decoded, raw } => {
-                    child_emitter.emit(index, decoded);
-                    requested_ready[index] = true;
-                    if rolling {
-                        received_shards[index] = Some(raw);
-                        dispatched_shards[index] = true;
-                        successes += 1;
-                    }
-                    continue;
-                }
-                RequestedShardCache::DecodedOnly(decoded) => {
-                    child_emitter.emit(index, decoded);
-                    requested_ready[index] = true;
-                    continue;
-                }
-                RequestedShardCache::Miss => {}
+    let mut cached_requested = cached_requested.into_iter();
+    for index in requested_indices.clone() {
+        let reference = &data_references[index];
+        let cached = if static_rolling_candidate {
+            cached_requested.next().flatten()
+        } else {
+            cached_decoded_chunk(reference).map(|decoded| (decoded, None))
+        };
+        if let Some((decoded, raw)) = cached {
+            child_emitter.emit(index, decoded);
+            requested_ready[index] = true;
+            if rolling && let Some(raw) = raw {
+                received_shards[index] = Some(raw);
+                dispatched_shards[index] = true;
+                successes += 1;
             }
-            raw_fetches.queue_data_shard(index, &data_references[index], initial_hedge_demand);
-            dispatched_shards[index] = true;
-            dispatched += 1;
+            continue;
         }
-    } else {
-        // Partial groups inspect, emit, and dispatch each requested child in order without
-        // cloning or validating an unneeded cached raw basis.
-        for index in requested_indices.clone() {
-            let reference = &data_references[index];
-            if let Some(chunk) = cached_decoded_chunk(reference) {
-                child_emitter.emit(index, chunk);
-                requested_ready[index] = true;
-                continue;
-            }
-            raw_fetches.queue_data_shard(
-                index,
-                &data_references[index],
-                RetrieveHedgeDemand::Ordinary,
-            );
-            dispatched_shards[index] = true;
-            dispatched += 1;
-        }
+        raw_fetches.queue_data_shard(index, reference, initial_hedge_demand);
+        dispatched_shards[index] = true;
+        dispatched += 1;
     }
+    drop(cached_requested);
     // Anchor both hedge policies after all initial registrations. This preserves the legacy
     // deadline and gives the rolling set a full hedge interval before parity can replace it.
     let started = Date::now();
+    let hedge_after = if rolling {
+        RETRIEVE_HEDGE_AFTER_MS
+    } else {
+        RETRIEVE_RS_HEDGE_AFTER_MS
+    };
 
     let mut completed = 0usize;
     let mut recovery_dispatched = false;
@@ -1157,7 +1081,6 @@ async fn fetch_data_group_indices_streaming(
                 completed = completed.checked_add(1)?;
                 settle_data_group_result(
                     result,
-                    rolling,
                     data_count,
                     &data_references,
                     !parity_references.is_empty(),
@@ -1187,77 +1110,46 @@ async fn fetch_data_group_indices_streaming(
             return None;
         }
 
-        if rolling {
-            let elapsed = (Date::now() - started).max(0.0) as u64;
-            let remaining_parity = (data_count..total_count)
-                .filter(|&index| !dispatched_shards[index])
-                .count();
-            if rolling_parity_admission_count(
-                elapsed,
-                RETRIEVE_HEDGE_AFTER_MS,
-                terminal,
+        let hedge_due = rolling && (Date::now() - started).max(0.0) as u64 >= hedge_after;
+        if hedge_due {
+            let active = dispatched.checked_sub(completed)?;
+            let queued = dispatch_group_parity(
                 data_count,
-                dispatched.checked_sub(completed)?,
-                remaining_parity,
-            ) != 0
-            {
-                dispatch_one_rolling_group_parity(
-                    data_count,
-                    &parity_references,
-                    &mut dispatched_shards,
-                    &mut raw_fetches,
-                )?;
-                dispatched += 1;
-                recovery_dispatched = true;
-                // Admit at most one replacement per coordinator turn, then settle any immediately
-                // ready cached/completed result and re-check terminal state before another.
-                continue;
-            }
-        } else if recovery_dispatched {
+                &parity_references,
+                &mut dispatched_shards,
+                &mut raw_fetches,
+                data_count.checked_sub(active)?,
+                RetrieveHedgeDemand::DistinctShardManaged,
+            );
+            dispatched += queued;
+            recovery_dispatched |= queued > 0;
+        } else if !rolling && recovery_dispatched {
             let top_up = recovery_top_up_count(data_count, successes, dispatched, completed);
-            if top_up > 0 {
-                dispatched += dispatch_group_recovery(
-                    &data_references,
-                    &parity_references,
-                    &mut dispatched_shards,
-                    &mut raw_fetches,
-                    top_up,
-                );
-            }
+            dispatched += dispatch_group_recovery(
+                &data_references,
+                &parity_references,
+                &mut dispatched_shards,
+                &mut raw_fetches,
+                top_up,
+            );
         }
 
-        if !rolling && completed == dispatched {
-            if recovery_dispatched || parity_references.is_empty() {
+        if completed == dispatched && (!rolling || hedge_due) {
+            if rolling || recovery_dispatched || parity_references.is_empty() {
                 return None;
             }
             recovery_dispatched = true;
             continue;
         }
 
-        let result = if rolling {
+        let waiting_for_hedge = if rolling {
+            !hedge_due
+        } else {
+            !recovery_dispatched
+        };
+        let result = if waiting_for_hedge && !parity_references.is_empty() {
             let elapsed = (Date::now() - started).max(0.0) as u64;
-            if completed == dispatched
-                && elapsed >= RETRIEVE_HEDGE_AFTER_MS
-                && (data_count..total_count).all(|index| dispatched_shards[index])
-            {
-                return None;
-            }
-            if elapsed < RETRIEVE_HEDGE_AFTER_MS {
-                let remaining = RETRIEVE_HEDGE_AFTER_MS.saturating_sub(elapsed).max(1);
-                match async_std::future::timeout(Duration::from_millis(remaining), result_in.recv())
-                    .await
-                {
-                    Ok(result) => result.ok(),
-                    Err(_) => continue,
-                }
-            } else {
-                recv_raw_result_cancellable(&result_in, &cancel).await
-            }
-        } else if !recovery_dispatched && parity_references.is_empty() {
-            recv_raw_result_cancellable(&result_in, &cancel).await
-        } else if !recovery_dispatched {
-            let elapsed = (Date::now() - started).max(0.0) as u64;
-            let remaining = RETRIEVE_RS_HEDGE_AFTER_MS.saturating_sub(elapsed).max(1);
+            let remaining = hedge_after.saturating_sub(elapsed).max(1);
             match async_std::future::timeout(Duration::from_millis(remaining), result_in.recv())
                 .await
             {
@@ -1266,20 +1158,26 @@ async fn fetch_data_group_indices_streaming(
                     if !retrieve_cancel_token_current(&cancel) {
                         return None;
                     }
-                    if requested_count == data_count {
-                        dispatched += dispatch_group_parity(
-                            data_count,
-                            &parity_references,
-                            &mut dispatched_shards,
-                            &mut raw_fetches,
-                            usize::MAX,
-                        );
+                    if !rolling {
+                        if requested_count == data_count {
+                            dispatched += dispatch_group_parity(
+                                data_count,
+                                &parity_references,
+                                &mut dispatched_shards,
+                                &mut raw_fetches,
+                                usize::MAX,
+                                RetrieveHedgeDemand::Ordinary,
+                            );
+                        }
+                        recovery_dispatched = true;
                     }
-                    recovery_dispatched = true;
                     continue;
                 }
             }
-        } else if dispatched_shards.iter().any(|dispatched| !*dispatched) {
+        } else if !rolling
+            && recovery_dispatched
+            && dispatched_shards.iter().any(|dispatched| !*dispatched)
+        {
             match async_std::future::timeout(
                 Duration::from_millis(RETRIEVE_RS_HEDGE_AFTER_MS),
                 result_in.recv(),
@@ -1312,7 +1210,6 @@ async fn fetch_data_group_indices_streaming(
         }
         let usable = settle_data_group_result(
             result,
-            rolling,
             data_count,
             &data_references,
             !parity_references.is_empty(),
@@ -1338,19 +1235,21 @@ async fn fetch_data_group_indices_streaming(
     if missing_indices.is_empty() {
         return Some(());
     }
-    let mut reconstructed_shards = received_shards
-        .into_iter()
-        .map(|chunk| chunk.and_then(padded_rs_shard))
-        .collect::<Vec<_>>();
-    reconstruct_data_indices(&mut reconstructed_shards, data_count, &missing_indices).ok()?;
+    reconstruct_data_indices(
+        &mut received_shards,
+        data_count,
+        &missing_indices,
+        CHUNK_WITH_SPAN_SIZE,
+    )
+    .ok()?;
 
     for index in missing_indices {
         let reference = &data_references[index];
-        let raw = reconstructed_shards[index].take()?;
+        let raw = received_shards[index].take()?;
         if !valid_cac(&raw, &reference[..HASH_SIZE]) {
             return None;
         }
-        remember_raw_chunk(reference.to_vec(), raw.into());
+        remember_raw_chunk(reference.to_vec(), raw);
         child_emitter.emit(index, cached_decoded_chunk(reference)?);
     }
     Some(())
@@ -1372,34 +1271,14 @@ struct GroupTraversalContext {
     child_count: usize,
 }
 
-enum GroupFetchEvent {
-    Child {
-        context: GroupTraversalContext,
-        index: usize,
-        chunk: DecodedJoinChunk,
-    },
-    Terminal {
-        success: bool,
-    },
-}
-
-#[derive(Clone)]
 struct GroupChildEmitter {
     context: GroupTraversalContext,
-    events: mpsc::Sender<GroupFetchEvent>,
+    events: mpsc::Sender<(GroupTraversalContext, usize, DecodedJoinChunk)>,
 }
 
 impl GroupChildEmitter {
     fn emit(&self, index: usize, chunk: DecodedJoinChunk) {
-        let _ = self.events.try_send(GroupFetchEvent::Child {
-            context: self.context,
-            index,
-            chunk,
-        });
-    }
-
-    fn finish(&self, success: bool) {
-        let _ = self.events.try_send(GroupFetchEvent::Terminal { success });
+        let _ = self.events.try_send((self.context, index, chunk));
     }
 }
 
@@ -1451,7 +1330,7 @@ pub(crate) async fn retrieve_data_range_from_root_cancellable(
     .await
 }
 
-async fn retrieve_data_range_from_root_with_prefix_cancellable(
+pub(crate) async fn retrieve_data_range_from_root_with_prefix_cancellable(
     root: DecodedJoinChunk,
     payload_start: u64,
     payload_end_inclusive: u64,
@@ -1478,10 +1357,9 @@ async fn retrieve_data_range_from_root_with_prefix_cancellable(
         chunk: root,
     }]);
     let mut groups = FuturesUnordered::new();
-    let (group_event_out, group_event_in) = mpsc::unbounded::<GroupFetchEvent>();
-    let mut active_groups = 0usize;
+    let (group_event_out, group_event_in) = mpsc::unbounded();
 
-    while !pending.is_empty() || active_groups > 0 {
+    loop {
         if !retrieve_cancel_token_current(&cancel) {
             return None;
         }
@@ -1546,9 +1424,8 @@ async fn retrieve_data_range_from_root_with_prefix_cancellable(
                 },
                 events: group_event_out.clone(),
             };
-            let terminal_emitter = emitter.clone();
             groups.push(async move {
-                let success = fetch_data_group_indices_streaming(
+                fetch_data_group_indices_streaming(
                     data_references,
                     parity_references,
                     encrypted,
@@ -1558,17 +1435,15 @@ async fn retrieve_data_range_from_root_with_prefix_cancellable(
                     emitter,
                 )
                 .await
-                .is_some();
-                terminal_emitter.finish(success);
             });
-            active_groups = active_groups.checked_add(1)?;
         }
 
-        if active_groups == 0 {
-            continue;
+        // A completed group may still have children waiting to be traversed.
+        if groups.is_empty() && group_event_in.is_empty() {
+            break;
         }
 
-        let event = if groups.is_empty() {
+        let (context, index, chunk) = if groups.is_empty() {
             group_event_in.recv().await.ok()?
         } else {
             let next_event = group_event_in.recv();
@@ -1576,45 +1451,34 @@ async fn retrieve_data_range_from_root_with_prefix_cancellable(
             pin_mut!(next_event, next_completion);
             match select(next_event, next_completion).await {
                 Either::Left((event, _)) => event.ok()?,
-                Either::Right((_completion, _)) => continue,
+                Either::Right((completion, _)) => {
+                    completion??;
+                    continue;
+                }
             }
         };
         if !retrieve_cancel_token_current(&cancel) {
             return None;
         }
 
-        match event {
-            GroupFetchEvent::Terminal { success } => {
-                active_groups = active_groups.checked_sub(1)?;
-                if !success {
-                    return None;
-                }
-            }
-            GroupFetchEvent::Child {
-                context,
-                index,
+        let index = u64::try_from(index).ok()?;
+        let child_offset = context.child_capacity.checked_mul(index)?;
+        let child_start = context.parent_start.checked_add(child_offset)?;
+        let child_limit = if index as usize + 1 == context.child_count {
+            context.parent_span.checked_sub(child_offset)?
+        } else {
+            context.child_capacity
+        };
+        if chunk.span > child_limit {
+            return None;
+        }
+        let child_end = child_start.checked_add(child_limit)?.checked_sub(1)?;
+        if child_start <= payload_end_inclusive && child_end >= payload_start {
+            pending.push_back(TraversalNode {
+                start: child_start,
+                depth: context.parent_depth + 1,
                 chunk,
-            } => {
-                let index = u64::try_from(index).ok()?;
-                let child_offset = context.child_capacity.checked_mul(index)?;
-                let child_start = context.parent_start.checked_add(child_offset)?;
-                let child_limit = if index as usize + 1 == context.child_count {
-                    context.parent_span.checked_sub(child_offset)?
-                } else {
-                    context.child_capacity
-                };
-                if chunk.span > child_limit {
-                    return None;
-                }
-                let child_end = child_start.checked_add(child_limit)?.checked_sub(1)?;
-                if child_start <= payload_end_inclusive && child_end >= payload_start {
-                    pending.push_back(TraversalNode {
-                        start: child_start,
-                        depth: context.parent_depth + 1,
-                        chunk,
-                    });
-                }
-            }
+            });
         }
     }
 
@@ -1684,13 +1548,12 @@ pub async fn retrieve_chunk(
     admission: Option<RetrieveAdmission>,
     hedge_demand: Option<SharedRetrieveHedgeDemand>,
     transfer_paused: Option<Arc<TransferPause>>,
-) -> Vec<u8> {
+) -> Bytes {
     let (caddr, encryption_key, encrypted) = chunk_address_parts(chunk_address);
 
     let mut skiplist = HashMap::new();
 
     let mut attempt_count = 0;
-    let mut error_count = 0;
 
     let mut retrieved = None;
 
@@ -1698,15 +1561,12 @@ pub async fn retrieve_chunk(
     let mut in_flight = 0_usize;
     let mut last_attempt_started = 0.0;
 
-    while error_count < RETRIEVE_CHUNK_MAX_ATTEMPT_ERRORS
-        && (attempt_count < RETRIEVE_CHUNK_MAX_ATTEMPT_ERRORS || in_flight > 0)
-    {
+    while attempt_count < RETRIEVE_CHUNK_MAX_ATTEMPT_ERRORS || in_flight > 0 {
         if in_flight > 0
             && let Ok(result) = attempt_in.try_recv()
         {
-            if let Some(success) =
-                record_retrieve_attempt_result(result, &mut in_flight, &mut error_count)
-            {
+            in_flight = in_flight.saturating_sub(1);
+            if let Some(success) = result {
                 retrieved = Some(success);
                 break;
             }
@@ -1758,15 +1618,15 @@ pub async fn retrieve_chunk(
             && retrieve_attempt_start_allowed(current_hedge_demand, in_flight, ordinary_hedge_due);
 
         if due {
-            if let Some(selected) = select_retrieve_peer(
+            let (selected, retry) = select_retrieve_peer(
                 caddr,
                 peers,
                 accounting,
                 physical_connections,
                 &mut skiplist,
             )
-            .await
-            {
+            .await;
+            if let Some(selected) = selected {
                 let cancelled = !chunk_retrieve_admission_current(&cancel, &admission);
                 let paused = !cancelled && transfer_is_paused(&transfer_paused);
                 if cancelled
@@ -1798,14 +1658,13 @@ pub async fn retrieve_chunk(
                 in_flight += 1;
                 last_attempt_started = Date::now();
             } else {
-                if !reset_overdraft(&mut skiplist) && in_flight == 0 && !skiplist.is_empty() {
+                if !retry && in_flight == 0 && !skiplist.is_empty() {
                     break;
                 }
                 let success = async {
                     while let Ok(result) = attempt_in.recv().await {
-                        if let Some(success) =
-                            record_retrieve_attempt_result(result, &mut in_flight, &mut error_count)
-                        {
+                        in_flight = in_flight.saturating_sub(1);
+                        if let Some(success) = result {
                             return success;
                         }
                     }
@@ -1828,49 +1687,40 @@ pub async fn retrieve_chunk(
             break;
         }
 
-        let result = if current_hedge_demand == RetrieveHedgeDemand::DistinctShardManaged {
-            let result = attempt_in.recv();
-            let promoted = hedge_demand
-                .as_ref()
-                .expect("managed demand is always shared")
-                .wait_until_ordinary();
-            pin_mut!(result, promoted);
-            match select(result, promoted).await {
-                Either::Left((result, _)) => result.ok(),
-                Either::Right(_) => continue,
-            }
-        } else if !can_start_attempt || cancelled {
-            attempt_in.recv().await.ok()
-        } else if paused {
-            let result = attempt_in.recv();
-            let resumed =
-                wait_transfer_unpaused(transfer_paused.as_ref().expect("paused transfer exists"));
-            pin_mut!(result, resumed);
-            match select(result, resumed).await {
-                Either::Left((result, _)) => result.ok(),
-                Either::Right(_) => continue,
-            }
-        } else {
-            let elapsed = Date::now() - last_attempt_started;
-            let wait_ms = (RETRIEVE_HEDGE_AFTER_MS as f64 - elapsed).max(0.0).ceil() as u64;
-            match async_std::future::timeout(Duration::from_millis(wait_ms), attempt_in.recv())
-                .await
-            {
-                Ok(result) => result.ok(),
-                Err(_) => continue,
+        let wake = async {
+            if current_hedge_demand == RetrieveHedgeDemand::DistinctShardManaged {
+                hedge_demand
+                    .as_ref()
+                    .expect("managed demand is always shared")
+                    .wait_until_ordinary()
+                    .await;
+            } else if !can_start_attempt || cancelled {
+                std::future::pending::<()>().await;
+            } else if paused {
+                wait_transfer_unpaused(transfer_paused.as_ref().expect("paused transfer exists"))
+                    .await;
+            } else {
+                let elapsed = Date::now() - last_attempt_started;
+                let wait_ms = (RETRIEVE_HEDGE_AFTER_MS as f64 - elapsed).max(0.0).ceil() as u64;
+                async_std::task::sleep(Duration::from_millis(wait_ms)).await;
             }
         };
+        let result = attempt_in.recv();
+        pin_mut!(result, wake);
+        let result = match select(result, wake).await {
+            Either::Left((result, _)) => result.ok(),
+            Either::Right(_) => continue,
+        };
         let Some(result) = result else { break };
-        if let Some(success) =
-            record_retrieve_attempt_result(result, &mut in_flight, &mut error_count)
-        {
+        in_flight = in_flight.saturating_sub(1);
+        if let Some(success) = result {
             retrieved = Some(success);
             break;
         }
     }
 
     let Some((chunk, soc)) = retrieved else {
-        return vec![];
+        return Bytes::new();
     };
     if !soc && let Some(admission) = admission {
         admission.record_returned_cac();
@@ -1901,7 +1751,7 @@ pub async fn retrieve_check_chunk(
             wait_transfer_unpaused(paused).await;
         }
 
-        let Some(selected) = select_retrieve_peer(
+        let (Some(selected), _) = select_retrieve_peer(
             caddr,
             peers,
             accounting,
@@ -1910,7 +1760,6 @@ pub async fn retrieve_check_chunk(
         )
         .await
         else {
-            reset_overdraft(&mut skiplist);
             async_std::task::sleep(Duration::from_millis(RETRIEVE_CHECK_RETRY_WAIT_MS)).await;
             continue;
         };
@@ -1943,7 +1792,7 @@ pub async fn retrieve_check_chunk(
     let Some((chunk, soc)) = retrieved else {
         return vec![];
     };
-    decode_retrieved_chunk(chunk, soc, encryption_key, encrypted)
+    decode_retrieved_chunk(chunk, soc, encryption_key, encrypted).into()
 }
 
 pub fn verify_chunk(caddr: &[u8], cd: &[u8]) -> (bool, bool) {
@@ -1995,7 +1844,7 @@ async fn get_feed_probe_chunk(
     if chunk_retrieve_chan
         .try_send(crate::ChunkRetrieveRequest {
             address: data_address,
-            chan: chan_out,
+            chan: crate::ChunkRetrieveReply::Channel(chan_out),
             cancel: None,
             admission: Some(admission.clone()),
             hedge_demand: None,
@@ -2117,7 +1966,7 @@ mod decrypt_tests {
         chunk
     }
 
-    #[test]
+    #[wasm_bindgen_test::wasm_bindgen_test]
     fn encrypted_cac_and_soc_payloads_have_identical_canonical_output() {
         let key = [0x5a; HASH_SIZE];
         let payload = b"retrieved payload";
@@ -2134,23 +1983,23 @@ mod decrypt_tests {
         let mut encrypted_reference = vec![0x11; HASH_SIZE];
         encrypted_reference.extend_from_slice(&key);
         let (address, extracted_key, encrypted) = chunk_address_parts(&encrypted_reference);
-        assert_eq!(address, encrypted_reference[..HASH_SIZE]);
+        assert_eq!(address, &encrypted_reference[..HASH_SIZE]);
         assert_eq!(extracted_key, key);
         assert!(encrypted);
         assert_eq!(
-            decode_retrieved_chunk(ciphertext.clone(), false, extracted_key, true),
+            decode_retrieved_chunk(ciphertext.clone().into(), false, extracted_key, true),
             expected
         );
 
         let mut soc = vec![0x33; 97];
         soc.extend_from_slice(&ciphertext);
         assert_eq!(
-            decode_retrieved_chunk(soc, true, extracted_key, true),
+            decode_retrieved_chunk(soc.into(), true, extracted_key, true),
             expected
         );
     }
 
-    #[test]
+    #[wasm_bindgen_test::wasm_bindgen_test]
     fn malformed_or_short_ciphertext_returns_empty_without_panicking() {
         let key = [0x2c; HASH_SIZE];
         assert!(decrypt(&[], &key).is_empty());
@@ -2161,7 +2010,7 @@ mod decrypt_tests {
         assert!(decrypt(&undersized, &key).is_empty());
         assert!(
             decode_retrieved_chunk(
-                vec![0; 97 + erasure_coding::SPAN_SIZE - 1],
+                vec![0; 97 + erasure_coding::SPAN_SIZE - 1].into(),
                 true,
                 &key,
                 true
@@ -2173,7 +2022,7 @@ mod decrypt_tests {
         assert_eq!(decrypt(&empty, &key), 0_u64.to_le_bytes());
     }
 
-    #[test]
+    #[wasm_bindgen_test::wasm_bindgen_test]
     fn multilevel_spans_keep_the_span_and_normalize_reference_payload_width() {
         let key = [0xb7; HASH_SIZE];
         let content = (0..CHUNK_SIZE)
@@ -2199,9 +2048,223 @@ mod decrypt_tests {
 #[cfg(test)]
 mod raw_fetch_tests {
     use super::*;
-    use alloy_primitives::keccak256;
+    use wasm_bindgen_test::wasm_bindgen_test;
 
-    #[test]
+    fn plain_chunk(payload: &[u8]) -> Bytes {
+        let mut raw = (payload.len() as u64).to_le_bytes().to_vec();
+        raw.extend_from_slice(payload);
+        raw.into()
+    }
+
+    #[wasm_bindgen_test]
+    async fn selection_defers_overdraft_storage_and_preserves_sweep_rollback() {
+        let ids = (0..200_u8)
+            .map(|index| PeerId::from_bytes(&[0, 1, index]).unwrap())
+            .collect::<Vec<_>>();
+        let peers: OverlayPeerMap = Arc::new(Mutex::new(Arc::new(
+            ids.iter()
+                .enumerate()
+                .map(|(i, peer)| ([i as u8; 32], *peer))
+                .collect(),
+        )));
+        let accounting: PeerAccountingMap = Arc::default();
+        let physical: PhysicalConnectionMap = Arc::default();
+        for (index, &peer) in ids.iter().enumerate() {
+            let connection_id = libp2p::swarm::ConnectionId::new_unchecked(index);
+            accounting.lock().await.insert(
+                peer,
+                Arc::new(Mutex::new(PeerAccounting {
+                    balance: 0,
+                    surplus_balance: 0,
+                    threshold: 0,
+                    reserve: 0,
+                    refreshment: 0.0,
+                    refresh_scheduled: false,
+                    id: peer,
+                    connection_id: Some(connection_id),
+                })),
+            );
+            crate::record_physical_connection_established(&physical, &peer, connection_id);
+        }
+        let mut skiplist = HashMap::new();
+        let (selected, retry) =
+            select_retrieve_peer(&[0; 32], &peers, &accounting, &physical, &mut skiplist).await;
+        assert!(selected.is_none() && retry);
+        assert_eq!(skiplist.capacity(), 0);
+
+        accounting.lock().await.remove(&ids[0]);
+        physical.lock().unwrap().remove(&ids[1]);
+        for index in [1, 3] {
+            accounting.lock().await[&ids[index]].lock().await.threshold = u64::MAX;
+        }
+        for _ in 0..2 {
+            let (selected, retry) =
+                select_retrieve_peer(&[0; 32], &peers, &accounting, &physical, &mut skiplist).await;
+            let selected = selected.unwrap();
+            assert_eq!(selected.peer, ids[3]);
+            assert!(!retry);
+            assert_eq!(
+                skiplist,
+                HashMap::from([
+                    (ids[0], true),
+                    (ids[1], true),
+                    (ids[2], false),
+                    (ids[3], true)
+                ])
+            );
+            cancel_reserve(&selected.accounting, selected.price).await;
+            assert_eq!(selected.accounting.lock().await.reserve, 0);
+            skiplist.remove(&selected.peer);
+        }
+        assert_eq!(accounting.lock().await[&ids[1]].lock().await.reserve, 0);
+        skiplist.insert(ids[3], true);
+        Arc::make_mut(&mut *peers.lock().await).retain(|overlay, _| overlay[0] < 4);
+        accounting.lock().await[&ids[2]].lock().await.threshold = u64::MAX;
+        let (selected, retry) =
+            select_retrieve_peer(&[0; 32], &peers, &accounting, &physical, &mut skiplist).await;
+        assert!(selected.is_none() && retry);
+        assert!(!skiplist.contains_key(&ids[2]));
+        let (selected, retry) =
+            select_retrieve_peer(&[0; 32], &peers, &accounting, &physical, &mut skiplist).await;
+        let selected = selected.unwrap();
+        assert_eq!(selected.peer, ids[2]);
+        assert!(!retry);
+        cancel_reserve(&selected.accounting, selected.price).await;
+    }
+
+    #[wasm_bindgen_test]
+    fn parity_batches_fill_only_free_slots_and_skip_admitted_shards() {
+        for (data_count, parity_count, active) in
+            [(119, 9, 119), (119, 9, 110), (39, 89, 1), (20, 87, 1)]
+        {
+            let parity = (0..parity_count)
+                .map(|index| Bytes::from(vec![index as u8; HASH_SIZE]))
+                .collect::<Vec<_>>();
+            let mut dispatched = vec![false; data_count + parity_count];
+            let (chunks, requests) = crate::chunk_retrieve_channel();
+            let (results, incoming) = mpsc::unbounded();
+            let cancel = None;
+            let mut queue = RawFetchQueue::new(&chunks, &results, &cancel);
+            let mut next = data_count;
+            for limit in [data_count - active, 1] {
+                let queued = dispatch_group_parity(
+                    data_count,
+                    &parity,
+                    &mut dispatched,
+                    &mut queue,
+                    limit,
+                    RetrieveHedgeDemand::DistinctShardManaged,
+                );
+                assert_eq!(queued, limit.min(data_count + parity_count - next));
+                for index in next..next + queued {
+                    let request = requests.try_recv().unwrap();
+                    assert_eq!(
+                        request.hedge_demand.unwrap().current(),
+                        RetrieveHedgeDemand::DistinctShardManaged
+                    );
+                    request.chan.send(Bytes::new());
+                    assert_eq!(incoming.try_recv().unwrap().index, index);
+                }
+                next += queued;
+                assert!(requests.is_empty());
+            }
+        }
+    }
+
+    #[wasm_bindgen_test]
+    async fn cached_join_drains_children_after_its_final_group_completes() {
+        let expected = [vec![0x31; CHUNK_SIZE], vec![0xa7; CHUNK_SIZE]].concat();
+        let mut references = Vec::new();
+        for payload in expected.chunks(CHUNK_SIZE) {
+            let raw = plain_chunk(payload);
+            let address = crate::content_address(&raw);
+            references.extend_from_slice(&address);
+            remember_raw_chunk(address, raw);
+        }
+        let root = DecodedJoinChunk {
+            level: RedundancyLevel::None,
+            span: expected.len() as u64,
+            payload: Bytes::from(references),
+        };
+        let (chunks, requests) = crate::chunk_retrieve_channel();
+        let span_prefix = root.span.to_le_bytes();
+        for (length, prefix) in [
+            (expected.len(), &[][..]),
+            (expected.len(), span_prefix.as_slice()),
+            (CHUNK_SIZE, span_prefix.as_slice()),
+        ] {
+            let result = retrieve_data_range_from_root_with_prefix_cancellable(
+                root.clone(),
+                0,
+                length as u64 - 1,
+                false,
+                &chunks,
+                prefix,
+                None,
+            )
+            .await;
+            assert_eq!(result, Some([prefix, &expected[..length]].concat()));
+        }
+        assert_eq!(
+            crate::bzz_stream::retrieve_embedded_data(&0_u64.to_le_bytes(), false, &chunks).await,
+            Some(0_u64.to_le_bytes().to_vec())
+        );
+        assert!(requests.is_empty());
+    }
+
+    #[wasm_bindgen_test]
+    fn raw_reply_drop_success_and_stale_drop_settle_only_their_own_flight() {
+        let raw = plain_chunk(b"direct raw completion contract");
+        let address = crate::content_address(&raw);
+        let (chunks, requests) = crate::chunk_retrieve_channel();
+        let (results, incoming) = mpsc::unbounded();
+        let cancel = None;
+        let mut queue = RawFetchQueue::new(&chunks, &results, &cancel);
+        queue.queue_data_shard(4, &address, RetrieveHedgeDemand::Ordinary);
+        let request = requests.try_recv().unwrap();
+        let crate::ChunkRetrieveReply::Raw(completion) = request.chan else {
+            panic!("raw request must own its completion");
+        };
+        let stale = RawFetchCompletion {
+            key: completion.key.clone(),
+            flight_id: completion.flight_id,
+        };
+        drop(completion);
+        let failed = incoming.try_recv().unwrap();
+        assert_eq!(failed.index, 4);
+        assert!(failed.chunk.is_empty());
+
+        queue.queue_data_shard(5, &address, RetrieveHedgeDemand::Ordinary);
+        let request = requests.try_recv().unwrap();
+        drop(stale);
+        assert!(incoming.try_recv().is_err());
+        request.chan.send(raw.clone());
+        let success = incoming.try_recv().unwrap();
+        assert_eq!(success.index, 5);
+        assert_eq!(success.chunk, raw);
+        assert_eq!(success.chunk.as_ptr(), raw.as_ptr());
+        assert!(success.canonical_cac);
+        assert!(incoming.try_recv().is_err());
+
+        drop(requests);
+        queue.queue_data_shard(6, &[0x6f; HASH_SIZE], RetrieveHedgeDemand::Ordinary);
+        let rejected = incoming.try_recv().unwrap();
+        assert_eq!(rejected.index, 6);
+        assert!(rejected.chunk.is_empty());
+    }
+
+    #[wasm_bindgen_test]
+    fn channel_reply_drop_remains_distinct_from_confirmed_empty() {
+        let (sender, mut receiver) = oneshot::channel();
+        drop(crate::ChunkRetrieveReply::Channel(sender));
+        assert!(receiver.try_recv().is_err());
+
+        let (sender, mut receiver) = oneshot::channel();
+        crate::ChunkRetrieveReply::Channel(sender).send(Bytes::new());
+        assert_eq!(receiver.try_recv(), Ok(Some(Vec::new())));
+    }
+
+    #[wasm_bindgen_test]
     fn decoded_cache_lru_reuses_the_stored_bytes_key() {
         let reference = vec![0x3c; HASH_SIZE];
         let mut cache = DecodedChunkCache::default();
@@ -2226,11 +2289,9 @@ mod raw_fetch_tests {
         assert_eq!(cache.order.back().unwrap().0.as_ptr(), stored_key_ptr);
     }
 
-    #[test]
+    #[wasm_bindgen_test]
     fn unencrypted_decoded_payload_shares_the_cached_raw_backing() {
-        let mut bytes = 3_u64.to_le_bytes().to_vec();
-        bytes.extend_from_slice(b"cat");
-        let raw = Bytes::from(bytes);
+        let raw = plain_chunk(b"cat");
         let mut cache = DecodedChunkCache::default();
         cache.insert_raw(vec![0; HASH_SIZE], raw.clone());
         let (decoded, cached_raw) = cache.get_decoded(&[0; HASH_SIZE], true).unwrap();
@@ -2250,15 +2311,14 @@ mod raw_fetch_tests {
         assert!(missing_raw.is_none());
     }
 
-    #[test]
+    #[wasm_bindgen_test]
     fn zero_waiter_late_success_caches_every_full_reference_owned_by_the_flight() {
-        let mut raw = 29_u64.to_le_bytes().to_vec();
-        raw.extend_from_slice(b"late raw cache payload");
-        let expected_cac = keccak256(&raw).to_vec();
+        let raw = plain_chunk(b"late raw cache payload");
+        let expected_cac = crate::content_address(&raw);
         let plain_reference = expected_cac.clone();
         let mut encrypted_reference = expected_cac.clone();
         encrypted_reference.extend_from_slice(&[0x5a; HASH_SIZE]);
-        let key = RawFetchKey::new(usize::MAX - 17, expected_cac.clone(), &expected_cac, &None);
+        let key = RawFetchKey::new(usize::MAX - 17, &expected_cac, &expected_cac, &None);
         assert_eq!(key.request_address.as_ptr(), key.expected_cac.as_ptr());
         let (result_chan, _result_in) = mpsc::unbounded();
         let registration = RAW_FETCH_FLIGHTS.with(|flights| {
@@ -2284,18 +2344,18 @@ mod raw_fetch_tests {
         assert!(registration.shared.admission.try_claim_physical_attempt());
         remove_raw_fetch_waiter(&key, registration.flight_id, registration.waiter_id);
 
-        assert!(complete_raw_fetch(
-            &key,
-            registration.flight_id,
-            raw.clone()
-        ));
+        RawFetchCompletion {
+            key,
+            flight_id: registration.flight_id,
+        }
+        .send(raw.clone());
         assert_eq!(
             cached_raw_chunk(&plain_reference).as_deref(),
-            Some(raw.as_slice())
+            Some(raw.as_ref())
         );
         assert_eq!(
             cached_raw_chunk(&encrypted_reference).as_deref(),
-            Some(raw.as_slice())
+            Some(raw.as_ref())
         );
     }
 }

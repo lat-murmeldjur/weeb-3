@@ -242,32 +242,6 @@ pub(crate) fn rolling_full_group_static_candidate(
     data_count > 0 && requested_count == data_count && parity_count > 0
 }
 
-/// One admission per coordinator turn makes the terminal check precede every
-/// replacement while never exceeding the structural data-group active width.
-pub(crate) fn rolling_parity_admission_count(
-    elapsed_ms: u64,
-    gate_ms: u64,
-    terminal: bool,
-    active_width: usize,
-    rolling_active: usize,
-    remaining_parity: usize,
-) -> usize {
-    if terminal || elapsed_ms < gate_ms {
-        return 0;
-    }
-    active_width
-        .saturating_sub(rolling_active)
-        .min(remaining_parity)
-        .min(1)
-}
-
-pub(crate) fn rolling_next_parity_index(
-    data_count: usize,
-    dispatched_shards: &[bool],
-) -> Option<usize> {
-    (data_count..dispatched_shards.len()).find(|&index| !dispatched_shards[index])
-}
-
 #[derive(Debug)]
 struct RetrieveAttemptBudget {
     limit: usize,

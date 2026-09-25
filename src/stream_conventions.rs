@@ -19,12 +19,15 @@ pub(crate) fn streaming_route_path(suffix: &str) -> String {
     }
 }
 
-#[cfg(target_arch = "wasm32")]
-pub(crate) fn route_markers(kind: &str) -> Vec<String> {
-    ["", "mainnet/", "testnet/"]
-        .into_iter()
-        .map(|network| streaming_route_path(&format!("{network}{kind}/")))
-        .collect()
+pub(crate) fn route_resource<'a>(pathname: &'a str, route: &str) -> Option<&'a str> {
+    let path = pathname
+        .strip_prefix(STREAMING_ROUTE_BASE)?
+        .strip_prefix('/')?;
+    let path = path
+        .strip_prefix("mainnet/")
+        .or_else(|| path.strip_prefix("testnet/"))
+        .unwrap_or(path);
+    path.strip_prefix(route)
 }
 
 #[cfg(target_arch = "wasm32")]

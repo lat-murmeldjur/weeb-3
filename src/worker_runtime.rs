@@ -75,9 +75,6 @@ impl Weeb3WorkerRuntime {
             }
             self.state.borrow_mut().bootnodes.clear();
             self.configured_network_id.set(Some(network_id));
-            crate::network_profile::activate_profile(
-                profile_for_swarm_network_id(network_id).expect("validated worker network"),
-            );
         }
         if !self.inner.runtime_is_started() {
             let inner = self.inner.clone();
@@ -114,7 +111,10 @@ impl Weeb3WorkerRuntime {
         }
 
         match request_type.as_str() {
-            "WEEB3_FETCH_REQUEST" => self.fetch_response(&message).await,
+            "WEEB3_FETCH_REQUEST" => {
+                self.request_network(&message)?;
+                Ok(crate::stream::service_worker_message_response(&message, self.inner.clone()).await)
+            }
             "WEEB3_NODE_REQUEST" => self.node_response(&message).await,
             "UPLOAD_REQUEST" => self.upload_response(&message).await,
             "WEEB3_RUNTIME_SNAPSHOT" => self.runtime_snapshot_response(&message).await,
@@ -140,8 +140,7 @@ impl Weeb3WorkerRuntime {
 
     async fn node_response(&self, message: &Object) -> Result<Object, Object> {
         let network_id = self.request_network(message)?;
-        let op = string_property(message, "op")
-            .ok_or_else(|| error_response(400, "node request requires op"))?;
+        let op = required_string(message, "op")?;
 
         match op.as_str() {
             "connectBootnodes" => self.connect_bootnodes_response(message, network_id).await,
@@ -162,8 +161,7 @@ impl Weeb3WorkerRuntime {
                 Ok(response)
             }
             "log" => {
-                let value = string_property(message, "message")
-                    .ok_or_else(|| error_response(400, "log requires message"))?;
+                let value = required_string(message, "message")?;
                 self.inner.interface_log(value);
                 Ok(ok_response())
             }
@@ -177,12 +175,9 @@ impl Weeb3WorkerRuntime {
                 Ok(response)
             }
             "progressStart" => {
-                let kind = string_property(message, "kind")
-                    .ok_or_else(|| error_response(400, "progressStart requires kind"))?;
-                let subject = string_property(message, "subject")
-                    .ok_or_else(|| error_response(400, "progressStart requires subject"))?;
-                let phase = string_property(message, "phase")
-                    .ok_or_else(|| error_response(400, "progressStart requires phase"))?;
+                let kind = required_string(message, "kind")?;
+                let subject = required_string(message, "subject")?;
+                let phase = required_string(message, "phase")?;
                 let response = ok_response();
                 let percent = percent_property(message);
                 let detail = string_property(message, "detail").unwrap_or_default();
@@ -198,10 +193,8 @@ impl Weeb3WorkerRuntime {
                 Ok(response)
             }
             "progressUpdate" => {
-                let id = string_property(message, "id")
-                    .ok_or_else(|| error_response(400, "progressUpdate requires id"))?;
-                let phase = string_property(message, "phase")
-                    .ok_or_else(|| error_response(400, "progressUpdate requires phase"))?;
+                let id = required_string(message, "id")?;
+                let phase = required_string(message, "phase")?;
                 let percent = percent_property(message);
                 let detail = string_property(message, "detail").unwrap_or_default();
                 self.inner
@@ -212,10 +205,8 @@ impl Weeb3WorkerRuntime {
                 Ok(ok_response())
             }
             "progressFinish" => {
-                let id = string_property(message, "id")
-                    .ok_or_else(|| error_response(400, "progressFinish requires id"))?;
-                let phase = string_property(message, "phase")
-                    .ok_or_else(|| error_response(400, "progressFinish requires phase"))?;
+                let id = required_string(message, "id")?;
+                let phase = required_string(message, "phase")?;
                 let ok = bool_property(message, "ok")
                     .ok_or_else(|| error_response(400, "progressFinish requires ok"))?;
                 let detail = string_property(message, "detail").unwrap_or_default();
@@ -227,8 +218,7 @@ impl Weeb3WorkerRuntime {
                 Ok(ok_response())
             }
             op @ ("acquire" | "retrieveBytes" | "retrieveChunk") => {
-                let address = string_property(message, "address")
-                    .ok_or_else(|| error_response(400, format!("{op} requires address")))?;
+                let address = required_string(message, "address")?;
                 Ok(bytes_response(match op {
                     "acquire" => self.inner.acquire(address).await,
                     "retrieveBytes" => self.inner.retrieve_bytes(address).await,
@@ -241,8 +231,7 @@ impl Weeb3WorkerRuntime {
             "pushChunk" => self.push_chunk_response(message).await,
             "resetStamp" => Ok(bytes_response(self.inner.reset_stamp().await)),
             "resolveBzz" => {
-                let resource = string_property(message, "resource")
-                    .ok_or_else(|| error_response(400, "resolveBzz requires resource"))?;
+                let resource = required_string(message, "resource")?;
                 self.inner
                     .resolve_bzz(resource)
                     .await
@@ -260,8 +249,7 @@ impl Weeb3WorkerRuntime {
                 hex::decode_to_slice(crate::strip_hex_prefix(owner), &mut [0; 20]).is_ok()
             })
             .ok_or_else(|| error_response(400, "invalid feed owner"))?;
-        let topic = string_property(message, "topic")
-            .ok_or_else(|| error_response(400, "acquireFeed requires topic"))?;
+        let topic = required_string(message, "topic")?;
         let deadline = number_property(message, "deadline")
             .ok_or_else(|| error_response(400, "acquireFeed requires deadline"))?;
         let progress = self.inner.progress.lock().await.start(
@@ -444,21 +432,15 @@ impl Weeb3WorkerRuntime {
             .ok_or_else(|| error_response(502, "range retrieval failed"))
     }
 
-    async fn fetch_response(&self, message: &Object) -> Result<Object, Object> {
-        self.request_network(message)?;
-        crate::stream::service_worker_message_response(message, self.inner.clone())
-            .await
-            .ok_or_else(|| error_response(400, "unsupported service-worker request"))
-    }
-
     async fn runtime_snapshot_response(&self, message: &Object) -> Result<Object, Object> {
         self.request_network(message)?;
         let seen_logs = integer_property(message, "seenLogSequence").unwrap_or(0);
         let seen_progress = integer_property(message, "seenProgressRevision").unwrap_or(0);
         let include_logs = bool_property(message, "includeLogs").unwrap_or(true);
         let include_progress = bool_property(message, "includeProgress").unwrap_or(true);
+        let response = ok_response();
         let fresh_logs = self.inner.get_current_logs();
-        let log_snapshot = {
+        {
             let mut state = self.state.borrow_mut();
             for log in fresh_logs {
                 state.log_sequence += 1;
@@ -468,8 +450,9 @@ impl Weeb3WorkerRuntime {
                     state.logs.pop_front();
                 }
             }
-            include_logs.then(|| {
-                let logs = (seen_logs < state.log_sequence).then(|| {
+            if include_logs {
+                set_number(&response, "logSequence", state.log_sequence as f64);
+                if seen_logs < state.log_sequence {
                     let logs = Array::new();
                     for (_, log) in state
                         .logs
@@ -478,24 +461,15 @@ impl Weeb3WorkerRuntime {
                     {
                         logs.push(&JsValue::from_str(log));
                     }
-                    logs
-                });
-                (state.log_sequence, logs)
-            })
-        };
-
-        let (connections, ongoing_connections) = self.inner.connection_counts().await;
-        let response = ok_response();
-        set_number(&response, "connections", connections as f64);
-        set_number(&response, "ongoingConnections", ongoing_connections as f64);
-        set_bool(&response, "paused", self.inner.transfer_paused());
-        if let Some((log_sequence, logs)) = log_snapshot {
-            set_number(&response, "logSequence", log_sequence as f64);
-            if let Some(logs) = logs {
-                set(&response, "logs", logs.into());
+                    set(&response, "logs", logs.into());
+                }
             }
         }
 
+        let (connections, ongoing_connections) = self.inner.connection_counts().await;
+        set_number(&response, "connections", connections as f64);
+        set_number(&response, "ongoingConnections", ongoing_connections as f64);
+        set_bool(&response, "paused", self.inner.transfer_paused());
         if include_progress {
             if let Some((revision, rows)) = self.inner.get_progress_snapshot(seen_progress).await {
                 set(&response, "progressChanged", JsValue::TRUE);
@@ -516,6 +490,13 @@ impl Weeb3WorkerRuntime {
 fn required_network_id(value: &JsValue) -> Option<u64> {
     let network_id = integer_property(value, "networkId")?;
     profile_for_swarm_network_id(network_id).map(|profile| profile.swarm_network_id)
+}
+
+fn required_string(message: &Object, field: &str) -> Result<String, Object> {
+    string_property(message, field).ok_or_else(|| {
+        let op = string_property(message, "op").unwrap_or_else(|| "node request".into());
+        error_response(400, format!("{op} requires {field}"))
+    })
 }
 
 fn percent_property(value: &JsValue) -> Option<u8> {

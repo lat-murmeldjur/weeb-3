@@ -16,13 +16,13 @@ use super::{
 use crate::{
     js_error_message,
     worker_protocol::{
-        bool_property as js_bool, integer_property, number_property, set, set_number, set_string,
-        string_property as js_string,
+        array_property, bool_property as js_bool, integer_property, number_property, set, set_number,
+        set_string, string_property as js_string,
     },
 };
 
 #[rustfmt::skip]
-const HLS_EVENTS: [&str; 7] = ["hlsManifestParsed", "hlsLevelUpdated", "hlsBufferCreated", "hlsFragLoading", "hlsBufferAppended", "hlsFragBuffered", "hlsError"];
+const HLS_EVENTS: [&str; 9] = ["hlsLevelSwitching", "hlsFragLoadEmergencyAborted", "hlsManifestParsed", "hlsBufferCreated", "hlsFragLoading", "hlsFragLoaded", "hlsBufferAppended", "hlsFragBuffered", "hlsError"];
 #[rustfmt::skip]
 const NATIVE_EVENTS: [&str; 6] = ["loadedmetadata", "durationchange", "progress", "canplay", "canplaythrough", "error"];
 const MEDIA_LIFECYCLE_EVENTS: [&str; 10] = [
@@ -68,7 +68,10 @@ extern "C" {
     fn attach_media(this: &Hls, media: &HtmlMediaElement) -> Result<(), JsValue>;
 
     #[wasm_bindgen(catch, method, js_name = startLoad)]
-    fn start_load_at(this: &Hls, position: f64) -> Result<(), JsValue>;
+    fn start_load(this: &Hls, position: f64, skip_seek: bool) -> Result<(), JsValue>;
+
+    #[wasm_bindgen(catch, method, js_name = detachMedia)]
+    fn detach_media(this: &Hls) -> Result<(), JsValue>;
 
     #[wasm_bindgen(catch, method, js_name = stopLoad)]
     fn stop_load(this: &Hls) -> Result<(), JsValue>;
@@ -84,6 +87,18 @@ extern "C" {
 
     #[wasm_bindgen(catch, method, js_name = destroy)]
     fn destroy(this: &Hls) -> Result<(), JsValue>;
+}
+
+impl Hls {
+    fn timeline_offset(&self) -> f64 {
+        js_property(self.as_ref(), "config")
+            .and_then(|config| number_property(&config, "timelineOffset")).unwrap_or(0.0)
+    }
+
+    fn start_load_at(&self, position: f64) -> Result<(), JsValue> {
+        let offset = self.timeline_offset();
+        self.start_load(position - offset, offset > 0.0)
+    }
 }
 
 thread_local! {
@@ -117,10 +132,12 @@ struct Player {
     hard_restarts: u8,
     decoder_wait: Option<(f64, event_listener::Event)>,
     reload_position: Option<f64>,
+    history_request: u64,
     clock_position: Option<f64>,
 }
 
 struct QualityControl {
+    revision: u64,
     select: HtmlSelectElement,
     change: Closure<dyn FnMut(Event)>,
 }
@@ -140,19 +157,9 @@ struct CodecRecovery {
     video_ready: bool,
 }
 
-impl CodecRecovery {
-    fn buffered(&self, fragment: Option<(u64, String)>) -> Option<bool> {
-        self.fragment
-            .as_ref()
-            .filter(|expected| Some(*expected) == fragment.as_ref())
-            .map(|_| self.video_ready)
-    }
-}
-
 struct NativePlayer {
     id: u64,
     media: HtmlMediaElement,
-    callback: Closure<dyn FnMut(Event)>,
     lifecycle: Closure<dyn FnMut(Event)>,
     plan: HlsStartupPlan,
     restore_autoplay: bool,
@@ -187,7 +194,9 @@ impl Drop for OpeningPlayer {
     }
 }
 
+#[derive(Default)]
 enum Action {
+    #[default]
     None,
     Start(Hls, f64),
     PauseBuffering(Hls),
@@ -200,6 +209,7 @@ enum Action {
     ResolveRemoteTail {
         sequence: u64,
         reference: String,
+        position: f64,
         restart: f64,
         error_type: Option<String>,
         details: String,
@@ -223,14 +233,15 @@ pub(super) async fn play_hls(
     let opening_intent = intent.clone();
     let opening_media = media.clone();
     let callback = Closure::new(move |event: Event| {
+        let event = event.type_();
         if !NEXT_ID.with(|next| next.get() == id)
-            || event.type_() == "pause" && !opening_media.paused()
-            || event.type_() == "play" && opening_media.paused()
+            || event == "pause" && !opening_media.paused()
+            || event == "play" && opening_media.paused()
         {
             return;
         }
         let mut intent = opening_intent.get();
-        intent.event(&event.type_());
+        intent.event(&event);
         opening_intent.set(intent);
     });
     let restore_autoplay = suspend_autoplay(&media);
@@ -292,31 +303,29 @@ pub(super) async fn play_hls(
     let Some(hls_class) = hls_class else {
         opening.restore_autoplay = false;
         drop(opening);
-        return play_native(id, media, &source, plan, restore_autoplay, intent);
+        return play_native(id, media, &source, plan.with_offset(0.0), restore_autoplay, intent);
     };
     let hls = opening.hls.as_ref().unwrap().clone();
     let xhr_setup = Closure::new(move |xhr: JsValue, url: String| {
         open_codec_request(id, &xhr, &url)
     });
     let config = js_property(hls.as_ref(), "config").ok_or("HLS configuration is unavailable")?;
+    if plan.timeline_offset > 0.0 {
+        set_number(config.unchecked_ref(), "timelineOffset", plan.timeline_offset);
+    }
     Reflect::set(&config, &JsValue::from_str("xhrSetup"), xhr_setup.as_ref())?
         .then_some(())
         .ok_or("HLS request setup could not be installed")?;
     let callback = Closure::new(move |event: JsValue, data: JsValue| {
         handle_event(id, event.as_string().as_deref().unwrap_or_default(), &data);
     });
-    for event in HLS_EVENTS {
-        if let Err(error) = hls.on(event, callback.as_ref().unchecked_ref()) {
-            remove_hls_events(&hls, &callback);
-            return Err(error);
-        }
-    }
+    add_hls_events(&hls, &callback)?;
 
     let lifecycle_media = media.clone();
     let lifecycle = Closure::<dyn FnMut(Event)>::new(move |event: Event| {
         handle_media_event(id, &lifecycle_media, &event.type_(), false);
     });
-    if let Err(error) = add_media_listeners(&media, &lifecycle) {
+    if let Err(error) = add_media_listeners(&media, &lifecycle, false) {
         remove_hls_events(&hls, &callback);
         return Err(error);
     }
@@ -351,6 +360,7 @@ pub(super) async fn play_hls(
             hard_restarts: 0,
             decoder_wait: None,
             reload_position: None,
+            history_request: 0,
             clock_position: None,
         });
     });
@@ -383,35 +393,23 @@ fn play_native(
     restore_autoplay: bool,
     intent: PlaybackIntent,
 ) -> Result<&'static str, JsValue> {
-    let callback = Closure::<dyn FnMut(Event)>::new(move |event: Event| {
-        handle_native_event(id, &event.type_());
-    });
-    for event in NATIVE_EVENTS {
-        if let Err(error) =
-            media.add_event_listener_with_callback(event, callback.as_ref().unchecked_ref())
-        {
-            remove_native_events(&media, &callback);
-            return Err(error);
-        }
-    }
     let lifecycle_media = media.clone();
     let lifecycle = Closure::<dyn FnMut(Event)>::new(move |event: Event| {
-        handle_media_event(id, &lifecycle_media, &event.type_(), true);
+        let event = event.type_();
+        if NATIVE_EVENTS.contains(&event.as_str()) {
+            handle_native_event(id, &event);
+        }
+        handle_media_event(id, &lifecycle_media, &event, true);
     });
-    if let Err(error) = add_media_listeners(&media, &lifecycle) {
-        remove_native_events(&media, &callback);
-        return Err(error);
-    }
+    add_media_listeners(&media, &lifecycle, true)?;
     if let Err(error) = media.set_attribute("data-weeb3-hls-mode", "native") {
         remove_media_listeners(&media, &lifecycle);
-        remove_native_events(&media, &callback);
         return Err(error);
     }
     NATIVE.with(|active| {
         *active.borrow_mut() = Some(NativePlayer {
             id,
             media: media.clone(),
-            callback,
             lifecycle,
             plan,
             restore_autoplay,
@@ -439,8 +437,12 @@ fn supports_native_hls(media: &HtmlMediaElement) -> bool {
 fn add_media_listeners(
     media: &HtmlMediaElement,
     listener: &Closure<dyn FnMut(Event)>,
+    native: bool,
 ) -> Result<(), JsValue> {
-    for event in MEDIA_LIFECYCLE_EVENTS {
+    for event in MEDIA_LIFECYCLE_EVENTS
+        .iter()
+        .chain(NATIVE_EVENTS.iter().filter(|_| native))
+    {
         if let Err(error) =
             media.add_event_listener_with_callback(event, listener.as_ref().unchecked_ref())
         {
@@ -449,10 +451,13 @@ fn add_media_listeners(
         }
     }
     if let Some(document) = web_sys::window().and_then(|window| window.document()) {
-        document.add_event_listener_with_callback(
+        if let Err(error) = document.add_event_listener_with_callback(
             "visibilitychange",
             listener.as_ref().unchecked_ref(),
-        )?;
+        ) {
+            remove_media_listeners(media, listener);
+            return Err(error);
+        }
     }
     Ok(())
 }
@@ -464,9 +469,19 @@ fn remove_media_listeners(media: &HtmlMediaElement, listener: &Closure<dyn FnMut
             listener.as_ref().unchecked_ref(),
         );
     }
-    for event in MEDIA_LIFECYCLE_EVENTS {
+    for event in MEDIA_LIFECYCLE_EVENTS.iter().chain(NATIVE_EVENTS.iter()) {
         let _ = media.remove_event_listener_with_callback(event, listener.as_ref().unchecked_ref());
     }
+}
+
+fn add_hls_events(hls: &Hls, callback: &Closure<dyn Fn(JsValue, JsValue)>) -> Result<(), JsValue> {
+    for event in HLS_EVENTS {
+        if let Err(error) = hls.on(event, callback.as_ref().unchecked_ref()) {
+            remove_hls_events(hls, callback);
+            return Err(error);
+        }
+    }
+    Ok(())
 }
 
 fn remove_hls_events(hls: &Hls, callback: &Closure<dyn Fn(JsValue, JsValue)>) {
@@ -475,13 +490,20 @@ fn remove_hls_events(hls: &Hls, callback: &Closure<dyn Fn(JsValue, JsValue)>) {
     }
 }
 
-fn remove_native_events(media: &HtmlMediaElement, callback: &Closure<dyn FnMut(Event)>) {
-    for event in NATIVE_EVENTS {
-        let _ = media.remove_event_listener_with_callback(event, callback.as_ref().unchecked_ref());
-    }
+fn with_player<T: Default>(id: u64, action: impl FnOnce(&mut Player) -> T) -> T {
+    ACTIVE.with_borrow_mut(|active| {
+        active
+            .as_mut()
+            .filter(|player| player.id == id)
+            .map(action)
+            .unwrap_or_default()
+    })
 }
 
 fn handle_media_event(id: u64, media: &HtmlMediaElement, event: &str, native: bool) {
+    if event == "timeupdate" && !native {
+        release_auto_quality(id, true);
+    }
     if matches!(event, "playing" | "pause" | "ended" | "visibilitychange") {
         let _ = update_media_session(media);
     }
@@ -502,11 +524,7 @@ fn handle_media_event(id: u64, media: &HtmlMediaElement, event: &str, native: bo
             None
         })
     } else {
-        ACTIVE.with(|active| {
-            let mut active = active.borrow_mut();
-            let Some(player) = active.as_mut().filter(|player| player.id == id) else {
-                return None;
-            };
+        with_player(id, |player| {
             if matches!(
                 event,
                 "play" | "playing" | "pause" | "ended" | "seeking" | "seeked" | "visibilitychange"
@@ -543,9 +561,22 @@ fn handle_media_event(id: u64, media: &HtmlMediaElement, event: &str, native: bo
                     })
             {
                 seek = Some(player.hls.clone());
-                let _ = player_fragment_loader(player);
-                let finalized = consumed_playlist_finalized(&player.hls).unwrap_or(false);
-                if let Some(plan) = seek_buffer_plan(media, &player.plan, finalized, player.live) {
+                if let Some(config) = js_property(player.hls.as_ref(), "config") {
+                    let _ = fragment_loader(&player.hls_class, &config.unchecked_into());
+                }
+                let finalized = level_details(&player.hls)
+                    .is_some_and(|details| js_bool(&details, "live") == Some(false));
+                let runway = if player.live {
+                    HLS_LIVE_STARTUP_BUFFER_SECONDS
+                } else {
+                    HLS_BEGINNING_STARTUP_BUFFER_SECONDS
+                };
+                if let Some(plan) = player.plan.at_position(
+                    media.current_time(),
+                    media.duration(),
+                    runway,
+                    finalized,
+                ) {
                     player.plan = plan;
                     if !player.ready {
                         player.reload_position = Some(media.current_time());
@@ -574,9 +605,70 @@ fn handle_media_event(id: u64, media: &HtmlMediaElement, event: &str, native: bo
         begin_playback(media.clone(), position);
     }
     if let Some(hls) = seek {
-        let result = hls.start_load_at(media.current_time());
-        finish_hls_action(id, &hls, "seeking", result);
+        seek_hls(id, hls, media.current_time());
     }
+}
+
+fn seek_hls(id: u64, hls: Hls, position: f64) {
+    let history = ACTIVE.with(|active| {
+        let mut active = active.borrow_mut();
+        let player = active.as_mut().filter(|player| player.id == id)?;
+        if player.plan.timeline_offset <= 0.0
+            || position >= player.plan.timeline_offset && player.reload_position.is_none() {
+            return None;
+        }
+        let selected = player.quality.as_ref().map_or(-1, |quality| quality.select.selected_index() - 1);
+        let level = if selected >= 0 {
+            array_property(hls.as_ref(), "levels")?.get(selected as u32)
+        } else { loaded_level(&hls)? };
+        let source = js_string(&level, "uri")?;
+        player.reload_position = Some(position);
+        player.history_request = player.history_request.wrapping_add(1);
+        player.ready = false;
+        cancel_decoder_recovery(player);
+        if let Some(quality) = player.quality.as_mut() {
+            quality.revision = quality.revision.wrapping_add(1);
+            quality.select.set_disabled(true);
+        }
+        Some((player.history_request, source))
+    });
+    let Some((request, source)) = history else {
+        let result = hls.start_load_at(position);
+        finish_hls_action(id, &hls, "seeking", result);
+        return;
+    };
+    if let Err(error) = hls.stop_load() {
+        finish_hls_action(id, &hls, "seeking", Err(error));
+        return;
+    }
+    spawn_local(async move {
+        if let Some(window) = web_sys::window() {
+            let _ = JsFuture::from(window.fetch_with_str(&source)).await;
+        }
+        let offset = loop {
+            if !ACTIVE.with(|active| active.borrow().as_ref().is_some_and(|player|
+                player.id == id && player.history_request == request
+                    && player.reload_position == Some(position))) { return; }
+            if let Some(prepared) = super::page_bridge::prepare_history(&source, position).await {
+                break prepared;
+            }
+            async_std::task::sleep(std::time::Duration::from_secs(1)).await;
+        };
+        let action = ACTIVE.with(|active| {
+            let mut active = active.borrow_mut();
+            let player = active.as_mut().filter(|player| player.id == id
+                && player.history_request == request
+                && Object::is(player.hls.as_ref(), hls.as_ref())
+                && player.reload_position == Some(position))?;
+            let config = js_property(hls.as_ref(), "config")?;
+            set_number(config.unchecked_ref(), "timelineOffset", offset);
+            player.plan.timeline_offset = offset;
+            player.plan.bootstrap_position = position;
+            if player.initial_source.is_some() { player.initial_source = Some(source); }
+            Some(Action::ReloadSource(hls.clone(), player.source.clone()))
+        });
+        if let Some(action) = action { apply_action(id, action); }
+    });
 }
 
 fn media_action(
@@ -645,12 +737,28 @@ fn handle_native_event(id: u64, event: &str) {
 }
 
 fn handle_event(id: u64, event: &str, data: &JsValue) {
+    if event == "hlsLevelSwitching" {
+        let hls = ACTIVE.with(|active| {
+            active
+                .borrow()
+                .as_ref()
+                .filter(|player| {
+                    player.id == id
+                        && player.ready
+                        && js_bool(player.hls.as_ref(), "autoLevelEnabled") == Some(true)
+                })
+                .and_then(|player| Some((player.hls.clone(), player.quality.as_ref()?.revision)))
+        });
+        if let (Some((hls, revision)), Some(level)) = (hls, integer_property(data, "level")) {
+            select_quality(id, Some((hls, level as i32, revision)));
+        }
+        return;
+    }
+    if matches!(event, "hlsError" | "hlsFragLoadEmergencyAborted") {
+        release_auto_quality(id, false);
+    }
     let mut resume_bootstrap = None;
-    let action = ACTIVE.with(|active| {
-        let mut active = active.borrow_mut();
-        let Some(player) = active.as_mut().filter(|player| player.id == id) else {
-            return Action::None;
-        };
+    let action = with_player(id, |player| {
         if event == "hlsBufferAppended" {
             schedule_decoder_recovery(player);
         }
@@ -668,6 +776,10 @@ fn handle_event(id: u64, event: &str, data: &JsValue) {
             resume_bootstrap = Some(player.hls.clone());
         }
         match event {
+            "hlsFragLoaded" if player.quality.is_some() => {
+                let _ = account_retrieval_time(data);
+                Action::None
+            }
             "hlsFragLoading" if player.codec_bootstrap_pending => {
                 if let Some(codec) = player.codec_recovery.as_mut()
                     && codec.fragment.is_none()
@@ -725,14 +837,11 @@ fn handle_event(id: u64, event: &str, data: &JsValue) {
                     return Action::None;
                 }
                 if let Some(codec) = &player.codec_recovery {
-                    match codec.buffered(failed_media_identity(data)) {
-                        None => return Action::None,
-                        Some(false) => {
-                            return Action::HardRestart(
-                                "HLS codec segment has no video buffer".into(),
-                            );
-                        }
-                        Some(true) => {}
+                    if codec.fragment != failed_media_identity(data) || codec.fragment.is_none() {
+                        return Action::None;
+                    }
+                    if !codec.video_ready {
+                        return Action::HardRestart("HLS codec segment has no video buffer".into());
                     }
                 }
                 player.codec_bootstrap_pending = false;
@@ -747,21 +856,6 @@ fn handle_event(id: u64, event: &str, data: &JsValue) {
                     )
                 }
             }
-            "hlsLevelUpdated" if !player.ready => {
-                if !player.initial_live {
-                    return Action::None;
-                }
-                let Some(_) = consumed_playlist_finalized(&player.hls) else {
-                    return Action::HardRestart("The live presentation was unavailable".into());
-                };
-                if !player.codec_bootstrap_pending
-                    && let Some(position) = finish_buffering(player)
-                {
-                    Action::Play(player.media.clone(), position)
-                } else {
-                    Action::None
-                }
-            }
             "hlsBufferAppended" | "hlsFragBuffered" if !player.ready => {
                 if let Some(position) = finish_buffering(player) {
                     Action::Play(player.media.clone(), position)
@@ -770,11 +864,9 @@ fn handle_event(id: u64, event: &str, data: &JsValue) {
                     Action::None
                 }
             }
-            "hlsBufferAppended" | "hlsFragBuffered" => {
-                if event == "hlsFragBuffered" {
-                    player.consecutive_media_recoveries = 0;
-                    player.media.remove_attribute("data-weeb3-hls-error").ok();
-                }
+            "hlsFragBuffered" => {
+                player.consecutive_media_recoveries = 0;
+                player.media.remove_attribute("data-weeb3-hls-error").ok();
                 Action::None
             }
             "hlsError" if js_bool(data, "fatal") == Some(true) => {
@@ -805,10 +897,13 @@ fn handle_event(id: u64, event: &str, data: &JsValue) {
                         "fragLoadError" | "fragLoadTimeOut" | "fragParsingError"
                     )
                     && let Some((sequence, reference)) = failed_media_identity(data)
+                    && let Some(position) = js_property(data, "frag")
+                        .and_then(|fragment| number_property(&fragment, "start"))
                 {
                     Action::ResolveRemoteTail {
                         sequence,
                         reference,
+                        position,
                         restart,
                         error_type: js_string(data, "type"),
                         details,
@@ -838,14 +933,8 @@ fn handle_event(id: u64, event: &str, data: &JsValue) {
 
 fn apply_action(id: u64, action: Action) {
     if !matches!(action, Action::None | Action::PauseBuffering(..)) {
-        ACTIVE.with(|active| {
-            if let Some(player) = active
-                .borrow_mut()
-                .as_mut()
-                .filter(|player| player.id == id)
-            {
-                cancel_decoder_recovery(player);
-            }
+        with_player(id, |player| {
+            cancel_decoder_recovery(player);
         });
     }
     let manifest = matches!(action, Action::Start(..));
@@ -895,16 +984,28 @@ fn apply_action(id: u64, action: Action) {
             finish_media_reset(id, &hls, "HLS source reload failed", result);
         }
         Action::RecoverMedia(hls) => {
-            let result = hls.recover_media_error();
+            let result = if hls.timeline_offset() > 0.0 {
+                // The library's recovery passes absolute time to relative startLoad.
+                let media = js_property(hls.as_ref(), "media")
+                    .and_then(|media| media.dyn_into::<HtmlMediaElement>().ok());
+                media.map_or(Ok(()), |media| {
+                    let position = media.current_time();
+                    hls.detach_media().and_then(|_| hls.attach_media(&media)).and_then(|_| {
+                        media.set_current_time(position);
+                        hls.start_load_at(position)
+                    })
+                })
+            } else { hls.recover_media_error() };
             finish_media_reset(id, &hls, "HLS media recovery failed", result);
         }
         Action::ResolveRemoteTail {
             sequence,
             reference,
+            position,
             restart,
             error_type,
             details,
-        } => resolve_remote_tail_failure(id, sequence, reference, restart, error_type, details),
+        } => resolve_remote_tail_failure(id, sequence, reference, position, restart, error_type, details),
         Action::HardRestart(message) => hard_restart(id, message),
     }
 }
@@ -931,6 +1032,7 @@ fn resolve_remote_tail_failure(
     id: u64,
     sequence: u64,
     reference: String,
+    position: f64,
     restart: f64,
     error_type: Option<String>,
     details: String,
@@ -949,11 +1051,8 @@ fn resolve_remote_tail_failure(
         if !is_current_hls(id, &hls) {
             return;
         }
-        let action = ACTIVE.with(|active| {
-            let mut active = active.borrow_mut();
-            let Some(player) = active.as_mut().filter(|player| player.id == id) else {
-                return Action::None;
-            };
+        let target = target.and_then(|distance| super::hls_retreat_position(position, distance));
+        let action = with_player(id, |player| {
             if let Some(target) = target {
                 player.consecutive_media_recoveries = 0;
                 player.reload_position = Some(target);
@@ -1007,9 +1106,7 @@ fn is_current_hls(id: u64, hls: &Hls) -> bool {
 fn hard_restart(id: u64, message: String) {
     type Launch = (Hls, Hls, String, HtmlMediaElement, f64);
     type Failure = (HtmlMediaElement, String, bool);
-    let replacement: Option<Result<Launch, Failure>> = ACTIVE.with(|active| {
-        let mut active = active.borrow_mut();
-        let player = active.as_mut().filter(|player| player.id == id)?;
+    let replacement: Option<Result<Launch, Failure>> = with_player(id, |player| {
         cancel_decoder_recovery(player);
         if player.hard_restarts >= MAX_HARD_RESTARTS {
             return Some(Err((player.media.clone(), message, true)));
@@ -1022,9 +1119,17 @@ fn hard_restart(id: u64, message: String) {
         if !position.is_finite() || position < 0.0 {
             position = player.plan.play_position;
         }
-        let Some(plan) =
-            recovery_plan(&player.plan, position, player.media.duration(), player.live)
-        else {
+        let duration = if player.live {
+            player.plan.duration
+        } else {
+            player.media.duration()
+        };
+        let Some(plan) = player.plan.at_position(
+            position,
+            duration,
+            player.plan.runway_end - player.plan.play_position,
+            !player.live,
+        ) else {
             return Some(Err((player.media.clone(), message, true)));
         };
         player.plan = plan;
@@ -1039,6 +1144,9 @@ fn hard_restart(id: u64, message: String) {
             HlsStart::Beginning
         };
         let config = hls_config(start);
+        if player.plan.timeline_offset > 0.0 {
+            set_number(&config, "timelineOffset", player.plan.timeline_offset);
+        }
         set(&config, "xhrSetup", player.xhr_setup.as_ref().clone());
         if (player.live || player.codec_recovery.is_some())
             && let Err(error) = fragment_loader(&player.hls_class, &config)
@@ -1055,16 +1163,13 @@ fn hard_restart(id: u64, message: String) {
                 )));
             }
         };
-        for event in HLS_EVENTS {
-            if let Err(error) = hls.on(event, player.callback.as_ref().unchecked_ref()) {
-                remove_hls_events(&hls, &player.callback);
-                let _ = hls.destroy();
-                return Some(Err((
-                    player.media.clone(),
-                    js_error_message(&error),
-                    player.hard_restarts >= MAX_HARD_RESTARTS,
-                )));
-            }
+        if let Err(error) = add_hls_events(&hls, &player.callback) {
+            let _ = hls.destroy();
+            return Some(Err((
+                player.media.clone(),
+                js_error_message(&error),
+                player.hard_restarts >= MAX_HARD_RESTARTS,
+            )));
         }
         remove_hls_events(&player.hls, &player.callback);
         let retired = std::mem::replace(&mut player.hls, hls.clone());
@@ -1108,6 +1213,20 @@ fn hard_restart(id: u64, message: String) {
 }
 
 fn begin_playback(media: HtmlMediaElement, position: f64) {
+    let selection = ACTIVE.with(|active| {
+        let active = active.borrow();
+        let player = active
+            .as_ref()
+            .filter(|player| player.media == media && player.initial_source.is_some())?;
+        let level = player
+            .quality
+            .as_ref()
+            .map_or(-1, |quality| quality.select.selected_index() - 1);
+        Some((player.hls.clone(), level))
+    });
+    if let Some((hls, level)) = selection {
+        set_number(hls.unchecked_ref(), "loadLevel", f64::from(level));
+    }
     let current = media.current_time();
     if !current.is_finite()
         || current + BUFFER_EPSILON_SECONDS + CLOCK_ADVANCE_EPSILON_SECONDS < position
@@ -1160,34 +1279,6 @@ fn playback_start_position(media: &HtmlMediaElement, plan: &HlsStartupPlan) -> O
     (media.ready_state() >= 3).then_some(position)
 }
 
-fn recovery_plan(
-    plan: &HlsStartupPlan,
-    position: f64,
-    duration: f64,
-    live: bool,
-) -> Option<HlsStartupPlan> {
-    let runway = playback_runway(plan);
-    let duration = if !live && duration.is_finite() {
-        plan.duration.max(duration)
-    } else {
-        plan.duration
-    };
-    let end = position + runway;
-    let end = if live { end } else { end.min(duration) };
-    (position.is_finite()
-        && position >= 0.0
-        && runway.is_finite()
-        && runway > 0.0
-        && end.is_finite()
-        && end > position)
-        .then(|| HlsStartupPlan {
-            play_position: position,
-            runway_end: end,
-            duration,
-            ..plan.clone()
-        })
-}
-
 fn fragment_loader(hls_class: &JsValue, config: &Object) -> Result<(), JsValue> {
     let loader = js_property(hls_class, "DefaultConfig")
         .and_then(|defaults| js_property(&defaults, "loader"))
@@ -1199,12 +1290,8 @@ fn fragment_loader(hls_class: &JsValue, config: &Object) -> Result<(), JsValue> 
 }
 
 fn loaded_level(hls: &Hls) -> Option<JsValue> {
-    let levels = js_property(hls.as_ref(), "levels")?;
-    let levels = Array::from(&levels);
-    let index = integer_property(hls.as_ref(), "loadLevel")
-        .and_then(|index| u32::try_from(index).ok())
-        .or_else(|| (levels.length() == 1).then_some(0))?;
-    (index < levels.length()).then(|| levels.get(index))
+    js_property(hls.as_ref(), "loadLevelObj")
+        .filter(|level| !level.is_undefined() && !level.is_null())
 }
 
 fn level_details(hls: &Hls) -> Option<JsValue> {
@@ -1215,8 +1302,8 @@ fn level_details(hls: &Hls) -> Option<JsValue> {
 fn pin_initial_level(hls: &Hls, media: &HtmlMediaElement, source: &str) -> Result<(), JsValue> {
     let source =
         web_sys::Url::new_with_base(source, &media.base_uri()?.unwrap_or_default())?.href();
-    let levels = js_property(hls.as_ref(), "levels").ok_or("HLS levels are unavailable")?;
-    let index = Array::from(&levels)
+    let levels = array_property(hls.as_ref(), "levels").ok_or("HLS levels are unavailable")?;
+    let index = levels
         .iter()
         .position(|level| js_string(&level, "uri").as_ref() == Some(&source))
         .ok_or("The prepared HLS rendition is unavailable")?;
@@ -1229,8 +1316,7 @@ fn quality_control(
     media: &HtmlMediaElement,
     hls: &Hls,
 ) -> Result<Option<QualityControl>, JsValue> {
-    let levels =
-        Array::from(&js_property(hls.as_ref(), "levels").ok_or("HLS levels are unavailable")?);
+    let levels = array_property(hls.as_ref(), "levels").ok_or("HLS levels are unavailable")?;
     if levels.length() < 2 {
         return Ok(None);
     }
@@ -1259,34 +1345,171 @@ fn quality_control(
         option.set_text_content(Some(&label));
         select.append_child(&option)?;
     }
-    select.set_value("-1");
+    // Keep the prepared rendition until the user selects a quality or Auto.
+    let initial = integer_property(hls.as_ref(), "startLevel").map_or(0, |level| level as i32 + 1);
+    select.set_selected_index(initial);
     select.set_disabled(true);
-    let selected = select.clone();
-    let change = Closure::new(move |_: Event| {
-        let hls = ACTIVE.with(|active| {
-            active
-                .borrow()
-                .as_ref()
-                .filter(|player| player.id == id && player.ready)
-                .map(|player| player.hls.clone())
-        });
-        if let Some(hls) = hls
-            && let Ok(level) = selected.value().parse::<i32>()
-        {
-            set_number(hls.unchecked_ref(), "loadLevel", f64::from(level));
-        }
-    });
+    let change = Closure::new(move |_: Event| select_quality(id, None));
     select.add_event_listener_with_callback("change", change.as_ref().unchecked_ref())?;
     if let Some(parent) = media.parent_node() {
         parent.insert_before(&select, media.next_sibling().as_ref())?;
     }
-    Ok(Some(QualityControl { select, change }))
+    Ok(Some(QualityControl {
+        revision: 0,
+        select,
+        change,
+    }))
 }
 
-fn consumed_playlist_finalized(hls: &Hls) -> Option<bool> {
-    let details = level_details(hls)?;
-    let finalized = !js_bool(&details, "live")?;
-    (integer_property(&details, "startSN")? == 0).then_some(finalized)
+fn quality_has_buffer(hls: &Hls) -> bool {
+    js_property(hls.as_ref(), "mainForwardBufferInfo")
+        .and_then(|buffer| number_property(&buffer, "len"))
+        .zip(
+            js_property(hls.as_ref(), "latestLevelDetails")
+                .and_then(|details| number_property(&details, "targetduration")),
+        )
+        .is_some_and(|(buffer, duration)| duration > 0.0 && buffer > 2.0 * duration)
+}
+
+fn release_auto_quality(id: u64, only_if_buffer_low: bool) {
+    let hls = with_player(id, |player| {
+        let quality = player
+            .quality
+            .as_mut()
+            .filter(|quality| quality.select.selected_index() == 0)?;
+        if only_if_buffer_low
+            && (!player.ready
+                || js_bool(player.hls.as_ref(), "autoLevelEnabled") != Some(false)
+                || quality_has_buffer(&player.hls))
+        {
+            return None;
+        }
+        quality.revision = quality.revision.wrapping_add(1);
+        Some(player.hls.clone())
+    });
+    if let Some(hls) = hls
+        && js_bool(hls.as_ref(), "autoLevelEnabled") == Some(false)
+    {
+        set_number(hls.unchecked_ref(), "loadLevel", -1.0);
+    }
+}
+
+fn select_quality(id: u64, automatic: Option<(Hls, i32, u64)>) {
+    spawn_local(async move {
+        let request = with_player(id, |player| {
+            if !player.ready {
+                return None;
+            }
+            let quality = player.quality.as_mut()?;
+            let selected = quality.select.selected_index() - 1;
+            if selected < -1
+                || automatic.as_ref().is_some_and(|(hls, level, revision)| {
+                    selected != -1
+                        || quality.revision != *revision
+                        || !Object::is(player.hls.as_ref(), hls.as_ref())
+                        || js_bool(hls.as_ref(), "autoLevelEnabled") != Some(true)
+                        || number_property(hls.as_ref(), "loadLevel") != Some(f64::from(*level))
+                })
+            {
+                return None;
+            }
+            quality.revision = quality.revision.wrapping_add(1);
+            Some((player.hls.clone(), quality.revision, selected))
+        });
+        let Some((hls, revision, selected)) = request else {
+            return;
+        };
+        let level = automatic.as_ref().map_or(selected, |(_, level, _)| *level);
+        if level == -1 {
+            set_number(hls.unchecked_ref(), "loadLevel", -1.0);
+            return;
+        }
+        let source = array_property(hls.as_ref(), "levels")
+            .and_then(|levels| js_string(&levels.get(level as u32), "uri"));
+        if automatic.is_some() {
+            let previous = js_property(hls.as_ref(), "latestLevelDetails")
+                .and_then(|details| array_property(&details, "fragments"))
+                .and_then(|fragments| integer_property(&fragments.get(0), "level"));
+            let Some(previous) = previous.filter(|previous| *previous != level as u64) else {
+                return;
+            };
+            if source.is_none() || !quality_has_buffer(&hls) {
+                return;
+            }
+            // Keep the last loaded rendition filling the buffer during discovery.
+            set_number(hls.unchecked_ref(), "loadLevel", previous as f64);
+        }
+        if let Some(window) = web_sys::window()
+            && let Some(source) = source.as_ref()
+        {
+            // On failure, hls.js retains its normal playlist retry policy.
+            let _ = JsFuture::from(window.fetch_with_str(source)).await;
+        }
+        let current = ACTIVE.with(|active| {
+            active.borrow().as_ref().is_some_and(|player| {
+                player.id == id
+                    && player.ready
+                    && Object::is(player.hls.as_ref(), hls.as_ref())
+                    && player.quality.as_ref().is_some_and(|quality| {
+                        quality.revision == revision
+                            && quality.select.selected_index() - 1 == selected
+                    })
+            })
+        });
+        if !current {
+            return;
+        }
+        let eligible = automatic.is_none()
+            || number_property(hls.as_ref(), "minAutoLevel")
+                .zip(number_property(hls.as_ref(), "maxAutoLevel"))
+                .is_some_and(|(minimum, maximum)| (minimum..=maximum).contains(&f64::from(level)))
+                && array_property(hls.as_ref(), "levels")
+                    .and_then(|levels| js_string(&levels.get(level as u32), "uri"))
+                    == source;
+        if eligible {
+            // Set the target while manual so this event cannot start another prefetch.
+            set_number(hls.unchecked_ref(), "loadLevel", f64::from(level));
+            if automatic.is_some() {
+                set_number(hls.unchecked_ref(), "nextAutoLevel", f64::from(level));
+            }
+        }
+        if selected == -1 {
+            set_number(hls.unchecked_ref(), "loadLevel", -1.0);
+        }
+    });
+}
+
+fn account_retrieval_time(data: &JsValue) -> Option<()> {
+    if !is_main_fragment(data) {
+        return None;
+    }
+    let response = js_property(data, "networkDetails")?;
+    let (headers, get) = if let Some(get) = js_function(&response, "getResponseHeader") {
+        (response, get)
+    } else {
+        let headers = js_property(&response, "headers")?;
+        let get = js_function(&headers, "get")?;
+        (headers, get)
+    };
+    let elapsed = get
+        .call1(&headers, &"X-Weeb3-Retrieval-Ms".into())
+        .ok()?
+        .as_string()?
+        .parse::<f64>()
+        .ok()
+        .filter(|elapsed| elapsed.is_finite() && *elapsed > 0.0)?;
+    let fragment = js_property(data, "frag")?;
+    let stats = js_property(&fragment, "stats")?;
+    let loading = js_property(&stats, "loading")?;
+    let end = number_property(&loading, "end")?;
+    let start = number_property(&loading, "start")?;
+    let ttfb = number_property(&loading, "first")? - start;
+    let start = end - elapsed.max(end - start);
+    // Full bodies arrive after retrieval. Include their original acquisition
+    // time on cache hits, preserving the TTFB hls.js has already sampled.
+    set_number(loading.unchecked_ref(), "start", start);
+    set_number(loading.unchecked_ref(), "first", start + ttfb);
+    Some(())
 }
 
 fn open_codec_request(id: u64, xhr: &JsValue, request_url: &str) -> Result<(), JsValue> {
@@ -1299,11 +1522,9 @@ fn open_codec_request(id: u64, xhr: &JsValue, request_url: &str) -> Result<(), J
             return false;
         };
         level_details(&player.hls)
-            .and_then(|details| js_property(&details, "fragments"))
+            .and_then(|details| array_property(&details, "fragments"))
             .and_then(|fragments| {
-                Array::from(&fragments)
-                    .iter()
-                    .find(|fragment| js_bool(fragment, "gap") != Some(true))
+                fragments.iter().find(|fragment| js_bool(fragment, "gap") != Some(true))
             })
             .and_then(|fragment| js_string(&fragment, "url"))
             .is_some_and(|url| url == request_url)
@@ -1319,12 +1540,6 @@ fn open_codec_request(id: u64, xhr: &JsValue, request_url: &str) -> Result<(), J
     Ok(())
 }
 
-fn player_fragment_loader(player: &Player) -> Result<(), JsValue> {
-    let config =
-        js_property(player.hls.as_ref(), "config").ok_or("HLS configuration is unavailable")?;
-    fragment_loader(&player.hls_class, &config.unchecked_into())
-}
-
 fn player_start_position(player: &Player) -> Option<f64> {
     if let Some(position) = playback_start_position(&player.media, &player.plan) {
         return Some(position);
@@ -1333,7 +1548,7 @@ fn player_start_position(player: &Player) -> Option<f64> {
         return None;
     }
     let ranges = player.media.buffered();
-    let runway = playback_runway(&player.plan);
+    let runway = player.plan.runway_end - player.plan.play_position;
     (0..ranges.length()).rev().find_map(|index| {
         let (start, end) = (ranges.start(index).ok()?, ranges.end(index).ok()?);
         let position = start
@@ -1346,12 +1561,10 @@ fn player_start_position(player: &Player) -> Option<f64> {
 
 fn finish_buffering(player: &mut Player) -> Option<f64> {
     let position = player_start_position(player)?;
-    if player.initial_source.is_some() {
-        let level = player.quality.as_ref().map_or(-1, |quality| {
-            quality.select.set_disabled(false);
-            quality.select.value().parse::<i32>().unwrap_or(-1)
-        });
-        set_number(player.hls.unchecked_ref(), "loadLevel", f64::from(level));
+    if player.initial_source.is_some()
+        && let Some(quality) = player.quality.as_ref()
+    {
+        quality.select.set_disabled(false);
     }
     player.ready = true;
     player.initial_live = false;
@@ -1373,33 +1586,6 @@ impl PlaybackIntent {
             _ => {}
         }
     }
-}
-
-fn seek_buffer_plan(
-    media: &HtmlMediaElement,
-    plan: &HlsStartupPlan,
-    finalized: bool,
-    live: bool,
-) -> Option<HlsStartupPlan> {
-    let position = media.current_time();
-    let duration = if media.duration().is_finite() {
-        plan.duration.max(media.duration())
-    } else {
-        plan.duration
-    };
-    let end = position
-        + if live {
-            HLS_LIVE_STARTUP_BUFFER_SECONDS
-        } else {
-            HLS_BEGINNING_STARTUP_BUFFER_SECONDS
-        };
-    let end = if finalized { end.min(duration) } else { end };
-    (position.is_finite() && position >= 0.0 && end > position).then(|| HlsStartupPlan {
-        play_position: position,
-        runway_end: end,
-        duration,
-        ..plan.clone()
-    })
 }
 
 fn cancel_decoder_recovery(player: &mut Player) -> bool {
@@ -1449,9 +1635,7 @@ fn schedule_decoder_recovery(player: &mut Player) {
         {
             return;
         }
-        let recovery = ACTIVE.with(|active| {
-            let mut active = active.borrow_mut();
-            let player = active.as_mut().filter(|player| player.id == id)?;
+        let recovery = with_player(id, |player| {
             if !listener.listens_to(&player.decoder_wait.as_ref()?.1) {
                 return None;
             }
@@ -1507,9 +1691,6 @@ fn playback_intent(media: &HtmlMediaElement, requested: Option<bool>) -> bool {
         .unwrap_or(false)
 }
 
-#[rustfmt::skip]
-fn playback_runway(plan: &HlsStartupPlan) -> f64 { plan.runway_end - plan.play_position }
-
 fn suspend_autoplay(media: &HtmlMediaElement) -> bool {
     let requested = media.autoplay();
     media.set_autoplay(false);
@@ -1546,7 +1727,6 @@ pub(super) fn destroy_current_hls() {
         restore_autoplay(&player.media, player.restore_autoplay);
     }
     if let Some(player) = NATIVE.with(|active| active.borrow_mut().take()) {
-        remove_native_events(&player.media, &player.callback);
         remove_media_listeners(&player.media, &player.lifecycle);
         let _ = player.media.pause();
         player.media.remove_attribute("src").ok();
@@ -1713,9 +1893,7 @@ fn construct_hls(hls_class: &JsValue, config: &Object) -> Result<Hls, JsValue> {
 fn hls_config(start: HlsStart) -> Object {
     let config = Object::new();
     set(&config, "progressive", JsValue::TRUE);
-    set(&config, "enableWorker", JsValue::TRUE);
     set(&config, "autoStartLoad", JsValue::FALSE);
-    set(&config, "startFragPrefetch", JsValue::FALSE);
     let (buffer, maximum) = if start == HlsStart::Live {
         LIVE_RUNWAY_BUFFER
     } else {
@@ -1801,23 +1979,24 @@ fn is_main_fragment(value: &JsValue) -> bool {
 }
 
 pub(super) fn set_state(media: &HtmlMediaElement, state: &str, message: &str) {
-    if media.get_attribute("data-weeb3-hls-state").as_deref() == Some("paused")
+    let previous = media.get_attribute("data-weeb3-hls-state");
+    if previous.as_deref() == Some("paused")
         && !matches!(state, "starting" | "playing" | "error")
     {
         return;
     }
+    if previous.as_deref() == Some(state) && state != "error" {
+        return;
+    }
     media.set_attribute("data-weeb3-hls-state", state).ok();
-    let busy = !matches!(state, "playing" | "ready" | "paused" | "error");
     let Some(parent) = media.parent_element() else {
         return;
     };
     let Ok(Some(status)) = parent.query_selector(".weeb3-hls-status") else {
         return;
     };
-    status.set_text_content(Some(message));
-    status.set_attribute("data-state", state).ok();
-    status.toggle_attribute_with_force("hidden", busy).ok();
-    status
-        .set_attribute("aria-busy", if busy { "true" } else { "false" })
-        .ok();
+    // The media element supplies the loading indicator and playback controls.
+    let notice = matches!(state, "ready" | "error");
+    status.set_text_content(notice.then_some(message));
+    status.toggle_attribute_with_force("hidden", !notice).ok();
 }

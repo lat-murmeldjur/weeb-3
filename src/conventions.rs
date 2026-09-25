@@ -13,7 +13,7 @@ use web3::types::Address;
 
 #[inline]
 pub(crate) fn keccak256(input: impl AsRef<[u8]>) -> [u8; 32] {
-    keccak256_bytes(input.as_ref())
+    web3::signing::keccak256(input.as_ref())
 }
 
 pub(crate) fn eip191_hash_message(message: &[u8]) -> [u8; 32] {
@@ -29,104 +29,6 @@ pub(crate) fn namehash(name: &str) -> [u8; 32] {
     name.rsplit('.').fold([0; 32], |node, label| {
         keccak256([node, keccak256(label.as_bytes())].as_flattened())
     })
-}
-
-// Keccak-f[1600] steps follow the Keccak Team summary:
-// https://keccak.team/keccak_specs_summary.html
-// Rotation cycle and round constants cross-checked with tiny-keccak 2.0.2 (CC0).
-const KECCAK_ROUND: [u64; 24] = [
-    0x0000000000000001,
-    0x0000000000008082,
-    0x800000000000808a,
-    0x8000000080008000,
-    0x000000000000808b,
-    0x0000000080000001,
-    0x8000000080008081,
-    0x8000000000008009,
-    0x000000000000008a,
-    0x0000000000000088,
-    0x0000000080008009,
-    0x000000008000000a,
-    0x000000008000808b,
-    0x800000000000008b,
-    0x8000000000008089,
-    0x8000000000008003,
-    0x8000000000008002,
-    0x8000000000000080,
-    0x000000000000800a,
-    0x800000008000000a,
-    0x8000000080008081,
-    0x8000000000008080,
-    0x0000000080000001,
-    0x8000000080008008,
-];
-const KECCAK_ROTATION: [u32; 24] = [
-    1, 3, 6, 10, 15, 21, 28, 36, 45, 55, 2, 14, 27, 41, 56, 8, 25, 43, 62, 18, 39, 61, 20, 44,
-];
-const KECCAK_POSITION: [usize; 24] = [
-    10, 7, 11, 17, 18, 3, 5, 16, 8, 21, 24, 4, 15, 23, 19, 13, 12, 2, 20, 14, 22, 9, 6, 1,
-];
-
-#[inline(never)]
-fn keccak_permute(state: &mut [u64; 25]) {
-    for &constant in &KECCAK_ROUND {
-        let mut columns = [0; 5];
-        for x in 0..5 {
-            columns[x] = state[x] ^ state[x + 5] ^ state[x + 10] ^ state[x + 15] ^ state[x + 20];
-        }
-        for row in state.chunks_exact_mut(5) {
-            for x in 0..5 {
-                row[x] ^= columns[(x + 4) % 5] ^ columns[(x + 1) % 5].rotate_left(1);
-            }
-        }
-        let mut previous = state[1];
-        macro_rules! rotate {
-            ($($index:literal),*) => {$({
-                let next = state[KECCAK_POSITION[$index]];
-                state[KECCAK_POSITION[$index]] = previous.rotate_left(KECCAK_ROTATION[$index]);
-                previous = next;
-            })*};
-        }
-        rotate!(
-            0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22,
-            23
-        );
-        let _ = previous;
-        for row in state.chunks_exact_mut(5) {
-            let original = [row[0], row[1], row[2], row[3], row[4]];
-            for x in 0..5 {
-                row[x] = original[x] ^ (!original[(x + 1) % 5] & original[(x + 2) % 5]);
-            }
-        }
-        state[0] ^= constant;
-    }
-}
-
-fn keccak256_bytes(input: &[u8]) -> [u8; 32] {
-    let mut state = [0; 25];
-    let mut blocks = input.chunks_exact(136);
-    for block in &mut blocks {
-        for (lane, bytes) in state.iter_mut().zip(block.chunks_exact(8)) {
-            *lane ^= u64::from_le_bytes(bytes.try_into().unwrap());
-        }
-        keccak_permute(&mut state);
-    }
-    let tail = blocks.remainder();
-    let full_lanes = tail.len() / 8;
-    for (lane, bytes) in state.iter_mut().zip(tail.chunks_exact(8)) {
-        *lane ^= u64::from_le_bytes(bytes.try_into().unwrap());
-    }
-    for (index, byte) in tail[full_lanes * 8..].iter().enumerate() {
-        state[full_lanes] ^= u64::from(*byte) << (index * 8);
-    }
-    state[tail.len() / 8] ^= 1u64 << ((tail.len() % 8) * 8);
-    state[16] ^= 1u64 << 63;
-    keccak_permute(&mut state);
-    let mut output = [0; 32];
-    for (bytes, lane) in output.chunks_exact_mut(8).zip(state) {
-        bytes.copy_from_slice(&lane.to_le_bytes());
-    }
-    output
 }
 
 pub(crate) fn public_key_address(key: &k256::ecdsa::VerifyingKey) -> Address {

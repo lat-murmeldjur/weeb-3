@@ -1,5 +1,6 @@
 use std::{cell::Cell, time::Duration};
 
+use bytes::Bytes;
 use prost::Message;
 
 use crate::mpsc;
@@ -61,13 +62,6 @@ fn decode_big_endian_u64(bytes: &[u8]) -> Option<u64> {
     Some(u64::from_be_bytes(value))
 }
 
-struct OutgoingChequeState {
-    beneficiary: Address,
-    chequebook: Address,
-    effective_deduction: U256,
-    cumulative_payout: U256,
-}
-
 async fn read_control_protocol_frame(stream: &mut Stream) -> Option<Vec<u8>> {
     read_control_protocol_frame_bounded(stream, CONTROL_PROTOCOL_MAX_FRAME_BYTES).await
 }
@@ -92,45 +86,6 @@ async fn read_control_protocol_frame_bounded(stream: &mut Stream, maximum: u64) 
         }
     }
     None
-}
-
-async fn prepare_outgoing_cheque_state(
-    beneficiary: Address,
-    amount: u64,
-    price: U256,
-    deduction: U256,
-) -> Option<OutgoingChequeState> {
-    let chequebook_bytes = get_chequebook_address().await;
-    if chequebook_bytes.len() != 20 {
-        return None;
-    }
-    let chequebook = Address::from_slice(&chequebook_bytes);
-
-    let last_payout_bytes =
-        get_chequebook_last_issued_cheque_payout(chequebook.as_bytes(), beneficiary.as_bytes())
-            .await;
-    let stored_cumulative_payout = match last_payout_bytes.len() {
-        0 => U256::zero(),
-        1..=32 => U256::from_big_endian(&last_payout_bytes),
-        _ => return None,
-    };
-
-    let effective_deduction = if stored_cumulative_payout.is_zero() {
-        deduction
-    } else {
-        U256::zero()
-    };
-    let cheque_delta = U256::from(amount).checked_mul(price)?;
-    let cumulative_payout = stored_cumulative_payout
-        .checked_add(cheque_delta)?
-        .checked_add(effective_deduction)?;
-
-    Some(OutgoingChequeState {
-        beneficiary,
-        chequebook,
-        effective_deduction,
-        cumulative_payout,
-    })
 }
 
 async fn handshake_exchange(
@@ -371,8 +326,31 @@ async fn cheque_exchange(
     }
 
     let wallet = PrivateKeySigner::from_slice(&signer_key).ok()?;
-    let cheque_state =
-        prepare_outgoing_cheque_state(beneficiary, amount, price, deduction).await?;
+    let (chequebook, effective_deduction, cumulative_payout) = {
+        let chequebook_bytes = get_chequebook_address().await;
+        if chequebook_bytes.len() != 20 {
+            return None;
+        }
+        let chequebook = Address::from_slice(&chequebook_bytes);
+        let last_payout_bytes =
+            get_chequebook_last_issued_cheque_payout(chequebook.as_bytes(), beneficiary.as_bytes())
+                .await;
+        let stored_cumulative_payout = match last_payout_bytes.len() {
+            0 => U256::zero(),
+            1..=32 => U256::from_big_endian(&last_payout_bytes),
+            _ => return None,
+        };
+        let effective_deduction = if stored_cumulative_payout.is_zero() {
+            deduction
+        } else {
+            U256::zero()
+        };
+        let cheque_delta = U256::from(amount).checked_mul(price)?;
+        let cumulative_payout = stored_cumulative_payout
+            .checked_add(cheque_delta)?
+            .checked_add(effective_deduction)?;
+        (chequebook, effective_deduction, cumulative_payout)
+    };
 
     let mut buf = [0u8; 32];
     price.to_big_endian(&mut buf);
@@ -382,7 +360,7 @@ async fn cheque_exchange(
     };
 
     let mut buf = [0u8; 32];
-    cheque_state.effective_deduction.to_big_endian(&mut buf);
+    effective_deduction.to_big_endian(&mut buf);
     let deduction_header = etiquette_0::Header {
         key: "deduction".to_string(),
         value: trimmed_big_endian(&buf),
@@ -398,14 +376,9 @@ async fn cheque_exchange(
 
     read_control_protocol_frame(&mut stream).await?;
 
-    let client = ChequebookClient::new(
-        cheque_state.chequebook,
-        wallet,
-        active_profile().wallet_chain_id,
-    );
+    let client = ChequebookClient::new(chequebook, wallet, active_profile().wallet_chain_id);
 
-    let cheque_json =
-        client.prepare_emit_cheque_bytes(cheque_state.beneficiary, cheque_state.cumulative_payout)?;
+    let cheque_json = client.prepare_emit_cheque_bytes(beneficiary, cumulative_payout)?;
 
     let msg = etiquette_8::EmitCheque {
         cheque: cheque_json,
@@ -418,12 +391,10 @@ async fn cheque_exchange(
     let _ = stream.flush().await;
 
     let mut cumulative_payout_bytes = [0u8; 32];
-    cheque_state
-        .cumulative_payout
-        .to_big_endian(&mut cumulative_payout_bytes);
+    cumulative_payout.to_big_endian(&mut cumulative_payout_bytes);
     let saved = set_chequebook_last_issued_cheque_payout(
-        cheque_state.chequebook.as_bytes(),
-        cheque_state.beneficiary.as_bytes(),
+        chequebook.as_bytes(),
+        beneficiary.as_bytes(),
         &cumulative_payout_bytes,
     )
     .await;
@@ -530,7 +501,7 @@ pub async fn retrieve_handler(
     request: &etiquette_6::Request,
     control: StreamControl,
     session: OutboundProtocolSession,
-) -> Option<Vec<u8>> {
+) -> Option<Bytes> {
     let mut stream = open_current_outbound_stream(peer, control, RETRIEVAL_PROTOCOL, &session).await?;
     if stream.write_all(EMPTY_HEADERS_FRAME).await.is_err() {
         return None;
@@ -545,9 +516,13 @@ pub async fn retrieve_handler(
     let _ = stream.close().await;
 
     let delivery = read_control_protocol_frame(&mut stream).await?;
-    etiquette_6::Delivery::decode(delivery.as_slice())
-        .ok()
-        .map(|message| Vec::from(message.data))
+    decode_retrieval_delivery(delivery)
+}
+
+fn decode_retrieval_delivery(delivery: Vec<u8>) -> Option<Bytes> {
+    let etiquette_6::Delivery { data, .. } =
+        etiquette_6::Delivery::decode(Bytes::from(delivery)).ok()?;
+    Some(data)
 }
 
 pub async fn pushsync_handler(
@@ -597,4 +572,62 @@ async fn pushsync_exchange(
 
     (receipt.err.is_empty() && receipt.address == delivery.address && !receipt.signature.is_empty())
         .then_some(())
+}
+
+#[cfg(test)]
+mod delivery_tests {
+    use super::*;
+    use wasm_bindgen_test::wasm_bindgen_test;
+
+    #[wasm_bindgen_test]
+    fn delivery_preserves_protobuf_fields_and_empty_data() {
+        let fixtures: &[(&[u8], &[u8])] = &[
+            (b"", b""),
+            (b"\x0a\x03cat", b"cat"),
+            (b"\x12\x03\x01\x02\x03\x0a\x03cat\x20\x07", b"cat"),
+            (b"\x0a\x03cat\x12\x03\x01\x02\x03\x1a\x03err", b"cat"),
+            (b"\x1a\x03err", b""),
+            (b"\x0a\x03cat\x0a\x03dog", b"dog"),
+        ];
+        for (frame, expected) in fixtures {
+            assert_eq!(
+                decode_retrieval_delivery(frame.to_vec()).as_deref(),
+                Some(*expected)
+            );
+        }
+    }
+
+    #[wasm_bindgen_test]
+    fn delivery_rejects_truncated_and_invalid_fields() {
+        let fixtures: &[&[u8]] = &[
+            b"\x0a\x03ca",
+            b"\x0a\x80",
+            b"\x0a\x03cat\x12\x03\x01\x02",
+            b"\x0a\x03cat\x1a\x03er",
+            b"\x0a\x03cat\x1a\x01\xff",
+            b"\x00",
+        ];
+        for frame in fixtures {
+            assert!(decode_retrieval_delivery(frame.to_vec()).is_none());
+        }
+    }
+
+    #[wasm_bindgen_test]
+    fn delivery_reuses_frame_allocation_after_dropping_stamp() {
+        let mut frame = Vec::with_capacity(4214);
+        frame.extend_from_slice(b"\x0a\x80\x20");
+        frame.extend(std::iter::repeat_n(0xab, 4096));
+        frame.extend_from_slice(b"\x12\x71");
+        frame.extend(std::iter::repeat_n(0xcd, 113));
+        let allocation = frame.as_ptr();
+        let capacity = frame.capacity();
+
+        let data = decode_retrieval_delivery(frame).unwrap();
+
+        assert_eq!(data, vec![0xab; 4096]);
+        assert_eq!(data.as_ptr(), allocation.wrapping_add(3));
+        let data = Vec::from(data);
+        assert_eq!(data.as_ptr(), allocation);
+        assert_eq!(data.capacity(), capacity);
+    }
 }

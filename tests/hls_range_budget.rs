@@ -17,8 +17,8 @@ fn ordinary_media_keeps_its_existing_range_retry_policy() {
         "async fn read_cached_range_with_retry(",
         "async fn read_cached_range(",
     );
-    assert_eq!(ordinary.matches("read_cached_range(").count(), 1);
-    assert!(ordinary.contains("STREAM_RANGE_RETRY_COUNT"));
+    assert_eq!(ordinary.matches("read_cached_range(").count(), 2);
+    assert!(ordinary.contains("if generation != 0 && result.is_err()"));
     assert!(ordinary.contains("RANGE_RETRY_DELAY_MS"));
 }
 
@@ -33,8 +33,8 @@ fn complete_hls_bodies_use_shared_ranges_and_respect_cache_epoch_and_budget() {
     assert!(load.contains("root.span > HLS_BODY_MAX_BYTES"));
     assert!(load.contains("hls_range(&client, &reference, root.span, 0, end, generation, &|| {"));
     assert!(load.contains("generation.is_none_or(|id| body_is_current(id, &reference))"));
-    assert!(HLS_RUNTIME.contains("feed_is_current(id) && result_view_request_is_current(view_generation)"));
-    assert!(load.find("hls_range(").unwrap() < load.find("finish_body(reference, epoch, body)").unwrap());
+    assert!(HLS_RUNTIME.contains(".get(id).is_some())\n        && result_view_request_is_current(view_generation)"));
+    assert!(load.find("hls_range(").unwrap() < load.find("finish_body(reference, epoch, body,").unwrap());
 
     let cache = section(HLS_RUNTIME, "struct BodyCache {", "struct FeedSession");
     let settlement = section(cache, "fn finish_body(", "fn trim(");
@@ -175,10 +175,9 @@ fn completed_hls_bodies_are_served_before_root_or_range_retrieval() {
         "async fn fetch_hls_body_response(",
     );
     assert!(cached.contains("parse_hls_range(range, span)?"));
-    assert!(
-        cached
-            .contains("FetchResponse::ok_shared_slice(status, headers, body, start, end)")
-    );
+    assert!(cached.contains("FetchResponse::ok_shared(status, headers, body.slice(start..end))"));
+    assert!(cached.contains("body.get(start..end)?"));
+    assert!(cached.contains("body.slice(start..end)"));
     assert!(cached.contains("FetchResponse::ok_shared(status, headers, body)"));
     assert!(!cached.contains("Arc::from(body.get"));
 
@@ -189,8 +188,6 @@ fn completed_hls_bodies_are_served_before_root_or_range_retrieval() {
     );
     assert!(transfer.contains("body: Option<Bytes>"));
     assert!(transfer.contains("body: body.map(Bytes::from)"));
-    assert!(transfer.contains("body.get(start..end)?"));
-    assert!(transfer.contains("body.slice(start..end)"));
     assert_eq!(transfer.matches("bytes_to_js(&body)").count(), 1);
 
     let response = section(

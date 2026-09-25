@@ -19,13 +19,9 @@ const FETCH_TIMEOUT_MS = 240000;
 const SERVICE_WORKER_MARKER = "forwarder-default29";
 const SERVICE_WORKER_PROTOCOL = 10;
 const MIB_BYTES = 1024 * 1024;
-const STREAM_STORAGE_WINDOW_BYTES = MIB_BYTES / 2;
+const STREAM_WINDOW_BYTES = MIB_BYTES / 2;
 const STREAM_LOOKAHEAD_CHUNKS = 8;
-const HLS_STREAM_WINDOW_BYTES = MIB_BYTES / 2;
-const HLS_STREAM_INITIAL_LOOKAHEAD_CHUNKS = 1;
 const HLS_STREAM_LOOKAHEAD_CHUNKS = 4;
-const HLS_LIVE_STREAM_WINDOW_BYTES = MIB_BYTES / 2;
-const HLS_LIVE_STREAM_LOOKAHEAD_CHUNKS = 4;
 const RANGE_REQUEST_FLIGHTS = new Map();
 const SHARED_WORKER_PROTOCOL = 5;
 const WINDOW_RELAY_TIMEOUT_MS = 1_500;
@@ -269,27 +265,16 @@ self.addEventListener("fetch", (event) => {
   }
 
   const bzzResource = canonicalBzzResource(url);
-  if (bzzResource && (request.method === "GET" || request.method === "HEAD")) {
-    if (isAppShellNavigation(request)) {
+  if (
+    (request.method === "GET" || request.method === "HEAD") &&
+    (bzzResource || canonicalRawResource(url) || canonicalFeedResource(url))
+  ) {
+    if (bzzResource && isAppShellNavigation(request)) {
       event.respondWith(fetchOrError(appShellRequest(request)));
     } else {
       event.respondWith(forwardRequestToRust(request, event.clientId, event.resultingClientId));
     }
-    return;
   }
-
-  const rawResource = canonicalRawResource(url);
-  if (rawResource && (request.method === "GET" || request.method === "HEAD")) {
-    event.respondWith(forwardRequestToRust(request, event.clientId, event.resultingClientId));
-    return;
-  }
-
-  const feedResource = canonicalFeedResource(url);
-  if (feedResource && (request.method === "GET" || request.method === "HEAD")) {
-    event.respondWith(forwardRequestToRust(request, event.clientId, event.resultingClientId));
-    return;
-  }
-
 });
 
 function isStableWindowClient(client) {
@@ -634,16 +619,6 @@ function responseBodyStream(body) {
   });
 }
 
-function responseHeaders(headerRows) {
-  const headers = new Headers();
-  for (const row of headerRows || []) {
-    if (row && row.length >= 2) {
-      headers.set(String(row[0]), String(row[1]));
-    }
-  }
-  return headers;
-}
-
 function requestRustRange(client, url, start, end, networkId) {
   const key = `${client?.id || ""}|${networkId}|${url}|${start}|${end}`;
   const existing = RANGE_REQUEST_FLIGHTS.get(key);
@@ -675,11 +650,7 @@ function requestRustRange(client, url, start, end, networkId) {
     return { ok: true, body };
   });
   RANGE_REQUEST_FLIGHTS.set(key, request);
-  request.finally(() => {
-    if (RANGE_REQUEST_FLIGHTS.get(key) === request) {
-      RANGE_REQUEST_FLIGHTS.delete(key);
-    }
-  }).catch(() => {});
+  request.finally(() => RANGE_REQUEST_FLIGHTS.delete(key)).catch(() => {});
   return request;
 }
 
@@ -689,7 +660,6 @@ function createRustRangeStream(
   size,
   networkId,
   windowBytes,
-  initialLookahead,
   lookahead
 ) {
   let position = 0;
@@ -697,34 +667,12 @@ function createRustRangeStream(
   let admissionOpen = true;
   const scheduled = new Map();
 
-  const nextRangeBounds = () => {
-    if (!admissionOpen || schedulePosition >= size) {
-      return null;
-    }
-
-    const start = schedulePosition;
-    const end = Math.min(start + windowBytes - 1, size - 1);
-    schedulePosition = end + 1;
-    return { start, end };
-  };
-
-  const admitRange = () => {
-    const range = nextRangeBounds();
-    if (!range) {
-      return null;
-    }
-    const { start, end } = range;
-    const request = requestRustRange(client, url, start, end, networkId);
-    scheduled.set(start, request);
-    return { start, request };
-  };
-
   const scheduleMore = () => {
-    const limit = position < initialLookahead * windowBytes ? initialLookahead : lookahead;
-    while (admissionOpen && schedulePosition < size && scheduled.size < limit) {
-      if (!admitRange()) {
-        break;
-      }
+    while (admissionOpen && schedulePosition < size && scheduled.size < lookahead) {
+      const start = schedulePosition;
+      const end = Math.min(start + windowBytes - 1, size - 1);
+      schedulePosition = end + 1;
+      scheduled.set(start, requestRustRange(client, url, start, end, networkId));
     }
   };
 
@@ -734,15 +682,11 @@ function createRustRangeStream(
     });
   };
 
-  const closeAdmission = () => {
-    admissionOpen = false;
-  };
-
   const failStream = async (controller, error) => {
     if (!admissionOpen) {
       return;
     }
-    closeAdmission();
+    admissionOpen = false;
     controller.error(error);
     await drainScheduledRanges();
   };
@@ -751,27 +695,15 @@ function createRustRangeStream(
     async pull(controller) {
       try {
         if (position >= size) {
-          closeAdmission();
+          admissionOpen = false;
           controller.close();
           await drainScheduledRanges();
           return;
         }
 
         scheduleMore();
-        const start = Math.floor(position / windowBytes) * windowBytes;
-        let pending = scheduled.get(start);
-        if (!pending) {
-          const foreground = admitRange();
-          if (!foreground || foreground.start !== start) {
-            await failStream(
-              controller,
-              new Error("weeb-3 foreground stream window was not admitted")
-            );
-            return;
-          }
-          pending = foreground.request;
-        }
-        const response = await pending;
+        const start = position;
+        const response = await scheduled.get(start);
         scheduled.delete(start);
 
         if (!admissionOpen) {
@@ -785,7 +717,7 @@ function createRustRangeStream(
           return;
         }
 
-        const body = toUint8Array(response.body);
+        const body = response.body;
         position = start + body.byteLength;
         controller.enqueue(body);
         scheduleMore();
@@ -796,7 +728,7 @@ function createRustRangeStream(
       }
     },
     cancel() {
-      closeAdmission();
+      admissionOpen = false;
       return drainScheduledRanges();
     }
   });
@@ -822,7 +754,7 @@ async function forwardRequestToRust(request, clientId, resultingClientId) {
     );
 
     const status = Number(response.status || (response.ok ? 200 : 404));
-    const headers = responseHeaders(response.headers);
+    const headers = new Headers(response.headers);
 
     if (!response.ok) {
       return new Response(response.error || "weeb-3 request failed", {
@@ -831,44 +763,27 @@ async function forwardRequestToRust(request, clientId, resultingClientId) {
       });
     }
 
+    let body;
     if (response.stream && request.method !== "HEAD") {
       const size = Number(headers.get("Content-Length") || "0");
       if (!Number.isSafeInteger(size) || size <= 0) {
         return new Response("weeb-3 stream response has an invalid length", { status: 502 });
       }
-      const liveHlsResource = hlsResource && url.searchParams.get("start") === "live";
-      const windowBytes = liveHlsResource
-        ? HLS_LIVE_STREAM_WINDOW_BYTES
-        : hlsResource ? HLS_STREAM_WINDOW_BYTES : STREAM_STORAGE_WINDOW_BYTES;
-      const lookahead = liveHlsResource
-        ? HLS_LIVE_STREAM_LOOKAHEAD_CHUNKS
-        : hlsResource ? HLS_STREAM_LOOKAHEAD_CHUNKS : STREAM_LOOKAHEAD_CHUNKS;
-      const initialLookahead = hlsResource
-        ? HLS_STREAM_INITIAL_LOOKAHEAD_CHUNKS
-        : lookahead;
-      return new Response(createRustRangeStream(
+      const lookahead = hlsResource ? HLS_STREAM_LOOKAHEAD_CHUNKS : STREAM_LOOKAHEAD_CHUNKS;
+      body = createRustRangeStream(
         client,
         request.url,
         size,
         networkId,
-        windowBytes,
-        initialLookahead,
+        STREAM_WINDOW_BYTES,
         lookahead
-      ), {
-        status,
-        headers
-      });
-    }
-
-    return new Response(
-      request.method === "HEAD" || status === 304
+      );
+    } else {
+      body = request.method === "HEAD" || status === 304
         ? null
-        : responseBodyStream(response.body),
-      {
-        status,
-        headers
-      }
-    );
+        : responseBodyStream(response.body);
+    }
+    return new Response(body, { status, headers });
   } catch (error) {
     return new Response(error && error.message ? error.message : "weeb-3 forwarder error", {
       status: 502

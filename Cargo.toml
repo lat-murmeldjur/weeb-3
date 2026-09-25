@@ -20,6 +20,9 @@ codegen-units = 1
 panic = "abort"
 strip = "symbols"
 
+[profile.release.package.weeb_3]
+opt-level = "s"
+
 [package.metadata.wasm-pack.profile.release]
 wasm-opt = ["-O", "--all-features"]
 
@@ -35,7 +38,6 @@ tokio = { version = "1.38.0", default-features = false, features = ["macros", "n
 tower-http = { git = "https://github.com/tower-rs/tower-http.git", features = ["cors"] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-alloy-primitives = { git = "https://github.com/alloy-rs/core.git", default-features = false, features = ["std", "k256"] }
 k256 = { version = "0.13.4", default-features = false, features = ["ecdsa", "std"] }
 async-std = { git = "https://github.com/async-rs/async-std.git" }
 bytes = "1.12"
@@ -103,6 +105,7 @@ base64 = "0.22.1"
 async-lock = "3.4.2"
 
 [target.'cfg(target_arch = "wasm32")'.dev-dependencies]
+alloy-primitives = { git = "https://github.com/alloy-rs/core.git", default-features = false, features = ["std", "k256"] }
 wasm-bindgen-test = "0.3.50"
 
 [dev-dependencies]

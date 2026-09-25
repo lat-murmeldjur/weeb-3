@@ -1,5 +1,8 @@
 #![allow(dead_code)]
 
+#[path = "support/source.rs"]
+mod source;
+
 #[path = "../src/feed.rs"]
 mod feed;
 #[path = "../src/manifest.rs"]
@@ -9,14 +12,32 @@ mod stream_conventions;
 #[path = "../src/stream_hls.rs"]
 mod stream_hls;
 
+struct ActiveProbe<'a>(&'a std::cell::Cell<usize>);
+
+impl Drop for ActiveProbe<'_> {
+    fn drop(&mut self) {
+        self.0.set(self.0.get() - 1);
+    }
+}
+
 mod hls_formats {
     use crate::{
         stream_conventions::HlsStart,
-        stream_hls::{HlsManifest, HlsPlaylist, HlsSource},
+        stream_hls::{HlsManifest, HlsPlaylist, HlsSource, hls_edge_wave_complete, hls_retreat_position},
     };
 
     fn reference(byte: char) -> String {
         byte.to_string().repeat(64)
+    }
+
+    #[test]
+    fn feed_bounds_wait_for_intervening_probes_but_not_distant_pending_negatives() {
+        let missing = [false, false, false, true, false, false];
+        assert!(hls_edge_wave_complete(2, &missing, &[false, true, true, true, false, false]));
+        assert!(!hls_edge_wave_complete(2, &missing, &[false, true, false, true, true, true]));
+        assert!(!hls_edge_wave_complete(2, &[false; 6], &[true; 6]));
+        // A higher authenticated positive invalidates the earlier missing bound.
+        assert!(!hls_edge_wave_complete(5, &missing, &[true; 6]));
     }
 
     #[test]
@@ -49,6 +70,27 @@ mod hls_formats {
             master.initial_source(),
             Some(format!("swarm://{owner}/lower-topic").as_str())
         );
+    }
+
+    #[test]
+    fn only_the_current_masters_initial_rendition_can_be_reused() {
+        let owner = "ab".repeat(20);
+        let old = format!("swarm://{owner}/first-rung");
+        let replacement = format!("swarm://{owner}/replacement-rung");
+        let source = HlsSource::parse(&old).unwrap();
+        for (uris, expected) in [
+            (vec![old.as_str(), replacement.as_str()], true),
+            (vec![replacement.as_str(), old.as_str()], false),
+            (vec![replacement.as_str()], false),
+        ] {
+            let text = format!("#EXTM3U\n{}", uris.iter().map(|uri|
+                format!("#EXT-X-STREAM-INF:BANDWIDTH=1000\n{uri}\n")
+            ).collect::<String>());
+            let Some(HlsManifest::Master(master)) = HlsManifest::parse(text.as_bytes()) else {
+                panic!("master");
+            };
+            assert_eq!(master.selects(&source), expected);
+        }
     }
 
     #[test]
@@ -289,6 +331,400 @@ mod hls_formats {
             matches!(HlsSource::parse(&format!("SWARM://{owner}/RawTopic")), Some(HlsSource::Feed { topic_is_hash: false, topic, .. }) if topic == "RawTopic")
         );
     }
+
+    fn dated_window(sequence: u64, count: usize, seam: Option<u64>) -> HlsPlaylist {
+        let mut text = format!("#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:{sequence}\n");
+        for offset in 0..count {
+            let sequence = sequence + offset as u64;
+            if seam == Some(sequence) {
+                text.push_str("#EXT-X-DISCONTINUITY\n");
+            }
+            text.push_str(&format!(
+                "#EXT-X-PROGRAM-DATE-TIME:2026-09-22T10:00:{:02}.000Z\n#EXTINF:0.5,\n{sequence:064x}\n",
+                sequence % 60
+            ));
+        }
+        HlsPlaylist::parse(text.as_bytes()).unwrap()
+    }
+
+    #[test]
+    fn dated_live_window_starts_without_a_sequence_zero_archive() {
+        let mut head = dated_window(90_000, 24, None);
+        let plan = head.startup_plan(HlsStart::Live).unwrap();
+        assert_eq!(plan.play_position, 0.0);
+        assert_eq!(plan.runway_end, 12.0);
+        assert!(!plan.codec_bootstrap);
+        assert_eq!(head.merge_playlist(dated_window(90_002, 24, None)), Some(2));
+        let rendered =
+            String::from_utf8(head.render_with_plan("/hls/bytes", HlsStart::Live, Some(&plan)))
+                .unwrap();
+        assert!(rendered.contains("#EXT-X-MEDIA-SEQUENCE:90000"));
+        assert!(rendered.contains(&format!("#EXT-X-START:TIME-OFFSET={:.6}", plan.play_position)));
+        assert_eq!(head.duration(), 13.0);
+    }
+
+    #[test]
+    fn dated_live_clock_uses_the_broadcast_origin_without_reconstructing_history() {
+        let parse = |date: &str| {
+            (date[11..13].parse::<f64>().unwrap() * 3_600.0
+                + date[14..16].parse::<f64>().unwrap() * 60.0
+                + date[17..23].parse::<f64>().unwrap()) * 1_000.0
+        };
+        let mut first = dated_window(0, 1, None);
+        first.segments[0].program_date_time = Some("2026-09-23T10:07:25.098Z".into());
+        let mut live = dated_window(13_000, 31, None);
+        for segment in &mut live.segments { segment.duration = 2.0; }
+        live.segments[0].program_date_time = Some("2026-09-23T17:07:25.598Z".into());
+        let offset = live.timeline_offset(&first, parse).unwrap();
+        assert_eq!(offset, 25_200.5);
+        let local = live.startup_plan(HlsStart::Live).unwrap();
+        let clock = local.clone().with_offset(offset);
+        assert_eq!((clock.play_position, clock.runway_end, clock.duration),
+            (25_250.5, 25_262.5, 25_262.5));
+        assert_eq!(clock.clone().with_offset(offset), clock);
+        assert_eq!(clock.clone().with_offset(0.0), local);
+        let seek = clock.at_position(25_230.5, clock.duration, 8.0, false).unwrap();
+        assert_eq!((seek.play_position, seek.runway_end, seek.timeline_offset),
+            (25_230.5, 25_238.5, offset));
+        assert_eq!(seek.clone().with_offset(offset), seek);
+        assert_eq!(seek.with_offset(0.0).play_position, 30.0);
+        assert!(live.timeline_offset(&first, |_| f64::NAN).is_none());
+        first.sequence = 1;
+        assert!(live.timeline_offset(&first, parse).is_none());
+        first.sequence = 0;
+        first.segments[0].program_date_time = Some("2026-09-23T18:07:25.098Z".into());
+        assert!(live.timeline_offset(&first, parse).is_none());
+        first.segments[0].program_date_time = None;
+        assert!(live.timeline_offset(&first, parse).is_none());
+    }
+
+    #[test]
+    fn new_dated_sequence_zero_starts_directly_while_legacy_keeps_codec_bootstrap() {
+        let mut head = dated_window(0, 24, None);
+        let plan = head.startup_plan(HlsStart::Live).unwrap();
+        assert_eq!((plan.play_position, plan.runway_end), (0.0, 12.0));
+        assert!(!plan.codec_bootstrap);
+        for segment in &mut head.segments {
+            segment.program_date_time = None;
+        }
+        let legacy = head.startup_plan(HlsStart::Live).unwrap();
+        assert_eq!((legacy.play_position, legacy.runway_end), (4.0, 12.0));
+        assert!(legacy.codec_bootstrap);
+    }
+
+    #[test]
+    fn seek_and_restart_keep_codec_history_and_clip_only_finalized_runways() {
+        let mut legacy = dated_window(0, 24, None);
+        for segment in &mut legacy.segments {
+            segment.program_date_time = None;
+        }
+        let original = legacy.startup_plan(HlsStart::Live).unwrap();
+        let live = original.at_position(20.0, f64::INFINITY, 8.0, false).unwrap();
+        assert_eq!((live.play_position, live.runway_end, live.duration), (20.0, 28.0, 12.0));
+        assert_eq!(live.bootstrap_position, original.bootstrap_position);
+        assert!(live.codec_bootstrap);
+        let ended = original.at_position(20.0, 24.0, 8.0, true).unwrap();
+        assert_eq!((ended.runway_end, ended.duration), (24.0, 24.0));
+        assert!(original.at_position(24.0, 24.0, 8.0, true).is_none());
+        for position in [f64::NAN, f64::INFINITY, -1.0] {
+            assert!(original.at_position(position, 24.0, 8.0, false).is_none());
+        }
+        for runway in [f64::NAN, f64::INFINITY, -1.0, 0.0] {
+            assert!(original.at_position(20.0, 24.0, runway, false).is_none());
+        }
+        assert_eq!(original, legacy.startup_plan(HlsStart::Live).unwrap());
+    }
+
+    #[test]
+    fn every_rendition_retains_the_original_viewing_origin_for_later_rewinds() {
+        let window = |sequence: u64, count: usize| {
+            let mut playlist = dated_window(sequence, count, None);
+            for (offset, segment) in playlist.segments.iter_mut().enumerate() {
+                let seconds = (sequence + offset as u64) * 2;
+                segment.duration = 2.0;
+                segment.program_date_time = Some(format!(
+                    "2026-09-22T10:{:02}:{:02}.000Z", seconds / 60, seconds % 60
+                ));
+            }
+            playlist
+        };
+        let parse = |date: &str| {
+            (date[14..16].parse::<f64>().unwrap() * 60.0
+                + date[17..19].parse::<f64>().unwrap()) * 1_000.0
+        };
+        let mut playing = window(20, 60);
+        // Rendition sequence numbers need not share an origin; PDT must match.
+        playing.sequence = 1_020;
+        let origin = playing.program_start(parse).unwrap();
+        let seek_date = parse(playing.segments[5].program_date_time.as_deref().unwrap());
+        let selected = window(50, 30);
+        let start = selected.program_start(parse).unwrap();
+        assert!(start > seek_date);
+
+        // Uncovered dates must not replace the requested range with stale or newer media.
+        let mut uncovered = selected.clone();
+        let end = start + selected.duration() * 1_000.0;
+        for date in [origin, start - 1.0, end, end + 7_200_000.0, f64::NAN] {
+            assert_eq!(uncovered.retain_from_date(date, parse), None);
+            assert_eq!(uncovered, selected);
+        }
+        let mut history = HlsPlaylist::reconstruct(vec![(10, window(15, 50))], 20, selected, 15)
+            .unwrap();
+        assert_eq!(history.retain_from_date(origin, parse), Some(origin));
+        assert_eq!(history.sequence, 20);
+        assert_eq!(history.segments[5].program_date_time, playing.segments[5].program_date_time);
+        assert_eq!(history.duration(), playing.duration());
+        assert!(!history.finalized);
+        let rendered = history.render("/hls/bytes", HlsStart::Live);
+        let loaded = HlsPlaylist::parse(&rendered).unwrap();
+        assert_eq!(loaded.segments[5].program_date_time, playing.segments[5].program_date_time);
+        assert!(!loaded.finalized);
+        assert_eq!(history.merge_playlist(window(70, 20)), Some(10));
+        assert_eq!(history.program_start(parse), Some(origin));
+        assert_eq!(history.segments[5].program_date_time, playing.segments[5].program_date_time);
+
+        // A publisher may date only the first segment of a window.
+        for segment in history.segments.iter_mut().skip(1) { segment.program_date_time = None; }
+        assert_eq!(history.retain_from_date(origin + 6_500.0, parse), Some(origin + 6_000.0));
+        assert_eq!(history.sequence, 23);
+        assert!(history.segments[0].program_date_time.is_none());
+    }
+
+    #[test]
+    fn tail_recovery_applies_authenticated_distance_on_the_media_clock() {
+        assert_eq!(hls_retreat_position(2.5, 1.0), Some(1.5));
+        assert_eq!(hls_retreat_position(76.5, 1.0), Some(75.5));
+        assert_eq!(hls_retreat_position(0.5, 1.0), None);
+        for distance in [f64::NAN, f64::INFINITY, -1.0, 0.0] {
+            assert_eq!(hls_retreat_position(76.5, distance), None);
+        }
+    }
+
+    #[test]
+    fn a_short_dated_live_runway_remains_playable_at_a_start_gap_or_end() {
+        let mut head = dated_window(0, 1, None);
+        let plan = head.startup_plan(HlsStart::Live).unwrap();
+        assert_eq!((plan.play_position, plan.runway_end), (0.0, 0.5));
+        head.finalized = true;
+        let rendered = head.render("/hls/bytes", HlsStart::Live);
+        assert!(HlsPlaylist::parse(&rendered).unwrap().finalized);
+        assert!(std::str::from_utf8(&rendered).unwrap().ends_with("#EXT-X-ENDLIST\n"));
+
+        let mut head = dated_window(50, 4, None);
+        head.segments[2].gap = true;
+        let plan = head.startup_plan(HlsStart::Live).unwrap();
+        assert_eq!((plan.play_position, plan.runway_end), (1.5, 2.0));
+    }
+
+    #[test]
+    fn dated_sliding_windows_keep_seams_after_the_tag_leaves_the_window() {
+        let mut active = dated_window(10, 10, Some(15));
+        let next = dated_window(16, 10, None);
+        assert!(active.joins(&next));
+        assert_eq!(active.merge_playlist(next), Some(6));
+        assert_eq!(active.segments.last().unwrap().discontinuity_sequence, 1);
+        let mut incompatible = dated_window(20, 10, Some(22));
+        assert!(!active.joins(&incompatible));
+        assert!(active.merge_playlist(incompatible.clone()).is_none());
+        incompatible.segments[2].discontinuity_sequence = 0;
+        assert!(active.merge_playlist(incompatible).is_none());
+    }
+
+    #[test]
+    fn dated_tail_can_include_a_seam_before_the_viewer_joined() {
+        let mut active = dated_window(16, 10, None);
+        let update = dated_window(10, 20, Some(15));
+        let tail = update.render("/hls/bytes", HlsStart::Live);
+        assert_eq!(active.merge_tail(&tail), Some(4));
+        assert_eq!(active.sequence, 16);
+        assert!(active.segments.iter().all(|segment| segment.discontinuity_sequence == 0));
+
+        let update = dated_window(25, 10, Some(30));
+        assert_eq!(active.merge_tail(&update.render("/hls/bytes", HlsStart::Live)), Some(5));
+        assert_eq!(active.segments.last().unwrap().discontinuity_sequence, 1);
+    }
+
+    #[test]
+    fn tail_growth_rejects_discontinuity_overflow_without_changing_the_playlist() {
+        let mut active = dated_window(16, 10, None);
+        active.discontinuity_sequence = u64::MAX;
+        for segment in &mut active.segments {
+            segment.discontinuity_sequence = u64::MAX;
+        }
+        let before = active.clone();
+        let update = dated_window(25, 10, Some(30));
+        assert!(active.merge_tail(&update.render("/hls/bytes", HlsStart::Live)).is_none());
+        assert_eq!(active, before);
+    }
+
+    #[test]
+    fn explicit_dated_discontinuity_counters_cannot_be_reinterpreted() {
+        let mut active = dated_window(10, 10, Some(15));
+        let next = dated_window(16, 10, None);
+        let text = String::from_utf8(next.render("/hls/bytes", HlsStart::Live))
+            .unwrap()
+            .replace("#EXTM3U", "#EXTM3U\n#EXT-X-DISCONTINUITY-SEQUENCE:0");
+        assert!(
+            active
+                .merge_playlist(HlsPlaylist::parse(text.as_bytes()).unwrap())
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn completed_recording_does_not_rebase_the_joined_live_window() {
+        let mut active = dated_window(16, 10, None);
+        let mut recording = dated_window(0, 30, Some(15));
+        recording.finalized = true;
+        recording.retain_from(active.sequence).unwrap();
+        assert_eq!(active.merge_playlist(recording), Some(4));
+        assert_eq!(active.sequence, 16);
+        assert_eq!(active.duration(), 7.0);
+        assert!(active.finalized);
+    }
+}
+
+mod hls_confirmation {
+    use super::ActiveProbe;
+    use std::{cell::{Cell, RefCell}, future::Future, task::{Context, Poll, Waker}};
+
+    use crate::{feed::FeedProbe, stream_hls::confirm_hls_feed_head};
+    use futures::future::{pending, poll_fn};
+
+    fn settle<T>(lookup: impl Future<Output = T>) -> Poll<T> {
+        let mut lookup = Box::pin(lookup);
+        let mut context = Context::from_waker(Waker::noop());
+        for _ in 0..100 {
+            if let Poll::Ready(result) = lookup.as_mut().poll(&mut context) {
+                return Poll::Ready(result);
+            }
+        }
+        Poll::Pending
+    }
+
+    #[test]
+    fn advancing_heads_release_obsolete_listeners_and_bound_concurrent_guards() {
+        for (head, slow_lower) in [(105, Some(101)), (145, None)] {
+            let requested = RefCell::new(Vec::new());
+            let active = Cell::new(0);
+            let maximum = Cell::new(0);
+            let result = settle(confirm_hls_feed_head(100, 100, 20, |index| {
+                requested.borrow_mut().push(index);
+                active.set(active.get() + 1);
+                maximum.set(maximum.get().max(active.get()));
+                let active = ActiveProbe(&active);
+                async move {
+                    let _active = active;
+                    if Some(index) == slow_lower {
+                        pending().await
+                    } else if index <= head {
+                        FeedProbe::Found(index)
+                    } else {
+                        FeedProbe::Missing
+                    }
+                }
+            }));
+            assert_eq!(result, Poll::Ready(Some((head, head))));
+            assert_eq!(*requested.borrow(), (101..=head + 20).collect::<Vec<_>>());
+            assert!(maximum.get() > 1 && maximum.get() <= 20);
+            assert_eq!(
+                active.get(),
+                0,
+                "all finished and obsolete listeners must be released"
+            );
+        }
+    }
+
+    #[test]
+    fn advancing_head_starts_extension_before_older_guards_finish() {
+        let extension_started = Cell::new(false);
+        let result = settle(confirm_hls_feed_head(100, 100, 20, |index| {
+            if index == 125 {
+                extension_started.set(true);
+            }
+            let extension_started = &extension_started;
+            poll_fn(move |_| {
+                if index == 120 && !extension_started.get() {
+                    Poll::Pending
+                } else {
+                    Poll::Ready(if index == 105 {
+                        FeedProbe::Found(index)
+                    } else {
+                        FeedProbe::Missing
+                    })
+                }
+            })
+        }));
+        assert_eq!(result, Poll::Ready(Some((105, 105))));
+    }
+
+    #[test]
+    fn zero_guards_return_the_existing_head_without_probes() {
+        assert_eq!(settle(confirm_hls_feed_head(100, 100, 0, |_| async {
+            panic!("a zero-sized guard window must not dispatch")
+        })), Poll::Ready(Some((100, 100))));
+    }
+
+    #[test]
+    fn every_guard_above_the_highest_positive_must_settle() {
+        for withheld in 106..=125 {
+            let result = settle(confirm_hls_feed_head(100, 100, 20, |index| async move {
+                if index == 105 {
+                    FeedProbe::Found(index)
+                } else if index == withheld {
+                    pending().await
+                } else {
+                    FeedProbe::Missing
+                }
+            }));
+            assert_eq!(result, Poll::Pending, "unsettled guard {withheld} was skipped");
+        }
+    }
+
+    #[test]
+    fn a_transient_guard_cannot_prove_the_head() {
+        for transient in 106..=125 {
+            let result = settle(confirm_hls_feed_head(100, 100, 20, |index| async move {
+                if index == 105 {
+                    FeedProbe::Found(index)
+                } else if index == transient {
+                    FeedProbe::Transient
+                } else {
+                    FeedProbe::Missing
+                }
+            }));
+            assert_eq!(result, Poll::Ready(None), "transient guard {transient} was accepted");
+        }
+    }
+
+    #[test]
+    fn late_lower_positives_and_transients_cannot_replace_a_newer_head() {
+        let result = settle(confirm_hls_feed_head(100, 100, 20, |index| {
+            let mut delayed = matches!(index, 109 | 120);
+            poll_fn(move |context| {
+                if std::mem::take(&mut delayed) {
+                    context.waker().wake_by_ref();
+                    return Poll::Pending;
+                }
+                Poll::Ready(match index {
+                    105 => FeedProbe::Transient,
+                    109 | 110 => FeedProbe::Found(index),
+                    _ => FeedProbe::Missing,
+                })
+            })
+        }));
+        assert_eq!(result, Poll::Ready(Some((110, 110))));
+    }
+
+    #[test]
+    fn overflow_cannot_turn_an_incomplete_guard_window_into_a_proven_head() {
+        assert_eq!(settle(confirm_hls_feed_head(u64::MAX - 19, 0, 20, |_| async {
+            panic!("the overflowing guard range must not dispatch")
+        })), Poll::Ready(None));
+        assert_eq!(settle(confirm_hls_feed_head(u64::MAX - 20, 0, 20, |index| async move {
+            if index == u64::MAX - 1 { FeedProbe::Found(1) } else { FeedProbe::Missing }
+        })), Poll::Ready(None));
+    }
 }
 
 mod bzz_manifest {
@@ -494,15 +930,12 @@ mod feed_format {
 }
 
 mod feed_frontier {
+    use super::ActiveProbe;
     use crate::feed;
 
-    use std::sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
-    };
     use std::{
+        cell::Cell,
         future::{Future, poll_fn},
-        pin::Pin,
         task::{Context, Poll, Waker},
     };
 
@@ -512,60 +945,30 @@ mod feed_frontier {
     };
     use futures::executor::block_on;
 
-    struct OverlapProbe {
-        index: u64,
-        active: Arc<AtomicUsize>,
-        maximum: Arc<AtomicUsize>,
-        pending_once: bool,
-        counted_active: bool,
-    }
-
-    impl Future for OverlapProbe {
-        type Output = Option<u64>;
-
-        fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
-            if !self.pending_once {
-                self.pending_once = true;
-                self.counted_active = true;
-                let now = self.active.fetch_add(1, Ordering::SeqCst) + 1;
-                self.maximum.fetch_max(now, Ordering::SeqCst);
+    async fn overlap_probe(index: u64, active: &Cell<usize>, maximum: &Cell<usize>) -> Option<u64> {
+        active.set(active.get() + 1);
+        maximum.set(maximum.get().max(active.get()));
+        let _active = ActiveProbe(active);
+        let mut pending = true;
+        poll_fn(|context| {
+            if std::mem::take(&mut pending) {
                 context.waker().wake_by_ref();
-                return Poll::Pending;
+                Poll::Pending
+            } else {
+                Poll::Ready((index <= 646).then_some(index))
             }
-
-            self.counted_active = false;
-            self.active.fetch_sub(1, Ordering::SeqCst);
-            Poll::Ready((self.index <= 646).then_some(self.index))
-        }
+        })
+        .await
     }
 
-    impl Drop for OverlapProbe {
-        fn drop(&mut self) {
-            if self.counted_active {
-                self.active.fetch_sub(1, Ordering::SeqCst);
+    fn frontier_probe(index: u64, head: u64, stalled: bool) -> impl Future<Output = Option<u64>> {
+        poll_fn(move |_| {
+            if stalled {
+                Poll::Pending
+            } else {
+                Poll::Ready((index <= head).then_some(index))
             }
-        }
-    }
-
-    #[derive(Clone, Copy)]
-    enum DeterministicProbeResult {
-        Pending,
-        Ready(Option<u64>),
-    }
-
-    struct DeterministicProbe {
-        result: DeterministicProbeResult,
-    }
-
-    impl Future for DeterministicProbe {
-        type Output = Option<u64>;
-
-        fn poll(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<Self::Output> {
-            match self.result {
-                DeterministicProbeResult::Pending => Poll::Pending,
-                DeterministicProbeResult::Ready(result) => Poll::Ready(result),
-            }
-        }
+        })
     }
 
     fn assert_lookup_ready(
@@ -601,23 +1004,22 @@ mod feed_frontier {
     #[test]
     fn exposes_authenticated_positive_payloads_before_finishing() {
         block_on(async {
-            let first_observed = Arc::new(AtomicUsize::new(usize::MAX));
-            let observed_count = Arc::new(AtomicUsize::new(0));
-            let first_for_callback = first_observed.clone();
-            let count_for_callback = observed_count.clone();
+            let mut first_observed = usize::MAX;
+            let mut observed_count = 0;
             let (latest, next) = seek_sequence_feed_frontier_bounded_observing_positive(
                 |index| async move { (index <= 646).then_some(index as usize) },
-                move |index, payload| {
+                |index, payload| {
                     assert_eq!(index as usize, *payload);
-                    if count_for_callback.fetch_add(1, Ordering::SeqCst) == 0 {
-                        first_for_callback.store(*payload, Ordering::SeqCst);
+                    if observed_count == 0 {
+                        first_observed = *payload;
                     }
+                    observed_count += 1;
                 },
             )
             .await;
 
-            assert_ne!(first_observed.load(Ordering::SeqCst), usize::MAX);
-            assert!(observed_count.load(Ordering::SeqCst) > 1);
+            assert_ne!(first_observed, usize::MAX);
+            assert!(observed_count > 1);
             assert_eq!(latest.map(|(index, _)| index), Some(646));
             assert_eq!(next, 647);
         });
@@ -627,13 +1029,7 @@ mod feed_frontier {
     fn bounded_frontier_does_not_wait_for_a_slow_zero_anchor() {
         assert_lookup_ready(
             seek_sequence_feed_frontier_bounded_observing_positive(
-                |index| DeterministicProbe {
-                    result: if index == 0 {
-                        DeterministicProbeResult::Pending
-                    } else {
-                        DeterministicProbeResult::Ready((index <= 646).then_some(index))
-                    },
-                },
+                |index| frontier_probe(index, 646, index == 0),
                 |_, _| {},
             ),
             646,
@@ -644,13 +1040,7 @@ mod feed_frontier {
     fn bounded_initial_wave_does_not_wait_for_index_three_or_zero_after_a_higher_success() {
         assert_lookup_ready(
             seek_sequence_feed_frontier_bounded_observing_positive(
-                |index| DeterministicProbe {
-                    result: if matches!(index, 0 | 3) {
-                        DeterministicProbeResult::Pending
-                    } else {
-                        DeterministicProbeResult::Ready((index <= 7).then_some(index))
-                    },
-                },
+                |index| frontier_probe(index, 7, matches!(index, 0 | 3)),
                 |_, _| {},
             ),
             7,
@@ -659,86 +1049,34 @@ mod feed_frontier {
 
     #[test]
     fn reliable_feed_lookup_retains_bees_anchor_first_semantics() {
-        let mut lookup = Box::pin(seek_sequence_feed_frontier(|index| DeterministicProbe {
-            result: if index == 0 {
-                DeterministicProbeResult::Pending
-            } else {
-                DeterministicProbeResult::Ready((index <= 646).then_some(index))
-            },
+        let mut lookup = Box::pin(seek_sequence_feed_frontier(|index| {
+            frontier_probe(index, 646, index == 0)
         }));
         let mut context = Context::from_waker(Waker::noop());
         assert_eq!(lookup.as_mut().poll(&mut context), Poll::Pending);
     }
 
     #[test]
-    fn overlaps_probes_but_never_exceeds_bees_eight_lookup_bound() {
+    fn feed_lookup_policies_overlap_without_exceeding_bees_eight_listener_bound() {
         block_on(async {
-            let active = Arc::new(AtomicUsize::new(0));
-            let maximum = Arc::new(AtomicUsize::new(0));
+            for bounded in [false, true] {
+                let active = Cell::new(0);
+                let maximum = Cell::new(0);
+                let probe = |index| overlap_probe(index, &active, &maximum);
+                let (latest, next) = if bounded {
+                    seek_sequence_feed_frontier_bounded_observing_positive(probe, |_, _| {}).await
+                } else {
+                    seek_sequence_feed_frontier(probe).await
+                };
 
-            let (latest, next) = seek_sequence_feed_frontier({
-                let active = active.clone();
-                let maximum = maximum.clone();
-                move |index| {
-                    let active = active.clone();
-                    let maximum = maximum.clone();
-                    OverlapProbe {
-                        index,
-                        active,
-                        maximum,
-                        pending_once: false,
-                        counted_active: false,
-                    }
-                }
-            })
-            .await;
-
-            assert_eq!(latest.map(|(index, _)| index), Some(646));
-            assert_eq!(next, 647);
-            assert!(
-                maximum.load(Ordering::SeqCst) > 1,
-                "feed probes did not overlap"
-            );
-            assert!(
-                maximum.load(Ordering::SeqCst) <= FEED_FRONTIER_LOOKAHEAD_LEVELS,
-                "feed lookup exceeded Bee's bounded lookahead"
-            );
-        });
-    }
-
-    #[test]
-    fn bounded_initial_wave_also_never_exceeds_eight_listener_futures() {
-        block_on(async {
-            let active = Arc::new(AtomicUsize::new(0));
-            let maximum = Arc::new(AtomicUsize::new(0));
-
-            let (latest, next) = seek_sequence_feed_frontier_bounded_observing_positive(
-                {
-                    let active = active.clone();
-                    let maximum = maximum.clone();
-                    move |index| {
-                        let active = active.clone();
-                        let maximum = maximum.clone();
-                        OverlapProbe {
-                            index,
-                            active,
-                            maximum,
-                            pending_once: false,
-                            counted_active: false,
-                        }
-                    }
-                },
-                |_, _| {},
-            )
-            .await;
-
-            assert_eq!(latest.map(|(index, _)| index), Some(646));
-            assert_eq!(next, 647);
-            assert!(maximum.load(Ordering::SeqCst) > 1);
-            assert!(
-                maximum.load(Ordering::SeqCst) <= FEED_FRONTIER_LOOKAHEAD_LEVELS,
-                "bounded frontier exceeded Bee's eight-listener lookahead"
-            );
+                assert_eq!(latest.map(|(index, _)| index), Some(646));
+                assert_eq!(next, 647);
+                assert!(maximum.get() > 1, "feed probes did not overlap");
+                assert!(
+                    maximum.get() <= FEED_FRONTIER_LOOKAHEAD_LEVELS,
+                    "feed lookup exceeded Bee's bounded lookahead"
+                );
+            }
         });
     }
 
@@ -746,12 +1084,8 @@ mod feed_frontier {
     fn a_full_interval_does_not_wait_for_lower_probe_tails() {
         let pending_lower_indices = [1, 3, 7, 15, 31, 63, 127];
         assert_lookup_ready(
-            seek_sequence_feed_frontier(|index| DeterministicProbe {
-                result: if pending_lower_indices.contains(&index) {
-                    DeterministicProbeResult::Pending
-                } else {
-                    DeterministicProbeResult::Ready((index <= 255).then_some(index))
-                },
+            seek_sequence_feed_frontier(|index| {
+                frontier_probe(index, 255, pending_lower_indices.contains(&index))
             }),
             255,
         );
@@ -760,12 +1094,8 @@ mod feed_frontier {
     #[test]
     fn a_resolved_partial_interval_does_not_wait_for_lower_probe_tails() {
         assert_lookup_ready(
-            seek_sequence_feed_frontier(|index| DeterministicProbe {
-                result: if matches!(index, 638 | 640) {
-                    DeterministicProbeResult::Pending
-                } else {
-                    DeterministicProbeResult::Ready((index <= 644).then_some(index))
-                },
+            seek_sequence_feed_frontier(|index| {
+                frontier_probe(index, 644, matches!(index, 638 | 640))
             }),
             644,
         );
@@ -774,30 +1104,26 @@ mod feed_frontier {
     #[test]
     fn a_lower_transient_miss_cannot_truncate_a_proven_higher_update() {
         block_on(async {
-            let missed_once = Arc::new(AtomicUsize::new(0));
-            let (latest, next) = seek_sequence_feed_frontier({
-                let missed_once = missed_once.clone();
-                move |index| {
-                    let missed_once = missed_once.clone();
-                    let mut delay_highest_once = index == 255;
-                    poll_fn(move |context| {
-                        if delay_highest_once {
-                            delay_highest_once = false;
-                            context.waker().wake_by_ref();
-                            return Poll::Pending;
-                        }
-                        if index == 63 && missed_once.fetch_add(1, Ordering::SeqCst) == 0 {
-                            return Poll::Ready(None);
-                        }
-                        Poll::Ready((index <= 646).then_some(index))
-                    })
-                }
+            let missed_once = Cell::new(0usize);
+            let (latest, next) = seek_sequence_feed_frontier(|index| {
+                let missed_once = &missed_once;
+                let mut delay_highest_once = index == 255;
+                poll_fn(move |context| {
+                    if std::mem::take(&mut delay_highest_once) {
+                        context.waker().wake_by_ref();
+                        return Poll::Pending;
+                    }
+                    if index == 63 && missed_once.replace(missed_once.get() + 1) == 0 {
+                        return Poll::Ready(None);
+                    }
+                    Poll::Ready((index <= 646).then_some(index))
+                })
             })
             .await;
 
             assert_eq!(latest.map(|(index, _)| index), Some(646));
             assert_eq!(next, 647);
-            assert_eq!(missed_once.load(Ordering::SeqCst), 1);
+            assert_eq!(missed_once.get(), 1);
         });
     }
 
@@ -816,11 +1142,11 @@ mod feed_frontier {
         );
         assert!(finder.contains("async_std::future::timeout("));
         assert!(!finder.contains("RetrieveCancelToken"));
-        let feed_probe = retrieval
-            .split("async fn get_feed_probe_chunk(")
-            .nth(1)
-            .and_then(|source| source.split("async fn probe_feed_update_status(").next())
-            .expect("feed probe chunk wrapper should remain inspectable");
+        let feed_probe = crate::source::between(
+            retrieval,
+            "async fn get_feed_probe_chunk(",
+            "async fn probe_feed_update_status(",
+        );
         assert!(feed_probe.contains("let _close_admission = admission.close_on_drop();"));
         assert!(feed_probe.contains("admission: Some(admission.clone()),"));
         assert!(feed_probe.contains(".is_err()"));
@@ -830,11 +1156,11 @@ mod feed_frontier {
         assert!(feed_probe.contains("Ok(_) => FeedProbe::Missing"));
         assert!(feed_probe.contains("Err(_) => FeedProbe::Transient"));
         assert!(!feed_probe.contains("retained"));
-        let attempt = retrieval
-            .split("async fn retrieve_attempt(")
-            .nth(1)
-            .and_then(|source| source.split("fn chunk_address_parts").next())
-            .expect("retrieve attempt should remain inspectable");
+        let attempt = crate::source::between(
+            retrieval,
+            "async fn retrieve_attempt(",
+            "fn chunk_address_parts",
+        );
         assert!(attempt.contains("settle_retrieve_attempt("));
         assert!(!attempt.contains("spawn_local(async move"));
     }
@@ -842,11 +1168,11 @@ mod feed_frontier {
     #[test]
     fn feed_payload_decoding_is_a_small_generic_boundary() {
         let bzz_stream = include_str!("../src/bzz_stream.rs");
-        let payload = bzz_stream
-            .split("pub(crate) struct FeedPayloadRoot")
-            .nth(1)
-            .and_then(|source| source.split("async fn retrieve_data_head(").next())
-            .expect("generic feed payload primitives");
+        let payload = crate::source::between(
+            bzz_stream,
+            "pub(crate) struct FeedPayloadRoot",
+            "async fn retrieve_data_head(",
+        );
 
         assert!(payload.contains("pub(crate) fn decode_feed_payload_root("));
         assert!(payload.contains("pub(crate) async fn retrieve_feed_payload("));

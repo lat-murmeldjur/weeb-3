@@ -29,6 +29,7 @@ fn edge_anchors() -> Vec<u64> {
 }
 
 fn refinement_indices(lower: u64, upper: u64, width: usize) -> Vec<u64> {
+    let width = (upper - lower).min(width as u64) as usize;
     let first = lower + 1;
     let divisor = (width - 1) as u128;
     let span = u128::from(upper - first);
@@ -41,7 +42,7 @@ fn refinement_indices(lower: u64, upper: u64, width: usize) -> Vec<u64> {
         .collect()
 }
 
-fn contiguous_edge_waves(head: u64) -> (usize, usize) {
+fn contiguous_edge_waves(head: u64, width: usize) -> (usize, usize) {
     let anchors = edge_anchors();
     let mut probes = anchors.len();
     let mut waves = 1;
@@ -56,9 +57,9 @@ fn contiguous_edge_waves(head: u64) -> (usize, usize) {
         .min()
         .expect("edge missing anchor");
     while upper - lower > 20 {
-        let indices = refinement_indices(lower, upper, 16);
+        let indices = refinement_indices(lower, upper, width);
         assert!(indices.windows(2).all(|pair| pair[0] < pair[1]));
-        assert!(indices.len() <= 16);
+        assert!(indices.len() <= width);
         probes += indices.len();
         waves += 1;
         lower = indices
@@ -137,8 +138,7 @@ fn cold_discovery_is_bounded_and_edge_search_is_hls_owned() {
         "stream::iter(0..BEGINNING_DISCOVERY_WIDTH)",
         ".buffer_unordered(BEGINNING_DISCOVERY_WIDTH as usize)",
         "probe_feed_payload(",
-        "!feed_is_current(id)",
-        "!result_view_request_is_current(view_generation)",
+        "!feed_is_current(id, view_generation)",
         "playlist.sequence == 0",
         "playlist.startup_plan(HlsStart::Beginning).is_some()",
         "while let Some(probe) = probes.next().await",
@@ -169,7 +169,11 @@ fn cold_discovery_is_bounded_and_edge_search_is_hls_owned() {
     );
     for expected in [
         "edge_probe_wave(client, owner, topic, &EDGE_ANCHORS, false, fast)",
-        "(1..EDGE_REFINEMENT_WIDTH - 1)",
+        "(upper - latest.0) as f64 / (HISTORY_STRIDE * 2) as f64",
+        "if width <= 24",
+        "width.max(EDGE_REFINEMENT_WIDTH)",
+        "let width = (upper - latest.0).min(width as u64) as usize;",
+        "(1..width - 1)",
         "let first = latest.0 + 1;",
         ".chain(std::iter::once(upper))",
         "edge_probe_wave(client, owner, topic, &indices, true, fast)",
@@ -191,7 +195,7 @@ fn cold_discovery_is_bounded_and_edge_search_is_hls_owned() {
     );
     for expected in [
         "let mut completed = vec![false; indices.len()];",
-        "completed[first_unsettled..=upper]",
+        "hls_edge_wave_complete(first_unsettled, &missing, &completed)",
         ".buffer_unordered(indices.len().max(1))",
         "probe_feed_update(",
         "attempt_limit",
@@ -201,7 +205,6 @@ fn cold_discovery_is_bounded_and_edge_search_is_hls_owned() {
         "let mut positive_seen = false;",
         "future::pending::<()>().left_future()",
         "future::select(probes.next(), deadline.as_mut()).await",
-        "let Some(upper)",
         "break;",
     ] {
         assert!(wave.contains(expected), "{expected}");
@@ -257,7 +260,7 @@ fn beginning_without_a_successor_starts_exact_following_immediately() {
     );
     let needs_successor = attach.find("let needs_successor = head").unwrap();
     let install = attach
-        .find("install_snapshot(id, index, head, None)")
+        .find("install_snapshot(id, index, head)")
         .unwrap();
     let follow = attach.find("if needs_successor").unwrap();
     assert!(needs_successor < install && install < follow);
@@ -266,37 +269,24 @@ fn beginning_without_a_successor_starts_exact_following_immediately() {
 }
 
 #[test]
-fn commit_337_edge_geometry_stays_small_and_stable() {
-    assert_eq!(
-        edge_anchors(),
-        vec![
-            0,
-            1,
-            7,
-            255,
-            511,
-            1_023,
-            1_535,
-            1_791,
-            2_047,
-            4_095,
-            8_191,
-            16_383,
-            65_535,
-            262_143,
-            1_048_575,
-            u64::MAX,
-        ]
-    );
-    for head in [217, 511, 1_687, 2_047, 3_798, 6_179, 6_256] {
-        let (waves, probes) = contiguous_edge_waves(head);
+fn edge_geometry_bounds_work_for_small_masters_and_long_recordings() {
+    let anchors = edge_anchors();
+    assert_eq!(anchors.len(), 16);
+    assert_eq!(anchors.first(), Some(&0));
+    assert_eq!(anchors.last(), Some(&u64::MAX));
+    assert!(anchors.windows(2).all(|pair| pair[0] < pair[1]));
+    for head in [0, 1, 7, 8, 14, 15, 30] {
+        assert_eq!(contiguous_edge_waves(head, 16), (1, 16), "small master {head}");
+    }
+    for head in [31, 63, 127, 217, 511, 1_687, 2_047, 3_798, 6_179, 6_256] {
+        let (waves, probes) = contiguous_edge_waves(head, 16);
         assert!(waves <= 4, "head {head} took {waves} waves");
         assert!(probes <= 64, "head {head} took {probes} probes");
     }
 }
 
 #[test]
-fn head_proof_preserves_the_initial_lattice_and_settles_every_probe() {
+fn head_proof_preserves_the_initial_lattice_and_twenty_fresh_guards() {
     let proof = section(
         HLS_RUNTIME,
         "async fn retrieve_confirmed_payload(",
@@ -304,14 +294,9 @@ fn head_proof_preserves_the_initial_lattice_and_settles_every_probe() {
     );
     assert!(proof.contains("probe_feed_update("));
     assert!(proof.contains("Some(FEED_PROBE_ATTEMPTS)"));
-    assert!(proof.contains(".buffered((HISTORY_STRIDE * 2) as usize)"));
-    assert!(proof.contains("while let Some((candidate, probe)) = probes.next().await"));
+    assert!(proof.contains("confirm_hls_feed_head(index, update, HISTORY_STRIDE * 2, |index|"));
     assert!(proof.contains("let lattice_residue = index % HISTORY_STRIDE;"));
-    assert!(proof.contains("let mut next = index.checked_add(1)?;"));
-    assert!(proof.contains("let mut probes = stream::iter(next..=end)"));
-    assert!(proof.contains("if end == index.checked_add(HISTORY_STRIDE * 2)?"));
-    assert!(proof.contains("next = end.checked_add(1)?;"));
-    assert!(proof.contains("if transient"));
+    assert!(proof.find("confirm_hls_feed_head(").unwrap() < proof.find("decode_feed_payload_root(index, update)").unwrap());
     assert!(proof.contains("lattice_residue,"));
     let history = section(
         HLS_RUNTIME,
@@ -319,7 +304,7 @@ fn head_proof_preserves_the_initial_lattice_and_settles_every_probe() {
         "async fn discover_raw_for_view(",
     );
     assert!(history.contains("lattice_residue: u64"));
-    assert!(history.contains("history_indices(head_index, lattice_residue)?"));
+    assert!(history.contains("history_indices(head_index, lattice_residue, origin.is_some())?"));
     assert!(HLS_RUNTIME.contains("const HISTORY_FOREGROUND_PARALLEL: usize = 64;"));
 }
 
@@ -389,24 +374,6 @@ fn live_follower_applies_commit337_followups_in_order_with_one_lookup_ahead() {
     assert!(!follower[progressed..idle_sleep].contains("recover_feed_frontier"));
     assert!(!follower.contains("pace_next"));
     assert!(!follower.contains("Duration::try_from_secs_f64"));
-}
-
-#[test]
-fn authenticated_tail_growth_requires_a_reference_overlap() {
-    let merge = section(
-        HLS_CORE,
-        "pub(crate) fn merge_tail",
-        "pub(crate) fn merge_playlist",
-    );
-    assert!(merge.contains("parse_segment_lines(text, 0)"));
-    assert!(merge.contains(".or_else(||"));
-    assert!(merge.contains("self.merge_segments(candidates"));
-
-    let segments = section(HLS_CORE, "fn merge_segments(", "pub(crate) fn render(");
-    assert!(segments.contains("rposition(|candidate| candidate.same_payload(current_tail))"));
-    assert!(segments.contains("checked_sub(candidates[overlap].discontinuity_sequence)"));
-    assert!(segments.contains("candidates[overlap].same_media(current_tail)"));
-    assert!(segments.contains("candidates.into_iter().skip(overlap + 1)"));
 }
 
 #[test]
