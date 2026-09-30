@@ -225,6 +225,7 @@ impl Weeb3 {
         drop(connected_peers_guard);
 
         if promoted {
+            notify_credit_available();
             let kind = if bootnode { "bootnode" } else { "peer" };
             self.interface_log(format!("Connected to {kind} {overlay_hex}"));
         } else if let Some(owner) = duplicate_owner {
@@ -983,6 +984,20 @@ pub(crate) async fn claim_current_cheque(
 
 // Only accounting-session close waits subscribe; retrieval selectors do not.
 pub(crate) static ACCOUNTING_DRAINED: Event = Event::new();
+pub(crate) static CREDIT_AVAILABLE: Event = Event::new();
+
+pub(crate) fn notify_credit_available() {
+    static PENDING: AtomicBool = AtomicBool::new(false);
+    if CREDIT_AVAILABLE.total_listeners() == 0 || PENDING.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    // Batch credit changes at the former retry interval; active transfers never wait here.
+    spawn_local(async {
+        async_std::task::sleep(Duration::from_millis(160)).await;
+        PENDING.store(false, Ordering::Relaxed);
+        CREDIT_AVAILABLE.notify(usize::MAX);
+    });
+}
 
 pub(crate) async fn quiesce_drain_and_close_accounting_session(
     wings: &Arc<Wings>,

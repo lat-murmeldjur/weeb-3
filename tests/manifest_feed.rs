@@ -45,7 +45,7 @@ mod hls_formats {
         let owner = "ab".repeat(20);
         let text = format!(
             "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-INDEPENDENT-SEGMENTS\n\
-             #EXT-X-STREAM-INF:BANDWIDTH=700000,AVERAGE-BANDWIDTH=600000,RESOLUTION=640x360\n\
+             #EXT-X-STREAM-INF:BANDWIDTH=700000,AVERAGE-BANDWIDTH=600000,RESOLUTION=640x360,CODECS=\"avc1.42001e,RESOLUTION=99999x99999,BANDWIDTH=999999999,mp4a.40.2\"\n\
              swarm://{owner}/lower-topic\n\
              #EXT-X-STREAM-INF:BANDWIDTH=2800000,CODECS=\"avc1.64001f,mp4a.40.2\",RESOLUTION=1280x720\n\
              swarm://{owner}/higher-topic\n"
@@ -68,8 +68,31 @@ mod hls_formats {
         assert_eq!(master.render(|_, _| None), text);
         assert_eq!(
             master.initial_source(),
-            Some(format!("swarm://{owner}/lower-topic").as_str())
+            Some(format!("swarm://{owner}/higher-topic").as_str())
         );
+    }
+
+    #[test]
+    fn initial_rendition_uses_resolution_then_bandwidth_and_keeps_first_ties() {
+        for (variants, expected) in [
+            (vec!["BANDWIDTH=9000000,RESOLUTION=640x360", "BANDWIDTH=6000000,RESOLUTION=1920x1080", "BANDWIDTH=7000000,RESOLUTION=1280x720"], 1),
+            (vec!["BANDWIDTH=6000000,RESOLUTION=1920x1080", "BANDWIDTH=9000000,RESOLUTION=640x360"], 0),
+            (vec!["BANDWIDTH=1000000,RESOLUTION=1280x720", "BANDWIDTH=2000000,RESOLUTION=1280x720"], 1),
+            (vec!["BANDWIDTH=3000000", "BANDWIDTH=4000000"], 1),
+            (vec!["BANDWIDTH=3000000", "BANDWIDTH=3000000"], 0),
+            (vec!["BANDWIDTH=1000,CODECS=\"avc1.64001f,BANDWIDTH=9999999,mp4a.40.2\"", "BANDWIDTH=2000"], 1),
+            (vec!["BANDWIDTH=999999999,CODECS=\"mp4a.40.2\"", "BANDWIDTH=1000000,RESOLUTION=640x360"], 1),
+            (vec!["BANDWIDTH=5000000,RESOLUTION=0x1080", "BANDWIDTH=1000000,RESOLUTION=640x360"], 1),
+            (vec!["BANDWIDTH=5000000,RESOLUTION=4294967296x1080", "BANDWIDTH=1000000,RESOLUTION=640x360"], 1),
+        ] {
+            let text = format!("#EXTM3U\n{}", variants.iter().enumerate().map(|(index, attributes)|
+                format!("#EXT-X-STREAM-INF:{attributes}\nrung-{index}\n")
+            ).collect::<String>());
+            let Some(HlsManifest::Master(master)) = HlsManifest::parse(text.as_bytes()) else {
+                panic!("master");
+            };
+            assert_eq!(master.initial_source(), Some(format!("rung-{expected}").as_str()), "{variants:?}");
+        }
     }
 
     #[test]
@@ -98,9 +121,9 @@ mod hls_formats {
         let r = reference('a');
         let text = format!(
             "#EXTM3U\n\
-            #EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"a\",NAME=\"URI=not,a,url\",URI=\"/bytes/{r}\"\n\
-            #EXT-X-I-FRAME-STREAM-INF:BANDWIDTH=100,URI=\"{r}\"\n\
-            #EXT-X-SESSION-KEY:METHOD=AES-128,URI=\"https://keys.example/key\"\n\
+            #EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"a\",NAME=\"URI=not,a,url\",BANDWIDTH=9999999,RESOLUTION=9999x9999,URI=\"/bytes/{r}\"\n\
+            #EXT-X-I-FRAME-STREAM-INF:BANDWIDTH=9999999,RESOLUTION=9999x9999,URI=\"{r}\"\n\
+            #EXT-X-SESSION-KEY:METHOD=AES-128,BANDWIDTH=9999999,RESOLUTION=9999x9999,URI=\"https://keys.example/key\"\n\
             #EXT-X-STREAM-INF:BANDWIDTH=1000,AUDIO=\"a\"\nhttps://example.org/main.m3u8\n"
         );
         let Some(HlsManifest::Master(master)) = HlsManifest::parse(text.as_bytes()) else {
@@ -939,11 +962,8 @@ mod feed_frontier {
         task::{Context, Poll, Waker},
     };
 
-    use feed::{
-        FEED_FRONTIER_LOOKAHEAD_LEVELS, FEED_FRONTIER_LOOKAHEAD_TIMEOUT,
-        seek_sequence_feed_frontier, seek_sequence_feed_frontier_bounded_observing_positive,
-    };
-    use futures::executor::block_on;
+    use feed::{FEED_FRONTIER_LOOKAHEAD_LEVELS, seek_sequence_feed_frontier};
+    use futures::{FutureExt, executor::block_on};
 
     async fn overlap_probe(index: u64, active: &Cell<usize>, maximum: &Cell<usize>) -> Option<u64> {
         active.set(active.get() + 1);
@@ -972,7 +992,7 @@ mod feed_frontier {
     }
 
     fn assert_lookup_ready(
-        lookup: impl Future<Output = (Option<(u64, u64)>, u64)>,
+        lookup: impl Future<Output = (Option<(u64, u64)>, Option<u64>)>,
         expected_latest: u64,
     ) {
         let mut lookup = Box::pin(lookup);
@@ -980,7 +1000,7 @@ mod feed_frontier {
         match lookup.as_mut().poll(&mut context) {
             Poll::Ready((latest, next)) => {
                 assert_eq!(latest, Some((expected_latest, expected_latest)));
-                assert_eq!(next, expected_latest + 1);
+                assert_eq!(next, Some(expected_latest + 1));
             }
             Poll::Pending => panic!("irrelevant lower feed probe held up the resolved frontier"),
         }
@@ -993,58 +1013,13 @@ mod feed_frontier {
                 let (latest, next) = seek_sequence_feed_frontier(|index| async move {
                     head.filter(|head| index <= *head).map(|_| index)
                 })
-                .await;
+                .await
+                .unwrap();
 
                 assert_eq!(latest, head.map(|head| (head, head)));
-                assert_eq!(next, head.map_or(0, |head| head.saturating_add(1)));
+                assert_eq!(next, head.map_or(Some(0), |head| head.checked_add(1)));
             }
         });
-    }
-
-    #[test]
-    fn exposes_authenticated_positive_payloads_before_finishing() {
-        block_on(async {
-            let mut first_observed = usize::MAX;
-            let mut observed_count = 0;
-            let (latest, next) = seek_sequence_feed_frontier_bounded_observing_positive(
-                |index| async move { (index <= 646).then_some(index as usize) },
-                |index, payload| {
-                    assert_eq!(index as usize, *payload);
-                    if observed_count == 0 {
-                        first_observed = *payload;
-                    }
-                    observed_count += 1;
-                },
-            )
-            .await;
-
-            assert_ne!(first_observed, usize::MAX);
-            assert!(observed_count > 1);
-            assert_eq!(latest.map(|(index, _)| index), Some(646));
-            assert_eq!(next, 647);
-        });
-    }
-
-    #[test]
-    fn bounded_frontier_does_not_wait_for_a_slow_zero_anchor() {
-        assert_lookup_ready(
-            seek_sequence_feed_frontier_bounded_observing_positive(
-                |index| frontier_probe(index, 646, index == 0),
-                |_, _| {},
-            ),
-            646,
-        );
-    }
-
-    #[test]
-    fn bounded_initial_wave_does_not_wait_for_index_three_or_zero_after_a_higher_success() {
-        assert_lookup_ready(
-            seek_sequence_feed_frontier_bounded_observing_positive(
-                |index| frontier_probe(index, 7, matches!(index, 0 | 3)),
-                |_, _| {},
-            ),
-            7,
-        );
     }
 
     #[test]
@@ -1057,26 +1032,16 @@ mod feed_frontier {
     }
 
     #[test]
-    fn feed_lookup_policies_overlap_without_exceeding_bees_eight_listener_bound() {
+    fn feed_lookup_overlaps_without_exceeding_bees_eight_listener_bound() {
         block_on(async {
-            for bounded in [false, true] {
-                let active = Cell::new(0);
-                let maximum = Cell::new(0);
-                let probe = |index| overlap_probe(index, &active, &maximum);
-                let (latest, next) = if bounded {
-                    seek_sequence_feed_frontier_bounded_observing_positive(probe, |_, _| {}).await
-                } else {
-                    seek_sequence_feed_frontier(probe).await
-                };
-
-                assert_eq!(latest.map(|(index, _)| index), Some(646));
-                assert_eq!(next, 647);
-                assert!(maximum.get() > 1, "feed probes did not overlap");
-                assert!(
-                    maximum.get() <= FEED_FRONTIER_LOOKAHEAD_LEVELS,
-                    "feed lookup exceeded Bee's bounded lookahead"
-                );
-            }
+            let active = Cell::new(0);
+            let maximum = Cell::new(0);
+            let (latest, next) = seek_sequence_feed_frontier(|index| overlap_probe(index, &active, &maximum))
+                .await.unwrap();
+            assert_eq!(latest.map(|(index, _)| index), Some(646));
+            assert_eq!(next, Some(647));
+            assert!(maximum.get() > 1, "feed probes did not overlap");
+            assert!(maximum.get() <= FEED_FRONTIER_LOOKAHEAD_LEVELS);
         });
     }
 
@@ -1086,7 +1051,7 @@ mod feed_frontier {
         assert_lookup_ready(
             seek_sequence_feed_frontier(|index| {
                 frontier_probe(index, 255, pending_lower_indices.contains(&index))
-            }),
+            }).map(Result::unwrap),
             255,
         );
     }
@@ -1096,7 +1061,7 @@ mod feed_frontier {
         assert_lookup_ready(
             seek_sequence_feed_frontier(|index| {
                 frontier_probe(index, 644, matches!(index, 638 | 640))
-            }),
+            }).map(Result::unwrap),
             644,
         );
     }
@@ -1119,50 +1084,33 @@ mod feed_frontier {
                     Poll::Ready((index <= 646).then_some(index))
                 })
             })
-            .await;
+            .await
+            .unwrap();
 
             assert_eq!(latest.map(|(index, _)| index), Some(646));
-            assert_eq!(next, 647);
+            assert_eq!(next, Some(647));
             assert_eq!(missed_once.get(), 1);
         });
     }
 
     #[test]
-    fn generic_feed_probe_preserves_admission_and_accounting() {
-        let retrieval = include_str!("../src/retrieval.rs");
-        let finder = include_str!("../src/feed.rs");
-
-        assert!(retrieval.contains("async fn probe_feed_update_status("));
-        assert!(retrieval.contains("probe_feed_update_status(&owner, &topic, index,"));
-        assert!(finder.contains("probe_with_timeout("));
-        assert!(retrieval.contains("seek_sequence_feed_frontier(|index|"));
-        assert_eq!(
-            FEED_FRONTIER_LOOKAHEAD_TIMEOUT,
-            std::time::Duration::from_secs(1)
-        );
-        assert!(finder.contains("async_std::future::timeout("));
-        assert!(!finder.contains("RetrieveCancelToken"));
-        let feed_probe = crate::source::between(
-            retrieval,
-            "async fn get_feed_probe_chunk(",
-            "async fn probe_feed_update_status(",
-        );
-        assert!(feed_probe.contains("let _close_admission = admission.close_on_drop();"));
-        assert!(feed_probe.contains("admission: Some(admission.clone()),"));
-        assert!(feed_probe.contains(".is_err()"));
-        assert!(feed_probe.contains("return FeedProbe::Transient;"));
-        assert!(feed_probe.contains("let (chan_out, chan_in) = oneshot::channel();"));
-        assert!(feed_probe.contains("match chan_in.await {"));
-        assert!(feed_probe.contains("Ok(_) => FeedProbe::Missing"));
-        assert!(feed_probe.contains("Err(_) => FeedProbe::Transient"));
-        assert!(!feed_probe.contains("retained"));
-        let attempt = crate::source::between(
-            retrieval,
-            "async fn retrieve_attempt(",
-            "fn chunk_address_parts",
-        );
-        assert!(attempt.contains("settle_retrieve_attempt("));
-        assert!(!attempt.contains("spawn_local(async move"));
+    fn feed_lookup_distinguishes_a_missing_anchor_from_transport_failure() {
+        block_on(async {
+            for (first, expected) in [
+                (Ok(None), Ok((None, Some(0)))),
+                (Err(()), Err(())),
+                (Ok(Some(9)), Ok((Some((0, 9)), None))),
+            ] {
+                let result = seek_sequence_feed_frontier(|index| async move {
+                    if index == 0 {
+                        first
+                    } else {
+                        Err(())
+                    }
+                }).await;
+                assert_eq!(result, expected);
+            }
+        });
     }
 
     #[test]
@@ -1174,24 +1122,30 @@ mod feed_frontier {
             "async fn retrieve_data_head(",
         );
 
-        assert!(payload.contains("pub(crate) fn decode_feed_payload_root("));
-        assert!(payload.contains("pub(crate) async fn retrieve_feed_payload("));
-        assert!(payload.contains("pub(crate) async fn retrieve_feed_payload_tail("));
-        assert!(payload.contains("manifest_payload_size_allowed(root.span)"));
-        assert!(payload.contains("if span > maximum_span"));
-        assert!(payload.contains("retrieve_data_range_from_root("));
-        assert!(payload.contains(".min(CHUNK_SIZE as u64)"));
+        crate::source::assert_contains(payload, &[
+            "pub(crate) fn decode_feed_payload_root(",
+            "pub(crate) async fn retrieve_feed_payload(",
+            "pub(crate) async fn retrieve_feed_payload_tail(",
+            "manifest_payload_size_allowed(root.span)",
+            "if span > maximum_span",
+            "retrieve_data_range_from_root(",
+            ".min(CHUNK_SIZE as u64)",
+        ]);
         assert!(!payload.contains("conservative"));
         assert!(!payload.to_ascii_lowercase().contains("hls"));
-        assert!(!payload.contains("RawFeedPayload"));
-        assert!(!payload.contains("DeferredRawFeedPayload"));
-        assert!(!payload.contains("StartupRawFeedPayload"));
+        crate::source::assert_excludes(payload, &[
+            "RawFeedPayload",
+            "DeferredRawFeedPayload",
+            "StartupRawFeedPayload",
+        ]);
 
         let retrieval = include_str!("../src/retrieval.rs");
-        assert!(!retrieval.contains("RetainedFeedProbePolicy"));
-        assert!(!retrieval.contains("retrieve_feed_update_at_index_retained_status"));
-        assert!(!retrieval.contains("RETRIEVE_FEED_HEDGE_ADMISSION_MS"));
-        assert!(!retrieval.contains("RETRIEVE_FEED_MAX_PHYSICAL_ATTEMPTS"));
+        crate::source::assert_excludes(retrieval, &[
+            "RetainedFeedProbePolicy",
+            "retrieve_feed_update_at_index_retained_status",
+            "RETRIEVE_FEED_HEDGE_ADMISSION_MS",
+            "RETRIEVE_FEED_MAX_PHYSICAL_ATTEMPTS",
+        ]);
 
         let finder = include_str!("../src/feed.rs");
         assert!(!finder.contains("seek_sequence_feed_frontier_wide_bounded"));

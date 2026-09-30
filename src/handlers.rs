@@ -147,7 +147,7 @@ async fn handshake_exchange(
     overlay_input[..20].copy_from_slice(signer.address().as_bytes());
     overlay_input[20..28].copy_from_slice(&network_id.to_le_bytes());
     overlay_input[28..].copy_from_slice(&nonce);
-    let overlay = keccak256(overlay_input);
+    let overlay = keccak256(&overlay_input);
     let sign_data = generate_sign_data(
         &underlay,
         overlay.as_slice(),

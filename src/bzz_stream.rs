@@ -8,9 +8,7 @@ use crate::{
     },
     retrieval::{
         DecodedJoinChunk, retrieve_data, retrieve_data_range_from_root,
-        retrieve_data_range_from_root_cancellable,
-        retrieve_data_range_from_root_with_prefix_cancellable, retrieve_decoded_data_root,
-        retrieve_decoded_data_root_cancellable, seek_latest_feed_update,
+        retrieve_decoded_data_root, seek_latest_feed_update,
     },
     retrieve_cancel_token_current,
     stream_conventions::{is_swarm_reference_hex, streaming_route_path},
@@ -158,7 +156,7 @@ async fn reference_span(
     reference: &[u8],
     chunk_retrieve_chan: &ChunkRetrieveSender,
 ) -> Option<u64> {
-    retrieve_decoded_data_root(reference, chunk_retrieve_chan)
+    retrieve_decoded_data_root(reference, chunk_retrieve_chan, None)
         .await
         .map(|root| root.span)
 }
@@ -192,7 +190,7 @@ pub(crate) async fn retrieve_embedded_data(
     if !manifest_payload_size_allowed(span) {
         return None;
     }
-    retrieve_data_range_from_root_with_prefix_cancellable(
+    retrieve_data_range_from_root(
         root,
         0,
         span.saturating_sub(1),
@@ -247,6 +245,8 @@ pub(crate) async fn retrieve_feed_payload(
         span.checked_sub(1)?,
         payload.encrypted,
         chunk_retrieve_chan,
+        &[],
+        None,
     )
     .await?;
     (u64::try_from(bytes.len()).ok()? == span).then_some(bytes)
@@ -273,6 +273,8 @@ pub(crate) async fn retrieve_feed_payload_tail(
         end_inclusive,
         payload.encrypted,
         chunk_retrieve_chan,
+        &[],
+        None,
     )
     .await?;
     (u64::try_from(tail.len()).ok()? == expected_len).then_some(tail)
@@ -287,10 +289,10 @@ async fn retrieve_data_head(
         return None;
     }
 
-    let root = retrieve_decoded_data_root(reference, chunk_retrieve_chan).await?;
+    let root = retrieve_decoded_data_root(reference, chunk_retrieve_chan, None).await?;
     let span = root.span;
     let head_len = span.min(CHUNK_SIZE as u64);
-    retrieve_data_range_from_root_with_prefix_cancellable(
+    retrieve_data_range_from_root(
         root,
         0,
         head_len.saturating_sub(1),
@@ -394,9 +396,9 @@ async fn collect_manifest_fork_targets(
                 .map(|topic| topic.to_string()),
         ) && let Some(feed_guard) = guard.descend_feed(&owner, &topic)
         {
-            let feed_data_soc = seek_latest_feed_update(owner, topic, &chunk_retrieve_chan).await;
-
-            if feed_data_soc.len() >= 8
+            if let Ok(Some(feed_data_soc)) =
+                seek_latest_feed_update(owner, topic, &chunk_retrieve_chan).await
+                && feed_data_soc.len() >= 8
                 && let Some(feed_data_content) =
                     retrieve_embedded_data(&feed_data_soc, ref_size == 64, &chunk_retrieve_chan)
                         .await
@@ -740,51 +742,42 @@ pub async fn resolve_bzz(
     Some(target_metadata(target, size, target_count))
 }
 
-async fn latest_feed_manifest(
+pub async fn acquire_latest_feed(
     owner: String,
     topic: String,
     chunk_retrieve_chan: &ChunkRetrieveSender,
-) -> Option<ParsedBzzManifest> {
-    let feed_data_soc = seek_latest_feed_update(owner, topic, chunk_retrieve_chan).await;
-    if feed_data_soc.len() < 8 {
-        return None;
-    }
-
+) -> Result<Option<(Vec<u8>, BzzMetadata)>, ()> {
+    let guard = ResolutionGuard::new().descend_feed(&owner, &topic).ok_or(())?;
+    let Some(feed_data_soc) = seek_latest_feed_update(owner, topic, chunk_retrieve_chan).await? else {
+        return Ok(None);
+    };
+    let mut feed_manifest = None;
     for encrypted in [false, true] {
         if let Some(content) =
             retrieve_embedded_data(&feed_data_soc, encrypted, chunk_retrieve_chan).await
             && let Some(manifest) = parse_bzz_manifest(content)
         {
-            return Some(manifest);
+            feed_manifest = Some(manifest);
+            break;
         }
     }
-
-    None
-}
-
-pub async fn acquire_latest_feed(
-    owner: String,
-    topic: String,
-    chunk_retrieve_chan: &ChunkRetrieveSender,
-) -> Option<(Vec<u8>, BzzMetadata)> {
-    let guard = ResolutionGuard::new().descend_feed(&owner, &topic)?;
-    let feed_manifest = latest_feed_manifest(owner, topic, chunk_retrieve_chan).await?;
     let target = Box::pin(lazy_manifest_target(
         Vec::new(),
-        feed_manifest,
+        feed_manifest.ok_or(())?,
         b"",
         chunk_retrieve_chan,
         guard,
     ))
-    .await?;
-    let size = reference_span(&target.data_reference, chunk_retrieve_chan).await?;
+    .await.ok_or(())?;
+    let size = reference_span(&target.data_reference, chunk_retrieve_chan).await.ok_or(())?;
     let metadata = target_metadata(target, size, 1);
 
     if size == 0 {
-        return Some((vec![], metadata));
+        return Ok(Some((vec![], metadata)));
     }
 
-    acquire_resolved_range(metadata, 0, size - 1, chunk_retrieve_chan).await
+    acquire_resolved_range(metadata, 0, size - 1, chunk_retrieve_chan)
+        .await.map(Some).ok_or(())
 }
 
 pub async fn acquire_resolved_range(
@@ -819,19 +812,20 @@ pub async fn acquire_resolved_range_cancellable(
             return None;
         }
 
-        let data = if let Some(root) = retrieve_decoded_data_root_cancellable(
+        let data = if let Some(root) = retrieve_decoded_data_root(
             &metadata.data_reference,
             chunk_retrieve_chan,
             cancel.clone(),
         )
         .await
         {
-            retrieve_data_range_from_root_cancellable(
+            retrieve_data_range_from_root(
                 root,
                 start,
                 end_inclusive,
                 metadata.data_reference.len() == 64,
                 chunk_retrieve_chan,
+                &[],
                 cancel.clone(),
             )
             .await

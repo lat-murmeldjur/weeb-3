@@ -1,12 +1,13 @@
 use std::{
     cell::{Cell, RefCell},
-    collections::{BTreeMap, HashMap, VecDeque},
+    collections::{BTreeMap, HashMap, hash_map::RandomState},
     rc::Rc,
     time::Duration,
 };
 
 use async_std::sync::Arc;
 use bytes::Bytes;
+use hashlink::LinkedHashMap;
 use js_sys::{Array, Object, Reflect};
 use libp2p::futures::{StreamExt, future::join_all, stream};
 use wasm_bindgen::{JsCast, JsValue, closure::Closure};
@@ -106,10 +107,8 @@ pub(crate) fn next_media_generation() -> u64 {
 #[derive(Default)]
 struct FetchCache {
     epoch: u64,
-    metadata_order: VecDeque<String>,
-    metadata: HashMap<String, BzzMetadata>,
-    range_order: VecDeque<String>,
-    ranges: HashMap<String, Bytes>,
+    metadata: LinkedHashMap<String, BzzMetadata, RandomState>,
+    ranges: LinkedHashMap<String, Bytes, RandomState>,
     pending_ranges: SingleflightRegistry<String, mpsc::Sender<Result<Bytes, String>>, RangeFlight>,
     range_bytes: u64,
     media_states: HashMap<String, MediaState>,
@@ -117,29 +116,18 @@ struct FetchCache {
 
 impl FetchCache {
     fn metadata(&mut self, resource: &str) -> Option<BzzMetadata> {
-        let metadata = self.metadata.get(resource).cloned()?;
-        self.metadata_order.retain(|key| key != resource);
-        self.metadata_order.push_back(resource.to_string());
-        Some(metadata)
+        self.metadata.to_back(resource).cloned()
     }
 
     fn remember_metadata(&mut self, resource: String, metadata: BzzMetadata) {
-        self.metadata_order.retain(|key| key != &resource);
-        self.metadata_order.push_back(resource.clone());
         self.metadata.insert(resource, metadata);
         while self.metadata.len() > METADATA_CACHE_MAX_ENTRIES {
-            let Some(oldest) = self.metadata_order.pop_front() else {
-                break;
-            };
-            self.metadata.remove(&oldest);
+            self.metadata.pop_front();
         }
     }
 
     fn range(&mut self, key: &str) -> Option<Bytes> {
-        let body = self.ranges.get(key)?.clone();
-        self.range_order.retain(|cached_key| cached_key != key);
-        self.range_order.push_back(key.to_string());
-        Some(body)
+        self.ranges.to_back(key).cloned()
     }
 
     fn remember_range(&mut self, key: String, body: Bytes, media_state_key: &str, generation: u64) {
@@ -155,11 +143,9 @@ impl FetchCache {
         if body_len > range_cache_capacity_bytes() {
             return;
         }
-        if let Some(old) = self.ranges.insert(key.clone(), body) {
+        if let Some(old) = self.ranges.insert(key, body) {
             self.range_bytes = self.range_bytes.saturating_sub(old.len() as u64);
         }
-        self.range_order.retain(|cached_key| cached_key != &key);
-        self.range_order.push_back(key);
         self.range_bytes = self.range_bytes.saturating_add(body_len);
         self.trim_ranges();
     }
@@ -169,7 +155,6 @@ impl FetchCache {
         for state in self.media_states.values_mut() {
             state.reset();
         }
-        self.range_order.clear();
         self.ranges.clear();
         self.range_bytes = 0;
     }
@@ -184,7 +169,6 @@ impl FetchCache {
                 true
             }
         });
-        self.range_order.retain(|key| !key.starts_with(&prefix));
     }
 
     fn range_load_role(
@@ -255,34 +239,13 @@ impl FetchCache {
         RangeLoadRole::Read(receiver, registration)
     }
 
-    fn finish_pending_range(
-        &mut self,
-        key: &String,
-        generation: u64,
-        load_id: u64,
-        result: Result<Bytes, String>,
-    ) {
-        if !self
-            .pending_ranges
-            .shared_mut(key, load_id)
-            .is_some_and(|shared| shared.generation == generation)
-        {
-            return;
-        }
-        if let Some(pending) = self.pending_ranges.take(key, load_id) {
-            finish_range_waiters(pending.waiters, result);
-        }
-    }
-
     fn trim_ranges(&mut self) {
         let max_bytes = range_cache_capacity_bytes();
         while self.range_bytes > max_bytes {
-            let Some(oldest) = self.range_order.pop_front() else {
+            let Some((_, range)) = self.ranges.pop_front() else {
                 break;
             };
-            if let Some(range) = self.ranges.remove(&oldest) {
-                self.range_bytes = self.range_bytes.saturating_sub(range.len() as u64);
-            }
+            self.range_bytes = self.range_bytes.saturating_sub(range.len() as u64);
         }
     }
 
@@ -306,7 +269,7 @@ impl FetchCache {
             let Some(oldest) = self
                 .media_states
                 .iter()
-                .filter(|(key, state)| key.as_str() != active_key && !state.prefetch_running)
+                .filter(|(key, state)| key.as_str() != active_key && state.prefetch_generation == 0)
                 .min_by(|left, right| left.1.last_touch.total_cmp(&right.1.last_touch))
                 .map(|(key, _)| key.clone())
             else {
@@ -359,10 +322,10 @@ impl Drop for RangeWaiterGuard {
 }
 
 fn finish_range_waiters(
-    waiters: Vec<mpsc::Sender<Result<Bytes, String>>>,
+    waiters: Vec<(u64, mpsc::Sender<Result<Bytes, String>>)>,
     result: Result<Bytes, String>,
 ) {
-    for waiter in waiters {
+    for (_, waiter) in waiters {
         let _ = waiter.try_send(result.clone());
     }
 }
@@ -383,13 +346,6 @@ struct RangeReadError {
 }
 
 impl RangeReadError {
-    fn terminal(message: impl Into<String>) -> Self {
-        Self {
-            message: message.into(),
-            waiter_timed_out: false,
-        }
-    }
-
     fn waiter_timeout(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
@@ -398,15 +354,12 @@ impl RangeReadError {
     }
 }
 
-impl From<String> for RangeReadError {
-    fn from(message: String) -> Self {
-        Self::terminal(message)
-    }
-}
-
-impl From<&str> for RangeReadError {
-    fn from(message: &str) -> Self {
-        Self::terminal(message)
+impl<T: Into<String>> From<T> for RangeReadError {
+    fn from(message: T) -> Self {
+        Self {
+            message: message.into(),
+            waiter_timed_out: false,
+        }
     }
 }
 
@@ -456,7 +409,6 @@ struct MediaState {
     scheduled_high_water_end: i64,
     completed_ranges: BTreeMap<u64, u64>,
     last_request_start: u64,
-    prefetch_running: bool,
     prefetch_generation: u64,
     last_touch: f64,
 }
@@ -470,7 +422,6 @@ impl MediaState {
             scheduled_high_water_end: -1,
             completed_ranges: BTreeMap::new(),
             last_request_start: 0,
-            prefetch_running: false,
             prefetch_generation: 0,
             last_touch: js_sys::Date::now(),
         }
@@ -861,8 +812,7 @@ fn media_state_key(resource: &str, metadata: &BzzMetadata) -> String {
 }
 
 fn with_current_media_state(key: &str, generation: u64, update: impl FnOnce(&mut MediaState)) {
-    FETCH_CACHE.with(|cache| {
-        let mut cache = cache.borrow_mut();
+    FETCH_CACHE.with_borrow_mut(|cache| {
         if let Some(state) = cache
             .media_states
             .get_mut(key)
@@ -871,15 +821,6 @@ fn with_current_media_state(key: &str, generation: u64, update: impl FnOnce(&mut
             update(state);
         }
     });
-}
-
-fn range_cache_key(resource: &str, metadata: &BzzMetadata, start: u64, end: u64) -> String {
-    window_key(
-        &metadata_identity(resource, metadata),
-        metadata.size,
-        start,
-        end,
-    )
 }
 
 fn pending_range_key(cache_key: &str, generation: u64) -> String {
@@ -911,8 +852,7 @@ fn inclusive_range_len(start: u64, end: u64) -> Option<usize> {
 fn begin_media_range(resource: &str, metadata: &BzzMetadata, start: u64) -> MediaRangeState {
     let key = media_state_key(resource, metadata);
 
-    FETCH_CACHE.with(|cache| {
-        let mut cache = cache.borrow_mut();
+    FETCH_CACHE.with_borrow_mut(|cache| {
         let state = cache.media_state_mut(&key);
         let previous_anchor = state.anchor_start;
         let previous_high_water = state.effective_high_water_end();
@@ -1170,9 +1110,9 @@ async fn read_range_window(
     if metadata.size == 0 || start > end || start >= metadata.size || end >= metadata.size {
         return Err("range window lies outside the resolved resource".into());
     }
-    let cache_key = range_cache_key(resource, metadata, start, end);
-    let (epoch, role) = FETCH_CACHE.with(|cache| {
-        let mut cache = cache.borrow_mut();
+    let identity = metadata_identity(resource, metadata);
+    let cache_key = window_key(&identity, metadata.size, start, end);
+    let (epoch, role) = FETCH_CACHE.with_borrow_mut(|cache| {
         (
             cache.epoch,
             cache.range_load_role(&cache_key, generation, cancel_when_unused),
@@ -1198,7 +1138,7 @@ async fn read_range_window(
         let load_id = registration.flight_id;
         let weeb3 = weeb3.clone();
         let metadata = metadata.clone();
-        let media_key = media_state_key(resource, &metadata);
+        let media_key = format!("{identity}|{resource}");
         let leader_cache_key = cache_key;
         let leader_pending_key = registration.key;
         spawn_local(async move {
@@ -1226,8 +1166,7 @@ async fn read_range_window(
             };
 
             if let Ok(body) = &load_result {
-                FETCH_CACHE.with(|cache| {
-                    let mut cache = cache.borrow_mut();
+                FETCH_CACHE.with_borrow_mut(|cache| {
                     if cache.epoch == epoch {
                         cache.remember_range(
                             leader_cache_key,
@@ -1240,19 +1179,21 @@ async fn read_range_window(
             }
 
             FETCH_CACHE.with(|cache| {
-                cache.borrow_mut().finish_pending_range(
-                    &leader_pending_key,
-                    generation,
-                    load_id,
-                    load_result,
-                );
+                if let Some(pending) = cache
+                    .borrow_mut()
+                    .pending_ranges
+                    .take(&leader_pending_key, load_id)
+                {
+                    finish_range_waiters(pending.waiters, load_result);
+                }
             });
         });
     }
 
+    drop(identity);
     match async_std::future::timeout(Duration::from_millis(timeout_ms), receiver.recv()).await {
-        Ok(Ok(result)) => result.map_err(RangeReadError::terminal),
-        Ok(Err(_)) => Err(RangeReadError::terminal("range load was canceled")),
+        Ok(Ok(result)) => result.map_err(RangeReadError::from),
+        Ok(Err(_)) => Err("range load was canceled".into()),
         Err(_) => {
             waiter.retain_owner();
             let error = format!("timed out retrieving range {}-{}", start, end);
@@ -1296,18 +1237,16 @@ fn spawn_prefetch_media_stages(
     generation: u64,
 ) {
     let key = media_state_key(&resource, &metadata);
-    let should_spawn = FETCH_CACHE.with(|cache| {
-        let mut cache = cache.borrow_mut();
+    let should_spawn = FETCH_CACHE.with_borrow_mut(|cache| {
         let Some(state) = cache.media_states.get_mut(&key) else {
             return false;
         };
         if state.generation != generation {
             return false;
         }
-        if state.prefetch_running && state.prefetch_generation == generation {
+        if state.prefetch_generation == generation {
             return false;
         }
-        state.prefetch_running = true;
         state.prefetch_generation = generation;
         true
     });
@@ -1327,13 +1266,12 @@ fn spawn_prefetch_media_stages(
         )
         .await;
 
-        FETCH_CACHE.with(|cache| {
-            let mut cache = cache.borrow_mut();
+        FETCH_CACHE.with_borrow_mut(|cache| {
             if let Some(state) = cache.media_states.get_mut(&key)
                 && state.generation == generation
                 && state.prefetch_generation == generation
             {
-                state.prefetch_running = false;
+                state.prefetch_generation = 0;
             }
         });
     });
@@ -1407,7 +1345,9 @@ async fn prefetch_media_windows(
         while next <= target_end && windows.len() < MEDIA_PREFETCH_MAX_PARALLEL {
             let window = range_storage_window_for_start(next, metadata.size);
             windows.push(window);
-            mark_media_window_scheduled(media_key, window.1, generation);
+            with_current_media_state(media_key, generation, |state| {
+                state.mark_scheduled(window.1);
+            });
             next = window.1.saturating_add(1);
         }
 
@@ -1424,10 +1364,14 @@ async fn prefetch_media_windows(
             let (start, end) = windows[index];
             match result {
                 Ok(bytes) if bytes.len() == (end - start + 1) as usize => {
-                    mark_media_window_complete(media_key, start, end, generation);
+                    with_current_media_state(media_key, generation, |state| {
+                        state.mark_complete(start, end);
+                    });
                 }
                 _ => {
-                    mark_media_window_failure(media_key, start, generation);
+                    with_current_media_state(media_key, generation, |state| {
+                        state.mark_failure(start);
+                    });
                     return;
                 }
             }
@@ -1448,32 +1392,13 @@ fn media_generation_current(key: &str, generation: u64) -> bool {
 }
 
 fn media_high_water_end(key: &str, generation: u64) -> Option<u64> {
-    FETCH_CACHE.with(|cache| {
-        let cache = cache.borrow();
+    FETCH_CACHE.with_borrow(|cache| {
         let state = cache.media_states.get(key)?;
         if state.generation != generation || state.high_water_end < 0 {
             return None;
         }
         Some(state.high_water_end as u64)
     })
-}
-
-fn mark_media_window_scheduled(key: &str, end: u64, generation: u64) {
-    with_current_media_state(key, generation, |state| {
-        state.mark_scheduled(end);
-    });
-}
-
-fn mark_media_window_complete(key: &str, start: u64, end: u64, generation: u64) {
-    with_current_media_state(key, generation, |state| {
-        state.mark_complete(start, end);
-    });
-}
-
-fn mark_media_window_failure(key: &str, start: u64, generation: u64) {
-    with_current_media_state(key, generation, |state| {
-        state.mark_failure(start);
-    });
 }
 
 fn metadata_headers(metadata: &BzzMetadata, length: u64) -> Vec<(String, String)> {
@@ -1820,6 +1745,64 @@ mod tests {
     use super::*;
 
     #[wasm_bindgen_test::wasm_bindgen_test]
+    fn metadata_cache_hits_and_replacement_preserve_the_entry_limit_and_recency() {
+        let metadata = BzzMetadata {
+            data_reference: vec![0; 32],
+            mime: "video/mp4".into(),
+            size: 10,
+            etag: "metadata-cache".into(),
+            path: String::new(),
+            target_count: 1,
+        };
+        let mut cache = FetchCache::default();
+        for index in 0..METADATA_CACHE_MAX_ENTRIES {
+            cache.remember_metadata(index.to_string(), metadata.clone());
+        }
+        assert!(cache.metadata("0").is_some());
+        let mut replacement = metadata.clone();
+        replacement.size = 20;
+        cache.remember_metadata("1".into(), replacement);
+        cache.remember_metadata("next".into(), metadata);
+        assert_eq!(cache.metadata.len(), METADATA_CACHE_MAX_ENTRIES);
+        assert!(cache.metadata("0").is_some());
+        assert_eq!(cache.metadata("1").unwrap().size, 20);
+        assert!(cache.metadata("2").is_none());
+    }
+
+    #[wasm_bindgen_test::wasm_bindgen_test]
+    fn range_cache_preserves_recency_byte_accounting_and_invalidation() {
+        let previous = AUXILIARY_MEDIA_CACHE_BYTES
+            .with(|bytes| bytes.replace(media_cache_max_bytes().saturating_sub(6)));
+        let mut cache = FetchCache::default();
+        let first = Bytes::from_static(b"aa");
+        cache.remember_range("one|0".into(), first.clone(), "", 0);
+        cache.remember_range("two|0".into(), Bytes::from_static(b"bbb"), "", 0);
+        assert_eq!(cache.range("one|0").unwrap().as_ptr(), first.as_ptr());
+        cache.remember_range("three|0".into(), Bytes::from_static(b"cc"), "", 0);
+        assert_eq!(cache.range_bytes, 4);
+        assert!(cache.range("two|0").is_none());
+
+        cache.remember_range("one|0".into(), Bytes::from_static(b"new"), "", 0);
+        assert_eq!(cache.range_bytes, 5);
+        cache
+            .media_states
+            .insert("media".into(), MediaState::new(3));
+        cache.remember_range("one|0".into(), Bytes::from_static(b"x"), "media", 2);
+        assert_eq!(cache.range("one|0").unwrap().as_ref(), b"new");
+        cache.remember_range("one|0".into(), first, "media", 3);
+        assert_eq!(cache.range_bytes, 4);
+        cache.forget_reference_ranges("one");
+        assert!(cache.range("one|0").is_none());
+        assert_eq!(cache.range_bytes, 2);
+        cache.clear_completed_ranges();
+        assert_eq!(
+            (cache.range_bytes, cache.ranges.len(), cache.epoch),
+            (0, 0, 1)
+        );
+        AUXILIARY_MEDIA_CACHE_BYTES.with(|bytes| bytes.set(previous));
+    }
+
+    #[wasm_bindgen_test::wasm_bindgen_test]
     fn first_unaligned_nonzero_range_advances_prefetch() {
         let resource = "nonzero-prefetch-start";
         let metadata = BzzMetadata {
@@ -1838,7 +1821,9 @@ mod tests {
             (start, end),
             range_storage_window_for_start(end + 1, metadata.size),
         ] {
-            mark_media_window_complete(&key, start, end, range.generation);
+            with_current_media_state(&key, range.generation, |state| {
+                state.mark_complete(start, end);
+            });
             assert_eq!(media_high_water_end(&key, range.generation), Some(end));
         }
     }

@@ -64,7 +64,7 @@ impl ChequeSigner {
         buf[..2].copy_from_slice(&[0x19, 0x01]);
         buf[2..34].copy_from_slice(&domain_separator);
         buf[34..].copy_from_slice(&struct_hash);
-        keccak256(buf)
+        keccak256(&buf)
     }
 
     pub fn sign(&self, cheque: &Cheque) -> Option<Vec<u8>> {

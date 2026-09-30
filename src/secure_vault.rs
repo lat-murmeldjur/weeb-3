@@ -485,7 +485,7 @@ async fn create_wallet_feed_update(
     if !current() {
         return None;
     }
-    let digest = crate::keccak256([id.as_slice(), &wrapped].concat());
+    let digest = crate::keccak256(&[id.as_slice(), &wrapped].concat());
     let params = Array::new();
     params.push(&JsValue::from_str(&format!("0x{}", hex::encode(digest))));
     params.push(&JsValue::from_str(&format!("0x{}", hex::encode(wallet))));
@@ -500,7 +500,7 @@ async fn create_wallet_feed_update(
         return None;
     }
     let soc_chunk = [id.as_slice(), &signature, &content].concat();
-    let soc_address = crate::keccak256([id.as_slice(), &wallet].concat()).to_vec();
+    let soc_address = crate::keccak256(&[id.as_slice(), &wallet].concat()).to_vec();
     if !valid_soc(&soc_chunk, &soc_address) {
         return None;
     }
@@ -1005,7 +1005,7 @@ async fn call_secure_client(
                     &error,
                 );
                 clear_secure_connection_if_current(&active_client);
-                sleep_ms(250 * attempt as i32).await;
+                async_std::task::sleep(Duration::from_millis(250 * attempt as u64)).await;
                 active_client = if secure_resume_required() {
                     wait_for_user_resume_connection(method).await?
                 } else {
@@ -1061,17 +1061,6 @@ async fn secure_module() -> Result<JsValue, JsValue> {
     SECURE_MODULE.with(|cell| cell.replace(Some(module.clone())));
 
     Ok(module)
-}
-
-async fn sleep_ms(ms: i32) {
-    let promise = Promise::new(&mut |resolve, _reject| {
-        if let Some(window) = web_sys::window() {
-            window
-                .set_timeout_with_callback_and_timeout_and_arguments_0(resolve.unchecked_ref(), ms)
-                .ok();
-        }
-    });
-    JsFuture::from(promise).await.ok();
 }
 
 fn connect_options() -> Result<JsValue, JsValue> {

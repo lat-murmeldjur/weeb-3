@@ -401,7 +401,7 @@ pub(crate) fn active_profile() -> NetworkProfile {
 
 pub(crate) fn initial_bootnodes(profile: NetworkProfile) -> Vec<&'static str> {
     let mut bootnodes = profile.bootnodes.to_vec();
-    bootnodes.shuffle(&mut rand::thread_rng());
+    bootnodes.shuffle(&mut rand::rng());
     bootnodes.truncate(INITIAL_BOOTNODE_BURST);
     bootnodes
 }

@@ -74,13 +74,15 @@ mod connection {
             "let peer_dial_scheduler =",
             "let swarm_event_loop = async",
         );
-        assert!(feeder.contains("VecDeque::<QueuedPeerDial>::new()"));
-        assert!(feeder.contains("HashSet::<(PeerId, Multiaddr)>::new()"));
-        assert!(feeder.contains("try_reserve_connection_capacity("));
-        assert!(feeder.contains("queue.pop_front()"));
-        assert!(feeder.contains("queue.push_back(candidate)"));
-        assert!(feeder.contains("Box::pin(capacity_changed)"));
-        assert!(feeder.contains("Box::pin(peers_instructions_chan_incoming.recv())"));
+        crate::source::assert_contains(feeder, &[
+            "VecDeque::<QueuedPeerDial>::new()",
+            "HashSet::<(PeerId, Multiaddr)>::new()",
+            "try_reserve_connection_capacity(",
+            "queue.pop_front()",
+            "queue.push_back(candidate)",
+            "Box::pin(capacity_changed)",
+            "Box::pin(peers_instructions_chan_incoming.recv())",
+        ]);
         assert!(!feeder.contains("task::sleep"));
         assert!(feeder.contains("queue_peer_dial_retry("));
         assert!(runtime.contains("mpsc::bounded::<PeerDialInstruction>(PEER_DIAL_INGEST_BATCH)"));
@@ -224,9 +226,11 @@ mod connection {
             "let peer_dial_scheduler =",
             "let swarm_event_loop = async",
         );
-        assert!(feeder.contains("peers_instructions_chan_incoming.recv()"));
-        assert!(feeder.contains("cooldowns.contains(&candidate.peer)"));
-        assert!(feeder.contains("queue.push_front(candidate)"));
+        crate::source::assert_contains(feeder, &[
+            "peers_instructions_chan_incoming.recv()",
+            "cooldowns.contains(&candidate.peer)",
+            "queue.push_front(candidate)",
+        ]);
         assert!(feeder.find("changed.listen()").unwrap()
             < feeder.find("try_reserve_connection_capacity(").unwrap());
         assert!(!feeder.contains("last_population_rescan_ms"));
@@ -329,19 +333,23 @@ mod connection {
 
         let runtime = crate::RUNTIME_SOURCE;
         let address_filter = include_str!("../src/addresses.rs");
-        assert!(runtime.contains("is_publicly_dialable_underlay(&source_addr)"));
-        assert!(runtime.contains("browser_dial_address(source_addr).ok()?"));
-        assert!(runtime.contains("browser_dial_address(addr33).unwrap_or_else"));
+        crate::source::assert_contains(runtime, &[
+            "is_publicly_dialable_underlay(&source_addr)",
+            "browser_dial_address(source_addr).ok()?",
+            "browser_dial_address(addr33).unwrap_or_else",
+        ]);
         assert!(address_filter.contains("pub(crate) fn browser_dial_address("));
         assert!(!address_filter.contains("enum UnderlayFormat"));
         assert!(!address_filter.contains("fn beewss_to_dns_transformed"));
         assert!(runtime.contains("!self.allow_private_gossip.load(Ordering::Acquire)"));
         assert!(runtime.contains("self.service_worker_network_id() != 0"));
-        assert!(address_filter.contains("|embedded| embedded == address"));
-        assert!(address_filter.contains(".map(is_public_ipv4)"));
-        assert!(address_filter.contains(".unwrap_or_else(|| is_public_dns_name(&hostname))"));
-        assert!(address_filter.contains("&& !ends_with(\".local\")"));
-        assert!(address_filter.contains("eq_ignore_ascii_case"));
+        crate::source::assert_contains(address_filter, &[
+            "|embedded| embedded == address",
+            ".map(is_public_ipv4)",
+            ".unwrap_or_else(|| is_public_dns_name(&hostname))",
+            "&& !ends_with(\".local\")",
+            "eq_ignore_ascii_case",
+        ]);
         assert!(include_str!("../src/handlers.rs").contains("underlay: peer.underlay,"));
     }
 
@@ -356,9 +364,11 @@ mod connection {
             "let accounting_event_handle = async",
         );
 
-        assert!(profile.contains("bootnodes.shuffle(&mut rand::thread_rng())"));
-        assert!(profile.contains("pub(crate) const INITIAL_BOOTNODE_BURST: usize = 160;"));
-        assert!(profile.contains("bootnodes.truncate(INITIAL_BOOTNODE_BURST)"));
+        crate::source::assert_contains(profile, &[
+            "bootnodes.shuffle(&mut rand::rng())",
+            "pub(crate) const INITIAL_BOOTNODE_BURST: usize = 160;",
+            "bootnodes.truncate(INITIAL_BOOTNODE_BURST)",
+        ]);
         assert!(accounting.contains("pub(crate) const CONNECTION_BUILDUP_LIMIT: u64 = 200;"));
         assert!(handler.contains("let mut bootnode_changes = vec![first_change];"));
         assert!(handler.contains("while let Ok(change) = self.bootnode_port.1.try_recv()"));
@@ -405,27 +415,28 @@ mod connection {
             .next()
             .and_then(|source| source.split("identify::Event::Error {").next())
             .expect("identify receive lifecycle");
-        assert!(received.contains("canonical_identify_address"));
-        assert!(received.contains("canonical.is_none()"));
-        assert!(received.contains("let observed_addr = info.observed_addr;"));
-        assert!(received.contains("Some(observed_addr.clone())"));
-        assert!(received.contains("try_from_multiaddr(&info.observed_addr)"));
-        assert!(received.contains(".is_some_and(|peer| peer != identify_local_peer_id)"));
+        crate::source::assert_contains(received, &[
+            "canonical_identify_address",
+            "canonical.is_none()",
+            "let observed_addr = info.observed_addr;",
+            "Some(observed_addr.clone())",
+            "try_from_multiaddr(&info.observed_addr)",
+            ".is_some_and(|peer| peer != identify_local_peer_id)",
+        ]);
         assert_eq!(received.matches("physical_connections").count(), 1);
         assert_eq!(received.matches("handshake_ready_connections").count(), 1);
         assert!(received.contains("swarm.add_external_address(canonical)"));
-        let push = received
-            .find(".push(std::iter::once(peer_id))")
-            .expect("Identify push");
-        let ready = received
-            .find("mark_handshake_ready_connection(")
-            .expect("Bee handshake readiness");
-        assert!(push < ready);
-        assert!(!runtime.contains("IDENTIFY_PUSH_CONCURRENCY"));
-        assert!(!runtime.contains("identify_push_capacity"));
-        assert!(!runtime.contains("IDENTIFY_PUSH_TIMEOUT_MS"));
-        assert!(!runtime.contains("pending_identify_push"));
-        assert!(!runtime.contains("identify::Event::Pushed {"));
+        crate::source::assert_first_in_order(received, &[
+            (".push(std::iter::once(peer_id))", "Identify push"),
+            ("mark_handshake_ready_connection(", "Bee handshake readiness"),
+        ]);
+        crate::source::assert_excludes(runtime, &[
+            "IDENTIFY_PUSH_CONCURRENCY",
+            "identify_push_capacity",
+            "IDENTIFY_PUSH_TIMEOUT_MS",
+            "pending_identify_push",
+            "identify::Event::Pushed {",
+        ]);
         assert!(runtime.contains("identify::Event::Received { .. } | identify::Event::Error { .. }"));
         assert_eq!(
             runtime
@@ -453,12 +464,14 @@ mod connection {
             "async fn close_failed_identify_connection(",
             "async fn remove_connection_attempt(",
         );
-        assert!(exact_close.contains("attempt.physical_connection_id == Some(connection_id)"));
-        assert!(exact_close.contains("!attempt.identify_failed"));
-        assert!(exact_close.contains("handshake_ready_connections"));
-        assert!(exact_close.contains("connections.contains(&connection_id)"));
-        assert!(exact_close.contains("attempt.identify_failed = true;"));
-        assert!(exact_close.contains("swarm.lock().await.close_connection(connection_id)"));
+        crate::source::assert_contains(exact_close, &[
+            "attempt.physical_connection_id == Some(connection_id)",
+            "!attempt.identify_failed",
+            "handshake_ready_connections",
+            "connections.contains(&connection_id)",
+            "attempt.identify_failed = true;",
+            "swarm.lock().await.close_connection(connection_id)",
+        ]);
     }
 
     #[test]
@@ -469,9 +482,11 @@ mod connection {
             "pub(crate) async fn connect_bootnodes_for_current_network(",
             "pub(super) fn current_connection_generation(",
         );
-        assert!(connect.contains("is_private_or_local_bootnode(address)"));
-        assert!(connect.contains("!profile.bootnodes.contains(&address.as_str())"));
-        assert!(connect.contains(".store(private_custom_bootnodes, Ordering::Release)"));
+        crate::source::assert_contains(connect, &[
+            "is_private_or_local_bootnode(address)",
+            "!profile.bootnodes.contains(&address.as_str())",
+            ".store(private_custom_bootnodes, Ordering::Release)",
+        ]);
         assert!(!connect.contains(".store(custom_bootnodes, Ordering::Release)"));
 
         let private_check = crate::source::between(
@@ -531,11 +546,11 @@ mod connection {
                 && threshold < promotion,
             "a handshake must own physical and counted capacity before publication and promotion"
         );
-        assert!(
-            accounting.contains("let accounting_peer_for_timeout = accounting_peer_lock.clone();")
-        );
-        assert!(accounting.contains("Arc::ptr_eq("));
-        assert!(accounting.contains("peer_file.connection_attempt_id == connection_attempt_id"));
+        crate::source::assert_contains(accounting, &[
+            "let accounting_peer_for_timeout = accounting_peer_lock.clone();",
+            "Arc::ptr_eq(",
+            "peer_file.connection_attempt_id == connection_attempt_id",
+        ]);
         assert!(!accounting.contains("timeout_attempt_id"));
 
         let promotion = crate::source::between(
@@ -583,11 +598,11 @@ mod connection {
             "let pricing_inbound_handle = async move",
             "let gossip_peers_instructions",
         );
-        assert!(inbound.contains("exclusive_physical_connection("));
-        assert!(inbound.contains("TransportConnectionSession::capture("));
-        assert!(inbound.contains(
-            "pricing_handler(peer, stream, pricing_session, &pricing_chan_outgoing).await"
-        ));
+        crate::source::assert_contains(inbound, &[
+            "exclusive_physical_connection(",
+            "TransportConnectionSession::capture(",
+            "pricing_handler(peer, stream, pricing_session, &pricing_chan_outgoing).await",
+        ]);
 
         let handler_source = include_str!("../src/handlers.rs");
         let handler = crate::source::between(
@@ -595,20 +610,22 @@ mod connection {
             "pub async fn pricing_handler(",
             "pub async fn gossip_handler(",
         );
-        assert!(handler.contains("session: TransportConnectionSession"));
-        assert!(handler.contains("if !session.is_current()"));
-        assert!(handler.contains("pricing_updates.try_send((peer, payment_threshold, session))"));
+        crate::source::assert_contains(handler, &[
+            "session: TransportConnectionSession",
+            "if !session.is_current()",
+            "pricing_updates.try_send((peer, payment_threshold, session))",
+        ]);
 
         let application = crate::source::between(
             runtime,
             "let pricing_event_handle = async",
             "let cheques_active_cache",
         );
-        assert!(application.contains("let (peer, amount, pricing_session) = pricing;"));
-        assert!(application.contains("pricing_session.is_current()"));
-        assert!(
-            application.contains("expected_connection == Some(pricing_session.connection_id())")
-        );
+        crate::source::assert_contains(application, &[
+            "let (peer, amount, pricing_session) = pricing;",
+            "pricing_session.is_current()",
+            "expected_connection == Some(pricing_session.connection_id())",
+        ]);
     }
 
     #[test]
@@ -707,20 +724,17 @@ mod connection {
             "pub(super) async fn current_connection_context(&self)",
             "pub(super) fn bump_connection_generation(&self)",
         );
-        let before = context
-            .find("let before = self.current_connection_generation();")
-            .unwrap();
-        let network = context
-            .find("let network_id = *self.network_id.lock().await;")
-            .unwrap();
-        let after = context
-            .find("let after = self.current_connection_generation();")
-            .unwrap();
-        assert!(before < network && network < after);
-        assert!(runtime.contains(".fetch_update("));
-        assert!(runtime.contains("Ordering::AcqRel"));
-        assert!(runtime.contains("Ordering::Acquire"));
-        assert!(runtime.contains("Some(generation.saturating_add(1))"));
+        crate::source::assert_first_in_order(context, &[
+            ("let before = self.current_connection_generation();", "missing source marker"),
+            ("let network_id = *self.network_id.lock().await;", "missing source marker"),
+            ("let after = self.current_connection_generation();", "missing source marker"),
+        ]);
+        crate::source::assert_contains(runtime, &[
+            ".fetch_update(",
+            "Ordering::AcqRel",
+            "Ordering::Acquire",
+            "Some(generation.saturating_add(1))",
+        ]);
         assert!(!runtime.contains("connection_generation.lock().await"));
     }
 
@@ -749,14 +763,16 @@ mod connection {
             .expect("terminal accounting mutation");
         assert!(balance < session && session < dispatch);
         assert!(dispatch < completion_time && completion_time < mutation);
-        assert!(instruction.contains("if !refreshment_due("));
-        assert!(instruction.contains("account.threshold,"));
-        assert!(instruction.contains("account.refresh_scheduled = false;"));
-        assert!(instruction.contains("RefreshmentOutcome::NotDispatched => {"));
-        assert!(instruction.contains("RefreshmentOutcome::Acknowledged(0)"));
-        assert!(instruction.contains("RefreshmentOutcome::AmbiguousAfterPayment"));
-        assert!(instruction.contains("account.balance = 0;"));
-        assert!(instruction.contains("account.threshold"));
+        crate::source::assert_contains(instruction, &[
+            "if !refreshment_due(",
+            "account.threshold,",
+            "account.refresh_scheduled = false;",
+            "RefreshmentOutcome::NotDispatched => {",
+            "RefreshmentOutcome::Acknowledged(0)",
+            "RefreshmentOutcome::AmbiguousAfterPayment",
+            "account.balance = 0;",
+            "account.threshold",
+        ]);
         assert!(instruction[dispatch..].contains("attempted_amount,"));
         assert!(instruction.contains("quiesce_drain_and_close_accounting_session("));
         assert!(!instruction.contains("REFRESH_RATE * 100"));
@@ -769,16 +785,11 @@ mod connection {
             "async fn quiesce_drain_and_close_accounting_session(",
             "#[derive(NetworkBehaviour)]",
         );
-        let quiesce = ambiguous_close
-            .find("account.connection_id = None;")
-            .expect("new reservation quiescence");
-        let drain = ambiguous_close
-            .find("accounting_peer.lock().await.reserve == 0")
-            .expect("dispatched accounting drain");
-        let close = ambiguous_close
-            .find("swarm.close_connection(connection_id)")
-            .expect("exact physical close");
-        assert!(quiesce < drain && drain < close);
+        crate::source::assert_first_in_order(ambiguous_close, &[
+            ("account.connection_id = None;", "new reservation quiescence"),
+            ("accounting_peer.lock().await.reserve == 0", "dispatched accounting drain"),
+            ("swarm.close_connection(connection_id)", "exact physical close"),
+        ]);
         assert!(!ambiguous_close.contains("timeout("));
 
         let accounting = include_str!("../src/accounting.rs");
@@ -897,12 +908,16 @@ mod connection {
                     .next()
             })
             .expect("retrieve dispatcher");
-        assert!(retrieve.contains("let retrieve_dispatch_yield_every = 128usize;"));
-        assert!(retrieve.contains("let mut retrieve_dispatches_since_browser_yield = 0usize;"));
-        assert!(retrieve.contains("async_std::task::sleep(Duration::ZERO).await;"));
-        assert!(!retrieve.contains("RETRIEVE_QUEUE_HOT_LOOP_GUARD_MS"));
-        assert!(!retrieve.contains("wave_done"));
-        assert!(!retrieve.contains("Completed {} of {} chunk retrieval requests"));
+        crate::source::assert_contains(retrieve, &[
+            "let retrieve_dispatch_yield_every = 128usize;",
+            "let mut retrieve_dispatches_since_browser_yield = 0usize;",
+            "async_std::task::sleep(Duration::ZERO).await;",
+        ]);
+        crate::source::assert_excludes(retrieve, &[
+            "RETRIEVE_QUEUE_HOT_LOOP_GUARD_MS",
+            "wave_done",
+            "Completed {} of {} chunk retrieval requests",
+        ]);
 
         let refresh = crate::source::between(
             runtime,
@@ -946,9 +961,11 @@ mod connection {
             "async fn handshake_exchange(",
             "pub async fn pricing_handler(",
         );
-        assert!(handshake.contains("deserialize_underlays(&syn.observed_underlay)"));
-        assert!(handshake.contains("try_from_multiaddr(underlay).as_ref() != Some(&local_peer)"));
-        assert!(handshake.contains("let underlay = syn.observed_underlay;"));
+        crate::source::assert_contains(handshake, &[
+            "deserialize_underlays(&syn.observed_underlay)",
+            "try_from_multiaddr(underlay).as_ref() != Some(&local_peer)",
+            "let underlay = syn.observed_underlay;",
+        ]);
         assert!(!handshake.contains("underlay.clone()"));
         assert!(handshake.contains("if ack.network_id != network_id"));
 
@@ -966,11 +983,13 @@ mod connection {
         assert!(open < capture);
         assert!(connection.contains("peer, connection_id, physical_connections"));
         assert!(!runtime.contains("self_ephemerals"));
-        assert!(handlers.contains("read_control_protocol_frame(&mut stream).await"));
-        assert!(handlers.contains("stream.read_exact(&mut frame).await"));
-        assert!(handlers.contains("enum RefreshmentOutcome"));
-        assert!(handlers.contains("if acknowledged_amount > amount"));
-        assert!(handlers.contains("RefreshmentOutcome::AmbiguousAfterPayment"));
+        crate::source::assert_contains(handlers, &[
+            "read_control_protocol_frame(&mut stream).await",
+            "stream.read_exact(&mut frame).await",
+            "enum RefreshmentOutcome",
+            "if acknowledged_amount > amount",
+            "RefreshmentOutcome::AmbiguousAfterPayment",
+        ]);
         let refresh_handler = crate::source::between(
             handlers,
             "pub async fn refresh_handler(",
@@ -1013,11 +1032,13 @@ mod connection {
         ]);
         assert!(!handlers.contains("syn_ack.ack.clone().unwrap()"));
 
-        assert!(runtime.contains("cheques.insert("));
-        assert!(runtime.contains("claim_current_cheque("));
-        assert!(runtime.contains("(cheque_amt, cheque_generation)"));
-        assert!(runtime.contains("map.get(&peer).copied() == Some((amount, cheque_generation))"));
-        assert!(runtime.contains("generation == cheque_generation"));
+        crate::source::assert_contains(runtime, &[
+            "cheques.insert(",
+            "claim_current_cheque(",
+            "(cheque_amt, cheque_generation)",
+            "map.get(&peer).copied() == Some((amount, cheque_generation))",
+            "generation == cheque_generation",
+        ]);
         assert!(!runtime.contains("swap_beneficiaries"));
         assert!(!handlers.contains("beneficiaries:"));
         let cheque = handlers.split("async fn cheque_exchange(").nth(1).unwrap();
@@ -1034,22 +1055,13 @@ mod connection {
 
         let cheque_claim =
             crate::source::between(runtime, "async fn claim_current_cheque(", "\npub(crate) ");
-        let lifecycle = cheque_claim
-            .find("wings.connected_peers.lock().await")
-            .expect("peer lifecycle guard");
-        let account = cheque_claim
-            .find(".accounting_peers")
-            .expect("exact account lookup");
-        let claims = cheque_claim
-            .find("wings.ongoing_cheques.lock().await")
-            .expect("cheque claim map");
-        let physical = cheque_claim
-            .find("exclusive_physical_connection(")
-            .expect("last physical-session check");
-        let publish = cheque_claim
-            .find("cheques.insert(")
-            .expect("claim publication");
-        assert!(lifecycle < account && account < claims && claims < physical && physical < publish);
+        crate::source::assert_first_in_order(cheque_claim, &[
+            ("wings.connected_peers.lock().await", "peer lifecycle guard"),
+            (".accounting_peers", "exact account lookup"),
+            ("wings.ongoing_cheques.lock().await", "cheque claim map"),
+            ("exclusive_physical_connection(", "last physical-session check"),
+            ("cheques.insert(", "claim publication"),
+        ]);
 
         let cheque_dispatch = crate::source::between(
             runtime,
@@ -1153,9 +1165,11 @@ mod connection {
     #[test]
     fn accounting_protocol_streams_cannot_implicitly_redial_or_cross_sessions() {
         let runtime = crate::RUNTIME_SOURCE;
-        assert!(runtime.contains("Poll::Ready(ToSwarm::Dial { opts })"));
-        assert!(runtime.contains("FromSwarm::DialFailure(DialFailure"));
-        assert!(runtime.contains("let error = DialError::NoAddresses;"));
+        crate::source::assert_contains(runtime, &[
+            "Poll::Ready(ToSwarm::Dial { opts })",
+            "FromSwarm::DialFailure(DialFailure",
+            "let error = DialError::NoAddresses;",
+        ]);
 
         let handlers = include_str!("../src/handlers.rs");
         let open_current = crate::source::between(
@@ -1189,7 +1203,7 @@ mod connection {
         let selection = crate::source::between(
             retrieval,
             "async fn select_retrieve_peer(",
-            "async fn settle_retrieve_attempt(",
+            "async fn retrieve_attempt(",
         );
         crate::source::assert_in_order(
             &crate::source::compact(selection),
@@ -1225,18 +1239,18 @@ mod retrieve_group_stream {
         );
         assert_eq!(
             group.matches("child_emitter.emit(").count(),
-            2,
-            "the shared cache-hit path and reconstruction both publish"
+            3,
+            "cache hits, received data, and reconstruction all publish"
         );
         assert!(
             group.contains("if requested_count == data_count")
-                && group.contains("dispatch_group_parity(")
+                && group.contains("dispatch_group_shards(")
                 && group.contains("usize::MAX"),
             "the conservative legacy fallback must retain its full-group parity hedge"
         );
 
         let traversal = source_section(
-            "async fn retrieve_data_range_from_root_with_prefix_cancellable(",
+            "async fn retrieve_data_range_from_root(",
             "async fn retrieve_data_joined(",
         );
         assert!(traversal.contains("fetch_data_group_indices_streaming("));
@@ -1249,7 +1263,7 @@ mod retrieve_group_stream {
     #[test]
     fn queued_children_keep_the_join_alive_and_failure_is_all_or_nothing() {
         let traversal = source_section(
-            "async fn retrieve_data_range_from_root_with_prefix_cancellable(",
+            "async fn retrieve_data_range_from_root(",
             "async fn retrieve_data_joined(",
         );
         let completion = traversal
@@ -1290,7 +1304,7 @@ mod retrieve_group_stream {
         assert!(!raw_flights.contains("wait_closed().await"));
 
         let traversal = source_section(
-            "async fn retrieve_data_range_from_root_with_prefix_cancellable(",
+            "async fn retrieve_data_range_from_root(",
             "async fn retrieve_data_joined(",
         );
         assert!(traversal.contains("groups.len() < RETRIEVE_DATA_GROUP_CONCURRENCY"));
@@ -1350,11 +1364,11 @@ mod rolling_erasure_tail {
             .find("let mut cached_requested = cached_requested.into_iter();")
             .map(|offset| candidate + offset)
             .expect("initial dispatch");
-        assert!(group[candidate..dispatch].contains("cached_decoded_and_raw_chunk("));
-        assert!(!group[dispatch..].contains("cached_decoded_and_raw_chunk("));
+        assert!(group[candidate..dispatch].contains("cache.get_decoded(reference, true)"));
+        assert!(!group[dispatch..].contains("cache.get_decoded(reference, true)"));
         let dispatch_source = &group[dispatch..];
         let reference = dispatch_source
-            .find("let reference = &data_references[index];")
+            .find("let reference = data_references.clone().nth(index)?;")
             .expect("requested child reference");
         let cache_hit = dispatch_source
             .find("cached_decoded_chunk(reference)")
@@ -1369,27 +1383,6 @@ mod rolling_erasure_tail {
         assert!(cache.contains("let raw = include_raw.then(|| entry.raw.clone()).flatten()"));
         assert!(RETRIEVAL_SOURCE.contains("get_decoded(reference, false)"));
         assert!(RETRIEVAL_SOURCE.contains("get_decoded(reference, true)"));
-    }
-
-    #[test]
-    fn a_ready_terminal_result_wins_the_freed_slot_before_parity() {
-        let group = group_source();
-        let loop_start = group.find("loop {").expect("coordinator loop");
-        let ready = group[loop_start..]
-            .find("result_in.try_recv()")
-            .map(|offset| loop_start + offset)
-            .expect("ready result poll");
-        let terminal_check = group[loop_start..]
-            .find("let terminal =")
-            .map(|offset| loop_start + offset)
-            .expect("terminal check");
-        let parity_admission = group[loop_start..]
-            .find("dispatch_group_parity(")
-            .map(|offset| loop_start + offset)
-            .expect("parity admission");
-        assert!(ready < terminal_check && terminal_check < parity_admission);
-        assert!(group.contains("std::iter::from_fn(|| result_in.try_recv().ok())"));
-        assert!(group.contains("Re-evaluate terminal state before any replacement admission."));
     }
 
     #[test]
@@ -1450,12 +1443,12 @@ mod rolling_erasure_tail {
     #[test]
     fn rolling_and_legacy_paths_keep_their_required_boundaries() {
         let group = group_source();
-        assert!(group.contains(
-            "let hedge_due = rolling && (Date::now() - started).max(0.0) as u64 >= hedge_after;"
-        ));
-        assert!(group.contains("let active = dispatched.checked_sub(completed)?;"));
-        assert!(group.contains("data_count.checked_sub(active)?"));
-        assert!(group.contains("if completed == dispatched && (!rolling || hedge_due)"));
+        crate::source::assert_contains(group, &[
+            "let hedge_due = rolling && (Date::now() - started).max(0.0) as u64 >= hedge_after;",
+            "let active = dispatched.checked_sub(completed)?;",
+            "data_count.checked_sub(active)?",
+            "if completed == dispatched && (!rolling || hedge_due)",
+        ]);
         let rolling_start = group.find("if hedge_due {").expect("rolling branch");
         let legacy_start = group[rolling_start..]
             .find("} else if !rolling && recovery_dispatched {")
@@ -1464,10 +1457,10 @@ mod rolling_erasure_tail {
         let rolling_branch = &group[rolling_start..legacy_start];
         let legacy_branch = &group[legacy_start..];
 
-        assert!(rolling_branch.contains("dispatch_group_parity("));
+        assert!(rolling_branch.contains("dispatch_group_shards("));
         assert!(rolling_branch.contains("RetrieveHedgeDemand::DistinctShardManaged"));
         assert!(!rolling_branch.contains("RETRIEVE_RS_HEDGE_AFTER_MS"));
-        assert!(legacy_branch.contains("dispatch_group_parity("));
+        assert!(legacy_branch.contains("dispatch_group_shards("));
         assert!(legacy_branch.contains("RETRIEVE_RS_HEDGE_AFTER_MS"));
         assert!(group.contains("requested_count == data_count"));
         assert!(group.contains("let started = Date::now();"));
@@ -1477,12 +1470,11 @@ mod rolling_erasure_tail {
             "fn queue_drained_raw_chunk(",
             "fn decrypt_join_chunk",
         );
-        let promote = raw_queue
-            .find("shared_demand.promote(hedge_demand)")
-            .unwrap();
-        let follower_branch = raw_queue.find("if !registration.leader").unwrap();
-        let dispatch = raw_queue.find("self.chunks.try_send(").unwrap();
-        assert!(promote < follower_branch && follower_branch < dispatch);
+        crate::source::assert_first_in_order(raw_queue, &[
+            ("shared_demand.promote(hedge_demand)", "missing source marker"),
+            ("if !registration.leader", "missing source marker"),
+            ("self.chunks.try_send(", "missing source marker"),
+        ]);
         assert!(raw_queue.contains("hedge_demand: registration.shared.hedge_demand.clone()"));
 
         let retrieve_chunk = crate::source::between(
@@ -1490,9 +1482,11 @@ mod rolling_erasure_tail {
             "pub async fn retrieve_chunk(",
             "pub async fn retrieve_check_chunk(",
         );
-        assert!(retrieve_chunk.contains("map(SharedRetrieveHedgeDemand::current)"));
-        assert!(retrieve_chunk.contains("unwrap_or(RetrieveHedgeDemand::Ordinary)"));
-        assert!(retrieve_chunk.contains("wait_until_ordinary()"));
+        crate::source::assert_contains(retrieve_chunk, &[
+            "map(SharedRetrieveHedgeDemand::current)",
+            "unwrap_or(RetrieveHedgeDemand::Ordinary)",
+            "wait_until_ordinary()",
+        ]);
         assert!(!retrieve_chunk.contains("RETRIEVE_MANAGED_ADMISSION_POLL_MS"));
         assert!(retrieve_chunk.contains("mpsc::unbounded::<RetrieveAttemptResult>()"));
         let physical_attempt = crate::source::between(
@@ -1502,10 +1496,13 @@ mod rolling_erasure_tail {
         );
         assert!(physical_attempt.contains("retrieve_handler(peer, &request, control, session)"));
         assert!(!physical_attempt.contains("spawn_local"));
-        assert!(
-            physical_attempt.find("settle_retrieve_attempt(").unwrap()
-                > physical_attempt.find("Err(_)").unwrap()
-        );
+        crate::source::assert_in_order(physical_attempt, &[
+            "Err(_)",
+            "verify_chunk(&request.addr, &chunk)",
+            "apply_credit(&accounting_peer, req_price, &refresh_chan).await",
+            "return RetrieveAttemptResult::Found(chunk, soc)",
+            "cancel_reserve(&accounting_peer, req_price).await",
+        ]);
         assert!(RETRIEVAL_SOURCE.contains("const RETRIEVE_ATTEMPT_TIMEOUT_MS: u64 = 10_000;"));
         assert!(RUNTIME_SOURCE.contains("hedge_demand: None"));
     }
@@ -1875,14 +1872,14 @@ mod retrieve_singleflight {
     fn completion_detaches_every_waiter_atomically() {
         let mut flights = SingleflightRegistry::<u8, usize, ()>::default();
         let first = flights.register(9, 4, || ());
-        flights.register(9, 2, || ());
+        let second = flights.register(9, 2, || ());
 
         let mut waiters = flights
             .take(&9, first.flight_id)
             .expect("active flight")
             .waiters;
-        waiters.sort_unstable();
-        assert_eq!(waiters, vec![2, 4]);
+        waiters.sort_unstable_by_key(|(_, waiter)| *waiter);
+        assert_eq!(waiters, vec![(second.waiter_id, 2), (first.waiter_id, 4)]);
     }
 
     #[test]
@@ -1904,7 +1901,7 @@ mod retrieve_singleflight {
         let old_flight = flights
             .take(&3, old.flight_id)
             .expect("old producer completes its own flight");
-        assert_eq!(old_flight.waiters, Vec::<&'static str>::new());
+        assert!(old_flight.waiters.is_empty());
 
         let successor = flights.register(3, "new", || Rc::new(Cell::new(true)));
         assert!(successor.leader);
@@ -1919,6 +1916,6 @@ mod retrieve_singleflight {
         let flight = flights
             .take(&3, successor.flight_id)
             .expect("successor remains registered");
-        assert_eq!(flight.waiters, vec!["new"]);
+        assert_eq!(flight.waiters, vec![(successor.waiter_id, "new")]);
     }
 }

@@ -1,10 +1,73 @@
 use js_sys::{Array, Object, Reflect, Uint8Array};
-use wasm_bindgen::{JsCast, JsValue};
+use wasm_bindgen::{JsCast, JsValue, closure::Closure};
+use web_sys::{Event, EventTarget, MessageChannel, MessageEvent, MessagePort};
 
 use crate::{bzz_stream::BzzMetadata, events::ProgressRow};
 
 pub(crate) const FEED_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 pub(crate) const REQUEST_TIMEOUT: &str = "request timed out";
+
+pub(crate) struct DomListener {
+    target: EventTarget,
+    event: &'static str,
+    callback: Closure<dyn FnMut(Event)>,
+}
+
+impl DomListener {
+    pub(crate) fn new(
+        target: &EventTarget,
+        event: &'static str,
+        callback: impl FnMut(Event) + 'static,
+    ) -> Result<Self, JsValue> {
+        let callback = Closure::<dyn FnMut(Event)>::new(callback);
+        target.add_event_listener_with_callback(event, callback.as_ref().unchecked_ref())?;
+        Ok(Self { target: target.clone(), event, callback })
+    }
+}
+
+impl Drop for DomListener {
+    fn drop(&mut self) {
+        let _ = self.target.remove_event_listener_with_callback(
+            self.event, self.callback.as_ref().unchecked_ref(),
+        );
+    }
+}
+
+pub(crate) struct ReplyChannel {
+    pub(crate) receiver: futures::channel::oneshot::Receiver<JsValue>,
+    pub(crate) transfer: Array,
+    port: MessagePort,
+    _callback: Closure<dyn FnMut(MessageEvent)>,
+}
+
+impl ReplyChannel {
+    pub(crate) fn new() -> Result<Self, JsValue> {
+        let channel = MessageChannel::new()?;
+        let (sender, receiver) = futures::channel::oneshot::channel();
+        let mut sender = Some(sender);
+        let callback = Closure::<dyn FnMut(MessageEvent)>::new(move |event: MessageEvent| {
+            if let Some(sender) = sender.take() {
+                let _ = sender.send(event.data());
+            }
+        });
+        let port = channel.port1();
+        port.set_onmessage(Some(callback.as_ref().unchecked_ref()));
+        port.start();
+        Ok(Self {
+            receiver,
+            transfer: Array::of1(channel.port2().as_ref()),
+            port,
+            _callback: callback,
+        })
+    }
+}
+
+impl Drop for ReplyChannel {
+    fn drop(&mut self) {
+        self.port.set_onmessage(None);
+        self.port.close();
+    }
+}
 
 pub(crate) fn property(value: &JsValue, name: &str) -> JsValue {
     Reflect::get(value, &JsValue::from_str(name)).unwrap_or(JsValue::UNDEFINED)

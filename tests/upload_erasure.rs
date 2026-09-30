@@ -241,15 +241,9 @@ mod bee_compatibility {
             );
 
             let (split_data, split_parity) =
-                erasure_coding::split_references(payload.clone().into(), span, level, encrypted).unwrap();
-            assert_eq!(
-                split_data,
-                children
-                    .iter()
-                    .map(|child| child.reference.clone())
-                    .collect::<Vec<_>>()
-            );
-            assert_eq!(split_parity, parity_references);
+                erasure_coding::split_references(&payload, layout, encrypted).unwrap();
+            assert!(split_data.eq(children.iter().map(|child| child.reference.as_slice())));
+            assert!(split_parity.eq(parity_references.iter().map(Vec::as_slice)));
 
             let mut encoded_span = span.to_le_bytes();
             if layout.parity_shards > 0 {
@@ -380,22 +374,20 @@ mod bee_compatibility {
             decoded: &DecodedNode,
             encrypted: bool,
         ) -> Result<Vec<RecoveredChild>, String> {
-            let (data_references, parity_references) = erasure_coding::split_references(
-                decoded.payload.clone().into(),
-                decoded.span,
-                decoded.level,
-                encrypted,
-            )
-            .ok_or_else(|| "unable to split parent references".to_string())?;
+            let layout = erasure_coding::reference_layout(decoded.span, decoded.level, encrypted)
+                .ok_or_else(|| "invalid parent layout".to_string())?;
+            let (data_references, parity_references) =
+                erasure_coding::split_references(&decoded.payload, layout, encrypted)
+                    .ok_or_else(|| "unable to split parent references".to_string())?;
             let data_count = data_references.len();
             let mut shards: Vec<Option<Vec<u8>>> = data_references
-                .iter()
+                .clone()
                 .map(|reference| {
                     store
                         .get(reference)
                         .and_then(|raw| crate::erasure_test_support::padded_chunk(raw))
                 })
-                .chain(parity_references.iter().map(|reference| {
+                .chain(parity_references.clone().map(|reference| {
                     store
                         .get(reference)
                         .filter(|raw| raw.len() == CHUNK_WITH_SPAN_SIZE)
@@ -404,7 +396,7 @@ mod bee_compatibility {
                 .collect();
 
             if shards[..data_count].iter().any(Option::is_none) {
-                if parity_references.is_empty() {
+                if parity_references.len() == 0 {
                     return Err("missing data shard without parity".to_string());
                 }
                 crate::erasure_test_support::reconstruct_data(&mut shards, data_count)
@@ -412,7 +404,6 @@ mod bee_compatibility {
             }
 
             data_references
-                .into_iter()
                 .zip(shards.into_iter().take(data_count))
                 .map(|(reference, raw)| {
                     raw.map(|raw| (reference.to_vec(), raw))
@@ -495,16 +486,18 @@ mod bee_compatibility {
             join_range(tree, 0, tree.root.span)
         }
 
-        fn immediate_references(tree: &SimTree) -> erasure_coding::SplitReferences {
+        fn immediate_references(tree: &SimTree) -> (Vec<bytes::Bytes>, Vec<bytes::Bytes>) {
             let decoded = root_decoded(tree).unwrap();
             assert!(decoded.span > CHUNK_SIZE as u64);
-            erasure_coding::split_references(
-                decoded.payload.into(),
-                decoded.span,
-                decoded.level,
-                tree.encrypted,
+            let layout =
+                erasure_coding::reference_layout(decoded.span, decoded.level, tree.encrypted)
+                    .unwrap();
+            let (data, parity) =
+                erasure_coding::split_references(&decoded.payload, layout, tree.encrypted).unwrap();
+            (
+                data.map(bytes::Bytes::copy_from_slice).collect(),
+                parity.map(bytes::Bytes::copy_from_slice).collect(),
             )
-            .unwrap()
         }
 
         fn remove_shards(
@@ -1336,6 +1329,7 @@ mod erasure_contracts {
             for encrypted in [false, true] {
                 let span = level.max_shards(encrypted) as u64 * CHUNK_SIZE as u64;
                 let (data_count, parity_count) = reference_count(span, *level, encrypted).unwrap();
+                let layout = reference_layout(span, *level, encrypted).unwrap();
                 let data_reference_size = if encrypted {
                     ENCRYPTED_REFERENCE_SIZE
                 } else {
@@ -1353,22 +1347,29 @@ mod erasure_contracts {
                     payload.len(),
                     encoded_reference_payload_len(span, *level, encrypted).unwrap()
                 );
-                let (data, parity) = split_references(payload.clone().into(), span, *level, encrypted).unwrap();
+                let (data, parity) = split_references(&payload, layout, encrypted).unwrap();
                 assert_eq!(data.len(), data_count);
                 assert_eq!(parity.len(), parity_count);
-                for (index, reference) in data.iter().enumerate() {
+                for (index, reference) in data.enumerate() {
                     assert_eq!(reference, &vec![(index + 1) as u8; data_reference_size]);
+                    assert_eq!(
+                        reference.as_ptr(),
+                        payload[index * data_reference_size..].as_ptr()
+                    );
                 }
-                for (index, reference) in parity.iter().enumerate() {
+                for (index, reference) in parity.enumerate() {
                     assert_eq!(reference, &vec![0x80 | index as u8; HASH_SIZE]);
+                    assert_eq!(
+                        reference.as_ptr(),
+                        payload[data_count * data_reference_size + index * HASH_SIZE..].as_ptr()
+                    );
                 }
 
                 let mut too_long = payload.clone();
                 too_long.push(0);
-                assert!(split_references(too_long.into(), span, *level, encrypted).is_none());
+                assert!(split_references(&too_long, layout, encrypted).is_none());
                 assert!(
-                    split_references(payload[..payload.len() - 1].to_vec().into(), span, *level, encrypted)
-                        .is_none()
+                    split_references(&payload[..payload.len() - 1], layout, encrypted).is_none()
                 );
             }
         }

@@ -381,7 +381,7 @@ async fn hls_body(client: Arc<Weeb3>, reference: String, generation: Option<u64>
     let started = js_sys::Date::now();
     let body = async {
         let decoded = hex::decode(&reference).ok()?;
-        let root = retrieve_decoded_data_root(&decoded, &client.chunk_port.0).await?;
+        let root = retrieve_decoded_data_root(&decoded, &client.chunk_port.0, None).await?;
         if root.span == 0
             || root.span > HLS_BODY_MAX_BYTES
             || BODY_CACHE.with(|cache| cache.borrow().epoch != epoch)
@@ -498,8 +498,7 @@ fn presentation_playlist(active: &FeedSession) -> Option<std::borrow::Cow<'_, Hl
 }
 
 fn spawn_body_runway(id: u64) {
-    let Some(client) = FEED.with(|feed| {
-        let mut feed = feed.borrow_mut();
+    let Some(client) = FEED.with_borrow_mut(|feed| {
         let active = feed.active_mut().filter(|active| {
             active.id == id
                 && !active.body_runway_running
@@ -513,20 +512,25 @@ fn spawn_body_runway(id: u64) {
     spawn_local(async move {
         let mut loaded = HashSet::new();
         loop {
-            let reference = FEED.with(|feed| {
-                let feed = feed.borrow();
+            let reference = FEED.with_borrow(|feed| {
                 let active = feed.active().filter(|active| active.id == id)?;
+                let playlist = active.playlist.as_ref()?;
+                let first = playlist.segments.iter().find(|segment| !segment.gap)?;
+                let foreground = active.foreground.as_deref().filter(|reference| {
+                    active.start == HlsStart::Beginning && *reference != first.reference
+                });
                 let targets = body_runway_targets(active);
                 loaded.retain(|reference| {
                     targets.iter().any(|segment| !segment.gap && &segment.reference == reference)
                 });
                 targets
                     .iter()
-                    .find(|segment| {
+                    .filter(|segment| {
                         !segment.gap
                             && !loaded.contains(&segment.reference)
                             && !BODY_CACHE.with(|cache| cache.borrow().body_cached(&segment.reference))
                     })
+                    .min_by_key(|segment| foreground == Some(segment.reference.as_str()))
                     .map(|segment| segment.reference.clone())
             });
             let Some(reference) = reference else {
@@ -547,8 +551,7 @@ fn spawn_body_runway(id: u64) {
 }
 
 fn prefetch_from_reference(reference: &str, cached: bool) -> bool {
-    let runway = FEED.with(|feed| {
-        let mut feed = feed.borrow_mut();
+    let runway = FEED.with_borrow_mut(|feed| {
         if feed.feeds.len() > 1 {
             let contains = |active: &&FeedSession| {
                 active.playlist.as_ref().is_some_and(|playlist| {
@@ -619,8 +622,7 @@ fn begin_feed(
     view_generation: u64,
 ) -> u64 {
     let id = next_feed_id();
-    FEED.with(|feed| {
-        let mut feed = feed.borrow_mut();
+    FEED.with_borrow_mut(|feed| {
         if feed.feeds.is_empty() {
             feed.active = id;
         }
@@ -656,8 +658,7 @@ fn feed_is_current(id: u64, view_generation: u64) -> bool {
 }
 
 fn end_feed(id: u64) {
-    FEED.with(|feed| {
-        let mut feed = feed.borrow_mut();
+    FEED.with_borrow_mut(|feed| {
         feed.feeds.retain(|feed| feed.id != id);
     });
 }
@@ -667,8 +668,7 @@ fn install_snapshot(
     index: u64,
     mut playlist: HlsPlaylist,
 ) -> Option<()> {
-    FEED.with(|feed| {
-        let mut feed = feed.borrow_mut();
+    FEED.with_borrow_mut(|feed| {
         let active = feed.get_mut(id)?;
         if let Some(tail) = active.playlist.take() {
             playlist.merge_playlist(tail)?;
@@ -713,8 +713,7 @@ async fn prepare_live_plan(
     anchor: &(u64, String, bool),
 ) -> Result<(u64, super::HlsStartupPlan, u64), &'static str> {
     loop {
-        let (changed, prepared) = FEED.with(|feed| {
-            let mut feed = feed.borrow_mut();
+        let (changed, prepared) = FEED.with_borrow_mut(|feed| {
             let active = feed
                 .get_mut(id)
                 .filter(|_| result_view_request_is_current(view_generation))
@@ -826,7 +825,7 @@ async fn edge_probe_wave(
     indices: &[u64],
     lower_is_known: bool,
     attempt_limit: Option<usize>,
-) -> (Vec<Option<Vec<u8>>>, Vec<bool>) {
+) -> (Option<(usize, Vec<u8>)>, Vec<bool>) {
     let mut probes = Box::pin(
         stream::iter(indices.iter().copied().enumerate())
             .map(|(slot, index)| async move {
@@ -837,7 +836,7 @@ async fn edge_probe_wave(
             })
             .buffer_unordered(indices.len().max(1)),
     );
-    let mut found = vec![None; indices.len()];
+    let mut found = None;
     let mut missing = vec![false; indices.len()];
     let mut completed = vec![false; indices.len()];
     let deadline = if lower_is_known {
@@ -846,27 +845,24 @@ async fn edge_probe_wave(
         async_std::task::sleep(EDGE_COLD_WAVE_TIMEOUT).right_future()
     };
     futures::pin_mut!(deadline);
-    let mut positive_seen = false;
     while let future::Either::Left((Some((slot, result)), _)) =
         future::select(probes.next(), deadline.as_mut()).await
     {
         completed[slot] = true;
         match result {
             FeedProbe::Found(update) => {
-                found[slot] = Some(update);
-                if !positive_seen {
-                    positive_seen = true;
+                if found.is_none() {
                     deadline.set(async_std::task::sleep(EDGE_WAVE_TIMEOUT).right_future());
+                }
+                if found.as_ref().is_none_or(|(highest, _)| slot > *highest) {
+                    found = Some((slot, update));
                 }
             }
             FeedProbe::Missing => missing[slot] = true,
             FeedProbe::Transient => {}
         }
-        let first_unsettled = found
-            .iter()
-            .rposition(Option::is_some)
-            .map_or(0, |found| found + 1);
-        if (positive_seen || lower_is_known)
+        let first_unsettled = found.as_ref().map_or(0, |(slot, _)| slot + 1);
+        if (found.is_some() || lower_is_known)
             && hls_edge_wave_complete(first_unsettled, &missing, &completed)
         {
             break;
@@ -884,10 +880,10 @@ async fn discover_edge_update(
     lattice: Option<&Cell<Option<u64>>>,
 ) -> Option<(u64, Vec<u8>)> {
     let fast = Some(EDGE_PROBE_ATTEMPTS);
-    let (mut found, missing) =
+    let (found, missing) =
         edge_probe_wave(client, owner, topic, &EDGE_ANCHORS, false, fast).await;
-    let highest = found.iter().rposition(Option::is_some)?;
-    let mut latest = (EDGE_ANCHORS[highest], found[highest].take()?);
+    let (highest, update) = found?;
+    let mut latest = (EDGE_ANCHORS[highest], update);
     client.interface_log(format!("HLS edge anchor {}", latest.0));
     let mut upper = (highest + 1..EDGE_ANCHORS.len())
         .find(|slot| missing[*slot])
@@ -924,11 +920,11 @@ async fn discover_edge_update(
             )
             .chain(std::iter::once(upper))
             .collect::<Vec<_>>();
-        let (mut found, missing) =
+        let (found, missing) =
             edge_probe_wave(client, owner, topic, &indices, true, fast).await;
         let previous = (latest.0, upper);
-        if let Some(slot) = found.iter().rposition(Option::is_some) {
-            latest = (indices[slot], found[slot].take()?);
+        if let Some((slot, update)) = found {
+            latest = (indices[slot], update);
         }
         if let Some(next_upper) = indices
             .iter()
@@ -999,7 +995,7 @@ fn warm_hls_prefix(
                 return None;
             }
             let decoded = hex::decode(&segment.reference).ok()?;
-            let root = retrieve_decoded_data_root(&decoded, &client.chunk_port.0).await?;
+            let root = retrieve_decoded_data_root(&decoded, &client.chunk_port.0, None).await?;
             if !current() || root.span == 0 {
                 return None;
             }
@@ -1111,7 +1107,7 @@ fn history_repairs(
     head_index: u64,
     from_beginning: bool,
 ) -> Option<Vec<u64>> {
-    snapshots.sort_by_key(|(index, _)| *index);
+    HlsPlaylist::sort_snapshots(snapshots);
     let mut repairs = Vec::new();
     let mut add = |range: std::ops::Range<u64>| -> Option<()> {
         for index in range {
@@ -1150,8 +1146,7 @@ async fn hls_history(
     earlier: Option<f64>,
 ) -> Option<HlsPlaylist> {
     let head_start = head.program_start(js_sys::Date::parse);
-    let origin = earlier.or_else(|| FEED.with(|feed| {
-        let feed = feed.borrow();
+    let origin = earlier.or_else(|| FEED.with_borrow(|feed| {
         if feed.get(id)?.start != HlsStart::Live || head_start.is_none() {
             return None;
         }
@@ -1393,8 +1388,7 @@ fn render_active_feed(
     start: HlsStart,
     local_bytes_base: &str,
 ) -> Option<(u64, Vec<u8>, Option<u64>, u64)> {
-    FEED.with(|feed| {
-        let feed = feed.borrow();
+    FEED.with_borrow(|feed| {
         let feed = feed.find(owner, topic, pinned)?;
         let index = feed.index?;
         let playlist = if start == HlsStart::Live {
@@ -1414,30 +1408,28 @@ fn apply_update(
     id: u64,
     index: u64,
     merge: impl FnOnce(&mut HlsPlaylist) -> Option<usize>,
-) -> Option<usize> {
-    let appended = FEED.with(|feed| {
-        let mut feed = feed.borrow_mut();
+) -> Option<(usize, bool)> {
+    let (appended, closing) = FEED.with_borrow_mut(|feed| {
         let active = feed.get_mut(id)?;
         if active.index.is_some_and(|current| index <= current) {
             return None;
         }
         let playlist = active.playlist.as_mut()?;
         let appended = merge(playlist)?;
-        playlist.finalized = false;
+        let closing = std::mem::take(&mut playlist.finalized);
         active.index = Some(index);
         active.updated_at = js_sys::Date::now();
         active.changed.notify(usize::MAX);
-        Some(appended)
+        Some((appended, closing))
     })?;
     if appended != 0 {
         spawn_body_runway(id);
     }
-    Some(appended)
+    Some((appended, closing))
 }
 
 fn retain_live_start(id: u64, candidate: &mut HlsPlaylist) -> Option<()> {
-    FEED.with(|feed| {
-        let feed = feed.borrow();
+    FEED.with_borrow(|feed| {
         let active = feed.get(id)?;
         if active.start == HlsStart::Live
             && let Some(playlist) = active
@@ -1451,7 +1443,7 @@ fn retain_live_start(id: u64, candidate: &mut HlsPlaylist) -> Option<()> {
     })
 }
 
-fn apply_full_update(id: u64, index: u64, mut candidate: HlsPlaylist) -> Option<usize> {
+fn apply_full_update(id: u64, index: u64, mut candidate: HlsPlaylist) -> Option<(usize, bool)> {
     retain_live_start(id, &mut candidate)?;
     apply_update(id, index, |playlist| playlist.merge_playlist(candidate))
 }
@@ -1464,8 +1456,7 @@ fn apply_confirmed_snapshot(
     foreground: Option<String>,
 ) -> Option<usize> {
     retain_live_start(id, &mut candidate)?;
-    let appended = FEED.with(|feed| {
-        let mut feed = feed.borrow_mut();
+    let appended = FEED.with_borrow_mut(|feed| {
         let active = feed.get_mut(id).filter(|active| {
             result_view_request_is_current(active.view_generation)
                 && active.index.is_none_or(|current| index >= current)
@@ -1515,8 +1506,7 @@ pub(crate) fn live_tail_failure_identity(
     sequence: u64,
     reference: &str,
 ) -> Option<(u64, u64, String)> {
-    FEED.with(|feed| {
-        let feed = feed.borrow();
+    FEED.with_borrow(|feed| {
         let active = feed.active().filter(|active| {
             active.start == HlsStart::Live && active.live_startup_plan.is_some()
         })?;
@@ -1530,8 +1520,7 @@ pub(crate) fn install_live_tail_fallback(
     sequence: u64,
     reference: &str,
 ) -> Option<f64> {
-    FEED.with(|feed| {
-        let mut feed = feed.borrow_mut();
+    FEED.with_borrow_mut(|feed| {
         let active = feed
             .active_mut()
             .filter(|feed| feed.start == HlsStart::Live && feed.live_startup_plan.is_some())?;
@@ -1569,8 +1558,7 @@ pub(crate) fn install_live_tail_fallback(
 }
 
 fn feed_follow_context(id: u64) -> Option<(Arc<Weeb3>, String, String, u64, u64)> {
-    FEED.with(|feed| {
-        let feed = feed.borrow();
+    FEED.with_borrow(|feed| {
         let feed = feed.get(id)?;
         if feed.playlist.as_ref()?.finalized {
             return None;
@@ -1589,7 +1577,7 @@ async fn apply_deferred_update(
     id: u64,
     client: &Arc<Weeb3>,
     root: FeedPayloadRoot,
-) -> Option<usize> {
+) -> Option<(usize, bool)> {
     let index = root.index;
     if let Some(tail) =
         retrieve_feed_payload_tail(&root, FEED_TAIL_PROBE_BYTES, &client.chunk_port.0).await
@@ -1603,8 +1591,7 @@ async fn apply_deferred_update(
 }
 
 fn start_beginning_history(id: u64) {
-    let context = FEED.with(|feed| {
-        let mut feed = feed.borrow_mut();
+    let context = FEED.with_borrow_mut(|feed| {
         let active = feed.get_mut(id).filter(|active| {
             result_view_request_is_current(active.view_generation)
                 && active.start == HlsStart::Beginning
@@ -1651,8 +1638,7 @@ fn start_beginning_history(id: u64) {
 }
 
 fn spawn_follower(id: u64) {
-    let claimed = FEED.with(|feed| {
-        let mut feed = feed.borrow_mut();
+    let claimed = FEED.with_borrow_mut(|feed| {
         if feed.active != id {
             return false;
         }
@@ -1675,7 +1661,7 @@ fn spawn_follower(id: u64) {
                 let Some((client, owner, topic, head, _)) = feed_follow_context(id) else {
                     return;
                 };
-                let mut progressed = false;
+                let mut progressed = None;
                 let mut skipped_missing_index = false;
                 let mut probes = stream::iter(1..=FEED_FOLLOW_AHEAD)
                     .map(async |offset| {
@@ -1698,9 +1684,7 @@ fn spawn_follower(id: u64) {
                     let Some((index, candidate)) = candidate else {
                         return;
                     };
-                    if !FEED
-                        .with(|feed| feed.borrow().active == id && feed.borrow().get(id).is_some())
-                    {
+                    if !FEED.with_borrow(|feed| feed.active == id && feed.get(id).is_some()) {
                         return;
                     }
                     let appended = match candidate {
@@ -1717,25 +1701,30 @@ fn spawn_follower(id: u64) {
                             continue;
                         }
                     };
-                    let Some(appended) = appended else {
+                    let Some((appended, closing)) = appended else {
                         break;
                     };
-                    progressed = true;
+                    progressed = Some(closing);
                     if appended != 0 {
                         client.interface_log(format!(
                             "HLS feed advanced to {index}; appended {appended} segment(s)"
                         ));
                     }
+                    if closing {
+                        break;
+                    }
                 }
                 drop(probes);
-                if progressed {
+                if let Some(closing) = progressed {
+                    if closing {
+                        recover_feed_frontier(id, &client, &owner, &topic).await;
+                    }
                     last_frontier_check = js_sys::Date::now();
                     continue;
                 }
 
                 async_std::task::sleep(FEED_POLL_INTERVAL).await;
-                if !FEED.with(|feed| feed.borrow().active == id && feed.borrow().get(id).is_some())
-                {
+                if !FEED.with_borrow(|feed| feed.active == id && feed.get(id).is_some()) {
                     return;
                 }
 
@@ -1908,7 +1897,7 @@ async fn fetch_hls_body_response(
         Ok(decoded) => decoded,
         Err(_) => return FetchResponse::error(400, "invalid HLS swarm reference"),
     };
-    let root = retrieve_decoded_data_root(&decoded, &client.chunk_port.0).await;
+    let root = retrieve_decoded_data_root(&decoded, &client.chunk_port.0, None).await;
 
     if complete_body && root.as_ref().is_none_or(|root| root.span <= HLS_BODY_MAX_BYTES) {
         let Some(body) = foreground_hls_body(client.clone(), reference.clone()).await else {
@@ -1994,8 +1983,7 @@ async fn fetch_feed_response(
             .find(&owner, &topic, index)
             .map(|feed| feed.id)
     });
-    let master = FEED.with(|feed| {
-        let feed = feed.borrow();
+    let master = FEED.with_borrow(|feed| {
         let (master_owner, master_topic, master_index, master) = feed.master.as_ref()?;
         (master_owner == &owner
             && master_topic == &topic
@@ -2014,8 +2002,7 @@ async fn fetch_feed_response(
         })
     });
     if master.is_none() {
-        let context = FEED.with(|feed| {
-            let feed = feed.borrow();
+        let context = FEED.with_borrow(|feed| {
             if feed.find(&owner, &topic, index).is_some() {
                 return None;
             }
@@ -2103,8 +2090,7 @@ async fn fetch_feed_response(
             });
         }
     }
-    while let Some(changed) = FEED.with(|feed| {
-        let feed = feed.borrow();
+    while let Some(changed) = FEED.with_borrow(|feed| {
         let active = feed
             .find(&owner, &topic, index)
             .filter(|active| active.refreshing || !active.ready)?;
@@ -2128,7 +2114,7 @@ async fn fetch_feed_response(
                 render_manifest(&bytes, local_bytes_base, start).map(|body| (index, body, None, 0))
             })
     };
-    let Some((index, body, follower, revision)) = rendered else {
+    let Some((resolved_index, body, follower, revision)) = rendered else {
         return FetchResponse::error(502, "The HLS feed could not be loaded");
     };
     if let Some(id) = follower {
@@ -2137,8 +2123,8 @@ async fn fetch_feed_response(
     let mode = (start == HlsStart::Live)
         .then_some("live")
         .unwrap_or("beginning");
-    let etag = format!("\"hls-feed-{index}-{mode}-{revision}\"");
-    let headers = vec![
+    let etag = format!("\"hls-feed-{resolved_index}-{mode}-{revision}\"");
+    let mut headers = vec![
         (
             "Content-Type".to_string(),
             "application/vnd.apple.mpegurl".to_string(),
@@ -2147,6 +2133,15 @@ async fn fetch_feed_response(
         ("Cache-Control".to_string(), "no-store".to_string()),
         ("ETag".to_string(), etag),
     ];
+    FEED.with_borrow(|feed| {
+        if let Some(playlist) = feed.find(&owner, &topic, index)
+            .and_then(|feed| feed.playlist.as_ref())
+            && let Some(start) = playlist.program_start(js_sys::Date::parse)
+        {
+            headers.push(("X-Weeb3-Program-Start".into(), start.to_string()));
+            headers.push(("X-Weeb3-Program-End".into(), (start + playlist.duration() * 1_000.0).to_string()));
+        }
+    });
     FetchResponse::ok(200, headers, (method != "HEAD").then_some(body))
 }
 
@@ -2480,13 +2475,19 @@ pub(crate) async fn prepare_hls_feed(
             let needs_successor = head.segments.iter().filter(|segment| !segment.gap).nth(1).is_none();
             let offset = if start == HlsStart::Live && !owner.is_empty()
                 && head.sequence != 0 && head.has_timeline() {
-                match async_std::future::timeout(EDGE_WAVE_TIMEOUT,
-                    probe_feed_payload(&client, &owner, &topic, 0,
-                        BEGINNING_PAYLOAD_BYTES, Some(FEED_PROBE_ATTEMPTS))).await {
-                    Ok(FeedPayloadProbe::Found(first)) => HlsPlaylist::parse(&first.bytes)
-                        .and_then(|first| head.timeline_offset(&first, js_sys::Date::parse))
-                        .unwrap_or(0.0),
-                    _ => 0.0,
+                loop {
+                    if !feed_is_current(id, view_generation) {
+                        return Err("HLS open was superseded".to_string());
+                    }
+                    if let Ok(FeedPayloadProbe::Found(first)) = async_std::future::timeout(
+                        EDGE_WAVE_TIMEOUT, probe_feed_payload(&client, &owner, &topic, 0,
+                            BEGINNING_PAYLOAD_BYTES, Some(FEED_PROBE_ATTEMPTS))).await
+                    {
+                        break HlsPlaylist::parse(&first.bytes)
+                            .and_then(|first| head.timeline_offset(&first, js_sys::Date::parse))
+                            .ok_or("The broadcast origin does not match its live timeline.")?;
+                    }
+                    async_std::task::sleep(INITIAL_DISCOVERY_RETRY_DELAY).await;
                 }
             } else { 0.0 };
             if !feed_is_current(id, view_generation) {
@@ -2556,8 +2557,7 @@ pub(super) async fn prepare_history(source: &str, position: f64) -> Option<f64> 
         Some((String::new(), canonical_hls_bytes_resource(&path)?.ok()?))
     })?;
     let pinned = url.search_params().get("index").map(|index| index.parse::<u64>()).transpose().ok()?;
-    let (cancelled, id, view, client, index, origin, head) = FEED.with(|feed| {
-        let feed = feed.borrow();
+    let (cancelled, id, view, client, index, origin, head) = FEED.with_borrow(|feed| {
         feed.history_changed.notify(usize::MAX);
         let active = feed.find(&owner, &topic, pinned).filter(|active| active.ready)?;
         Some((feed.history_changed.listen(), active.id, active.view_generation,
@@ -2585,8 +2585,7 @@ pub(super) async fn prepare_history(source: &str, position: f64) -> Option<f64> 
     let future::Either::Right((history, _)) = future::select(cancelled, Box::pin(lookup)).await
         else { return None; };
     let mut history = history.ok()??;
-    let start = FEED.with(|feed| {
-        let mut feed = feed.borrow_mut();
+    let start = FEED.with_borrow_mut(|feed| {
         if !result_view_request_is_current(view) {
             return None;
         }
@@ -2607,8 +2606,7 @@ pub(super) async fn prepare_history(source: &str, position: f64) -> Option<f64> 
 }
 
 pub(crate) fn release_hls_runtime() {
-    FEED.with(|feed| {
-        let mut feed = feed.borrow_mut();
+    FEED.with_borrow_mut(|feed| {
         feed.history_changed.notify(usize::MAX);
         *feed = FeedSessions::default();
     });

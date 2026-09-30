@@ -27,7 +27,7 @@ use libp2p::{
     identity::ecdsa,
     noise,
     swarm::{ConnectionId, DialError, SwarmEvent},
-    websocket_websys, yamux,
+    yamux,
 };
 pub(crate) use libp2p_stream::Control as StreamControl;
 use wasm_bindgen::JsValue;
@@ -41,6 +41,8 @@ use bzz_stream::*;
 
 mod conventions;
 pub(crate) use conventions::*;
+
+mod websocket;
 
 mod network_conventions;
 pub(crate) use network_conventions::*;
@@ -174,7 +176,6 @@ const PEER_RETRY_DELAY_MS: u64 = 500;
 const MAINNET_BOOTNODE_RETRY_DELAY_MS: u64 = 30_000;
 const MAINNET_BOOTNODE_RETRY_JITTER_MS: u64 = 5_000;
 const PUSH_CHUNK_RETRY_DELAY_MS: u64 = 500;
-const PUSH_CHUNK_QUEUE_BACKOFF_MS: u64 = 25;
 const RANGE_REQUEST_CONCURRENCY: usize = 16;
 const RETRIEVE_CHUNK_CONCURRENCY: usize = 256;
 const RANGE_REQUEST_QUEUE_CAPACITY: usize = 256;
@@ -480,7 +481,7 @@ impl Weeb3 {
         let swarm = libp2p::SwarmBuilder::with_existing_identity(keypair.into())
             .with_wasm_bindgen()
             .with_other_transport(|key| {
-                websocket_websys::Transport::default()
+                websocket::Transport
                     .upgrade(core::upgrade::Version::V1Lazy)
                     .authenticate(noise::Config::new(key).unwrap())
                     .multiplex(yamux::Config::default())
@@ -661,12 +662,6 @@ impl Weeb3 {
                 let mut pending_instruction = None;
 
                 loop {
-                    let current_generation = self.current_connection_generation();
-                    if current_generation != queue_generation {
-                        queue.clear();
-                        queued_underlays.clear();
-                        queue_generation = current_generation;
-                    }
                     let instruction = match pending_instruction.take() {
                         Some(instruction) => Some(instruction),
                         None if queue.is_empty() => {
@@ -677,17 +672,17 @@ impl Weeb3 {
                         }
                         None => peers_instructions_chan_incoming.try_recv().ok(),
                     };
+                    let current_generation = self.current_connection_generation();
+                    if current_generation != queue_generation {
+                        queue.clear();
+                        queued_underlays.clear();
+                        queue_generation = current_generation;
+                    }
                     let public_gossip_only = self.service_worker_network_id() != 0
                         && !self.allow_private_gossip.load(Ordering::Acquire);
                     for instruction in drain_ready(instruction, &peers_instructions_chan_incoming)
                         .take(PEER_DIAL_INGEST_BATCH)
                     {
-                        let current_generation = self.current_connection_generation();
-                        if current_generation != queue_generation {
-                            queue.clear();
-                            queued_underlays.clear();
-                            queue_generation = current_generation;
-                        }
                         if instruction.generation != queue_generation {
                             continue;
                         }
@@ -859,6 +854,14 @@ impl Weeb3 {
                             .lock()
                             .unwrap_or_else(|error| error.into_inner())
                             .remove(&(*peer_id, *connection_id));
+                    }
+                    SwarmEvent::Behaviour(BehaviourEvent::Ping(event))
+                        if matches!(
+                            &event.result,
+                            Err(libp2p::ping::Failure::Timeout | libp2p::ping::Failure::Other { .. })
+                        ) =>
+                    {
+                        self.swarm.lock().await.close_connection(event.connection);
                     }
                     _ => {}
                 }
@@ -1639,7 +1642,7 @@ impl Weeb3 {
                         // Dispatched settlement always runs to completion.
                         let attempted_amount = {
                             let mut account = accounting_peer.lock().await;
-                            if !refreshment_due(
+                            if account.threshold == 0 || !refreshment_due(
                                 account.balance,
                                 account.refreshment,
                                 account.threshold,
@@ -1650,10 +1653,6 @@ impl Weeb3 {
                             // Include in-flight completions in the advertised allowance.
                             account.threshold
                         };
-                        if attempted_amount == 0 {
-                            accounting_peer.lock().await.refresh_scheduled = false;
-                            return;
-                        }
                         let outcome = refresh_handler(
                             peer,
                             attempted_amount,
@@ -1673,6 +1672,7 @@ impl Weeb3 {
                                 account.refreshment = Date::now();
                                 account.balance = 0;
                                 account.refresh_scheduled = false;
+                                notify_credit_available();
                                 interface_log("Refreshment attempt cleared 0".into());
                                 return;
                             }
@@ -1991,24 +1991,7 @@ impl Weeb3 {
 
                     wait_transfer_unpaused(&self.transfer_paused).await;
 
-                    let Some(permit) = push_sem.try_acquire_arc() else {
-                        async_std::task::sleep(Duration::from_millis(PUSH_CHUNK_QUEUE_BACKOFF_MS))
-                            .await;
-                        if !feedback.is_closed() {
-                            let _ = chunk_upload_chan_outgoing.try_send((
-                                d,
-                                soc,
-                                checkad,
-                                stamp,
-                                feedback,
-                                slot_feedback,
-                                progress,
-                            ));
-                        } else {
-                            let _ = slot_feedback.try_send(true);
-                        }
-                        break;
-                    };
+                    let permit = push_sem.acquire_arc().await;
 
                     if feedback.is_closed() {
                         let _ = slot_feedback.try_send(true);
@@ -2116,16 +2099,8 @@ impl Weeb3 {
                     let cancel = request.cancel;
                     let admission = request.admission;
                     let hedge_demand = request.hedge_demand;
-                    let admission_open =
-                        wait_transfer_unpaused_for_admission(&self.transfer_paused, &admission)
-                            .await;
-
-                    let stream_generation_current = retrieve_cancel_token_current(&cancel);
-                    if !admission_open
-                        || !retrieval_conventions::retrieve_admission_current(
-                            stream_generation_current,
-                            &admission,
-                        )
+                    if !wait_transfer_unpaused_for_admission(&self.transfer_paused, &admission).await
+                        || !retrieve_cancel_token_current(&cancel)
                     {
                         chan.send(Bytes::new());
                         continue;
@@ -2156,15 +2131,8 @@ impl Weeb3 {
 
                             if !wait_transfer_unpaused_for_admission(&transfer_paused, &admission)
                                 .await
+                                || !retrieve_cancel_token_current(&cancel)
                             {
-                                return Bytes::new();
-                            }
-
-                            let stream_generation_current = retrieve_cancel_token_current(&cancel);
-                            if !retrieval_conventions::retrieve_admission_current(
-                                stream_generation_current,
-                                &admission,
-                            ) {
                                 return Bytes::new();
                             }
 

@@ -33,10 +33,12 @@ fn native_server_rebuilds_and_revalidates_every_embedded_browser_runtime_asset()
         );
     }
     assert!(!source_version.contains("static/snippets"));
-    assert!(BUILD.contains("collect_all_files(Path::new(\"static/snippets\"), &mut files);"));
-    assert!(BUILD.contains("CARGO_CFG_TARGET_ARCH"));
-    assert!(BUILD.contains("cargo:rustc-env=WEEB3_ASSET_VERSION={version}"));
-    assert!(BUILD.contains("cargo:rerun-if-changed=static/snippets"));
+    crate::source::assert_contains(BUILD, &[
+        "collect_all_files(Path::new(\"static/snippets\"), &mut files);",
+        "CARGO_CFG_TARGET_ARCH",
+        "cargo:rustc-env=WEEB3_ASSET_VERSION={version}",
+        "cargo:rerun-if-changed=static/snippets",
+    ]);
     assert!(
         NPM_WORKFLOW.find("wasm-pack build").unwrap()
             < NPM_WORKFLOW.find("cargo build --verbose").unwrap(),
@@ -59,39 +61,45 @@ fn native_server_rebuilds_and_revalidates_every_embedded_browser_runtime_asset()
         SERVER
             .contains("const EMBEDDED_ASSET_BUILD_VERSION: &str = env!(\"WEEB3_ASSET_VERSION\");")
     );
-    assert!(SERVER.contains(
-        "const EMBEDDED_ASSET_ETAG: &str = concat!(\"\\\"\", env!(\"WEEB3_ASSET_VERSION\"), \"\\\"\");"
-    ));
-    assert!(SERVER.contains("const REVALIDATE_EMBEDDED_ASSET: &str = \"private, no-cache\";"));
-    assert!(SERVER.contains("HeaderName::from_static(\"x-weeb3-build-version\")"));
-    assert!(SERVER.contains("fn html_response(path: &str)"));
+    crate::source::assert_contains(SERVER, &[
+        "const EMBEDDED_ASSET_ETAG: &str = concat!(\"\\\"\", env!(\"WEEB3_ASSET_VERSION\"), \"\\\"\");",
+        "const REVALIDATE_EMBEDDED_ASSET: &str = \"private, no-cache\";",
+        "HeaderName::from_static(\"x-weeb3-build-version\")",
+        "fn html_response(path: &str)",
+    ]);
 
     let validator = between(
         SERVER,
         "fn embedded_asset_is_current(",
         "fn embedded_asset_response(",
     );
-    assert!(validator.contains(".get_all(IF_NONE_MATCH)"));
-    assert!(validator.contains("value.strip_prefix(\"W/\").unwrap_or(value)"));
-    assert!(validator.contains("== EMBEDDED_ASSET_ETAG"));
+    crate::source::assert_contains(validator, &[
+        ".get_all(IF_NONE_MATCH)",
+        "value.strip_prefix(\"W/\").unwrap_or(value)",
+        "== EMBEDDED_ASSET_ETAG",
+    ]);
 
     let response = between(
         SERVER,
         "fn embedded_asset_response(",
         "async fn get_static_file(",
     );
-    assert!(response.contains("(CACHE_CONTROL, REVALIDATE_EMBEDDED_ASSET)"));
-    assert!(response.contains("(ETAG, EMBEDDED_ASSET_ETAG)"));
-    assert!(response.contains("StatusCode::NOT_MODIFIED"));
+    crate::source::assert_contains(response, &[
+        "(CACHE_CONTROL, REVALIDATE_EMBEDDED_ASSET)",
+        "(ETAG, EMBEDDED_ASSET_ETAG)",
+        "StatusCode::NOT_MODIFIED",
+    ]);
 
     let static_file = between(
         SERVER,
         "async fn get_static_file(",
         "async fn get_static_snippet(",
     );
-    assert!(static_file.contains("matches!(path, \"service.js\" | \"worker.js\")"));
-    assert!(static_file.contains("(CACHE_CONTROL, \"no-store\")"));
-    assert!(static_file.contains("embedded_asset_response(&headers, path, content_type)"));
+    crate::source::assert_contains(static_file, &[
+        "matches!(path, \"service.js\" | \"worker.js\")",
+        "(CACHE_CONTROL, \"no-store\")",
+        "embedded_asset_response(&headers, path, content_type)",
+    ]);
 
     let snippets = between(SERVER, "async fn get_static_snippet(", "async fn get_404(");
     assert!(snippets.contains("embedded_asset_response("));
@@ -114,9 +122,11 @@ fn npm_attach_starts_the_shared_runtime_before_hls() {
 
 #[test]
 fn npm_release_contains_the_worker_required_by_the_runtime_protocol() {
-    assert!(NPM_WORKFLOW.contains("files[5]=\"service.js\""));
-    assert!(NPM_WORKFLOW.contains("'exports[./service.js].default=./service.js'"));
-    assert!(NPM_WORKFLOW.contains("npm pack ./static"));
+    crate::source::assert_contains(NPM_WORKFLOW, &[
+        "files[5]=\"service.js\"",
+        "'exports[./service.js].default=./service.js'",
+        "npm pack ./static",
+    ]);
     assert!(NPM_README.contains("serve the packaged worker at `/weeb-3/service.js`"));
 }
 
@@ -127,19 +137,26 @@ fn playback_readiness_updates_before_accepting_a_controller() {
         "pub async fn get_service_worker()",
         "async fn get_service_worker_locked(",
     );
-    assert!(setup.contains("SERVICE_WORKER_SETUP_LOCK.lock().await"));
-    assert!(setup.contains("Object::is(worker.as_ref(), controller.as_ref())"));
-    assert!(setup.contains("get_service_worker_locked(&service0).await"));
+    crate::source::assert_contains(setup, &[
+        "SERVICE_WORKER_SETUP_LOCK.lock().await",
+        "Object::is(worker.as_ref(), controller.as_ref())",
+        "get_service_worker_locked(&service0).await",
+    ]);
     assert!(playback_readiness().contains("get_service_worker().await.is_some()"));
 }
 
 #[test]
 fn busy_or_failed_setup_remains_retryable_without_overlap() {
     let readiness = playback_readiness();
-    assert!(readiness.contains("while still_needed()"));
-    assert!(readiness.contains("timeout(SERVICE_WORKER_SETUP_RETRY, changed.recv()).await"));
-    assert!(readiness.contains("\"controllerchange\""));
-    assert!(readiness.contains("remove_event_listener_with_callback"));
+    crate::source::assert_contains(readiness, &[
+        "while still_needed()",
+        "timeout(SERVICE_WORKER_SETUP_RETRY, changed.recv()).await",
+        "\"controllerchange\"",
+        "DomListener::new(&container, \"controllerchange\"",
+    ]);
+    let listener = include_str!("../src/worker_protocol.rs");
+    assert!(between(listener, "impl Drop for DomListener", "pub(crate) struct ReplyChannel")
+        .contains("remove_event_listener_with_callback"));
     assert!(!readiness.contains("task::sleep"));
     assert!(!readiness.contains("Date::now"));
 }
@@ -150,22 +167,28 @@ fn readiness_requires_a_controlling_protocol_worker() {
     assert!(WORKER.contains("const SERVICE_WORKER_PROTOCOL = 10;"));
     assert!(RUNTIME.contains(r#"const SERVICE_WORKER_MARKER: &str = "forwarder-default29";"#));
     assert!(RUNTIME.contains("const SERVICE_WORKER_PROTOCOL: f64 = 10.0;"));
-    assert!(WORKER.contains("event.waitUntil(self.skipWaiting())"));
-    assert!(WORKER.contains("event.waitUntil(self.clients.claim())"));
-    assert!(WORKER.contains("type: \"WEEB3_PONG\""));
-    assert!(WORKER.contains("protocol: SERVICE_WORKER_PROTOCOL"));
-    assert_eq!(WORKER.matches("marker: SERVICE_WORKER_MARKER").count(), 2);
-    assert!(RUNTIME.contains("number_property(&data, \"protocol\")"));
-    assert!(RUNTIME.contains("string_property(&data, \"marker\")"));
-    assert!(RUNTIME.contains("marker == expected_marker"));
+    crate::source::assert_contains(WORKER, &[
+        "event.waitUntil(self.skipWaiting())",
+        "event.waitUntil(self.clients.claim())",
+        "type: type === \"WEEB3_CLAIM\" ? \"WEEB3_CLAIMED\" : \"WEEB3_PONG\"",
+        "protocol: SERVICE_WORKER_PROTOCOL",
+    ]);
+    assert_eq!(WORKER.matches("marker: SERVICE_WORKER_MARKER").count(), 1);
+    crate::source::assert_contains(RUNTIME, &[
+        "number_property(&data, \"protocol\")",
+        "string_property(&data, \"marker\")",
+        "marker == SERVICE_WORKER_MARKER",
+    ]);
     assert!(WORKER.contains("event.data?.protocol !== SERVICE_WORKER_PROTOCOL"));
     assert!(!WORKER.contains("source.navigate("));
     assert!(WORKER.contains("scope: SCOPE_PATH"));
 
     let readiness = playback_readiness();
-    assert!(!readiness.contains("registration.active()"));
-    assert!(!readiness.contains("registration.waiting()"));
-    assert!(!readiness.contains("registration.installing()"));
+    crate::source::assert_excludes(readiness, &[
+        "registration.active()",
+        "registration.waiting()",
+        "registration.installing()",
+    ]);
 }
 
 #[test]
@@ -183,9 +206,11 @@ fn hls_routes_own_their_stream_windows_and_preserve_http_validators() {
         "self.addEventListener(\"fetch\"",
         "function isStableWindowClient(",
     );
-    assert!(fetch_routes.contains("canonicalRawResource(url)"));
-    assert!(fetch_routes.contains("canonicalFeedResource(url)"));
-    assert!(fetch_routes.contains("request.method === \"GET\" || request.method === \"HEAD\""));
+    crate::source::assert_contains(fetch_routes, &[
+        "canonicalRawResource(url)",
+        "canonicalFeedResource(url)",
+        "request.method === \"GET\" || request.method === \"HEAD\"",
+    ]);
 
     let request = between(
         WORKER,
@@ -208,9 +233,11 @@ fn hls_routes_own_their_stream_windows_and_preserve_http_validators() {
         "function responseBodyStream(",
         "function requestRustRange(",
     );
-    assert!(one_shot.contains("const bytes = toUint8Array(body);"));
-    assert!(one_shot.contains("controller.enqueue(bytes);"));
-    assert!(one_shot.contains("controller.close();"));
+    crate::source::assert_contains(one_shot, &[
+        "const bytes = toUint8Array(body);",
+        "controller.enqueue(bytes);",
+        "controller.close();",
+    ]);
 
     let forward = between(
         WORKER,
@@ -218,13 +245,15 @@ fn hls_routes_own_their_stream_windows_and_preserve_http_validators() {
         "function parseUploadRedundancyHeader(",
     );
     assert!(!forward.contains("if (hlsResource && response.stream)"));
-    assert!(forward.contains(": responseBodyStream(response.body)"));
-    assert!(forward.contains("if (response.stream && request.method !== \"HEAD\")"));
-    assert!(forward.contains("hlsResource ? \"\" : request.headers.get(\"Range\")"));
-    assert!(forward.contains("request.headers.get(\"If-None-Match\")"));
-    assert!(forward.contains("hlsResource ? \"\" : request.headers.get(\"If-Range\")"));
-    assert!(forward.contains("request.method === \"HEAD\" || status === 304"));
-    assert!(forward.contains("const headers = new Headers(response.headers);"));
+    crate::source::assert_contains(forward, &[
+        ": responseBodyStream(response.body)",
+        "if (response.stream && request.method !== \"HEAD\")",
+        "hlsResource ? \"\" : request.headers.get(\"Range\")",
+        "request.headers.get(\"If-None-Match\")",
+        "hlsResource ? \"\" : request.headers.get(\"If-Range\")",
+        "request.method === \"HEAD\" || status === 304",
+        "const headers = new Headers(response.headers);",
+    ]);
 
     for removed in [
         "HLS_STREAM_READY_ADMISSION_THRESHOLD",
@@ -305,10 +334,12 @@ fn network_switch_reprobes_the_stable_window_before_rebinding() {
         "async function windowMatchesNetwork(",
         "async function originatingWindow(",
     );
-    assert!(matching.contains("const hadCachedNetwork = cachedWindowNetworks.has(client.id)"));
-    assert!(matching.contains("if (!hadCachedNetwork)"));
-    assert!(matching.contains("await windowNetworkId(client) === requiredNetworkId"));
-    assert!(matching.contains("invalidateWindowClient(client)"));
+    crate::source::assert_contains(matching, &[
+        "const hadCachedNetwork = cachedWindowNetworks.has(client.id)",
+        "if (!hadCachedNetwork)",
+        "await windowNetworkId(client) === requiredNetworkId",
+        "invalidateWindowClient(client)",
+    ]);
     assert_eq!(matching.matches("windowNetworkId(client)").count(), 2);
 
     let selection = between(
@@ -322,21 +353,25 @@ fn network_switch_reprobes_the_stable_window_before_rebinding() {
 
 #[test]
 fn generic_range_stream_keeps_ordered_bounded_lookahead() {
-    assert!(WORKER.contains("const STREAM_WINDOW_BYTES = MIB_BYTES / 2;"));
-    assert!(WORKER.contains("const STREAM_LOOKAHEAD_CHUNKS = 8;"));
-    assert!(WORKER.contains("const HLS_STREAM_LOOKAHEAD_CHUNKS = 4;"));
-    assert!(WORKER.contains("const RANGE_REQUEST_FLIGHTS = new Map();"));
+    crate::source::assert_contains(WORKER, &[
+        "const STREAM_WINDOW_BYTES = MIB_BYTES / 2;",
+        "const STREAM_LOOKAHEAD_CHUNKS = 8;",
+        "const HLS_STREAM_LOOKAHEAD_CHUNKS = 4;",
+        "const RANGE_REQUEST_FLIGHTS = new Map();",
+    ]);
 
     let request = between(
         WORKER,
         "function requestRustRange(",
         "function createRustRangeStream(",
     );
-    assert!(request.contains("range: `bytes=${start}-${end}`"));
-    assert!(request.contains("body.byteLength !== expected"));
-    assert!(request.contains("RANGE_REQUEST_FLIGHTS.get(key)"));
-    assert!(request.contains("RANGE_REQUEST_FLIGHTS.set(key, request)"));
-    assert!(request.contains("RANGE_REQUEST_FLIGHTS.delete(key)"));
+    crate::source::assert_contains(request, &[
+        "range: `bytes=${start}-${end}`",
+        "body.byteLength !== expected",
+        "RANGE_REQUEST_FLIGHTS.get(key)",
+        "RANGE_REQUEST_FLIGHTS.set(key, request)",
+        "RANGE_REQUEST_FLIGHTS.delete(key)",
+    ]);
     assert_eq!(request.matches("messageRuntime(client,").count(), 1);
 
     let stream = between(
@@ -369,9 +404,11 @@ fn generic_range_stream_keeps_ordered_bounded_lookahead() {
         "async function forwardRequestToRust(",
         "function parseUploadRedundancyHeader(",
     );
-    assert!(forward.contains("Number.isSafeInteger(size) || size <= 0"));
-    assert!(forward.contains("STREAM_WINDOW_BYTES,"));
-    assert!(forward.contains("hlsResource ? HLS_STREAM_LOOKAHEAD_CHUNKS : STREAM_LOOKAHEAD_CHUNKS"));
+    crate::source::assert_contains(forward, &[
+        "Number.isSafeInteger(size) || size <= 0",
+        "STREAM_WINDOW_BYTES,",
+        "hlsResource ? HLS_STREAM_LOOKAHEAD_CHUNKS : STREAM_LOOKAHEAD_CHUNKS",
+    ]);
     assert!(!forward.contains("url.searchParams.get(\"startup\")"));
     assert!(!forward.contains("beginningHlsResource"));
 }
@@ -486,10 +523,12 @@ fn setup_validates_scope_and_every_registration_state() {
         "fn expected_service_worker_registration(",
         "fn warn_about_worker_conflict(",
     );
-    assert!(validation.contains("registration.scope() != expected_scope_url"));
-    assert!(validation.contains("registration.active()"));
-    assert!(validation.contains("registration.waiting()"));
-    assert!(validation.contains("registration.installing()"));
+    crate::source::assert_contains(validation, &[
+        "registration.scope() != expected_scope_url",
+        "registration.active()",
+        "registration.waiting()",
+        "registration.installing()",
+    ]);
 
     let setup = between(
         RUNTIME,
@@ -511,15 +550,20 @@ fn setup_validates_scope_and_every_registration_state() {
     assert!(!setup.contains("return Some(service_worker)"));
     let exact_claim = between(
         RUNTIME,
-        "async fn claim_exact_service_worker(",
-        "struct ServiceWorkerProtocolPort",
+        "async fn claim_service_worker_registration(",
+        "fn warn_about_worker_conflict(",
     );
-    assert!(exact_claim.contains("request_service_worker_claim(worker).await"));
-    assert!(exact_claim.contains("service_worker_forwarder_ready_with_timeout(1_500).await"));
+    assert_in_order(exact_claim, &[
+        "expected_service_worker_registration(",
+        "registration.active()",
+        "service_worker_protocol_request(&active, \"WEEB3_CLAIM\", \"WEEB3_CLAIMED\", 1_500).await",
+        "return Ok(None)",
+        "service_worker_forwarder_ready_with_timeout(1_500).await",
+    ]);
     let ready = between(
         RUNTIME,
         "async fn service_worker_forwarder_ready_with_timeout(",
-        "async fn request_service_worker_claim(",
+        "async fn service_worker_protocol_request(",
     );
     assert_in_order(
         ready,

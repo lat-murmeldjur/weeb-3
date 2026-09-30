@@ -70,7 +70,7 @@ weeb3node.start({ testnet: true });
 const ready = await weeb3node.ready(1, 20_000);
 ```
 
-The wrapper exposes the browser node as `Weeb3No103`. It can start the runtime, switch between mainnet and testnet with `switchNetwork(mode)`, render the bundled interface into a container, attach a Swarm HLS stream to an application-owned media element, report network and progress state, retrieve BZZ resources, retrieve raw bytes or chunks, upload `File` objects or byte arrays, and publish or read feed updates.
+`Weeb3No103` supports BZZ, byte/chunk retrieval, uploads, feeds, and optional interface rendering. `ready(minConnections, timeoutMs)` waits for connections; `batchState(depth, validityDays)` checks postage and `buyBatch(depth, validityDays)` explicitly purchases it. Uploads do not automatically buy a batch. `postUploadBytes` accepts bytes; `acquireFeedBytes(owner, topic)` returns `{status, reason, index, body}`, with a 30-second budget including startup. Status is `ok`, `not_found`, `network_error`, `timeout`, or `error`; `not_found` means the lookup found no update, not proof that none exists anywhere.
 
 The HLS example creates its own `<video>` and passes it to `attachStream(media, owner, topic, start)`, where `start` is `"beginning"` or `"live"`. The method uses the same runtime boot, connection buildup, Service Worker setup, retrieval, media loading, player and accounting paths as the standalone application without mounting the rest of its interface.
 
@@ -248,7 +248,7 @@ The libp2p identity is generated when the SharedWorker creates its `Weeb3` node.
 
 `src/persistence.rs` stores the chequebook signer and address and last issued payouts across browser sessions. Network-scoped postage state, upload and feed identities, and other sensitive state are routed through the secure vault module instead of being handled directly by ordinary UI code.
 
-Wallet access is requested only for on-chain operations. The browser wallet is used for chain switching, account access, postage purchase flows, chequebook deployment, and deposits. Upload/feed identities and cheque signer keys are managed separately from the wallet account so that Swarm protocol operations do not require signing every action with the injected wallet.
+Wallet access supports account/chain selection, postage, chequebooks, and deposits. By default, feed identities and cheque keys remain in the secure vault. For a portable feed owned by an EOA wallet, call `postFeedBytes(topic, bytes, mime, filename, encryption, walletAddress)`: each update requests `personal_sign`, and another browser can read it using that wallet address and topic. Omitting `walletAddress` preserves the stored identity. No private key is derived from signatures; contract wallets are unsupported for this signing mode. The JSON sync example offers both owner modes.
 
 When the network profile changes, the runtime clears the current peer state and increments its connection generation so stale dialing, handshake, and connection events do not leak into the new network session.
 

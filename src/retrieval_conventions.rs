@@ -413,7 +413,7 @@ pub(crate) async fn acquire_retrieve_permit(
         return None;
     }
 
-    let permit = semaphore.clone().acquire_arc();
+    let permit = semaphore.acquire_arc();
     let closed = async {
         match admission {
             Some(admission) => admission.wait_closed().await,
@@ -441,20 +441,15 @@ pub(crate) struct SingleflightRegistration<K, A> {
 }
 
 pub(crate) struct SingleflightFlight<W, A> {
+    flight_id: u64,
     pub(crate) shared: A,
-    pub(crate) waiters: Vec<W>,
+    pub(crate) waiters: Vec<(u64, W)>,
 }
 
 pub(crate) struct SingleflightRegistry<K, W, A> {
     next_flight_id: u64,
     next_waiter_id: u64,
-    flights: HashMap<K, SingleflightEntry<W, A>>,
-}
-
-struct SingleflightEntry<W, A> {
-    flight_id: u64,
-    shared: A,
-    waiters: Vec<(u64, W)>,
+    flights: HashMap<K, SingleflightFlight<W, A>>,
 }
 
 impl<K, W, A> Default for SingleflightRegistry<K, W, A> {
@@ -513,7 +508,7 @@ where
             let shared = make_shared();
             self.flights.insert(
                 key.clone(),
-                SingleflightEntry {
+                SingleflightFlight {
                     flight_id,
                     shared: shared.clone(),
                     waiters: vec![(waiter_id, waiter)],
@@ -551,14 +546,6 @@ where
         if self.flights.get(key)?.flight_id != flight_id {
             return None;
         }
-        let flight = self.flights.remove(key)?;
-        Some(SingleflightFlight {
-            shared: flight.shared,
-            waiters: flight
-                .waiters
-                .into_iter()
-                .map(|(_, waiter)| waiter)
-                .collect(),
-        })
+        self.flights.remove(key)
     }
 }

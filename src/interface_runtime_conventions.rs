@@ -1,8 +1,8 @@
 use super::*;
 use js_sys::{Object, Reflect};
-use web_sys::{MessageChannel, MessageEvent, MessagePort};
-
-use crate::worker_protocol::{bool_property, number_property, set as set_js, string_property};
+use crate::worker_protocol::{
+    DomListener, ReplyChannel, bool_property, number_property, set as set_js, string_property,
+};
 
 const SERVICE_WORKER_PROTOCOL: f64 = 10.0;
 const SERVICE_WORKER_MARKER: &str = "forwarder-default29";
@@ -105,13 +105,7 @@ pub(super) async fn collect_upload_prerequisites() -> Result<String, String> {
 }
 
 pub(super) fn current_network_profile() -> crate::network_profile::NetworkProfile {
-    let document = interface_document();
-    let network_id = document
-        .get_element_by_id("networkIDSettings")
-        .and_then(|el| el.dyn_into::<HtmlInputElement>().ok())
-        .and_then(|input| input.value().parse::<u64>().ok())
-        .unwrap_or(1);
-
+    let network_id = current_network_id_input().parse().unwrap_or(1);
     profile_for_swarm_network_id(network_id)
         .unwrap_or_else(|| profile_for_mode(NetworkMode::Mainnet))
 }
@@ -290,6 +284,17 @@ fn append_result_action(node: &Element) {
     let _ = actions.append_child(node);
 }
 
+fn append_download_button(filename: String, mut download: impl FnMut(&str) + 'static) {
+    let Ok(button) = interface_document().create_element("button") else {
+        return;
+    };
+    button.set_text_content(Some(&format!("Download {filename}")));
+    let callback = Closure::<dyn FnMut(Event)>::new(move |_| download(&filename));
+    let _ = button.add_event_listener_with_callback("click", callback.as_ref().unchecked_ref());
+    append_result_action(&button);
+    RESULT_CALLBACKS.with(|callbacks| callbacks.borrow_mut().push(callback));
+}
+
 pub(super) async fn apply_network_settings_and_connect(
     weeb3: &InterfaceNode,
     apply_generation: u64,
@@ -340,17 +345,15 @@ pub(super) async fn connect_all_bootnode_settings(
     let mut dial_requests = Vec::<(String, bool)>::new();
 
     let profile = profile_for_swarm_network_id(expected_network_id);
-    for (index, element_id) in BOOTNODE_INPUT_IDS.iter().enumerate() {
+    let configured = BOOTNODE_INPUT_IDS.iter().enumerate().filter_map(|(index, element_id)| {
         let address = bootnode_setting(element_id);
-        if address.trim().is_empty() {
-            continue;
-        }
-        if profile
+        let default = profile
             .and_then(|profile| profile.bootnodes.get(index))
-            .is_some_and(|default| address == *default)
-        {
-            continue;
-        }
+            .is_some_and(|default| address == *default);
+        (!address.trim().is_empty() && !default).then_some(address)
+    });
+    let defaults = profile.into_iter().flat_map(initial_bootnodes).map(str::to_owned);
+    for address in configured.chain(defaults) {
         if !is_browser_dialable_underlay(&address) {
             weeb3.interface_log(format!(
                 "Skipped non-browser bootnode for network {}: {}",
@@ -360,19 +363,6 @@ pub(super) async fn connect_all_bootnode_settings(
         }
         if seen.insert(address.clone()) {
             dial_requests.push((address, true));
-        }
-    }
-
-    if let Some(profile) = profile {
-        for address in initial_bootnodes(profile) {
-            let address = address.to_string();
-            if !is_browser_dialable_underlay(&address) {
-                weeb3.interface_log(format!(
-                    "Skipped non-browser bootnode for network {network_id}: {address}"
-                ));
-            } else if seen.insert(address.clone()) {
-                dial_requests.push((address, true));
-            }
         }
     }
 
@@ -586,22 +576,14 @@ pub(super) fn render_single_result_with_download((bytes, mime, path): &(Vec<u8>,
     let Ok(wrapper) = document.create_element("div") else {
         return;
     };
-    let Ok(button) = document.create_element("button") else {
-        return;
-    };
-
     let filename = result_filename(path, "download");
-    button.set_text_content(Some(&format!("Download {}", filename)));
     let blob = create_blob(bytes, mime);
     let download_blob = blob.clone();
-    let callback = Closure::<dyn FnMut(Event)>::new(move |_event| {
+    append_download_button(filename, move |filename| {
         if let Some(url) = download_blob.as_ref().and_then(blob_object_url) {
-            click_download_url(url, &filename);
+            click_download_url(url, filename);
         }
     });
-    let _ = button.add_event_listener_with_callback("click", callback.as_ref().unchecked_ref());
-    append_result_action(&button);
-    RESULT_CALLBACKS.with(|callbacks| callbacks.borrow_mut().push(callback));
 
     let display_mime = mime.split(';').next().unwrap_or("").trim();
     if display_mime.starts_with("text/") {
@@ -645,22 +627,14 @@ pub(super) fn tar_entries(entries: &[(Vec<u8>, String, String)]) -> Option<Vec<u
 }
 
 pub(super) fn render_collection_download_button(entries: RenderedEntries, index: &str) {
-    let document = interface_document();
-    let Ok(button) = document.create_element("button") else {
-        return;
-    };
     let filename = format!("{}.tar", result_filename(index, "collection"));
-    button.set_text_content(Some(&format!("Download {}", filename)));
-    let callback = Closure::<dyn FnMut(Event)>::new(move |_event| {
+    append_download_button(filename, move |filename| {
         if let Some(bytes) = tar_entries(&entries)
             && let Some(url) = blob_url(&bytes, "application/x-tar")
         {
-            click_download_url(url, &filename);
+            click_download_url(url, filename);
         }
     });
-    let _ = button.add_event_listener_with_callback("click", callback.as_ref().unchecked_ref());
-    append_result_action(&button);
-    RESULT_CALLBACKS.with(|callbacks| callbacks.borrow_mut().push(callback));
 }
 
 async fn bzz_view_request_is_current(
@@ -981,9 +955,6 @@ pub(super) fn render_canonical_bzz_frame(
         return;
     };
 
-    let Ok(download) = document.create_element("button") else {
-        return;
-    };
     let filename = if metadata.path.is_empty() {
         "index.html"
     } else {
@@ -997,23 +968,11 @@ pub(super) fn render_canonical_bzz_frame(
     } else {
         result_filename(filename, "download")
     };
-    download.set_text_content(Some(&format!("Download {}", download_filename)));
-    let frame_url = url.to_string();
-    let resource = resource.to_string();
-    let callback = Closure::<dyn FnMut(Event)>::new(move |_event| {
-        let node = weeb3.clone();
-        let resource = resource.clone();
-        let filename = download_filename.clone();
-        spawn_local(async move {
-            download_bzz_resource(node, resource, filename).await;
-        });
-    });
-    let _ = download.add_event_listener_with_callback("click", callback.as_ref().unchecked_ref());
     let Ok(frame) = document.create_element("iframe") else {
         return;
     };
-    let _ = frame.set_attribute("srcdoc", &srcdoc_with_base(index_html, &frame_url));
-    let _ = frame.set_attribute("data-src", &frame_url);
+    let _ = frame.set_attribute("srcdoc", &srcdoc_with_base(index_html, url));
+    let _ = frame.set_attribute("data-src", url);
     let _ = frame.set_attribute("width", "100%");
     let _ = frame.set_attribute("height", "640");
     let _ = frame.set_attribute("loading", "eager");
@@ -1021,8 +980,15 @@ pub(super) fn render_canonical_bzz_frame(
 
     let _ = wrapper.append_child(&frame);
     replace_result_view(&wrapper);
-    append_result_action(&download);
-    RESULT_CALLBACKS.with(|callbacks| callbacks.borrow_mut().push(callback));
+    let resource = resource.to_string();
+    append_download_button(download_filename, move |filename| {
+        let node = weeb3.clone();
+        let resource = resource.clone();
+        let filename = filename.to_string();
+        spawn_local(async move {
+            download_bzz_resource(node, resource, filename).await;
+        });
+    });
 }
 
 fn srcdoc_with_base(bytes: &[u8], canonical_url: &str) -> String {
@@ -1211,14 +1177,7 @@ pub(super) fn render_result(data: Vec<(Vec<u8>, String, String)>, indx: String) 
 }
 
 fn bootnode_setting(id: &str) -> String {
-    let document = interface_document();
-    let bootnode_element = document
-        .get_element_by_id(id)
-        .unwrap_or_else(|| panic!("#{id} should exist"));
-    let bootnode_input = bootnode_element
-        .dyn_ref::<HtmlInputElement>()
-        .unwrap_or_else(|| panic!("#{id} should be a HtmlInputElement"));
-    bootnode_input.value()
+    required_element::<HtmlInputElement>(&interface_document(), id).value()
 }
 
 pub(super) fn service_worker_container() -> Option<web_sys::ServiceWorkerContainer> {
@@ -1307,7 +1266,10 @@ async fn claim_service_worker_registration(
     let Some(active) = registration.active() else {
         return Ok(None);
     };
-    Ok(claim_exact_service_worker(&active).await)
+    if !service_worker_protocol_request(&active, "WEEB3_CLAIM", "WEEB3_CLAIMED", 1_500).await {
+        return Ok(None);
+    }
+    Ok(service_worker_forwarder_ready_with_timeout(1_500).await)
 }
 
 fn warn_about_worker_conflict(worker: &str, expected_scope_url: &str) {
@@ -1458,62 +1420,15 @@ async fn service_worker_forwarder_ready_with_timeout(
     }
 }
 
-async fn request_service_worker_claim(worker: &web_sys::ServiceWorker) -> bool {
-    service_worker_protocol_request(worker, "WEEB3_CLAIM", "WEEB3_CLAIMED", 1_500).await
-}
-
-async fn claim_exact_service_worker(
-    worker: &web_sys::ServiceWorker,
-) -> Option<web_sys::ServiceWorker> {
-    if !request_service_worker_claim(worker).await {
-        return None;
-    }
-    service_worker_forwarder_ready_with_timeout(1_500).await
-}
-
-struct ServiceWorkerProtocolPort {
-    port: MessagePort,
-    _callback: Closure<dyn FnMut(MessageEvent)>,
-}
-
-impl Drop for ServiceWorkerProtocolPort {
-    fn drop(&mut self) {
-        self.port.set_onmessage(None);
-        self.port.close();
-    }
-}
-
 async fn service_worker_protocol_request(
     worker: &web_sys::ServiceWorker,
     request_type: &str,
     response_type: &str,
     timeout_ms: u64,
 ) -> bool {
-    let Ok(channel) = MessageChannel::new() else {
+    let Ok(mut channel) = ReplyChannel::new() else {
         return false;
     };
-    let (sender, receiver) = async_std::channel::bounded::<bool>(1);
-    let expected_scope = STREAMING_SERVICE_WORKER_SCOPE;
-    let expected_marker = SERVICE_WORKER_MARKER;
-    let expected_response_type = response_type.to_string();
-    let callback = Closure::<dyn FnMut(MessageEvent)>::new(move |event: MessageEvent| {
-        let data = event.data();
-        let matches = string_property(&data, "type")
-            .is_some_and(|value| value == expected_response_type)
-            && number_property(&data, "protocol") == Some(SERVICE_WORKER_PROTOCOL)
-            && string_property(&data, "scope").is_some_and(|scope| scope == expected_scope)
-            && string_property(&data, "marker").is_some_and(|marker| marker == expected_marker);
-        let _ = sender.try_send(matches);
-    });
-    let protocol_port = ServiceWorkerProtocolPort {
-        port: channel.port1(),
-        _callback: callback,
-    };
-    protocol_port
-        .port
-        .set_onmessage(Some(protocol_port._callback.as_ref().unchecked_ref()));
-    protocol_port.port.start();
-
     let ping = Object::new();
     set_js(&ping, "type", JsValue::from_str(request_type));
     set_js(
@@ -1521,20 +1436,23 @@ async fn service_worker_protocol_request(
         "protocol",
         JsValue::from_f64(SERVICE_WORKER_PROTOCOL),
     );
-    let transfer = Array::new();
-    transfer.push(&channel.port2());
     if worker
-        .post_message_with_transferable(&ping, &transfer)
+        .post_message_with_transferable(&ping, &channel.transfer)
         .is_err()
     {
         return false;
     }
 
-    async_std::future::timeout(Duration::from_millis(timeout_ms), receiver.recv())
-        .await
-        .ok()
-        .and_then(Result::ok)
-        .unwrap_or(false)
+    let Ok(Ok(data)) =
+        async_std::future::timeout(Duration::from_millis(timeout_ms), &mut channel.receiver).await
+    else {
+        return false;
+    };
+    string_property(&data, "type").is_some_and(|value| value == response_type)
+        && number_property(&data, "protocol") == Some(SERVICE_WORKER_PROTOCOL)
+        && string_property(&data, "scope")
+            .is_some_and(|scope| scope == STREAMING_SERVICE_WORKER_SCOPE)
+        && string_property(&data, "marker").is_some_and(|marker| marker == SERVICE_WORKER_MARKER)
 }
 
 pub(crate) fn service_worker_scope_protocol_error(purpose: &str) -> String {
@@ -1560,23 +1478,11 @@ async fn wait_for_service_worker_control(
         return false;
     };
     let (sender, changed) = async_std::channel::bounded(1);
-    let callback = Closure::<dyn FnMut(Event)>::new(move |_| {
+    let Ok(_listener) = DomListener::new(&container, "controllerchange", move |_| {
         let _ = sender.try_send(());
-    });
-    let listener = ServiceWorkerControlListener {
-        container,
-        callback,
-    };
-    if listener
-        .container
-        .add_event_listener_with_callback(
-            "controllerchange",
-            listener.callback.as_ref().unchecked_ref(),
-        )
-        .is_err()
-    {
+    }) else {
         return false;
-    }
+    };
 
     weeb3.interface_log(format!("service worker activating for {}", purpose));
     while still_needed() {
@@ -1589,20 +1495,6 @@ async fn wait_for_service_worker_control(
         let _ = async_std::future::timeout(SERVICE_WORKER_SETUP_RETRY, changed.recv()).await;
     }
     false
-}
-
-struct ServiceWorkerControlListener {
-    container: web_sys::ServiceWorkerContainer,
-    callback: Closure<dyn FnMut(Event)>,
-}
-
-impl Drop for ServiceWorkerControlListener {
-    fn drop(&mut self) {
-        let _ = self.container.remove_event_listener_with_callback(
-            "controllerchange",
-            self.callback.as_ref().unchecked_ref(),
-        );
-    }
 }
 
 pub(crate) async fn service_worker_controls_bzz_requests(

@@ -11,15 +11,107 @@ use crate::erasure_coding::{CHUNK_SIZE, HASH_SIZE};
 use k256::ecdsa::{RecoveryId, Signature, VerifyingKey};
 use web3::types::Address;
 
-#[inline]
-pub(crate) fn keccak256(input: impl AsRef<[u8]>) -> [u8; 32] {
-    web3::signing::keccak256(input.as_ref())
+pub(crate) fn keccak256(mut input: &[u8]) -> [u8; 32] {
+    let mut state = [0; 25];
+    while input.len() >= 136 {
+        let (block, rest) = input.split_at(136);
+        input = rest;
+        for (lane, bytes) in state.iter_mut().zip(block.chunks_exact(8)) {
+            *lane ^= u64::from_le_bytes(bytes.try_into().unwrap());
+        }
+        keccak_permute(&mut state);
+    }
+    for (lane, bytes) in state.iter_mut().zip(input.chunks_exact(8)) {
+        *lane ^= u64::from_le_bytes(bytes.try_into().unwrap());
+    }
+    for (index, &byte) in input[input.len() / 8 * 8..].iter().enumerate() {
+        state[input.len() / 8] ^= u64::from(byte) << (index * 8);
+    }
+    // Ethereum/Swarm Keccak padding, rather than the SHA3 domain separator.
+    state[input.len() / 8] ^= 1 << (input.len() % 8 * 8);
+    state[16] ^= 1 << 63;
+    keccak_permute(&mut state);
+    let [a, b, c, d, ..] = state;
+    [a.to_le_bytes(), b.to_le_bytes(), c.to_le_bytes(), d.to_le_bytes()]
+        .as_flattened()
+        .try_into()
+        .unwrap()
+}
+
+fn keccak_permute(a: &mut [u64; 25]) {
+    const ROUND: [u64; 24] = [
+        0x0000000000000001,
+        0x0000000000008082,
+        0x800000000000808a,
+        0x8000000080008000,
+        0x000000000000808b,
+        0x0000000080000001,
+        0x8000000080008081,
+        0x8000000000008009,
+        0x000000000000008a,
+        0x0000000000000088,
+        0x0000000080008009,
+        0x000000008000000a,
+        0x000000008000808b,
+        0x800000000000008b,
+        0x8000000000008089,
+        0x8000000000008003,
+        0x8000000000008002,
+        0x8000000000000080,
+        0x000000000000800a,
+        0x800000008000000a,
+        0x8000000080008081,
+        0x8000000000008080,
+        0x0000000080000001,
+        0x8000000080008008,
+    ];
+    // Keep six lanes complemented across rounds: Chi needs five NOTs instead of 25.
+    macro_rules! complement {
+        ($($i:literal),*) => { $(a[$i] = !a[$i];)* };
+    }
+    complement!(1, 2, 8, 12, 17, 20);
+    for &round in &ROUND {
+        macro_rules! columns {
+            ($($x:literal),*) => { [$(a[$x] ^ a[$x + 5] ^ a[$x + 10] ^ a[$x + 15] ^ a[$x + 20]),*] };
+        }
+        let c = columns!(0, 1, 2, 3, 4);
+        let d = [
+            c[4] ^ c[1].rotate_left(1),
+            c[0] ^ c[2].rotate_left(1),
+            c[1] ^ c[3].rotate_left(1),
+            c[2] ^ c[4].rotate_left(1),
+            c[3] ^ c[0].rotate_left(1),
+        ];
+        let mut out = [0; 25];
+        macro_rules! row {
+            ($y:literal; $(($index:literal, $rotation:literal)),+) => {{
+                let [b0, b1, b2, b3, b4] = [$((a[$index] ^ d[$index % 5]).rotate_left($rotation)),+];
+                let row = match $y {
+                    0 => [b0 ^ (b1 | b2), b1 ^ (!b2 | b3), b2 ^ (b3 & b4), b3 ^ (b4 | b0), b4 ^ (b0 & b1)],
+                    5 => [b0 ^ (b1 | b2), b1 ^ (b2 & b3), b2 ^ (b3 | !b4), b3 ^ (b4 | b0), b4 ^ (b0 & b1)],
+                    10 => [b0 ^ (b1 | b2), b1 ^ (b2 & b3), b2 ^ (!b3 & b4), !b3 ^ (b4 | b0), b4 ^ (b0 & b1)],
+                    15 => [b0 ^ (b1 & b2), b1 ^ (b2 | b3), b2 ^ (!b3 | b4), !b3 ^ (b4 & b0), b4 ^ (b0 | b1)],
+                    20 => [b0 ^ (!b1 & b2), !b1 ^ (b2 | b3), b2 ^ (b3 & b4), b3 ^ (b4 | b0), b4 ^ (b0 & b1)],
+                    _ => unreachable!(),
+                };
+                out[$y..$y + 5].copy_from_slice(&row);
+            }};
+        }
+        row!(0; (0, 0), (6, 44), (12, 43), (18, 21), (24, 14));
+        row!(5; (3, 28), (9, 20), (10, 3), (16, 45), (22, 61));
+        row!(10; (1, 1), (7, 6), (13, 25), (19, 8), (20, 18));
+        row!(15; (4, 27), (5, 36), (11, 10), (17, 15), (23, 56));
+        row!(20; (2, 62), (8, 55), (14, 39), (15, 41), (21, 2));
+        out[0] ^= round;
+        *a = out;
+    }
+    complement!(1, 2, 8, 12, 17, 20);
 }
 
 pub(crate) fn eip191_hash_message(message: &[u8]) -> [u8; 32] {
     let mut prefixed = format!("\x19Ethereum Signed Message:\n{}", message.len()).into_bytes();
     prefixed.extend_from_slice(message);
-    keccak256(prefixed)
+    keccak256(&prefixed)
 }
 
 pub(crate) fn namehash(name: &str) -> [u8; 32] {
@@ -48,14 +140,14 @@ pub(crate) fn encryption_segment_key(key: &[u8], counter: u32) -> [u8; HASH_SIZE
     let mut seed = [0u8; HASH_SIZE + 4];
     seed[..HASH_SIZE].copy_from_slice(key);
     seed[HASH_SIZE..].copy_from_slice(&counter.to_le_bytes());
-    keccak256(keccak256(seed))
+    keccak256(&keccak256(&seed))
 }
 
 pub(crate) fn bee_replica_address(id: &[u8; HASH_SIZE]) -> [u8; HASH_SIZE] {
     let mut input = [0u8; HASH_SIZE + BEE_REPLICA_OWNER.len()];
     input[..HASH_SIZE].copy_from_slice(id);
     input[HASH_SIZE..].copy_from_slice(&BEE_REPLICA_OWNER);
-    keccak256(input)
+    keccak256(&input)
 }
 
 #[derive(Debug, Clone)]
@@ -100,16 +192,15 @@ pub fn get_proximity(one: &[u8], other: &[u8]) -> u8 {
     MAX_PO
 }
 
-const SECTION_SIZE: usize = 32;
-const SECTION2_SIZE: usize = 2 * SECTION_SIZE;
+const SECTION2_SIZE: usize = 2 * HASH_SIZE;
 const BMT_LEAF_COUNT: usize = CHUNK_SIZE / SECTION2_SIZE;
 const BMT_LEVEL_COUNT: usize = 7;
 
-type BmtHash = [u8; SECTION_SIZE];
+type BmtHash = [u8; HASH_SIZE];
 
 fn zero_bmt_nodes() -> [BmtHash; BMT_LEVEL_COUNT] {
-    let mut nodes = [[0u8; SECTION_SIZE]; BMT_LEVEL_COUNT];
-    nodes[0] = keccak256([0u8; SECTION2_SIZE]);
+    let mut nodes = [[0u8; HASH_SIZE]; BMT_LEVEL_COUNT];
+    nodes[0] = keccak256(&[0u8; SECTION2_SIZE]);
     for level in 1..BMT_LEVEL_COUNT {
         nodes[level] = keccak256([nodes[level - 1]; 2].as_flattened());
     }
@@ -132,20 +223,16 @@ fn bmt_root(content: &[u8]) -> Option<BmtHash> {
     if effective_len == 0 {
         return Some(ZERO_BMT_NODES.with(|nodes| nodes[BMT_LEVEL_COUNT - 1]));
     }
-    let mut nodes = [[0u8; SECTION_SIZE]; BMT_LEAF_COUNT];
-    let mut block = [0u8; SECTION2_SIZE];
+    let mut nodes = [[0u8; HASH_SIZE]; BMT_LEAF_COUNT];
 
-    let full_blocks = effective_len / SECTION2_SIZE;
-    for (index, section) in content[..full_blocks * SECTION2_SIZE]
-        .chunks_exact(SECTION2_SIZE)
-        .enumerate()
-    {
-        nodes[index] = keccak256(section);
+    let (sections, tail) = content[..effective_len].as_chunks::<SECTION2_SIZE>();
+    for (node, section) in nodes.iter_mut().zip(sections) {
+        *node = keccak256(section);
     }
-    if effective_len % SECTION2_SIZE != 0 {
-        let start = full_blocks * SECTION2_SIZE;
-        block[..effective_len - start].copy_from_slice(&content[start..effective_len]);
-        nodes[full_blocks] = keccak256(block);
+    if !tail.is_empty() {
+        let mut block = [0u8; SECTION2_SIZE];
+        block[..tail.len()].copy_from_slice(tail);
+        nodes[sections.len()] = keccak256(&block);
     }
 
     Some(ZERO_BMT_NODES.with(|zero_nodes| {
@@ -166,16 +253,12 @@ fn bmt_root(content: &[u8]) -> Option<BmtHash> {
 }
 
 fn content_address_array(chunk_content: &[u8]) -> Option<BmtHash> {
-    if !(SPAN_SIZE..=SPAN_SIZE + CHUNK_SIZE).contains(&chunk_content.len()) {
-        return None;
-    }
-
-    let (span, content) = chunk_content.split_at(SPAN_SIZE);
+    let (span, content) = chunk_content.split_at_checked(SPAN_SIZE)?;
     let root = bmt_root(content)?;
-    let mut hash_input = [0u8; SPAN_SIZE + SECTION_SIZE];
+    let mut hash_input = [0u8; SPAN_SIZE + HASH_SIZE];
     hash_input[..SPAN_SIZE].copy_from_slice(span);
     hash_input[SPAN_SIZE..].copy_from_slice(&root);
-    Some(keccak256(hash_input))
+    Some(keccak256(&hash_input))
 }
 
 pub fn content_address(chunk_content: &[u8]) -> Vec<u8> {
@@ -200,14 +283,14 @@ pub fn valid_soc(chunk_content: &[u8], address: &[u8]) -> bool {
     let mut sign_input = [0_u8; 64];
     sign_input[..32].copy_from_slice(soc_address);
     sign_input[32..].copy_from_slice(&wrapped_address);
-    let to_sign = keccak256(sign_input);
+    let to_sign = keccak256(&sign_input);
     let Some(owner) = recover_address(soc_signature, to_sign.as_slice()) else {
         return false;
     };
     let mut address_input = [0_u8; 52];
     address_input[..32].copy_from_slice(soc_address);
     address_input[32..].copy_from_slice(owner.as_bytes());
-    address == keccak256(address_input).as_slice()
+    address == keccak256(&address_input).as_slice()
 }
 
 pub fn get_feed_address(owner: &str, topic: &str, index: u64) -> Vec<u8> {
@@ -222,10 +305,7 @@ pub fn get_feed_address(owner: &str, topic: &str, index: u64) -> Vec<u8> {
         return vec![];
     }
 
-    crate::feed::sequence_feed_address(&topic_bytes, &owner_bytes, index, |input| {
-        keccak256(input)
-    })
-    .to_vec()
+    crate::feed::sequence_feed_address(&topic_bytes, &owner_bytes, index, keccak256).to_vec()
 }
 
 pub fn encode_resources(data_array: Vec<(Vec<u8>, String, String)>, indx: String) -> Vec<u8> {
@@ -240,7 +320,7 @@ pub(crate) fn normalize_feed_topic(topic: &str) -> String {
     if hex::decode_to_slice(unprefixed, &mut bytes).is_ok() {
         hex::encode(bytes)
     } else {
-        hex::encode(keccak256(trimmed))
+        hex::encode(keccak256(trimmed.as_bytes()))
     }
 }
 
@@ -413,7 +493,7 @@ mod hash_tests {
                 let mut padded = vec![0; CHUNK_SIZE];
                 padded[..length].copy_from_slice(&data[..length]);
                 let mut level = padded;
-                while level.len() > SECTION_SIZE {
+                while level.len() > HASH_SIZE {
                     level = level
                         .chunks_exact(SECTION2_SIZE)
                         .flat_map(web3::signing::keccak256)
@@ -431,8 +511,8 @@ mod hash_tests {
     }
 
     #[wasm_bindgen_test]
-    fn existing_keccak_backends_agree_at_rate_boundaries() {
-        for length in (0..=3 * 136).chain([CHUNK_SIZE]) {
+    fn minimal_keccak_matches_independent_backends() {
+        for length in 0..=CHUNK_SIZE {
             for input in [
                 (0..length).map(|index| index as u8).collect::<Vec<_>>(),
                 vec![0xff; length],
@@ -448,7 +528,7 @@ mod hash_tests {
             ("", "c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470"),
             ("abc", "4e03657aea45a94fc7d47ba826c8d667c0d1e6e33a64a036ec44f58fa12d6c45"),
         ] {
-            assert_eq!(hex::encode(keccak256(input)), expected);
+            assert_eq!(hex::encode(keccak256(input.as_bytes())), expected);
         }
         for name in ["", "eth", "swarm.eth", "a..ETH", "é.eth", "\0.eth", "."] {
             assert_eq!(namehash(name), web3::signing::namehash(name));

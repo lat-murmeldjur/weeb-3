@@ -88,78 +88,32 @@ function isBzzUploadPath(pathname) {
   return NETWORK_ROUTE_PREFIXES.some((prefix) => pathname === `${SCOPE_PATH}${prefix}bzz`);
 }
 
-function canonicalBzzResource(url) {
-  for (const marker of BZZ_ROUTE_MARKERS) {
-    if (!url.pathname.startsWith(marker)) {
-      continue;
-    }
-
-    const resource = url.pathname.substring(marker.length);
-    if (!resource) {
-      return null;
-    }
-
-    const reference = resource.split("/", 1)[0];
-    if (!isSwarmReference(reference)) {
-      return null;
-    }
-
-    try {
-      return decodeURIComponent(resource);
-    } catch (_) {
-      return resource;
-    }
+function decodeResource(resource) {
+  try {
+    return decodeURIComponent(resource);
+  } catch (_) {
+    return resource;
   }
+}
 
-  return null;
+function canonicalBzzResource(url) {
+  const marker = BZZ_ROUTE_MARKERS.find((marker) => url.pathname.startsWith(marker));
+  const resource = marker && url.pathname.substring(marker.length);
+  return resource && isSwarmReference(resource.split("/", 1)[0])
+    ? decodeResource(resource) : null;
 }
 
 function canonicalRawResource(url) {
-  for (const [marker, rawType] of RAW_ROUTE_MARKERS) {
-    if (!url.pathname.startsWith(marker)) {
-      continue;
-    }
-
-    const encodedResource = url.pathname.substring(marker.length);
-    if (!encodedResource) {
-      return null;
-    }
-
-    let resource;
-    try {
-      resource = decodeURIComponent(encodedResource);
-    } catch (_) {
-      resource = encodedResource;
-    }
-    if (rawType === "hls-bytes" && !isSwarmReference(resource)) {
-      return null;
-    }
-    return resource;
-  }
-
-  return null;
+  const route = RAW_ROUTE_MARKERS.find(([marker]) => url.pathname.startsWith(marker));
+  if (!route) return null;
+  const resource = decodeResource(url.pathname.substring(route[0].length));
+  return resource && (route[1] !== "hls-bytes" || isSwarmReference(resource)) ? resource : null;
 }
 
 function canonicalFeedResource(url) {
-  for (const marker of FEED_ROUTE_MARKERS) {
-    if (!url.pathname.startsWith(marker)) {
-      continue;
-    }
-
-    const resource = url.pathname.substring(marker.length);
-    const parts = resource.split("/");
-    if (
-      parts.length !== 2 ||
-      !/^[a-fA-F0-9]{40}$/.test(parts[0]) ||
-      !/^[a-fA-F0-9]{64}$/.test(parts[1])
-    ) {
-      return null;
-    }
-
-    return `${parts[0]}/${parts[1]}`;
-  }
-
-  return null;
+  const marker = FEED_ROUTE_MARKERS.find((marker) => url.pathname.startsWith(marker));
+  const resource = marker && url.pathname.substring(marker.length);
+  return resource && /^[a-fA-F0-9]{40}\/[a-fA-F0-9]{64}$/.test(resource) ? resource : null;
 }
 
 function isHlsResource(url) {
@@ -206,41 +160,31 @@ self.addEventListener("activate", (event) => {
 });
 
 self.addEventListener("message", (event) => {
+  const type = event.data?.type;
   if (
-    (event.data?.type === "WEEB3_CLAIM" || event.data?.type === "WEEB3_PING") &&
+    (type !== "WEEB3_CLAIM" && type !== "WEEB3_PING") ||
     event.data?.protocol !== SERVICE_WORKER_PROTOCOL
   ) {
     return;
   }
-  if (event.data?.type === "WEEB3_CLAIM") {
-    const port = event.ports?.[0];
+  const port = event.ports?.[0];
+  const reply = () => {
+    port?.postMessage({
+      type: type === "WEEB3_CLAIM" ? "WEEB3_CLAIMED" : "WEEB3_PONG",
+      protocol: SERVICE_WORKER_PROTOCOL,
+      scope: SCOPE_PATH,
+      marker: SERVICE_WORKER_MARKER
+    });
+    closeMessagePort(port);
+  };
+  if (type === "WEEB3_CLAIM") {
     event.waitUntil((async () => {
       await self.clients.claim();
-      port?.postMessage({
-        type: "WEEB3_CLAIMED",
-        protocol: SERVICE_WORKER_PROTOCOL,
-        scope: SCOPE_PATH,
-        marker: SERVICE_WORKER_MARKER
-      });
-      closeMessagePort(port);
+      reply();
     })());
-    return;
+  } else if (port) {
+    reply();
   }
-
-  if (event.data?.type !== "WEEB3_PING") {
-    return;
-  }
-  const port = event.ports?.[0];
-  if (!port) {
-    return;
-  }
-  port.postMessage({
-    type: "WEEB3_PONG",
-    protocol: SERVICE_WORKER_PROTOCOL,
-    scope: SCOPE_PATH,
-    marker: SERVICE_WORKER_MARKER
-  });
-  closeMessagePort(port);
 });
 
 self.addEventListener("fetch", (event) => {

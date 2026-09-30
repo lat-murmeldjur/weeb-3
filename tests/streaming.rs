@@ -386,12 +386,16 @@ mod hls_minimal {
         let first = window(0, &REFERENCES[..4]);
         let middle = window(3, &REFERENCES[3..7]);
         let head = window(5, &REFERENCES[5..]);
-        let history =
-            HlsPlaylist::reconstruct(vec![(5, first.clone()), (15, middle)], 25, head.clone(), 0)
-                .unwrap();
-        assert_eq!(history.sequence, 0);
-        assert_eq!(history.segments.len(), 8);
-        assert_eq!(history.duration(), 32.0);
+        for snapshots in [
+            vec![(5, first.clone()), (15, middle.clone())],
+            vec![(15, middle.clone()), (5, first.clone())],
+            vec![(5, first.clone()), (5, middle)],
+        ] {
+            let history = HlsPlaylist::reconstruct(snapshots, 25, head.clone(), 0).unwrap();
+            assert_eq!(history.sequence, 0);
+            assert_eq!(history.segments.len(), 8);
+            assert_eq!(history.duration(), 32.0);
+        }
 
         let disconnected = window(5, &[REFERENCES[7]]);
         assert!(HlsPlaylist::reconstruct(vec![(5, first)], 25, disconnected, 0).is_none());
@@ -577,23 +581,23 @@ mod hls_minimal {
             suppress < attach,
             "native play intent must be owned before MSE attach"
         );
-        assert!(PLAYER.contains("let requested = media.autoplay()"));
-        assert!(PLAYER.contains("media.set_autoplay(false)"));
-        assert!(PLAYER.contains("media.set_autoplay(true)"));
-        assert!(
-            PLAYER.contains(
-                "playback_start_position(&player.media, &player.plan)"
-            )
-        );
-        assert!(PLAYER.contains("matches!(event, \"durationchange\" | \"seeked\" | \"canplay\")"));
-        assert!(PLAYER.contains("begin_playback(media.clone(), position)"));
-        assert!(PLAYER.contains("event == \"timeupdate\""));
+        crate::source::assert_contains(PLAYER, &[
+            "let requested = media.autoplay()",
+            "media.set_autoplay(false)",
+            "media.set_autoplay(true)",
+            "playback_start_position(&player.media, &player.plan)",
+            "matches!(event, \"durationchange\" | \"seeked\" | \"canplay\")",
+            "begin_playback(media.clone(), position)",
+            "event == \"timeupdate\"",
+        ]);
         assert!(!PLAYER.contains("Ok(_) => set_state(&media, \"playing\""));
-        assert!(PLAYER.contains("(180.0, 600.0)"));
-        assert!(PLAYER.contains("const LIVE_RUNWAY_BUFFER: (f64, f64) = (90.0, 120.0)"));
-        assert!(PLAYER.contains("set(&config, \"autoStartLoad\", JsValue::FALSE)"));
-        assert!(PLAYER.contains("futures::future::join(initialize, prepared).await"));
-        assert!(PLAYER.contains("if media.paused() && playback_intent(&media, None)"));
+        crate::source::assert_contains(PLAYER, &[
+            "(180.0, 600.0)",
+            "const LIVE_RUNWAY_BUFFER: (f64, f64) = (90.0, 120.0)",
+            "set(&config, \"autoStartLoad\", JsValue::FALSE)",
+            "futures::future::join(initialize, prepared).await",
+            "if media.paused() && playback_intent(&media, None)",
+        ]);
         assert!(!PLAYER.contains("media.set_hidden(true)"));
         assert!(!PLAYER.contains("fn initial_live_position("));
         assert_eq!(PLAYER.matches("media.play()").count(), 1);
@@ -633,10 +637,12 @@ mod hls_minimal {
             .unwrap()
             .0;
         assert!(!PLAYER.contains("enum MediaAction"));
-        assert!(lifecycle.contains("event == \"timeupdate\""));
-        assert!(lifecycle.contains("position + CLOCK_ADVANCE_EPSILON_SECONDS"));
-        assert!(lifecycle.contains("*clock_position = Some(media.current_time())"));
-        assert!(lifecycle.contains("&& !media.seeking()"));
+        crate::source::assert_contains(lifecycle, &[
+            "event == \"timeupdate\"",
+            "position + CLOCK_ADVANCE_EPSILON_SECONDS",
+            "*clock_position = Some(media.current_time())",
+            "&& !media.seeking()",
+        ]);
         assert!(!PLAYER.contains("clock_origin"));
     }
 
@@ -680,22 +686,22 @@ mod hls_minimal {
         }
         assert!(!PLAYER.contains("has_video_track"));
         assert!(WORKER_BRIDGE.contains(".record(snapshot, sequence, &reference)"));
-        assert!(RUNTIME.contains("pub(crate) fn live_tail_failure_identity("));
-        assert!(RUNTIME.contains("pub(crate) fn install_live_tail_fallback("));
-        assert!(RUNTIME.contains("let retreat = (0..failed)"));
-        assert!(RUNTIME.contains("const LIVE_TAIL_FALLBACK_LIMIT: usize = 4"));
-        assert!(RUNTIME.contains("const LIVE_TAIL_FALLBACK_WINDOW_MS: f64 = 300_000.0"));
-        assert!(RUNTIME.contains("active.tail_fallbacks.len() >= LIVE_TAIL_FALLBACK_LIMIT"));
-        assert!(RUNTIME.contains("Some(target)"));
-        assert!(RUNTIME.contains("presentation_gaps"));
-        assert!(RUNTIME.contains("presentation_playlist(feed)?"));
-        assert!(RUNTIME.contains("active.live_startup_plan = Some(plan.clone())"));
-        assert!(RUNTIME.contains("let mut presentation = playlist.clone()"));
-        assert!(RUNTIME.contains(
-            "playlist.render_with_plan(local_bytes_base, start, feed.live_startup_plan.as_ref())"
-        ));
-        assert!(RUNTIME.contains("presentation.mark_gap(*sequence, reference)"));
-        assert!(RUNTIME.contains(".take(HLS_LIVE_EDGE_SEGMENTS)"));
+        crate::source::assert_contains(RUNTIME, &[
+            "pub(crate) fn live_tail_failure_identity(",
+            "pub(crate) fn install_live_tail_fallback(",
+            "let retreat = (0..failed)",
+            "const LIVE_TAIL_FALLBACK_LIMIT: usize = 4",
+            "const LIVE_TAIL_FALLBACK_WINDOW_MS: f64 = 300_000.0",
+            "active.tail_fallbacks.len() >= LIVE_TAIL_FALLBACK_LIMIT",
+            "Some(target)",
+            "presentation_gaps",
+            "presentation_playlist(feed)?",
+            "active.live_startup_plan = Some(plan.clone())",
+            "let mut presentation = playlist.clone()",
+            "playlist.render_with_plan(local_bytes_base, start, feed.live_startup_plan.as_ref())",
+            "presentation.mark_gap(*sequence, reference)",
+            ".take(HLS_LIVE_EDGE_SEGMENTS)",
+        ]);
         assert!(!PLAYER.contains("internal_seek"));
 
         let manifest = PLAYER.find("\"hlsManifestParsed\" =>").unwrap();
@@ -755,14 +761,11 @@ mod hls_minimal {
         assert!(duration_retry.contains("&& !player.codec_bootstrap_pending"));
         let ready_gate = handoff + PLAYER[handoff..].find("if !player.ready =>").unwrap();
         let handoff_path = &PLAYER[handoff..ready_gate];
-        let cleared = handoff_path
-            .find("player.codec_bootstrap_pending = false")
-            .unwrap();
-        let recheck = handoff_path.find("finish_buffering(player)").unwrap();
-        let play = handoff_path
-            .find("Action::Play(player.media.clone(), position)")
-            .unwrap();
-        assert!(cleared < recheck && recheck < play);
+        crate::source::assert_first_in_order(handoff_path, &[
+            ("player.codec_bootstrap_pending = false", "missing source marker"),
+            ("finish_buffering(player)", "missing source marker"),
+            ("Action::Play(player.media.clone(), position)", "missing source marker"),
+        ]);
         assert!(
             handoff_path.contains("Action::Retarget(\n                        player.hls.clone()")
         );
@@ -796,13 +799,15 @@ mod hls_minimal {
             .split_once("fn finish_buffering(")
             .unwrap()
             .0;
-        assert!(gate.contains("player.initial_live && player.hard_restarts == 0"));
-        assert!(gate.contains("let runway = player.plan.runway_end - player.plan.play_position"));
-        assert!(gate.contains("(0..ranges.length()).rev().find_map"));
-        assert!(gate.contains(".max(player.plan.play_position)"));
-        assert!(gate.contains(".max(player.media.current_time())"));
-        assert!(gate.contains("end + BUFFER_EPSILON_SECONDS >= position + runway"));
-        assert!(gate.contains(".then_some(position)"));
+        crate::source::assert_contains(gate, &[
+            "player.initial_live && player.hard_restarts == 0",
+            "let runway = player.plan.runway_end - player.plan.play_position",
+            "(0..ranges.length()).rev().find_map",
+            ".max(player.plan.play_position)",
+            ".max(player.media.current_time())",
+            "end + BUFFER_EPSILON_SECONDS >= position + runway",
+            ".then_some(position)",
+        ]);
     }
 
     #[test]
@@ -819,10 +824,12 @@ mod hls_minimal {
             .split_once("\n}\n\nfn next_feed_id(")
             .unwrap()
             .0;
-        assert!(successor.contains("active.foreground = Some(reference.to_string())"));
-        assert!(successor.contains("hls_progressive_foreground_transition"));
-        assert!(successor.contains("if follow {"));
-        assert!(successor.contains("spawn_body_runway(id)"));
+        crate::source::assert_contains(successor, &[
+            "active.foreground = Some(reference.to_string())",
+            "hls_progressive_foreground_transition",
+            "if follow {",
+            "spawn_body_runway(id)",
+        ]);
         assert!(!successor.contains(".await"), "a seek must return its fragment without waiting for later media");
         let runway = RUNTIME.split_once("fn body_runway_targets(").unwrap().1
             .split_once("fn prefetch_from_reference(").unwrap().0;
@@ -835,14 +842,12 @@ mod hls_minimal {
             .split_once("\n}\n\nfn parse_hls_range(")
             .unwrap()
             .0;
-        assert!(response.contains("method == \"GET\" && range.is_none()"));
-        assert!(response.contains("prefetch_from_reference(&reference, cached)"));
-        assert!(response.contains("if complete_body && root.as_ref()"));
-        assert!(
-            response.contains(
-                "foreground_hls_body(client.clone(), reference.clone())"
-            )
-        );
+        crate::source::assert_contains(response, &[
+            "method == \"GET\" && range.is_none()",
+            "prefetch_from_reference(&reference, cached)",
+            "if complete_body && root.as_ref()",
+            "foreground_hls_body(client.clone(), reference.clone())",
+        ]);
         assert!(!response.contains("hls_body(client.clone(), successor, None).await"));
         assert!(response.contains("let mime = if codec_bootstrap"));
     }
@@ -1374,39 +1379,30 @@ mod service_worker {
             "fn schedule_start(&self, options: StartOptions)",
             "async fn boot_runtime(&self)",
         );
-        let npm_release = npm_start
-            .find("crate::stream::release_current_stream_view()")
-            .expect("npm network switch stream release");
-        let npm_switch = npm_start
-            .find("configure_shared_node(&inner")
-            .expect("npm network switch");
-        assert!(npm_release < npm_switch);
+        crate::source::assert_first_in_order(npm_start, &[
+            ("crate::stream::release_current_stream_view()", "npm network switch stream release"),
+            ("configure_shared_node(&inner", "npm network switch"),
+        ]);
 
         let settings = source_between(
             INTERFACE_RUNTIME,
             "pub(super) async fn apply_network_settings_and_connect(",
             "pub(super) fn current_network_id_input()",
         );
-        let settings_release = settings
-            .find("crate::stream::release_current_stream_view()")
-            .expect("settings network switch stream release");
-        let settings_switch = settings
-            .find("connect_all_bootnode_settings(")
-            .expect("settings network switch");
-        assert!(settings_release < settings_switch);
+        crate::source::assert_first_in_order(settings, &[
+            ("crate::stream::release_current_stream_view()", "settings network switch stream release"),
+            ("connect_all_bootnode_settings(", "settings network switch"),
+        ]);
 
         let api_switch = source_between(
             LIBRARY,
             "pub async fn switch_network(&self, mode: String)",
             "#[wasm_bindgen(js_name = retrieve)]",
         );
-        let api_release = api_switch
-            .find("crate::stream::release_current_stream_view()")
-            .expect("switchNetwork stream release");
-        let api_set = api_switch
-            .find("configure_shared_node(&self.inner")
-            .expect("switchNetwork network switch");
-        assert!(api_release < api_set);
+        crate::source::assert_first_in_order(api_switch, &[
+            ("crate::stream::release_current_stream_view()", "switchNetwork stream release"),
+            ("configure_shared_node(&self.inner", "switchNetwork network switch"),
+        ]);
     }
 
     #[test]
@@ -1416,15 +1412,18 @@ mod service_worker {
             "pub fn render_interface(&self, container: Element)",
             "#[wasm_bindgen(js_name = attachStream)]",
         );
-        assert!(render.contains("self.startup.begin()"));
-        assert!(render.contains("let guard = startup.serial.lock().await"));
-        assert!(render.contains("route_network_mode_from_location()"));
-        assert!(render.contains("startup.finish(None)"));
-        assert!(render.contains("Some(initial_result_generation)"));
+        crate::source::assert_contains(render, &[
+            "self.startup.begin()",
+            "let guard = startup.serial.lock().await",
+            "route_network_mode_from_location()",
+            "startup.finish(None)",
+            "Some(initial_result_generation)",
+        ]);
 
-        let dial = render.find("configure_shared_node(&s").unwrap();
-        let release = render.find("startup.finish(None)").unwrap();
-        assert!(dial < release);
+        crate::source::assert_first_in_order(render, &[
+            ("configure_shared_node(&s", "missing source marker"),
+            ("startup.finish(None)", "missing source marker"),
+        ]);
 
         let mount = source_between(
             INTERFACE,
@@ -1442,18 +1441,18 @@ mod service_worker {
             "function isStableWindowClient(client)",
             "function closeMessagePort(",
         );
-        assert!(selection.contains("async function windowNetworkId(client)"));
-        assert!(selection.contains("{ type: \"WEEB3_CLIENT_PING\" }"));
-        assert!(selection.contains("response?.type !== \"WEEB3_CLIENT_PONG\""));
-        assert!(selection.contains("response?.sharedWorkerProtocol"));
-        assert!(
-            selection.contains("async function originatingWindow(clientId, resultingClientId)")
-        );
-        assert!(selection.contains("for (const id of [clientId, resultingClientId])"));
-        assert!(selection.contains("windowNetworkDiscoveries.get(client.id)"));
-        assert!(selection.contains("cachedWindowNetworks.set(client.id, networkId)"));
-        assert!(selection.contains("allowFallback = true"));
-        assert!(selection.contains("includeUncontrolled: false"));
+        crate::source::assert_contains(selection, &[
+            "async function windowNetworkId(client)",
+            "{ type: \"WEEB3_CLIENT_PING\" }",
+            "response?.type !== \"WEEB3_CLIENT_PONG\"",
+            "response?.sharedWorkerProtocol",
+            "async function originatingWindow(clientId, resultingClientId)",
+            "for (const id of [clientId, resultingClientId])",
+            "windowNetworkDiscoveries.get(client.id)",
+            "cachedWindowNetworks.set(client.id, networkId)",
+            "allowFallback = true",
+            "includeUncontrolled: false",
+        ]);
         assert!(!selection.contains("includeUncontrolled: true"));
         assert_eq!(STATIC_WORKER.matches("WEEB3_CLIENT_PING").count(), 1);
 
@@ -1509,9 +1508,9 @@ mod service_worker {
             "function canonicalRawResource(url)",
             "function canonicalFeedResource(url)",
         );
-        assert!(raw_routes.contains("for (const [marker, rawType] of RAW_ROUTE_MARKERS)"));
-        assert!(raw_routes.contains(r#"rawType === "hls-bytes" && !isSwarmReference(resource)"#));
-        assert!(raw_routes.contains("return resource;"));
+        assert!(raw_routes.contains("RAW_ROUTE_MARKERS.find(([marker]) => url.pathname.startsWith(marker))"));
+        assert!(raw_routes.contains(r#"route[1] !== "hls-bytes" || isSwarmReference(resource)"#));
+        assert!(raw_routes.contains("? resource : null;"));
     }
 
     #[test]
@@ -1536,9 +1535,11 @@ mod service_worker {
         assert!(worker_matcher.contains("parts.length === streamOffset + 3"));
         assert!(worker_matcher.contains(r#"parts[streamOffset] === "stream""#));
         assert!(worker_matcher.contains("/^[a-fA-F0-9]{40}$/"));
-        assert!(!worker_matcher.contains("testnet"));
-        assert!(!worker_matcher.contains("mainnet"));
-        assert!(!worker_matcher.contains("index"));
+        crate::source::assert_excludes(worker_matcher, &[
+            "testnet",
+            "mainnet",
+            "index",
+        ]);
 
         let fetch_handler = source_between(
             STATIC_WORKER,
@@ -1605,7 +1606,7 @@ mod stream_reader_concurrency {
         assert!(window.contains("RangeReadError::waiter_timeout(error)"));
         let timeout = window.split_once("Err(_) => {").unwrap().1;
         assert!(timeout.find("waiter.retain_owner()").unwrap() < timeout.find("RangeReadError::waiter_timeout(error)").unwrap());
-        assert!(!timeout.contains("finish_pending_range("));
+        assert!(!timeout.contains(".pending_ranges"));
         let retain = source_section("impl RangeWaiterGuard {", "impl Drop for RangeWaiterGuard {");
         assert!(retain.contains("shared.admission = None"));
 
@@ -1679,17 +1680,20 @@ mod stream_reader_concurrency {
         assert!(window.contains("range_load_role(&cache_key, generation, cancel_when_unused)"));
         let moved_key = window.find("let leader_cache_key = cache_key;").unwrap();
         let remembered = window.find("remember_range(").unwrap();
-        let completed = window.find("finish_pending_range(").unwrap();
+        let completed = window.find("if let Some(pending)").unwrap();
         assert!(moved_key < remembered && remembered < completed);
-        assert!(window[completed..].contains("&leader_pending_key"));
+        assert!(window[completed..].contains(".take(&leader_pending_key, load_id)"));
+        assert!(window[completed..].contains("finish_range_waiters(pending.waiters, load_result)"));
     }
 
     #[test]
     fn page_media_events_do_not_mutate_the_worker_owned_fetch_cache() {
-        assert!(!STREAMING_PLAYER.contains("ACTIVE_BZZ_MEDIA_URL"));
-        assert!(!STREAMING_PLAYER.contains("reset_bzz_fetch_url_activity"));
-        assert!(!STREAMING_PLAYER.contains("suspend_bzz_fetch_url_prefetch"));
-        assert!(!STREAMING_PLAYER.contains("BZZ_MEDIA_PLAYING"));
+        crate::source::assert_excludes(STREAMING_PLAYER, &[
+            "ACTIVE_BZZ_MEDIA_URL",
+            "reset_bzz_fetch_url_activity",
+            "suspend_bzz_fetch_url_prefetch",
+            "BZZ_MEDIA_PLAYING",
+        ]);
 
         let retry = source_section("fn install_play_retries(", "fn schedule_media_retry(");
         assert!(retry.contains("MediaRetryState"));

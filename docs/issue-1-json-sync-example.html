@@ -15,7 +15,7 @@
         margin-top: 1.25rem;
         padding-top: 1rem;
       }
-      button, input {
+      button, input, select {
         font: inherit;
         margin: .25rem .5rem .25rem 0;
       }
@@ -49,6 +49,10 @@
 
     <section>
       <h2>3. Upload JSON</h2>
+      <label>Feed owner <select id="feedOwner">
+        <option value="wallet">Connected wallet (sign each update; works across browsers)</option>
+        <option value="stored">Stored vault identity (existing local feeds)</option>
+      </select></label>
       <button id="uploadJson">Upload encrypted JSON</button>
       <pre id="uploadOut"></pre>
     </section>
@@ -57,7 +61,7 @@
       <h2>4. Download JSON</h2>
       <label>
         Owner address
-        <input id="owner" type="text" placeholder="0x..." />
+        <input id="owner" type="text" placeholder="0x... wallet or stored feed owner" />
       </label>
       <button id="downloadJson">Download JSON from Swarm</button>
       <pre id="downloadOut"></pre>
@@ -103,14 +107,6 @@
         return value;
       }
 
-      function bytesFromText(text) {
-        return encoder.encode(text);
-      }
-
-      function textFromBytes(bytes) {
-        return decoder.decode(bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes));
-      }
-
       function bytesToHex(bytes) {
         return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
       }
@@ -122,7 +118,7 @@
       }
 
       async function sha256Hex(text) {
-        const digest = await crypto.subtle.digest("SHA-256", bytesFromText(text));
+        const digest = await crypto.subtle.digest("SHA-256", encoder.encode(text));
         return bytesToHex(new Uint8Array(digest));
       }
 
@@ -251,10 +247,11 @@
         const payload = makePayload();
         const upload = await node.postFeedBytes(
           TOPIC,
-          bytesFromText(payload.text),
+          encoder.encode(payload.text),
           "application/json",
           "oneplusone-links.json",
-          ENCRYPTION
+          ENCRYPTION,
+          $("feedOwner").value === "wallet" ? batch.wallet : undefined
         );
         if (!okStatus(upload)) {
           throw new Error(upload.error || upload.reason || "feed upload failed");
@@ -271,7 +268,7 @@
           syncId: payload.syncId,
           digest,
           encryption: ENCRYPTION,
-          bytes: bytesFromText(payload.text).byteLength,
+          bytes: encoder.encode(payload.text).byteLength,
           batch,
           upload,
           json: payload.payload
@@ -290,7 +287,7 @@
           return { status: result.status, reason: result.reason, owner, topic: TOPIC, result };
         }
 
-        const downloadedText = textFromBytes(result.body);
+        const downloadedText = decoder.decode(result.body);
         const downloadedJson = JSON.parse(downloadedText);
         const text = JSON.stringify(downloadedJson, null, 2);
         const digest = await sha256Hex(text);

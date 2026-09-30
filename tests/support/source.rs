@@ -19,3 +19,27 @@ pub fn assert_in_order<'a>(source: &'a str, markers: &[&'a str]) {
 pub fn compact(source: &str) -> String {
     source.split_whitespace().collect()
 }
+
+#[track_caller]
+pub fn assert_contains(source: &str, markers: &[&str]) {
+    for marker in markers {
+        assert!(source.contains(marker), "missing source marker {marker:?}");
+    }
+}
+
+#[track_caller]
+pub fn assert_excludes(source: &str, markers: &[&str]) {
+    for marker in markers {
+        assert!(!source.contains(marker), "unexpected source marker {marker:?}");
+    }
+}
+
+#[track_caller]
+pub fn assert_first_in_order(source: &str, markers: &[(&str, &str)]) {
+    let mut previous = None;
+    for &(marker, missing) in markers {
+        let position = source.find(marker).unwrap_or_else(|| panic!("{missing}: {marker:?}"));
+        assert!(previous.is_none_or(|last| last < position), "out-of-order source marker {marker:?}");
+        previous = Some(position);
+    }
+}

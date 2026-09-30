@@ -66,11 +66,15 @@ pub(crate) async fn set_payment_threshold(
     amount: u64,
     refreshments: &mpsc::Sender<RefreshmentInstruction>,
 ) {
-    let has_debt = {
+    let (has_debt, increased) = {
         let mut account = accounting.lock().await;
+        let increased = amount > account.threshold;
         account.threshold = amount;
-        account.balance > 0
+        (account.balance > 0, increased)
     };
+    if increased {
+        crate::notify_credit_available();
+    }
     if has_debt {
         apply_credit(accounting, 0, refreshments).await;
     }
@@ -121,6 +125,9 @@ pub(crate) async fn apply_credit(
     if drained {
         crate::ACCOUNTING_DRAINED.notify(usize::MAX);
     }
+    if compensated > 0 {
+        crate::notify_credit_available();
+    }
 
     if let Some(instruction) = instruction
         && let Err(error) = refreshments.try_send(instruction)
@@ -135,6 +142,9 @@ pub(crate) async fn apply_refreshment(
     amount: u64,
 ) -> Option<(PeerId, u64, u64)> {
     let mut account = accounting.lock().await;
+    if amount > 0 && account.balance > 0 {
+        crate::notify_credit_available();
+    }
     if amount >= account.balance {
         let surplus_growth = amount - account.balance;
         account.balance = 0;
@@ -151,11 +161,15 @@ pub(crate) async fn apply_refreshment(
 #[cfg(target_arch = "wasm32")]
 pub(crate) async fn cancel_reserve(accounting: &Mutex<PeerAccounting>, amount: u64) {
     let mut account = accounting.lock().await;
+    let released = amount > 0 && account.reserve > 0;
     account.reserve = account.reserve.saturating_sub(amount);
     let drained = account.reserve == 0;
     drop(account);
     if drained {
         crate::ACCOUNTING_DRAINED.notify(usize::MAX);
+    }
+    if released {
+        crate::notify_credit_available();
     }
 }
 

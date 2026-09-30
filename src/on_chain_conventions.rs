@@ -74,7 +74,7 @@ impl ChainContract {
 
 pub(crate) fn abi_call(signature: &str, parameters: &[[u8; 32]]) -> Vec<u8> {
     let mut data = Vec::with_capacity(4 + parameters.len() * 32);
-    data.extend_from_slice(&keccak256(signature)[..4]);
+    data.extend_from_slice(&keccak256(signature.as_bytes())[..4]);
     data.extend_from_slice(parameters.as_flattened());
     data
 }

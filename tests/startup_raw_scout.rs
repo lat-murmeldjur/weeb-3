@@ -107,21 +107,25 @@ fn hls_retrieval_ownership_boundary_stays_strict() {
 
     assert!(HLS_RUNTIME.contains("read_cached_hls_range"));
     assert!(HLS_RUNTIME.contains("retrieve_decoded_data_root"));
-    assert!(!HLS_RUNTIME.contains("retrieve_data_payload("));
-    assert!(!HLS_RUNTIME.contains("retrieve_data_payload_cancellable"));
-    assert!(!HLS_RUNTIME.contains("register_retrieve_cancel_token"));
+    crate::source::assert_excludes(HLS_RUNTIME, &[
+        "retrieve_data_payload(",
+        "retrieve_data_payload_cancellable",
+        "register_retrieve_cancel_token",
+    ]);
 }
 
 #[test]
 fn live_preparation_and_following_share_one_duration_based_owner() {
     assert!(HLS_CORE.contains("HLS_LIVE_STARTUP_BUFFER_SECONDS: f64 = 8.0"));
     let runway = section(HLS_RUNTIME, "fn body_runway_targets(", "fn prefetch_from_reference(");
-    assert!(runway.contains("seconds >= HLS_LIVE_STARTUP_BUFFER_SECONDS"));
-    assert!(runway.contains("-> &[super::HlsSegment]"));
-    assert!(runway.contains("&playlist.segments[position..position + length]"));
-    assert!(runway.contains("active.body_runway_running = true"));
-    assert!(runway.contains("active.body_runway_running = false"));
-    assert!(runway.contains("hls_body(client.clone(), reference.clone(), Some(id))"));
+    crate::source::assert_contains(runway, &[
+        "seconds >= HLS_LIVE_STARTUP_BUFFER_SECONDS",
+        "-> &[super::HlsSegment]",
+        "&playlist.segments[position..position + length]",
+        "active.body_runway_running = true",
+        "active.body_runway_running = false",
+        "hls_body(client.clone(), reference.clone(), Some(id))",
+    ]);
     let update = section(HLS_RUNTIME, "fn apply_update(", "fn apply_full_update(");
     assert!(update.contains("spawn_body_runway(id)"));
     assert!(!update.contains("active.foreground ="));
@@ -202,7 +206,8 @@ fn cold_discovery_is_bounded_and_edge_search_is_hls_owned() {
         "probes.next()",
         "EDGE_COLD_WAVE_TIMEOUT",
         "EDGE_WAVE_TIMEOUT",
-        "let mut positive_seen = false;",
+        "if found.is_none()",
+        "if found.as_ref().is_none_or(|(highest, _)| slot > *highest)",
         "future::pending::<()>().left_future()",
         "future::select(probes.next(), deadline.as_mut()).await",
         "break;",
@@ -219,9 +224,11 @@ fn cold_discovery_is_bounded_and_edge_search_is_hls_owned() {
         "async fn probe_feed_update(",
         "async fn probe_feed_payload(",
     );
-    assert!(shared_probe.contains("attempt_limit: Option<usize>"));
-    assert!(shared_probe.contains("map_or_else(RetrieveAdmission::new"));
-    assert!(shared_probe.contains("RetrieveAdmission::new_with_attempt_limit"));
+    crate::source::assert_contains(shared_probe, &[
+        "attempt_limit: Option<usize>",
+        "map_or_else(RetrieveAdmission::new",
+        "RetrieveAdmission::new_with_attempt_limit",
+    ]);
 
     let initial = section(
         HLS_RUNTIME,
@@ -241,13 +248,12 @@ fn beginning_history_and_exact_following_run_after_the_worker_warms_a() {
         "fn start_beginning_history(id: u64)",
         "fn spawn_follower(",
     );
-    let follow = history.find("spawn_follower(id)").unwrap();
-    let successor = history.find("hls_body(client.clone(), successor, Some(id)).await").unwrap();
-    let discover = history.find("let history = discover_for_view(").unwrap();
-    let apply = history
-        .find("apply_confirmed_snapshot(id, index, history, None)")
-        .unwrap();
-    assert!(follow < successor && successor < discover && discover < apply);
+    crate::source::assert_first_in_order(history, &[
+        ("spawn_follower(id)", "missing source marker"),
+        ("hls_body(client.clone(), successor, Some(id)).await", "missing source marker"),
+        ("let history = discover_for_view(", "missing source marker"),
+        ("apply_confirmed_snapshot(id, index, history, None)", "missing source marker"),
+    ]);
     assert_eq!(history.matches("spawn_follower(id)").count(), 1);
 }
 
@@ -292,10 +298,12 @@ fn head_proof_preserves_the_initial_lattice_and_twenty_fresh_guards() {
         "async fn retrieve_confirmed_payload(",
         "fn warm_hls_prefix(",
     );
-    assert!(proof.contains("probe_feed_update("));
-    assert!(proof.contains("Some(FEED_PROBE_ATTEMPTS)"));
-    assert!(proof.contains("confirm_hls_feed_head(index, update, HISTORY_STRIDE * 2, |index|"));
-    assert!(proof.contains("let lattice_residue = index % HISTORY_STRIDE;"));
+    crate::source::assert_contains(proof, &[
+        "probe_feed_update(",
+        "Some(FEED_PROBE_ATTEMPTS)",
+        "confirm_hls_feed_head(index, update, HISTORY_STRIDE * 2, |index|",
+        "let lattice_residue = index % HISTORY_STRIDE;",
+    ]);
     assert!(proof.find("confirm_hls_feed_head(").unwrap() < proof.find("decode_feed_payload_root(index, update)").unwrap());
     assert!(proof.contains("lattice_residue,"));
     let history = section(
@@ -310,33 +318,41 @@ fn head_proof_preserves_the_initial_lattice_and_twenty_fresh_guards() {
 
 #[test]
 fn live_follower_applies_commit337_followups_in_order_with_one_lookup_ahead() {
-    assert!(HLS_RUNTIME.contains("const FEED_TAIL_PROBE_BYTES: usize = 4 * 1024;"));
-    assert!(HLS_RUNTIME.contains("const FEED_FOLLOW_AHEAD: u64 = 4;"));
-    assert!(
-        HLS_RUNTIME.contains("const FEED_POLL_INTERVAL: Duration = Duration::from_millis(400);")
-    );
-    assert!(HLS_RUNTIME.contains("const FEED_FRONTIER_REFRESH_INTERVAL: f64 = 15_000.0;"));
+    crate::source::assert_contains(HLS_RUNTIME, &[
+        "const FEED_TAIL_PROBE_BYTES: usize = 4 * 1024;",
+        "const FEED_FOLLOW_AHEAD: u64 = 4;",
+        "const FEED_POLL_INTERVAL: Duration = Duration::from_millis(400);",
+        "const FEED_FRONTIER_REFRESH_INTERVAL: f64 = 15_000.0;",
+    ]);
 
     let follower = section(
         HLS_RUNTIME,
         "fn spawn_follower(",
         "async fn fetch_hls_body_response(",
     );
-    assert!(follower.contains("stream::iter(1..=FEED_FOLLOW_AHEAD)"));
-    assert!(follower.contains("head.checked_add(offset)"));
-    assert!(follower.contains("while let Some(candidate) = probes.next().await"));
-    assert!(follower.contains(".buffered(2)"));
-    assert!(follower.contains("probe_feed_payload("));
-    assert!(!follower.contains("settled_payload_wave("));
-    assert!(!follower.contains("payload_probe_wave("));
-    assert!(!follower.contains("Vec<Option<(u64, FeedPayloadProbe)>>"));
-    assert!(follower.contains("FeedPayloadProbe::Missing | FeedPayloadProbe::Transient => {"));
-    assert!(follower.contains("if skipped_missing_index"));
-    assert!(follower.contains("skipped_missing_index = true"));
+    crate::source::assert_contains(follower, &[
+        "stream::iter(1..=FEED_FOLLOW_AHEAD)",
+        "head.checked_add(offset)",
+        "while let Some(candidate) = probes.next().await",
+        ".buffered(2)",
+        "probe_feed_payload(",
+    ]);
+    crate::source::assert_excludes(follower, &[
+        "settled_payload_wave(",
+        "payload_probe_wave(",
+        "Vec<Option<(u64, FeedPayloadProbe)>>",
+    ]);
+    crate::source::assert_contains(follower, &[
+        "FeedPayloadProbe::Missing | FeedPayloadProbe::Transient => {",
+        "if skipped_missing_index",
+        "skipped_missing_index = true",
+    ]);
     assert!(!follower.contains("recovered_missing_index"));
-    assert!(follower.contains("let Some(appended) = appended else"));
-    assert!(follower.contains("continue;"));
-    assert!(follower.contains("if progressed"));
+    crate::source::assert_contains(follower, &[
+        "let Some((appended, closing)) = appended else",
+        "continue;",
+        "if let Some(closing) = progressed",
+    ]);
 
     let indices = follower
         .find("stream::iter(1..=FEED_FOLLOW_AHEAD)")
@@ -350,28 +366,31 @@ fn live_follower_applies_commit337_followups_in_order_with_one_lookup_ahead() {
         .unwrap()
         + settled;
     let stop = follower[apply..]
-        .find("let Some(appended) = appended else")
+        .find("let Some((appended, closing)) = appended else")
         .unwrap()
         + apply;
-    let progressed = follower[stop..].find("if progressed").unwrap() + stop;
+    let progressed = follower[stop..].find("if let Some(closing) = progressed").unwrap() + stop;
     assert!(indices < dispatched && dispatched < settled && settled < apply);
     assert!(apply < stop && stop < progressed);
 
-    assert!(follower.contains("now - last_frontier_check >= FEED_FRONTIER_REFRESH_INTERVAL"));
-    assert!(follower.contains("discover_latest_once(client, owner, topic, None).await"));
-    assert!(follower.contains("if index < head"));
-    assert!(follower.contains("hls_history("));
+    crate::source::assert_contains(follower, &[
+        "now - last_frontier_check >= FEED_FRONTIER_REFRESH_INTERVAL",
+        "discover_latest_once(client, owner, topic, None).await",
+        "if index < head",
+        "hls_history(",
+    ]);
     assert!(
         follower.find("HlsPlaylist::parse(&payload.bytes)").unwrap()
             < follower.find("let Some(history) = hls_history(").unwrap()
     );
-    let progressed = follower.find("if progressed").unwrap();
+    let progressed = follower.find("if let Some(closing) = progressed").unwrap();
     let idle_sleep = follower
         .find("async_std::task::sleep(FEED_POLL_INTERVAL).await")
         .unwrap();
     assert!(progressed < idle_sleep);
     assert!(follower.find("drop(probes)").unwrap() < idle_sleep);
-    assert!(!follower[progressed..idle_sleep].contains("recover_feed_frontier"));
+    assert!(follower.find("drop(probes)").unwrap() < progressed);
+    assert!(follower[progressed..idle_sleep].contains("if closing {\n                        recover_feed_frontier"));
     assert!(!follower.contains("pace_next"));
     assert!(!follower.contains("Duration::try_from_secs_f64"));
 }
@@ -386,9 +405,12 @@ fn active_feed_treats_snapshot_endlist_as_tentative() {
     assert!(install.contains("playlist.finalized = false"));
 
     let apply = section(HLS_RUNTIME, "fn apply_update(", "fn apply_full_update(");
-    assert!(apply.contains("index <= current"));
-    assert!(apply.contains("let appended = merge(playlist)?"));
-    assert!(apply.contains("playlist.finalized = false"));
+    crate::source::assert_contains(apply, &[
+        "index <= current",
+        "let appended = merge(playlist)?",
+        "let closing = std::mem::take(&mut playlist.finalized)",
+        "Some((appended, closing))",
+    ]);
 
     let follow = section(
         HLS_RUNTIME,

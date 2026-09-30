@@ -27,12 +27,11 @@ use crate::{
         route_network_mode_from_location,
     },
     network_profile::{
-        NetworkMode, NetworkProfile, initial_bootnodes, is_browser_dialable_underlay,
-        profile_for_mode, profile_for_swarm_network_id,
+        NetworkMode, initial_bootnodes, is_browser_dialable_underlay, profile_for_mode,
+        profile_for_swarm_network_id,
     },
     on_chain::{
-        Web3Inst, chequebook_balance, deploy_chequebook_with_payer, deposit_to_chequebook,
-        token_contract,
+        chequebook_balance, deploy_chequebook_with_payer, deposit_to_chequebook, token_contract,
     },
     persistence::{
         get_chequebook_address, get_chequebook_signer_key, set_chequebook_address,
@@ -46,6 +45,7 @@ use crate::{
         BatchPurchaseError, BatchPurchaseOutcome, MissingSecureBatchState, ensure_batch,
         inspect_batch,
     },
+    worker_protocol::DomListener,
 };
 
 #[path = "interface_runtime_conventions.rs"]
@@ -86,23 +86,6 @@ fn alert(message: &str) {
     let _ = web_sys::window().unwrap().alert_with_message(message);
 }
 
-async fn wallet_chain_matches(w3: &Web3Inst, profile: NetworkProfile) -> bool {
-    if w3
-        .eth()
-        .chain_id()
-        .await
-        .is_ok_and(|chain_id| chain_id != U256::from(profile.wallet_chain_id))
-    {
-        alert(&format!(
-            "Wallet is not on {:?} chain ({}). Please switch in your wallet and try again.",
-            profile.mode, profile.wallet_chain_id
-        ));
-        false
-    } else {
-        true
-    }
-}
-
 async fn stored_chequebook_address() -> Option<Address> {
     let signer_key = get_chequebook_signer_key().await;
     let address = get_chequebook_address().await;
@@ -124,6 +107,7 @@ pub(crate) fn shared_network_changed(network_id: u64) {
 thread_local! {
     static NETWORK_APPLY_GENERATION: Cell<u64> = const { Cell::new(0) };
     static INTERFACE_MOUNT_GENERATION: Cell<u64> = const { Cell::new(0) };
+    static INTERFACE_CHANGED: event_listener::Event = const { event_listener::Event::new() };
     static BFCACHE_PAGESHOW_LISTENER: RefCell<Option<Closure<dyn FnMut(Event)>>> =
         const { RefCell::new(None) };
 }
@@ -168,6 +152,7 @@ pub(crate) fn begin_interface_mount() -> u64 {
         let next = generation.get().wrapping_add(1);
         let next = if next == 0 { 1 } else { next };
         generation.set(next);
+        INTERFACE_CHANGED.with(|changed| changed.notify(usize::MAX));
         next
     })
 }
@@ -474,56 +459,41 @@ pub(crate) async fn mount_interface_with_generation(
     let deploy_chequebook_callback = Closure::<dyn FnMut(Event)>::new(move |_| {
         let state = chequebook_state_deploy.clone();
         spawn_local(async move {
-            let payer = match connect_wallet_address().await {
-                Ok(payer) => payer,
-                Err(error) => {
-                    alert(&format!("Wallet connect failed: {error}"));
-                    return;
+            let result: Result<String, String> = async {
+                let payer = connect_wallet_address()
+                    .await
+                    .map_err(|error| format!("Wallet connect failed: {error}"))?;
+                if let Some(address) = stored_chequebook_address().await {
+                    return Ok(format!(
+                        "Already have a chequebook deployed at address 0x{}",
+                        hex::encode(address.as_bytes())
+                    ));
                 }
-            };
 
-            if let Some(address) = stored_chequebook_address().await {
-                alert(&format!(
-                    "Already have a chequebook deployed at address 0x{}",
-                    hex::encode(address.as_bytes())
-                ));
-                return;
-            }
+                let cheque_signer_key = random_encryption_key();
+                let cheque_signer = PrivateKeySigner::from_slice(&cheque_signer_key)
+                    .map_err(|_| "Failed to create chequebook signer key")?;
+                let issuer = cheque_signer.address();
+                let deployment = deploy_chequebook_with_payer(issuer, payer)
+                    .await
+                    .map_err(|e| format!("Chequebook deployment failed: {e:?}"))?;
 
-            let cheque_signer_key = random_encryption_key();
-            let cheque_signer = match PrivateKeySigner::from_slice(&cheque_signer_key) {
-                Ok(s) => s,
-                Err(_) => {
-                    alert("Failed to create chequebook signer key");
-                    return;
+                if !set_chequebook_signer_key(&cheque_signer_key).await {
+                    alert("Chequebook deployed, but failed to save signer key locally.");
                 }
-            };
-            let issuer = cheque_signer.address();
-
-            let deployment = match deploy_chequebook_with_payer(issuer, payer).await {
-                Ok(d) => d,
-                Err(e) => {
-                    alert(&format!("Chequebook deployment failed: {e:?}"));
-                    return;
+                if !set_chequebook_address(deployment.chequebook.as_bytes()).await {
+                    alert("Chequebook deployed, but failed to save address locally.");
                 }
-            };
-
-            if !set_chequebook_signer_key(&cheque_signer_key).await {
-                alert("Chequebook deployed, but failed to save signer key locally.");
+                state.set(Some(deployment.chequebook));
+                Ok(format!(
+                    "Chequebook deployed at 0x{}.\nIssuer: 0x{}\nDeployment tx: 0x{}",
+                    hex::encode(deployment.chequebook.as_bytes()),
+                    hex::encode(issuer.as_bytes()),
+                    hex::encode(deployment.tx.as_bytes())
+                ))
             }
-
-            if !set_chequebook_address(deployment.chequebook.as_bytes()).await {
-                alert("Chequebook deployed, but failed to save address locally.");
-            }
-
-            state.set(Some(deployment.chequebook));
-
-            alert(&format!(
-                "Chequebook deployed at 0x{}.\nIssuer: 0x{}\nDeployment tx: 0x{}",
-                hex::encode(deployment.chequebook.as_bytes()),
-                hex::encode(issuer.as_bytes()),
-                hex::encode(deployment.tx.as_bytes())
-            ));
+            .await;
+            alert(&result.unwrap_or_else(|error| error));
         });
     });
 
@@ -553,68 +523,49 @@ pub(crate) async fn mount_interface_with_generation(
         let chequebook = state.get();
 
         spawn_local(async move {
-            let chequebook = match chequebook {
-                Some(addr) => addr,
-                None => match stored_chequebook_address().await {
-                    Some(address) => {
+            let result: Result<String, String> = async {
+                let chequebook = match chequebook {
+                    Some(address) => address,
+                    None => {
+                        let address = stored_chequebook_address()
+                            .await
+                            .ok_or("Deploy a chequebook first before depositing.")?;
                         state.set(Some(address));
                         address
                     }
-                    None => {
-                        alert("Deploy a chequebook first before depositing.");
-                        return;
-                    }
-                },
-            };
-
-            let payer = match connect_wallet_address().await {
-                Ok(payer) => payer,
-                Err(error) => {
-                    alert(&format!("Wallet connect failed: {error}"));
-                    return;
+                };
+                let payer = connect_wallet_address()
+                    .await
+                    .map_err(|error| format!("Wallet connect failed: {error}"))?;
+                let w3 = crate::on_chain::web3()
+                    .map_err(|e| format!("Failed to initialize web3: {e:?}"))?;
+                let profile = current_network_profile();
+                if w3.eth().chain_id().await.is_ok_and(|chain_id| {
+                    chain_id != U256::from(profile.wallet_chain_id)
+                }) {
+                    return Err(format!(
+                        "Wallet is not on {:?} chain ({}). Please switch in your wallet and try again.",
+                        profile.mode, profile.wallet_chain_id
+                    ));
                 }
-            };
+                let token = token_contract(&w3)
+                    .map_err(|e| format!("Failed to load token contract: {e:?}"))?;
+                let receipt = deposit_to_chequebook(&token, chequebook, payer, amount)
+                    .await
+                    .map_err(|e| format!("Deposit failed: {e:?}"))?;
 
-            let w3 = match crate::on_chain::web3() {
-                Ok(w) => w,
-                Err(e) => {
-                    alert(&format!("Failed to initialize web3: {e:?}"));
-                    return;
+                let mut balance_note = String::new();
+                if let Ok(balance) = chequebook_balance(&w3, chequebook).await {
+                    balance_note = format!("\nNew balance: {}", balance);
                 }
-            };
-
-            let profile = current_network_profile();
-
-            if !wallet_chain_matches(&w3, profile).await {
-                return;
+                Ok(format!(
+                    "Deposit submitted.\nTx: 0x{}{}",
+                    hex::encode(receipt.transaction_hash.as_bytes()),
+                    balance_note
+                ))
             }
-
-            let token = match token_contract(&w3) {
-                Ok(t) => t,
-                Err(e) => {
-                    alert(&format!("Failed to load token contract: {e:?}"));
-                    return;
-                }
-            };
-
-            let receipt = match deposit_to_chequebook(&token, chequebook, payer, amount).await {
-                Ok(r) => r,
-                Err(e) => {
-                    alert(&format!("Deposit failed: {e:?}"));
-                    return;
-                }
-            };
-
-            let mut balance_note = String::new();
-            if let Ok(balance) = chequebook_balance(&w3, chequebook).await {
-                balance_note = format!("\nNew balance: {}", balance);
-            }
-
-            alert(&format!(
-                "Deposit submitted.\nTx: 0x{}{}",
-                hex::encode(receipt.transaction_hash.as_bytes()),
-                balance_note
-            ));
+            .await;
+            alert(&result.unwrap_or_else(|error| error));
         });
     });
 
@@ -635,6 +586,10 @@ pub(crate) async fn mount_interface_with_generation(
 
     let ongoing_element = required_element::<HtmlSpanElement>(&document, "ongoing");
     let connections_element = required_element::<HtmlSpanElement>(&document, "connections");
+    let _visibility = DomListener::new(&document, "visibilitychange", |_| {
+        INTERFACE_CHANGED.with(|changed| changed.notify(usize::MAX));
+    })
+    .map_err(|error| JsError::new(&crate::js_error_message(&error)))?;
     let mut last_progress_revision = 0u64;
     let mut last_ongoing = None::<u64>;
     let mut last_connections = None::<u64>;
@@ -644,7 +599,7 @@ pub(crate) async fn mount_interface_with_generation(
             break;
         }
         if document.hidden() {
-            async_std::task::sleep(Duration::from_millis(160)).await;
+            INTERFACE_CHANGED.with(event_listener::Event::listen).await;
             continue;
         }
 
@@ -688,3 +643,7 @@ pub(crate) async fn mount_interface_with_generation(
 
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "../tests/support/interface_visibility.rs"]
+mod visibility_tests;

@@ -24,7 +24,7 @@ use crate::conventions::keccak256;
 use serde_json::json;
 
 use libp2p::futures::{StreamExt, future::join_all, stream::FuturesUnordered};
-use rand::RngCore;
+use rand::Rng;
 
 use std::{future::Future, pin::Pin};
 
@@ -513,8 +513,9 @@ pub async fn upload_resource(
     )
     .await;
 
-    let index_up =
-        seek_next_feed_update_index(feed_owner, topic.clone(), chunk_retrieve_chan).await;
+    let Ok(index_up) = seek_next_feed_update_index(feed_owner, topic.clone(), chunk_retrieve_chan).await else {
+        return vec![];
+    };
 
     // Feed updates must wrap the exact erasure-coded root chunk.
     let soc_wrapped_content = manifest_upload.root_data;
@@ -1341,7 +1342,7 @@ fn encrypt_with_span(span: &[u8; 8], content: &[u8], key: &[u8]) -> Vec<u8> {
     encrypted.extend_from_slice(content);
     let content_end = encrypted.len();
     encrypted.resize(CHUNK_WITH_SPAN_SIZE, 0);
-    rand::thread_rng().fill_bytes(&mut encrypted[content_end..]);
+    rand::rng().fill_bytes(&mut encrypted[content_end..]);
 
     let span_key = encryption_segment_key(key, (CHUNK_SIZE / HASH_SIZE) as u32);
     for (byte, mask) in encrypted[..span.len()].iter_mut().zip(span_key.iter()) {
@@ -1359,7 +1360,7 @@ fn encrypt_with_span(span: &[u8; 8], content: &[u8], key: &[u8]) -> Vec<u8> {
 
 pub fn random_encryption_key() -> Vec<u8> {
     let mut key = vec![0; HASH_SIZE];
-    rand::thread_rng().fill_bytes(&mut key);
+    rand::rng().fill_bytes(&mut key);
     key
 }
 
@@ -1375,13 +1376,13 @@ pub fn make_soc(
     let mut address_input = [0; HASH_SIZE + 20];
     address_input[..HASH_SIZE].copy_from_slice(id_bytes);
     address_input[HASH_SIZE..].copy_from_slice(soc_signer.address().as_bytes());
-    let soc_address = keccak256(address_input).to_vec();
+    let soc_address = keccak256(&address_input).to_vec();
 
     let wrapped_address = content_address(chunk_content);
     let mut digest_input = [0; HASH_SIZE * 2];
     digest_input[..HASH_SIZE].copy_from_slice(id_bytes);
     digest_input[HASH_SIZE..].copy_from_slice(&wrapped_address);
-    let digest = keccak256(digest_input);
+    let digest = keccak256(&digest_input);
 
     let signature = soc_signer.sign_message(digest.as_slice()).unwrap();
 

@@ -1,5 +1,4 @@
-use bytes::Bytes;
-use std::{cell::RefCell, collections::VecDeque, fmt, rc::Rc};
+use std::{cell::RefCell, collections::VecDeque, fmt, rc::Rc, slice::ChunksExact};
 
 pub const SPAN_SIZE: usize = 8;
 pub const CHUNK_SIZE: usize = 4096;
@@ -297,35 +296,28 @@ pub fn encoded_reference_payload_len(
         .checked_add(parity_shards.checked_mul(HASH_SIZE)?)
 }
 
-pub type SplitReferences = (Vec<Bytes>, Vec<Bytes>);
+pub type SplitReferences<'a> = (ChunksExact<'a, u8>, ChunksExact<'a, u8>);
 
 pub fn split_references(
-    payload: Bytes,
-    span: u64,
-    level: RedundancyLevel,
+    payload: &[u8],
+    layout: ReferenceLayout,
     encrypted: bool,
-) -> Option<SplitReferences> {
-    let (data_count, parity_count) = reference_count(span, level, encrypted)?;
+) -> Option<SplitReferences<'_>> {
     let data_reference_size = if encrypted {
         ENCRYPTED_REFERENCE_SIZE
     } else {
         HASH_SIZE
     };
-    let data_bytes = data_count.checked_mul(data_reference_size)?;
-    let parity_bytes = parity_count.checked_mul(HASH_SIZE)?;
+    let data_bytes = layout.data_shards.checked_mul(data_reference_size)?;
+    let parity_bytes = layout.parity_shards.checked_mul(HASH_SIZE)?;
     if payload.len() != data_bytes.checked_add(parity_bytes)? {
         return None;
     }
 
-    let data = payload[..data_bytes]
-        .chunks_exact(data_reference_size)
-        .map(|reference| payload.slice_ref(reference))
-        .collect();
-    let parity = payload[data_bytes..]
-        .chunks_exact(HASH_SIZE)
-        .map(|reference| payload.slice_ref(reference))
-        .collect();
-    Some((data, parity))
+    Some((
+        payload[..data_bytes].chunks_exact(data_reference_size),
+        payload[data_bytes..].chunks_exact(HASH_SIZE),
+    ))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

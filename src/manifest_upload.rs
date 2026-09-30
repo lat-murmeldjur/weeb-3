@@ -7,7 +7,7 @@ use crate::{
     upload::{ChunkUploadSender, UploadProgressSender},
     upload_data,
 };
-use rand::RngCore;
+use rand::Rng;
 use serde_json::json;
 #[cfg(test)]
 use wasm_bindgen_test::wasm_bindgen_test;
@@ -15,7 +15,7 @@ use wasm_bindgen_test::wasm_bindgen_test;
 fn manifest_obfuscation_key(obfuscated: bool) -> [u8; 32] {
     let mut key = [0; 32];
     if obfuscated {
-        rand::thread_rng().fill_bytes(&mut key);
+        rand::rng().fill_bytes(&mut key);
     }
     key
 }

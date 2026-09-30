@@ -3,6 +3,8 @@ use std::cell::RefCell;
 use wasm_bindgen::{JsCast, JsValue, closure::Closure};
 use web_sys::{Document, Element, Event, HtmlButtonElement, HtmlElement};
 
+use crate::worker_protocol::DomListener;
+
 const INTERFACE_STYLE_ID: &str = "weeb3InterfaceStyle";
 
 const INDEX_HTML: &str = include_str!("../static/index.html");
@@ -10,20 +12,7 @@ const INDEX_HTML: &str = include_str!("../static/index.html");
 thread_local! {
     static INTERFACE_EVENT_CALLBACKS: RefCell<Vec<Closure<dyn FnMut(Event)>>> =
         RefCell::new(Vec::new());
-    static OS_THEME_LISTENER: RefCell<Option<ThemeListener>> = const { RefCell::new(None) };
-}
-
-struct ThemeListener {
-    target: web_sys::EventTarget,
-    callback: Closure<dyn FnMut(Event)>,
-}
-
-impl Drop for ThemeListener {
-    fn drop(&mut self) {
-        let _ = self
-            .target
-            .remove_event_listener_with_callback("change", self.callback.as_ref().unchecked_ref());
-    }
+    static OS_THEME_LISTENER: RefCell<Option<DomListener>> = const { RefCell::new(None) };
 }
 
 fn embedded_section(start: &str, end: &str) -> &'static str {
@@ -288,31 +277,12 @@ fn set_theme_button_text() {
 }
 
 fn install_os_theme_listener() {
-    let Some(query) = web_sys::window().and_then(|window| {
-        window
-            .match_media("(prefers-color-scheme: dark)")
-            .ok()
-            .flatten()
-    }) else {
-        return;
-    };
-    let Some(target) = query.dyn_ref::<web_sys::EventTarget>() else {
-        return;
-    };
-
-    let callback = Closure::<dyn FnMut(Event)>::new(move |_event| {
-        set_theme_button_text();
-    });
-
-    if target
-        .add_event_listener_with_callback("change", callback.as_ref().unchecked_ref())
-        .is_ok()
+    if let Some(listener) = web_sys::window()
+        .and_then(|window| window.match_media("(prefers-color-scheme: dark)").ok().flatten())
+        .and_then(|query| {
+            DomListener::new(query.dyn_ref()?, "change", |_| set_theme_button_text()).ok()
+        })
     {
-        OS_THEME_LISTENER.with(|listener| {
-            *listener.borrow_mut() = Some(ThemeListener {
-                target: target.clone(),
-                callback,
-            });
-        });
+        OS_THEME_LISTENER.with_borrow_mut(|slot| *slot = Some(listener));
     }
 }

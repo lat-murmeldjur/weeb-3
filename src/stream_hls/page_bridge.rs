@@ -79,7 +79,7 @@ async fn prepare_hls(
         },
     );
     let prepared = runtime
-        .request(&request, HLS_PREPARE_TIMEOUT)
+        .request(&request, Some(HLS_PREPARE_TIMEOUT))
         .await
         .and_then(parse_prepare_response);
     let (prepared, worker_session) = match prepared {
@@ -174,15 +174,14 @@ fn notify_abandon(id: u64, runtime: &SharedRuntime, network_id: u64) {
 }
 
 async fn live_control(kind: &str, timeout: Duration, configure: impl FnOnce(&Object)) -> Option<Object> {
-    let (runtime, request) = ACTIVE_HLS.with(|active| {
-        let active = active.borrow();
+    let (runtime, request) = ACTIVE_HLS.with_borrow(|active| {
         let active = active.as_ref().filter(|active| active.live)?;
         let request = request_object(kind, active.network_id);
         set_number(&request, "session", active.worker_session as f64);
         Some((active.runtime.clone(), request))
     })?;
     configure(&request);
-    let response = runtime.request(&request, timeout).await.ok()?;
+    let response = runtime.request(&request, Some(timeout)).await.ok()?;
     (bool_property(&response, "ok") == Some(true)).then_some(response)
 }
 

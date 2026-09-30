@@ -10,7 +10,7 @@ use js_sys::{Array, Object, Uint8Array};
 use wasm_bindgen::{JsCast, JsValue, closure::Closure};
 use wasm_bindgen_futures::spawn_local;
 use web_sys::{
-    Event, File, MessageChannel, MessageEvent, MessagePort, SharedWorker, Url, WorkerOptions,
+    File, MessageEvent, MessagePort, SharedWorker, Url, WorkerOptions,
     WorkerType,
 };
 
@@ -19,7 +19,7 @@ use crate::{
     erasure_coding::RedundancyLevel,
     events::ProgressRow,
     worker_protocol::{
-        REQUEST_TIMEOUT, array_property, bool_property, bytes_from_js, integer_property,
+        DomListener, REQUEST_TIMEOUT, ReplyChannel, array_property, bool_property, bytes_from_js, integer_property,
         metadata_from_js, metadata_to_js, progress_from_js, property, set, set_bool, set_number,
         set_optional_percent, set_string, string_property,
     },
@@ -30,20 +30,11 @@ const SHARED_WORKER_URL: &str = "/weeb-3/worker.js";
 const START_TIMEOUT: Duration = Duration::from_secs(15);
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(15);
 
-struct ReplyPort(MessagePort);
-
-impl Drop for ReplyPort {
-    fn drop(&mut self) {
-        self.0.set_onmessage(None);
-        self.0.close();
-    }
-}
-
 pub(crate) struct SharedRuntime {
     _worker: SharedWorker,
     port: MessagePort,
     _message_listener: Closure<dyn FnMut(MessageEvent)>,
-    _pagehide_listener: Closure<dyn FnMut(Event)>,
+    _pagehide_listener: DomListener,
     service_worker_relay_id: u64,
     status: Rc<RuntimeStatus>,
 }
@@ -113,21 +104,12 @@ fn create_runtime(
     port.start();
 
     let close_port = port.clone();
-    let close = Closure::<dyn FnMut(Event)>::new(move |_| {
+    let close = DomListener::new(&window, "pagehide", move |_| {
         let request = request_object("WEEB3_CLIENT_CLOSE", 0);
         let _ = close_port.post_message(&request);
-    });
-    window
-        .add_event_listener_with_callback("pagehide", close.as_ref().unchecked_ref())
-        .map_err(|error| js_error("could not install SharedWorker pagehide cleanup", &error))?;
-    let service_worker_relay_id = match register_service_worker_relay(&port) {
-        Ok(id) => id,
-        Err(error) => {
-            let _ = window
-                .remove_event_listener_with_callback("pagehide", close.as_ref().unchecked_ref());
-            return Err(error);
-        }
-    };
+    })
+    .map_err(|error| js_error("could not install SharedWorker pagehide cleanup", &error))?;
+    let service_worker_relay_id = register_service_worker_relay(&port)?;
 
     Ok(SharedRuntime {
         _worker: worker,
@@ -140,8 +122,7 @@ fn create_runtime(
 }
 
 fn register_service_worker_relay(port: &MessagePort) -> Result<u64, String> {
-    SERVICE_WORKER_RELAY.with(|slot| {
-        let mut slot = slot.borrow_mut();
+    SERVICE_WORKER_RELAY.with_borrow_mut(|slot| {
         if slot.is_none() {
             let ports = Rc::new(RefCell::new(Vec::<(u64, MessagePort)>::new()));
             let listener_ports = ports.clone();
@@ -208,8 +189,7 @@ fn reply_relay_error(reply: &MessagePort, message: &str) {
 }
 
 fn unregister_service_worker_relay(id: u64) {
-    SERVICE_WORKER_RELAY.with(|slot| {
-        let mut slot = slot.borrow_mut();
+    SERVICE_WORKER_RELAY.with_borrow_mut(|slot| {
         let Some(relay) = slot.as_mut() else {
             return;
         };
@@ -267,39 +247,18 @@ impl SharedRuntime {
     pub(crate) async fn request(
         &self,
         request: &Object,
-        timeout: Duration,
-    ) -> Result<Object, String> {
-        self.request_inner(request, Some(timeout)).await
-    }
-
-    async fn request_inner(
-        &self,
-        request: &Object,
         timeout: Option<Duration>,
     ) -> Result<Object, String> {
-        let channel = MessageChannel::new()
+        let mut channel = ReplyChannel::new()
             .map_err(|error| js_error("could not create SharedWorker reply channel", &error))?;
-        let reply = channel.port1();
-        reply.start();
-        let (sender, receiver) = futures::channel::oneshot::channel();
-        let mut sender = Some(sender);
-        let callback = Closure::<dyn FnMut(MessageEvent)>::new(move |event: MessageEvent| {
-            if let Some(sender) = sender.take() {
-                let _ = sender.send(event.data());
-            }
-        });
-        reply.set_onmessage(Some(callback.as_ref().unchecked_ref()));
-        let _close_reply = ReplyPort(reply.clone());
-        let transfer = Array::new();
-        transfer.push(channel.port2().as_ref());
-        if let Err(error) = self.port.post_message_with_transferable(request, &transfer) {
+        if let Err(error) = self.port.post_message_with_transferable(request, &channel.transfer) {
             return Err(js_error("could not post SharedWorker request", &error));
         }
         let response = match timeout {
-            Some(timeout) => async_std::future::timeout(timeout, receiver)
+            Some(timeout) => async_std::future::timeout(timeout, &mut channel.receiver)
                 .await
                 .map_err(|_| REQUEST_TIMEOUT.to_string()),
-            None => Ok(receiver.await),
+            None => Ok((&mut channel.receiver).await),
         };
         response?
             .map_err(|_| "SharedWorker reply channel closed")?
@@ -309,7 +268,7 @@ impl SharedRuntime {
 
     async fn start(&self, network_id: u64) -> Result<(), String> {
         let request = request_object("WEEB3_WORKER_START", network_id);
-        let response = self.request(&request, START_TIMEOUT).await?;
+        let response = self.request(&request, Some(START_TIMEOUT)).await?;
         require_ok(&response, "SharedWorker startup")?;
         let actual = integer_property(&response, "networkId")
             .ok_or("SharedWorker startup omitted networkId")?;
@@ -330,12 +289,6 @@ impl SharedRuntime {
 impl Drop for SharedRuntime {
     fn drop(&mut self) {
         unregister_service_worker_relay(self.service_worker_relay_id);
-        if let Some(window) = web_sys::window() {
-            let _ = window.remove_event_listener_with_callback(
-                "pagehide",
-                self._pagehide_listener.as_ref().unchecked_ref(),
-            );
-        }
         let _ = self.notify(&request_object(
             "WEEB3_CLIENT_CLOSE",
             self.status.network_id.get(),
@@ -385,7 +338,7 @@ impl SharedNodeClient {
             let request = node_request_object("connectBootnodes", network_id);
             set(&request, "nodes", bootnodes_to_js(&bootstrap_nodes).into());
             let result = runtime
-                .request(&request, CONTROL_TIMEOUT)
+                .request(&request, Some(CONTROL_TIMEOUT))
                 .await
                 .and_then(|response| require_ok(&response, "connect bootnodes"));
             if let Err(error) = result {
@@ -442,7 +395,7 @@ impl SharedNodeClient {
 
     async fn send_node_operation(&self, op: &str, request: Object) -> Result<Object, String> {
         let runtime = self.ensure().await?;
-        let transfer_bearing = matches!(
+        let timeout = if matches!(
             op,
             "acquire"
                 | "retrieveBytes"
@@ -452,19 +405,17 @@ impl SharedNodeClient {
                 | "pushChunk"
                 | "resolveBzz"
                 | "acquireRange"
-        );
-        let response = if transfer_bearing {
-            runtime.request_inner(&request, None).await?
+        ) {
+            None
         } else {
             let wait = if op == "connections" {
                 integer_property(&request, "waitMs").unwrap_or(0)
             } else {
                 0
             };
-            runtime
-                .request(&request, CONTROL_TIMEOUT + Duration::from_millis(wait))
-                .await?
+            Some(CONTROL_TIMEOUT + Duration::from_millis(wait))
         };
+        let response = runtime.request(&request, timeout).await?;
         require_ok(&response, op)?;
         Ok(response)
     }
@@ -489,7 +440,7 @@ impl SharedNodeClient {
             "seenProgressRevision",
             seen_progress_revision as f64,
         );
-        let response = runtime.request(&request, CONTROL_TIMEOUT).await.ok()?;
+        let response = runtime.request(&request, Some(CONTROL_TIMEOUT)).await.ok()?;
         require_ok(&response, "SharedWorker snapshot").ok()?;
         let mut logs = Vec::new();
         if include_logs {
@@ -609,17 +560,11 @@ impl SharedNodeClient {
     }
 
     pub(crate) async fn retrieve_bytes(&self, address: String) -> Uint8Array {
-        self.typed_bytes_operation("retrieveBytes", |request| {
-            set_string(request, "address", address)
-        })
-        .await
+        self.typed_bytes_operation("retrieveBytes", address).await
     }
 
     pub(crate) async fn retrieve_chunk_bytes(&self, address: String) -> Uint8Array {
-        self.typed_bytes_operation("retrieveChunk", |request| {
-            set_string(request, "address", address)
-        })
-        .await
+        self.typed_bytes_operation("retrieveChunk", address).await
     }
 
     pub(crate) async fn acquire_feed(
@@ -720,8 +665,8 @@ impl SharedNodeClient {
         bytes_from_js(&response, "body").unwrap_or_default()
     }
 
-    async fn typed_bytes_operation(&self, op: &str, populate: impl FnOnce(&Object)) -> Uint8Array {
-        self.node_operation(op, populate)
+    async fn typed_bytes_operation(&self, op: &str, address: String) -> Uint8Array {
+        self.node_operation(op, |request| set_string(request, "address", address))
             .await
             .ok()
             .and_then(|response| property(&response, "body").dyn_into().ok())

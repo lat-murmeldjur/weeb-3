@@ -47,7 +47,32 @@ impl HlsMasterPlaylist {
     pub(crate) fn initial_source(&self) -> Option<&str> {
         self.uris
             .iter()
-            .find(|(range, _)| self.text[..range.start].ends_with('\n'))
+            .rev()
+            .filter(|(range, _)| self.text[..range.start].ends_with('\n'))
+            .max_by_key(|(range, _)| {
+                let line = self.text[..range.start].lines().next_back().unwrap_or_default();
+                let mut quoted = false;
+                let mut rank = (0u64, 0u64);
+                for attribute in hls_attributes(
+                    line.trim_start_matches("#EXT-X-STREAM-INF:"),
+                    &mut quoted,
+                ) {
+                    match attribute.trim().split_once('=') {
+                        Some(("RESOLUTION", value)) => {
+                            rank.0 = value
+                                .split_once('x')
+                                .and_then(|(width, height)| {
+                                    Some(u64::from(width.parse::<u32>().ok()?)
+                                        * u64::from(height.parse::<u32>().ok()?))
+                                })
+                                .unwrap_or_default();
+                        }
+                        Some(("BANDWIDTH", value)) => rank.1 = value.parse().unwrap_or_default(),
+                        _ => {}
+                    }
+                }
+                rank
+            })
             .map(|(range, _)| &self.text[range.clone()])
     }
 
@@ -149,6 +174,13 @@ fn is_master_tag(line: &str) -> bool {
     .any(|prefix| line.starts_with(prefix))
 }
 
+fn hls_attributes<'a>(line: &'a str, quoted: &'a mut bool) -> impl Iterator<Item = &'a str> {
+    line.split(move |character| {
+        *quoted ^= character == '"';
+        character == ',' && !*quoted
+    })
+}
+
 fn uri_attribute_ranges(line: &str) -> Option<Vec<std::ops::Range<usize>>> {
     let mut ranges = Vec::new();
     if !line.starts_with("#EXT-") {
@@ -159,28 +191,17 @@ fn uri_attribute_ranges(line: &str) -> Option<Vec<std::ops::Range<usize>>> {
     };
     let mut start = colon + 1;
     let mut quoted = false;
-    for (end, byte) in line
-        .bytes()
-        .enumerate()
-        .skip(start)
-        .chain(std::iter::once((line.len(), b',')))
-    {
-        if byte == b'"' {
-            quoted = !quoted;
-        }
-        if byte != b',' || quoted {
-            continue;
-        }
-        let attribute = line[start..end].trim();
+    for field in hls_attributes(&line[start..], &mut quoted) {
+        let attribute = field.trim();
         if let Some(value) = attribute.strip_prefix("URI=") {
             let uri = value.strip_prefix('"')?.strip_suffix('"')?;
             if uri.is_empty() || uri.chars().any(char::is_control) {
                 return None;
             }
-            let offset = start + line[start..end].find(attribute)? + 5;
+            let offset = start + field.find(attribute)? + 5;
             ranges.push(offset..offset + uri.len());
         }
-        start = end + 1;
+        start += field.len() + 1;
     }
     (!quoted).then_some(ranges)
 }
@@ -778,6 +799,10 @@ impl HlsPlaylist {
         true
     }
 
+    pub(crate) fn sort_snapshots(snapshots: &mut [(u64, Self)]) {
+        snapshots.sort_by_key(|(index, _)| *index);
+    }
+
     pub(crate) fn reconstruct(
         mut snapshots: Vec<(u64, Self)>,
         head_index: u64,
@@ -785,7 +810,7 @@ impl HlsPlaylist {
         start_sequence: u64,
     ) -> Option<Self> {
         snapshots.retain(|(index, _)| *index < head_index);
-        snapshots.sort_by_key(|(index, _)| *index);
+        Self::sort_snapshots(&mut snapshots);
         let expected_end = head.end_sequence()?;
         snapshots.push((head_index, head));
         let mut snapshots = snapshots.into_iter();

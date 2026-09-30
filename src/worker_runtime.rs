@@ -279,7 +279,7 @@ impl Weeb3WorkerRuntime {
         let response = bytes_response(vec![]);
         set_string(&response, "index", "not found");
         let (status, detail) = match result {
-            Ok(Some((body, metadata))) => {
+            Ok(Ok(Some((body, metadata)))) => {
                 let detail = format!("{} bytes", body.len());
                 set(&response, "body", bytes_to_js(&body).into());
                 set_string(&response, "index", &metadata.path);
@@ -287,10 +287,8 @@ impl Weeb3WorkerRuntime {
                 set_string(&response, "mime", metadata.mime);
                 ("ok", detail)
             }
-            Ok(None) if self.inner.get_connections().await == 0 => {
-                ("network_error", "no connected peers".into())
-            }
-            Ok(None) => ("not_found", "feed update not found".into()),
+            Ok(Err(())) => ("network_error", "feed lookup or payload retrieval failed".into()),
+            Ok(Ok(None)) => ("not_found", "peers reported no feed update".into()),
             Err(reason) => ("timeout", reason.into()),
         };
         set_string(&response, "status", status);
