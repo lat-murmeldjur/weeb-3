@@ -27,7 +27,6 @@ use std::{
     cell::RefCell,
     collections::{HashMap, VecDeque, hash_map::RandomState},
     ops::Range,
-    rc::Rc,
     slice::ChunksExact,
 };
 
@@ -222,7 +221,7 @@ struct CachedJoinChunk {
 
 #[derive(Default)]
 struct DecodedChunkCache {
-    chunks: LinkedHashMap<Bytes, CachedJoinChunk, RandomState>,
+    chunks: LinkedHashMap<Box<[u8]>, CachedJoinChunk, RandomState>,
 }
 
 impl DecodedChunkCache {
@@ -255,7 +254,7 @@ impl DecodedChunkCache {
     ) {
         let cached = self
             .chunks
-            .entry(Bytes::from(reference))
+            .entry(reference.into_boxed_slice())
             .or_insert_with(CachedJoinChunk::default);
         cached.raw = cached.raw.take().or(raw);
         cached.decoded = decoded.or(cached.decoded.take());
@@ -387,11 +386,11 @@ struct RawFetchWaiter {
     result_chan: mpsc::Sender<RawFetchResult>,
 }
 
-#[derive(Clone)]
 struct RawFetchShared {
     admission: RetrieveAdmission,
     hedge_demand: Option<SharedRetrieveHedgeDemand>,
-    cache_references: Rc<RefCell<Vec<Vec<u8>>>>,
+    // The flight owns references; boxing keeps each registry entry compact.
+    cache_references: Box<Vec<Vec<u8>>>,
 }
 
 impl RawFetchShared {
@@ -400,13 +399,13 @@ impl RawFetchShared {
             admission: RetrieveAdmission::new_with_attempt_limit(usize::MAX),
             hedge_demand: (hedge_demand == RetrieveHedgeDemand::DistinctShardManaged)
                 .then(|| SharedRetrieveHedgeDemand::new(hedge_demand)),
-            cache_references: Rc::new(RefCell::new(Vec::new())),
+            cache_references: Box::default(),
         }
     }
 
-    fn remember_cache_reference(&self, reference: Option<&[u8]>) {
+    fn remember_cache_reference(&mut self, reference: Option<&[u8]>) {
         if let Some(reference) = reference {
-            let mut references = self.cache_references.borrow_mut();
+            let references = &mut self.cache_references;
             if !references.iter().any(|known| known.as_slice() == reference) {
                 references.push(reference.to_vec());
             }
@@ -422,13 +421,13 @@ thread_local! {
 }
 
 fn remove_raw_fetch_waiter(key: &RawFetchKey, flight_id: u64, waiter_id: u64) {
-    let shared = RAW_FETCH_FLIGHTS.with_borrow_mut(|flights| {
-        flights.remove_waiter(key, flight_id, waiter_id)
+    let admission = RAW_FETCH_FLIGHTS.with_borrow_mut(|flights| {
+        flights.remove_waiter(key, flight_id, waiter_id).map(|shared| shared.admission.clone())
     });
-    if let Some(shared) = shared {
+    if let Some(admission) = admission {
         // Keep the flight registered while dispatched accounting work drains.
-        shared.admission.close();
-        if shared.admission.claimed_physical_attempts() == Some(0) {
+        admission.close();
+        if admission.claimed_physical_attempts() == Some(0) {
             RAW_FETCH_FLIGHTS.with_borrow_mut(|flights| flights.take(key, flight_id));
         }
     }
@@ -530,14 +529,13 @@ impl<'a> RawFetchQueue<'a> {
                     result_chan: self.results.clone(),
                 },
                 || RawFetchShared::new(hedge_demand),
+                |shared| {
+                    shared.remember_cache_reference(cache_reference);
+                    if let Some(shared_demand) = &shared.hedge_demand { shared_demand.promote(hedge_demand); }
+                    (shared.admission.clone(), shared.hedge_demand.clone())
+                },
             )
         });
-        registration
-            .shared
-            .remember_cache_reference(cache_reference);
-        if let Some(shared_demand) = registration.shared.hedge_demand.as_ref() {
-            shared_demand.promote(hedge_demand);
-        }
 
         let flight_id = registration.flight_id;
         self.waiters
@@ -548,6 +546,7 @@ impl<'a> RawFetchQueue<'a> {
         }
 
         let completion_key = registration.key;
+        let (admission, hedge_demand) = registration.shared;
         let _ = self.chunks.try_send(crate::ChunkRetrieveRequest {
             address: completion_key.request_address.to_vec(),
             chan: crate::ChunkRetrieveReply::Raw(RawFetchCompletion {
@@ -555,8 +554,8 @@ impl<'a> RawFetchQueue<'a> {
                 flight_id,
             }),
             cancel: self.cancel.clone(),
-            admission: Some(registration.shared.admission.clone()),
-            hedge_demand: registration.shared.hedge_demand.clone(),
+            admission: Some(admission),
+            hedge_demand,
         });
     }
 }
@@ -607,7 +606,7 @@ fn complete_raw_fetch(key: &RawFetchKey, flight_id: u64, chunk: Bytes) -> bool {
     // logical waiters. A retired caller may have zero waiters when a canonical
     // late result arrives, and that result must still benefit a later caller.
     if canonical_cac {
-        for reference in flight.shared.cache_references.borrow_mut().drain(..) {
+        for reference in *flight.shared.cache_references {
             remember_raw_chunk(reference, delivered.clone());
         }
     }
@@ -877,21 +876,26 @@ async fn fetch_data_group_indices_streaming(
     let mut received_shards: Vec<Option<Bytes>> = vec![None; total_count];
     let static_rolling_candidate =
         rolling_full_group_static_candidate(requested_count, data_count, parity_count);
-    let mut cached_requested = Vec::new();
     let mut decoded_only_count = 0usize;
-    let mut unresolved_count = 0usize;
+    let mut unresolved_count = requested_count;
+    let mut successes = 0usize;
     if static_rolling_candidate {
-        cached_requested.reserve(requested_count);
         for index in requested_indices.clone() {
             let reference = data_references.clone().nth(index)?;
             let cached = RETRIEVE_DECODED_CHUNK_CACHE
                 .with_borrow_mut(|cache| cache.get_decoded(reference, true));
-            match &cached {
-                Some((_, Some(_))) => {}
-                Some((_, None)) => decoded_only_count += 1,
-                None => unresolved_count += 1,
+            if let Some((decoded, raw)) = cached {
+                unresolved_count -= 1;
+                child_emitter.emit(index, decoded);
+                requested_ready[index] = true;
+                if let Some(raw) = raw {
+                    received_shards[index] = Some(raw);
+                    dispatched_shards[index] = true;
+                    successes += 1;
+                } else {
+                    decoded_only_count += 1;
+                }
             }
-            cached_requested.push(cached);
         }
     }
     let rolling = static_rolling_candidate
@@ -902,36 +906,31 @@ async fn fetch_data_group_indices_streaming(
             decoded_only_count,
             unresolved_count,
         );
+    if !rolling && successes > 0 {
+        received_shards.fill(None);
+        dispatched_shards.fill(false);
+        successes = 0;
+    }
     let initial_hedge_demand = if rolling {
         RetrieveHedgeDemand::DistinctShardManaged
     } else {
         RetrieveHedgeDemand::Ordinary
     };
-    let mut successes = 0usize;
     let mut dispatched = 0usize;
-    let mut cached_requested = cached_requested.into_iter();
     for index in requested_indices.clone() {
         let reference = data_references.clone().nth(index)?;
-        let cached = if static_rolling_candidate {
-            cached_requested.next().flatten()
-        } else {
-            cached_decoded_chunk(reference).map(|decoded| (decoded, None))
-        };
-        if let Some((decoded, raw)) = cached {
+        if requested_ready[index] {
+            continue;
+        }
+        if !static_rolling_candidate && let Some(decoded) = cached_decoded_chunk(reference) {
             child_emitter.emit(index, decoded);
             requested_ready[index] = true;
-            if rolling && let Some(raw) = raw {
-                received_shards[index] = Some(raw);
-                dispatched_shards[index] = true;
-                successes += 1;
-            }
             continue;
         }
         raw_fetches.queue_data_shard(index, reference, initial_hedge_demand);
         dispatched_shards[index] = true;
         dispatched += 1;
     }
-    drop(cached_requested);
     // Anchor both hedge policies after all initial registrations. This preserves the legacy
     // deadline and gives the rolling set a full hedge interval before parity can replace it.
     let started = Date::now();
@@ -956,7 +955,7 @@ async fn fetch_data_group_indices_streaming(
                 None
             }
         }) {
-            completed = completed.checked_add(1)?;
+            completed += 1;
             if result.chunk.is_empty() || (!result.canonical_cac && parity_count > 0) {
                 if !rolling && !recovery_dispatched {
                     if parity_count == 0 {
@@ -969,7 +968,7 @@ async fn fetch_data_group_indices_streaming(
 
             let index = result.index;
             let raw = received_shards.get_mut(index)?.insert(result.chunk);
-            successes = successes.checked_add(1)?;
+            successes += 1;
             if index < data_count && requested_indices.contains(&index) && !requested_ready[index] {
                 let reference = data_references.clone().nth(index)?;
                 let chunk = if result.canonical_cac {
@@ -999,14 +998,14 @@ async fn fetch_data_group_indices_streaming(
         }
         let hedge_due = rolling && (Date::now() - started).max(0.0) as u64 >= hedge_after;
         if hedge_due {
-            let active = dispatched.checked_sub(completed)?;
+            let active = dispatched - completed;
             let queued = dispatch_group_shards(
                 data_references.clone(),
                 parity_references.clone(),
                 &mut dispatched_shards,
                 &mut raw_fetches,
                 data_count,
-                data_count.checked_sub(active)?,
+                data_count - active,
                 RetrieveHedgeDemand::DistinctShardManaged,
             );
             dispatched += queued;
@@ -2455,19 +2454,15 @@ mod raw_fetch_tests {
                     result_chan,
                 },
                 || RawFetchShared::new(RetrieveHedgeDemand::Ordinary),
+                |shared| {
+                    shared.remember_cache_reference(Some(&plain_reference));
+                    shared.remember_cache_reference(Some(&plain_reference));
+                    shared.remember_cache_reference(Some(&encrypted_reference));
+                    assert_eq!(shared.cache_references.len(), 2);
+                    assert!(shared.admission.try_claim_physical_attempt());
+                },
             )
         });
-        registration
-            .shared
-            .remember_cache_reference(Some(&plain_reference));
-        registration
-            .shared
-            .remember_cache_reference(Some(&plain_reference));
-        registration
-            .shared
-            .remember_cache_reference(Some(&encrypted_reference));
-        assert_eq!(registration.shared.cache_references.borrow().len(), 2);
-        assert!(registration.shared.admission.try_claim_physical_attempt());
         remove_raw_fetch_waiter(&key, registration.flight_id, registration.waiter_id);
 
         RawFetchCompletion {

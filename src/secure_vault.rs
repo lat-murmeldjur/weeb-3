@@ -126,7 +126,7 @@ pub(crate) async fn handle_worker_vault_request(request: &Object) -> Object {
             set_js_bool(
                 &response,
                 "authorized",
-                secure_ensure_authorized_in_window().await,
+                secure_client().await.is_some(),
             );
             true
         }
@@ -153,27 +153,22 @@ pub(crate) async fn handle_worker_vault_request(request: &Object) -> Object {
         "createFeedUpdateSocWithStamp" => {
             let topic = string_prop(request, "topic").unwrap_or_default();
             let index = u64_prop(request, "feedIndex");
-            match bytes_array_prop(request, "wrappedContent") {
-                Some(content) => {
-                    match secure_create_feed_update_soc_with_stamp_in_window(
-                        topic,
-                        index,
-                        content,
-                        string_prop(request, "walletOwner"),
-                    )
-                    .await
-                    {
-                        Some(update) => {
-                            set_js_bool(&response, "bucketFull", update.bucket_full);
-                            set_js(&response, "socChunk", bytes_value(&update.soc_chunk));
-                            set_js(&response, "socAddress", bytes_value(&update.soc_address));
-                            set_js(&response, "stamp", bytes_value(&update.stamp));
-                            true
-                        }
-                        None => false,
-                    }
-                }
-                None => false,
+            if let Some(content) = bytes_array_prop(request, "wrappedContent")
+                && let Some(update) = secure_create_feed_update_soc_with_stamp_in_window(
+                    topic,
+                    index,
+                    content,
+                    string_prop(request, "walletOwner"),
+                )
+                .await
+            {
+                set_js_bool(&response, "bucketFull", update.bucket_full);
+                set_js(&response, "socChunk", bytes_value(&update.soc_chunk));
+                set_js(&response, "socAddress", bytes_value(&update.soc_address));
+                set_js(&response, "stamp", bytes_value(&update.stamp));
+                true
+            } else {
+                false
             }
         }
         _ => false,
@@ -190,20 +185,6 @@ pub async fn secure_batch_state_for_wallet(
     network_id: u64,
 ) -> Option<SecureBatchState> {
     let client = secure_client_for_wallet(wallet).await?;
-    check_batch_state(client, network_id).await
-}
-
-pub async fn secure_ensure_authorized() -> bool {
-    worker_vault_call("ensureAuthorized", Object::new())
-        .await
-        .is_some_and(|response| bool_prop(&response, "authorized"))
-}
-
-async fn secure_ensure_authorized_in_window() -> bool {
-    secure_client().await.is_some()
-}
-
-async fn check_batch_state(client: Rc<JsValue>, network_id: u64) -> Option<SecureBatchState> {
     let options = auth_options_for_network(network_id).ok()?;
     let state = call_secure_client_logged(&client, "checkBatchState", options).await?;
 
@@ -214,6 +195,12 @@ async fn check_batch_state(client: Rc<JsValue>, network_id: u64) -> Option<Secur
         batch_validity_status: string_prop(&state, "batchValidityStatus")
             .unwrap_or_else(|| "unknown".to_string()),
     })
+}
+
+pub async fn secure_ensure_authorized() -> bool {
+    worker_vault_call("ensureAuthorized", Object::new())
+        .await
+        .is_some_and(|response| bool_prop(&response, "authorized"))
 }
 
 pub async fn secure_prepare_batch_purchase(
@@ -884,7 +871,7 @@ fn ensure_resume_connection_prompt(context: &str) {
                 return;
             }
 
-            remove_element(&notice_for_success);
+            notice_for_success.remove();
             wake_resume_waiters();
         });
     });
@@ -914,10 +901,6 @@ fn result_field(document: &web_sys::Document) -> Option<web_sys::HtmlElement> {
     document
         .get_element_by_id("resultField")
         .and_then(|element| element.dyn_into::<web_sys::HtmlElement>().ok())
-}
-
-fn remove_element(element: &web_sys::Element) {
-    element.remove();
 }
 
 fn focus_current_window() {

@@ -252,7 +252,7 @@ struct RetrieveAttemptBudget {
 
 #[derive(Debug)]
 struct RetrieveAdmissionInner {
-    open: AtomicBool,
+    state: AtomicU8,
     returned_cac: AtomicBool,
     attempts: Option<RetrieveAttemptBudget>,
     closed: Event,
@@ -265,6 +265,9 @@ pub(crate) struct RetrieveAdmission {
 }
 
 impl RetrieveAdmission {
+    const OPEN: u8 = 1;
+    const LISTENED: u8 = 2;
+
     pub(crate) fn new() -> Self {
         Self::with_attempts_remaining(None)
     }
@@ -276,7 +279,7 @@ impl RetrieveAdmission {
     fn with_attempts_remaining(attempts_remaining: Option<usize>) -> Self {
         Self {
             inner: Arc::new(RetrieveAdmissionInner {
-                open: AtomicBool::new(attempts_remaining != Some(0)),
+                state: AtomicU8::new(u8::from(attempts_remaining != Some(0))),
                 returned_cac: AtomicBool::new(false),
                 attempts: attempts_remaining.map(|limit| RetrieveAttemptBudget {
                     limit,
@@ -290,7 +293,7 @@ impl RetrieveAdmission {
     }
 
     pub(crate) fn is_open(&self) -> bool {
-        self.inner.open.load(Ordering::SeqCst)
+        self.inner.state.load(Ordering::SeqCst) != 0
     }
 
     pub(crate) fn record_returned_cac(&self) {
@@ -302,7 +305,7 @@ impl RetrieveAdmission {
     }
 
     pub(crate) fn close(&self) {
-        if self.inner.open.swap(false, Ordering::SeqCst) {
+        if self.inner.state.swap(0, Ordering::SeqCst) == Self::LISTENED {
             self.inner.closed.notify(usize::MAX);
         }
     }
@@ -374,6 +377,9 @@ impl RetrieveAdmission {
     }
 
     pub(crate) async fn wait_closed(&self) {
+        if self.inner.state.compare_exchange(
+            Self::OPEN, Self::LISTENED, Ordering::SeqCst, Ordering::SeqCst,
+        ) == Err(0) { return; }
         let listener = self.inner.closed.listen();
         if self.is_open() {
             listener.await;
@@ -465,7 +471,6 @@ impl<K, W, A> Default for SingleflightRegistry<K, W, A> {
 impl<K, W, A> SingleflightRegistry<K, W, A>
 where
     K: Clone + Eq + Hash,
-    A: Clone,
 {
     pub(crate) fn len(&self) -> usize {
         self.flights.len()
@@ -475,12 +480,12 @@ where
         &mut self,
         key: &K,
         mut keep: impl FnMut(&W) -> bool,
-    ) -> Option<(u64, A, usize)> {
+    ) -> Option<(u64, &A, usize)> {
         let flight = self.flights.get_mut(key)?;
         flight.waiters.retain(|(_, waiter)| keep(waiter));
         Some((
             flight.flight_id,
-            flight.shared.clone(),
+            &flight.shared,
             flight.waiters.len(),
         ))
     }
@@ -490,31 +495,33 @@ where
         (flight.flight_id == flight_id).then_some(&mut flight.shared)
     }
 
-    pub(crate) fn register(
+    pub(crate) fn register<R>(
         &mut self,
         key: K,
         waiter: W,
         make_shared: impl FnOnce() -> A,
-    ) -> SingleflightRegistration<K, A> {
+        project: impl FnOnce(&mut A) -> R,
+    ) -> SingleflightRegistration<K, R> {
         self.next_waiter_id = next_nonzero_generation(self.next_waiter_id);
         let waiter_id = self.next_waiter_id;
 
         let (flight_id, shared, leader) = if let Some(flight) = self.flights.get_mut(&key) {
             flight.waiters.push((waiter_id, waiter));
-            (flight.flight_id, flight.shared.clone(), false)
+            (flight.flight_id, project(&mut flight.shared), false)
         } else {
             self.next_flight_id = next_nonzero_generation(self.next_flight_id);
             let flight_id = self.next_flight_id;
-            let shared = make_shared();
+            let mut shared = make_shared();
+            let registered = project(&mut shared);
             self.flights.insert(
                 key.clone(),
                 SingleflightFlight {
                     flight_id,
-                    shared: shared.clone(),
+                    shared,
                     waiters: vec![(waiter_id, waiter)],
                 },
             );
-            (flight_id, shared, true)
+            (flight_id, registered, true)
         };
 
         SingleflightRegistration {
@@ -527,7 +534,7 @@ where
     }
 
     /// Keep a zero-waiter flight registered until its dispatched producer settles.
-    pub(crate) fn remove_waiter(&mut self, key: &K, flight_id: u64, waiter_id: u64) -> Option<A> {
+    pub(crate) fn remove_waiter(&mut self, key: &K, flight_id: u64, waiter_id: u64) -> Option<&A> {
         let flight = self.flights.get_mut(key)?;
         if flight.flight_id != flight_id {
             return None;
@@ -538,7 +545,7 @@ where
             return None;
         }
 
-        Some(flight.shared.clone())
+        Some(&flight.shared)
     }
 
     /// A stale producer cannot detach a newer flight with the same key.

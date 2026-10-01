@@ -57,6 +57,11 @@ const UPLOAD_REDUNDANCY_TYPES: &str = r#"
 /** Bee-compatible erasure-coding level used for uploads. */
 export type UploadRedundancyLevel = 0 | 1 | 2 | 3 | 4;
 export type HlsStart = "beginning" | "live";
+export interface StreamQuality {
+    levels: { level: number; width: number; height: number; bitrate: number }[];
+    selectedLevel: number;
+    currentLevel: number;
+}
 "#;
 
 fn resource_to_js(bytes: Vec<u8>, mime: String, path: String) -> Object {
@@ -441,18 +446,10 @@ async fn configure_shared_node(
             ));
             continue;
         }
-        dial_nodes.push(node);
+        dial_nodes.push((node.multiaddr, node.usable));
     }
 
-    inner
-        .configure(
-            expected_network_id,
-            dial_nodes
-                .into_iter()
-                .map(|node| (node.multiaddr, node.usable))
-                .collect(),
-        )
-        .await
+    inner.configure(expected_network_id, dial_nodes).await
 }
 
 #[wasm_bindgen]
@@ -587,13 +584,10 @@ impl Weeb3No103 {
             "live" => HlsStart::Live,
             _ => return Err(JsValue::from_str("stream start must be beginning or live")),
         };
-        let route =
-            StreamShareRoute::new(owner, topic).map_err(|error| JsValue::from_str(&error))?;
+        let route = StreamShareRoute::new(owner, topic)?;
         let view_generation = crate::stream::begin_result_view_request();
         crate::stream::release_current_stream_view();
-        self.boot_runtime()
-            .await
-            .map_err(|error| JsValue::from_str(&error))?;
+        self.boot_runtime().await?;
         crate::stream_hls::attach_hls_feed_player(
             self.inner.clone(),
             &media,
@@ -605,6 +599,24 @@ impl Weeb3No103 {
         .await
         .map(|_| ())
         .map_err(|error| JsValue::from_str(&error))
+    }
+
+    #[wasm_bindgen(js_name = streamQuality, unchecked_return_type = "StreamQuality")]
+    pub fn stream_quality(&self, media: &HtmlMediaElement) -> Result<JsValue, JsValue> {
+        crate::stream_hls::stream_quality(media)
+    }
+
+    #[wasm_bindgen(js_name = setStreamQuality)]
+    pub fn set_stream_quality(&self, media: &HtmlMediaElement, level: f64) -> Result<(), JsValue> {
+        crate::stream_hls::set_stream_quality(media, level)
+    }
+
+    #[wasm_bindgen(js_name = connectionCount)]
+    pub async fn connection_count(&self) -> Result<f64, JsValue> {
+        self.boot_runtime().await?;
+        self.inner.runtime_snapshot(0, false, false).await
+            .map(|snapshot| snapshot.connections as f64)
+            .ok_or_else(|| JsValue::from_str("SharedWorker connection snapshot unavailable"))
     }
 
     #[wasm_bindgen(js_name = networkState)]
@@ -679,9 +691,7 @@ impl Weeb3No103 {
 
     #[wasm_bindgen(js_name = retrieve)]
     pub async fn retrieve(&self, address: String) -> Result<Array, JsValue> {
-        self.boot_runtime()
-            .await
-            .map_err(|error| JsValue::from_str(&error))?;
+        self.boot_runtime().await?;
         let raw = self.inner.acquire(address).await;
         let (mut data, indx) = decode_resources(raw);
 
@@ -709,25 +719,19 @@ impl Weeb3No103 {
 
     #[wasm_bindgen(js_name = retrieveBytes)]
     pub async fn retrieve_bytes(&self, address: String) -> Result<Uint8Array, JsValue> {
-        self.boot_runtime()
-            .await
-            .map_err(|error| JsValue::from_str(&error))?;
+        self.boot_runtime().await?;
         Ok(self.inner.retrieve_bytes(address).await)
     }
 
     #[wasm_bindgen(js_name = retrieveChunk)]
     pub async fn retrieve_chunk(&self, address: String) -> Result<Uint8Array, JsValue> {
-        self.boot_runtime()
-            .await
-            .map_err(|error| JsValue::from_str(&error))?;
+        self.boot_runtime().await?;
         Ok(self.inner.retrieve_chunk_bytes(address).await)
     }
 
     #[wasm_bindgen(js_name = ready)]
     pub async fn ready(&self, min_connections: u32, timeout_ms: u32) -> Result<bool, JsValue> {
-        self.boot_runtime()
-            .await
-            .map_err(|error| JsValue::from_str(&error))?;
+        self.boot_runtime().await?;
 
         let min_connections = min_connections.max(1) as u64;
         Ok(self
@@ -776,9 +780,7 @@ impl Weeb3No103 {
         chunk_address: Uint8Array,
         stamp: Uint8Array,
     ) -> Result<String, JsValue> {
-        self.boot_runtime()
-            .await
-            .map_err(|error| JsValue::from_str(&error))?;
+        self.boot_runtime().await?;
         let raw = self
             .inner
             .post_push_chunk(data, soc, chunk_address, stamp)
@@ -869,21 +871,12 @@ impl Weeb3No103 {
             set_js_str(&obj, "feedTopic", &feed_topic);
             set_js_str(&obj, "feedReference", &indx);
             let owner = match wallet_owner {
-                Some(owner) => hex::decode(strip_hex_prefix(&owner)).ok(),
-                None => secure_ensure_feed_owner_in_window().await,
+                Some(owner) => Ok(owner),
+                None => feed_owner_for_request("").await,
             };
             match owner {
-                Some(owner) if owner.len() == 20 => {
-                    set_js_str(&obj, "feedOwner", format!("0x{}", hex::encode(owner)));
-                }
-                Some(owner) => {
-                    set_js_str(
-                        &obj,
-                        "feedOwnerError",
-                        format!("feed owner had invalid length {}", owner.len()),
-                    );
-                }
-                None => set_js_str(&obj, "feedOwnerError", "feed owner unavailable"),
+                Ok(owner) => set_js_str(&obj, "feedOwner", owner),
+                Err(error) => set_js_str(&obj, "feedOwnerError", error),
             }
         }
 

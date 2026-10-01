@@ -49,7 +49,7 @@ fn complete_hls_bodies_use_shared_ranges_and_respect_cache_epoch_and_budget() {
     let trim = section(cache, "fn trim(", "fn clear(");
     crate::source::assert_contains(trim, &[
         ".min(HLS_BODY_CACHE_MAX_BYTES)",
-        "self.body_order.pop_front()",
+        "self.bodies.pop_front()",
         "set_auxiliary_media_cache_bytes(self.bytes)",
     ]);
     assert!(cache.contains("self.epoch = self.epoch.wrapping_add(1)"));

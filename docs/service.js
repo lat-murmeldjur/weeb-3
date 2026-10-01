@@ -621,9 +621,9 @@ function createRustRangeStream(
   };
 
   const drainScheduledRanges = () => {
-    return Promise.allSettled(Array.from(scheduled.values())).then(() => {
-      scheduled.clear();
-    });
+    const pending = Array.from(scheduled.values(), request => request.then(() => {}));
+    scheduled.clear();
+    return Promise.allSettled(pending);
   };
 
   const failStream = async (controller, error) => {

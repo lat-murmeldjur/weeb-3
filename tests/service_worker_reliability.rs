@@ -442,8 +442,11 @@ fn generic_range_stream_cancel_closes_admission_and_drains_dispatched_promises()
         "const drainScheduledRanges = () => {",
         "const failStream = async",
     );
-    assert!(drain.contains("Promise.allSettled(Array.from(scheduled.values()))"));
-    assert!(drain.contains("scheduled.clear();"));
+    assert_in_order(drain, &[
+        "Array.from(scheduled.values(), request => request.then(() => {}))",
+        "scheduled.clear();",
+        "Promise.allSettled(pending)",
+    ]);
 
     let admission = between(
         stream,

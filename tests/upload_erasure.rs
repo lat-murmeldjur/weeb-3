@@ -1825,7 +1825,7 @@ mod upload_redundancy {
             .find("let push_reference = upload_resource(")
             .unwrap();
         let completion = iteration[upload..].find(".await;").unwrap() + upload;
-        let feedback = iteration.find("chan.try_send(push_reference)").unwrap();
+        let feedback = iteration.find("chan.send(push_reference)").unwrap();
         assert!(upload < completion && completion < feedback);
 
         let data = crate::source::between(

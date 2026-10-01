@@ -3,7 +3,7 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>weeb-3 npm HLS stream example</title>
+    <title>weeb-3 npm HLS resolution example</title>
     <script type="importmap">
       {
         "imports": {
@@ -17,17 +17,10 @@
         font-family: system-ui, sans-serif;
       }
       body {
-        box-sizing: border-box;
-        margin: 0;
-      }
-      header {
-        padding: 1rem;
+        margin: 1rem;
       }
       header p {
         max-width: 72ch;
-      }
-      main {
-        padding: 0 1rem 1rem;
       }
       video {
         display: block;
@@ -44,11 +37,10 @@
   </head>
   <body>
     <header>
-      <h1>Swarm HLS stream</h1>
+      <h1>Swarm HLS archive</h1>
       <p>
-        This page owns its video element and passes it to the npm client. The
-        same Rust runtime, connections, retrieval, prefetch and player used by
-        weeb-3 run underneath it.
+        Play a multi-resolution archive through the npm client. Playback switches
+        to a lower resolution as connected peers drop.
       </p>
       <p id="status" role="status">Loading the weeb-3 npm client...</p>
     </header>
@@ -63,38 +55,56 @@
     <script type="module">
       import init, { Weeb3No103 } from "./weeb_3.js";
 
+      const connectionLimits = [90, 60, 30]; // Below each limit: 2nd, 3rd, 4th highest resolution.
       const parameters = new URLSearchParams(location.search);
-      const owner = parameters.get("owner") || "6F2728386F8a47ef5EBe323721188e630Ff0FdE9";
-      const topic = parameters.get("topic") || "b347b89b-933c-424f-a3d1-403bdd270b25";
-      const initialStart = parameters.get("start") === "live" ? "live" : "beginning";
-      const status = document.getElementById("status");
-      const video = document.getElementById("stream");
+      const owner = parameters.get("owner") || "2ac5d080dafd13b6ec1d25a4ca78102d45d2d9e4";
+      const topic = parameters.get("topic") || "93629e09-8e88-4617-b270-4f2e26ba4219";
+      const byId = id => document.getElementById(id);
+      const status = byId("status");
+      const video = byId("stream");
       let attachRequest = 0;
 
       try {
         await init();
         const node = new Weeb3No103();
         node.start();
+        let checkingConnections = false;
+        setInterval(async () => {
+          if (checkingConnections) return;
+          checkingConnections = true;
+          try {
+            const count = await node.connectionCount();
+            const rank = connectionLimits.filter(limit => count < limit).length;
+            if (rank === 0) return;
+            const { levels, selectedLevel, currentLevel } = node.streamQuality(video);
+            if (selectedLevel >= 0 && selectedLevel !== currentLevel) return;
+            const current = levels.find(({ level }) => level === currentLevel);
+            const resolutions = levels.filter(({ height }) => height > 0)
+              .sort((a, b) => b.height - a.height || b.bitrate - a.bitrate)
+              .filter((item, index, sorted) => index === 0 || item.height !== sorted[index - 1].height);
+            const target = resolutions[Math.min(rank, resolutions.length - 1)];
+            if (current && target && target.height < current.height) node.setStreamQuality(video, target.level);
+          } catch { // Retry on the next poll if the stream or worker is not ready.
+          } finally { checkingConnections = false; }
+        }, 5000);
 
         async function attach(start) {
           const request = ++attachRequest;
           status.textContent = `Opening the stream from ${start}...`;
           try {
             await node.attachStream(video, owner, topic, start);
-            if (request === attachRequest) {
-              status.textContent = `Stream attached from ${start}; loading playback...`;
-            }
+            if (request !== attachRequest) return;
+            status.textContent = `Stream attached from ${start}; loading playback...`;
           } catch (error) {
-            if (request === attachRequest) {
-              status.textContent = `Could not open the stream: ${error.message || error}`;
-              console.error(error);
-            }
+            if (request !== attachRequest) return;
+            status.textContent = `Could not open the stream: ${error.message || error}`;
+            console.error(error);
           }
         }
 
-        document.getElementById("beginning").onclick = () => attach("beginning");
-        document.getElementById("live").onclick = () => attach("live");
-        await attach(initialStart);
+        byId("beginning").onclick = () => attach("beginning");
+        byId("live").onclick = () => attach("live");
+        await attach(parameters.get("start") === "live" ? "live" : "beginning");
       } catch (error) {
         status.textContent = `Could not initialize weeb-3: ${error.message || error}`;
         console.error(error);

@@ -1,5 +1,6 @@
 use super::*;
 use js_sys::{Object, Reflect};
+use std::fmt::Write as _;
 use crate::worker_protocol::{
     DomListener, ReplyChannel, bool_property, number_property, set as set_js, string_property,
 };
@@ -1127,36 +1128,29 @@ pub(super) fn render_log_messages(messages: &[String]) {
 }
 
 pub(super) fn render_progress_rows(rows: Vec<crate::events::ProgressRow>) {
-    let document = interface_document();
-    let Some(progress_rows) = ensure_progress_child(&document, "progressRows", "pre") else {
+    let Some(progress_rows) = ensure_progress_child(&interface_document(), "progressRows", "pre") else {
         return;
     };
 
-    let lines: Vec<String> = rows
-        .into_iter()
-        .map(|row| {
-            let percent = row
-                .percent
-                .map(|percent| format!("{}%", percent))
-                .unwrap_or_else(|| "...".to_string());
-            let status = if row.done {
-                if row.ok || row.phase.starts_with("complete") {
-                    "done"
-                } else {
-                    "failed"
-                }
-            } else {
-                "running"
-            };
-
-            format!(
-                "{} {} [{}] {} {} {}",
-                row.kind, row.subject, status, row.phase, percent, row.detail
-            )
-        })
-        .collect();
-
-    progress_rows.set_text_content(Some(&lines.join("\n")));
+    let mut lines = String::new();
+    for row in rows {
+        let status = if !row.done {
+            "running"
+        } else if row.ok || row.phase.starts_with("complete") {
+            "done"
+        } else {
+            "failed"
+        };
+        let _ = write!(lines, "{} {} [{}] {} ", row.kind, row.subject, status, row.phase);
+        if let Some(percent) = row.percent {
+            let _ = write!(lines, "{percent}%");
+        } else {
+            lines.push_str("...");
+        }
+        let _ = writeln!(lines, " {}", row.detail);
+    }
+    lines.pop();
+    progress_rows.set_text_content(Some(&lines));
 }
 
 pub(super) fn render_result(data: Vec<(Vec<u8>, String, String)>, indx: String) {

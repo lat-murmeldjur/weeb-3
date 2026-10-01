@@ -240,9 +240,9 @@ fn secure_vault_stays_lazy_and_window_brokered() {
     let authorization = section(
         SECURE_VAULT,
         "pub async fn secure_ensure_authorized()",
-        "async fn check_batch_state(",
+        "pub async fn secure_prepare_batch_purchase(",
     );
-    assert!(authorization.contains("secure_client().await"));
+    assert!(authorization.contains("worker_vault_call("));
     let user_action = section(
         SECURE_VAULT,
         "pub fn secure_open_vault_from_user_action()",
@@ -264,7 +264,7 @@ fn secure_vault_stays_lazy_and_window_brokered() {
     for (broker_call, window_call) in [
         (
             "worker_vault_call(\"ensureAuthorized\"",
-            "secure_ensure_authorized_in_window().await",
+            "secure_client().await.is_some()",
         ),
         (
             "worker_vault_call(\"stampChunk\"",
@@ -294,8 +294,9 @@ fn secure_vault_stays_lazy_and_window_brokered() {
         LIBRARY
             .matches("secure_ensure_feed_owner_in_window().await")
             .count(),
-        2
+        1
     );
+    assert!(LIBRARY.contains("None => feed_owner_for_request(\"\").await"));
 
     let oracle = compact(ON_CHAIN);
     assert!(oracle.contains(
@@ -447,11 +448,8 @@ fn log_polling_is_combined_bounded_and_per_client() {
     assert!(poll.contains("Duration::from_millis(160)"));
     assert!(!poll.contains("get_connections("));
     assert!(!poll.contains("get_current_logs("));
-    assert_eq!(
-        INTERFACE.matches("runtime_snapshot(").count()
-            + LIBRARY.matches("runtime_snapshot(").count(),
-        1
-    );
+    assert_eq!(INTERFACE.matches("runtime_snapshot(").count(), 1);
+    assert_eq!(LIBRARY.matches("runtime_snapshot(0, false, false)").count(), 1);
 
     assert!(SHARED_RUNTIME.contains("seen_log_sequence: Cell<u64>"));
     assert!(SHARED_RUNTIME.contains("self.seen_log_sequence.set(log_sequence)"));

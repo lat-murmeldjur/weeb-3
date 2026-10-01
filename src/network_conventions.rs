@@ -885,17 +885,13 @@ pub(crate) async fn start_owned_connection_attempt(
     if swarm.lock().await.is_connected(peer) {
         let physical_connection_id =
             exclusive_physical_connection(&wings.physical_connections, peer);
-        let attempt_owned = {
-            let mut attempts = wings.connection_attempts.lock().await;
-            match attempts.get_mut(peer) {
-                Some(attempt) if attempt.id == attempt_id && physical_connection_id.is_some() => {
-                    attempt.physical_connection_id = physical_connection_id;
-                    true
-                }
-                _ => false,
+        return Ok(match wings.connection_attempts.lock().await.get_mut(peer) {
+            Some(attempt) if attempt.id == attempt_id && physical_connection_id.is_some() => {
+                attempt.physical_connection_id = physical_connection_id;
+                true
             }
-        };
-        return Ok(attempt_owned);
+            _ => false,
+        });
     }
 
     let options = DialOpts::peer_id(*peer)
@@ -903,15 +899,12 @@ pub(crate) async fn start_owned_connection_attempt(
         .addresses(vec![dial_addr.clone()])
         .build();
     let connection_id = options.connection_id();
-    let attempt_owned = {
-        let mut attempts = wings.connection_attempts.lock().await;
-        match attempts.get_mut(peer) {
-            Some(attempt) if attempt.id == attempt_id => {
-                attempt.physical_connection_id = Some(connection_id);
-                true
-            }
-            _ => false,
+    let attempt_owned = match wings.connection_attempts.lock().await.get_mut(peer) {
+        Some(attempt) if attempt.id == attempt_id => {
+            attempt.physical_connection_id = Some(connection_id);
+            true
         }
+        _ => false,
     };
     if attempt_owned {
         swarm.lock().await.dial(options)?;

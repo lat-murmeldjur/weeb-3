@@ -18,7 +18,7 @@ use crate::{
     Weeb3,
     bzz_stream::{BzzMetadata, canonical_bzz_url},
     interface::service_worker_controls_bzz_requests,
-    mpsc,
+    oneshot,
     retrieval_conventions::{
         PendingGenerationRelation, RetrieveAdmission, SingleflightRegistration,
         SingleflightRegistry, next_nonzero_generation, pending_generation_relation,
@@ -109,7 +109,7 @@ struct FetchCache {
     epoch: u64,
     metadata: LinkedHashMap<String, BzzMetadata, RandomState>,
     ranges: LinkedHashMap<String, Bytes, RandomState>,
-    pending_ranges: SingleflightRegistry<String, mpsc::Sender<Result<Bytes, String>>, RangeFlight>,
+    pending_ranges: SingleflightRegistry<String, oneshot::Sender<Result<Bytes, String>>, RangeFlight>,
     range_bytes: u64,
     media_states: HashMap<String, MediaState>,
 }
@@ -184,7 +184,7 @@ impl FetchCache {
         let mut joining = false;
         if let Some((flight_id, shared, waiters)) = self
             .pending_ranges
-            .inspect_waiters(&pending_key, |waiter| !waiter.is_closed())
+            .inspect_waiters(&pending_key, |waiter| !waiter.is_canceled())
         {
             match pending_generation_relation(shared.generation, generation) {
                 PendingGenerationRelation::RejectStale => {
@@ -219,23 +219,17 @@ impl FetchCache {
         if !joining && self.pending_ranges.len() >= RANGE_SINGLEFLIGHT_MAX_LOADS {
             return RangeLoadRole::Reject("too many range loads are already pending".to_string());
         }
-        let (sender, receiver) = mpsc::bounded(1);
-        let mut registration = self
-            .pending_ranges
-            .register(pending_key, sender, || RangeFlight {
-                generation,
-                admission: cancel_when_unused.then(RetrieveAdmission::new),
-            });
-        // Stable readers retain the original completion/cache behavior even if they leave.
-        if !cancel_when_unused {
-            if let Some(shared) = self
-                .pending_ranges
-                .shared_mut(&registration.key, registration.flight_id)
-            {
-                shared.admission = None;
-            }
-            registration.shared.admission = None;
-        }
+        let (sender, receiver) = oneshot::channel();
+        let registration = self.pending_ranges.register(
+            pending_key,
+            sender,
+            || RangeFlight { generation, admission: cancel_when_unused.then(RetrieveAdmission::new) },
+            |shared| {
+                // Stable readers retain completion/cache ownership even if they leave.
+                if !cancel_when_unused { shared.admission = None; }
+                shared.clone()
+            },
+        );
         RangeLoadRole::Read(receiver, registration)
     }
 
@@ -308,32 +302,32 @@ impl RangeWaiterGuard {
 
 impl Drop for RangeWaiterGuard {
     fn drop(&mut self) {
-        let shared = FETCH_CACHE.with(|cache| {
+        let admission = FETCH_CACHE.with(|cache| {
             cache.borrow_mut().pending_ranges.remove_waiter(
                 &self.key,
                 self.flight_id,
                 self.waiter_id,
-            )
+            ).and_then(|shared| shared.admission.clone())
         });
-        if let Some(admission) = shared.and_then(|shared| shared.admission) {
+        if let Some(admission) = admission {
             admission.close();
         }
     }
 }
 
 fn finish_range_waiters(
-    waiters: Vec<(u64, mpsc::Sender<Result<Bytes, String>>)>,
+    waiters: Vec<(u64, oneshot::Sender<Result<Bytes, String>>)>,
     result: Result<Bytes, String>,
 ) {
     for (_, waiter) in waiters {
-        let _ = waiter.try_send(result.clone());
+        let _ = waiter.send(result.clone());
     }
 }
 
 enum RangeLoadRole {
     Cached(Bytes),
     Read(
-        mpsc::Receiver<Result<Bytes, String>>,
+        oneshot::Receiver<Result<Bytes, String>>,
         SingleflightRegistration<String, RangeFlight>,
     ),
     Reject(String),
@@ -1191,7 +1185,7 @@ async fn read_range_window(
     }
 
     drop(identity);
-    match async_std::future::timeout(Duration::from_millis(timeout_ms), receiver.recv()).await {
+    match async_std::future::timeout(Duration::from_millis(timeout_ms), receiver).await {
         Ok(Ok(result)) => result.map_err(RangeReadError::from),
         Ok(Err(_)) => Err("range load was canceled".into()),
         Err(_) => {

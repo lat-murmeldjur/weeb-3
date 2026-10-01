@@ -78,7 +78,7 @@ impl Weeb3 {
             }
             None => None,
         };
-        let (chan, result) = mpsc::bounded(1);
+        let (chan, result) = oneshot::channel();
         self.range_port
             .0
             .try_send(BzzRangeRequest {
@@ -90,7 +90,7 @@ impl Weeb3 {
                 chan,
             })
             .ok()?;
-        result.recv().await.unwrap_or(None)
+        result.await.unwrap_or(None)
     }
 }
 
@@ -193,7 +193,7 @@ pub(crate) type UploadRequest = (
     String,
     Option<String>,
     Option<UploadProgressSender>,
-    mpsc::Sender<Vec<u8>>,
+    oneshot::Sender<Vec<u8>>,
 );
 pub(crate) type BootnodeChange = (String, bool, u64);
 
@@ -262,5 +262,5 @@ pub(crate) struct BzzRangeRequest {
     pub(crate) end_inclusive: u64,
     pub(crate) cancel: Option<RetrieveCancelToken>,
     pub(crate) admission: Option<retrieval_conventions::RetrieveAdmission>,
-    pub(crate) chan: mpsc::Sender<Option<(Vec<u8>, BzzMetadata)>>,
+    pub(crate) chan: oneshot::Sender<Option<(Vec<u8>, BzzMetadata)>>,
 }

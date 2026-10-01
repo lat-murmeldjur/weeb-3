@@ -4,6 +4,7 @@ use std::{
     pin::Pin,
     rc::Rc,
     task::{Context, Poll, Waker},
+    time::Duration,
 };
 
 use bytes::{Buf, BytesMut};
@@ -14,6 +15,7 @@ use futures::{
 use js_sys::{Function, Uint8Array};
 use libp2p::core::{
     multiaddr::{Multiaddr, Protocol},
+    muxing::{StreamMuxer, StreamMuxerEvent},
     transport::{DialOpts, ListenerId, TransportError, TransportEvent},
 };
 use send_wrapper::SendWrapper;
@@ -73,6 +75,49 @@ impl libp2p::Transport for Transport {
         _: &mut Context<'_>,
     ) -> Poll<TransportEvent<Self::ListenerUpgrade, io::Error>> {
         Poll::Pending
+    }
+}
+
+pub(crate) struct CloseTimeout<M> {
+    inner: M,
+    deadline: Option<BoxFuture<'static, ()>>,
+}
+
+impl<M> CloseTimeout<M> {
+    pub(crate) fn new(inner: M) -> Self {
+        Self { inner, deadline: None }
+    }
+}
+
+impl<M: StreamMuxer + Unpin> StreamMuxer for CloseTimeout<M>
+where
+    M::Error: Send + Sync + 'static,
+{
+    type Substream = M::Substream;
+    type Error = io::Error;
+
+    fn poll_inbound(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<Self::Substream>> {
+        Pin::new(&mut self.inner).poll_inbound(cx).map_err(io::Error::other)
+    }
+
+    fn poll_outbound(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<Self::Substream>> {
+        Pin::new(&mut self.inner).poll_outbound(cx).map_err(io::Error::other)
+    }
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<StreamMuxerEvent>> {
+        Pin::new(&mut self.inner).poll(cx).map_err(io::Error::other)
+    }
+
+    fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        // Prefer a completed close after background suspension, even if its timer expired.
+        if let Poll::Ready(result) = Pin::new(&mut self.inner).poll_close(cx) {
+            self.deadline = None;
+            return Poll::Ready(result.map_err(io::Error::other));
+        }
+        let deadline = self.deadline.get_or_insert_with(|| {
+            SendWrapper::new(async_std::task::sleep(Duration::from_secs(8))).boxed()
+        });
+        deadline.poll_unpin(cx).map(|()| Err(io::ErrorKind::TimedOut.into()))
     }
 }
 

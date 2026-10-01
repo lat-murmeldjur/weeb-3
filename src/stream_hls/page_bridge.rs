@@ -173,31 +173,35 @@ fn notify_abandon(id: u64, runtime: &SharedRuntime, network_id: u64) {
     let _ = runtime.notify(&request);
 }
 
-async fn live_control(kind: &str, timeout: Duration, configure: impl FnOnce(&Object)) -> Option<Object> {
+async fn hls_control(kind: &str, timeout: Duration, configure: impl FnOnce(&Object)) -> Option<Object> {
     let (runtime, request) = ACTIVE_HLS.with_borrow(|active| {
-        let active = active.as_ref().filter(|active| active.live)?;
+        let active = active.as_ref().filter(|active| active.live || kind == "WEEB3_HLS_HISTORY")?;
         let request = request_object(kind, active.network_id);
         set_number(&request, "session", active.worker_session as f64);
         Some((active.runtime.clone(), request))
     })?;
     configure(&request);
-    let response = runtime.request(&request, Some(timeout)).await.ok()?;
-    (bool_property(&response, "ok") == Some(true)).then_some(response)
+    runtime.request(&request, Some(timeout)).await.ok()
 }
 
-pub(super) async fn prepare_history(source: &str, position: f64) -> Option<f64> {
-    let response = live_control("WEEB3_HLS_HISTORY", HLS_PREPARE_TIMEOUT, |request| {
+pub(super) async fn prepare_history(source: &str, position: f64) -> Option<Result<f64, String>> {
+    let response = hls_control("WEEB3_HLS_HISTORY", HLS_PREPARE_TIMEOUT, |request| {
         set_string(request, "source", source);
         set_number(request, "position", position);
     }).await?;
-    number_property(&response, "timelineOffset")
+    if integer_property(&response, "status") == Some(416) {
+        return Some(Err(string_property(&response, "error")?));
+    }
+    (bool_property(&response, "ok") == Some(true)).then_some(())?;
+    number_property(&response, "timelineOffset").map(Ok)
 }
 
 pub(super) async fn resolve_live_tail_failure(sequence: u64, reference: &str) -> Option<f64> {
-    let response = live_control("WEEB3_HLS_TAIL_FAILURE", HLS_CONTROL_TIMEOUT, |request| {
+    let response = hls_control("WEEB3_HLS_TAIL_FAILURE", HLS_CONTROL_TIMEOUT, |request| {
         set_number(request, "sequence", sequence as f64);
         set_string(request, "reference", reference);
     }).await?;
+    (bool_property(&response, "ok") == Some(true)).then_some(())?;
     number_property(&response, "target").filter(|target| target.is_finite() && *target >= 0.0)
 }
 

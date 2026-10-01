@@ -33,6 +33,8 @@ The higher-level `Weeb3No103` interface provides the main methods used by the em
 - `uploadWithRedundancy(file, encryption, redundancy_level, index_string, add_to_feed, feed_topic)`
 - `postUploadBytesWithRedundancy(bytes, mime, filename, encryption, redundancy_level, add_to_feed, feed_topic)`
 - `attachStream(media, owner, topic, start)`
+- `streamQuality(media)` and `setStreamQuality(media, level)`
+- `connectionCount()`
 - `renderInterface(container)`
 - `resetStamp()`
 - `postPushChunk(data, soc, chunk_address, stamp)`
@@ -94,6 +96,25 @@ await node.attachStream(video, owner, topic, "live");
 ```
 
 Public HLS feeds use mainnet. The embedding page must be below the `/weeb-3/` scope and serve the packaged worker at `/weeb-3/service.js`, or already be controlled by a worker implementing the same forwarding protocol.
+
+`streamQuality(video)` returns the available `levels` (`level`, `width`, `height`, and `bitrate`), the requested `selectedLevel`, and the playing `currentLevel`. Levels become available after the master playlist loads. A selected level of `-1` means Auto; a current level of `-1` means no rendition is playing yet. The highest available resolution is the initial selection. Quality controls require an attached hls.js stream; native HLS is unsupported, and switching during a history seek is temporarily unavailable.
+
+For example, your application's periodic monitor can lower resolution when too few peers are connected:
+
+```js
+async function reduceResolutionBelow(minimumConnections) {
+  if (await node.connectionCount() >= minimumConnections) return;
+  const { levels, selectedLevel, currentLevel } = node.streamQuality(video);
+  if (selectedLevel >= 0 && selectedLevel !== currentLevel) return;
+  const current = levels.find(({ level }) => level === currentLevel);
+  if (!current) return;
+  const lower = levels.filter(({ height }) => height > 0 && height < current.height)
+    .sort((a, b) => b.height - a.height || b.bitrate - a.bitrate)[0];
+  if (lower) node.setStreamQuality(video, lower.level);
+}
+```
+
+The host chooses the threshold and monitoring interval; the library adds no poller. `setStreamQuality` accepts a request synchronously through the built-in selector's switching path; `currentLevel` reports when the switch takes effect. Pass `-1` to restore Auto. `connectionCount()` reads the shared worker's connected peer count without requesting logs or progress; worker communication failures reject its promise.
 
 ## Example corresponding to `example.html`
 

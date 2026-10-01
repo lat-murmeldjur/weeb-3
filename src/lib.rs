@@ -249,7 +249,7 @@ impl Weeb3 {
         feed_topic: String,
         wallet_owner: Option<String>,
     ) -> Vec<u8> {
-        let (chan_out, chan_in) = mpsc::bounded::<Vec<u8>>(1);
+        let (chan_out, chan_in) = oneshot::channel();
         let (progress_out, progress_in) = mpsc::unbounded::<UploadProgressDelta>();
 
         let f_size = file.size();
@@ -358,7 +358,7 @@ impl Weeb3 {
             return upload_result("upload result: upload queue unavailable", "");
         }
 
-        let result = chan_in.recv().await.unwrap_or_default();
+        let result = chan_in.await.unwrap_or_default();
 
         if result.is_empty() {
             self.progress
@@ -485,8 +485,7 @@ impl Weeb3 {
                     .upgrade(core::upgrade::Version::V1Lazy)
                     .authenticate(noise::Config::new(key).unwrap())
                     .multiplex(yamux::Config::default())
-                    .outbound_timeout(Duration::from_millis(OUTBOUND_CONNECTION_TIMEOUT_MS))
-                    .boxed()
+                    .map(|(peer, muxer), _| (peer, websocket::CloseTimeout::new(muxer)))
             })
             .expect("Failed to create WebSocket transport")
             .with_behaviour(|key| Behaviour::new(key.public()))
@@ -499,6 +498,7 @@ impl Weeb3 {
                     .with_per_connection_event_buffer_size(10_000)
                     .with_notify_handler_buffer_size(NonZero::new(10_000).unwrap())
             })
+            .with_connection_timeout(Duration::from_millis(OUTBOUND_CONNECTION_TIMEOUT_MS))
             .build();
 
         Weeb3 {
@@ -1019,10 +1019,8 @@ impl Weeb3 {
                                     | libp2p::swarm::DialError::WrongPeerId { .. }
                             );
                             let mut retry_address = match &error {
-                                libp2p::swarm::DialError::LocalPeerId { address } => {
-                                    Some(address.clone())
-                                }
-                                libp2p::swarm::DialError::WrongPeerId { address, .. } => {
+                                libp2p::swarm::DialError::LocalPeerId { address }
+                                | libp2p::swarm::DialError::WrongPeerId { address, .. } => {
                                     Some(address.clone())
                                 }
                                 libp2p::swarm::DialError::Transport(errors) => {
@@ -1282,9 +1280,7 @@ impl Weeb3 {
         let bootnode_change_handle = async {
             while let Ok(first_change) = self.bootnode_port.1.recv().await {
                 let mut bootnode_changes = vec![first_change];
-                while let Ok(change) = self.bootnode_port.1.try_recv() {
-                    bootnode_changes.push(change);
-                }
+                bootnode_changes.extend(drain_ready(None, &self.bootnode_port.1));
 
                 let swarm = self.swarm.clone();
                 let wings = wings.clone();
@@ -1300,22 +1296,16 @@ impl Weeb3 {
                             continue;
                         }
 
-                        let addr33 = match baddr.parse::<Multiaddr>() {
-                            Ok(aok) => aok,
-                            _ => {
-                                continue;
-                            }
+                        let Ok(address) = baddr.parse::<Multiaddr>() else {
+                            continue;
                         };
 
-                        let pid: PeerId = match try_from_multiaddr(&addr33) {
-                            Some(aok) => aok,
-                            _ => {
-                                continue;
-                            }
+                        let Some(pid) = try_from_multiaddr(&address) else {
+                            continue;
                         };
 
                         let dial_addr =
-                            browser_dial_address(addr33).unwrap_or_else(std::convert::identity);
+                            browser_dial_address(address).unwrap_or_else(std::convert::identity);
                         if !reserve_connection_capacity(
                             &connection_population,
                             &connection_generation,
@@ -1924,7 +1914,7 @@ impl Weeb3 {
                         } else {
                             retrieve.await
                         };
-                        let _ = chan.try_send(data);
+                        let _ = chan.send(data);
                     });
                 }
 
@@ -1951,7 +1941,7 @@ impl Weeb3 {
                         self.interface_log(
                             "Could not authorize weeb-3-secure for upload signing".to_string(),
                         );
-                        let _ = chan.try_send(vec![]);
+                        let _ = chan.send(vec![]);
                     } else {
                         let push_reference = upload_resource(
                             file0,
@@ -1967,7 +1957,7 @@ impl Weeb3 {
                             progress,
                         )
                         .await;
-                        let _ = chan.try_send(push_reference);
+                        let _ = chan.send(push_reference);
                     }
                 }
 

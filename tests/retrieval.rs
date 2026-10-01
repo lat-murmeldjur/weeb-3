@@ -107,7 +107,7 @@ mod connection {
         assert!(!runtime.contains("CONNECTION_BUILDUP_SWARM_POLL_MS"));
         assert!(
             runtime.contains(
-                ".outbound_timeout(Duration::from_millis(OUTBOUND_CONNECTION_TIMEOUT_MS))"
+                ".with_connection_timeout(Duration::from_millis(OUTBOUND_CONNECTION_TIMEOUT_MS))"
             )
         );
         assert!(runtime.contains("const OUTBOUND_CONNECTION_TIMEOUT_MS: u64 = 8_000;"));
@@ -336,7 +336,7 @@ mod connection {
         crate::source::assert_contains(runtime, &[
             "is_publicly_dialable_underlay(&source_addr)",
             "browser_dial_address(source_addr).ok()?",
-            "browser_dial_address(addr33).unwrap_or_else",
+            "browser_dial_address(address).unwrap_or_else",
         ]);
         assert!(address_filter.contains("pub(crate) fn browser_dial_address("));
         assert!(!address_filter.contains("enum UnderlayFormat"));
@@ -371,7 +371,7 @@ mod connection {
         ]);
         assert!(accounting.contains("pub(crate) const CONNECTION_BUILDUP_LIMIT: u64 = 200;"));
         assert!(handler.contains("let mut bootnode_changes = vec![first_change];"));
-        assert!(handler.contains("while let Ok(change) = self.bootnode_port.1.try_recv()"));
+        assert!(handler.contains("bootnode_changes.extend(drain_ready(None, &self.bootnode_port.1))"));
 
         let spawn = handler
             .find("spawn_local(async move")
@@ -1239,8 +1239,8 @@ mod retrieve_group_stream {
         );
         assert_eq!(
             group.matches("child_emitter.emit(").count(),
-            3,
-            "cache hits, received data, and reconstruction all publish"
+            4,
+            "both cache paths, received data, and reconstruction all publish"
         );
         assert!(
             group.contains("if requested_count == data_count")
@@ -1361,7 +1361,7 @@ mod rolling_erasure_tail {
             .find("if static_rolling_candidate {")
             .expect("static candidate branch");
         let dispatch = group[candidate..]
-            .find("let mut cached_requested = cached_requested.into_iter();")
+            .find("let mut dispatched = 0usize;")
             .map(|offset| candidate + offset)
             .expect("initial dispatch");
         assert!(group[candidate..dispatch].contains("cache.get_decoded(reference, true)"));
@@ -1445,8 +1445,8 @@ mod rolling_erasure_tail {
         let group = group_source();
         crate::source::assert_contains(group, &[
             "let hedge_due = rolling && (Date::now() - started).max(0.0) as u64 >= hedge_after;",
-            "let active = dispatched.checked_sub(completed)?;",
-            "data_count.checked_sub(active)?",
+            "let active = dispatched - completed;",
+            "data_count - active",
             "if completed == dispatched && (!rolling || hedge_due)",
         ]);
         let rolling_start = group.find("if hedge_due {").expect("rolling branch");
@@ -1475,7 +1475,7 @@ mod rolling_erasure_tail {
             ("if !registration.leader", "missing source marker"),
             ("self.chunks.try_send(", "missing source marker"),
         ]);
-        assert!(raw_queue.contains("hedge_demand: registration.shared.hedge_demand.clone()"));
+        assert!(raw_queue.contains("(shared.admission.clone(), shared.hedge_demand.clone())"));
 
         let retrieve_chunk = crate::source::between(
             RETRIEVAL_SOURCE,
@@ -1821,12 +1821,12 @@ mod retrieve_singleflight {
         let first = flights.register("chunk".to_string(), 3, move || {
             first_created.set(first_created.get() + 1);
             Rc::new(Cell::new(true))
-        });
+        }, |shared| shared.clone());
         let second_created = Rc::clone(&created);
         let second = flights.register("chunk".to_string(), 5, move || {
             second_created.set(second_created.get() + 1);
             Rc::new(Cell::new(true))
-        });
+        }, |shared| shared.clone());
 
         assert!(first.leader);
         assert!(!second.leader);
@@ -1838,8 +1838,8 @@ mod retrieve_singleflight {
     #[test]
     fn last_waiter_closes_but_does_not_remove_the_producer_flight() {
         let mut flights = SingleflightRegistry::<u8, (), Rc<Cell<bool>>>::default();
-        let first = flights.register(7, (), || Rc::new(Cell::new(true)));
-        let second = flights.register(7, (), || Rc::new(Cell::new(true)));
+        let first = flights.register(7, (), || Rc::new(Cell::new(true)), |shared| shared.clone());
+        let second = flights.register(7, (), || Rc::new(Cell::new(true)), |shared| shared.clone());
 
         assert!(
             flights
@@ -1853,7 +1853,7 @@ mod retrieve_singleflight {
         shared.set(false);
         assert!(!first.shared.get());
 
-        let follower = flights.register(7, (), || Rc::new(Cell::new(true)));
+        let follower = flights.register(7, (), || Rc::new(Cell::new(true)), |shared| shared.clone());
         assert!(!follower.leader);
         assert_eq!(follower.flight_id, first.flight_id);
         assert!(!follower.shared.get());
@@ -1863,7 +1863,7 @@ mod retrieve_singleflight {
             .expect("only the producer removes the flight");
         assert_eq!(completed.waiters.len(), 1);
 
-        let successor = flights.register(7, (), || Rc::new(Cell::new(true)));
+        let successor = flights.register(7, (), || Rc::new(Cell::new(true)), |shared| shared.clone());
         assert!(successor.leader);
         assert_ne!(successor.flight_id, first.flight_id);
     }
@@ -1871,8 +1871,8 @@ mod retrieve_singleflight {
     #[test]
     fn completion_detaches_every_waiter_atomically() {
         let mut flights = SingleflightRegistry::<u8, usize, ()>::default();
-        let first = flights.register(9, 4, || ());
-        let second = flights.register(9, 2, || ());
+        let first = flights.register(9, 4, || (), |shared| *shared);
+        let second = flights.register(9, 2, || (), |shared| *shared);
 
         let mut waiters = flights
             .take(&9, first.flight_id)
@@ -1885,15 +1885,15 @@ mod retrieve_singleflight {
     #[test]
     fn distinct_scopes_never_share() {
         let mut flights = SingleflightRegistry::<(&str, u64), (), ()>::default();
-        assert!(flights.register(("video", 1), (), || ()).leader);
-        assert!(flights.register(("video", 2), (), || ()).leader);
-        assert!(flights.register(("audio", 1), (), || ()).leader);
+        assert!(flights.register(("video", 1), (), || (), |shared| *shared).leader);
+        assert!(flights.register(("video", 2), (), || (), |shared| *shared).leader);
+        assert!(flights.register(("audio", 1), (), || (), |shared| *shared).leader);
     }
 
     #[test]
     fn stale_producer_cannot_take_a_successor_with_the_same_key() {
         let mut flights = SingleflightRegistry::<u8, &'static str, Rc<Cell<bool>>>::default();
-        let old = flights.register(3, "old", || Rc::new(Cell::new(true)));
+        let old = flights.register(3, "old", || Rc::new(Cell::new(true)), |shared| shared.clone());
         let old_shared = flights
             .remove_waiter(&3, old.flight_id, old.waiter_id)
             .expect("old flight admission is returned");
@@ -1903,7 +1903,7 @@ mod retrieve_singleflight {
             .expect("old producer completes its own flight");
         assert!(old_flight.waiters.is_empty());
 
-        let successor = flights.register(3, "new", || Rc::new(Cell::new(true)));
+        let successor = flights.register(3, "new", || Rc::new(Cell::new(true)), |shared| shared.clone());
         assert!(successor.leader);
         assert_ne!(old.flight_id, successor.flight_id);
         assert!(flights.take(&3, old.flight_id).is_none());

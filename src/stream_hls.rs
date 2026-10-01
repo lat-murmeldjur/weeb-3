@@ -1062,6 +1062,9 @@ pub(crate) fn hls_retreat_position(position: f64, distance: f64) -> Option<f64> 
 mod player;
 
 #[cfg(target_arch = "wasm32")]
+pub(crate) use player::{set_stream_quality, stream_quality};
+
+#[cfg(target_arch = "wasm32")]
 #[path = "stream_hls/page_bridge.rs"]
 mod page_bridge;
 

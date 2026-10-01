@@ -102,11 +102,12 @@ async fn hls_control_response(kind: &str, message: &Object) -> Object {
                 return error_response(400, "HLS history requires a source and playback position");
             };
             match super::runtime::prepare_history(&source, position).await {
-                Some(offset) => {
+                Some(Ok(offset)) => {
                     let response = ok_response();
                     set_number(&response, "timelineOffset", offset);
                     response
                 }
+                Some(Err(error)) => error_response(416, error),
                 None => error_response(502, "The requested HLS history could not be loaded"),
             }
         }
