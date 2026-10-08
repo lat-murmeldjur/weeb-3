@@ -13,7 +13,7 @@ let vaultQueue = Promise.resolve();
 const vaultDisconnects = new Map();
 let activeHlsLease = null;
 let playbackLockRelease = null;
-let serviceWorkerPort = null;
+const serviceWorkerPorts = new Map();
 let activeTransferOperations = 0;
 const clients = new Map();
 
@@ -63,26 +63,29 @@ function closePort(port) {
   try { port?.close(); } catch (_) {}
 }
 
-function closeServiceWorkerPort(notify = false) {
-  const current = serviceWorkerPort;
-  serviceWorkerPort = null;
-  if (!current) return;
-  if (notify) {
-    try {
-      current.port.postMessage({
-        type: "WEEB3_RUNTIME_PORT_INVALID",
-        protocol: SHARED_WORKER_PROTOCOL,
-        networkId: current.networkId
-      });
-    } catch (_) {}
+function closeServiceWorkerPort(notify = false, scope) {
+  for (const [key, current] of serviceWorkerPorts) {
+    if (scope !== undefined && key !== scope) continue;
+    serviceWorkerPorts.delete(key);
+    if (notify) {
+      try {
+        current.port.postMessage({
+          type: "WEEB3_RUNTIME_PORT_INVALID",
+          protocol: SHARED_WORKER_PROTOCOL,
+          networkId: current.networkId
+        });
+      } catch (_) {}
+    }
+    closePort(current.port);
   }
-  closePort(current.port);
 }
 
 function bindServiceWorkerPort(message, port) {
   const networkId = requestedNetworkId(message);
+  const scope = message?.scope || "/weeb-3/";
   if (
     !port ||
+    (scope !== "/" && scope !== "/weeb-3/") ||
     message?.serviceWorkerRelay !== SHARED_WORKER_PROTOCOL ||
     networkId === null ||
     networkId !== configuredNetworkId
@@ -94,11 +97,11 @@ function bindServiceWorkerPort(message, port) {
     return;
   }
 
-  closeServiceWorkerPort(true);
+  closeServiceWorkerPort(true, scope);
   const binding = { networkId, port };
-  serviceWorkerPort = binding;
+  serviceWorkerPorts.set(scope, binding);
   const invalidate = () => {
-    if (serviceWorkerPort === binding) closeServiceWorkerPort();
+    if (serviceWorkerPorts.get(scope) === binding) closeServiceWorkerPort(false, scope);
   };
   port.addEventListener("message", (event) => {
     const request = event.data;
@@ -347,18 +350,21 @@ async function dispatch(message, client = null) {
     if (!client?.id || !Number.isSafeInteger(attempt) || attempt <= 0) {
       return errorResponse("HLS preparation requires a window attempt", 400);
     }
-    if (activeHlsLease && activeHlsLease.clientId !== client.id) {
-      return errorResponse("another tab owns active HLS playback", 409);
-    }
     const stale = activeHlsLease;
     const lease = { clientId: client.id, attempt, session: null, prepareKey: `${client.id}:${attempt}` };
     activeHlsLease = lease;
+    if (stale && stale.clientId !== client.id) {
+      try {
+        clients.get(stale.clientId)?.port.postMessage({ type: "WEEB3_HLS_REPLACED", attempt: stale.attempt });
+      } catch (_) {}
+    }
     try {
       if (stale) await cancelHlsLease(stale);
+      const runtime = await getRuntime();
+      if (activeHlsLease !== lease) return errorResponse("HLS preparation was abandoned", 409);
       // A Web Lock improves background tolerance when available. The singleton
       // HLS lease remains authoritative, so browsers without a lock must still play.
       void acquirePlaybackLock();
-      const runtime = await getRuntime();
       const response = await runtime.handleMessage({ ...message, prepareKey: lease.prepareKey });
       const session = Number(response?.session);
       if (activeHlsLease !== lease) {

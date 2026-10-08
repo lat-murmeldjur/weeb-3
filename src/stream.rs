@@ -130,6 +130,16 @@ impl FetchCache {
         self.ranges.to_back(key).cloned()
     }
 
+    fn prefer_cached_windows(&self, identity: &str, size: u64) -> bool {
+        !self.ranges.contains_key(&window_key(identity, size, 0, size - 1))
+            && (0..size.div_ceil(MEDIA_STORAGE_WINDOW_BYTES)).all(|index| {
+                let (start, end) =
+                    range_storage_window_for_start(index * MEDIA_STORAGE_WINDOW_BYTES, size);
+                self.ranges.get(&window_key(identity, size, start, end))
+                    .is_some_and(|body| body.len() as u64 == end - start + 1)
+            })
+    }
+
     fn remember_range(&mut self, key: String, body: Bytes, media_state_key: &str, generation: u64) {
         if generation > 0
             && !self
@@ -1006,6 +1016,9 @@ async fn read_cached_range(
         && start == 0
         && end == metadata.size - 1
         && metadata.size <= HLS_BODY_MAX_BYTES
+        && !FETCH_CACHE.with_borrow(|cache| {
+            cache.prefer_cached_windows(&metadata_identity(resource, metadata), metadata.size)
+        })
     {
         (start, end)
     } else {
@@ -1514,7 +1527,7 @@ pub(crate) fn replace_result_view_contents(new_element: &Element) {
 }
 
 pub(crate) fn release_current_stream_view() {
-    crate::stream_hls::release_hls_view();
+    crate::stream_hls::release_hls_view(None);
     release_bzz_view();
 }
 
@@ -1737,6 +1750,43 @@ fn navigate_to_bzz_url(src: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[wasm_bindgen_test::wasm_bindgen_test]
+    async fn complete_cached_windows_supply_hls_bytes_without_another_retrieval() {
+        let metadata = BzzMetadata {
+            data_reference: vec![0x91; 32], size: MEDIA_STORAGE_WINDOW_BYTES + 3,
+            mime: String::new(), etag: String::new(), path: String::new(), target_count: 1,
+        };
+        let identity = metadata_identity("cached-hls", &metadata);
+        let first = Bytes::from(vec![0xa7; MEDIA_STORAGE_WINDOW_BYTES as usize]);
+        let tail = Bytes::from_static(b"end");
+        let first_key = window_key(&identity, metadata.size, 0, MEDIA_STORAGE_WINDOW_BYTES - 1);
+        let tail_key = window_key(&identity, metadata.size, MEDIA_STORAGE_WINDOW_BYTES, metadata.size - 1);
+        let mut cache = FetchCache::default();
+        cache.remember_range(first_key, first.clone(), "", 0);
+        assert!(!cache.prefer_cached_windows(&identity, metadata.size));
+        cache.remember_range(tail_key.clone(), tail.slice(..2), "", 0);
+        assert!(!cache.prefer_cached_windows(&identity, metadata.size));
+        cache.remember_range(tail_key, tail, "", 0);
+        assert!(cache.prefer_cached_windows(&identity, metadata.size));
+        assert!(!cache.prefer_cached_windows("another-reference", metadata.size));
+        assert!(!cache.prefer_cached_windows(&identity, metadata.size + 1));
+        let old_cache = FETCH_CACHE.with_borrow_mut(|stored| std::mem::replace(stored, cache));
+        let node = crate::Weeb3WorkerRuntime::new().inner;
+        let current = || true;
+        let body = async_std::future::timeout(Duration::from_secs(1), read_cached_range(
+            &node, "cached-hls", &metadata, 0, metadata.size - 1, 0, Some(&current),
+        )).await.expect("cached bytes must not wait for network work").unwrap();
+        assert_eq!(&body[..first.len()], first.as_ref());
+        assert_eq!(&body[first.len()..], b"end");
+        assert!(node.range_port.1.is_empty());
+        FETCH_CACHE.with_borrow_mut(|cache| {
+            assert_eq!(cache.ranges.len(), 2);
+            cache.clear_completed_ranges();
+            assert!(!cache.prefer_cached_windows(&identity, metadata.size));
+            *cache = old_cache;
+        });
+    }
 
     #[wasm_bindgen_test::wasm_bindgen_test]
     fn metadata_cache_hits_and_replacement_preserve_the_entry_limit_and_recency() {

@@ -4,7 +4,7 @@ const HLS_RUNTIME: &str = include_str!("../src/stream_hls/runtime.rs");
 
 #[path = "support/source.rs"]
 pub mod source;
-use source::between as section;
+use source::{assert_contains, assert_excludes, assert_first_in_order, between as section};
 
 #[test]
 fn ordinary_media_keeps_its_existing_range_retry_policy() {
@@ -14,8 +14,7 @@ fn ordinary_media_keeps_its_existing_range_retry_policy() {
         "async fn read_cached_range(",
     );
     assert_eq!(ordinary.matches("read_cached_range(").count(), 2);
-    assert!(ordinary.contains("if generation != 0 && result.is_err()"));
-    assert!(ordinary.contains("RANGE_RETRY_DELAY_MS"));
+    assert_contains(ordinary, &["if generation != 0 && result.is_err()", "RANGE_RETRY_DELAY_MS"]);
 }
 
 #[test]
@@ -25,10 +24,10 @@ fn complete_hls_bodies_use_shared_ranges_and_respect_cache_epoch_and_budget() {
     assert!(STREAM.contains("pending_ranges: SingleflightRegistry<"));
 
     let load = section(HLS_RUNTIME, "async fn hls_body(", "async fn foreground_hls_body(");
-    crate::source::assert_contains(load, &[
+    assert_contains(load, &[
         "root.span == 0",
         "root.span > HLS_BODY_MAX_BYTES",
-        "hls_range(&client, &reference, root.span, 0, end, generation, &|| {",
+        "hls_range(client, &reference, root.span, 0, end, generation, &|| {",
         "generation.is_none_or(|id| body_is_current(id, &reference))",
     ]);
     assert!(HLS_RUNTIME.contains(".get(id).is_some())\n        && result_view_request_is_current(view_generation)"));
@@ -39,7 +38,7 @@ fn complete_hls_bodies_use_shared_ranges_and_respect_cache_epoch_and_budget() {
     let insert = settlement.find("self.bodies.insert(").unwrap();
     assert!(settlement.find("if epoch != self.epoch").unwrap() < insert);
     assert!(settlement.find("if let Some(body) = &body").unwrap() < insert);
-    crate::source::assert_contains(settlement, &[
+    assert_contains(settlement, &[
         "body.len() as u64 <= media_cache_max_bytes().min(HLS_BODY_CACHE_MAX_BYTES)",
         "!self.bodies.contains_key(&reference)",
         "self.trim()",
@@ -47,13 +46,12 @@ fn complete_hls_bodies_use_shared_ranges_and_respect_cache_epoch_and_budget() {
     assert!(settlement.find("forget_completed_reference_ranges(&reference)").unwrap() < insert);
 
     let trim = section(cache, "fn trim(", "fn clear(");
-    crate::source::assert_contains(trim, &[
+    assert_contains(trim, &[
         ".min(HLS_BODY_CACHE_MAX_BYTES)",
         "self.bodies.pop_front()",
         "set_auxiliary_media_cache_bytes(self.bytes)",
     ]);
-    assert!(cache.contains("self.epoch = self.epoch.wrapping_add(1)"));
-    assert!(cache.contains("body.slice(start..end)"));
+    assert_contains(cache, &["self.epoch = self.epoch.wrapping_add(1)", "body.slice(start..end)"]);
 
     let window = section(STREAM, "async fn read_range_window(", "pub(crate) async fn read_cached_hls_range(");
     let validated = window.find("if body.len() == expected_len").unwrap();
@@ -67,9 +65,9 @@ fn complete_hls_bodies_use_shared_ranges_and_respect_cache_epoch_and_budget() {
 #[test]
 fn foreground_windows_and_whole_body_assembly_share_the_aligned_cache() {
     let range = section(HLS_RUNTIME, "async fn hls_range(", "async fn hls_body(");
-    crate::source::assert_first_in_order(range, &[
-        ("cache.borrow().get(reference, start, end)", "missing source marker"),
-        ("read_cached_hls_range(", "missing source marker"),
+    assert_first_in_order(range, &[
+        "cache.borrow().get(reference, start, end)",
+        "read_cached_hls_range(",
     ]);
     assert!(!range.contains("waiter.recv()"));
     assert_eq!(range.matches("read_cached_hls_range(").count(), 1);
@@ -77,10 +75,10 @@ fn foreground_windows_and_whole_body_assembly_share_the_aligned_cache() {
 #[test]
 fn live_duration_window_keeps_owned_bodies_and_beginning_seek_delivery() {
     let runway = section(HLS_RUNTIME, "fn body_runway_targets(", "fn prefetch_from_reference(");
-    crate::source::assert_contains(runway, &[
+    assert_contains(runway, &[
         "seconds >= HLS_LIVE_STARTUP_BUFFER_SECONDS",
         "!live_segment_is_playable(active, position + offset)",
-        "hls_body(client.clone(), reference.clone(), Some(id))",
+        "hls_body(&client, reference.clone(), Some(id))",
         "!active.body_runway_running",
     ]);
     let cursor = section(HLS_RUNTIME, "fn prefetch_from_reference(", "fn next_feed_id(");
@@ -92,7 +90,7 @@ fn live_duration_window_keeps_owned_bodies_and_beginning_seek_delivery() {
 fn follower_applies_commit337_successors_in_order_and_tolerates_one_gap() {
     assert!(HLS_RUNTIME.contains("const FEED_FOLLOW_AHEAD: u64 = 4;"));
     assert!(HLS_RUNTIME.contains("const FEED_FRONTIER_REFRESH_INTERVAL: f64 = 15_000.0;"));
-    let initial = section(HLS_RUNTIME, "fn initialize_live_head(", "async fn prepare_live_plan(");
+    let initial = section(HLS_RUNTIME, "fn initialize_live_head(", "fn prepare_live_plan(");
     assert!(initial.contains("spawn_follower(id)"));
     assert!(!HLS_RUNTIME.contains("async fn catch_up_history("));
 
@@ -139,16 +137,14 @@ fn follower_applies_commit337_successors_in_order_and_tolerates_one_gap() {
     assert!(applied < missing && missing < skip_once && skip_once < remember_gap);
     assert!(remember_gap < failed && failed < progressed && progressed < idle_sleep);
     assert!(follower.find("drop(probes)").unwrap() < idle_sleep);
-    assert!(!follower.contains("pace_next"));
-    assert!(!follower.contains("Duration::try_from_secs_f64"));
-    assert!(follower[dispatched..settled].contains("FEED_TAIL_PROBE_BYTES"));
-    assert!(follower[dispatched..settled].contains("None"));
-    assert!(!follower.contains("payload_probe_wave("));
-    assert!(!follower.contains("settled_payload_wave("));
+    assert_excludes(follower, &[
+        "pace_next", "Duration::try_from_secs_f64", "payload_probe_wave(", "settled_payload_wave(",
+    ]);
+    assert_contains(&follower[dispatched..settled], &["FEED_TAIL_PROBE_BYTES", "None"]);
     assert!(follower.contains("skipped_missing_index"));
     assert!(follower[progressed..idle_sleep].contains("if closing {\n                        recover_feed_frontier"));
     assert!(!follower.contains("Vec<Option<(u64, FeedPayloadProbe)>>"));
-    crate::source::assert_contains(follower, &[
+    assert_contains(follower, &[
         "now - last_frontier_check >= FEED_FRONTIER_REFRESH_INTERVAL",
         "discover_latest_once(client, owner, topic, None).await",
         "if index < head",
@@ -168,8 +164,7 @@ fn follower_applies_commit337_successors_in_order_and_tolerates_one_gap() {
         "fn live_segment_is_playable(",
         "fn spawn_body_runway(",
     );
-    assert!(runway.contains("presentation_gaps"));
-    assert!(runway.contains("live_segment_is_playable(active"));
+    assert_contains(runway, &["presentation_gaps", "live_segment_is_playable(active"]);
 }
 
 #[test]
@@ -179,7 +174,7 @@ fn completed_hls_bodies_are_served_before_root_or_range_retrieval() {
         "fn hls_body_response(",
         "async fn fetch_hls_body_response(",
     );
-    crate::source::assert_contains(cached, &[
+    assert_contains(cached, &[
         "parse_hls_range(range, span)?",
         "FetchResponse::ok_shared(status, headers, body.slice(start..end))",
         "body.get(start..end)?",
@@ -193,8 +188,7 @@ fn completed_hls_bodies_are_served_before_root_or_range_retrieval() {
         "pub(crate) struct FetchResponse {",
         "pub(crate) async fn service_worker_message_response(",
     );
-    assert!(transfer.contains("body: Option<Bytes>"));
-    assert!(transfer.contains("body: body.map(Bytes::from)"));
+    assert_contains(transfer, &["body: Option<Bytes>", "body: body.map(Bytes::from)"]);
     assert_eq!(transfer.matches("bytes_to_js(&body)").count(), 1);
 
     let response = section(
@@ -212,23 +206,21 @@ fn completed_hls_bodies_are_served_before_root_or_range_retrieval() {
 #[test]
 fn playback_does_not_add_a_predecessor_eviction_policy() {
     assert!(!HLS_CORE.contains("cached_predecessors"));
-    assert!(!HLS_RUNTIME.contains("evict_cached_predecessors"));
-    assert!(!HLS_RUNTIME.contains("fn evict_references("));
+    assert_excludes(HLS_RUNTIME, &["evict_cached_predecessors", "fn evict_references("]);
 }
 
 #[test]
 fn media_delivery_shares_windows_and_seeks_retain_whole_body_retries() {
-    assert!(HLS_RUNTIME.contains("const HLS_BODY_ATTEMPTS: usize = 6;"));
-    assert!(HLS_RUNTIME.contains("const HLS_BODY_RETRY_DELAY_MS: u64 = 75;"));
+    assert_contains(HLS_RUNTIME, &["const HLS_BODY_ATTEMPTS: usize = 6;", "const HLS_BODY_RETRY_DELAY_MS: u64 = 75;"]);
 
     let foreground = section(
         HLS_RUNTIME,
         "async fn foreground_hls_body(",
         "fn live_segment_is_playable(",
     );
-    crate::source::assert_contains(foreground, &[
+    assert_contains(foreground, &[
         "for attempt in 0..HLS_BODY_ATTEMPTS",
-        "hls_body(client.clone(), reference.clone(), None).await",
+        "hls_body(client, reference.to_string(), None).await",
         "HLS_BODY_RETRY_DELAY_MS * (attempt + 1) as u64",
     ]);
 
@@ -253,17 +245,16 @@ fn hls_service_streams_whole_bodies_through_exact_inclusive_ranges() {
         "async fn fetch_hls_body_response(",
         "fn parse_hls_range(",
     );
-    crate::source::assert_first_in_order(response, &[
-        ("parse_hls_range(range, span)", "missing source marker"),
-        ("hls_range(&client, &reference, span, start, end, None, &|| true).await", "missing source marker"),
-        ("let headers = hls_body_headers(", "missing source marker"),
-        ("FetchResponse::ok_shared(206, headers, bytes)", "missing source marker"),
+    assert_first_in_order(response, &[
+        "parse_hls_range(range, span)",
+        "hls_range(&client, &reference, span, start, end, None, &|| true).await",
+        "let headers = hls_body_headers(",
+        "FetchResponse::ok_shared(206, headers, bytes)",
     ]);
     assert!(response.contains("FetchResponse::stream(200, headers)"));
     let headers = section(HLS_RUNTIME, "fn hls_body_headers(", "fn hls_body_response(");
-    assert!(headers.contains("Content-Length"));
-    assert!(headers.contains("Accept-Ranges"));
-    crate::source::assert_contains(response, &[
+    assert_contains(headers, &["Content-Length", "Accept-Ranges"]);
+    assert_contains(response, &[
         "let mime = if codec_bootstrap",
         "hls_payload_mime(&prefix)",
         "else {\n        \"application/octet-stream\"",
@@ -274,7 +265,7 @@ fn hls_service_streams_whole_bodies_through_exact_inclusive_ranges() {
         "fn parse_hls_range(",
         "async fn fetch_feed_response(",
     );
-    crate::source::assert_contains(parser, &[
+    assert_contains(parser, &[
         "strip_prefix(\"bytes=\")",
         "split_once('-')",
         "start.is_empty() || end.is_empty() || end.contains(',')",

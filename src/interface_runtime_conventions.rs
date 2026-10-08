@@ -17,6 +17,20 @@ thread_local! {
     static ACTIVE_RESULT_OBJECT_URL: RefCell<Option<String>> = const { RefCell::new(None) };
     static RESULT_CALLBACKS: RefCell<Vec<Closure<dyn FnMut(Event)>>> = const { RefCell::new(Vec::new()) };
     static READY_SERVICE_WORKER: RefCell<Option<web_sys::ServiceWorker>> = const { RefCell::new(None) };
+    static SERVICE_WORKER_SCOPE: Cell<&'static str> = const { Cell::new(STREAMING_SERVICE_WORKER_SCOPE) };
+}
+
+pub(crate) fn configure_service_worker_scope(scope: Option<&str>) -> Result<(), JsError> {
+    let Some(scope) = scope else { return Ok(()) };
+    let scope = match scope {
+        "/" => "/",
+        STREAMING_SERVICE_WORKER_SCOPE => STREAMING_SERVICE_WORKER_SCOPE,
+        _ => return Err(JsError::new("Service Worker scope must be / or /weeb-3/")),
+    };
+    if SERVICE_WORKER_SCOPE.with(|configured| configured.replace(scope)) != scope {
+        READY_SERVICE_WORKER.with(|ready| *ready.borrow_mut() = None);
+    }
+    Ok(())
 }
 
 pub(super) async fn check_upload_prerequisites(weeb3: InterfaceNode) {
@@ -1069,7 +1083,7 @@ pub(super) fn create_element_wmt(mime: &str, blob_url: &str) -> Element {
 }
 
 pub(crate) fn service_worker_missing() {
-    let message = "The weeb-3 Service Worker is unavailable or did not become ready. Browser-routed Swarm resources require the configured /weeb-3/ scope in a secure context with a trusted HTTPS certificate.";
+    let message = "The weeb-3 Service Worker is unavailable or did not become ready. Browser-routed Swarm resources require the configured scope in a secure context with a trusted HTTPS certificate.";
     web_sys::console::warn_1(&JsValue::from_str(message));
 
     // npm consumers do not necessarily mount the built-in interface. A Service
@@ -1206,25 +1220,20 @@ async fn service_worker_registration(
 }
 
 fn configured_service_worker_urls() -> Option<(String, String)> {
-    let window = web_sys::window()?;
-    let page_url = window.location().href().ok()?;
-    let absolute = |path| {
-        web_sys::Url::new_with_base(path, &page_url)
-            .ok()
-            .map(|url| url.href())
-    };
+    let origin = web_sys::window()?.location().origin().ok()?;
     Some((
-        absolute(STREAMING_SERVICE_WORKER_URL)?,
-        absolute(STREAMING_SERVICE_WORKER_SCOPE)?,
+        format!("{origin}{STREAMING_SERVICE_WORKER_URL}"),
+        SERVICE_WORKER_SCOPE.with(|scope| format!("{origin}{}", scope.get())),
     ))
 }
 
 fn expected_service_worker_registration(
     registration: &ServiceWorkerRegistration,
     expected_worker_url: &str,
-    expected_scope_url: &str,
+    expected_scope_url: Option<&str>,
 ) -> bool {
-    if registration.scope() != expected_scope_url {
+    if let Some(expected_scope_url) = expected_scope_url
+        && registration.scope() != expected_scope_url {
         warn_about_worker_conflict(
             &format!("scope {}", registration.scope()),
             expected_scope_url,
@@ -1241,7 +1250,7 @@ fn expected_service_worker_registration(
     .flatten()
     {
         if worker.script_url() != expected_worker_url {
-            warn_about_worker_conflict(&worker.script_url(), expected_scope_url);
+            warn_about_worker_conflict(&worker.script_url(), expected_scope_url.unwrap_or(&registration.scope()));
             return false;
         }
     }
@@ -1253,14 +1262,15 @@ async fn claim_service_worker_registration(
     expected_worker_url: &str,
     expected_scope_url: &str,
 ) -> Result<Option<web_sys::ServiceWorker>, ()> {
-    if !expected_service_worker_registration(registration, expected_worker_url, expected_scope_url)
+    if !expected_service_worker_registration(registration, expected_worker_url, Some(expected_scope_url))
     {
         return Err(());
     }
     let Some(active) = registration.active() else {
         return Ok(None);
     };
-    if !service_worker_protocol_request(&active, "WEEB3_CLAIM", "WEEB3_CLAIMED", 1_500).await {
+    if service_worker_protocol_request(&active, "WEEB3_CLAIM", "WEEB3_CLAIMED", 1_500).await.as_deref()
+        != Some(SERVICE_WORKER_SCOPE.with(Cell::get)) {
         return Ok(None);
     }
     Ok(service_worker_forwarder_ready_with_timeout(1_500).await)
@@ -1316,36 +1326,31 @@ async fn get_service_worker_locked(
         if !expected_service_worker_registration(
             &registration,
             &expected_worker_url,
-            &expected_scope_url,
+            None,
         ) {
             return None;
         }
-        // Check the no-cache worker script before accepting a same-URL
-        // controller. Protocol alone cannot distinguish an older forwarder.
+        // A narrow controller also needs updating when enabling root embedding.
         if let Ok(update) = registration.update() {
-            let _ =
-                async_std::future::timeout(Duration::from_secs(10), JsFuture::from(update)).await;
+            let _ = async_std::future::timeout(Duration::from_secs(10), JsFuture::from(update)).await;
         }
-        if let Some(controller) = claim_service_worker_registration(
-            &registration,
-            &expected_worker_url,
-            &expected_scope_url,
-        )
-        .await
-        .ok()?
-        {
-            return Some(controller);
+        if registration.scope() == expected_scope_url {
+            if let Some(controller) = claim_service_worker_registration(
+                &registration, &expected_worker_url, &expected_scope_url,
+            ).await.ok()? {
+                return Some(controller);
+            }
         }
     }
 
     let registration_options = RegistrationOptions::new();
-    registration_options.set_scope(STREAMING_SERVICE_WORKER_SCOPE);
+    SERVICE_WORKER_SCOPE.with(|scope| registration_options.set_scope(scope.get()));
     let _ = Reflect::set(
         registration_options.as_ref(),
         &JsValue::from_str("updateViaCache"),
         &JsValue::from_str("none"),
     );
-    match async_std::future::timeout(
+    let registration = match async_std::future::timeout(
         Duration::from_secs(10),
         JsFuture::from(
             service0.register_with_options(STREAMING_SERVICE_WORKER_URL, &registration_options),
@@ -1353,43 +1358,25 @@ async fn get_service_worker_locked(
     )
     .await
     {
-        Ok(Ok(registration)) => {
-            if let Ok(registration) = registration.dyn_into::<ServiceWorkerRegistration>()
-                && let Some(controller) = claim_service_worker_registration(
-                    &registration,
-                    &expected_worker_url,
-                    &expected_scope_url,
-                )
-                .await
-                .ok()?
-            {
-                return Some(controller);
-            }
-
-            if let Ok(ready) = service0.ready()
-                && let Ok(Ok(registration)) =
-                    async_std::future::timeout(Duration::from_secs(10), JsFuture::from(ready)).await
-                && let Ok(registration) = registration.dyn_into::<ServiceWorkerRegistration>()
-                && let Some(controller) = claim_service_worker_registration(
-                    &registration,
-                    &expected_worker_url,
-                    &expected_scope_url,
-                )
-                .await
-                .ok()?
-            {
-                return Some(controller);
-            }
-        }
+        Ok(Ok(registration)) => registration.dyn_into::<ServiceWorkerRegistration>().ok()?,
         Ok(Err(err)) => {
             web_sys::console::warn_1(&err);
+            return None;
         }
-        Err(_) => web_sys::console::warn_1(&JsValue::from_str(
-            "timed out while registering the weeb-3 Service Worker",
-        )),
+        Err(_) => {
+            web_sys::console::warn_1(&JsValue::from_str("timed out while registering the weeb-3 Service Worker"));
+            return None;
+        }
+    };
+    if let Some(controller) = claim_service_worker_registration(
+        &registration, &expected_worker_url, &expected_scope_url,
+    ).await.ok()? {
+        return Some(controller);
     }
 
-    let registration = service_worker_registration(service0).await?;
+    let registration = async_std::future::timeout(
+        Duration::from_secs(10), JsFuture::from(service0.ready().ok()?),
+    ).await.ok()?.ok()?.dyn_into::<ServiceWorkerRegistration>().ok()?;
     claim_service_worker_registration(&registration, &expected_worker_url, &expected_scope_url)
         .await
         .ok()
@@ -1404,7 +1391,14 @@ async fn service_worker_forwarder_ready_with_timeout(
     timeout_ms: u64,
 ) -> Option<web_sys::ServiceWorker> {
     let controller = controlled_service_worker()?;
-    if service_worker_protocol_request(&controller, "WEEB3_PING", "WEEB3_PONG", timeout_ms).await
+    let scope = service_worker_protocol_request(&controller, "WEEB3_PING", "WEEB3_PONG", timeout_ms).await?;
+    let configured = SERVICE_WORKER_SCOPE.with(Cell::get);
+    // A page already controlled by our narrow worker keeps using its forwarding
+    // while the root registration serves pages outside /weeb-3/.
+    let compatible = configured == "/" && scope == STREAMING_SERVICE_WORKER_SCOPE
+        && controller.script_url() == configured_service_worker_urls()?.0
+        && web_sys::window()?.location().pathname().ok()?.starts_with(STREAMING_SERVICE_WORKER_SCOPE);
+    if (scope == configured || compatible)
         && controlled_service_worker()
             .is_some_and(|current| Object::is(controller.as_ref(), current.as_ref()))
     {
@@ -1419,9 +1413,9 @@ async fn service_worker_protocol_request(
     request_type: &str,
     response_type: &str,
     timeout_ms: u64,
-) -> bool {
+) -> Option<String> {
     let Ok(mut channel) = ReplyChannel::new() else {
-        return false;
+        return None;
     };
     let ping = Object::new();
     set_js(&ping, "type", JsValue::from_str(request_type));
@@ -1434,19 +1428,22 @@ async fn service_worker_protocol_request(
         .post_message_with_transferable(&ping, &channel.transfer)
         .is_err()
     {
-        return false;
+        return None;
     }
 
     let Ok(Ok(data)) =
         async_std::future::timeout(Duration::from_millis(timeout_ms), &mut channel.receiver).await
     else {
-        return false;
+        return None;
     };
-    string_property(&data, "type").is_some_and(|value| value == response_type)
+    if string_property(&data, "type").is_some_and(|value| value == response_type)
         && number_property(&data, "protocol") == Some(SERVICE_WORKER_PROTOCOL)
-        && string_property(&data, "scope")
-            .is_some_and(|scope| scope == STREAMING_SERVICE_WORKER_SCOPE)
         && string_property(&data, "marker").is_some_and(|marker| marker == SERVICE_WORKER_MARKER)
+    {
+        string_property(&data, "scope")
+    } else {
+        None
+    }
 }
 
 pub(crate) fn service_worker_scope_protocol_error(purpose: &str) -> String {
@@ -1457,7 +1454,7 @@ pub(crate) fn service_worker_scope_protocol_error(purpose: &str) -> String {
         SERVICE_WORKER_MARKER,
         purpose,
         STREAMING_SERVICE_WORKER_URL,
-        STREAMING_SERVICE_WORKER_SCOPE,
+        SERVICE_WORKER_SCOPE.with(Cell::get),
         SERVICE_WORKER_CONTROL_TOTAL_TIMEOUT_MS,
     )
 }

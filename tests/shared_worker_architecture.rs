@@ -1,6 +1,6 @@
 use std::{env, fs, path::Path, time::Duration};
 
-use anyhow_crates_io::{Result, anyhow};
+use anyhow_crates_io::{Context, Result, anyhow};
 use serde_json::Value;
 
 #[path = "support/browser.rs"]
@@ -8,7 +8,7 @@ mod browser;
 #[path = "support/source.rs"]
 pub mod source;
 
-use source::{assert_in_order, between as section, compact};
+use source::{assert_contains, assert_excludes, assert_in_order, between as section, compact};
 
 const CARGO: &str = include_str!("../Cargo.toml");
 const BUILD: &str = include_str!("../build.rs");
@@ -37,26 +37,30 @@ const TRANSFER_NODE_OPERATIONS: [&str; 8] = [
     "acquireRange",
 ];
 
-fn visit_rust_sources(root: &Path, hits: &mut Vec<std::path::PathBuf>, needle: &str) {
-    for entry in fs::read_dir(root).unwrap_or_else(|error| panic!("{}: {error}", root.display())) {
-        let entry = entry.unwrap_or_else(|error| panic!("{}: {error}", root.display()));
-        let path = entry.path();
-        if path.is_dir() {
-            visit_rust_sources(&path, hits, needle);
-        } else if path.extension().and_then(|extension| extension.to_str()) == Some("rs") {
-            let source = fs::read_to_string(&path).unwrap();
-            hits.extend(source.match_indices(needle).map(|_| path.clone()));
-        }
-    }
+fn runtime_function(name: &str) -> &'static str {
+    section(INTERFACE_RUNTIME, &format!("fn {name}("), "\n}")
+}
+
+fn worker_function(name: &str) -> &'static str {
+    section(SHARED_WORKER, &format!("function {name}("), "\n}")
 }
 
 fn rust_source_hits(needle: &str) -> Vec<std::path::PathBuf> {
+    let mut paths = vec![Path::new(env!("CARGO_MANIFEST_DIR")).join("src")];
     let mut hits = Vec::new();
-    visit_rust_sources(
-        &Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
-        &mut hits,
-        needle,
-    );
+    while let Some(path) = paths.pop() {
+        if path.is_dir() {
+            paths.extend(fs::read_dir(path).unwrap().map(|entry| entry.unwrap().path()));
+        } else if path.extension().and_then(|extension| extension.to_str()) == Some("rs") {
+            let mut source = fs::read_to_string(&path).unwrap().replace("\r\n", "\n");
+            // Test fixtures may construct a node; preserve production code after test modules.
+            while let Some(start) = source.find("#[cfg(test)]\nmod ") {
+                let end = start + source[start..].find("\n}").expect("test module closing brace") + 2;
+                source.replace_range(start..end, "");
+            }
+            hits.extend(source.match_indices(needle).map(|_| path.clone()));
+        }
+    }
     hits
 }
 
@@ -75,36 +79,19 @@ fn batch_purchase_preserves_interface_and_npm_missing_vault_policies() {
 }
 
 fn numeric_constant(source: &str, name: &str) -> u64 {
-    let marker = format!("const {name}");
-    source
-        .lines()
-        .find(|line| line.contains(&marker))
-        .and_then(|line| line.rsplit_once('='))
-        .map(|(_, value)| value.trim().trim_end_matches(';'))
-        .unwrap_or_else(|| panic!("missing value for numeric constant {name}"))
-        .parse()
-        .unwrap_or_else(|error| panic!("invalid numeric constant {name}: {error}"))
+    let declaration = section(source, &format!("const {name}"), ";");
+    let (_, value) = declaration.rsplit_once('=').expect("constant assignment");
+    value.trim().parse().unwrap_or_else(|error| panic!("invalid {name}: {error}"))
 }
 
 #[test]
 fn single_result_download_retains_a_blob_instead_of_wasm_bytes() {
-    let render = section(
-        INTERFACE_RUNTIME,
-        "pub(super) fn render_single_result_with_download(",
-        "pub(super) fn tar_entries(",
-    );
-    assert!(render.contains("let download_blob = blob.clone();"));
-    assert!(render.contains("download_blob.as_ref().and_then(blob_object_url)"));
-    assert!(!render.contains("entries.clone()"));
-    assert!(!render.contains("download_entries"));
+    let render = runtime_function("render_single_result_with_download");
+    assert_contains(render, &["let download_blob = blob.clone();", "download_blob.as_ref().and_then(blob_object_url)"]);
+    assert_excludes(render, &["entries.clone()", "download_entries"]);
 
-    let dispatch = section(
-        INTERFACE_RUNTIME,
-        "pub(super) fn render_result(",
-        "fn bootnode_setting(",
-    );
     assert_in_order(
-        dispatch,
+        runtime_function("render_result"),
         &[
             "render_single_result_with_download(&data[selected])",
             "if data.len() > 1",
@@ -115,18 +102,9 @@ fn single_result_download_retains_a_blob_instead_of_wasm_bytes() {
 
 #[test]
 fn replacing_or_remounting_releases_the_previous_result() {
-    let release = section(
-        INTERFACE_RUNTIME,
-        "pub(crate) fn release_result_object_url()",
-        "fn clear_result_view()",
-    );
-    assert!(release.contains("revoke_object_url"));
-    let clear = section(
-        INTERFACE_RUNTIME,
-        "fn clear_result_view()",
-        "pub(crate) fn replace_result_view(",
-    );
-    crate::source::assert_contains(clear, &[
+    assert!(runtime_function("release_result_object_url").contains("revoke_object_url"));
+    let clear = runtime_function("clear_result_view");
+    assert_contains(clear, &[
         "release_result_object_url()",
         "resultActions",
         "RESULT_CALLBACKS.with",
@@ -134,13 +112,8 @@ fn replacing_or_remounting_releases_the_previous_result() {
     ]);
     assert!(clear.matches("set_inner_html(\"\")").count() >= 2);
 
-    let replace = section(
-        INTERFACE_RUNTIME,
-        "pub(crate) fn replace_result_view(",
-        "fn append_result_view(",
-    );
     assert_in_order(
-        replace,
+        runtime_function("replace_result_view"),
         &["clear_result_view()", "append_result_view(node)"],
     );
 
@@ -162,34 +135,29 @@ fn replacing_or_remounting_releases_the_previous_result() {
 #[test]
 fn one_shared_worker_owns_the_node_and_unified_wasm() {
     for source in [INTERFACE, LIBRARY] {
-        assert!(!source.contains("Weeb3::new("));
-        assert!(!source.contains("Arc<Weeb3>"));
+        assert_excludes(source, &["Weeb3::new(", "Arc<Weeb3>"]);
     }
-    let owners = rust_source_hits("Weeb3::new(");
-    assert_eq!(owners.len(), 1, "unexpected node owners: {owners:?}");
-    assert!(owners[0].ends_with("src/worker_runtime.rs"));
-
-    let constructors = rust_source_hits("SharedWorker::new_with_worker_options(");
-    assert_eq!(
-        constructors.len(),
-        1,
-        "unexpected worker constructors: {constructors:?}"
-    );
-    assert!(constructors[0].ends_with("src/shared_runtime.rs"));
+    for (constructor, owner) in [
+        ("Weeb3::new(", "src/worker_runtime.rs"),
+        ("SharedWorker::new_with_worker_options(", "src/shared_runtime.rs"),
+    ] {
+        let hits = rust_source_hits(constructor);
+        assert_eq!(hits.len(), 1, "unexpected {constructor} owners: {hits:?}");
+        assert!(hits[0].ends_with(owner));
+    }
     assert_eq!(SHARED_WORKER.matches("new Weeb3WorkerRuntime()").count(), 1);
 
-    crate::source::assert_contains(CORE, &[
+    assert_contains(CORE, &[
         "mod worker_runtime;",
         "pub use worker_runtime::Weeb3WorkerRuntime;",
         "mod library;",
     ]);
     assert!(INDEX.contains("import(\"/weeb-3/weeb_3.js\")"));
     assert!(SHARED_WORKER.starts_with("import init, { Weeb3WorkerRuntime } from \"./weeb_3.js\";"));
-    assert!(!CARGO.contains("worker-runtime"));
-    assert!(!CARGO.contains("facade ="));
+    assert_excludes(CARGO, &["worker-runtime", "facade ="]);
 
     let facade = compact(SHARED_RUNTIME);
-    crate::source::assert_contains(&facade, &[
+    assert_contains(&facade, &[
         "constSHARED_WORKER_URL:&str=\"/weeb-3/worker.js\";",
         "requested_url.unwrap_or(SHARED_WORKER_URL)",
         "document.base_uri().ok().flatten()",
@@ -219,18 +187,15 @@ fn unified_wasm_and_worker_are_in_every_distribution() {
         assert!(SERVER.contains(&format!("#[include = \"{asset}\"]")));
         assert!(SERVER.contains(&format!("/weeb-3/{asset}")));
     }
-    crate::source::assert_contains(NPM_WORKFLOW, &[
+    assert_contains(NPM_WORKFLOW, &[
         "npm pack ./static",
         "path: \"*.tgz\"",
         "npm publish ./package/*.tgz",
     ]);
 
-    assert!(!SHARED_WORKER.trim().is_empty());
-    assert!(CARGO.contains("'SharedWorker'"));
-    assert!(CARGO.contains("'WorkerOptions'"));
+    assert_contains(CARGO, &["'SharedWorker'", "'WorkerOptions'"]);
     assert!(HAXE_BUILD.contains("'worker.js'"));
-    assert!(NPM_WORKFLOW.contains("files[6]=\"worker.js\""));
-    assert!(NPM_WORKFLOW.contains("'exports[./worker.js].default=./worker.js'"));
+    assert_contains(NPM_WORKFLOW, &["files[6]=\"worker.js\"", "'exports[./worker.js].default=./worker.js'"]);
 }
 
 #[test]
@@ -261,33 +226,17 @@ fn secure_vault_stays_lazy_and_window_brokered() {
         "pub(crate) async fn handle_worker_vault_request(",
         "pub async fn secure_batch_state_for_wallet(",
     );
-    for (broker_call, window_call) in [
-        (
-            "worker_vault_call(\"ensureAuthorized\"",
-            "secure_client().await.is_some()",
-        ),
-        (
-            "worker_vault_call(\"stampChunk\"",
-            "secure_stamp_chunk_in_window(",
-        ),
-        (
-            "worker_vault_call(\"resetStamp\"",
-            "secure_reset_stamp_in_window().await",
-        ),
-        (
-            "worker_vault_call(\"ensureFeedOwner\"",
-            "secure_ensure_feed_owner_in_window().await",
-        ),
-        (
-            "worker_vault_call(\"createFeedUpdateSocWithStamp\"",
-            "secure_create_feed_update_soc_with_stamp_in_window(",
-        ),
+    for (operation, window_call) in [
+        ("ensureAuthorized", "secure_client().await.is_some()"),
+        ("stampChunk", "secure_stamp_chunk_in_window("),
+        ("resetStamp", "secure_reset_stamp_in_window().await"),
+        ("ensureFeedOwner", "secure_ensure_feed_owner_in_window().await"),
+        ("createFeedUpdateSocWithStamp", "secure_create_feed_update_soc_with_stamp_in_window("),
     ] {
-        assert!(SECURE_VAULT.contains(broker_call));
+        assert!(SECURE_VAULT.contains(&format!("worker_vault_call(\"{operation}\"")));
         assert!(handler.contains(window_call));
     }
-    assert!(!CORE.contains("WORKER_CONTEXT"));
-    assert!(!CORE.contains("window_context()"));
+    assert_excludes(CORE, &["WORKER_CONTEXT", "window_context()"]);
     assert!(SECURE_VAULT.contains("SECURE_RESUME_CALLBACK"));
     assert!(!SECURE_VAULT.contains("let callback = callback.into_js_value()"));
     assert_eq!(
@@ -303,30 +252,19 @@ fn secure_vault_stays_lazy_and_window_brokered() {
         "pubasyncfnget_price_from_oracle()->Option<(U256,U256)>{crate::secure_vault::worker_price_oracle().await}"
     ));
     let vault = compact(SECURE_VAULT);
-    crate::source::assert_contains(&vault, &[
+    assert_contains(&vault, &[
         "worker_vault_call(\"priceOracle\",Object::new())",
         "bytes_array_prop(value,name).filter(|value|value.length()==32)?",
         "value.copy_to(&mutbytes)",
         "Some(U256::from_big_endian(&bytes))",
     ]);
 
-    let gate = section(
-        SHARED_WORKER,
-        "function requiresVault(message)",
-        "function dispatchForClient(message",
-    );
-    crate::source::assert_contains(gate, &[
+    assert_contains(worker_function("requiresVault"), &[
         "message?.type === \"UPLOAD_REQUEST\"",
         "message.op === \"upload\"",
         "message.op === \"resetStamp\"",
     ]);
-    let queue = section(
-        SHARED_WORKER,
-        "function dispatchForClient(message",
-        "function acquirePlaybackLock()",
-    );
-    assert!(queue.contains("const flight = vaultQueue.then(run, run)"));
-    assert!(queue.contains("vaultQueue = flight.then"));
+    assert_contains(worker_function("dispatchForClient"), &["const flight = vaultQueue.then(run, run)", "vaultQueue = flight.then"]);
 }
 
 #[test]
@@ -339,26 +277,14 @@ fn network_switches_preserve_dispatched_transfer_accounting() {
     for operation in TRANSFER_NODE_OPERATIONS {
         assert!(operations.contains(&format!("\"{operation}\"")));
     }
-    let classifier = section(
-        SHARED_WORKER,
-        "function carriesTransferAccounting(message)",
-        "async function dispatchRuntimeMessage(message)",
-    );
-    for request_type in [
+    assert_contains(worker_function("carriesTransferAccounting"), &[
         "WEEB3_FETCH_REQUEST",
         "UPLOAD_REQUEST",
         "WEEB3_NODE_REQUEST",
-    ] {
-        assert!(classifier.contains(request_type));
-    }
+    ]);
 
-    let tracked = section(
-        SHARED_WORKER,
-        "async function dispatchRuntimeMessage(message)",
-        "function dispatchForClient(message, client)",
-    );
     assert_in_order(
-        tracked,
+        worker_function("dispatchRuntimeMessage"),
         &[
             "activeTransferOperations += 1",
             "return await runtime.handleMessage(message)",
@@ -366,11 +292,7 @@ fn network_switches_preserve_dispatched_transfer_accounting() {
             "activeTransferOperations -= 1",
         ],
     );
-    let start = section(
-        SHARED_WORKER,
-        "async function performStart(message, client)",
-        "async function startRuntime(message, client)",
-    );
+    let start = worker_function("performStart");
     assert_in_order(
         start,
         &[
@@ -385,8 +307,7 @@ fn network_switches_preserve_dispatched_transfer_accounting() {
         "pub(crate) async fn has_unsettled_accounting(",
         "pub(crate) async fn connection_counts(",
     );
-    assert!(accounting.contains("accounting_peer.lock().await.reserve != 0"));
-    assert!(accounting.contains("ongoing_cheques.lock().await.is_empty()"));
+    assert_contains(accounting, &["accounting_peer.borrow().reserve != 0", "ongoing_cheques.lock().await.is_empty()"]);
     let rust_start = section(
         WORKER_RUNTIME,
         "pub async fn start(&self, options: JsValue)",
@@ -445,29 +366,26 @@ fn log_polling_is_combined_bounded_and_per_client() {
         "\n    Ok(())\n}",
     );
     assert_eq!(poll.matches("runtime_snapshot(").count(), 1);
-    assert!(poll.contains("Duration::from_millis(160)"));
-    assert!(!poll.contains("get_connections("));
-    assert!(!poll.contains("get_current_logs("));
+    assert!(poll.contains("Duration::from_millis(600)"));
+    assert_excludes(poll, &["get_connections(", "get_current_logs("]);
     assert_eq!(INTERFACE.matches("runtime_snapshot(").count(), 1);
     assert_eq!(LIBRARY.matches("runtime_snapshot(0, false, false)").count(), 1);
 
-    assert!(SHARED_RUNTIME.contains("seen_log_sequence: Cell<u64>"));
-    assert!(SHARED_RUNTIME.contains("self.seen_log_sequence.set(log_sequence)"));
+    assert_contains(SHARED_RUNTIME, &["seen_log_sequence: Cell<u64>", "self.seen_log_sequence.set(log_sequence)"]);
     let snapshot = section(
         WORKER_RUNTIME,
         "async fn runtime_snapshot_response(",
         "fn required_network_id(",
     );
-    crate::source::assert_contains(snapshot, &[
+    assert_contains(snapshot, &[
         "*sequence > seen_logs",
         "state.logs.push_back((sequence, log))",
         "state.logs.pop_front()",
     ]);
     assert!(!snapshot.contains("state.logs.clear()"));
-    assert!(WORKER_RUNTIME.contains("state: RefCell<RuntimeState>"));
-    assert!(WORKER_RUNTIME.contains("const WORKER_LOG_RING_CAPACITY: usize = 256;"));
+    assert_contains(WORKER_RUNTIME, &["state: RefCell<RuntimeState>", "const WORKER_LOG_RING_CAPACITY: usize = 256;"]);
 
-    crate::source::assert_contains(CORE, &[
+    assert_contains(CORE, &[
         "const LOG_QUEUE_CAPACITY: usize = 256;",
         "const LOG_DRAIN_BATCH: usize = 64;",
         "pub(crate) const LOG_DOM_RETAINED: u32 = 256;",
@@ -490,18 +408,11 @@ fn log_polling_is_combined_bounded_and_per_client() {
 
 #[test]
 fn web_lock_and_client_state_follow_window_lifecycle() {
-    assert_eq!(SHARED_WORKER.matches("new Weeb3WorkerRuntime()").count(), 1);
-    assert!(SHARED_WORKER.contains("const clients = new Map();"));
-    assert!(SHARED_WORKER.contains("const vaultDisconnects = new Map();"));
+    assert_contains(SHARED_WORKER, &["const clients = new Map();", "const vaultDisconnects = new Map();"]);
     assert!(!SHARED_WORKER.contains("runtimeMap"));
 
-    let remove = section(
-        SHARED_WORKER,
-        "async function removeClient(client)",
-        "async function dispatch(message",
-    );
     assert_in_order(
-        remove,
+        worker_function("removeClient"),
         &[
             "clients.delete(id)",
             "vaultDisconnects.delete(id)",
@@ -512,20 +423,15 @@ fn web_lock_and_client_state_follow_window_lifecycle() {
         ],
     );
     let connect = section(SHARED_WORKER, "self.addEventListener(\"connect\"", "\n});");
-    crate::source::assert_contains(connect, &[
+    assert_contains(connect, &[
         "clients.set(client.id, client)",
         "if (!clients.has(client.id)) clients.set(client.id, client)",
         "port.addEventListener(\"close\"",
         "WEEB3_CLIENT_CLOSE",
     ]);
 
-    let pagehide = section(
-        SHARED_RUNTIME,
-        "fn create_runtime(",
-        "fn register_service_worker_relay(",
-    );
-    assert!(pagehide.contains("DomListener::new(&window, \"pagehide\""));
-    assert!(pagehide.contains("request_object(\"WEEB3_CLIENT_CLOSE\", 0)"));
+    let pagehide = section(SHARED_RUNTIME, "fn create_runtime(", "\n}");
+    assert_contains(pagehide, &["DomListener::new(&window, \"pagehide\"", "request_object(\"WEEB3_CLIENT_CLOSE\", 0)"]);
     let restore = section(
         INTERFACE,
         "fn pageshow_event_is_persisted(event: &Event) -> bool",
@@ -539,15 +445,14 @@ fn web_lock_and_client_state_follow_window_lifecycle() {
         "function acquirePlaybackLock()",
         "async function removeClient(client)",
     );
-    crate::source::assert_contains(lock, &[
+    assert_contains(lock, &[
         "self.navigator.locks.request(\"weeb3-active-playback\"",
         "mode: \"exclusive\"",
         "ifAvailable: true",
         "await held",
         "function releasePlaybackLock()",
     ]);
-    assert!(SHARED_WORKER.contains("void acquirePlaybackLock()"));
-    assert!(SHARED_WORKER.contains("releasePlaybackLock();"));
+    assert_contains(SHARED_WORKER, &["void acquirePlaybackLock()", "releasePlaybackLock();"]);
 }
 
 #[test]
@@ -566,16 +471,10 @@ fn optional_two_tab_shared_worker_smoke() -> Result<()> {
     }
 
     let protocol = numeric_constant(SHARED_RUNTIME, "SHARED_WORKER_PROTOCOL");
-    let network_id = env::var("WEEB3_SHARED_WORKER_NETWORK_ID")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .map(|value| {
-            value.parse::<u64>().map_err(|error| {
-                anyhow!("invalid WEEB3_SHARED_WORKER_NETWORK_ID {value:?}: {error}")
-            })
-        })
-        .transpose()?
-        .unwrap_or(1);
+    let network_id = env::var("WEEB3_SHARED_WORKER_NETWORK_ID").unwrap_or_default();
+    let network_id = if network_id.trim().is_empty() { 1 } else {
+        network_id.parse().context("invalid WEEB3_SHARED_WORKER_NETWORK_ID")?
+    };
     let worker_url = if raw_url.contains("protocol=") {
         raw_url
     } else if raw_url.contains('?') {
@@ -586,50 +485,23 @@ fn optional_two_tab_shared_worker_smoke() -> Result<()> {
     let worker_name = format!("weeb3-shared-runtime-v{protocol}:{worker_url}");
     let timeout = Duration::from_secs(30);
     let browser = browser::launch(timeout, false)?;
-    let first = browser
-        .new_tab()
-        .map_err(|error| anyhow!("could not open first SharedWorker smoke tab: {error:?}"))?;
-    let second = browser
-        .new_tab()
-        .map_err(|error| anyhow!("could not open second SharedWorker smoke tab: {error:?}"))?;
-    for tab in [&first, &second] {
+    let tabs = [browser.new_tab()?, browser.new_tab()?];
+    let mut runtime_ids = Vec::new();
+    for (index, tab) in tabs.iter().enumerate() {
         tab.set_default_timeout(timeout);
         tab.navigate_to(&worker_url)
-            .map_err(|error| anyhow!("could not navigate to {worker_url}: {error:?}"))?
+            .with_context(|| format!("tab {index} navigation to {worker_url}"))?
             .wait_until_navigated()
-            .map_err(|error| anyhow!("navigation to {worker_url} did not finish: {error:?}"))?;
+            .context("SharedWorker navigation did not finish")?;
+        let result = run_worker_smoke(tab, &worker_url, &worker_name, protocol, network_id)?;
+        for operation in ["started", "ping"] {
+            assert_eq!(result[operation]["ok"], true, "tab {index} {operation}: {result}");
+        }
+        assert_eq!(result["ping"]["networkId"], network_id);
+        runtime_ids.push(result["ping"]["runtimeId"].as_str()
+            .ok_or_else(|| anyhow!("tab {index} ping omitted runtimeId: {result}"))?.to_owned());
     }
-
-    let first_result = run_worker_smoke(&first, &worker_url, &worker_name, protocol, network_id)?;
-    let second_result = run_worker_smoke(&second, &worker_url, &worker_name, protocol, network_id)?;
-    for (name, result) in [("first", &first_result), ("second", &second_result)] {
-        assert_eq!(
-            result.pointer("/started/ok"),
-            Some(&Value::Bool(true)),
-            "{name} tab failed to start the worker: {result}"
-        );
-        assert_eq!(
-            result.pointer("/ping/ok"),
-            Some(&Value::Bool(true)),
-            "{name} tab failed to ping the worker: {result}"
-        );
-        assert_eq!(
-            result.pointer("/ping/networkId").and_then(Value::as_u64),
-            Some(network_id)
-        );
-    }
-    let first_runtime = first_result
-        .pointer("/ping/runtimeId")
-        .and_then(Value::as_str)
-        .ok_or_else(|| anyhow!("first tab ping omitted runtimeId: {first_result}"))?;
-    let second_runtime = second_result
-        .pointer("/ping/runtimeId")
-        .and_then(Value::as_str)
-        .ok_or_else(|| anyhow!("second tab ping omitted runtimeId: {second_result}"))?;
-    assert_eq!(
-        first_runtime, second_runtime,
-        "two tabs reached different node-owning SharedWorkers"
-    );
+    assert_eq!(runtime_ids[0], runtime_ids[1], "tabs reached different SharedWorkers");
     Ok(())
 }
 
@@ -648,7 +520,7 @@ fn run_worker_smoke(
           });
           globalThis.__weeb3SharedWorkerSmoke = worker;
           worker.port.start();
-          const call = (message) => new Promise((resolve, reject) => {
+          const call = (type) => new Promise((resolve, reject) => {
             const channel = new MessageChannel();
             const timer = setTimeout(() => {
               channel.port1.close();
@@ -659,31 +531,16 @@ fn run_worker_smoke(
               channel.port1.close();
               resolve(event.data);
             };
-            worker.port.postMessage(message, [channel.port2]);
+            worker.port.postMessage({type, protocol: __PROTOCOL__, networkId: __NETWORK_ID__}, [channel.port2]);
           });
-          const started = await call({
-            type: "WEEB3_WORKER_START",
-            protocol: __PROTOCOL__,
-            networkId: __NETWORK_ID__
-          });
-          const ping = await call({
-            type: "WEEB3_CLIENT_PING",
-            protocol: __PROTOCOL__,
-            networkId: __NETWORK_ID__
-          });
-          return JSON.stringify({ started, ping });
+          return JSON.stringify({ started: await call("WEEB3_WORKER_START"), ping: await call("WEEB3_CLIENT_PING") });
         })()
     "#
     .replace("__WORKER_URL__", &serde_json::to_string(worker_url)?)
     .replace("__WORKER_NAME__", &serde_json::to_string(worker_name)?)
     .replace("__PROTOCOL__", &protocol.to_string())
     .replace("__NETWORK_ID__", &network_id.to_string());
-    let remote = tab
-        .evaluate(&script, true)
-        .map_err(|error| anyhow!("SharedWorker smoke script failed: {error:?}"))?;
-    let raw = remote
-        .value
-        .and_then(|value| value.as_str().map(ToOwned::to_owned))
-        .ok_or_else(|| anyhow!("SharedWorker smoke did not return JSON"))?;
-    serde_json::from_str(&raw).map_err(|error| anyhow!("invalid SharedWorker smoke JSON: {error}"))
+    let value = tab.evaluate(&script, true).context("SharedWorker smoke script failed")?
+        .value.context("SharedWorker smoke did not return a value")?;
+    Ok(serde_json::from_str(value.as_str().context("SharedWorker smoke omitted JSON")?)?)
 }

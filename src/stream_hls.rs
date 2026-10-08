@@ -1,13 +1,12 @@
 //! Minimal append-only HLS feed reader with a duration-based live startup runway.
 
-use std::fmt::Write;
+use std::{collections::HashMap, fmt::Write};
 
 use crate::stream_conventions::{HlsStart, is_swarm_reference_hex as is_hex_reference};
 
 pub(crate) const HLS_BEGINNING_STARTUP_BUFFER_SECONDS: f64 = 3.0;
-pub(crate) const HLS_LIVE_STARTUP_BUFFER_SECONDS: f64 = 8.0;
+pub(crate) const HLS_LIVE_STARTUP_BUFFER_SECONDS: f64 = 16.0;
 pub(crate) const HLS_LIVE_EDGE_SEGMENTS: usize = 3;
-pub(crate) const HLS_LIVE_BODY_RUNWAY_SEGMENTS: usize = 4;
 pub(crate) const HLS_BODY_MAX_BYTES: u64 = 96 * 1024 * 1024;
 pub(crate) const MAX_STREAM_FEED_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
 
@@ -81,12 +80,10 @@ impl HlsMasterPlaylist {
     }
 
     fn parse(bytes: &[u8]) -> Option<Self> {
-        if bytes.len() > MAX_STREAM_FEED_PAYLOAD_BYTES || !is_hls_manifest(bytes) {
+        if bytes.len() > MAX_STREAM_FEED_PAYLOAD_BYTES {
             return None;
         }
-        let text: String = std::str::from_utf8(bytes)
-            .ok()?
-            .trim_start_matches('\u{feff}')
+        let text: String = hls_text(bytes)?
             .lines()
             .flat_map(|line| [line.trim(), "\n"])
             .collect();
@@ -473,10 +470,10 @@ pub(crate) async fn confirm_hls_feed_head<
 
 impl HlsPlaylist {
     pub(crate) fn parse(bytes: &[u8]) -> Option<Self> {
-        if bytes.len() > MAX_STREAM_FEED_PAYLOAD_BYTES || !is_hls_manifest(bytes) {
+        if bytes.len() > MAX_STREAM_FEED_PAYLOAD_BYTES {
             return None;
         }
-        let text = std::str::from_utf8(bytes).ok()?;
+        let text = hls_text(bytes)?;
         let mut sequence = None;
         let mut discontinuity_sequence = None;
         let mut target_duration = None;
@@ -627,31 +624,7 @@ impl HlsPlaylist {
         if segment.gap || segment.reference != anchor_reference {
             return None;
         }
-        let runway = if self.has_timeline() {
-            12.0
-        } else {
-            HLS_LIVE_STARTUP_BUFFER_SECONDS
-        };
-        let mut first = anchor;
-        let mut last = anchor;
-        let mut seconds = segment.duration;
-        while seconds < runway
-            && let Some(next) = self.segments.get(last + 1).filter(|segment| !segment.gap)
-        {
-            seconds += next.duration;
-            last += 1;
-        }
-        while seconds < runway && first > 0 {
-            let previous = &self.segments[first - 1];
-            if previous.gap {
-                break;
-            }
-            seconds += previous.duration;
-            first -= 1;
-        }
-        if !seconds.is_finite() || (!self.has_timeline() && seconds < runway) {
-            return None;
-        }
+        let (first, last) = self.live_runway(anchor, |position| !self.segments[position].gap)?;
         let mut plan = self.startup_plan(HlsStart::Beginning)?;
         plan.play_position = self.segments[..first]
             .iter()
@@ -666,6 +639,20 @@ impl HlsPlaylist {
             && plan.play_position > plan.bootstrap_position;
         (plan.runway_end.is_finite() && plan.runway_end > plan.play_position)
             .then_some((plan, first))
+    }
+
+    pub(crate) fn live_runway(
+        &self,
+        anchor: usize,
+        playable: impl Fn(usize) -> bool,
+    ) -> Option<(usize, usize)> {
+        let mut first = anchor;
+        let mut seconds = self.segments.get(anchor)?.duration;
+        while seconds < HLS_LIVE_STARTUP_BUFFER_SECONDS && first > 0 && playable(first - 1) {
+            first -= 1;
+            seconds += self.segments[first].duration;
+        }
+        (seconds.is_finite() && seconds > 0.0).then_some((first, anchor))
     }
 
     pub(crate) fn merge_tail(&mut self, bytes: &[u8]) -> Option<usize> {
@@ -782,23 +769,6 @@ impl HlsPlaylist {
         self.merge_extension(candidate).is_some()
     }
 
-    pub(crate) fn mark_gap(&mut self, sequence: u64, reference: &str) -> bool {
-        let Some(position) = sequence
-            .checked_sub(self.sequence)
-            .and_then(|position| usize::try_from(position).ok())
-        else {
-            return false;
-        };
-        let Some(segment) = self.segments.get_mut(position) else {
-            return false;
-        };
-        if segment.reference != reference {
-            return false;
-        }
-        segment.gap = true;
-        true
-    }
-
     pub(crate) fn sort_snapshots(snapshots: &mut [(u64, Self)]) {
         snapshots.sort_by_key(|(index, _)| *index);
     }
@@ -854,7 +824,7 @@ impl HlsPlaylist {
     }
 
     pub(crate) fn render(&self, local_bytes_base: &str, start: HlsStart) -> Vec<u8> {
-        self.render_with_plan(local_bytes_base, start, self.startup_plan(start).as_ref())
+        self.render_with_plan(local_bytes_base, start, self.startup_plan(start).as_ref(), None)
     }
 
     pub(crate) fn render_with_plan(
@@ -862,10 +832,16 @@ impl HlsPlaylist {
         local_bytes_base: &str,
         start: HlsStart,
         plan: Option<&HlsStartupPlan>,
+        gaps: Option<&HashMap<u64, String>>,
     ) -> Vec<u8> {
+        let is_gap = |position: usize, segment: &HlsSegment| {
+            segment.gap || self.sequence.checked_add(position as u64)
+                .and_then(|sequence| gaps.and_then(|gaps| gaps.get(&sequence)))
+                .is_some_and(|reference| reference == &segment.reference)
+        };
         let mut output = String::with_capacity(self.segments.len().saturating_mul(112) + 160);
         output.push_str(HLS_HEADER);
-        output.push_str(if self.segments.iter().any(|segment| segment.gap) {
+        output.push_str(if self.segments.iter().enumerate().any(|(position, segment)| is_gap(position, segment)) {
             "\n#EXT-X-VERSION:8"
         } else {
             "\n#EXT-X-VERSION:3"
@@ -890,14 +866,14 @@ impl HlsPlaylist {
                 let position = plan.map_or(0.0, |plan| plan.play_position);
                 let _ = write!(
                     output,
-                    "\n#EXT-X-START:TIME-OFFSET={position:.6},PRECISE=NO"
+                    "\n#EXT-X-START:TIME-OFFSET={position:.6},PRECISE=YES"
                 );
             }
         }
         let mut discontinuity_sequence = self.discontinuity_sequence;
         let mut beginning_startup = start == HlsStart::Beginning;
         let local_bytes_base = local_bytes_base.trim_end_matches('/');
-        for segment in &self.segments {
+        for (position, segment) in self.segments.iter().enumerate() {
             let discontinuity = segment.discontinuity_sequence > discontinuity_sequence;
             if discontinuity {
                 output.push_str("\n#EXT-X-DISCONTINUITY");
@@ -907,7 +883,7 @@ impl HlsPlaylist {
                 let _ = write!(output, "\n#EXT-X-PROGRAM-DATE-TIME:{date}");
             }
             let _ = write!(output, "\n#EXTINF:{:.6},", segment.duration);
-            if segment.gap {
+            if is_gap(position, segment) {
                 let _ = write!(output, "\n#EXT-X-GAP\n{}", segment.reference);
                 continue;
             }
@@ -915,8 +891,8 @@ impl HlsPlaylist {
             output.push_str(local_bytes_base);
             output.push('/');
             output.push_str(&segment.reference);
-            let startup = beginning_startup && !segment.gap;
-            beginning_startup &= !startup;
+            let startup = beginning_startup;
+            beginning_startup = false;
             output.push_str(match (start, startup) {
                 (HlsStart::Live, _) => "?start=live",
                 (HlsStart::Beginning, true) => "?start=beginning&startup=1",
@@ -932,11 +908,13 @@ impl HlsPlaylist {
 }
 
 pub(crate) fn is_hls_manifest(bytes: &[u8]) -> bool {
-    std::str::from_utf8(bytes)
-        .ok()
-        .map(|text| text.strip_prefix('\u{feff}').unwrap_or(text).trim_start())
-        .and_then(|text| text.lines().next())
-        .is_some_and(|line| line.trim() == HLS_HEADER)
+    hls_text(bytes).is_some()
+}
+
+fn hls_text(bytes: &[u8]) -> Option<&str> {
+    let text = std::str::from_utf8(bytes).ok()?;
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text).trim_start();
+    (text.lines().next()?.trim() == HLS_HEADER).then_some(text)
 }
 
 pub(crate) fn hls_payload_mime(bytes: &[u8]) -> &'static str {

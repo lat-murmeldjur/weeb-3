@@ -1,5 +1,5 @@
 use crate::{
-    ChunkRetrieveSender, Date, Duration, HashSet, Mutex, OutboundProtocolSession, OverlayPeerMap,
+    ChunkRetrieveSender, Date, Duration, HashSet, OutboundProtocolSession, OverlayPeerMap,
     PROTOCOL_ROUND_TIME, PUSH_CHUNK_CONFIRMATION_PEERS, PeerAccounting, PeerAccountingMap, PeerId,
     PhysicalConnectionMap, PrivateKeySigner, RefreshmentInstruction, StreamControl, TransferPause,
     apply_credit, bee_replica_address, cancel_reserve, content_address, encryption_segment_key,
@@ -26,7 +26,7 @@ use serde_json::json;
 use libp2p::futures::{StreamExt, future::join_all, stream::FuturesUnordered};
 use rand::Rng;
 
-use std::{future::Future, pin::Pin};
+use std::{cell::RefCell, future::Future, pin::Pin};
 
 const BATCH_BUCKET_TRIALS: usize = 1024;
 const STAMP_CHUNK_WINDOW: usize = 64;
@@ -138,7 +138,7 @@ pub(crate) type UploadProgressSender = mpsc::Sender<UploadProgressDelta>;
 struct ReservedPushPeer {
     peer: PeerId,
     price: u64,
-    accounting: Arc<Mutex<PeerAccounting>>,
+    accounting: Arc<RefCell<PeerAccounting>>,
     session: OutboundProtocolSession,
 }
 
@@ -336,9 +336,9 @@ async fn pushsync_attempt(
     // This task retains protocol and accounting ownership through its receipt.
     let success = pushsync_handler(peer, caddr, data, cstamp0, control, session).await;
     if success {
-        apply_credit(&accounting_peer, req_price, &refresh_chan).await;
+        apply_credit(&accounting_peer, req_price, &refresh_chan);
     } else {
-        cancel_reserve(&accounting_peer, req_price).await;
+        cancel_reserve(&accounting_peer, req_price);
     }
 
     let _ = result_chan.try_send(success);
@@ -1207,7 +1207,7 @@ pub async fn push_chunk(
             }
 
             let closest_peer = {
-                let peers_map = peers.lock().await;
+                let peers_map = peers.borrow();
                 peers_map
                     .iter()
                     .filter(|(_, id)| !skiplist.contains(id))
@@ -1246,12 +1246,12 @@ pub async fn push_chunk(
             skiplist.insert(closest_peer_id);
 
             let accounting_peer = {
-                let accounting_peers = accounting.lock().await;
+                let accounting_peers = accounting.borrow();
                 accounting_peers.get(&closest_peer_id).cloned()
             };
 
             if let Some(accounting_peer) = accounting_peer {
-                if let Some(connection_id) = reserve(&accounting_peer, req_price).await {
+                if let Some(connection_id) = reserve(&accounting_peer, req_price) {
                     if let Some(session) = OutboundProtocolSession::capture(
                         closest_peer_id,
                         connection_id,
@@ -1264,7 +1264,7 @@ pub async fn push_chunk(
                             session,
                         });
                     } else {
-                        cancel_reserve(&accounting_peer, req_price).await;
+                        cancel_reserve(&accounting_peer, req_price);
                     }
                 } else {
                     overdraftlist.insert(closest_peer_id);
@@ -1277,7 +1277,7 @@ pub async fn push_chunk(
         };
 
         if paused() {
-            cancel_reserve(&selected_peer.accounting, selected_peer.price).await;
+            cancel_reserve(&selected_peer.accounting, selected_peer.price);
             continue;
         }
 

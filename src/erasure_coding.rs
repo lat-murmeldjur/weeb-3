@@ -499,9 +499,9 @@ pub fn reconstruct_data_indices<T: AsRef<[u8]> + From<Vec<u8>>>(
         return Err(ReedSolomonError::InvalidShardCount);
     }
 
-    let mut requested_mask = vec![false; data_count];
+    let mut requested_mask = [false; 256];
     for &index in requested_indices {
-        let Some(requested) = requested_mask.get_mut(index) else {
+        let Some(requested) = requested_mask[..data_count].get_mut(index) else {
             return Err(ReedSolomonError::InvalidShardCount);
         };
         *requested = true;
@@ -707,7 +707,8 @@ fn gauss_jordan(work: &mut [Vec<u8>], size: usize) -> Result<(), ReedSolomonErro
         let pivot = work[diagonal][diagonal];
         if pivot != 1 {
             let products = &GF_MUL[gf_inverse(pivot) as usize];
-            for value in &mut work[diagonal] {
+            // Earlier columns are already zero after forward elimination.
+            for value in &mut work[diagonal][diagonal..] {
                 *value = products[*value as usize];
             }
         }
@@ -721,7 +722,7 @@ fn gauss_jordan(work: &mut [Vec<u8>], size: usize) -> Result<(), ReedSolomonErro
             let (before_target, target_and_after) = work.split_at_mut(row);
             let source = &before_target[diagonal];
             let target = &mut target_and_after[0];
-            for (target, source) in target.iter_mut().zip(source) {
+            for (target, source) in target[diagonal..].iter_mut().zip(&source[diagonal..]) {
                 *target ^= products[*source as usize];
             }
         }
@@ -737,7 +738,7 @@ fn gauss_jordan(work: &mut [Vec<u8>], size: usize) -> Result<(), ReedSolomonErro
             let (before_source, source_and_after) = work.split_at_mut(diagonal);
             let target = &mut before_source[row];
             let source = &source_and_after[0];
-            for (target, source) in target.iter_mut().zip(source) {
+            for (target, source) in target[diagonal..].iter_mut().zip(&source[diagonal..]) {
                 *target ^= products[*source as usize];
             }
         }
@@ -760,34 +761,17 @@ fn gf_mul(left: u8, right: u8) -> u8 {
     GF_MUL[left as usize][right as usize]
 }
 
-const fn gf_mul_polynomial(mut left: u8, mut right: u8) -> u8 {
-    let mut result = 0u8;
-    let mut bit = 0;
-    while bit < 8 {
-        if right & 1 != 0 {
-            result ^= left;
-        }
-        let high = left & 0x80;
-        left <<= 1;
-        if high != 0 {
-            left ^= 0x1d;
-        }
-        right >>= 1;
-        bit += 1;
-    }
-    result
-}
-
-const fn multiplication_table() -> [[u8; 256]; 256] {
+fn multiplication_table() -> [[u8; 256]; 256] {
     let mut table = [[0; 256]; 256];
-    let mut left = 0;
-    while left < 256 {
-        let mut right = 0;
-        while right < 256 {
-            table[left][right] = gf_mul_polynomial(left as u8, right as u8);
-            right += 1;
+    for (left, row) in table.iter_mut().enumerate().skip(1) {
+        for right in 1..256 {
+            row[right] = if right & 1 == 0 {
+                let half = row[right / 2];
+                (half << 1) ^ if half & 0x80 == 0 { 0 } else { 0x1d }
+            } else {
+                row[right - 1] ^ left as u8
+            };
         }
-        left += 1;
     }
     table
 }

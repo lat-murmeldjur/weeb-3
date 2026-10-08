@@ -52,6 +52,8 @@ pub(crate) async fn serve(listen_addr: Ipv4Addr) {
         .unwrap();
 
     let server = Router::new()
+        .route("/", get(get_example))
+        .route("/embed/{*path}", get(get_example))
         .route("/weeb-3/", get(get_index))
         .route("/weeb-3/index.html", get(get_index))
         .route("/weeb-3/mainnet", get(get_index))
@@ -87,12 +89,10 @@ async fn get_index() -> Result<impl IntoResponse, StatusCode> {
 }
 
 async fn get_example(uri: OriginalUri) -> Result<impl IntoResponse, StatusCode> {
-    let path = match uri.path() {
+    html_response(match uri.path() {
         "/example.html" => "example.html",
-        "/weeb-3/hls-stream-example.html" => "hls-stream-example.html",
-        _ => return Err(StatusCode::NOT_FOUND),
-    };
-    html_response(path)
+        _ => "hls-stream-example.html",
+    })
 }
 
 fn html_response(path: &str) -> Result<Response, StatusCode> {
@@ -204,7 +204,7 @@ async fn get_static_file(headers: HeaderMap, uri: OriginalUri) -> Result<Respons
     };
     if matches!(path, "service.js" | "worker.js") {
         let content = StaticFiles::get(path).ok_or(StatusCode::NOT_FOUND)?.data;
-        return Ok((
+        let mut response = (
             [
                 (CONTENT_TYPE, content_type),
                 (CACHE_CONTROL, "no-store"),
@@ -212,7 +212,11 @@ async fn get_static_file(headers: HeaderMap, uri: OriginalUri) -> Result<Respons
             ],
             content,
         )
-            .into_response());
+            .into_response();
+        if path == "service.js" {
+            response.headers_mut().insert("service-worker-allowed", HeaderValue::from_static("/"));
+        }
+        return Ok(response);
     }
     embedded_asset_response(&headers, path, content_type)
 }
@@ -243,7 +247,7 @@ mod tests {
 
     #[test]
     fn html_documents_are_not_cached_and_expose_the_build_version() {
-        for path in ["index.html", "example.html", "404.html"] {
+        for path in ["index.html", "example.html", "hls-stream-example.html", "404.html"] {
             let response = html_response(path).unwrap().into_response();
             assert_eq!(response.headers()[CACHE_CONTROL], "no-store");
             assert_eq!(
@@ -315,4 +319,5 @@ mod tests {
         headers.insert(ACCEPT_ENCODING, "deflate;q=0, gzip".parse().unwrap());
         assert!(!accepts_content_encoding(&headers, "deflate"));
     }
+
 }

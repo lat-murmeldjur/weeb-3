@@ -39,8 +39,9 @@
     <header>
       <h1>Swarm HLS archive</h1>
       <p>
-        Play a multi-resolution archive through the npm client. Playback switches
-        to a lower resolution as connected peers drop.
+        Play a multi-resolution archive through the npm client. Every five seconds,
+        this example selects a resolution from the connected peer count, moving
+        up or down as it changes. This also replaces manual quality selections.
       </p>
       <p id="status" role="status">Loading the weeb-3 npm client...</p>
     </header>
@@ -53,47 +54,61 @@
     </main>
 
     <script type="module">
-      import init, { Weeb3No103 } from "./weeb_3.js";
+      import init, { Weeb3No103 } from "/weeb-3/weeb_3.js";
 
-      const connectionLimits = [90, 60, 30]; // Below each limit: 2nd, 3rd, 4th highest resolution.
       const parameters = new URLSearchParams(location.search);
       const owner = parameters.get("owner") || "2ac5d080dafd13b6ec1d25a4ca78102d45d2d9e4";
-      const topic = parameters.get("topic") || "93629e09-8e88-4617-b270-4f2e26ba4219";
+      const topic = parameters.get("topic") || "b193bf5c-4df2-457f-8524-e370315f29de";
       const byId = id => document.getElementById(id);
       const status = byId("status");
       const video = byId("stream");
+      const connectionLimits = [90, 60, 30]; // Highest, then one resolution lower below each limit.
       let attachRequest = 0;
+      let streamReady = false;
+
+      function resolutionForConnections(levels, connections) {
+        const resolutions = levels.filter(level => level.height > 0)
+          .sort((a, b) => b.height - a.height || b.bitrate - a.bitrate)
+          .filter((level, index, sorted) => index === 0 || level.height !== sorted[index - 1].height);
+        const rank = connectionLimits.filter(limit => connections < limit).length;
+        return resolutions[Math.min(rank, resolutions.length - 1)];
+      }
 
       try {
         await init();
-        const node = new Weeb3No103();
+        const scope = location.pathname.startsWith("/weeb-3/") ? "/weeb-3/" : "/";
+        const node = new Weeb3No103(undefined, scope);
         node.start();
-        let checkingConnections = false;
-        setInterval(async () => {
-          if (checkingConnections) return;
-          checkingConnections = true;
+
+        async function updateResolution() {
+          const request = attachRequest;
           try {
-            const count = await node.connectionCount();
-            const rank = connectionLimits.filter(limit => count < limit).length;
-            if (rank === 0) return;
+            if (!streamReady || video.paused || video.ended) return;
+            const connections = await node.connectionCount();
+            if (request !== attachRequest || video.paused || video.ended) return;
             const { levels, selectedLevel, currentLevel } = node.streamQuality(video);
             if (selectedLevel >= 0 && selectedLevel !== currentLevel) return;
-            const current = levels.find(({ level }) => level === currentLevel);
-            const resolutions = levels.filter(({ height }) => height > 0)
-              .sort((a, b) => b.height - a.height || b.bitrate - a.bitrate)
-              .filter((item, index, sorted) => index === 0 || item.height !== sorted[index - 1].height);
-            const target = resolutions[Math.min(rank, resolutions.length - 1)];
-            if (current && target && target.height < current.height) node.setStreamQuality(video, target.level);
-          } catch { // Retry on the next poll if the stream or worker is not ready.
-          } finally { checkingConnections = false; }
-        }, 5000);
+            const current = levels.find(level => level.level === currentLevel);
+            const target = resolutionForConnections(levels, connections);
+            if (current && target && target.height !== current.height) {
+              node.setStreamQuality(video, target.level);
+            }
+          } catch {
+            // Retry when the worker or player is ready, including after a seek.
+          } finally {
+            setTimeout(updateResolution, 5000);
+          }
+        }
+        setTimeout(updateResolution, 5000);
 
         async function attach(start) {
           const request = ++attachRequest;
+          streamReady = false;
           status.textContent = `Opening the stream from ${start}...`;
           try {
             await node.attachStream(video, owner, topic, start);
             if (request !== attachRequest) return;
+            streamReady = true;
             status.textContent = `Stream attached from ${start}; loading playback...`;
           } catch (error) {
             if (request !== attachRequest) return;

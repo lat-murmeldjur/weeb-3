@@ -32,12 +32,9 @@ pub(crate) async fn yield_after_swarm_event(events_since_browser_yield: &mut usi
 
 impl Weeb3 {
     pub(crate) async fn has_unsettled_accounting(&self) -> bool {
-        let accounting_peers = {
-            let peers = self.wings.accounting_peers.lock().await;
-            peers.values().cloned().collect::<Vec<_>>()
-        };
-        for accounting_peer in accounting_peers {
-            if accounting_peer.lock().await.reserve != 0 {
+        {
+            let peers = self.wings.accounting_peers.borrow();
+            if peers.values().any(|accounting_peer| accounting_peer.borrow().reserve != 0) {
                 return true;
             }
         }
@@ -124,7 +121,7 @@ impl Weeb3 {
     }
 
     pub(super) fn bump_connection_generation(&self) {
-        let _ = self.connection_generation.fetch_update(
+        let _ = self.connection_generation.try_update(
             Ordering::AcqRel,
             Ordering::Acquire,
             |generation| Some(generation.saturating_add(1)),
@@ -168,10 +165,10 @@ impl Weeb3 {
         }
 
         wings.connected_peers.lock().await.clear();
-        *wings.overlay_peers.lock().await = Arc::default();
+        wings.overlay_peers.borrow_mut().clear();
         wings.connection_attempts.lock().await.clear();
         wings.connection_cooldowns.lock().await.clear();
-        wings.accounting_peers.lock().await.clear();
+        wings.accounting_peers.borrow_mut().clear();
         wings.bootnodes.lock().await.clear();
         wings.ongoing_cheques.lock().await.clear();
         ACCOUNTING_DRAINED.notify(usize::MAX);
@@ -182,7 +179,6 @@ impl Weeb3 {
         let mut population = self.connection_population.lock().await;
         population.connected = 0;
         population.ongoing = 0;
-        population.lost = 0;
         population.changed.notify(usize::MAX);
     }
 
@@ -207,10 +203,10 @@ impl Weeb3 {
         let bootnode = wings.bootnodes.lock().await.contains(&peer);
 
         let (promoted, duplicate_owner) = if !bootnode {
-            let mut overlay_peers_map = wings.overlay_peers.lock().await;
+            let mut overlay_peers_map = wings.overlay_peers.borrow_mut();
             match overlay_peers_map.get(&peer_file.overlay) {
                 None => {
-                    Arc::make_mut(&mut overlay_peers_map).insert(peer_file.overlay, peer);
+                    overlay_peers_map.insert(peer_file.overlay, peer);
                     (true, None)
                 }
                 Some(owner) if owner == &peer => (false, None),
@@ -239,7 +235,7 @@ impl Weeb3 {
                 .await
                 .insert(peer, owner);
             wings.connected_peers.lock().await.remove(&peer);
-            wings.accounting_peers.lock().await.remove(&peer);
+            wings.accounting_peers.borrow_mut().remove(&peer);
             wings.known_peers.lock().await.remove(&peer);
             wings.delayed_peer_retries.lock().await.remove(&peer);
             let _ = self.swarm.lock().await.disconnect_peer_id(peer);
@@ -340,7 +336,6 @@ impl NetworkBehaviour for StreamBehaviour {
 pub(crate) struct ConnectionPopulation {
     pub(crate) connected: u64,
     pub(crate) ongoing: u64,
-    pub(crate) lost: u16,
     pub(crate) changed: Event,
 }
 
@@ -350,14 +345,9 @@ pub(crate) async fn release_connection_reservation(population: &Arc<Mutex<Connec
 
 pub(crate) async fn release_connected_peer(
     population: &Arc<Mutex<ConnectionPopulation>>,
-    replacement: bool,
 ) {
     let mut population = population.lock().await;
     population.connected = population.connected.saturating_sub(1);
-    if replacement {
-        // Nine reductions reach the 30-peer floor.
-        population.lost = (population.lost + 1).min(900);
-    }
     population.changed.notify(usize::MAX);
 }
 
@@ -394,7 +384,7 @@ pub(crate) async fn try_reserve_connection_capacity(
     population: &Arc<Mutex<ConnectionPopulation>>,
 ) -> bool {
     let mut population = population.lock().await;
-    if connection_dial_capacity_available(population.connected, population.ongoing, population.lost) {
+    if connection_dial_capacity_available(population.connected, population.ongoing) {
         population.ongoing = population.ongoing.saturating_add(1);
         true
     } else {
@@ -515,7 +505,7 @@ impl Drop for SharedSwarmGuard<'_> {
     }
 }
 
-pub(crate) type OverlayPeerMap = Arc<Mutex<Arc<BTreeMap<[u8; 32], PeerId>>>>;
+pub(crate) type OverlayPeerMap = Arc<RefCell<BTreeMap<[u8; 32], PeerId>>>;
 
 pub(crate) fn closest_overlay_peers<'a>(
     peers: &'a BTreeMap<[u8; 32], PeerId>,
@@ -539,7 +529,7 @@ pub(crate) fn closest_overlay_peers<'a>(
     })
 }
 
-pub(crate) type PeerAccountingMap = Arc<Mutex<HashMap<PeerId, Arc<Mutex<PeerAccounting>>>>>;
+pub(crate) type PeerAccountingMap = Arc<RefCell<HashMap<PeerId, Arc<RefCell<PeerAccounting>>>>>;
 pub(crate) type PhysicalConnectionMap =
     Arc<std::sync::Mutex<HashMap<PeerId, HashSet<ConnectionId>>>>;
 
@@ -709,17 +699,16 @@ pub(crate) struct Wings {
     pub(crate) rejected_duplicate_peers: Mutex<HashMap<PeerId, PeerId>>,
 }
 
-pub(crate) async fn get_or_create_accounting_peer(
+pub(crate) fn get_or_create_accounting_peer(
     wings: &Wings,
     peer: PeerId,
-) -> Arc<Mutex<PeerAccounting>> {
+) -> Arc<RefCell<PeerAccounting>> {
     wings
         .accounting_peers
-        .lock()
-        .await
+        .borrow_mut()
         .entry(peer)
         .or_insert_with(|| {
-            Arc::new(Mutex::new(PeerAccounting {
+            Arc::new(RefCell::new(PeerAccounting {
                 balance: 0,
                 surplus_balance: 0,
                 threshold: 0,
@@ -915,7 +904,7 @@ pub(crate) async fn start_owned_connection_attempt(
 pub(crate) async fn current_accounting_protocol_session(
     wings: &Arc<Wings>,
     peer: &PeerId,
-    accounting_peer: &Arc<Mutex<PeerAccounting>>,
+    accounting_peer: &Arc<RefCell<PeerAccounting>>,
     connection_id: ConnectionId,
 ) -> Option<OutboundProtocolSession> {
     let connected_peers = wings.connected_peers.lock().await;
@@ -927,14 +916,13 @@ pub(crate) async fn current_accounting_protocol_session(
     }
     let owns_account = wings
         .accounting_peers
-        .lock()
-        .await
+        .borrow()
         .get(peer)
         .is_some_and(|current| Arc::ptr_eq(current, accounting_peer));
     if !owns_account {
         return None;
     }
-    if accounting_peer.lock().await.connection_id != Some(connection_id) {
+    if accounting_peer.borrow().connection_id != Some(connection_id) {
         return None;
     }
     OutboundProtocolSession::capture(*peer, connection_id, wings.physical_connections.clone())
@@ -943,7 +931,7 @@ pub(crate) async fn current_accounting_protocol_session(
 pub(crate) async fn claim_current_cheque(
     wings: &Arc<Wings>,
     peer: PeerId,
-    accounting_peer: &Arc<Mutex<PeerAccounting>>,
+    accounting_peer: &Arc<RefCell<PeerAccounting>>,
     connection_id: ConnectionId,
     amount: u64,
     generation: u64,
@@ -957,11 +945,10 @@ pub(crate) async fn claim_current_cheque(
     }
     let owns_account = wings
         .accounting_peers
-        .lock()
-        .await
+        .borrow()
         .get(&peer)
         .is_some_and(|current| Arc::ptr_eq(current, accounting_peer));
-    if !owns_account || accounting_peer.lock().await.connection_id != Some(connection_id) {
+    if !owns_account || accounting_peer.borrow().connection_id != Some(connection_id) {
         return false;
     }
 
@@ -996,7 +983,7 @@ pub(crate) async fn quiesce_drain_and_close_accounting_session(
     wings: &Arc<Wings>,
     swarm: &Arc<SharedSwarm>,
     peer: PeerId,
-    accounting_peer: &Arc<Mutex<PeerAccounting>>,
+    accounting_peer: &Arc<RefCell<PeerAccounting>>,
     connection_id: ConnectionId,
 ) {
     // Reserved requests must settle before the accounting connection closes.
@@ -1006,12 +993,12 @@ pub(crate) async fn quiesce_drain_and_close_accounting_session(
             .get(&peer)
             .is_some_and(|peer_file| peer_file.connection_id == connection_id);
         let owns_account = {
-            let accounting = wings.accounting_peers.lock().await;
+            let accounting = wings.accounting_peers.borrow();
             accounting
                 .get(&peer)
                 .is_some_and(|current| Arc::ptr_eq(current, accounting_peer))
         };
-        let mut account = accounting_peer.lock().await;
+        let mut account = accounting_peer.borrow_mut();
         if owns_connection && owns_account && account.connection_id == Some(connection_id) {
             account.connection_id = None;
             drop(account);
@@ -1023,7 +1010,7 @@ pub(crate) async fn quiesce_drain_and_close_accounting_session(
 
     loop {
         let changed = ACCOUNTING_DRAINED.listen();
-        let reserve_drained = accounting_peer.lock().await.reserve == 0;
+        let reserve_drained = accounting_peer.borrow().reserve == 0;
         let cheque_drained = match pending_cheque {
             Some(claim) => {
                 let cheques = wings.ongoing_cheques.lock().await;

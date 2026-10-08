@@ -93,11 +93,56 @@ const PROFILE_SCRIPT: &str = r#"
     let activeVideo = null;
     let playingCandidate = null;
 
+    // Observe the player's own manifests; profiling must not initiate Swarm work.
+    const capturePlaylist = (url, status, text) => {
+        if (profile.finished_at_ms !== null || !text.includes('#EXTINF:')) return;
+        const lines = text.split(/\r?\n/);
+        const durations = lines.filter(line => line.startsWith('#EXTINF:'))
+            .map(line => Number(line.substring(8).split(',', 1)[0])).filter(Number.isFinite);
+        const references = lines.filter(line => line && !line.startsWith('#'))
+            .map(line => line.split(/[?#]/, 1)[0].split('/').at(-1));
+        const date = Date.parse(text.match(/^#EXT-X-PROGRAM-DATE-TIME:(.+)$/m)?.[1]);
+        profile.latest_playlist = {
+            url, status, ok: status >= 200 && status < 300, observed_at_ms: performance.now(),
+            segment_count: durations.length, duration_s: durations.reduce((sum, value) => sum + value, 0),
+            date_ms: Number.isFinite(date) ? date : null, dated: Number.isFinite(date), timeline_offset_s: 0,
+            tail_one_s: durations.at(-1) || 0,
+            tail_two_s: durations.slice(-2).reduce((sum, value) => sum + value, 0),
+            tail_three_s: durations.slice(-3).reduce((sum, value) => sum + value, 0),
+            tail_durations_s: durations.slice(-5), tail_references: references.slice(-5),
+            target_duration_s: Number(lines.find(line => line.startsWith('#EXT-X-TARGETDURATION:'))?.substring(22)) || null,
+            endlist: text.trimEnd().endsWith('#EXT-X-ENDLIST')
+        };
+    };
+    const isPlaylist = url => {
+        try { return new URL(url, location.href).pathname.includes('/feeds/'); }
+        catch (_) { return false; }
+    };
+    const open = XMLHttpRequest.prototype.open;
+    XMLHttpRequest.prototype.open = function(method, url, ...args) {
+        if (isPlaylist(url)) this.addEventListener('load', () => {
+            if (this.responseType === '' || this.responseType === 'text') {
+                capturePlaylist(String(url), this.status, this.responseText);
+            }
+        }, {once: true});
+        return open.call(this, method, url, ...args);
+    };
+    const fetch = window.fetch;
+    window.fetch = function(input, ...args) {
+        const response = fetch.call(this, input, ...args);
+        if (isPlaylist(input?.url || input)) response.then(value => {
+            value.clone().text().then(text => capturePlaylist(value.url, value.status, text)).catch(() => {});
+        }).catch(() => {});
+        return response;
+    };
+
     const sample = () => {
+        if (profile.finished_at_ms !== null) return;
         const video = activeVideo || document.querySelector('video');
         if (!video) return;
         const buffered = ranges(video.buffered);
         const seekable = ranges(video.seekable);
+        const quality = video.getVideoPlaybackQuality?.();
         if (
             profile.marks.first_confirmed_playback_ms === null &&
             profile.marks.first_presented_frame_ms !== null &&
@@ -107,6 +152,7 @@ const PROFILE_SCRIPT: &str = r#"
         ) {
             profile.marks.first_confirmed_playback_ms = performance.now();
             profile.marks.first_confirmed_playback_current_time_s = finite(video.currentTime);
+            profile.startup_playlist = profile.latest_playlist || null;
         }
         profile.samples.push({
             at_ms: performance.now(),
@@ -116,6 +162,9 @@ const PROFILE_SCRIPT: &str = r#"
             paused: video.paused,
             ended: video.ended,
             ready_state: video.readyState,
+            video_height: finite(video.videoHeight),
+            total_video_frames: finite(quality?.totalVideoFrames),
+            dropped_video_frames: finite(quality?.droppedVideoFrames),
             network_state: video.networkState,
             playback_rate: video.playbackRate,
             buffered,
@@ -123,8 +172,21 @@ const PROFILE_SCRIPT: &str = r#"
             forward_buffer_s: forwardBuffer(video.currentTime, buffered)
         });
         if (profile.samples.length > sampleCap) profile.samples.shift();
+        return profile.samples.at(-1);
     };
     window.__weeb3TakeHlsSmokeSample = sample;
+    window.__weeb3BeginHlsResourceProfile = () => {
+        const start = sample();
+        profile.resource_window = {start_ms: start.at_ms, start_sample: start};
+    };
+    window.__weeb3FinishHlsSmokeProfile = () => {
+        if (profile.finished_at_ms !== null) return;
+        clearInterval(window.__weeb3HlsSmokeTimer);
+        const end = sample();
+        profile.finished_at_ms = end?.at_ms ?? performance.now();
+        profile.final_playlist = profile.latest_playlist || null;
+        if (profile.resource_window) profile.resource_window.end_ms = profile.finished_at_ms;
+    };
 
     window.__weeb3BeginHlsSeekProfile = position => {
         const video = activeVideo || document.querySelector('video');
@@ -132,6 +194,7 @@ const PROFILE_SCRIPT: &str = r#"
         profile.phase_started_ms = performance.now();
         profile.samples.length = 0;
         profile.events.length = 0;
+        profile.startup_playlist = null;
         for (const mark of Object.keys(profile.marks)) profile.marks[mark] = null;
         video.currentTime = position;
         playingCandidate = { video, currentTime: position };
@@ -148,6 +211,7 @@ const PROFILE_SCRIPT: &str = r#"
     };
 
     const recordEvent = (video, name) => {
+        if (profile.finished_at_ms !== null) return;
         if (name === 'playing') activeVideo = video;
         const at = performance.now();
         if (name === 'play' && profile.marks.first_play_ms === null) {
@@ -272,10 +336,8 @@ const RESULT_SCRIPT: &str = r#"
 (async () => {
     const profile = window.__weeb3HlsSmokeProfile;
     if (!profile) return null;
-    clearInterval(window.__weeb3HlsSmokeTimer);
-    window.__weeb3TakeHlsSmokeSample?.();
+    window.__weeb3FinishHlsSmokeProfile();
     window.__weeb3CaptureHlsLogs?.();
-    profile.finished_at_ms = performance.now();
 
     let registrations = [];
     try {
@@ -287,7 +349,8 @@ const RESULT_SCRIPT: &str = r#"
     return JSON.stringify({
         ...profile,
         hls_resources: performance.getEntriesByType('resource')
-            .filter(entry => /\/(?:feeds|hls\/bytes)\//.test(new URL(entry.name).pathname))
+            .filter(entry => entry.responseEnd <= profile.finished_at_ms &&
+                /\/(?:feeds|hls\/bytes)\//.test(new URL(entry.name).pathname))
             .map(entry => ({
                 name: entry.name,
                 initiator_type: entry.initiatorType,
@@ -300,6 +363,9 @@ const RESULT_SCRIPT: &str = r#"
                 decoded_bytes: entry.decodedBodySize
             })),
         document: {
+            video_height: document.querySelector('video')?.videoHeight || null,
+            quality: Array.from(document.querySelector('[data-weeb3-hls-quality]')?.options || [],
+                option => ({label: option.textContent, selected: option.selected})),
             url: location.href,
             title: document.title,
             visibility_state: document.visibilityState,
@@ -322,46 +388,30 @@ const RESULT_SCRIPT: &str = r#"
 
 const PLAYLIST_SCRIPT: &str = r#"
 (async () => {
-    const entries = performance.getEntriesByType('resource')
-        .map(entry => entry.name)
-        .filter(name => {
-            try { return new URL(name).pathname.includes('/feeds/'); }
-            catch (_) { return false; }
-        });
-    const url = entries.at(-1) || null;
-    if (!url) return JSON.stringify(null);
+    const profile = window.__weeb3HlsSmokeProfile;
+    const playlists = [profile.startup_playlist, profile.final_playlist].map(value => value && {...value});
+    const origins = new Map();
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 3000);
     try {
-        const response = await fetch(url, { cache: 'no-store', signal: controller.signal });
-        const text = await response.text();
-        const durations = text.split(/\r?\n/)
-            .filter(line => line.startsWith('#EXTINF:'))
-            .map(line => Number(line.substring(8).split(',', 1)[0]))
-            .filter(Number.isFinite);
-        const references = text.split(/\r?\n/)
-            .filter(line => line && !line.startsWith('#'))
-            .map(line => line.split(/[?#]/, 1)[0].split('/').at(-1));
-        const targetDuration = Number(text.split(/\r?\n/)
-            .find(line => line.startsWith('#EXT-X-TARGETDURATION:'))
-            ?.substring(22));
-        return JSON.stringify({
-            url,
-            observed_at_ms: performance.now(),
-            status: response.status,
-            ok: response.ok,
-            segment_count: durations.length,
-            duration_s: durations.reduce((sum, value) => sum + value, 0),
-            tail_one_s: durations.at(-1) || 0,
-            tail_two_s: durations.slice(-2).reduce((sum, value) => sum + value, 0),
-            tail_three_s: durations.slice(-3).reduce((sum, value) => sum + value, 0),
-            tail_durations_s: durations.slice(-5),
-            tail_references: references.slice(-5),
-            target_duration_s: Number.isFinite(targetDuration) ? targetDuration : null,
-            endlist: text.trimEnd().endsWith('#EXT-X-ENDLIST')
-        });
+        // Resolve dated origins only after resource and playback snapshots are frozen.
+        for (const playlist of playlists.filter(value => value?.dated)) {
+            const originUrl = new URL(playlist.url, location.href);
+            originUrl.search = '?start=beginning&index=0';
+            if (!origins.has(originUrl.href)) {
+                const origin = await fetch(originUrl, {cache: 'no-store', signal: controller.signal});
+                if (!origin.ok) throw new Error(`timeline origin returned ${origin.status}`);
+                origins.set(originUrl.href, Date.parse((await origin.text())
+                    .match(/^#EXT-X-PROGRAM-DATE-TIME:(.+)$/m)?.[1]));
+            }
+            const timelineOffset = (playlist.date_ms - origins.get(originUrl.href)) / 1000;
+            if (!Number.isFinite(timelineOffset) || timelineOffset < 0) throw new Error('invalid dated timeline origin');
+            playlist.timeline_offset_s = timelineOffset;
+            playlist.duration_s += timelineOffset;
+        }
+        return JSON.stringify(playlists);
     } catch (error) {
-        return JSON.stringify({ url, error: String(error?.message || error) });
+        return JSON.stringify(playlists.map(playlist => ({...playlist, error: String(error?.message || error)})));
     } finally {
         clearTimeout(timer);
     }
@@ -459,7 +509,7 @@ struct BrowserProcessResourceSample {
     cpu_delta_ms: u64,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Default, Serialize)]
 struct BrowserResourcePhaseSummary {
     sample_count: usize,
     observed_ms: f64,
@@ -626,12 +676,9 @@ fn sample_browser_process_tree(
             let accumulated = process.accumulated_cpu_time();
             accumulated_cpu_ms = accumulated_cpu_ms.saturating_add(accumulated);
             let identity = (pid.as_u32(), process.start_time());
-            // A process's accumulated value covers its whole lifetime. Establish a
-            // baseline on first observation instead of charging that lifetime to one
-            // 500 ms sample; subsequent samples account for every measured delta.
-            let process_cpu_delta_ms = previous_cpu
-                .insert(identity, accumulated)
-                .map_or(0, |previous| accumulated.saturating_sub(previous));
+            let process_cpu_delta_ms = process_cpu_delta(
+                previous_cpu.insert(identity, accumulated), accumulated, samples.is_empty(),
+            );
             cpu_delta_ms = cpu_delta_ms.saturating_add(process_cpu_delta_ms);
             let (process_type, utility_sub_type) = edge_process_type(process, *pid == root);
             processes.push(BrowserProcessResourceSample {
@@ -664,8 +711,7 @@ fn sample_browser_process_tree(
     loop {
         match receiver.recv_timeout(RESOURCE_SAMPLE_INTERVAL) {
             Ok(ResourceSamplerCommand::MarkSteadyPlayback) => {
-                // Keep phase means separate; peak CPU also includes this closing
-                // sample because playback already started before the command arrived.
+                // Close the startup interval before measuring steady playback.
                 take_sample(phase);
                 phase = ResourcePhase::SteadyPlayback;
             }
@@ -677,6 +723,13 @@ fn sample_browser_process_tree(
         }
     }
     samples
+}
+
+fn process_cpu_delta(previous: Option<u64>, accumulated: u64, initial_sample: bool) -> u64 {
+    // Existing processes establish a baseline; newly observed children contribute
+    // their startup CPU instead of losing all work before their first sample.
+    previous.map_or(if initial_sample { 0 } else { accumulated },
+        |previous| accumulated.saturating_sub(previous))
 }
 
 fn edge_process_type(process: &sysinfo::Process, root: bool) -> (String, Option<String>) {
@@ -735,7 +788,7 @@ fn summarize_browser_resources(
         } else {
             "process virtual memory"
         },
-        steady_peak_cpu_scope: "Maximum whole-sample rate across steady samples and the immediately preceding forced startup-closing sample; that boundary sample overlaps playback and may include pre-playback CPU. Means and memory retain their recorded phase scope.",
+        steady_peak_cpu_scope: "CPU peaks use only intervals of at least 500 ms within each phase; all intervals contribute to means and memory.",
         startup: summarize_resource_phase(&samples, ResourcePhase::Startup, logical_cpu_count),
         steady_playback: summarize_resource_phase(
             &samples,
@@ -786,12 +839,6 @@ fn summarize_resource_phase(
         }
     };
     let average_cpu_cores = (observed_ms > 0.0).then_some(accumulated_cpu_ms as f64 / observed_ms);
-    let playback_boundary = samples.windows(2).find_map(|pair| {
-        (phase == ResourcePhase::SteadyPlayback
-            && pair[0].phase == ResourcePhase::Startup
-            && pair[1].phase == ResourcePhase::SteadyPlayback)
-            .then_some(&pair[0])
-    });
 
     BrowserResourcePhaseSummary {
         sample_count: phase_samples.len(),
@@ -812,9 +859,7 @@ fn summarize_resource_phase(
         average_cpu_cores,
         peak_cpu_cores: phase_samples
             .iter()
-            .copied()
-            .chain(playback_boundary)
-            .filter(|sample| sample.interval_ms > 0.0)
+            .filter(|sample| sample.interval_ms >= RESOURCE_SAMPLE_INTERVAL.as_secs_f64() * 1_000.0)
             .map(|sample| sample.cpu_delta_ms as f64 / sample.interval_ms)
             .reduce(f64::max),
         average_cpu_percent_of_machine: average_cpu_cores
@@ -828,15 +873,9 @@ fn summarize_resource_phase(
 
 fn summarize_hls_efficiency(
     metrics: &Value,
-    playback: &PlaybackSummary,
     steady_resources: &BrowserResourcePhaseSummary,
 ) -> HlsEfficiencySummary {
-    let resources: Vec<&Value> = metrics
-        .get("hls_resources")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .collect();
+    let resources: Vec<&Value> = array_at(metrics, "/hls_resources").iter().collect();
     let all_start_ms = resources
         .iter()
         .filter_map(|resource| number_at(resource, "/start_ms"))
@@ -848,29 +887,33 @@ fn summarize_hls_efficiency(
     let all_observed_ms = all_start_ms
         .zip(all_end_ms)
         .map_or(0.0, |(start, end)| (end - start).max(0.0));
-    let first_playing_ms = number_at(metrics, "/marks/first_confirmed_playback_ms");
-    let steady_end_ms = first_playing_ms.map(|start| start + steady_resources.observed_ms);
+    let steady_start_ms = number_at(metrics, "/resource_window/start_ms");
+    let steady_end_ms = number_at(metrics, "/resource_window/end_ms");
+    let observed_ms = steady_start_ms.zip(steady_end_ms)
+        .map_or(0.0, |(start, end)| (end - start).max(0.0));
     let completed_during_steady: Vec<&Value> = resources
         .iter()
         .copied()
         .filter(|resource| {
             number_at(resource, "/response_end_ms").is_some_and(|completed| {
-                first_playing_ms.is_some_and(|start| completed >= start)
+                steady_start_ms.is_some_and(|start| completed >= start)
                     && steady_end_ms.is_some_and(|end| completed <= end)
             })
         })
         .collect();
     let all_hls_responses = summarize_transfer_window(&resources, all_observed_ms);
     let steady_playback =
-        summarize_transfer_window(&completed_during_steady, steady_resources.observed_ms);
+        summarize_transfer_window(&completed_during_steady, observed_ms);
     let cpu_seconds = steady_resources.accumulated_cpu_ms as f64 / 1_000.0;
     let encoded_mib = steady_playback.encoded_bytes as f64 / (1024.0 * 1024.0);
-    let buffer_growth_s = playback
-        .start_buffer_s
-        .zip(playback.final_buffer_s)
+    let start = metrics.pointer("/resource_window/start_sample");
+    let end = array_at(metrics, "/samples").last();
+    let values = |path| start.and_then(|sample| number_at(sample, path))
+        .zip(end.and_then(|sample| number_at(sample, path)));
+    let buffer_growth_s = values("/forward_buffer_s")
         .map(|(start, end)| end - start);
-    let media_plus_buffer_growth_s =
-        buffer_growth_s.map(|growth| playback.media_advance_s + growth);
+    let media_plus_buffer_growth_s = buffer_growth_s.zip(values("/current_time_s"))
+        .map(|(growth, (start, end))| (end - start).max(0.0) + growth);
 
     HlsEfficiencySummary {
         all_hls_responses,
@@ -905,7 +948,7 @@ fn summarize_transfer_window(resources: &[&Value], observed_ms: f64) -> Transfer
     }
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Default, Serialize)]
 struct PlaybackSummary {
     first_play_event_ms: Option<f64>,
     first_presented_frame_ms: Option<f64>,
@@ -947,7 +990,7 @@ fn weeb3_hls_profile() -> Result<()> {
         return Ok(());
     };
     let live_target = target_url.contains("/live/") || target_url.contains("start=live");
-    let npm_target = target_url.contains("/hls-stream-example.html");
+    let npm_target = env_bool("WEEB3_HLS_EMBEDDED", target_url.contains("/hls-stream-example.html"));
 
     let profile_seconds = env_u64("WEEB3_HLS_PROFILE_SECONDS", DEFAULT_PROFILE_SECONDS)?;
     if profile_seconds == 0 {
@@ -957,6 +1000,7 @@ fn weeb3_hls_profile() -> Result<()> {
     let max_stall_ms = env_u64("WEEB3_HLS_MAX_STALL_MS", DEFAULT_MAX_STALL_MS)?;
     let minimum_progress_ratio = env_f64("WEEB3_HLS_MIN_PROGRESS_RATIO", 0.75)?;
     let seek_seconds = env_optional_f64("WEEB3_HLS_SEEK_SECONDS")?;
+    let switch_quality = env_bool("WEEB3_HLS_SWITCH_QUALITY", false);
     let connection_validation =
         env::var("WEEB3_HLS_CONNECTION_VALIDATION").unwrap_or_else(|_| "page_cdp".to_string());
     let shared_worker_connection_logs = match connection_validation.as_str() {
@@ -993,6 +1037,10 @@ fn weeb3_hls_profile() -> Result<()> {
     let tab = browser
         .new_tab()
         .map_err(|error| anyhow!("failed to open HLS profile tab: {error:?}"))?;
+    let other_tabs = browser.get_tabs().lock().unwrap().clone();
+    for other in other_tabs.iter().filter(|other| other.get_target_id() != tab.get_target_id()) {
+        other.close(false).map_err(|error| anyhow!("failed to close Edge's initial tab: {error:?}"))?;
+    }
     tab.set_default_timeout(timeout);
 
     tab.call_method(EnableNetwork {
@@ -1031,54 +1079,45 @@ fn weeb3_hls_profile() -> Result<()> {
     let event_websocket_handshake_times = Arc::clone(&websocket_handshake_times);
     let event_hls_network = Arc::clone(&hls_network);
     let _network_listener = tab
-        .add_event_listener(Arc::new(move |event: &Event| match event {
-            Event::NetworkWebSocketCreated(_)
+        .add_event_listener(Arc::new(move |event: &Event| {
+            let record = |target: &Mutex<Vec<f64>>| {
                 if let Ok(started) = event_navigation_start.lock()
                     && let Some(started) = *started
-                    && let Ok(mut times) = event_websocket_times.lock() =>
-            {
-                times.push(started.elapsed().as_secs_f64() * 1_000.0);
-            }
-            Event::NetworkWebSocketWillSendHandshakeRequest(_)
-                if let Ok(started) = event_navigation_start.lock()
-                    && let Some(started) = *started
-                    && let Ok(mut times) = event_websocket_request_times.lock() =>
-            {
-                times.push(started.elapsed().as_secs_f64() * 1_000.0);
-            }
-            Event::NetworkWebSocketHandshakeResponseReceived(_)
-                if let Ok(started) = event_navigation_start.lock()
-                    && let Some(started) = *started
-                    && let Ok(mut times) = event_websocket_handshake_times.lock() =>
-            {
-                times.push(started.elapsed().as_secs_f64() * 1_000.0);
-            }
-            Event::NetworkResponseReceived(event)
-                if event.params.response.url.contains("/feeds/")
-                    || event.params.response.url.contains("/hls/bytes/") =>
-            {
-                if let Ok(mut events) = event_hls_network.lock() {
-                    events.push(json!({
-                        "kind": "response",
-                        "request_id": event.params.request_id,
-                        "url": event.params.response.url,
-                        "status": event.params.response.status,
-                        "mime_type": event.params.response.mime_type,
-                        "from_service_worker": event.params.response.from_service_worker
-                    }));
+                    && let Ok(mut times) = target.lock() {
+                    times.push(started.elapsed().as_secs_f64() * 1_000.0);
                 }
-            }
-            Event::NetworkLoadingFailed(event) => {
-                if let Ok(mut events) = event_hls_network.lock() {
-                    events.push(json!({
-                        "kind": "failed",
-                        "request_id": event.params.request_id,
-                        "error": event.params.error_text,
-                        "canceled": event.params.canceled
-                    }));
+            };
+            match event {
+                Event::NetworkWebSocketCreated(_) => record(&event_websocket_times),
+                Event::NetworkWebSocketWillSendHandshakeRequest(_) => record(&event_websocket_request_times),
+                Event::NetworkWebSocketHandshakeResponseReceived(_) => record(&event_websocket_handshake_times),
+                Event::NetworkResponseReceived(event)
+                    if event.params.response.url.contains("/feeds/")
+                        || event.params.response.url.contains("/hls/bytes/") =>
+                {
+                    if let Ok(mut events) = event_hls_network.lock() {
+                        events.push(json!({
+                            "kind": "response",
+                            "request_id": event.params.request_id,
+                            "url": event.params.response.url,
+                            "status": event.params.response.status,
+                            "mime_type": event.params.response.mime_type,
+                            "from_service_worker": event.params.response.from_service_worker
+                        }));
+                    }
                 }
+                Event::NetworkLoadingFailed(event) => {
+                    if let Ok(mut events) = event_hls_network.lock() {
+                        events.push(json!({
+                            "kind": "failed",
+                            "request_id": event.params.request_id,
+                            "error": event.params.error_text,
+                            "canceled": event.params.canceled
+                        }));
+                    }
+                }
+                _ => {}
             }
-            _ => {}
         }))
         .map_err(|error| anyhow!("failed to observe WebSocket creation: {error:?}"))?;
 
@@ -1095,7 +1134,6 @@ fn weeb3_hls_profile() -> Result<()> {
     // the required startup threshold remains five seconds by default.
     let startup_observation_ms = max_startup_ms.saturating_add(10_000);
     let cold_playing = wait_for_first_playing(&tab, Duration::from_millis(startup_observation_ms))?;
-    let startup_playlist = evaluate_playlist(&tab)?;
     let playing = if let (Some(_), Some(position)) = (cold_playing, seek_seconds) {
         wait_for_seekable_position(&tab, position, Duration::from_secs(30))?;
         begin_seek_profile(&tab, position)?;
@@ -1104,13 +1142,39 @@ fn weeb3_hls_profile() -> Result<()> {
         cold_playing
     };
     if playing.is_some() {
+        tab.evaluate("window.__weeb3BeginHlsResourceProfile()", false)?;
         resource_sampler.mark_steady_playback()?;
+        if switch_quality {
+            tab.evaluate(r#"(() => {
+                const video = document.querySelector('video');
+                const select = document.querySelector('[data-weeb3-hls-quality]');
+                const options = Array.from(select?.options || []).map(option =>
+                    ({option, height: Number(option.textContent.match(/^(\d+)p/)?.[1])}))
+                    .filter(item => item.height > 0).sort((a, b) => b.height - a.height);
+                const target = options.find(item => item.height !== video.videoHeight);
+                if (!target) throw new Error('no alternative quality is available');
+                if (!video.requestVideoFrameCallback) throw new Error('Edge cannot observe presented video frames');
+                const change = window.__weeb3HlsSmokeProfile.quality_switch = {
+                    started_ms: performance.now(), from_height: video.videoHeight, height: target.height
+                };
+                const frame = (now, metadata) => {
+                    if (metadata.height === change.height) change.first_frame_ms = now;
+                    else video.requestVideoFrameCallback(frame);
+                };
+                video.requestVideoFrameCallback(frame);
+                select.value = target.option.value;
+                select.dispatchEvent(new Event('change'));
+            })()"#, false)?;
+        }
         thread::sleep(Duration::from_secs(profile_seconds));
     }
+    tab.evaluate("window.__weeb3FinishHlsSmokeProfile()", false)?;
     let resource_usage = resource_sampler.finish()?;
 
-    let final_playlist = evaluate_playlist(&tab)?;
-    let browser_metrics = evaluate_profile(&tab)?;
+    let browser_metrics = evaluate_json(&tab, RESULT_SCRIPT, "HLS profile")?;
+    let playlists = evaluate_json(&tab, PLAYLIST_SCRIPT, "observed HLS playlists")?;
+    let startup_playlist = &playlists[0];
+    let final_playlist = &playlists[1];
     let browser_targets = match tab.call_method(GetTargets { filter: None }) {
         Ok(snapshot) => json!({
             "captured_after_playback": true,
@@ -1121,7 +1185,7 @@ fn weeb3_hls_profile() -> Result<()> {
             "error": format!("{error:?}")
         }),
     };
-    let served_assets = evaluate_served_asset_provenance(&tab)?;
+    let served_assets = evaluate_json(&tab, SERVED_ASSET_PROVENANCE_SCRIPT, "served asset provenance")?;
     let socket_times = websocket_times
         .lock()
         .map_err(|_| anyhow!("WebSocket timing lock was poisoned"))?
@@ -1145,7 +1209,7 @@ fn weeb3_hls_profile() -> Result<()> {
         .clone();
     let playback = summarize_playback(&browser_metrics, profile_seconds as f64);
     let efficiency =
-        summarize_hls_efficiency(&browser_metrics, &playback, &resource_usage.steady_playback);
+        summarize_hls_efficiency(&browser_metrics, &resource_usage.steady_playback);
     let usable_connections = summarize_usable_connections(&browser_metrics);
     let provenance = collect_run_provenance(served_assets)?;
 
@@ -1155,6 +1219,7 @@ fn weeb3_hls_profile() -> Result<()> {
         "seek_seconds": seek_seconds,
         "requested_playback_seconds": profile_seconds,
         "requirements": {
+            "gpu_enabled": env_bool("WEEB3_ENABLE_GPU", false),
             "max_startup_ms": max_startup_ms,
             "max_stall_ms": max_stall_ms,
             "minimum_progress_ratio": minimum_progress_ratio,
@@ -1221,13 +1286,24 @@ fn weeb3_hls_profile() -> Result<()> {
         ));
     }
     validate_browser_environment(&browser_metrics, !npm_target)?;
+    if switch_quality && number_at(&browser_metrics, "/quality_switch/first_frame_ms").is_none() {
+        return Err(anyhow!("the selected resolution never presented a video frame"));
+    }
     validate_playlist_position(
         &playback,
         &startup_playlist,
         &final_playlist,
+        browser_metrics.get("hls_open_log").and_then(Value::as_str),
         !live_target || seek_seconds.is_some(),
     )?;
-    if shared_worker_connection_logs {
+    if npm_target {
+        let targets = report.pointer("/browser_targets/target_infos").and_then(Value::as_array)
+            .ok_or_else(|| anyhow!("embedded playback did not expose browser targets"))?;
+        if !targets.iter().any(|target| target["type"] == "shared_worker"
+            && target["url"].as_str().is_some_and(|url| url.contains("/weeb-3/worker.js"))) {
+            return Err(anyhow!("embedded playback did not use the shared Swarm worker"));
+        }
+    } else if shared_worker_connection_logs {
         println!(
             "SharedWorker socket construction is outside page-target CDP; explicitly validating timestamped usable-connection logs"
         );
@@ -1308,37 +1384,12 @@ fn wait_for_seekable_position(
     }
 }
 
-fn evaluate_profile(tab: &headless_chrome::browser::tab::Tab) -> Result<Value> {
-    let remote = tab
-        .evaluate(RESULT_SCRIPT, true)
-        .map_err(|error| anyhow!("failed to read HLS profile: {error:?}"))?;
-    let raw = remote
-        .value
-        .and_then(|value| value.as_str().map(ToOwned::to_owned))
-        .ok_or_else(|| anyhow!("Edge did not return HLS profile JSON"))?;
-    serde_json::from_str(&raw).context("failed to parse HLS profile JSON")
-}
-
-fn evaluate_served_asset_provenance(tab: &headless_chrome::browser::tab::Tab) -> Result<Value> {
-    let remote = tab
-        .evaluate(SERVED_ASSET_PROVENANCE_SCRIPT, true)
-        .map_err(|error| anyhow!("failed to inspect served asset provenance: {error:?}"))?;
-    let raw = remote
-        .value
-        .and_then(|value| value.as_str().map(ToOwned::to_owned))
-        .ok_or_else(|| anyhow!("Edge did not return served asset provenance JSON"))?;
-    serde_json::from_str(&raw).context("failed to parse served asset provenance JSON")
-}
-
-fn evaluate_playlist(tab: &headless_chrome::browser::tab::Tab) -> Result<Value> {
-    let remote = tab
-        .evaluate(PLAYLIST_SCRIPT, true)
-        .map_err(|error| anyhow!("failed to inspect the rendered HLS playlist: {error:?}"))?;
-    let raw = remote
-        .value
-        .and_then(|value| value.as_str().map(ToOwned::to_owned))
-        .ok_or_else(|| anyhow!("Edge did not return rendered HLS playlist JSON"))?;
-    serde_json::from_str(&raw).context("failed to parse rendered HLS playlist JSON")
+fn evaluate_json(tab: &headless_chrome::browser::tab::Tab, script: &str, label: &str) -> Result<Value> {
+    let value = tab.evaluate(script, true)
+        .map_err(|error| anyhow!("failed to inspect {label}: {error:?}"))?
+        .value.ok_or_else(|| anyhow!("Edge did not return {label} JSON"))?;
+    let raw = value.as_str().ok_or_else(|| anyhow!("Edge did not return {label} JSON"))?;
+    serde_json::from_str(raw).with_context(|| format!("failed to parse {label} JSON"))
 }
 
 fn summarize_playback(metrics: &Value, requested_seconds: f64) -> PlaybackSummary {
@@ -1350,15 +1401,10 @@ fn summarize_playback(metrics: &Value, requested_seconds: f64) -> PlaybackSummar
     let first_playing_at = number_at(metrics, "/marks/first_confirmed_playback_ms");
     let first_playing_ms = first_playing_at.map(|at| (at - phase_started_ms).max(0.0));
     let first_media_time_s = number_at(metrics, "/marks/first_confirmed_playback_current_time_s");
-    let samples: Vec<&Value> = metrics
-        .get("samples")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
+    let samples: Vec<&Value> = array_at(metrics, "/samples")
+        .iter()
         .filter(|sample| {
-            sample
-                .get("at_ms")
-                .and_then(Value::as_f64)
+            number_at(sample, "/at_ms")
                 .is_some_and(|at| first_playing_at.is_some_and(|first| at + 0.001 >= first))
         })
         .collect();
@@ -1366,10 +1412,10 @@ fn summarize_playback(metrics: &Value, requested_seconds: f64) -> PlaybackSummar
     let final_media_time_s = samples
         .iter()
         .rev()
-        .find_map(|sample| sample.get("current_time_s").and_then(Value::as_f64));
+        .find_map(|sample| number_at(sample, "/current_time_s"));
     let observed_after_playing_ms = samples
         .last()
-        .and_then(|sample| sample.get("at_ms").and_then(Value::as_f64))
+        .and_then(|sample| number_at(sample, "/at_ms"))
         .zip(first_playing_at)
         .map_or(0.0, |(last, first)| (last - first).max(0.0));
     let media_advance_s = final_media_time_s
@@ -1385,10 +1431,10 @@ fn summarize_playback(metrics: &Value, requested_seconds: f64) -> PlaybackSummar
     let mut previous_at = first_playing_at;
     let mut previous_duration: Option<f64> = None;
     for sample in &samples {
-        let Some(at) = sample.get("at_ms").and_then(Value::as_f64) else {
+        let Some(at) = number_at(sample, "/at_ms") else {
             continue;
         };
-        let Some(current) = sample.get("current_time_s").and_then(Value::as_f64) else {
+        let Some(current) = number_at(sample, "/current_time_s") else {
             continue;
         };
         if let Some(previous) = last_time {
@@ -1396,10 +1442,7 @@ fn summarize_playback(metrics: &Value, requested_seconds: f64) -> PlaybackSummar
                 last_progress_at = at;
                 let expected = previous_at.map_or(0.0, |previous_at| {
                     ((at - previous_at).max(0.0) / 1_000.0)
-                        * sample
-                            .get("playback_rate")
-                            .and_then(Value::as_f64)
-                            .unwrap_or(1.0)
+                        * number_at(sample, "/playback_rate").unwrap_or(1.0)
                 });
                 if current - previous > expected + 0.75 {
                     timeline_forward_jumps += 1;
@@ -1409,7 +1452,7 @@ fn summarize_playback(metrics: &Value, requested_seconds: f64) -> PlaybackSummar
                 last_progress_at = at;
             }
         }
-        if let Some(duration) = sample.get("duration_s").and_then(Value::as_f64) {
+        if let Some(duration) = number_at(sample, "/duration_s") {
             if previous_duration.is_some_and(|previous| duration < previous - 0.25) {
                 duration_regressions += 1;
             }
@@ -1421,85 +1464,52 @@ fn summarize_playback(metrics: &Value, requested_seconds: f64) -> PlaybackSummar
     }
 
     let event_count = |name: &str| {
-        metrics
-            .get("events")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
+        array_at(metrics, "/events")
+            .iter()
             .filter(|event| {
                 event.get("name").and_then(Value::as_str) == Some(name)
-                    && event
+                    && (!matches!(name, "waiting" | "stalled") || event
                         .get("ready_state")
                         .and_then(Value::as_u64)
-                        .is_none_or(|ready| ready < 3)
-                    && event
-                        .get("at_ms")
-                        .and_then(Value::as_f64)
+                        .is_none_or(|ready| ready < 3))
+                    && number_at(event, "/at_ms")
                         .is_some_and(|at| first_playing_at.is_some_and(|first| at + 0.001 >= first))
             })
             .count()
     };
-    let media_error_events = metrics
-        .get("events")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
+    let media_error_events = array_at(metrics, "/events")
+        .iter()
         .filter(|event| event.get("error").is_some_and(|error| !error.is_null()))
         .count();
 
-    let sample_number = |sample: Option<&&Value>, field: &str| {
-        sample
-            .and_then(|value| value.get(field))
-            .and_then(Value::as_f64)
+    let sample_number = |sample: Option<&&Value>, pointer: &str| {
+        sample.and_then(|value| number_at(value, pointer))
     };
     let start = samples.first();
     let end = samples.last();
     let maximum_buffer_s = samples
         .iter()
-        .filter_map(|sample| sample.get("forward_buffer_s").and_then(Value::as_f64))
+        .filter_map(|sample| number_at(sample, "/forward_buffer_s"))
         .reduce(f64::max);
     let minimum_buffer_s = samples
         .iter()
-        .filter_map(|sample| sample.get("forward_buffer_s").and_then(Value::as_f64))
+        .filter_map(|sample| number_at(sample, "/forward_buffer_s"))
         .reduce(f64::min);
-    let early_limit = first_playing_at.map(|first| first + 10_000.0);
-    let late_limit = samples
-        .last()
-        .and_then(|sample| sample.get("at_ms").and_then(Value::as_f64))
-        .map(|last| last - 10_000.0);
-    let minute_window = first_playing_at.map(|first| (first + 50_000.0, first + 60_000.0));
-    let low_water = |late: bool| {
+    let low_water = |window: Option<(f64, f64)>| {
         samples
             .iter()
             .filter(|sample| {
-                sample
-                    .get("at_ms")
-                    .and_then(Value::as_f64)
-                    .is_some_and(|at| {
-                        if late {
-                            late_limit.is_some_and(|limit| at >= limit)
-                        } else {
-                            early_limit.is_some_and(|limit| at <= limit)
-                        }
-                    })
+                number_at(sample, "/at_ms")
+                    .is_some_and(|at| window.is_some_and(|(start, end)| at >= start && at <= end))
             })
-            .filter_map(|sample| sample.get("forward_buffer_s").and_then(Value::as_f64))
+            .filter_map(|sample| number_at(sample, "/forward_buffer_s"))
             .reduce(f64::min)
     };
-    let early_low_water_s = low_water(false);
-    let late_low_water_s = low_water(true);
-    let minute_low_water_s = samples
-        .iter()
-        .filter(|sample| {
-            sample
-                .get("at_ms")
-                .and_then(Value::as_f64)
-                .is_some_and(|at| {
-                    minute_window.is_some_and(|(start, end)| at >= start && at <= end)
-                })
-        })
-        .filter_map(|sample| sample.get("forward_buffer_s").and_then(Value::as_f64))
-        .reduce(f64::min);
+    let early_low_water_s = low_water(first_playing_at.map(|first| (f64::NEG_INFINITY, first + 10_000.0)));
+    let late_low_water_s = low_water(samples.last()
+        .and_then(|sample| number_at(sample, "/at_ms"))
+        .map(|last| (last - 10_000.0, f64::INFINITY)));
+    let minute_low_water_s = low_water(first_playing_at.map(|first| (first + 50_000.0, first + 60_000.0)));
 
     PlaybackSummary {
         first_play_event_ms,
@@ -1526,8 +1536,8 @@ fn summarize_playback(metrics: &Value, requested_seconds: f64) -> PlaybackSummar
             .count(),
         ended_events: event_count("ended"),
         media_error_events,
-        start_buffer_s: sample_number(start, "forward_buffer_s"),
-        final_buffer_s: sample_number(end, "forward_buffer_s"),
+        start_buffer_s: sample_number(start, "/forward_buffer_s"),
+        final_buffer_s: sample_number(end, "/forward_buffer_s"),
         minimum_buffer_s,
         maximum_buffer_s,
         early_low_water_s,
@@ -1539,8 +1549,8 @@ fn summarize_playback(metrics: &Value, requested_seconds: f64) -> PlaybackSummar
         post_minute_low_water_trend_s: minute_low_water_s
             .zip(late_low_water_s)
             .map(|(minute, late)| late - minute),
-        start_duration_s: sample_number(start, "duration_s"),
-        final_duration_s: sample_number(end, "duration_s"),
+        start_duration_s: sample_number(start, "/duration_s"),
+        final_duration_s: sample_number(end, "/duration_s"),
     }
 }
 
@@ -1579,11 +1589,8 @@ fn summarize_usable_connections(metrics: &Value) -> UsableConnectionSummary {
 
 fn usable_connection_times(metrics: &Value) -> Vec<f64> {
     let mut ready_by_overlay = HashMap::<String, f64>::new();
-    for line in metrics
-        .get("connection_logs")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
+    for line in array_at(metrics, "/connection_logs")
+        .iter()
         .filter_map(Value::as_str)
     {
         let Some((ready_ms, overlay)) = parse_usable_connection_log(line) else {
@@ -1686,23 +1693,14 @@ fn validate_playback(
         ));
     }
     if require_buffer_growth {
-        let trend = summary
-            .low_water_trend_s
-            .ok_or_else(|| anyhow!("HLS buffer trend could not be measured"))?;
-        if trend < -0.25 {
-            return Err(anyhow!(
-                "HLS late buffer low-water decreased by {:.3}s",
-                -trend
-            ));
-        }
-        let post_minute_trend = summary
-            .post_minute_low_water_trend_s
-            .ok_or_else(|| anyhow!("HLS post-minute buffer trend could not be measured"))?;
-        if post_minute_trend < -0.25 {
-            return Err(anyhow!(
-                "HLS buffer low-water decreased by {:.3}s after one minute",
-                -post_minute_trend
-            ));
+        for (trend, period, missing) in [
+            (summary.low_water_trend_s, "late", "HLS buffer trend could not be measured"),
+            (summary.post_minute_low_water_trend_s, "post-minute", "HLS post-minute buffer trend could not be measured"),
+        ] {
+            let trend = trend.ok_or_else(|| anyhow!(missing))?;
+            if trend < -0.25 {
+                return Err(anyhow!("HLS {period} buffer low-water decreased by {:.3}s", -trend));
+            }
         }
         if summary
             .final_buffer_s
@@ -1723,6 +1721,7 @@ fn validate_playlist_position(
     summary: &PlaybackSummary,
     playlist: &Value,
     final_playlist: &Value,
+    open_log: Option<&str>,
     beginning: bool,
 ) -> Result<()> {
     let object = playlist
@@ -1746,25 +1745,18 @@ fn validate_playlist_position(
             "startup HLS playlist exposed only {segment_count} segment(s)"
         ));
     }
-    let playlist_duration = object
-        .get("duration_s")
-        .and_then(Value::as_f64)
-        .filter(|duration| duration.is_finite() && *duration > 0.0)
+    let positive = |name: &str| object.get(name).and_then(Value::as_f64)
+        .filter(|value| value.is_finite() && *value > 0.0);
+    let playlist_duration = positive("duration_s")
         .ok_or_else(|| anyhow!("startup HLS playlist had no finite elapsed duration"))?;
     let displayed_duration = summary
         .start_duration_s
         .filter(|duration| duration.is_finite() && *duration > 0.0)
         .ok_or_else(|| anyhow!("the player had no finite elapsed duration at playback start"))?;
-    let target_duration = object
-        .get("target_duration_s")
-        .and_then(Value::as_f64)
-        .filter(|duration| duration.is_finite() && *duration > 0.0)
-        .unwrap_or(5.0);
+    let target_duration = positive("target_duration_s").unwrap_or(5.0);
 
-    // The independent fetch happens immediately after the first presented frame.
-    // A growing feed may append once while that request is in flight, and MSE may
-    // expose container PTS slightly beyond EXTINF. Either clock must remain within
-    // one target-duration update of the other.
+    // The actual player manifest and MSE may differ by one feed update, and MSE
+    // may expose container PTS slightly beyond EXTINF.
     let elapsed_tolerance = target_duration + 0.5;
     let elapsed_gap = playlist_duration - displayed_duration;
     if !beginning && elapsed_gap.abs() > elapsed_tolerance {
@@ -1797,39 +1789,27 @@ fn validate_playlist_position(
     }
 
     if !beginning {
-        let tail_one = object
-            .get("tail_one_s")
-            .and_then(Value::as_f64)
-            .filter(|duration| duration.is_finite() && *duration > 0.0)
-            .ok_or_else(|| anyhow!("startup HLS playlist had no live tail segment"))?;
-        let tail_two = object
-            .get("tail_two_s")
-            .and_then(Value::as_f64)
-            .filter(|duration| duration.is_finite() && *duration > tail_one)
-            .ok_or_else(|| anyhow!("startup HLS playlist had no two-segment live edge"))?;
-        let tail_three = object
-            .get("tail_three_s")
-            .and_then(Value::as_f64)
-            .filter(|duration| duration.is_finite() && *duration > tail_two)
-            .ok_or_else(|| anyhow!("startup HLS playlist had no three-segment live edge"))?;
         let actual_position = summary
             .first_media_time_s
             .ok_or_else(|| anyhow!("live playback had no initial media position"))?;
-        let expected = (displayed_duration - tail_three).max(0.0);
-        if (actual_position - expected).abs() > 1.0 {
+        // The live plan fixes its edge at open; a publication may extend MSE
+        // duration before the first frame without changing that playback position.
+        let opened_duration = open_log.and_then(|log| log.split_once("elapsed="))
+            .and_then(|(_, tail)| tail.split('s').next()?.parse::<f64>().ok())
+            .filter(|duration| duration.is_finite() && *duration > 0.0);
+        let expected = (opened_duration.unwrap_or(displayed_duration) - 16.0).max(0.0);
+        let (behind, ahead) = if opened_duration.is_some() { (target_duration + 1.0, 1.0) }
+            else { (target_duration + elapsed_tolerance, elapsed_tolerance) };
+        if expected - actual_position > behind || actual_position - expected > ahead {
             return Err(anyhow!(
-                "live playback did not start two segments behind its edge: position={actual_position:.3}s, expected={expected:.3}s"
+                "live playback did not start at its playable runway: position={actual_position:.3}s, expected={expected:.3}s"
             ));
         }
-        let start_buffer = summary
-            .start_buffer_s
-            .filter(|duration| duration.is_finite() && *duration >= 0.0)
-            .ok_or_else(|| anyhow!("live playback had no measurable startup runway"))?;
-        let current_segment = tail_three - tail_two;
-        if start_buffer + 0.75 < current_segment {
-            return Err(anyhow!(
-                "live playback started without one buffered segment: buffered={start_buffer:.3}s, segment={current_segment:.3}s"
-            ));
+        // Start may round backward to a segment; native playback can precede a full reserve.
+        // Available timeline and actual appended buffer remain separate; position
+        // and measured buffer are separate requirements, recorded in the report.
+        if summary.start_buffer_s.is_none_or(|seconds| !seconds.is_finite() || seconds <= 0.0) {
+            return Err(anyhow!("live playback had no positive startup buffer"));
         }
     }
     Ok(())
@@ -1845,10 +1825,7 @@ fn validate_browser_environment(metrics: &Value, require_interface_log: bool) ->
             "the cold playback page was not controlled by its service worker"
         ));
     }
-    let page_errors = metrics
-        .get("page_errors")
-        .and_then(Value::as_array)
-        .map_or(0, Vec::len);
+    let page_errors = array_at(metrics, "/page_errors").len();
     if page_errors != 0 {
         return Err(anyhow!(
             "the playback page reported {page_errors} JavaScript error(s)"
@@ -1864,11 +1841,8 @@ fn validate_browser_environment(metrics: &Value, require_interface_log: bool) ->
         .get("hls_open_log")
         .and_then(Value::as_str)
         .is_some_and(|line| line.contains("HLS open index=") && line.contains("elapsed="))
-        || metrics
-            .get("interface_logs")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
+        || array_at(metrics, "/interface_logs")
+            .iter()
             .filter_map(Value::as_str)
             .any(|line| line.contains("HLS open index=") && line.contains("elapsed="));
     if require_interface_log && !opened {
@@ -1931,6 +1905,10 @@ fn validate_shared_worker_connections(
 
 fn number_at(value: &Value, pointer: &str) -> Option<f64> {
     value.pointer(pointer).and_then(Value::as_f64)
+}
+
+fn array_at<'a>(value: &'a Value, pointer: &str) -> &'a [Value] {
+    value.pointer(pointer).and_then(Value::as_array).map_or(&[], Vec::as_slice)
 }
 
 fn summary_position_error(summary: &PlaybackSummary, requested: f64) -> f64 {
@@ -2029,10 +2007,7 @@ fn file_provenance(path: &Path) -> Result<FileProvenance> {
         .with_context(|| format!("failed to hash profile artifact {}", path.display()))?;
     let metadata = fs::metadata(path)
         .with_context(|| format!("failed to inspect profile artifact {}", path.display()))?;
-    let sha3_256 = Sha3_256::digest(&bytes)
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect();
+    let sha3_256 = hex::encode(Sha3_256::digest(&bytes));
     let modified_unix_ms = metadata
         .modified()
         .ok()
@@ -2065,6 +2040,7 @@ fn launch_fresh_edge(timeout: Duration) -> Result<Browser> {
     builder
         .path(Some(edge))
         .headless(!env_bool("WEEB3_HEADFUL", false))
+        .enable_gpu(env_bool("WEEB3_ENABLE_GPU", false))
         .ignore_certificate_errors(ignore_certificate_errors)
         .sandbox(!env_bool("WEEB3_CHROME_NO_SANDBOX", true))
         .window_size(Some((1280, 720)))
@@ -2186,18 +2162,49 @@ mod tests {
             ],
             "events": [
                 {"at_ms": 2_000.0, "name": "waiting", "ready_state": 2, "error": null},
-                {"at_ms": 2_500.0, "name": "waiting", "ready_state": 4, "error": null}
+                {"at_ms": 2_500.0, "name": "waiting", "ready_state": 4, "error": null},
+                {"at_ms": 3_500.0, "name": "ended", "ready_state": 4, "error": null}
             ]
         });
         let summary = summarize_playback(&metrics, 3.0);
         assert_eq!(summary.media_advance_s, 2.5);
         assert_eq!(summary.max_stagnant_ms, 1_500.0);
         assert_eq!(summary.waiting_events, 1);
+        assert_eq!(summary.ended_events, 1);
         assert_eq!(summary.timeline_forward_jumps, 1);
         assert_eq!(summary.start_duration_s, Some(50.0));
         assert_eq!(summary.final_duration_s, Some(54.0));
     }
 
+    #[test]
+    fn live_position_allows_segment_rounding_and_keeps_its_open_edge() {
+        for (segment, dated, tail) in [(1.0_f64, true, 3.0), (2.0, true, 6.0),
+            (4.167, false, 12.501), (20.0, false, 60.0)] {
+            let playlist = json!({"ok": true, "segment_count": 32, "duration_s": 6064.0,
+                "target_duration_s": segment.ceil(), "dated": dated,
+                "tail_one_s": segment, "tail_two_s": 2.0 * segment, "tail_three_s": tail});
+            let mut summary = PlaybackSummary {
+                first_media_time_s: Some(6046.18), start_duration_s: Some(6064.017),
+                final_duration_s: Some(6064.017), start_buffer_s: Some(0.1),
+                ..Default::default()
+            };
+            let open = Some("[+6044ms] HLS open index=3030 elapsed=6062.000s mode=live");
+            validate_playlist_position(&summary, &playlist, &playlist, open, false).unwrap();
+            summary.first_media_time_s = Some((6046.0 / segment).floor() * segment + 0.18);
+            validate_playlist_position(&summary, &playlist, &playlist, open, false).unwrap();
+            summary.first_media_time_s = Some(6048.18);
+            validate_playlist_position(&summary, &playlist, &playlist, None, false).unwrap();
+            for position in [6046.0 - segment.ceil() - 1.5, 6048.0, 6050.0, 6062.0 - tail] {
+                summary.first_media_time_s = Some(position);
+                assert!(validate_playlist_position(&summary, &playlist, &playlist, open, false).is_err());
+            }
+            summary.first_media_time_s = Some(6046.18);
+            for buffer in [None, Some(0.0), Some(f64::NAN)] {
+                summary.start_buffer_s = buffer;
+                assert!(validate_playlist_position(&summary, &playlist, &playlist, open, false).is_err());
+            }
+        }
+    }
     #[test]
     fn websocket_burst_uses_the_first_attempt_as_its_origin() {
         let times: Vec<f64> = (0..160).map(|index| 700.0 + index as f64 * 0.8).collect();
@@ -2210,63 +2217,48 @@ mod tests {
 
     #[test]
     fn resource_phase_summary_is_time_weighted_and_uses_cpu_time() {
+        let sample = |at_ms, interval_ms, phase, process_count,
+            memory: (u64, u64), cpu: (u64, u64)| BrowserResourceSample {
+            at_ms, interval_ms, phase, process_count,
+            resident_bytes: memory.0, private_equivalent_bytes: memory.1,
+            accumulated_cpu_ms: cpu.0, cpu_delta_ms: cpu.1, processes: Vec::new(),
+        };
         let samples = vec![
-            BrowserResourceSample {
-                at_ms: 100.0,
-                interval_ms: 100.0,
-                phase: ResourcePhase::Startup,
-                process_count: 3,
-                resident_bytes: 100,
-                private_equivalent_bytes: 200,
-                accumulated_cpu_ms: 20,
-                cpu_delta_ms: 20,
-                processes: Vec::new(),
-            },
-            BrowserResourceSample {
-                at_ms: 400.0,
-                interval_ms: 300.0,
-                phase: ResourcePhase::Startup,
-                process_count: 4,
-                resident_bytes: 300,
-                private_equivalent_bytes: 400,
-                accumulated_cpu_ms: 50,
-                cpu_delta_ms: 30,
-                processes: Vec::new(),
-            },
-            BrowserResourceSample {
-                at_ms: 900.0,
-                interval_ms: 500.0,
-                phase: ResourcePhase::SteadyPlayback,
-                process_count: 4,
-                resident_bytes: 500,
-                private_equivalent_bytes: 600,
-                accumulated_cpu_ms: 60,
-                cpu_delta_ms: 10,
-                processes: Vec::new(),
-            },
+            sample(600.0, 600.0, ResourcePhase::Startup, 3, (100, 200), (60, 60)),
+            sample(800.0, 200.0, ResourcePhase::Startup, 4, (300, 400), (140, 80)),
+            sample(1300.0, 500.0, ResourcePhase::SteadyPlayback, 4, (500, 600), (150, 10)),
+            sample(1400.0, 100.0, ResourcePhase::SteadyPlayback, 4, (500, 600), (180, 30)),
         ];
         let summary = summarize_resource_phase(&samples, ResourcePhase::Startup, 8);
-        assert_eq!(summary.observed_ms, 400.0);
-        assert_eq!(summary.average_resident_bytes, Some(250.0));
-        assert_eq!(summary.average_private_equivalent_bytes, Some(350.0));
+        assert_eq!(summary.observed_ms, 800.0);
+        assert_eq!(summary.average_resident_bytes, Some(150.0));
+        assert_eq!(summary.average_private_equivalent_bytes, Some(250.0));
         assert_eq!(summary.peak_resident_bytes, Some(300));
-        assert_eq!(summary.accumulated_cpu_ms, 50);
-        assert_eq!(summary.average_cpu_cores, Some(0.125));
-        assert_eq!(summary.peak_cpu_cores, Some(0.2));
-        assert_eq!(summary.average_cpu_percent_of_machine, Some(1.5625));
+        assert_eq!(summary.accumulated_cpu_ms, 140);
+        assert_eq!(summary.average_cpu_cores, Some(0.175));
+        assert_eq!(summary.peak_cpu_cores, Some(0.1));
+        assert_eq!(summary.average_cpu_percent_of_machine, Some(2.1875));
         assert_eq!(summary.maximum_process_count, Some(4));
         assert_eq!(summarize_resource_phase(&[], ResourcePhase::Startup, 8).peak_cpu_cores, None);
         let steady = summarize_resource_phase(&samples, ResourcePhase::SteadyPlayback, 8);
-        // Include the adjacent 0.1-core boundary, excluding the earlier 0.2-core startup spike.
-        assert_eq!(steady.peak_cpu_cores, Some(0.1));
-        assert_eq!(steady.observed_ms, 500.0);
-        assert_eq!(steady.accumulated_cpu_ms, 10);
-        assert_eq!(steady.average_cpu_cores, Some(0.02));
+        // Short boundary intervals count in means, never as comparable peaks.
+        assert_eq!(steady.peak_cpu_cores, Some(0.02));
+        assert_eq!(steady.observed_ms, 600.0);
+        assert_eq!(steady.accumulated_cpu_ms, 40);
+        assert_eq!(steady.average_cpu_cores, Some(40.0 / 600.0));
         assert_eq!(steady.average_resident_bytes, Some(500.0));
         assert_eq!(steady.average_private_equivalent_bytes, Some(600.0));
         assert_eq!(steady.peak_private_equivalent_bytes, Some(600));
         assert_eq!(summarize_resource_phase(&samples[..2], ResourcePhase::SteadyPlayback, 8).peak_cpu_cores, None);
-        assert_eq!(summarize_resource_phase(&samples[2..], ResourcePhase::SteadyPlayback, 8).peak_cpu_cores, Some(0.02));
+        assert_eq!(summarize_resource_phase(&samples[3..], ResourcePhase::SteadyPlayback, 8).peak_cpu_cores, None);
+    }
+
+    #[test]
+    fn cpu_accounting_includes_new_children_without_charging_existing_lifetimes() {
+        assert_eq!(process_cpu_delta(None, 2_000, true), 0);
+        assert_eq!(process_cpu_delta(None, 150, false), 150);
+        assert_eq!(process_cpu_delta(Some(2_000), 2_150, false), 150);
+        assert_eq!(process_cpu_delta(Some(2_000), 1_900, false), 0);
     }
 
     #[test]
@@ -2332,7 +2324,7 @@ mod tests {
     }
 
     #[test]
-    fn hls_efficiency_normalizes_cpu_by_completed_steady_bytes() {
+    fn hls_efficiency_uses_resource_boundaries_instead_of_earlier_playback_start() {
         let metrics = json!({
             "marks": {
                 "first_confirmed_playback_ms": 1_000.0,
@@ -2340,8 +2332,10 @@ mod tests {
             },
             "samples": [
                 {"at_ms": 1_000.0, "current_time_s": 0.0, "forward_buffer_s": 4.0, "duration_s": 20.0, "paused": false, "playback_rate": 1.0},
-                {"at_ms": 2_000.0, "current_time_s": 1.0, "forward_buffer_s": 14.0, "duration_s": 20.0, "paused": false, "playback_rate": 1.0}
+                {"at_ms": 2_700.0, "current_time_s": 1.7, "forward_buffer_s": 15.0, "duration_s": 20.0, "paused": false, "playback_rate": 1.0}
             ],
+            "resource_window": {"start_ms": 1_500.0, "end_ms": 2_700.0,
+                "start_sample": {"current_time_s": 0.5, "forward_buffer_s": 5.0}},
             "events": [],
             "hls_resources": [
                 {"start_ms": 100.0, "response_end_ms": 500.0, "encoded_bytes": 1_048_576u64, "decoded_bytes": 1_048_576u64},
@@ -2350,28 +2344,22 @@ mod tests {
                 {"start_ms": 2_100.0, "response_end_ms": 2_600.0, "encoded_bytes": 4_194_304u64, "decoded_bytes": 4_194_304u64}
             ]
         });
-        let playback = summarize_playback(&metrics, 1.0);
         let steady = BrowserResourcePhaseSummary {
             sample_count: 2,
-            observed_ms: 1_000.0,
-            average_resident_bytes: None,
-            peak_resident_bytes: None,
-            average_private_equivalent_bytes: None,
-            peak_private_equivalent_bytes: None,
+            observed_ms: 1_200.0,
             accumulated_cpu_ms: 10_000,
             average_cpu_cores: Some(10.0),
-            peak_cpu_cores: None,
-            average_cpu_percent_of_machine: None,
-            maximum_process_count: None,
+            ..Default::default()
         };
-        let summary = summarize_hls_efficiency(&metrics, &playback, &steady);
+        let summary = summarize_hls_efficiency(&metrics, &steady);
         assert_eq!(summary.all_hls_responses.encoded_bytes, 10 * 1_048_576);
         assert_eq!(summary.steady_playback.completed_responses, 2);
-        assert_eq!(summary.steady_playback.encoded_bytes, 5 * 1_048_576);
-        assert_eq!(summary.steady_playback.encoded_mib_per_second, Some(5.0));
-        assert_eq!(summary.cpu_seconds_per_encoded_mib, Some(2.0));
+        assert_eq!(summary.steady_playback.encoded_bytes, 7 * 1_048_576);
+        assert_eq!(summary.steady_playback.observed_ms, 1_200.0);
+        assert_eq!(summary.steady_playback.encoded_mib_per_second, Some(7.0 / 1.2));
+        assert_eq!(summary.cpu_seconds_per_encoded_mib, Some(10.0 / 7.0));
         assert_eq!(summary.buffer_growth_s, Some(10.0));
-        assert_eq!(summary.media_plus_buffer_growth_s, Some(11.0));
+        assert_eq!(summary.media_plus_buffer_growth_s, Some(11.2));
     }
 
     #[test]

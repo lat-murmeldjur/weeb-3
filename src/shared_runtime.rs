@@ -215,6 +215,12 @@ fn handle_worker_message(event: MessageEvent, status: &RuntimeStatus) {
             crate::interface::shared_network_changed(actual);
             return;
         }
+        Some("WEEB3_HLS_REPLACED") => {
+            if let Some(id) = integer_property(&data, "attempt") {
+                crate::stream_hls::release_hls_view(Some(id));
+            }
+            return;
+        }
         Some("WEEB3_VAULT_REQUEST") => {}
         _ => return,
     }

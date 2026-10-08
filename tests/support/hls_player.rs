@@ -382,7 +382,7 @@ impl HandoffFixture {
         }
     }
 
-    async fn prepare(&self, automatic: bool) {
+    fn start(&self, automatic: bool) {
         if automatic {
             self.select.set_selected_index(0);
             set_number(self.hls.unchecked_ref(), "loadLevel", 0.0);
@@ -390,7 +390,12 @@ impl HandoffFixture {
             set_number(self.hls.unchecked_ref(), "manualLevel", -1.0);
         }
         select_quality(1, automatic.then(|| (self.hls.clone(), 0, 0)));
-        wait_for_handoff(|| self.waiting()).await;
+    }
+
+    async fn prepare(&self, automatic: bool) {
+        self.start(automatic);
+        wait_for_handoff(|| with_player(1, |player| player.quality.as_ref().unwrap().revision) != 0
+            && self.level() == Some(if automatic { -1.0 } else { 0.0 })).await;
     }
 
     fn level(&self) -> Option<f64> {
@@ -398,10 +403,37 @@ impl HandoffFixture {
         number_property(self.hls.as_ref(), "manualLevel")
     }
 
-    fn waiting(&self) -> bool {
-        with_player(1, |player| {
-            player.quality.as_ref().unwrap().waiting.is_some()
-        })
+}
+
+struct PendingQualityFetch {
+    _fetch: FetchOverride,
+    requested: Rc<Cell<bool>>,
+    resolve: Function,
+}
+
+impl PendingQualityFetch {
+    fn new() -> Self {
+        let mut resolve = None;
+        let response = Promise::new(&mut |fulfilled, _| resolve = Some(fulfilled));
+        let requested = Rc::new(Cell::new(false));
+        let observed = requested.clone();
+        let fetch = FetchOverride::new(Closure::new(move |_, init| {
+            assert_eq!(js_string(&init, "method").as_deref(), Some("HEAD"));
+            observed.set(true);
+            response.clone()
+        }));
+        Self { _fetch: fetch, requested, resolve: resolve.unwrap() }
+    }
+
+    async fn begin(&self, fixture: &HandoffFixture, automatic: bool) {
+        fixture.start(automatic);
+        wait_for_handoff(|| self.requested.get()).await;
+    }
+
+    fn finish(&self, ok: bool) {
+        let response = Object::new();
+        set(&response, "ok", ok.into());
+        self.resolve.call1(&JsValue::UNDEFINED, &response).unwrap();
     }
 }
 
@@ -422,8 +454,6 @@ async fn quality_flush_cancellation_preserves_buffering_ownership() {
         if action != "no-forward" { fixture.forward_flush.set(Some(10.0)); }
         if action == "already-disabled" { set(fixture.hls.unchecked_ref(), "bufferingEnabled", JsValue::FALSE); }
         fixture.prepare(false).await;
-        handle_event(1, "hlsFragBuffered", &js_sys::JSON::parse(r#"{"frag":{"type":"main","sn":1}}"#).unwrap());
-        wait_for_handoff(|| fixture.level() == Some(0.0)).await;
         if !matches!(action, "no-forward" | "already-disabled") {
             assert_eq!(fixture.buffering_calls.borrow().as_slice(), &["pauseBuffering"]);
             assert_eq!(with_player(1, |player| player.quality.as_ref().unwrap().flush_from), Some(10.0));
@@ -483,32 +513,32 @@ async fn wait_for_handoff(condition: impl Fn() -> bool) {
 }
 
 #[wasm_bindgen_test(async)]
-async fn prepared_quality_waits_for_one_main_request_and_preserves_auto() {
-    for automatic in [false, true] {
+async fn prepared_quality_switches_during_main_loading_and_preserves_auto() {
+    for (automatic, ok) in [(false, true), (true, true), (false, false), (true, false)] {
         let fixture = HandoffFixture::new();
-        fixture.prepare(automatic).await;
+        let pending = PendingQualityFetch::new();
+        pending.begin(&fixture, automatic).await;
         assert_eq!(fixture.level(), Some(1.0));
         fixture.level_calls.borrow_mut().clear();
         let audio = js_sys::JSON::parse(r#"{"frag":{"type":"audio","sn":1}}"#).unwrap();
         handle_event(1, "hlsFragLoaded", &audio);
         handle_event(1, "hlsFragBuffered", &audio);
-        assert!(fixture.waiting());
+        assert_eq!(fixture.level(), Some(1.0));
         let main = js_sys::JSON::parse(r#"{"frag":{"type":"main","sn":1}}"#).unwrap();
         handle_event(1, "hlsFragLoaded", &main);
-        assert!(fixture.waiting());
+        assert_eq!(fixture.level(), Some(1.0));
         handle_event(1, "hlsFragBuffered", &main);
-        // hls.js may start its next request before the waiting Rust future resumes.
         handle_event(1, "hlsFragLoading", &main);
-        let target = if automatic { -1.0 } else { 0.0 };
-        wait_for_handoff(|| fixture.level() == Some(target)).await;
-        assert!(!fixture.waiting());
-        if automatic {
-            assert_eq!(
-                number_property(fixture.hls.as_ref(), "nextAutoLevel"),
-                Some(0.0)
-            );
-        }
-        let expected: &[(&str, f64)] = if automatic {
+        pending.finish(ok);
+        let target = if automatic { -1.0 } else if ok { 0.0 } else { 1.0 };
+        wait_for_handoff(|| !fixture.level_calls.borrow().is_empty() && fixture.level() == Some(target)).await;
+        // A failed discovery keeps the previous manual quality or releases Auto.
+        assert_eq!(number_property(fixture.hls.as_ref(), "nextAutoLevel"),
+            (automatic && ok).then_some(0.0));
+        let fallback = [("loadLevel", target)];
+        let expected: &[(&str, f64)] = if !ok {
+            &fallback
+        } else if automatic {
             &[("loadLevel", 0.0), ("loadLevel", -1.0)]
         } else {
             &[("nextLevel", 0.0)]
@@ -530,7 +560,8 @@ async fn pending_quality_releases_on_media_interruptions_errors_and_abort() {
         "hlsFragLoading",
     ] {
         let fixture = HandoffFixture::new();
-        fixture.prepare(false).await;
+        let pending = PendingQualityFetch::new();
+        pending.begin(&fixture, false).await;
         if event.starts_with("hls") {
             let main = js_sys::JSON::parse(r#"{"frag":{"type":"main","sn":2}}"#).unwrap();
             handle_event(1, event, &main);
@@ -544,8 +575,8 @@ async fn pending_quality_releases_on_media_interruptions_errors_and_abort() {
             }
             handle_media_event(1, &fixture.media, event, false);
         }
+        pending.finish(true);
         wait_for_handoff(|| fixture.level() == Some(0.0)).await;
-        assert!(!fixture.waiting(), "{event}");
         assert!(fixture.playback_calls.borrow().is_empty(), "{event}");
         if event == "pause" {
             assert!(with_player(1, |player| player.intent == PlaybackIntent::Paused));
@@ -557,12 +588,13 @@ async fn pending_quality_releases_on_media_interruptions_errors_and_abort() {
 #[wasm_bindgen_test(async)]
 async fn starving_auto_releases_the_hold_and_cancels_prepared_handoff() {
     let fixture = HandoffFixture::new();
-    fixture.prepare(true).await;
+    let pending = PendingQualityFetch::new();
+    pending.begin(&fixture, true).await;
     assert_eq!(number_property(fixture.hls.as_ref(), "manualLevel"), Some(1.0));
     assert_eq!(js_bool(fixture.hls.as_ref(), "autoLevelEnabled"), Some(false));
     fixture_property(fixture.media.as_ref(), "readyState", 2.into());
     handle_media_event(1, &fixture.media, "waiting", false);
-    assert!(!fixture.waiting());
+    pending.finish(true);
     async_std::task::sleep(std::time::Duration::from_millis(10)).await;
     assert_eq!(fixture.level(), Some(-1.0));
     assert_eq!(number_property(fixture.hls.as_ref(), "nextAutoLevel"), None);
@@ -574,7 +606,8 @@ async fn starving_auto_releases_the_hold_and_cancels_prepared_handoff() {
 async fn quality_supersession_failed_restart_and_destruction_cancel_old_handoff() {
     for action in ["selection", "restart", "destruction"] {
         let fixture = HandoffFixture::new();
-        fixture.prepare(false).await;
+        let pending = PendingQualityFetch::new();
+        pending.begin(&fixture, false).await;
         match action {
             "selection" => {
                 fixture.select.set_selected_index(0);
@@ -587,8 +620,8 @@ async fn quality_supersession_failed_restart_and_destruction_cancel_old_handoff(
             }
             _ => ACTIVE.with_borrow_mut(|active| *active = None),
         }
+        pending.finish(true);
         async_std::task::sleep(std::time::Duration::from_millis(10)).await;
-        assert!(!fixture.waiting(), "{action}");
         let expected = if action == "selection" { -1.0 } else { 1.0 };
         assert_eq!(fixture.level(), Some(expected), "{action}");
         // Exhausting recovery destroys the player and pauses its retired media.
@@ -596,16 +629,19 @@ async fn quality_supersession_failed_restart_and_destruction_cancel_old_handoff(
         assert_eq!(fixture.playback_calls.borrow().as_slice(), calls, "{action}");
     }
     let fixture = HandoffFixture::new();
-    let (sender, mut receiver) = oneshot::channel();
-    with_player(1, |player| {
-        player.quality.as_mut().unwrap().waiting = Some(sender)
-    });
-    assert_eq!(receiver.try_recv().unwrap(), None);
+    let pending = PendingQualityFetch::new();
+    pending.begin(&fixture, false).await;
+    let retired = fixture.hls.clone();
+    ACTIVE.with_borrow_mut(|active| *active = None);
+    let replacement = HandoffFixture::new();
+    pending.finish(true);
+    async_std::task::sleep(std::time::Duration::from_millis(10)).await;
+    assert_eq!(number_property(retired.as_ref(), "manualLevel"), Some(1.0));
+    assert_eq!(replacement.level(), Some(1.0));
+    assert!(replacement.playback_calls.borrow().is_empty());
+    drop(replacement);
+    drop(pending);
     drop(fixture);
-    assert!(
-        receiver.try_recv().is_err(),
-        "destroying the player must wake the receiver"
-    );
 }
 
 #[wasm_bindgen_test(async)]
@@ -620,7 +656,7 @@ async fn quality_selection_does_not_wait_when_playback_cannot_use_the_current_lo
         fixture_property(fixture.media.as_ref(), property, value);
         select_quality(1, None);
         wait_for_handoff(|| fixture.level() == Some(0.0)).await;
-        assert!(!fixture.waiting(), "{property}");
+        if property == "paused" { assert!(fixture.media.paused()); }
         assert!(fixture.playback_calls.borrow().is_empty(), "{property}");
     }
 }
@@ -628,9 +664,10 @@ async fn quality_selection_does_not_wait_when_playback_cannot_use_the_current_lo
 #[wasm_bindgen_test(async)]
 async fn quality_api_copies_metadata_and_validates_without_cancelling_handoff() {
     let fixture = HandoffFixture::new();
+    let pending = PendingQualityFetch::new();
     fixture.select.set_selected_index(2);
     set_stream_quality(&fixture.media, 0.0).unwrap();
-    wait_for_handoff(|| fixture.waiting()).await;
+    wait_for_handoff(|| pending.requested.get()).await;
     set_number(fixture.hls.unchecked_ref(), "currentLevel", 1.0);
     let level = array_property(fixture.hls.as_ref(), "levels").unwrap().get(0);
     set_number(level.unchecked_ref(), "width", 640.0);
@@ -658,10 +695,10 @@ async fn quality_api_copies_metadata_and_validates_without_cancelling_handoff() 
     async_std::task::sleep(std::time::Duration::from_millis(10)).await;
     assert_eq!(fixture.select.selected_index(), 1);
     assert_eq!(with_player(1, |player| player.quality.as_ref().unwrap().revision), 1);
-    assert!(fixture.waiting());
+    pending.finish(true);
+    wait_for_handoff(|| fixture.level() == Some(0.0)).await;
     set_stream_quality(&fixture.media, -1.0).unwrap();
     wait_for_handoff(|| fixture.level() == Some(-1.0)).await;
-    assert!(!fixture.waiting());
     let state = stream_quality(&fixture.media).unwrap();
     assert_eq!(number_property(&state, "selectedLevel"), Some(-1.0));
     assert_eq!(number_property(&state, "currentLevel"), Some(1.0));

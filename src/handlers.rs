@@ -1,4 +1,4 @@
-use std::{cell::Cell, time::Duration};
+use std::time::Duration;
 
 use bytes::Bytes;
 use prost::Message;
@@ -265,21 +265,14 @@ pub(crate) enum RefreshmentOutcome {
     NotDispatched,
     Acknowledged(u64),
     AmbiguousAfterPayment,
+    TimedOut,
 }
 
-async fn refreshment_exchange(
-    amount: u64,
-    mut stream: Stream,
-    timeout_outcome: &Cell<RefreshmentOutcome>,
-) -> RefreshmentOutcome {
-    if stream.write_all(EMPTY_HEADERS_FRAME).await.is_err() {
-        return RefreshmentOutcome::NotDispatched;
-    }
-    if stream.flush().await.is_err() {
-        return RefreshmentOutcome::NotDispatched;
-    }
-
-    if read_control_protocol_frame(&mut stream).await.is_none() {
+async fn refreshment_exchange(amount: u64, mut stream: Stream) -> RefreshmentOutcome {
+    if stream.write_all(EMPTY_HEADERS_FRAME).await.is_err()
+        || stream.flush().await.is_err()
+        || read_control_protocol_frame(&mut stream).await.is_none()
+    {
         return RefreshmentOutcome::NotDispatched;
     }
 
@@ -288,11 +281,7 @@ async fn refreshment_exchange(
     };
 
     let payment_frame = payment.encode_length_delimited_to_vec();
-    timeout_outcome.set(RefreshmentOutcome::AmbiguousAfterPayment);
-    if stream.write_all(&payment_frame).await.is_err() {
-        return RefreshmentOutcome::AmbiguousAfterPayment;
-    }
-    if stream.flush().await.is_err() || stream.close().await.is_err() {
+    if stream.write_all(&payment_frame).await.is_err() || stream.close().await.is_err() {
         return RefreshmentOutcome::AmbiguousAfterPayment;
     }
 
@@ -464,17 +453,16 @@ pub async fn refresh_handler(
     control: StreamControl,
     session: OutboundProtocolSession,
 ) -> RefreshmentOutcome {
-    let timeout_outcome = Cell::new(RefreshmentOutcome::NotDispatched);
-    async_std::future::timeout(Duration::from_secs(10), async {
+    async_std::future::timeout(Duration::from_secs(3), async {
         let Some(stream) =
             open_current_outbound_stream(peer, control, PSEUDOSETTLE_PROTOCOL, &session).await
         else {
             return RefreshmentOutcome::NotDispatched;
         };
-        refreshment_exchange(amount, stream, &timeout_outcome).await
+        refreshment_exchange(amount, stream).await
     })
     .await
-    .unwrap_or_else(|_| timeout_outcome.get())
+    .unwrap_or(RefreshmentOutcome::TimedOut)
 }
 
 pub async fn issue_handler(
@@ -575,9 +563,120 @@ async fn pushsync_exchange(
 }
 
 #[cfg(test)]
-mod delivery_tests {
+mod tests {
     use super::*;
     use wasm_bindgen_test::wasm_bindgen_test;
+
+    #[wasm_bindgen_test]
+    async fn refresh_deadline_before_dispatch_is_terminal_but_stale_session_is_not() {
+        let wings = crate::Wings::default();
+        let peer = PeerId::random();
+        let connection = ConnectionId::new_unchecked(51);
+        crate::record_physical_connection_established(&wings.physical_connections, &peer, connection);
+        let capture = || OutboundProtocolSession::capture(peer, connection, wings.physical_connections.clone()).unwrap();
+        let stale = capture();
+        // Never poll the behaviour: stream negotiation and payment cannot begin.
+        let behaviour = libp2p_stream::Behaviour::new();
+        assert_eq!(
+            refresh_handler(peer, 1, behaviour.new_control(), capture()).await,
+            RefreshmentOutcome::TimedOut,
+        );
+        crate::record_physical_connection_closed(&wings.physical_connections, &peer, connection);
+        assert_eq!(
+            refresh_handler(peer, 1, behaviour.new_control(), stale).await,
+            RefreshmentOutcome::NotDispatched,
+        );
+    }
+
+    #[wasm_bindgen_test]
+    async fn retrieval_timeout_retirement_preserves_settlement_ownership() {
+        let wings = crate::Wings::default();
+        let peer = PeerId::random();
+        let connection = ConnectionId::new_unchecked(54);
+        let account = crate::get_or_create_accounting_peer(&wings, peer);
+        account.borrow_mut().connection_id = Some(connection);
+        account.borrow_mut().threshold = 10;
+        account.borrow_mut().reserve = 2;
+        let (outgoing, incoming) = mpsc::bounded(1);
+        let retire = |connection| crate::accounting::retire_timed_out_session(&account, connection, &outgoing);
+
+        // A replacement session must reject retirement claimed for its predecessor.
+        account.borrow_mut().connection_id = Some(ConnectionId::new_unchecked(55));
+        retire(connection);
+        assert!(incoming.is_empty() && !account.borrow().refresh_scheduled);
+        account.borrow_mut().connection_id = Some(connection);
+
+        account.borrow_mut().refresh_scheduled = true;
+        retire(connection);
+        assert!(incoming.is_empty() && account.borrow().refresh_scheduled);
+        account.borrow_mut().refresh_scheduled = false;
+        retire(ConnectionId::new_unchecked(53));
+        assert!(incoming.is_empty() && !account.borrow().refresh_scheduled);
+
+        retire(connection);
+        retire(connection);
+        // A successful reserved delivery must settle without scheduling a competing refresh.
+        crate::apply_credit(&account, 1, &outgoing);
+        let (queued_peer, queued_account, queued_connection, action) = incoming.try_recv().unwrap();
+        assert_eq!((queued_peer, queued_connection), (peer, connection));
+        assert!(std::sync::Arc::ptr_eq(&queued_account, &account));
+        assert!(matches!(action, crate::accounting::RefreshmentAction::Retire));
+        assert!(incoming.is_empty() && account.borrow().refresh_scheduled);
+        assert_eq!((account.borrow().reserve, account.borrow().balance), (1, 1));
+        assert_eq!(account.borrow().connection_id, Some(connection));
+
+        for closed in [false, true] {
+            let (outgoing, incoming) = mpsc::bounded(1);
+            if closed { drop(incoming); } else {
+                assert!(outgoing.try_send((peer, account.clone(), connection,
+                    crate::accounting::RefreshmentAction::Refresh)).is_ok());
+            }
+            account.borrow_mut().refresh_scheduled = false;
+            crate::accounting::retire_timed_out_session(&account, connection, &outgoing);
+            assert!(!account.borrow().refresh_scheduled);
+            assert_eq!(account.borrow().connection_id, Some(connection));
+        }
+    }
+
+    #[wasm_bindgen_test]
+    async fn retiring_refresh_drains_only_its_original_accounting_session() {
+        let client = crate::Weeb3::new();
+        let peer = PeerId::random();
+        let old = ConnectionId::new_unchecked(52);
+        let replacement = ConnectionId::new_unchecked(53);
+        let account = crate::get_or_create_accounting_peer(&client.wings, peer);
+        account.borrow_mut().connection_id = Some(old);
+        account.borrow_mut().reserve = 1;
+        client.wings.connected_peers.lock().await.insert(peer, PeerFile {
+            peer_id: peer, overlay: [0; 32], beneficiary: Address::zero(),
+            connection_attempt_id: 1, connection_id: old,
+        });
+        client.wings.ongoing_cheques.lock().await.insert(peer, (1, 1));
+        let retiring = crate::quiesce_drain_and_close_accounting_session(
+            &client.wings, &client.swarm, peer, &account, old,
+        );
+        libp2p::futures::pin_mut!(retiring);
+        assert!(libp2p::futures::poll!(&mut retiring).is_pending());
+        assert_eq!(account.borrow().connection_id, None);
+        assert_eq!(crate::reserve(&account, 1), None);
+        client.wings.accounting_peers.borrow_mut().remove(&peer);
+        let successor = crate::get_or_create_accounting_peer(&client.wings, peer);
+        successor.borrow_mut().connection_id = Some(replacement);
+        successor.borrow_mut().reserve = 7;
+        client.wings.connected_peers.lock().await.get_mut(&peer).unwrap().connection_id = replacement;
+        crate::cancel_reserve(&account, 1);
+        assert!(libp2p::futures::poll!(&mut retiring).is_pending());
+        client.wings.ongoing_cheques.lock().await.remove(&peer);
+        crate::ACCOUNTING_DRAINED.notify(usize::MAX);
+        retiring.await;
+        // A late completion for the old session must also leave its replacement alone.
+        crate::quiesce_drain_and_close_accounting_session(
+            &client.wings, &client.swarm, peer, &account, old,
+        ).await;
+        let successor = successor.borrow();
+        assert_eq!(successor.connection_id, Some(replacement));
+        assert_eq!(successor.reserve, 7);
+    }
 
     #[wasm_bindgen_test]
     fn delivery_preserves_protobuf_fields_and_empty_data() {

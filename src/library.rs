@@ -6,8 +6,8 @@ use crate::{
     erasure_coding::RedundancyLevel,
     erasure_coding::validated_upload_redundancy_number,
     interface::{
-        begin_interface_mount, get_service_worker, install_bfcache_restore_guard,
-        mount_interface_with_generation, release_result_object_url,
+        begin_interface_mount, configure_service_worker_scope, get_service_worker,
+        install_bfcache_restore_guard, mount_interface_with_generation, release_result_object_url,
     },
     interface_conventions::render_interface_shell,
     nav::route_network_mode_from_location,
@@ -455,15 +455,18 @@ async fn configure_shared_node(
 #[wasm_bindgen]
 impl Weeb3No103 {
     #[wasm_bindgen(constructor)]
-    pub fn new(shared_worker_url: Option<String>) -> Weeb3No103 {
+    pub fn new(
+        shared_worker_url: Option<String>, service_worker_scope: Option<String>,
+    ) -> Result<Weeb3No103, JsError> {
+        configure_service_worker_scope(service_worker_scope.as_deref())?;
         install_bfcache_restore_guard();
-        Weeb3No103 {
+        Ok(Weeb3No103 {
             inner: Rc::new(SharedNodeClient::new(
                 active_profile().swarm_network_id,
                 shared_worker_url.as_deref(),
             )),
             startup: Rc::new(StartupState::default()),
-        }
+        })
     }
 
     fn schedule_start(&self, options: StartOptions) {

@@ -17,64 +17,56 @@ mod retrieval_conventions;
 pub mod source;
 
 mod connection {
+    use crate::RUNTIME_SOURCE as RUNTIME;
+    use crate::source::{assert_contains, assert_excludes, assert_first_in_order, between};
     use crate::accounting::{
         CONNECTION_BUILDUP_LIMIT, REFRESH_RATE, bee_reconnect_delay_seconds,
         connection_dial_capacity_available, connection_population_deficit, price, refreshment_due,
     };
-    #[test]
-    fn first_usable_connections_do_not_wait_for_the_population_target() {
-        assert_eq!(CONNECTION_BUILDUP_LIMIT, 200);
-        assert!(connection_dial_capacity_available(0, 0, 0));
-        assert!(connection_dial_capacity_available(1, 0, 0));
-        assert!(connection_dial_capacity_available(
-            CONNECTION_BUILDUP_LIMIT - 1,
-            0,
-            0
-        ));
+
+    const HANDLERS: &str = include_str!("../src/handlers.rs");
+
+    fn dial_scheduler() -> &'static str {
+        between(RUNTIME, "let peer_dial_scheduler =", "let swarm_event_loop = async")
+    }
+
+    fn refresh_instruction() -> &'static str {
+        between(RUNTIME, "let refreshment_instruction_handle = async", "let swap_price =")
     }
 
     #[test]
-    fn retrieval_uses_the_shared_overlay_snapshot() {
-        let retrieval = include_str!("../src/retrieval.rs");
-        let runtime = crate::RUNTIME_SOURCE;
-        assert!(
-            runtime.contains("type OverlayPeerMap = Arc<Mutex<Arc<BTreeMap<[u8; 32], PeerId>>>>")
-        );
-        assert!(runtime.contains("overlay_peers: OverlayPeerMap"));
-        assert!(retrieval.contains("let peers = peers.lock().await.clone();"));
+    fn first_usable_connections_do_not_wait_for_the_population_target() {
+        assert_eq!(CONNECTION_BUILDUP_LIMIT, 200);
+        assert!(connection_dial_capacity_available(0, 0));
+        assert!(connection_dial_capacity_available(1, 0));
+        assert!(connection_dial_capacity_available(
+            CONNECTION_BUILDUP_LIMIT - 1,
+            0
+        ));
     }
 
     #[test]
     fn dial_storm_can_fill_but_never_exceed_the_peer_population() {
         assert!(connection_dial_capacity_available(
             0,
-            CONNECTION_BUILDUP_LIMIT - 1,
-            0
+            CONNECTION_BUILDUP_LIMIT - 1
         ));
         assert!(!connection_dial_capacity_available(
             0,
-            CONNECTION_BUILDUP_LIMIT,
-            0
+            CONNECTION_BUILDUP_LIMIT
         ));
         assert!(!connection_dial_capacity_available(
             1,
-            CONNECTION_BUILDUP_LIMIT - 1,
-            0
+            CONNECTION_BUILDUP_LIMIT - 1
         ));
         assert!(!connection_dial_capacity_available(
             CONNECTION_BUILDUP_LIMIT,
-            0,
             0
         ));
-        assert!(!connection_dial_capacity_available(u64::MAX, u64::MAX, 0));
+        assert!(!connection_dial_capacity_available(u64::MAX, u64::MAX));
 
-        let runtime = crate::RUNTIME_SOURCE;
-        let feeder = crate::source::between(
-            runtime,
-            "let peer_dial_scheduler =",
-            "let swarm_event_loop = async",
-        );
-        crate::source::assert_contains(feeder, &[
+        let feeder = dial_scheduler();
+        assert_contains(feeder, &[
             "VecDeque::<QueuedPeerDial>::new()",
             "HashSet::<(PeerId, Multiaddr)>::new()",
             "try_reserve_connection_capacity(",
@@ -85,99 +77,75 @@ mod connection {
         ]);
         assert!(!feeder.contains("task::sleep"));
         assert!(feeder.contains("queue_peer_dial_retry("));
-        assert!(runtime.contains("mpsc::bounded::<PeerDialInstruction>(PEER_DIAL_INGEST_BATCH)"));
-        assert!(!runtime.contains("MAX_QUEUED_PEER_DIALS"));
-        assert!(runtime.contains("remove_connection_attempt_for_connection("));
-        let failed_dial = crate::source::between(
-            runtime,
+        assert!(RUNTIME.contains("mpsc::bounded::<PeerDialInstruction>(PEER_DIAL_INGEST_BATCH)"));
+        assert!(!RUNTIME.contains("MAX_QUEUED_PEER_DIALS"));
+        assert!(RUNTIME.contains("remove_connection_attempt_for_connection("));
+        let failed_dial = between(
+            RUNTIME,
             "let retryable = !matches!(",
             "SwarmEvent::ConnectionClosed {",
         );
-        let removal = failed_dial
-            .find("remove_connection_attempt_for_connection")
-            .expect("exact dial removal");
-        let release = failed_dial
-            .find("release_connection_reservation(")
-            .expect("dial capacity release");
-        let retry = failed_dial
-            .find("queue_peer_dial_retry(")
-            .expect("retry registration before capacity release");
-        assert!(removal < retry && retry < release);
-        assert!(runtime.contains("self.swarm.next_event().await"));
-        assert!(!runtime.contains("CONNECTION_BUILDUP_SWARM_POLL_MS"));
+        assert_first_in_order(failed_dial, &[
+            "remove_connection_attempt_for_connection",
+            "queue_peer_dial_retry(",
+            "release_connection_reservation(",
+        ]);
+        assert!(RUNTIME.contains("self.swarm.next_event().await"));
+        assert!(!RUNTIME.contains("CONNECTION_BUILDUP_SWARM_POLL_MS"));
         assert!(
-            runtime.contains(
+            RUNTIME.contains(
                 ".with_connection_timeout(Duration::from_millis(OUTBOUND_CONNECTION_TIMEOUT_MS))"
             )
         );
-        assert!(runtime.contains("const OUTBOUND_CONNECTION_TIMEOUT_MS: u64 = 8_000;"));
-        assert!(!runtime.contains("FRESH_GOSSIP_DIAL_TIMEOUT_MS"));
+        assert!(RUNTIME.contains("const OUTBOUND_CONNECTION_TIMEOUT_MS: u64 = 8_000;"));
+        assert!(!RUNTIME.contains("FRESH_GOSSIP_DIAL_TIMEOUT_MS"));
         assert!(!feeder.contains("disconnect_peer_id"));
     }
 
     #[test]
     fn drained_reload_reservations_expose_the_exact_population_deficit() {
         let mut ongoing = CONNECTION_BUILDUP_LIMIT - 55;
-        assert_eq!(connection_population_deficit(55, ongoing, 0), 0);
+        assert_eq!(connection_population_deficit(55, ongoing), 0);
         for _ in 0..ongoing {
             ongoing = ongoing.saturating_sub(1);
         }
         assert_eq!(ongoing, 0);
-        assert_eq!(connection_population_deficit(55, ongoing, 0), CONNECTION_BUILDUP_LIMIT - 55);
-        assert_eq!(connection_population_deficit(CONNECTION_BUILDUP_LIMIT - 1, 0, 0), 1);
-        assert_eq!(connection_population_deficit(CONNECTION_BUILDUP_LIMIT, 0, 0), 0);
-        assert_eq!(connection_population_deficit(u64::MAX, u64::MAX, 0), 0);
+        assert_eq!(connection_population_deficit(55, ongoing), CONNECTION_BUILDUP_LIMIT - 55);
+        assert_eq!(connection_population_deficit(CONNECTION_BUILDUP_LIMIT - 1, 0), 1);
+        assert_eq!(connection_population_deficit(CONNECTION_BUILDUP_LIMIT, 0), 0);
+        assert_eq!(connection_population_deficit(u64::MAX, u64::MAX), 0);
     }
 
     #[test]
-    fn every_hundred_replacements_reduces_the_target_until_thirty() {
-        let targets = [200, 160, 128, 102, 81, 64, 51, 40, 32, 30];
-        for (round, target) in targets.into_iter().enumerate() {
-            let lost = round as u16 * 100;
-            assert_eq!(connection_population_deficit(0, 0, lost), target);
-            assert_eq!(connection_population_deficit(0, 0, lost + 99), target);
-            assert!(connection_dial_capacity_available(target - 1, 0, lost));
-            assert!(!connection_dial_capacity_available(target - 1, 1, lost));
-            assert!(!connection_dial_capacity_available(target + 1, 0, lost));
+    fn partial_disconnects_always_restore_the_full_population() {
+        for remaining in [199, 160, 30, 1, 0] {
+            let deficit = connection_population_deficit(remaining, 0);
+            assert_eq!(remaining + deficit, CONNECTION_BUILDUP_LIMIT);
+            assert!(connection_dial_capacity_available(remaining, deficit - 1));
+            assert!(!connection_dial_capacity_available(remaining, deficit));
         }
-        assert_eq!(connection_population_deficit(0, 0, u16::MAX), 30);
-        assert_eq!(connection_population_deficit(u64::MAX, u64::MAX, 900), 0);
     }
 
     #[test]
     fn delayed_retry_backoff_is_registered_and_released_around_enqueue() {
-        let runtime = crate::RUNTIME_SOURCE;
-        let retry = crate::source::between(
-            runtime,
+        let retry = between(
+            RUNTIME,
             "async fn queue_peer_dial_retry(",
             "fn failed_peer_retry_delay_ms(",
         );
-        let register = retry
-            .find(".insert(peer, (expected_generation, retry_id))")
-            .expect("retry not-before registration");
-        let sleep = retry
-            .find("failed_peer_retry_delay_ms(&address)")
-            .expect("configured retry backoff");
-        let ownership = retry
-            .find("delayed.get(&peer) != Some(&(expected_generation, retry_id))")
-            .expect("exact delayed retry ownership");
-        let enqueue = retry
-            .find(".send(PeerDialInstruction {")
-            .expect("retry enqueue after backoff");
-        let release = retry
-            .find("drop(delayed)")
-            .expect("retry exclusion released before enqueue wakes the scheduler");
-        assert!(register < sleep && sleep < ownership && ownership < release && release < enqueue);
+        assert_first_in_order(retry, &[
+            ".insert(peer, (expected_generation, retry_id))",
+            "failed_peer_retry_delay_ms(&address)",
+            "delayed.get(&peer) != Some(&(expected_generation, retry_id))",
+            "drop(delayed)",
+            ".send(PeerDialInstruction {",
+        ]);
 
-        let feeder = crate::source::between(
-            runtime,
-            "let peer_dial_scheduler =",
-            "let swarm_event_loop = async",
-        );
+        let feeder = dial_scheduler();
         assert!(feeder.contains("wings.delayed_peer_retries"));
         assert!(feeder.contains("retry.0 == queue_generation"));
-        let marker = crate::source::between(
-            runtime,
+        let marker = between(
+            RUNTIME,
             "async fn try_mark_connection_attempt(",
             "async fn mark_handshake_ready_connection(",
         );
@@ -187,46 +155,28 @@ mod connection {
 
     #[test]
     fn stalled_pre_handshake_reservations_expire_and_capacity_wakes_retained_candidates() {
-        let runtime = crate::RUNTIME_SOURCE;
-        assert!(runtime.contains("const PRE_HANDSHAKE_CONNECTION_TIMEOUT_MS: u64 = 60_000;"));
-        assert!(!runtime.contains("PEER_POPULATION_RESCAN_MS"));
+        assert!(RUNTIME.contains("const PRE_HANDSHAKE_CONNECTION_TIMEOUT_MS: u64 = 60_000;"));
+        assert!(!RUNTIME.contains("PEER_POPULATION_RESCAN_MS"));
 
-        let joiner = crate::source::between(
-            runtime,
+        let joiner = between(
+            RUNTIME,
             "let handshake_instruction_handle = async",
             "join!(",
         );
-        let ready_timeout = joiner
-            .find("Duration::from_millis(PRE_HANDSHAKE_CONNECTION_TIMEOUT_MS)")
-            .expect("pre-handshake reservation timeout");
-        let ready_wait = joiner
-            .find("ready_connection.recv().await")
-            .expect("identify-ready wait");
-        let ownership = joiner[ready_timeout..]
-            .find("connection_attempt_is_current(")
-            .map(|offset| ready_timeout + offset)
-            .expect("exact attempt ownership check");
-        let removal = joiner[ready_wait..]
-            .find("remove_connection_attempt(&wings, &id, connection_attempt_id)")
-            .map(|offset| ready_wait + offset)
-            .expect("timed-out reservation release");
-        let retry = joiner[removal..]
-            .find("queue_peer_dial_retry(")
-            .map(|offset| removal + offset)
-            .expect("timed-out retry registration");
-        let release = joiner[retry..]
-            .find("release_connection_reservation(")
-            .map(|offset| retry + offset)
-            .expect("single reservation release");
-        assert!(ready_timeout < ownership && ownership < ready_wait);
-        assert!(ready_wait < removal && removal < retry && retry < release);
+        let ready_timeout = joiner.find("Duration::from_millis(PRE_HANDSHAKE_CONNECTION_TIMEOUT_MS)").unwrap();
+        assert!(ready_timeout < joiner.find("ready_connection.recv().await").unwrap());
+        assert_first_in_order(&joiner[ready_timeout..], &[
+            "Duration::from_millis(PRE_HANDSHAKE_CONNECTION_TIMEOUT_MS)",
+            "connection_attempt_is_current(",
+            "ready_connection.recv().await",
+            "swarm.disconnect_peer_id(id).is_err()",
+            "remove_connection_attempt(&wings, &id, connection_attempt_id)",
+            "queue_peer_dial_retry(",
+            "release_connection_reservation(",
+        ]);
 
-        let feeder = crate::source::between(
-            runtime,
-            "let peer_dial_scheduler =",
-            "let swarm_event_loop = async",
-        );
-        crate::source::assert_contains(feeder, &[
+        let feeder = dial_scheduler();
+        assert_contains(feeder, &[
             "peers_instructions_chan_incoming.recv()",
             "cooldowns.contains(&candidate.peer)",
             "queue.push_front(candidate)",
@@ -235,20 +185,8 @@ mod connection {
             < feeder.find("try_reserve_connection_capacity(").unwrap());
         assert!(!feeder.contains("last_population_rescan_ms"));
 
-        let timeout_cleanup = &joiner[ready_wait..];
-        let disconnect = timeout_cleanup
-            .find("swarm.disconnect_peer_id(id).is_err()")
-            .expect("pending transport abort");
-        let removal = timeout_cleanup
-            .find("remove_connection_attempt(&wings, &id, connection_attempt_id)")
-            .expect("exact reservation removal");
-        let release = timeout_cleanup
-            .find("release_connection_reservation(")
-            .expect("reservation counter release");
-        assert!(disconnect < removal && removal < release);
-
-        let outgoing_error = crate::source::between(
-            runtime,
+        let outgoing_error = between(
+            RUNTIME,
             "let retryable = !matches!(",
             "SwarmEvent::ConnectionClosed {",
         );
@@ -267,8 +205,7 @@ mod connection {
 
     #[test]
     fn duplicate_overlay_peers_are_suppressed_until_the_owner_disconnects() {
-        let runtime = crate::RUNTIME_SOURCE;
-        let promotion = crate::source::between(
+        let promotion = between(
             crate::NETWORK_SOURCE,
             "pub(super) async fn promote_priced_peer(",
             "pub(crate) struct StreamBehaviour {",
@@ -289,14 +226,10 @@ mod connection {
             duplicate[..disconnect].contains("delayed_peer_retries.lock().await.remove(&peer)")
         );
 
-        let feeder = crate::source::between(
-            runtime,
-            "let peer_dial_scheduler =",
-            "let swarm_event_loop = async",
-        );
+        let feeder = dial_scheduler();
         assert!(feeder.contains("rejected.contains_key(&candidate.peer)"));
-        assert!(runtime.contains("wings.rejected_duplicate_peers.lock().await.clear()"));
-        assert!(runtime.contains(".retain(|_, owner| owner != &peer_id)"));
+        assert!(RUNTIME.contains("wings.rejected_duplicate_peers.lock().await.clear()"));
+        assert!(RUNTIME.contains(".retain(|_, owner| owner != &peer_id)"));
     }
 
     #[test]
@@ -331,9 +264,8 @@ mod connection {
         );
         assert!(!profile.contains("bootnodes.retain("));
 
-        let runtime = crate::RUNTIME_SOURCE;
         let address_filter = include_str!("../src/addresses.rs");
-        crate::source::assert_contains(runtime, &[
+        assert_contains(RUNTIME, &[
             "is_publicly_dialable_underlay(&source_addr)",
             "browser_dial_address(source_addr).ok()?",
             "browser_dial_address(address).unwrap_or_else",
@@ -341,9 +273,9 @@ mod connection {
         assert!(address_filter.contains("pub(crate) fn browser_dial_address("));
         assert!(!address_filter.contains("enum UnderlayFormat"));
         assert!(!address_filter.contains("fn beewss_to_dns_transformed"));
-        assert!(runtime.contains("!self.allow_private_gossip.load(Ordering::Acquire)"));
-        assert!(runtime.contains("self.service_worker_network_id() != 0"));
-        crate::source::assert_contains(address_filter, &[
+        assert!(RUNTIME.contains("!self.allow_private_gossip.load(Ordering::Acquire)"));
+        assert!(RUNTIME.contains("self.service_worker_network_id() != 0"));
+        assert_contains(address_filter, &[
             "|embedded| embedded == address",
             ".map(is_public_ipv4)",
             ".unwrap_or_else(|| is_public_dns_name(&hostname))",
@@ -355,16 +287,15 @@ mod connection {
 
     #[test]
     fn cold_bootnode_burst_drains_into_one_dispatch_task() {
-        let runtime = crate::RUNTIME_SOURCE;
         let profile = include_str!("../src/network_profile.rs");
         let accounting = include_str!("../src/accounting.rs");
-        let handler = crate::source::between(
-            runtime,
+        let handler = between(
+            RUNTIME,
             "let bootnode_change_handle = async",
             "let accounting_event_handle = async",
         );
 
-        crate::source::assert_contains(profile, &[
+        assert_contains(profile, &[
             "bootnodes.shuffle(&mut rand::rng())",
             "pub(crate) const INITIAL_BOOTNODE_BURST: usize = 160;",
             "bootnodes.truncate(INITIAL_BOOTNODE_BURST)",
@@ -395,12 +326,10 @@ mod connection {
 
     #[test]
     fn handshake_signer_is_derived_once_per_node() {
-        let runtime = crate::RUNTIME_SOURCE;
-        let handlers = include_str!("../src/handlers.rs");
-        assert!(runtime.contains("handshake_signer: Arc<PrivateKeySigner>"));
-        assert_eq!(runtime.matches("PrivateKeySigner::from_slice(").count(), 1);
-        let handshake = crate::source::between(
-            handlers,
+        assert!(RUNTIME.contains("handshake_signer: Arc<PrivateKeySigner>"));
+        assert_eq!(RUNTIME.matches("PrivateKeySigner::from_slice(").count(), 1);
+        let handshake = between(
+            HANDLERS,
             "async fn handshake_exchange(",
             "pub async fn pricing_handler(",
         );
@@ -409,13 +338,12 @@ mod connection {
 
     #[test]
     fn bee_handshake_starts_after_queueing_one_canonical_observed_address() {
-        let runtime = crate::RUNTIME_SOURCE;
-        let received = runtime
+        let received = RUNTIME
             .rsplit("identify::Event::Received {")
             .next()
             .and_then(|source| source.split("identify::Event::Error {").next())
             .expect("identify receive lifecycle");
-        crate::source::assert_contains(received, &[
+        assert_contains(received, &[
             "canonical_identify_address",
             "canonical.is_none()",
             "let observed_addr = info.observed_addr;",
@@ -426,45 +354,45 @@ mod connection {
         assert_eq!(received.matches("physical_connections").count(), 1);
         assert_eq!(received.matches("handshake_ready_connections").count(), 1);
         assert!(received.contains("swarm.add_external_address(canonical)"));
-        crate::source::assert_first_in_order(received, &[
-            (".push(std::iter::once(peer_id))", "Identify push"),
-            ("mark_handshake_ready_connection(", "Bee handshake readiness"),
+        assert_first_in_order(received, &[
+            ".push(std::iter::once(peer_id))",
+            "mark_handshake_ready_connection(",
         ]);
-        crate::source::assert_excludes(runtime, &[
+        assert_excludes(RUNTIME, &[
             "IDENTIFY_PUSH_CONCURRENCY",
             "identify_push_capacity",
             "IDENTIFY_PUSH_TIMEOUT_MS",
             "pending_identify_push",
             "identify::Event::Pushed {",
         ]);
-        assert!(runtime.contains("identify::Event::Received { .. } | identify::Event::Error { .. }"));
+        assert!(RUNTIME.contains("identify::Event::Received { .. } | identify::Event::Error { .. }"));
         assert_eq!(
-            runtime
+            RUNTIME
                 .matches("swarm.add_external_address(canonical)")
                 .count(),
             1
         );
-        assert!(runtime.contains("canonical_identify_address"));
-        assert!(runtime.contains("swarm.remove_external_address(&address)"));
+        assert!(RUNTIME.contains("canonical_identify_address"));
+        assert!(RUNTIME.contains("swarm.remove_external_address(&address)"));
 
         let empty_observed = received
             .split("if info.observed_addr.is_empty()")
             .nth(1)
             .expect("empty Identify observation handling");
         assert!(empty_observed.contains("close_failed_identify_connection("));
-        let identify_error = runtime
+        let identify_error = RUNTIME
             .rsplit("identify::Event::Error {")
             .next()
             .and_then(|source| source.split("SwarmEvent::OutgoingConnectionError").next())
             .expect("Identify error lifecycle");
         assert!(identify_error.contains("close_failed_identify_connection("));
 
-        let exact_close = crate::source::between(
-            runtime,
+        let exact_close = between(
+            RUNTIME,
             "async fn close_failed_identify_connection(",
             "async fn remove_connection_attempt(",
         );
-        crate::source::assert_contains(exact_close, &[
+        assert_contains(exact_close, &[
             "attempt.physical_connection_id == Some(connection_id)",
             "!attempt.identify_failed",
             "handshake_ready_connections",
@@ -476,21 +404,20 @@ mod connection {
 
     #[test]
     fn only_private_custom_bootnodes_enable_private_gossip() {
-        let runtime = crate::RUNTIME_SOURCE;
-        let connect = crate::source::between(
+        let connect = between(
             crate::NETWORK_SOURCE,
             "pub(crate) async fn connect_bootnodes_for_current_network(",
             "pub(super) fn current_connection_generation(",
         );
-        crate::source::assert_contains(connect, &[
+        assert_contains(connect, &[
             "is_private_or_local_bootnode(address)",
             "!profile.bootnodes.contains(&address.as_str())",
             ".store(private_custom_bootnodes, Ordering::Release)",
         ]);
         assert!(!connect.contains(".store(custom_bootnodes, Ordering::Release)"));
 
-        let private_check = crate::source::between(
-            runtime,
+        let private_check = between(
+            RUNTIME,
             "fn is_private_or_local_bootnode(",
             "pub(crate) struct BzzRangeRequest",
         );
@@ -506,122 +433,75 @@ mod connection {
 
     #[test]
     fn early_pricing_is_reconciled_after_reservation_and_close_cannot_split_promotion() {
-        let runtime = crate::RUNTIME_SOURCE;
-        let accounting = crate::source::between(
-            runtime,
+        let accounting = between(
+            RUNTIME,
             "let accounting_event_handle = async",
             "let pricing_event_handle = async",
         );
-        let attempt = accounting
-            .find("let connection_attempt_id = peer_file.connection_attempt_id;")
-            .expect("handshake attempt identity");
-        let connected_guard = accounting
-            .find("let mut connected_peers = wings.connected_peers.lock().await;")
-            .expect("peer lifecycle guard");
-        let physical = accounting
-            .find("let physical_session_current =")
-            .expect("physical connection validation");
-        let ownership = accounting
-            .find("attempt.physical_connection_id")
-            .expect("attempt reservation ownership");
-        let accounting_arc = accounting
-            .find("let accounting_peer_lock = {")
-            .expect("saved accounting peer");
-        let connected = accounting
-            .find("connected_peers.insert(peer, peer_file)")
-            .expect("connected-peer publication");
-        let threshold = accounting
-            .find("let threshold_ready = {")
-            .expect("post-reservation pricing reconciliation");
-        let promotion = accounting
-            .find("self.promote_priced_peer(&wings, peer).await;")
-            .expect("priced peer promotion");
-        assert!(
-            attempt < connected_guard
-                && connected_guard < physical
-                && physical < ownership
-                && ownership < accounting_arc
-                && accounting_arc < threshold
-                && threshold < connected
-                && threshold < promotion,
-            "a handshake must own physical and counted capacity before publication and promotion"
-        );
-        crate::source::assert_contains(accounting, &[
+        assert_first_in_order(accounting, &[
+            "let connection_attempt_id = peer_file.connection_attempt_id;",
+            "let mut connected_peers = wings.connected_peers.lock().await;",
+            "let physical_session_current =",
+            "attempt.physical_connection_id",
+            "let accounting_peer_lock = {",
+            "let threshold_ready = {",
+            "connected_peers.insert(peer, peer_file)",
+            "self.promote_priced_peer(&wings, peer).await;",
+        ]);
+        assert_contains(accounting, &[
             "let accounting_peer_for_timeout = accounting_peer_lock.clone();",
             "Arc::ptr_eq(",
             "peer_file.connection_attempt_id == connection_attempt_id",
         ]);
         assert!(!accounting.contains("timeout_attempt_id"));
 
-        let promotion = crate::source::between(
+        let promotion = between(
             crate::NETWORK_SOURCE,
             "pub(super) async fn promote_priced_peer(",
             "pub(crate) struct StreamBehaviour {",
         );
-        let connected_guard = promotion
-            .find("let connected_peers_guard = wings.connected_peers.lock().await;")
-            .expect("disconnect serialization guard");
-        let physical = promotion
-            .find("exclusive_physical_connection(&wings.physical_connections, &peer)")
-            .expect("physical connection validation");
-        let reservation_transfer = promotion
-            .find("remove_connection_attempt(wings, &peer, peer_file.connection_attempt_id)")
-            .expect("owned reservation transfer");
-        let overlay_publish = promotion
-            .find("Arc::make_mut(&mut overlay_peers_map).insert(peer_file.overlay, peer)")
-            .expect("overlay publication");
-        let population_transfer = promotion
-            .find("complete_connection_reservation(")
-            .expect("atomic reservation transfer");
-        let connected_drop = promotion
-            .find("drop(connected_peers_guard);")
-            .expect("disconnect serialization release");
-        let duplicate_cleanup = promotion
-            .find("connected_peers.lock().await.remove(&peer)")
-            .expect("duplicate cleanup");
-        assert!(
-            connected_guard < physical
-                && physical < reservation_transfer
-                && reservation_transfer < overlay_publish
-                && overlay_publish < population_transfer
-                && population_transfer < connected_drop
-                && connected_drop < duplicate_cleanup,
-            "disconnect must not interleave the reservation, overlay, and counter transfer"
-        );
+        // Disconnect cannot interleave the reservation, overlay, and counter transfer.
+        assert_first_in_order(promotion, &[
+            "let connected_peers_guard = wings.connected_peers.lock().await;",
+            "exclusive_physical_connection(&wings.physical_connections, &peer)",
+            "remove_connection_attempt(wings, &peer, peer_file.connection_attempt_id)",
+            "overlay_peers_map.insert(peer_file.overlay, peer)",
+            "complete_connection_reservation(",
+            "drop(connected_peers_guard);",
+            "connected_peers.lock().await.remove(&peer)",
+        ]);
     }
 
     #[test]
     fn inbound_pricing_is_bound_to_the_exact_transport_session() {
-        let runtime = crate::RUNTIME_SOURCE;
-        let inbound = crate::source::between(
-            runtime,
+        let inbound = between(
+            RUNTIME,
             "let pricing_inbound_handle = async move",
             "let gossip_peers_instructions",
         );
-        crate::source::assert_contains(inbound, &[
+        assert_contains(inbound, &[
             "exclusive_physical_connection(",
             "TransportConnectionSession::capture(",
             "pricing_handler(peer, stream, pricing_session, &pricing_chan_outgoing).await",
         ]);
 
-        let handler_source = include_str!("../src/handlers.rs");
-        let handler = crate::source::between(
-            handler_source,
+        let handler = between(
+            HANDLERS,
             "pub async fn pricing_handler(",
             "pub async fn gossip_handler(",
         );
-        crate::source::assert_contains(handler, &[
+        assert_contains(handler, &[
             "session: TransportConnectionSession",
             "if !session.is_current()",
             "pricing_updates.try_send((peer, payment_threshold, session))",
         ]);
 
-        let application = crate::source::between(
-            runtime,
+        let application = between(
+            RUNTIME,
             "let pricing_event_handle = async",
             "let cheques_active_cache",
         );
-        crate::source::assert_contains(application, &[
+        assert_contains(application, &[
             "let (peer, amount, pricing_session) = pricing;",
             "pricing_session.is_current()",
             "expected_connection == Some(pricing_session.connection_id())",
@@ -630,22 +510,16 @@ mod connection {
 
     #[test]
     fn only_the_connection_that_owns_the_session_tears_down_peer_state() {
-        let runtime = crate::RUNTIME_SOURCE;
-        let close = runtime
+        let close = RUNTIME
             .split("SwarmEvent::ConnectionClosed {")
             .find(|source| source.contains("let close_owns_lifecycle ="))
             .and_then(|source| source.split("let accounting_peer =").next())
             .expect("connection-close lifecycle");
-        let expected = close
-            .find("let expected_peer_connection =")
-            .expect("current session connection");
-        let ownership = close
-            .find("let close_owns_lifecycle =")
-            .expect("connection ownership decision");
-        let cleanup = close
-            .find("let removed_peer_file = connected_peers.remove(&peer_id)")
-            .expect("peer state cleanup");
-        assert!(expected < ownership && ownership < cleanup);
+        assert_first_in_order(close, &[
+            "let expected_peer_connection =",
+            "let close_owns_lifecycle =",
+            "let removed_peer_file = connected_peers.remove(&peer_id)",
+        ]);
         assert!(close.contains("expected == connection_id"));
         assert!(close.contains("expected_attempt_connection == Some(connection_id)"));
     }
@@ -667,49 +541,31 @@ mod connection {
         assert_eq!(bee_reconnect_delay_seconds(1, 2, 3, 0), 1);
         assert!(bee_reconnect_delay_seconds(u64::MAX, u64::MAX, u64::MAX, 1) > 0);
 
-        let runtime = crate::RUNTIME_SOURCE;
-        let close = runtime
+        let close = RUNTIME
             .split("SwarmEvent::ConnectionClosed {")
             .find(|source| source.contains("let close_owns_lifecycle ="))
             .and_then(|source| source.split("_ => {}").next())
             .expect("connection-close lifecycle");
-        let snapshot = close
-            .find("accounting_peer.balance")
-            .expect("accounting balance snapshot");
-        let backoff = close
-            .find("bee_reconnect_delay_seconds(")
-            .expect("Bee-compatible reconnect backoff");
-        let cooldown = close
-            .find(".connection_cooldowns")
-            .expect("gossip-resistant reconnect cooldown");
-        let guard_release = cooldown
-            + close[cooldown..]
-                .find("drop(connected_peers);")
-                .expect("peer lifecycle guard release");
-        let sleep = close
-            .find("Duration::from_millis(reconnect_delay_ms)")
-            .expect("backoff sleep");
-        let generation_check = close[sleep..]
-            .find("connection_generation.load(Ordering::Acquire) == retry_generation")
-            .expect("post-backoff generation check");
-        let cooldown_release = close[sleep..]
-            .find(".remove(&peer_id)")
-            .expect("same-generation cooldown release");
-        let enqueue = close[sleep..]
-            .find("PeerDialInstruction {")
-            .expect("reconnect enqueue");
-        assert!(close[enqueue..].contains("retry: true,"));
-        assert!(
-            snapshot < backoff
-                && backoff < cooldown
-                && cooldown < guard_release
-                && guard_release < sleep
-                && generation_check < cooldown_release
-                && cooldown_release < enqueue
-        );
+        assert_first_in_order(close, &[
+            "accounting_peer.balance",
+            "bee_reconnect_delay_seconds(",
+            ".connection_cooldowns",
+        ]);
+        let cooldown = close.find(".connection_cooldowns").unwrap();
+        let sleep = close.find("Duration::from_millis(reconnect_delay_ms)").unwrap();
+        assert!(cooldown < sleep && close[cooldown..sleep].contains("drop(connected_peers);"));
+        let delayed = &close[sleep..];
+        assert_first_in_order(delayed, &[
+            "Duration::from_millis(reconnect_delay_ms)",
+            "connection_generation.load(Ordering::Acquire) == retry_generation",
+            ".remove(&peer_id)",
+            "PeerDialInstruction {",
+        ]);
+        let enqueue = delayed.find("PeerDialInstruction {").unwrap();
+        assert!(delayed[enqueue..].contains("retry: true,"));
 
-        let reservation = crate::source::between(
-            runtime,
+        let reservation = between(
+            RUNTIME,
             "async fn try_mark_connection_attempt(",
             "async fn remove_connection_attempt(",
         );
@@ -718,52 +574,37 @@ mod connection {
 
     #[test]
     fn connection_generation_is_atomic_saturating_and_snapshotted_around_network_id() {
-        let runtime = crate::RUNTIME_SOURCE;
-        let context = crate::source::between(
+        let context = between(
             crate::NETWORK_SOURCE,
             "pub(super) async fn current_connection_context(&self)",
             "pub(super) fn bump_connection_generation(&self)",
         );
-        crate::source::assert_first_in_order(context, &[
-            ("let before = self.current_connection_generation();", "missing source marker"),
-            ("let network_id = *self.network_id.lock().await;", "missing source marker"),
-            ("let after = self.current_connection_generation();", "missing source marker"),
+        assert_first_in_order(context, &[
+            "let before = self.current_connection_generation();",
+            "let network_id = *self.network_id.lock().await;",
+            "let after = self.current_connection_generation();",
         ]);
-        crate::source::assert_contains(runtime, &[
-            ".fetch_update(",
+        assert_contains(RUNTIME, &[
+            ".try_update(",
             "Ordering::AcqRel",
             "Ordering::Acquire",
             "Some(generation.saturating_add(1))",
         ]);
-        assert!(!runtime.contains("connection_generation.lock().await"));
+        assert!(!RUNTIME.contains("connection_generation.lock().await"));
     }
 
     #[test]
     fn refresh_settlement_coalesces_per_account_and_rearms_until_debt_is_clear() {
-        let runtime = crate::RUNTIME_SOURCE;
-        let instruction = crate::source::between(
-            runtime,
-            "let refreshment_instruction_handle = async",
-            "let swap_price =",
-        );
-        let balance = instruction
-            .find("let (balance, last_refreshment, payment_threshold) =")
-            .expect("accounting snapshot");
-        let session = instruction
-            .find("current_accounting_protocol_session(")
-            .expect("exact accounting session check");
-        let dispatch = instruction
-            .find("refresh_handler(")
-            .expect("settlement dispatch");
-        let completion_time = instruction
-            .find("accounting_peer.lock().await.refreshment = Date::now();")
-            .expect("completion-based attempt rate limit");
-        let mutation = instruction
-            .find("apply_refreshment(&accounting_peer, amount)")
-            .expect("terminal accounting mutation");
-        assert!(balance < session && session < dispatch);
-        assert!(dispatch < completion_time && completion_time < mutation);
-        crate::source::assert_contains(instruction, &[
+        let instruction = refresh_instruction();
+        assert_first_in_order(instruction, &[
+            "let (balance, last_refreshment, payment_threshold) =",
+            "current_accounting_protocol_session(",
+            "refresh_handler(",
+            "accounting_peer.borrow_mut().refreshment = Date::now();",
+            "apply_refreshment(&accounting_peer, amount)",
+        ]);
+        let dispatch = instruction.find("refresh_handler(").unwrap();
+        assert_contains(instruction, &[
             "if !refreshment_due(",
             "account.threshold,",
             "account.refresh_scheduled = false;",
@@ -777,34 +618,24 @@ mod connection {
         assert!(instruction.contains("quiesce_drain_and_close_accounting_session("));
         assert!(!instruction.contains("REFRESH_RATE * 100"));
         assert!(!instruction.contains("Duration::from_secs(15)"));
-        assert!(!runtime.contains("ongoing_refreshments"));
-        assert!(!runtime.contains("refreshment_apply_handle"));
+        assert!(!RUNTIME.contains("ongoing_refreshments"));
+        assert!(!RUNTIME.contains("refreshment_apply_handle"));
 
-        let ambiguous_close = crate::source::between(
-            runtime,
-            "async fn quiesce_drain_and_close_accounting_session(",
-            "#[derive(NetworkBehaviour)]",
-        );
-        crate::source::assert_first_in_order(ambiguous_close, &[
-            ("account.connection_id = None;", "new reservation quiescence"),
-            ("accounting_peer.lock().await.reserve == 0", "dispatched accounting drain"),
-            ("swarm.close_connection(connection_id)", "exact physical close"),
+        let retirement = between(RUNTIME, "async fn quiesce_drain_and_close_accounting_session(", "#[derive(NetworkBehaviour)]");
+        assert_first_in_order(retirement, &[
+            "account.connection_id = None;",
+            "accounting_peer.borrow().reserve == 0",
+            "swarm.close_connection(connection_id)",
         ]);
-        assert!(!ambiguous_close.contains("timeout("));
+        assert!(!retirement.contains("timeout("));
 
         let accounting = include_str!("../src/accounting.rs");
-        let coalescing = accounting
-            .find("if refreshment_due(")
-            .expect("atomic refresh coalescing");
-        let claim = accounting[coalescing..]
-            .find("account.refresh_scheduled = true;")
-            .map(|offset| coalescing + offset)
-            .expect("refresh instruction claim");
-        let enqueue = accounting[claim..]
-            .find("refreshments.try_send(instruction)")
-            .map(|offset| claim + offset)
-            .expect("claimed refresh enqueue");
-        assert!(coalescing < claim && claim < enqueue);
+        let coalescing = &accounting[accounting.find("if refreshment_due(").unwrap()..];
+        assert_first_in_order(coalescing, &[
+            "if refreshment_due(",
+            "account.refresh_scheduled = true;",
+            "refreshments.try_send(instruction)",
+        ]);
     }
 
     #[test]
@@ -864,14 +695,9 @@ mod connection {
 
     #[test]
     fn original_refresh_interface_logs_use_the_bounded_log() {
-        let runtime = crate::RUNTIME_SOURCE;
-        let instruction = crate::source::between(
-            runtime,
-            "let refreshment_instruction_handle = async",
-            "let swap_price =",
-        );
+        let instruction = refresh_instruction();
 
-        assert!(runtime.contains("mpsc::bounded::<String>(LOG_QUEUE_CAPACITY)"));
+        assert!(RUNTIME.contains("mpsc::bounded::<String>(LOG_QUEUE_CAPACITY)"));
         assert!(instruction.contains("interface_log_to("));
         for marker in [
             "Applied refreshment {}",
@@ -898,8 +724,7 @@ mod connection {
 
     #[test]
     fn wasm_retrieval_yields_browser_turns_without_per_chunk_telemetry() {
-        let runtime = crate::RUNTIME_SOURCE;
-        let retrieve = runtime
+        let retrieve = RUNTIME
             .split("let retrieve_chunk_handle = async")
             .nth(1)
             .and_then(|source| {
@@ -908,22 +733,18 @@ mod connection {
                     .next()
             })
             .expect("retrieve dispatcher");
-        crate::source::assert_contains(retrieve, &[
+        assert_contains(retrieve, &[
             "let retrieve_dispatch_yield_every = 128usize;",
             "let mut retrieve_dispatches_since_browser_yield = 0usize;",
             "async_std::task::sleep(Duration::ZERO).await;",
         ]);
-        crate::source::assert_excludes(retrieve, &[
+        assert_excludes(retrieve, &[
             "RETRIEVE_QUEUE_HOT_LOOP_GUARD_MS",
             "wave_done",
             "Completed {} of {} chunk retrieval requests",
         ]);
 
-        let refresh = crate::source::between(
-            runtime,
-            "let refreshment_instruction_handle = async",
-            "let swap_price =",
-        );
+        let refresh = refresh_instruction();
         assert!(refresh.contains("refresh_dispatches % 8 == 0"));
         assert!(refresh.contains("async_std::task::sleep(Duration::ZERO).await;"));
 
@@ -931,37 +752,34 @@ mod connection {
 
     #[test]
     fn direct_work_requests_do_not_cross_forwarding_queues() {
-        let runtime = crate::RUNTIME_SOURCE;
 
-        assert!(runtime.contains("chunk_push_port: AsyncPort<ChunkUploadRequest>"));
-        assert!(runtime.contains("self.chunk_push_port.1.recv().await"));
-        assert!(!runtime.contains("DirectChunkPushRequest"));
-        assert!(!runtime.contains("push_chunk_port_handle"));
+        assert!(RUNTIME.contains("chunk_push_port: AsyncPort<ChunkUploadRequest>"));
+        assert!(RUNTIME.contains("self.chunk_push_port.1.recv().await"));
+        assert!(!RUNTIME.contains("DirectChunkPushRequest"));
+        assert!(!RUNTIME.contains("push_chunk_port_handle"));
 
-        let resolve = crate::source::between(
-            runtime,
+        let resolve = between(
+            RUNTIME,
             "pub async fn resolve_bzz(&self, resource: String)",
             "pub async fn acquire_resolved_range(",
         );
         assert!(resolve.contains("bzz_stream::resolve_bzz(&resource, &self.chunk_port.0).await"));
-        assert!(!runtime.contains("BzzResolveRequest"));
-        assert!(!runtime.contains("resolve_bzz_handle"));
+        assert!(!RUNTIME.contains("BzzResolveRequest"));
+        assert!(!RUNTIME.contains("resolve_bzz_handle"));
     }
 
     #[test]
     fn handshake_and_cheque_lifecycles_are_session_bound() {
-        let runtime = crate::RUNTIME_SOURCE;
-        assert!(runtime.contains("Duration::from_millis(HANDSHAKE_PROTOCOL_TIMEOUT_MS)"));
+        assert!(RUNTIME.contains("Duration::from_millis(HANDSHAKE_PROTOCOL_TIMEOUT_MS)"));
 
-        let handlers = include_str!("../src/handlers.rs");
-        assert!(handlers.contains("let ack = syn_ack.ack?;"));
-        assert!(handlers.contains("let peer_address = ack.address?;"));
-        let handshake = crate::source::between(
-            handlers,
+        assert!(HANDLERS.contains("let ack = syn_ack.ack?;"));
+        assert!(HANDLERS.contains("let peer_address = ack.address?;"));
+        let handshake = between(
+            HANDLERS,
             "async fn handshake_exchange(",
             "pub async fn pricing_handler(",
         );
-        crate::source::assert_contains(handshake, &[
+        assert_contains(handshake, &[
             "deserialize_underlays(&syn.observed_underlay)",
             "try_from_multiaddr(underlay).as_ref() != Some(&local_peer)",
             "let underlay = syn.observed_underlay;",
@@ -969,8 +787,8 @@ mod connection {
         assert!(!handshake.contains("underlay.clone()"));
         assert!(handshake.contains("if ack.network_id != network_id"));
 
-        let connection = crate::source::between(
-            handlers,
+        let connection = between(
+            HANDLERS,
             "pub async fn connection_handler(",
             "pub async fn refresh_handler(",
         );
@@ -982,29 +800,30 @@ mod connection {
             .expect("physical session capture");
         assert!(open < capture);
         assert!(connection.contains("peer, connection_id, physical_connections"));
-        assert!(!runtime.contains("self_ephemerals"));
-        crate::source::assert_contains(handlers, &[
+        assert!(!RUNTIME.contains("self_ephemerals"));
+        assert_contains(HANDLERS, &[
             "read_control_protocol_frame(&mut stream).await",
             "stream.read_exact(&mut frame).await",
             "enum RefreshmentOutcome",
             "if acknowledged_amount > amount",
             "RefreshmentOutcome::AmbiguousAfterPayment",
         ]);
-        let refresh_handler = crate::source::between(
-            handlers,
+        let refresh_handler = between(
+            HANDLERS,
             "pub async fn refresh_handler(",
             "pub async fn issue_handler(",
         );
-        // Expiry may close an ambiguous refresh only after its physical work drains.
-        assert!(refresh_handler.contains("Duration::from_secs(10)"));
+        // Every expiry retires its session; dispatched physical work still drains first.
+        assert!(refresh_handler.contains("Duration::from_secs(3)"));
         crate::source::assert_in_order(refresh_handler, &[
-            "RefreshmentOutcome::NotDispatched",
             "async_std::future::timeout(",
             "open_current_outbound_stream(",
+            "RefreshmentOutcome::NotDispatched",
             "refreshment_exchange(",
+            "RefreshmentOutcome::TimedOut",
         ]);
-        let pricing = crate::source::between(
-            handlers,
+        let pricing = between(
+            HANDLERS,
             "pub async fn pricing_handler(",
             "pub async fn gossip_handler(",
         );
@@ -1014,8 +833,8 @@ mod connection {
                 .count(),
             2
         );
-        let refresh = crate::source::between(
-            handlers,
+        let refresh = between(
+            HANDLERS,
             "async fn refreshment_exchange(",
             "async fn cheque_exchange(",
         );
@@ -1027,21 +846,21 @@ mod connection {
         );
         crate::source::assert_in_order(refresh, &[
             "read_control_protocol_frame(&mut stream).await",
-            "timeout_outcome.set(RefreshmentOutcome::AmbiguousAfterPayment)",
             "stream.write_all(&payment_frame).await",
+            "RefreshmentOutcome::AmbiguousAfterPayment",
         ]);
-        assert!(!handlers.contains("syn_ack.ack.clone().unwrap()"));
+        assert!(!HANDLERS.contains("syn_ack.ack.clone().unwrap()"));
 
-        crate::source::assert_contains(runtime, &[
+        assert_contains(RUNTIME, &[
             "cheques.insert(",
             "claim_current_cheque(",
             "(cheque_amt, cheque_generation)",
             "map.get(&peer).copied() == Some((amount, cheque_generation))",
             "generation == cheque_generation",
         ]);
-        assert!(!runtime.contains("swap_beneficiaries"));
-        assert!(!handlers.contains("beneficiaries:"));
-        let cheque = handlers.split("async fn cheque_exchange(").nth(1).unwrap();
+        assert!(!RUNTIME.contains("swap_beneficiaries"));
+        assert!(!HANDLERS.contains("beneficiaries:"));
+        let cheque = HANDLERS.split("async fn cheque_exchange(").nth(1).unwrap();
         crate::source::assert_in_order(cheque, &[
             "get_chequebook_last_issued_cheque_payout(",
             "stored_cumulative_payout.is_zero()",
@@ -1054,50 +873,37 @@ mod connection {
         ]);
 
         let cheque_claim =
-            crate::source::between(runtime, "async fn claim_current_cheque(", "\npub(crate) ");
-        crate::source::assert_first_in_order(cheque_claim, &[
-            ("wings.connected_peers.lock().await", "peer lifecycle guard"),
-            (".accounting_peers", "exact account lookup"),
-            ("wings.ongoing_cheques.lock().await", "cheque claim map"),
-            ("exclusive_physical_connection(", "last physical-session check"),
-            ("cheques.insert(", "claim publication"),
+            between(RUNTIME, "async fn claim_current_cheque(", "\npub(crate) ");
+        assert_first_in_order(cheque_claim, &[
+            "wings.connected_peers.lock().await",
+            ".accounting_peers",
+            "wings.ongoing_cheques.lock().await",
+            "exclusive_physical_connection(",
+            "cheques.insert(",
         ]);
 
-        let cheque_dispatch = crate::source::between(
-            runtime,
+        let cheque_dispatch = between(
+            RUNTIME,
             "let cheque_instruction_handle = async",
             "let cheque_apply_handle = async",
         );
-        let capture = cheque_dispatch
-            .find("OutboundProtocolSession::capture(")
-            .expect("cheque transport-session capture");
-        let beneficiary = cheque_dispatch[capture..]
-            .find("peer_file.connection_id == protocol_session.connection_id()")
-            .map(|offset| capture + offset)
-            .expect("cheque beneficiary must belong to the captured connection");
-        assert!(cheque_dispatch[beneficiary..].contains("peer_file.beneficiary"));
-        let post_capture_claim = cheque_dispatch[capture..]
-            .find("map.get(&peer).copied() == Some((amount, cheque_generation))")
-            .map(|offset| capture + offset)
-            .expect("post-capture cheque claim validation");
-        let dispatch = cheque_dispatch[post_capture_claim..]
-            .find("issue_handler(")
-            .map(|offset| post_capture_claim + offset)
-            .expect("cheque protocol dispatch");
-        assert!(
-            capture < beneficiary
-                && beneficiary < post_capture_claim
-                && post_capture_claim < dispatch,
-            "a stale cheque claim must not cross onto a replacement peer session"
-        );
+        let capture = cheque_dispatch.find("OutboundProtocolSession::capture(").unwrap();
+        let dispatch = &cheque_dispatch[capture..];
+        assert_first_in_order(dispatch, &[
+            "OutboundProtocolSession::capture(",
+            "peer_file.connection_id == protocol_session.connection_id()",
+            "map.get(&peer).copied() == Some((amount, cheque_generation))",
+            "issue_handler(",
+        ]);
+        let beneficiary = dispatch.find("peer_file.connection_id == protocol_session.connection_id()").unwrap();
+        assert!(dispatch[beneficiary..].contains("peer_file.beneficiary"));
     }
 
     #[test]
     fn retrieval_reads_complete_length_delimited_frames_despite_transport_fragmentation() {
-        let handlers = include_str!("../src/handlers.rs");
-        assert!(handlers.contains("const EMPTY_HEADERS_FRAME: &[u8] = &[0];"));
-        let retrieval = crate::source::between(
-            handlers,
+        assert!(HANDLERS.contains("const EMPTY_HEADERS_FRAME: &[u8] = &[0];"));
+        let retrieval = between(
+            HANDLERS,
             "pub async fn retrieve_handler(",
             "pub async fn pushsync_handler(",
         );
@@ -1114,9 +920,8 @@ mod connection {
 
     #[test]
     fn hive_reads_complete_length_delimited_frames_despite_transport_fragmentation() {
-        let handlers = include_str!("../src/handlers.rs");
-        let hive = crate::source::between(
-            handlers,
+        let hive = between(
+            HANDLERS,
             "pub async fn gossip_handler(",
             "async fn refreshment_exchange(",
         );
@@ -1142,8 +947,7 @@ mod connection {
 
     #[test]
     fn pushsync_uses_exact_framing_and_cannot_drop_a_short_write() {
-        let handlers = include_str!("../src/handlers.rs");
-        let pushsync = handlers
+        let pushsync = HANDLERS
             .split("async fn pushsync_exchange(")
             .nth(1)
             .expect("pushsync protocol handler");
@@ -1164,16 +968,14 @@ mod connection {
 
     #[test]
     fn accounting_protocol_streams_cannot_implicitly_redial_or_cross_sessions() {
-        let runtime = crate::RUNTIME_SOURCE;
-        crate::source::assert_contains(runtime, &[
+        assert_contains(RUNTIME, &[
             "Poll::Ready(ToSwarm::Dial { opts })",
             "FromSwarm::DialFailure(DialFailure",
             "let error = DialError::NoAddresses;",
         ]);
 
-        let handlers = include_str!("../src/handlers.rs");
-        let open_current = crate::source::between(
-            handlers,
+        let open_current = between(
+            HANDLERS,
             "async fn open_current_outbound_stream(",
             "pub async fn refresh_handler(",
         );
@@ -1194,26 +996,20 @@ mod connection {
             "open_current_outbound_stream(peer, control, PUSHSYNC_PROTOCOL, &session)",
         ] {
             assert!(
-                handlers.contains(call),
+                HANDLERS.contains(call),
                 "accounting protocol wrapper must use the session-bound stream helper: {call}"
             );
         }
 
         let retrieval = include_str!("../src/retrieval.rs");
-        let selection = crate::source::between(
-            retrieval,
-            "async fn select_retrieve_peer(",
-            "async fn retrieve_attempt(",
-        );
-        crate::source::assert_in_order(
-            &crate::source::compact(selection),
-            &[
-                "letSome(connection_id)=reserve(accounting_peer,req_price).await",
-                "OutboundProtocolSession::capture(",
-                "letselected=ReservedRetrievePeer{",
-                "return(Some(selected),false);",
-            ],
-        );
+        let selection = crate::source::compact(between(retrieval,
+            "fn select_retrieve_peer(", "async fn retrieve_attempt("));
+        assert_first_in_order(&selection, &[
+            "letSome(connection_id)=reserve(accounting_peer,req_price)",
+            "OutboundProtocolSession::capture(",
+            "letselected=ReservedRetrievePeer{",
+            "return(Some(selected),false);",
+        ]);
         assert!(retrieval.contains("retrieve_handler(peer, &request, control, session)"));
 
         let upload = include_str!("../src/upload.rs");
@@ -1314,7 +1110,7 @@ mod retrieve_group_stream {
                 .to_ascii_lowercase()
                 .contains("conservative")
         );
-        assert!(RETRIEVAL_SOURCE.contains("const RETRIEVE_ATTEMPT_TIMEOUT_MS: u64 = 10_000;"));
+        assert!(RETRIEVAL_SOURCE.contains("const RETRIEVE_ATTEMPT_TIMEOUT_MS: u64 = 3_000;"));
         assert!(RETRIEVAL_SOURCE.contains("const RETRIEVE_CHUNK_MAX_ATTEMPT_ERRORS: usize = 20;"));
     }
 }
@@ -1471,9 +1267,9 @@ mod rolling_erasure_tail {
             "fn decrypt_join_chunk",
         );
         crate::source::assert_first_in_order(raw_queue, &[
-            ("shared_demand.promote(hedge_demand)", "missing source marker"),
-            ("if !registration.leader", "missing source marker"),
-            ("self.chunks.try_send(", "missing source marker"),
+            "shared_demand.promote(hedge_demand)",
+            "if !registration.leader",
+            "self.chunks.try_send(",
         ]);
         assert!(raw_queue.contains("(shared.admission.clone(), shared.hedge_demand.clone())"));
 
@@ -1499,11 +1295,11 @@ mod rolling_erasure_tail {
         crate::source::assert_in_order(physical_attempt, &[
             "Err(_)",
             "verify_chunk(&request.addr, &chunk)",
-            "apply_credit(&accounting_peer, req_price, &refresh_chan).await",
+            "apply_credit(&accounting_peer, req_price, &refresh_chan)",
             "return RetrieveAttemptResult::Found(chunk, soc)",
-            "cancel_reserve(&accounting_peer, req_price).await",
+            "cancel_reserve(&accounting_peer, req_price)",
         ]);
-        assert!(RETRIEVAL_SOURCE.contains("const RETRIEVE_ATTEMPT_TIMEOUT_MS: u64 = 10_000;"));
+        assert!(RETRIEVAL_SOURCE.contains("const RETRIEVE_ATTEMPT_TIMEOUT_MS: u64 = 3_000;"));
         assert!(RUNTIME_SOURCE.contains("hedge_demand: None"));
     }
 }

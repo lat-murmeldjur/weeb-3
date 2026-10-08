@@ -8,6 +8,7 @@ use wasm_bindgen_futures::spawn_local;
 
 pub(crate) use async_std::channel as mpsc;
 pub(crate) use futures::channel::oneshot;
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::num::NonZero;
 use std::time::Duration;
@@ -55,7 +56,7 @@ pub(crate) use signer::PrivateKeySigner;
 
 mod accounting;
 use accounting::{
-    REFRESH_RATE, RefreshmentInstruction, apply_credit, apply_refreshment,
+    REFRESH_RATE, RefreshmentAction, RefreshmentInstruction, apply_credit, apply_refreshment,
     bee_reconnect_delay_seconds, cancel_reserve, connection_dial_capacity_available, price,
     refreshment_due, reserve, set_payment_threshold,
 };
@@ -269,104 +270,60 @@ impl Weeb3 {
             f_type0
         };
 
-        let mut fvec0 = Vec::new();
-
-        let mut index_document = "".to_string();
-
-        if f_type == "application/x-tar" || f_type == "application/tar" {
-            index_document = match index_string.is_empty() {
-                true => "index.html".to_string(),
-                false => index_string,
-            };
-
-            let content = read_file(file).await;
-            if content.is_empty() && f_size > 0.0 {
-                self.progress.lock().await.finish(
-                    &progress_id,
-                    "failed",
-                    "file read failed",
-                    false,
-                );
-                return upload_result("upload result: failed to read file", "");
-            }
-
-            self.progress.lock().await.update(
-                &progress_id,
-                "parse",
-                Some(20),
-                "reading tar archive",
-            );
-
-            fvec0 = match tar_resources(&content) {
-                Ok(resources) => resources,
-                Err(_) => {
-                    self.progress.lock().await.finish(
-                        &progress_id,
-                        "failed",
-                        "invalid tar archive",
-                        false,
-                    );
-                    return upload_result("upload result: invalid tar archive", "");
+        let result = async {
+            let mut index_document = String::new();
+            let resources = if f_type == "application/x-tar" || f_type == "application/tar" {
+                index_document = if index_string.is_empty() {
+                    "index.html".to_string()
+                } else {
+                    index_string
+                };
+                let content = read_file(file).await;
+                if content.is_empty() && f_size > 0.0 {
+                    return Err(("file read failed", "upload result: failed to read file"));
                 }
+                self.progress.lock().await.update(
+                    &progress_id, "parse", Some(20), "reading tar archive",
+                );
+                tar_resources(&content)
+                    .map_err(|_| ("invalid tar archive", "upload result: invalid tar archive"))?
+            } else {
+                vec![Resource {
+                    path: f_name.clone(),
+                    filename: f_name,
+                    mime: f_type,
+                    data: ResourceData::BrowserFile(file),
+                }]
             };
-        } else {
-            fvec0.push(Resource {
-                path: f_name.clone(),
-                filename: f_name,
-                mime: f_type,
-                data: ResourceData::BrowserFile(file),
-            });
-        }
-
-        if fvec0.is_empty() {
-            self.progress
-                .lock()
-                .await
-                .finish(&progress_id, "failed", "no uploadable files", false);
-            return upload_result("upload result: no uploadable files", "");
-        }
-
-        let topic_safe = normalize_feed_topic(&feed_topic);
-
-        self.progress
-            .lock()
-            .await
-            .update(&progress_id, "push", None, "upload queued");
-
-        if self
-            .upload_port
-            .0
-            .try_send((
-                fvec0,
+            if resources.is_empty() {
+                return Err(("no uploadable files", "upload result: no uploadable files"));
+            }
+            self.progress.lock().await.update(&progress_id, "push", None, "upload queued");
+            self.upload_port.0.try_send((
+                resources,
                 encryption,
                 redundancy_level,
                 index_document,
                 add_to_feed,
-                topic_safe,
+                normalize_feed_topic(&feed_topic),
                 wallet_owner,
                 Some(progress_out),
                 chan_out,
             ))
-            .is_err()
-        {
-            self.progress.lock().await.finish(
-                &progress_id,
-                "failed",
-                "upload queue unavailable",
-                false,
-            );
-            return upload_result("upload result: upload queue unavailable", "");
-        }
-
-        let result = chan_in.await.unwrap_or_default();
-
-        if result.is_empty() {
-            self.progress
-                .lock()
-                .await
-                .finish(&progress_id, "failed", "upload failed", false);
-            return upload_result("upload result: failure", "");
-        }
+            .map_err(|_| ("upload queue unavailable", "upload result: upload queue unavailable"))?;
+            let result = chan_in.await.unwrap_or_default();
+            if result.is_empty() {
+                return Err(("upload failed", "upload result: failure"));
+            }
+            Ok(result)
+        }.await;
+        let result = match result {
+            Ok(result) => result,
+            Err((detail, message)) => {
+                self.progress.lock().await.finish(&progress_id, "failed", detail, false);
+                return upload_result(message, "");
+            }
+        };
 
         let reference_hex = hex::encode(&result);
         self.progress.lock().await.finish(
@@ -1143,9 +1100,9 @@ impl Weeb3 {
                                 let was_bootnode = wings.bootnodes.lock().await.contains(&peer_id);
                                 tracked_bootnode = was_bootnode;
                                 removed_owned_overlay = {
-                                    let mut overlay_peers_map = wings.overlay_peers.lock().await;
+                                    let mut overlay_peers_map = wings.overlay_peers.borrow_mut();
                                     if overlay_peers_map.get(overlay) == Some(&peer_id) {
-                                        Arc::make_mut(&mut overlay_peers_map).remove(overlay);
+                                        overlay_peers_map.remove(overlay);
                                         true
                                     } else {
                                         false
@@ -1174,10 +1131,10 @@ impl Weeb3 {
                             }
 
                             let accounting_peer =
-                                wings.accounting_peers.lock().await.remove(&peer_id);
+                                wings.accounting_peers.borrow_mut().remove(&peer_id);
                             let (balance, reserve, announced_threshold) =
                                 if let Some(accounting_peer) = accounting_peer {
-                                    let accounting_peer = accounting_peer.lock().await;
+                                    let accounting_peer = accounting_peer.borrow();
                                     (
                                         accounting_peer.balance,
                                         accounting_peer.reserve,
@@ -1220,8 +1177,7 @@ impl Weeb3 {
                                 release_connection_reservation(&connection_population).await;
                                 "Ongoing"
                             } else if removed_owned_overlay || tracked_bootnode {
-                                release_connected_peer(&connection_population, retry_is_current)
-                                    .await;
+                                release_connected_peer(&connection_population).await;
                                 "Connected"
                             } else {
                                 "None"
@@ -1421,10 +1377,10 @@ impl Weeb3 {
 
                     let accounting_peer_lock = {
                         // Pricing can arrive before handshake publication; both paths share this entry.
-                        get_or_create_accounting_peer(&wings, peer).await
+                        get_or_create_accounting_peer(&wings, peer)
                     };
                     let threshold_ready = {
-                        let mut accounting_peer = accounting_peer_lock.lock().await;
+                        let mut accounting_peer = accounting_peer_lock.borrow_mut();
                         accounting_peer.connection_id = Some(peer_file.connection_id);
                         accounting_peer.threshold > 0
                     };
@@ -1461,7 +1417,7 @@ impl Weeb3 {
                             }
 
                             let current_accounting_peer = {
-                                let accounting = wings_for_timeout.accounting_peers.lock().await;
+                                let accounting = wings_for_timeout.accounting_peers.borrow();
                                 accounting.get(&peer).cloned()
                             };
 
@@ -1474,7 +1430,7 @@ impl Weeb3 {
                                 return;
                             }
 
-                            if current_accounting_peer.lock().await.threshold > 0 {
+                            if current_accounting_peer.borrow().threshold > 0 {
                                 return;
                             }
 
@@ -1517,21 +1473,18 @@ impl Weeb3 {
                         && expected_connection == Some(pricing_session.connection_id());
                     if physical_session_current {
                         let accounting_peer_lock =
-                            get_or_create_accounting_peer(&wings, peer).await;
+                            get_or_create_accounting_peer(&wings, peer);
                         set_payment_threshold(
                             &accounting_peer_lock,
                             amount,
                             &refreshment_instructions_chan_outgoing,
-                        )
-                        .await;
+                        );
                     }
                     drop(connected_peers);
                     if physical_session_current {
                         self.promote_priced_peer(&wings, peer).await;
                     }
                 }
-
-                async_std::task::yield_now().await;
             }
         };
 
@@ -1550,7 +1503,7 @@ impl Weeb3 {
         let refreshment_log_start_ms = self.log_start_ms;
         let refreshment_instruction_handle = async {
             let mut refresh_dispatches = 0usize;
-            while let Ok((peer, accounting_peer, connection_id)) =
+            while let Ok((peer, accounting_peer, connection_id, action)) =
                 refreshment_instructions_chan_incoming.recv().await
             {
                 let refreshment_wings = wings.clone();
@@ -1565,9 +1518,9 @@ impl Weeb3 {
                     let interface_log = |message: String| {
                         interface_log_to(&refreshment_log_port, refreshment_log_start_ms, message);
                     };
-                    loop {
+                    while action == RefreshmentAction::Refresh {
                         let (balance, last_refreshment, payment_threshold) = {
-                            let mut account = accounting_peer.lock().await;
+                            let mut account = accounting_peer.borrow_mut();
                             if !refreshment_due(
                                 account.balance,
                                 account.refreshment,
@@ -1588,7 +1541,7 @@ impl Weeb3 {
                         .await
                         .is_none()
                         {
-                            accounting_peer.lock().await.refresh_scheduled = false;
+                            accounting_peer.borrow_mut().refresh_scheduled = false;
                             return;
                         }
 
@@ -1625,13 +1578,13 @@ impl Weeb3 {
                         )
                         .await
                         else {
-                            accounting_peer.lock().await.refresh_scheduled = false;
+                            accounting_peer.borrow_mut().refresh_scheduled = false;
                             return;
                         };
 
                         // Dispatched settlement always runs to completion.
                         let attempted_amount = {
-                            let mut account = accounting_peer.lock().await;
+                            let mut account = accounting_peer.borrow_mut();
                             if account.threshold == 0 || !refreshment_due(
                                 account.balance,
                                 account.refreshment,
@@ -1658,7 +1611,7 @@ impl Weeb3 {
                                 continue;
                             }
                             RefreshmentOutcome::Acknowledged(0) => {
-                                let mut account = accounting_peer.lock().await;
+                                let mut account = accounting_peer.borrow_mut();
                                 account.refreshment = Date::now();
                                 account.balance = 0;
                                 account.refresh_scheduled = false;
@@ -1667,26 +1620,19 @@ impl Weeb3 {
                                 return;
                             }
                             RefreshmentOutcome::Acknowledged(amount) => {
-                                accounting_peer.lock().await.refreshment = Date::now();
+                                accounting_peer.borrow_mut().refreshment = Date::now();
                                 amount
                             }
-                            RefreshmentOutcome::AmbiguousAfterPayment => {
+                            RefreshmentOutcome::AmbiguousAfterPayment
+                            | RefreshmentOutcome::TimedOut => {
                                 interface_log("Refreshment attempt cleared 0".into());
-                                quiesce_drain_and_close_accounting_session(
-                                    &refreshment_wings,
-                                    &refreshment_swarm,
-                                    peer,
-                                    &accounting_peer,
-                                    connection_id,
-                                )
-                                .await;
-                                return;
+                                break;
                             }
                         };
 
                         interface_log(format!("Applied refreshment {}", amount));
                         if let Some((peer, surplus_growth, surplus_balance)) =
-                            apply_refreshment(&accounting_peer, amount).await
+                            apply_refreshment(&accounting_peer, amount)
                         {
                             interface_log(format!(
                                 "Surplus balance increased for peer {} by {} to {}",
@@ -1694,7 +1640,7 @@ impl Weeb3 {
                             ));
                         }
 
-                        let balance = accounting_peer.lock().await.balance;
+                        let balance = accounting_peer.borrow().balance;
                         if cheques_active_cache.load(Ordering::Relaxed) && balance > REFRESH_RATE {
                             let cheque_amt = balance - REFRESH_RATE;
                             let cheque_generation = cheque_generations
@@ -1724,6 +1670,14 @@ impl Weeb3 {
                             }
                         }
                     }
+                    quiesce_drain_and_close_accounting_session(
+                        &refreshment_wings,
+                        &refreshment_swarm,
+                        peer,
+                        &accounting_peer,
+                        connection_id,
+                    )
+                    .await;
                 });
                 refresh_dispatches += 1;
                 if refresh_dispatches % 8 == 0 {
@@ -1782,12 +1736,12 @@ impl Weeb3 {
                             return;
                         }
                         let accounting_peer =
-                            wings.accounting_peers.lock().await.get(&peer).cloned();
+                            wings.accounting_peers.borrow().get(&peer).cloned();
                         let Some(accounting_peer) = accounting_peer else {
                             let _ = cheque_chan.try_send((peer, false, cheque_generation));
                             return;
                         };
-                        let connection_id = accounting_peer.lock().await.connection_id;
+                        let connection_id = accounting_peer.borrow().connection_id;
                         let Some(protocol_session) = connection_id.and_then(|connection_id| {
                             OutboundProtocolSession::capture(
                                 peer,
@@ -1848,7 +1802,7 @@ impl Weeb3 {
                         && generation == cheque_generation
                     {
                         let accounting_peer =
-                            wings.accounting_peers.lock().await.get(&peer).cloned();
+                            wings.accounting_peers.borrow().get(&peer).cloned();
                         let still_current = {
                             let cheques = wings.ongoing_cheques.lock().await;
                             cheques.get(&peer).copied() == Some((amount, cheque_generation))
@@ -1857,7 +1811,7 @@ impl Weeb3 {
                             && ok
                             && let Some(accounting_peer) = accounting_peer
                         {
-                            let _ = apply_refreshment(&accounting_peer, amount).await;
+                            let _ = apply_refreshment(&accounting_peer, amount);
                         }
                         let mut cheques = wings.ongoing_cheques.lock().await;
                         if cheques.get(&peer).copied() == Some((amount, cheque_generation)) {
@@ -1867,8 +1821,6 @@ impl Weeb3 {
                         ACCOUNTING_DRAINED.notify(usize::MAX);
                     }
                 }
-
-                async_std::task::yield_now().await;
             }
         };
 
@@ -1917,8 +1869,6 @@ impl Weeb3 {
                         let _ = chan.send(data);
                     });
                 }
-
-                async_std::task::yield_now().await;
             }
         };
 
@@ -1960,8 +1910,6 @@ impl Weeb3 {
                         let _ = chan.send(push_reference);
                     }
                 }
-
-                async_std::task::yield_now().await;
             }
         };
 
@@ -2066,8 +2014,6 @@ impl Weeb3 {
                         }
                     });
                 }
-
-                async_std::task::yield_now().await;
             }
         };
 
@@ -2145,8 +2091,6 @@ impl Weeb3 {
                         chan.send(chunk_data);
                     });
                 }
-
-                async_std::task::yield_now().await;
             }
         };
 
@@ -2319,8 +2263,6 @@ impl Weeb3 {
                         }
                     });
                 }
-
-                async_std::task::yield_now().await;
             }
         };
 

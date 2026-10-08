@@ -55,9 +55,6 @@ async fn prepare_hls(
     if !result_view_request_is_current(view_generation) {
         return Err("HLS open was superseded".to_string());
     }
-    if PENDING_HLS.with(|pending| pending.borrow().is_some()) {
-        return Err("another HLS preparation is already pending".to_string());
-    }
     PENDING_HLS.with(|pending| {
         *pending.borrow_mut() = Some(PendingHlsAttempt {
             id: view_generation,
@@ -85,7 +82,7 @@ async fn prepare_hls(
     let (prepared, worker_session) = match prepared {
         Ok(parsed) => parsed,
         Err(error) => {
-            abandon_hls_attempt(view_generation, &runtime, network_id);
+            release_hls_matching(Some(view_generation));
             return Err(error);
         }
     };
@@ -134,17 +131,14 @@ fn parse_prepare_response(response: Object) -> Result<(PreparedHlsFeed, u64), St
     ))
 }
 
-fn release_hls_matching(view_generation: Option<u64>) {
-    let active = ACTIVE_HLS.with(|active| {
-        active
-            .borrow_mut()
-            .take_if(|active| view_generation.is_none_or(|id| active.id == id))
+fn release_hls_matching(view_generation: Option<u64>) -> bool {
+    let active = ACTIVE_HLS.with_borrow_mut(|active| {
+        active.take_if(|active| view_generation.is_none_or(|id| active.id == id))
     });
-    let pending = PENDING_HLS.with(|pending| {
-        pending
-            .borrow_mut()
-            .take_if(|pending| view_generation.is_none_or(|id| pending.id == id))
+    let pending = PENDING_HLS.with_borrow_mut(|pending| {
+        pending.take_if(|pending| view_generation.is_none_or(|id| pending.id == id))
     });
+    let owned = active.is_some() || pending.is_some();
     if let Some(active) = active {
         let request = request_object("WEEB3_HLS_RELEASE", active.network_id);
         set_number(&request, "session", active.worker_session as f64);
@@ -153,18 +147,7 @@ fn release_hls_matching(view_generation: Option<u64>) {
     if let Some(pending) = pending {
         notify_abandon(pending.id, &pending.runtime, pending.network_id);
     }
-}
-
-fn abandon_hls_attempt(id: u64, runtime: &SharedRuntime, network_id: u64) {
-    let current = PENDING_HLS.with(|pending| {
-        pending
-            .borrow_mut()
-            .take_if(|pending| pending.id == id)
-            .is_some()
-    });
-    if current {
-        notify_abandon(id, runtime, network_id);
-    }
+    owned
 }
 
 fn notify_abandon(id: u64, runtime: &SharedRuntime, network_id: u64) {
@@ -213,6 +196,9 @@ pub(crate) async fn attach_hls_feed_player(
     start: HlsStart,
     view_generation: u64,
 ) -> Result<&'static str, String> {
+    if !result_view_request_is_current(view_generation) {
+        return Err("HLS open was superseded".to_string());
+    }
     let loader = JsFuture::from(player::load_hls());
     let worker_client = client.clone();
     let worker = async {
@@ -283,12 +269,16 @@ pub(crate) async fn open_hls_feed_view(
     }
 }
 
-pub(crate) fn release_hls_view() {
-    release_hls_matching(None);
-    player::destroy_current_hls();
+pub(crate) fn release_hls_view(view_generation: Option<u64>) {
+    if release_hls_matching(view_generation) || view_generation.is_none() {
+        if view_generation.is_some_and(result_view_request_is_current) {
+            begin_result_view_request();
+        }
+        player::destroy_current_hls();
+    }
 }
 
 pub(crate) fn release_hls_for_bzz_view(client: &SharedNodeClient) {
-    release_hls_view();
+    release_hls_view(None);
     client.clear_hls_cache();
 }

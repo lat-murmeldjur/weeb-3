@@ -52,8 +52,8 @@ use crate::{
 mod interface_runtime_conventions;
 use interface_runtime_conventions::*;
 pub(crate) use interface_runtime_conventions::{
-    get_service_worker, release_result_object_url, replace_result_view,
-    service_worker_controls_bzz_requests, service_worker_scope_protocol_error,
+    configure_service_worker_scope, get_service_worker, release_result_object_url,
+    replace_result_view, service_worker_controls_bzz_requests, service_worker_scope_protocol_error,
 };
 
 const BOOTNODE_INPUT_IDS: [&str; 8] = [
@@ -609,7 +609,7 @@ pub(crate) async fn mount_interface_with_generation(
                 .is_none_or(|panel| !panel.has_attribute("hidden")),
             true,
         ).await else {
-            async_std::task::sleep(Duration::from_millis(160)).await;
+            async_std::task::sleep(Duration::from_millis(600)).await;
             continue;
         };
         if !interface_mount_can_poll(mount_generation) {
@@ -638,7 +638,7 @@ pub(crate) async fn mount_interface_with_generation(
             last_progress_revision = revision;
         }
 
-        async_std::task::sleep(Duration::from_millis(160)).await
+        async_std::task::sleep(Duration::from_millis(600)).await
     }
 
     Ok(())

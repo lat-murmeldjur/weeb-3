@@ -14,7 +14,7 @@ use super::{
     HlsStartupPlan, PreparedHlsFeed,
 };
 use crate::{
-    js_error_message, oneshot,
+    js_error_message,
     worker_protocol::{
         array_property, bool_property as js_bool, integer_property, number_property, set, set_number,
         set_string, string_property as js_string,
@@ -22,7 +22,7 @@ use crate::{
 };
 
 #[rustfmt::skip]
-const HLS_EVENTS: [&str; 11] = ["hlsLevelSwitching", "hlsFragLoadEmergencyAborted", "hlsManifestParsed", "hlsBufferCreated", "hlsFragLoading", "hlsFragLoaded", "hlsBufferAppended", "hlsFragBuffered", "hlsBufferFlushing", "hlsBufferFlushed", "hlsError"];
+const HLS_EVENTS: [&str; 10] = ["hlsLevelSwitching", "hlsManifestParsed", "hlsBufferCreated", "hlsFragLoading", "hlsFragLoaded", "hlsBufferAppended", "hlsFragBuffered", "hlsBufferFlushing", "hlsBufferFlushed", "hlsError"];
 #[rustfmt::skip]
 const NATIVE_EVENTS: [&str; 6] = ["loadedmetadata", "durationchange", "progress", "canplay", "canplaythrough", "error"];
 const MEDIA_LIFECYCLE_EVENTS: [&str; 10] = [
@@ -40,7 +40,6 @@ const MEDIA_LIFECYCLE_EVENTS: [&str; 10] = [
 const MEDIA_SESSION_ACTIONS: [&str; 5] = ["play", "pause", "seekbackward", "seekforward", "seekto"];
 const BUFFER_EPSILON_SECONDS: f64 = 0.15;
 const CLOCK_ADVANCE_EPSILON_SECONDS: f64 = 0.01;
-const LIVE_RUNWAY_BUFFER: (f64, f64) = (90.0, 120.0);
 const MAX_CONSECUTIVE_MEDIA_RECOVERIES: u8 = 1;
 const MAX_HARD_RESTARTS: u8 = 2;
 
@@ -48,6 +47,9 @@ const MAX_HARD_RESTARTS: u8 = 2;
 extern "C" {
     #[wasm_bindgen(js_name = loadHls)]
     pub(super) fn load_hls() -> Promise;
+
+    #[wasm_bindgen(js_name = hlsConfig)]
+    fn make_hls_config(live: bool, live_sync_duration: f64) -> Object;
 }
 
 #[wasm_bindgen]
@@ -146,7 +148,6 @@ struct Player {
 
 struct QualityControl {
     revision: u64,
-    waiting: Option<oneshot::Sender<()>>,
     flush_from: Option<f64>,
     select: HtmlSelectElement,
     change: Closure<dyn FnMut(Event)>,
@@ -155,7 +156,6 @@ struct QualityControl {
 impl QualityControl {
     fn cancel(&mut self) {
         self.revision = self.revision.wrapping_add(1);
-        self.waiting = None;
     }
 }
 
@@ -540,11 +540,6 @@ fn handle_media_event(id: u64, media: &HtmlMediaElement, event: &str, native: bo
         })
     } else {
         with_player(id, |player| {
-            if matches!(event, "waiting" | "pause" | "ended" | "seeking")
-                && let Some(quality) = &mut player.quality
-            {
-                quality.waiting = None;
-            }
             if matches!(
                 event,
                 "play" | "playing" | "pause" | "ended" | "seeking" | "seeked" | "visibilitychange"
@@ -629,6 +624,12 @@ fn handle_media_event(id: u64, media: &HtmlMediaElement, event: &str, native: bo
     }
 }
 
+async fn fetch_head(source: &str) -> Option<JsValue> {
+    let init = web_sys::RequestInit::new();
+    init.set_method("HEAD");
+    JsFuture::from(web_sys::window()?.fetch_with_str_and_init(source, &init)).await.ok()
+}
+
 fn seek_hls(id: u64, hls: Hls, position: f64) {
     finish_quality_flush(id);
     let history = ACTIVE.with_borrow_mut(|active| {
@@ -672,9 +673,7 @@ fn seek_hls(id: u64, hls: Hls, position: f64) {
         return;
     }
     spawn_local(async move {
-        if let Some(window) = web_sys::window() {
-            let _ = JsFuture::from(window.fetch_with_str(&source)).await;
-        }
+        let _ = fetch_head(&source).await;
         let current = || with_player(id, |player| player.history_request == request
             && Object::is(player.hls.as_ref(), hls.as_ref())
             && player.reload_position == Some(position));
@@ -801,12 +800,6 @@ fn handle_event(id: u64, event: &str, data: &JsValue) {
     }
     let mut resume_bootstrap = None;
     let action = with_player(id, |player| {
-        if (matches!(event, "hlsError" | "hlsFragLoadEmergencyAborted")
-            || matches!(event, "hlsFragBuffered" | "hlsFragLoading") && is_main_fragment(data))
-            && let Some(quality) = &mut player.quality
-        {
-            quality.waiting = None;
-        }
         if event == "hlsBufferAppended" {
             schedule_decoder_recovery(player);
         }
@@ -1241,7 +1234,7 @@ fn hard_restart(id: u64, message: String) {
         }
         Some(Err((_, error, false))) => hard_restart(id, error),
         Some(Err((media, error, true))) => {
-            super::page_bridge::release_hls_view();
+            super::page_bridge::release_hls_view(None);
             set_state(&media, "error", &format!("HLS recovery failed: {error}"));
         }
         None => {}
@@ -1390,7 +1383,6 @@ fn quality_control(
     }
     Ok(Some(QualityControl {
         revision: 0,
-        waiting: None,
         flush_from: None,
         select,
         change,
@@ -1530,39 +1522,13 @@ fn select_quality(id: u64, automatic: Option<(Hls, i32, u64)>) {
             // Keep the last loaded rendition filling the buffer during discovery.
             set_number(hls.unchecked_ref(), "loadLevel", previous as f64);
         }
-        let response = if let Some(window) = web_sys::window()
-            && let Some(source) = source.as_ref()
-        {
+        let response = if let Some(source) = source.as_ref() {
             let url = web_sys::Url::new(source).ok();
             if let Some(url) = &url && let Some(date) = playing_date(&hls) {
                 url.search_params().set("at", &date.to_string());
             }
-            JsFuture::from(window.fetch_with_str(&url.map_or_else(|| source.clone(), |url| url.href()))).await.ok()
+            fetch_head(&url.map_or_else(|| source.clone(), |url| url.href())).await
         } else { None };
-        let loaded = with_player(id, |player| {
-            let quality = player.quality.as_mut()?;
-            if quality.revision != revision
-                || !player.ready
-                || player.intent != PlaybackIntent::Play
-                || player.media.paused()
-                || player.media.seeking()
-                || player.media.ended()
-                || player.media.ready_state() <= 2
-                || !response.as_ref().is_some_and(|response| quality_response_covers(&hls, response))
-                || js_property(hls.as_ref(), "inFlightFragments")
-                    .and_then(|flights| js_property(&flights, "main"))
-                    .and_then(|main| js_string(&main, "state")).as_deref() != Some("FRAG_LOADING")
-            {
-                return None;
-            }
-            let (finished, loaded) = oneshot::channel();
-            quality.waiting = Some(finished);
-            Some(loaded)
-        });
-        // Dropping the sender ends this wait; do not wait for a subsequent request.
-        if let Some(loaded) = loaded {
-            let _ = loaded.await;
-        }
         let current = with_player(id, |player| {
             player.ready
                 && Object::is(player.hls.as_ref(), hls.as_ref())
@@ -2055,45 +2021,7 @@ fn construct_hls(hls_class: &JsValue, config: &Object) -> Result<Hls, JsValue> {
 }
 
 fn hls_config(start: HlsStart) -> Object {
-    let config = Object::new();
-    set(&config, "progressive", JsValue::TRUE);
-    set(&config, "autoStartLoad", JsValue::FALSE);
-    let (buffer, maximum) = if start == HlsStart::Live {
-        LIVE_RUNWAY_BUFFER
-    } else {
-        (180.0, 600.0)
-    };
-    for (name, value) in [
-        ("maxBufferLength", buffer),
-        ("maxMaxBufferLength", maximum),
-        ("maxBufferSize", 128.0 * 1024.0 * 1024.0),
-        ("backBufferLength", 15.0),
-        ("maxBufferHole", 0.5),
-    ] {
-        set_number(&config, name, value);
-    }
-    if start == HlsStart::Live {
-        set_number(&config, "liveSyncDuration", HLS_LIVE_STARTUP_BUFFER_SECONDS);
-    }
-    let retry = Object::new();
-    for (name, value) in [
-        ("maxNumRetry", 2.0),
-        ("retryDelayMs", 250.0),
-        ("maxRetryDelayMs", 2_000.0),
-    ] {
-        set_number(&retry, name, value);
-    }
-    let defaults = Object::new();
-    set_number(&defaults, "maxTimeToFirstByteMs", 240_000.0);
-    set_number(&defaults, "maxLoadTimeMs", 250_000.0);
-    set(&defaults, "timeoutRetry", JsValue::NULL);
-    set(&defaults, "errorRetry", retry.into());
-    let policy = Object::new();
-    set(&policy, "default", defaults.into());
-    for name in ["manifestLoadPolicy", "playlistLoadPolicy", "fragLoadPolicy"] {
-        set(&config, name, policy.clone().into());
-    }
-    config
+    make_hls_config(start == HlsStart::Live, HLS_LIVE_STARTUP_BUFFER_SECONDS)
 }
 
 fn missing_video_source_buffer(data: &JsValue) -> bool {

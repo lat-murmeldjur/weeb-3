@@ -1,5 +1,6 @@
 const SCOPE = new URL(self.registration.scope);
-const SCOPE_PATH = SCOPE.pathname.endsWith("/") ? SCOPE.pathname : `${SCOPE.pathname}/`;
+const SCOPE_PATH = SCOPE.pathname;
+const API_PATH = "/weeb-3/";
 const NETWORK_ROUTE_PREFIXES = ["", "mainnet/", "testnet/"];
 const RAW_ROUTE_KINDS = [
   ["hls/bytes", "hls-bytes"],
@@ -7,13 +8,13 @@ const RAW_ROUTE_KINDS = [
   ["chunks", "chunk"]
 ];
 const BZZ_ROUTE_MARKERS = NETWORK_ROUTE_PREFIXES.map(
-  (prefix) => `${SCOPE_PATH}${prefix}bzz/`
+  (prefix) => `${API_PATH}${prefix}bzz/`
 );
 const RAW_ROUTE_MARKERS = NETWORK_ROUTE_PREFIXES.flatMap((prefix) =>
-  RAW_ROUTE_KINDS.map(([kind, rawType]) => [`${SCOPE_PATH}${prefix}${kind}/`, rawType])
+  RAW_ROUTE_KINDS.map(([kind, rawType]) => [`${API_PATH}${prefix}${kind}/`, rawType])
 );
 const FEED_ROUTE_MARKERS = NETWORK_ROUTE_PREFIXES.map(
-  (prefix) => `${SCOPE_PATH}${prefix}feeds/`
+  (prefix) => `${API_PATH}${prefix}feeds/`
 );
 const FETCH_TIMEOUT_MS = 240000;
 const SERVICE_WORKER_MARKER = "forwarder-default29";
@@ -44,17 +45,17 @@ function isSwarmReference(reference) {
 }
 
 function canonicalRouteNetworkId(pathname) {
-  if (!pathname.startsWith(SCOPE_PATH)) {
+  if (!pathname.startsWith(API_PATH)) {
     return null;
   }
 
-  const relative = pathname.substring(SCOPE_PATH.length);
+  const relative = pathname.substring(API_PATH.length);
   return relative === "testnet" || relative.startsWith("testnet/") ? 10 : 1;
 }
 
 function isNetworkShellPath(pathname) {
   return ["mainnet", "testnet"].some((mode) =>
-    pathname === `${SCOPE_PATH}${mode}` || pathname === `${SCOPE_PATH}${mode}/`
+    pathname === `${API_PATH}${mode}` || pathname === `${API_PATH}${mode}/`
   );
 }
 
@@ -72,11 +73,11 @@ function isCanonicalStreamTopic(value) {
 }
 
 function isDirectShareShellPath(pathname) {
-  if (!pathname.startsWith(SCOPE_PATH)) {
+  if (!pathname.startsWith(API_PATH)) {
     return false;
   }
 
-  const parts = pathname.substring(SCOPE_PATH.length).split("/");
+  const parts = pathname.substring(API_PATH.length).split("/");
   const streamOffset = parts[0] === "live" ? 1 : 0;
   return parts.length === streamOffset + 3 &&
     parts[streamOffset] === "stream" &&
@@ -85,7 +86,7 @@ function isDirectShareShellPath(pathname) {
 }
 
 function isBzzUploadPath(pathname) {
-  return NETWORK_ROUTE_PREFIXES.some((prefix) => pathname === `${SCOPE_PATH}${prefix}bzz`);
+  return NETWORK_ROUTE_PREFIXES.some((prefix) => pathname === `${API_PATH}${prefix}bzz`);
 }
 
 function decodeResource(resource) {
@@ -117,11 +118,9 @@ function canonicalFeedResource(url) {
 }
 
 function isHlsResource(url) {
-  return canonicalFeedResource(url) !== null || RAW_ROUTE_MARKERS.some(([marker, rawType]) =>
-    rawType === "hls-bytes" &&
-    url.pathname.startsWith(marker) &&
-    canonicalRawResource(url) !== null
-  );
+  return FEED_ROUTE_MARKERS.some(marker => url.pathname.startsWith(marker)) ||
+    RAW_ROUTE_MARKERS.some(([marker, rawType]) =>
+      rawType === "hls-bytes" && url.pathname.startsWith(marker));
 }
 
 function isAppShellNavigation(request) {
@@ -143,7 +142,7 @@ async function fetchOrError(request) {
 }
 
 function appShellRequest(sourceRequest) {
-  return new Request(new URL(SCOPE_PATH, self.registration.scope).toString(), {
+  return new Request(new URL(API_PATH, SCOPE).toString(), {
     cache: sourceRequest.cache,
     credentials: "same-origin"
   });
@@ -398,6 +397,7 @@ function bindRuntimePort(client, networkId) {
     try {
       client.postMessage({
         type: "WEEB3_RUNTIME_PORT_BIND",
+        scope: SCOPE_PATH,
         networkId,
         serviceWorkerRelay: SHARED_WORKER_PROTOCOL
       }, [channel.port2]);

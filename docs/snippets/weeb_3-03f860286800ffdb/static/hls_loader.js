@@ -1,3 +1,17 @@
+export function hlsConfig(live, liveSyncDuration) {
+  const policy = { default: {
+    maxTimeToFirstByteMs: 240000, maxLoadTimeMs: 250000, timeoutRetry: null,
+    errorRetry: { maxNumRetry: 2, retryDelayMs: 250, maxRetryDelayMs: 2000 }
+  } };
+  return {
+    progressive: true, autoStartLoad: false,
+    maxBufferLength: live ? 90 : 180, maxMaxBufferLength: live ? 120 : 600,
+    maxBufferSize: 128 * 1024 * 1024, backBufferLength: 15, maxBufferHole: 0.5,
+    ...(live && { liveSyncDuration }),
+    manifestLoadPolicy: policy, playlistLoadPolicy: policy, fragLoadPolicy: policy
+  };
+}
+
 export async function loadHls() {
   const module = await import("hls.js");
   const Hls = module.default ?? module.Hls;

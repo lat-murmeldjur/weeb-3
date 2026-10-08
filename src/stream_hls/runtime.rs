@@ -1,6 +1,6 @@
 use std::{
     cell::{Cell, RefCell},
-    collections::{HashSet, VecDeque, hash_map::RandomState},
+    collections::{HashMap, HashSet, VecDeque, hash_map::RandomState},
     sync::Arc,
     time::Duration,
 };
@@ -14,7 +14,7 @@ use wasm_bindgen_futures::spawn_local;
 
 use super::{
     HISTORY_STRIDE, HLS_BEGINNING_STARTUP_BUFFER_SECONDS, HLS_BODY_MAX_BYTES,
-    HLS_LIVE_BODY_RUNWAY_SEGMENTS, HLS_LIVE_EDGE_SEGMENTS, HLS_LIVE_STARTUP_BUFFER_SECONDS,
+    HLS_LIVE_EDGE_SEGMENTS, HLS_LIVE_STARTUP_BUFFER_SECONDS,
     HlsManifest, HlsMasterPlaylist, HlsPlaylist, HlsSource, HlsStart,
     MAX_STREAM_FEED_PAYLOAD_BYTES, PreparedHlsFeed, confirm_hls_feed_head, history_indices,
     hls_edge_wave_complete, hls_payload_mime, hls_progressive_foreground_transition,
@@ -42,7 +42,7 @@ use crate::{
 };
 
 const HLS_BODY_CACHE_MAX_BYTES: u64 = 32 * 1024 * 1024;
-const BODY_PREFETCH_HORIZON: usize = HLS_LIVE_BODY_RUNWAY_SEGMENTS;
+const HISTORY_STARTUP_BUFFER_SECONDS: f64 = 8.0;
 const BEGINNING_DISCOVERY_WIDTH: u64 = 8;
 const BEGINNING_PAYLOAD_BYTES: usize = 64 * 1024;
 const EDGE_COLD_WAVE_TIMEOUT: Duration = Duration::from_millis(4_000);
@@ -194,25 +194,33 @@ struct FeedSession {
     beginning_history_started: bool,
     body_runway_running: bool,
     live_startup_plan: Option<super::HlsStartupPlan>,
-    foreground: Option<String>,
+    foreground: Option<u64>,
     index: Option<u64>,
     updated_at: f64,
     playlist: Option<HlsPlaylist>,
-    presentation_gaps: HashSet<(u64, String)>,
+    presentation_gaps: HashMap<u64, String>,
     tail_fallbacks: VecDeque<f64>,
 }
 
 impl FeedSession {
+    fn foreground_position(&self) -> Option<usize> {
+        let playlist = self.playlist.as_ref()?;
+        let position = usize::try_from(self.foreground?.checked_sub(playlist.sequence)?).ok()?;
+        let playable = if self.start == HlsStart::Live {
+            live_segment_is_playable(self, position)
+        } else {
+            !playlist.segments.get(position)?.gap
+        };
+        playable.then_some(position)
+    }
+
     fn position_of(&self, reference: &str) -> Option<usize> {
         let mut positions = self.playlist.as_ref()?.segments.iter().enumerate();
         let live = self.start == HlsStart::Live;
         let matches = |(position, segment): &(usize, &super::HlsSegment)| {
             segment.reference == reference
-                && if live {
-                    live_segment_is_playable(self, *position)
-                } else {
-                    !segment.gap
-                }
+                && !segment.gap
+                && (!live || live_segment_is_playable(self, *position))
         };
         if live {
             positions.rfind(matches)
@@ -235,7 +243,7 @@ struct RawFeedPayload {
     bytes: Vec<u8>,
 }
 
-type LiveManifest = (u64, HlsManifest, Option<(u64, String, bool)>);
+type InitialManifest = (u64, HlsManifest, Option<(u64, String)>);
 
 enum FeedPayloadProbe {
     Found(RawFeedPayload),
@@ -361,7 +369,7 @@ fn body_is_current(id: u64, reference: &str) -> bool {
     })
 }
 
-async fn hls_body(client: Arc<Weeb3>, reference: String, generation: Option<u64>) -> Option<Bytes> {
+async fn hls_body(client: &Arc<Weeb3>, reference: String, generation: Option<u64>) -> Option<Bytes> {
     if generation.is_some_and(|id| !body_is_current(id, &reference)) {
         return None;
     }
@@ -380,7 +388,7 @@ async fn hls_body(client: Arc<Weeb3>, reference: String, generation: Option<u64>
             return None;
         }
         let end = root.span.checked_sub(1)?;
-        hls_range(&client, &reference, root.span, 0, end, generation, &|| {
+        hls_range(client, &reference, root.span, 0, end, generation, &|| {
             generation.is_none_or(|id| body_is_current(id, &reference))
         })
         .await
@@ -392,9 +400,9 @@ async fn hls_body(client: Arc<Weeb3>, reference: String, generation: Option<u64>
     })
 }
 
-async fn foreground_hls_body(client: Arc<Weeb3>, reference: String) -> Option<Bytes> {
+async fn foreground_hls_body(client: &Arc<Weeb3>, reference: &str) -> Option<Bytes> {
     for attempt in 0..HLS_BODY_ATTEMPTS {
-        if let Some(body) = hls_body(client.clone(), reference.clone(), None).await {
+        if let Some(body) = hls_body(client, reference.to_string(), None).await {
             return Some(body);
         }
         if attempt + 1 < HLS_BODY_ATTEMPTS {
@@ -412,32 +420,23 @@ fn live_segment_is_playable(active: &FeedSession, position: usize) -> bool {
     let Some(playlist) = active.playlist.as_ref() else { return false };
     let Some(segment) = playlist.segments.get(position) else { return false };
     let Some(sequence) = playlist.sequence.checked_add(position as u64) else { return false };
-    !segment.gap && !active.presentation_gaps.iter().any(|(gap, reference)| *gap == sequence && reference == &segment.reference)
+    !segment.gap && active.presentation_gaps.get(&sequence) != Some(&segment.reference)
 }
 
 fn latest_live_position(active: &FeedSession) -> Option<usize> {
-    let playlist = presentation_playlist(active)?;
-    let (position, segment) = playlist
-        .segments
-        .iter()
-        .enumerate()
-        .rfind(|(_, segment)| !segment.gap)?;
-    let sequence = playlist.sequence.checked_add(position as u64)?;
+    let playlist = active.playlist.as_ref()?;
+    let position = (0..playlist.segments.len())
+        .rfind(|position| live_segment_is_playable(active, *position))?;
     playlist
-        .anchored_startup_plan(sequence, &segment.reference)
-        .map(|(_, first)| first)
+        .live_runway(position, |position| live_segment_is_playable(active, position))
+        .map(|(first, _)| first)
 }
 
 fn body_runway_targets(active: &FeedSession) -> &[super::HlsSegment] {
     let Some(playlist) = active.playlist.as_ref() else {
         return &[];
     };
-    let foreground = active
-        .foreground
-        .as_deref()
-        .and_then(|reference| active.position_of(reference))
-        .filter(|position| playlist.sequence.checked_add(*position as u64).is_some());
-    let Some(position) = foreground.or_else(|| {
+    let Some(position) = active.foreground_position().or_else(|| {
         if active.start == HlsStart::Live {
             latest_live_position(active)
         } else {
@@ -446,45 +445,23 @@ fn body_runway_targets(active: &FeedSession) -> &[super::HlsSegment] {
     }) else {
         return &[];
     };
-    if active.start == HlsStart::Beginning {
-        let length = playlist.segments[position..]
-            .iter()
-            .enumerate()
-            .filter(|(_, segment)| !segment.gap)
-            .take(BODY_PREFETCH_HORIZON)
-            .last()
-            .map_or(0, |(offset, _)| offset + 1);
-        return &playlist.segments[position..position + length];
-    }
     let mut seconds = 0.0;
     let length = playlist.segments[position..]
         .iter()
         .enumerate()
         .take_while(|(offset, segment)| {
             if seconds >= HLS_LIVE_STARTUP_BUFFER_SECONDS
-                || !live_segment_is_playable(active, position + offset)
+                || active.start == HlsStart::Live && !live_segment_is_playable(active, position + offset)
             {
                 return false;
             }
-            if !active.ready || *offset != 0 {
+            if !segment.gap && (!active.ready || *offset != 0) {
                 seconds += segment.duration;
             }
             true
         })
         .count();
     &playlist.segments[position..position + length]
-}
-
-fn presentation_playlist(active: &FeedSession) -> Option<std::borrow::Cow<'_, HlsPlaylist>> {
-    let playlist = active.playlist.as_ref()?;
-    if active.presentation_gaps.is_empty() {
-        return Some(std::borrow::Cow::Borrowed(playlist));
-    }
-    let mut presentation = playlist.clone();
-    for (sequence, reference) in &active.presentation_gaps {
-        presentation.mark_gap(*sequence, reference);
-    }
-    Some(std::borrow::Cow::Owned(presentation))
 }
 
 fn spawn_body_runway(id: u64) {
@@ -506,9 +483,11 @@ fn spawn_body_runway(id: u64) {
                 let active = feed.active().filter(|active| active.id == id)?;
                 let playlist = active.playlist.as_ref()?;
                 let first = playlist.segments.iter().find(|segment| !segment.gap)?;
-                let foreground = active.foreground.as_deref().filter(|reference| {
-                    active.start == HlsStart::Beginning && *reference != first.reference
-                });
+                let foreground = active.foreground_position()
+                    .map(|position| playlist.segments[position].reference.as_str())
+                    .filter(|reference| {
+                        active.start == HlsStart::Beginning && *reference != first.reference
+                    });
                 let targets = body_runway_targets(active);
                 loaded.retain(|reference| {
                     targets.iter().any(|segment| !segment.gap && &segment.reference == reference)
@@ -526,7 +505,7 @@ fn spawn_body_runway(id: u64) {
             let Some(reference) = reference else {
                 break;
             };
-            if hls_body(client.clone(), reference.clone(), Some(id)).await.is_some() {
+            if hls_body(&client, reference.clone(), Some(id)).await.is_some() {
                 loaded.insert(reference);
             } else if body_is_current(id, &reference) {
                 async_std::task::sleep(Duration::from_millis(HLS_BODY_RETRY_DELAY_MS)).await;
@@ -568,15 +547,13 @@ fn prefetch_from_reference(reference: &str, cached: bool) -> bool {
         let live = active.start == HlsStart::Live;
         let position = active.position_of(reference)?;
         let (transition, foreground) = active
-            .foreground
-            .as_deref()
+            .foreground_position()
             .filter(|_| !live || active.ready)
-            .and_then(|reference| active.position_of(reference))
             .map_or((false, position), |last| {
                 hls_progressive_foreground_transition(last, position, cached)
             });
         if foreground == position {
-            active.foreground = Some(reference.to_string());
+            active.foreground = playlist.sequence.checked_add(position as u64);
         }
         active.changed.notify(usize::MAX);
         Some((
@@ -635,7 +612,7 @@ fn begin_feed(
             index: None,
             updated_at: 0.0,
             playlist: None,
-            presentation_gaps: HashSet::new(),
+            presentation_gaps: HashMap::new(),
             tail_fallbacks: VecDeque::new(),
         });
     });
@@ -673,87 +650,43 @@ fn install_snapshot(
     })
 }
 
-fn initialize_live_head(id: u64, index: u64, head: &HlsPlaylist) -> Option<(u64, String, bool)> {
+fn initialize_live_head(id: u64, index: u64, head: &HlsPlaylist) -> Option<(u64, String)> {
     let (position, segment) = head
         .segments
         .iter()
         .enumerate()
         .rfind(|(_, segment)| !segment.gap)?;
     let sequence = head.sequence.checked_add(position as u64)?;
-    let foreground = if head.finalized {
-        head.anchored_startup_plan(sequence, &segment.reference)
-            .map_or(position, |(_, first)| first)
-    } else {
-        position
-    };
+    let (_, foreground) = head.anchored_startup_plan(sequence, &segment.reference)?;
     apply_confirmed_snapshot(
         id,
         index,
         head.clone(),
-        Some(head.segments[foreground].reference.clone()),
+        head.sequence.checked_add(foreground as u64),
     )?;
     spawn_body_runway(id);
     spawn_follower(id);
-    Some((sequence, segment.reference.clone(), !head.finalized))
+    Some((sequence, segment.reference.clone()))
 }
 
-async fn prepare_live_plan(
+fn prepare_live_plan(
     id: u64,
     view_generation: u64,
-    anchor: &(u64, String, bool),
+    anchor: &(u64, String),
 ) -> Result<(u64, super::HlsStartupPlan, u64), &'static str> {
-    loop {
-        let (changed, prepared) = FEED.with_borrow_mut(|feed| {
-            let active = feed
-                .get_mut(id)
-                .filter(|_| result_view_request_is_current(view_generation))
-                .ok_or("HLS open was superseded.")?;
-            let changed = active.changed.listen();
-            let playlist = active
-                .playlist
-                .as_ref()
-                .filter(|playlist| playlist.sequence == 0)
-                .ok_or("The HLS feed history could not be reconstructed.")?;
-            let position = usize::try_from(anchor.0)
-                .ok()
-                .filter(|position| {
-                    playlist
-                        .segments
-                        .get(*position)
-                        .is_some_and(|segment| !segment.gap && segment.reference == anchor.1)
-                })
-                .ok_or("The initial HLS edge no longer matches its history.")?;
-            let selected = playlist
-                .anchored_startup_plan(anchor.0, &anchor.1)
-                .filter(|(_, first)| !anchor.2 || playlist.finalized || *first == position);
-            let prepared = if let Some((plan, first)) = selected {
-                active.foreground = Some(playlist.segments[first].reference.clone());
-                active.live_startup_plan = Some(plan.clone());
-                active.changed.notify(usize::MAX);
-                Some((
-                    active.index.ok_or("The HLS feed index was unavailable.")?,
-                    plan,
-                    first as u64,
-                ))
-            } else {
-                if !anchor.2
-                    || playlist.finalized
-                    || playlist.segments[position..]
-                        .iter()
-                        .any(|segment| segment.gap)
-                {
-                    return Err("The HLS feed does not contain a playable startup runway.");
-                }
-                None
-            };
-            Ok((changed, prepared))
-        })?;
-        if let Some(prepared) = prepared {
-            spawn_body_runway(id);
-            return Ok(prepared);
-        }
-        changed.await;
-    }
+    FEED.with_borrow_mut(|feed| -> Result<_, &'static str> {
+        let active = feed.get_mut(id)
+            .filter(|_| result_view_request_is_current(view_generation))
+            .ok_or("HLS open was superseded.")?;
+        let playlist = active.playlist.as_ref().filter(|playlist| playlist.sequence == 0)
+            .ok_or("The HLS feed history could not be reconstructed.")?;
+        let (plan, first) = playlist.anchored_startup_plan(anchor.0, &anchor.1)
+            .ok_or("The initial HLS edge no longer matches its history.")?;
+        active.foreground = Some(first as u64);
+        active.live_startup_plan = Some(plan.clone());
+        active.changed.notify(usize::MAX);
+        Ok((active.index.ok_or("The HLS feed index was unavailable.")?, plan, first as u64))
+    })
 }
 
 async fn discover_beginning(
@@ -785,19 +718,12 @@ async fn discover_beginning(
             if let FeedPayloadProbe::Found(payload) = probe {
                 match HlsManifest::parse(&payload.bytes) {
                     Some(HlsManifest::Master(_)) => {
-                        return discover_raw_for_view(id, view_generation, client, owner, topic).await;
+                        return Some(payload);
                     }
                     Some(HlsManifest::Media(playlist))
                         if playlist.sequence == 0
                             && playlist.startup_plan(HlsStart::Beginning).is_some() =>
                     {
-                        warm_hls_prefix(
-                            client.clone(),
-                            id,
-                            view_generation,
-                            &playlist,
-                            HlsStart::Beginning,
-                        );
                         return Some(payload);
                     }
                     _ => {}
@@ -1221,13 +1147,21 @@ async fn discover_raw_for_view(
     }
 }
 
-async fn discover_live_with_rendition(
+async fn discover_with_rendition(
     id: u64,
     view_generation: u64,
     client: &Arc<Weeb3>,
     owner: &str,
     topic: &str,
-) -> Result<(LiveManifest, Option<(u64, HlsPlaylist)>), &'static str> {
+    start: HlsStart,
+) -> Result<(InitialManifest, Option<(u64, HlsPlaylist)>), &'static str> {
+    if start == HlsStart::Beginning {
+        let payload = discover_beginning(id, view_generation, client, owner, topic).await
+            .ok_or("The HLS feed could not be loaded.")?;
+        if let Some(HlsManifest::Media(head)) = HlsManifest::parse(&payload.bytes) {
+            return Ok(((payload.index, HlsManifest::Media(head), None), None));
+        }
+    }
     let current = || feed_is_current(id, view_generation);
     let lattice = Cell::new(None);
     let (payload, selected, provisional) = loop {
@@ -1244,15 +1178,13 @@ async fn discover_live_with_rendition(
                 let bytes =
                     retrieve_feed_payload(&root, FEED_TAIL_PROBE_BYTES, &client.chunk_port.0)
                         .await?;
-                let HlsManifest::Master(master) = HlsManifest::parse(&bytes)? else {
-                    return None;
-                };
+                let master = HlsMasterPlaylist::parse(&bytes)?;
                 HlsSource::parse(master.initial_source()?)
             }
             .await;
             let matches = |payload: &RawFeedPayload| {
-                matches!(HlsManifest::parse(&payload.bytes), Some(HlsManifest::Master(master))
-                    if selected.as_ref().is_some_and(|source| master.selects(source)))
+                selected.as_ref().is_some_and(|source|
+                    HlsMasterPlaylist::parse(&payload.bytes).is_some_and(|master| master.selects(source)))
             };
             let provisional = async {
                 let HlsSource::Feed {
@@ -1269,7 +1201,11 @@ async fn discover_live_with_rendition(
                 } else {
                     hex::encode(crate::conventions::keccak256(topic.as_bytes()))
                 };
-                discover_latest_once(client, owner, &topic, None).await
+                if start == HlsStart::Beginning {
+                    discover_beginning(id, view_generation, client, owner, &topic).await
+                } else {
+                    discover_latest_once(client, owner, &topic, None).await
+                }
             };
             let confirmed = retrieve_confirmed_payload(client, owner, topic, index, update);
             let (payload, provisional) =
@@ -1306,13 +1242,14 @@ async fn discover_live_with_rendition(
                 return None;
             }
             let playlist = HlsPlaylist::parse(&payload.bytes)?;
-            playlist.has_timeline().then_some((payload.index, playlist))
+            (start == HlsStart::Beginning || playlist.has_timeline())
+                .then_some((payload.index, playlist))
         });
         return Ok(((index, manifest, None), rendition));
     };
     // Dated windows already carry the common timeline used by every rendition.
     // Reading the broadcast's entire history delays live playback as it grows.
-    if head.has_timeline() {
+    if start == HlsStart::Beginning || head.has_timeline() {
         return Ok(((index, HlsManifest::Media(head), None), None));
     }
     let anchor = initialize_live_head(id, index, &head)
@@ -1453,13 +1390,10 @@ fn render_active_feed(
     FEED.with_borrow(|feed| {
         let feed = feed.find(owner, topic, pinned)?;
         let index = feed.index?;
-        let playlist = if start == HlsStart::Live {
-            presentation_playlist(feed)?
-        } else {
-            std::borrow::Cow::Borrowed(feed.playlist.as_ref()?)
-        };
-        let body =
-            playlist.render_with_plan(local_bytes_base, start, feed.live_startup_plan.as_ref());
+        let playlist = feed.playlist.as_ref()?;
+        let gaps = (start == HlsStart::Live && !feed.presentation_gaps.is_empty())
+            .then_some(&feed.presentation_gaps);
+        let body = playlist.render_with_plan(local_bytes_base, start, feed.live_startup_plan.as_ref(), gaps);
         let follower =
             (start == HlsStart::Live && !playlist.finalized && !feed.following).then_some(feed.id);
         Some((index, body, follower, feed.presentation_gaps.len() as u64))
@@ -1514,7 +1448,7 @@ fn apply_confirmed_snapshot(
     id: u64,
     index: u64,
     mut candidate: HlsPlaylist,
-    foreground: Option<String>,
+    foreground: Option<u64>,
 ) -> Option<usize> {
     retain_feed_start(id, &mut candidate)?;
     let appended = FEED.with_borrow_mut(|feed| {
@@ -1585,13 +1519,11 @@ pub(crate) fn install_live_tail_fallback(
         let active = feed
             .active_mut()
             .filter(|feed| feed.start == HlsStart::Live && feed.live_startup_plan.is_some())?;
-        if active.index != Some(snapshot)
-            || live_tail_position(active, sequence, reference).is_none()
-        {
+        if active.index != Some(snapshot) {
             return None;
         }
+        let failed = live_tail_position(active, sequence, reference)?;
         let playlist = active.playlist.as_ref()?;
-        let failed = usize::try_from(sequence.checked_sub(playlist.sequence)?).ok()?;
         let retreat = (0..failed)
             .rev()
             .find(|position| live_segment_is_playable(active, *position))?;
@@ -1606,12 +1538,11 @@ pub(crate) fn install_live_tail_fallback(
             active.tail_fallbacks.pop_front();
         }
         if !target.is_finite() || active.tail_fallbacks.len() >= LIVE_TAIL_FALLBACK_LIMIT
-            || !active
-                .presentation_gaps
-                .insert((sequence, reference.to_string()))
+            || active.presentation_gaps.get(&sequence).is_some_and(|gap| gap == reference)
         {
             return None;
         }
+        active.presentation_gaps.insert(sequence, reference.to_string());
         active.tail_fallbacks.push_back(now);
         active.changed.notify(usize::MAX);
         Some(target)
@@ -1684,7 +1615,7 @@ fn start_beginning_history(id: u64) {
         }
         spawn_follower(id);
         if let Some(successor) = successor {
-            let _ = hls_body(client.clone(), successor, Some(id)).await;
+            let _ = hls_body(&client, successor, Some(id)).await;
         }
         if !feed_is_current(id, view_generation) {
             return;
@@ -1961,7 +1892,7 @@ async fn fetch_hls_body_response(
     let root = retrieve_decoded_data_root(&decoded, &client.chunk_port.0, None).await;
 
     if complete_body && root.as_ref().is_none_or(|root| root.span <= HLS_BODY_MAX_BYTES) {
-        let Some(body) = foreground_hls_body(client.clone(), reference.clone()).await else {
+        let Some(body) = foreground_hls_body(&client, &reference).await else {
             return FetchResponse::error(503, "HLS segment body was unavailable");
         };
         return hls_body_response(body, codec_bootstrap, method, None, &reference)
@@ -2414,7 +2345,7 @@ async fn load_manifest(
     pinned: Option<u64>,
 ) -> Option<(u64, HlsManifest)> {
     if owner.is_empty() {
-        let bytes = hls_body(client.clone(), topic.to_string(), None).await?;
+        let bytes = hls_body(client, topic.to_string(), None).await?;
         return Some((0, HlsManifest::parse(&bytes)?));
     }
     let payload = if let Some(index) = pinned {
@@ -2506,26 +2437,23 @@ pub(crate) async fn prepare_hls_feed(
                 (index, manifest, None)
             } else if let Some((index, playlist)) = rendition.take() {
                 (index, HlsManifest::Media(playlist), None)
-            } else if start == HlsStart::Live {
-                let (confirmed, provisional) = discover_live_with_rendition(
+            } else {
+                let (confirmed, provisional) = discover_with_rendition(
                     id,
                     view_generation,
                     &client,
                     &owner,
                     &topic,
+                    start,
                 )
                 .await?;
                 rendition = provisional;
                 confirmed
-            } else {
-                let payload = discover_beginning(id, view_generation, &client, &owner, &topic).await
-                    .ok_or("The HLS feed could not be loaded.")?;
-                (payload.index, HlsManifest::parse(&payload.bytes).ok_or("The HLS manifest is invalid.")?, None)
             };
             if !feed_is_current(id, view_generation) {
                 return Err("HLS open was superseded".to_string());
             }
-            let head = match manifest {
+            let mut head = match manifest {
                 HlsManifest::Media(head) => head,
                 HlsManifest::Master(master) => {
                     if initial_source.is_some() { return Err("Nested HLS master playlists are invalid.".to_string()); }
@@ -2538,8 +2466,11 @@ pub(crate) async fn prepare_hls_feed(
                     continue;
                 }
             };
+            if start == HlsStart::Beginning && !immutable {
+                warm_hls_prefix(client.clone(), id, view_generation, &head, start);
+            }
             let needs_successor = head.segments.iter().filter(|segment| !segment.gap).nth(1).is_none();
-            let offset = if start == HlsStart::Live && !owner.is_empty()
+            let mut offset = if start == HlsStart::Live && !owner.is_empty()
                 && head.sequence != 0 && head.has_timeline() {
                 loop {
                     if !feed_is_current(id, view_generation) {
@@ -2556,6 +2487,19 @@ pub(crate) async fn prepare_hls_feed(
                     async_std::task::sleep(INITIAL_DISCOVERY_RETRY_DELAY).await;
                 }
             } else { 0.0 };
+            if start == HlsStart::Live && !owner.is_empty() && head.sequence != 0 && head.has_timeline()
+                && head.duration() < HLS_LIVE_STARTUP_BUFFER_SECONDS
+            {
+                let origin = head.program_start(js_sys::Date::parse)
+                    .ok_or("The HLS timeline is unavailable.")? - offset * 1_000.0;
+                let date = (dated_end(&head).ok_or("The HLS timeline is invalid.")?
+                    - HLS_LIVE_STARTUP_BUFFER_SECONDS * 1_000.0).max(origin);
+                head = hls_history(id, view_generation, &client, &owner, &topic, index,
+                    index % HISTORY_STRIDE, head, HISTORY_FOREGROUND_PARALLEL, false, Some(date))
+                    .await.ok_or("The HLS live runway could not be reconstructed.")?;
+                offset = (head.program_start(js_sys::Date::parse)
+                    .ok_or("The HLS timeline is unavailable.")? - origin) / 1_000.0;
+            }
             if !feed_is_current(id, view_generation) {
                 return Err("HLS open was superseded".to_string());
             }
@@ -2566,7 +2510,7 @@ pub(crate) async fn prepare_hls_feed(
             install_snapshot(id, index, head)
                 .ok_or("The HLS feed history did not match its live updates.")?;
             let (index, plan, start_sequence) = if let Some(anchor) = &anchor {
-                prepare_live_plan(id, view_generation, anchor).await?
+                prepare_live_plan(id, view_generation, anchor)?
             } else {
                 let plan = plan.ok_or("The HLS feed does not contain a playable startup runway.")?;
                 FEED.with(|feed| {
@@ -2595,7 +2539,7 @@ pub(crate) async fn prepare_hls_feed(
                     active.changed.notify(usize::MAX);
                 }
             });
-            client.interface_log(if let Some((sequence, reference, _)) = anchor {
+            client.interface_log(if let Some((sequence, reference)) = anchor {
                 format!("HLS open index={index} elapsed={elapsed:.3}s mode=live anchor={sequence} anchor_ref={reference} start_seq={start_sequence} start={:.6}s end={:.6}s", plan.play_position, plan.runway_end)
             } else {
                 let mode = if start == HlsStart::Live {
@@ -2659,11 +2603,11 @@ pub(super) async fn prepare_history(source: &str, position: f64) -> Option<Resul
         // Make the next few segments available before the first frame resumes.
         let mut seconds = 0.0;
         let mut bodies = stream::iter(history.segments.iter().take_while(|segment| {
-            let needed = seconds < HLS_LIVE_STARTUP_BUFFER_SECONDS;
+            let needed = seconds < HISTORY_STARTUP_BUFFER_SECONDS;
             seconds += segment.duration;
             needed
         }).filter(|segment| !segment.gap))
-            .map(|segment| hls_body(client.clone(), segment.reference.clone(), None)).buffered(2);
+            .map(|segment| hls_body(&client, segment.reference.clone(), None)).buffered(2);
         while bodies.next().await.is_some() {}
         drop(bodies);
         Some(Ok((index, history)))
@@ -2698,7 +2642,7 @@ pub(super) async fn prepare_history(source: &str, position: f64) -> Option<Resul
             active.presentation_gaps.clear();
             active.tail_fallbacks.clear();
         }
-        active.foreground = history.segments.first().map(|segment| segment.reference.clone());
+        active.foreground = history.segments.first().map(|_| history.sequence);
         active.live_startup_plan = history.startup_plan(HlsStart::Beginning);
         active.playlist = Some(history);
         active.changed.notify(usize::MAX);

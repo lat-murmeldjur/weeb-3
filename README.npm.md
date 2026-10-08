@@ -95,26 +95,24 @@ await node.attachStream(video, owner, topic, "beginning");
 await node.attachStream(video, owner, topic, "live");
 ```
 
-Public HLS feeds use mainnet. The embedding page must be below the `/weeb-3/` scope and serve the packaged worker at `/weeb-3/service.js`, or already be controlled by a worker implementing the same forwarding protocol.
+Public HLS feeds use mainnet. Serve the packaged worker at `/weeb-3/service.js` and the shared runtime at `/weeb-3/worker.js`. The default Service Worker scope is `/weeb-3/`. To embed playback at `/` or another path, use `new Weeb3No103(undefined, "/")` and return the `Service-Worker-Allowed: /` HTTP header for `/weeb-3/service.js`. Both scopes keep every Swarm API under `/weeb-3/`; scope is a document-wide setting and accepts only `/` or `/weeb-3/`. A host worker implementing the same forwarding protocol can also control the page.
+
+An already controlled `/weeb-3/` page can keep using its existing worker while the root registration handles embedded pages elsewhere. Both scopes share one client. Opening another stream transfers playback to the new tab and pauses the previous player.
+
+The repository's HTTPS test server serves the same HLS example at `/`, `/embed/any/path`, and `/weeb-3/hls-stream-example.html`. Add `?owner=...&topic=...&start=live` to select a stream and start position.
 
 `streamQuality(video)` returns the available `levels` (`level`, `width`, `height`, and `bitrate`), the requested `selectedLevel`, and the playing `currentLevel`. Levels become available after the master playlist loads. A selected level of `-1` means Auto; a current level of `-1` means no rendition is playing yet. The highest available resolution is the initial selection. Quality controls require an attached hls.js stream; native HLS is unsupported, and switching during a history seek is temporarily unavailable.
 
-For example, your application's periodic monitor can lower resolution when too few peers are connected:
+Select a rendition explicitly, or return to Auto:
 
 ```js
-async function reduceResolutionBelow(minimumConnections) {
-  if (await node.connectionCount() >= minimumConnections) return;
-  const { levels, selectedLevel, currentLevel } = node.streamQuality(video);
-  if (selectedLevel >= 0 && selectedLevel !== currentLevel) return;
-  const current = levels.find(({ level }) => level === currentLevel);
-  if (!current) return;
-  const lower = levels.filter(({ height }) => height > 0 && height < current.height)
-    .sort((a, b) => b.height - a.height || b.bitrate - a.bitrate)[0];
-  if (lower) node.setStreamQuality(video, lower.level);
-}
+const { levels } = node.streamQuality(video);
+const rendition = levels.find(({ height }) => height === 720);
+if (rendition) node.setStreamQuality(video, rendition.level);
+node.setStreamQuality(video, -1); // Auto
 ```
 
-The host chooses the threshold and monitoring interval; the library adds no poller. `setStreamQuality` accepts a request synchronously through the built-in selector's switching path; `currentLevel` reports when the switch takes effect. Pass `-1` to restore Auto. `connectionCount()` reads the shared worker's connected peer count without requesting logs or progress; worker communication failures reject its promise.
+`setStreamQuality` uses the built-in selector's switching path; `currentLevel` reports when the switch takes effect. `connectionCount()` reads the shared worker's connected peer count without requesting logs or progress; worker communication failures reject its promise.
 
 ## Example corresponding to `example.html`
 

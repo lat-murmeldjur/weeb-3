@@ -283,7 +283,7 @@ mod hls_formats {
     }
 
     #[test]
-    fn gap_placeholders_never_make_ordinary_media_or_an_eight_second_runway() {
+    fn gap_placeholders_never_make_ordinary_media_or_extend_a_live_runway() {
         let a = reference('a');
         assert!(HlsPlaylist::parse(b"#EXTM3U\n#EXTINF:4,\ngap-1\n").is_none());
         for pending in [
@@ -299,7 +299,9 @@ mod hls_formats {
             format!("#EXTM3U\n#EXTINF:4,\n{a}\n#EXT-X-GAP\n#EXTINF:4,\ngap-1\n").as_bytes(),
         )
         .unwrap();
-        assert!(playlist.anchored_startup_plan(0, &a).is_none());
+        let (plan, _) = playlist.anchored_startup_plan(0, &a).unwrap();
+        assert_eq!((plan.play_position, plan.runway_end), (0.0, 4.0));
+        assert!(playlist.anchored_startup_plan(1, "gap-1").is_none());
     }
 
     #[test]
@@ -379,7 +381,7 @@ mod hls_formats {
         assert!(!plan.codec_bootstrap);
         assert_eq!(head.merge_playlist(dated_window(90_002, 24, None)), Some(2));
         let rendered =
-            String::from_utf8(head.render_with_plan("/hls/bytes", HlsStart::Live, Some(&plan)))
+            String::from_utf8(head.render_with_plan("/hls/bytes", HlsStart::Live, Some(&plan), None))
                 .unwrap();
         assert!(rendered.contains("#EXT-X-MEDIA-SEQUENCE:90000"));
         assert!(rendered.contains(&format!("#EXT-X-START:TIME-OFFSET={:.6}", plan.play_position)));
@@ -403,7 +405,7 @@ mod hls_formats {
         let local = live.startup_plan(HlsStart::Live).unwrap();
         let clock = local.clone().with_offset(offset);
         assert_eq!((clock.play_position, clock.runway_end, clock.duration),
-            (25_250.5, 25_262.5, 25_262.5));
+            (25_246.5, 25_262.5, 25_262.5));
         assert_eq!(clock.clone().with_offset(offset), clock);
         assert_eq!(clock.clone().with_offset(0.0), local);
         let seek = clock.at_position(25_230.5, clock.duration, 8.0, false).unwrap();
@@ -423,27 +425,27 @@ mod hls_formats {
 
     #[test]
     fn new_dated_sequence_zero_starts_directly_while_legacy_keeps_codec_bootstrap() {
-        let mut head = dated_window(0, 24, None);
+        let mut head = dated_window(0, 40, None);
         let plan = head.startup_plan(HlsStart::Live).unwrap();
-        assert_eq!((plan.play_position, plan.runway_end), (0.0, 12.0));
+        assert_eq!((plan.play_position, plan.runway_end), (4.0, 20.0));
         assert!(!plan.codec_bootstrap);
         for segment in &mut head.segments {
             segment.program_date_time = None;
         }
         let legacy = head.startup_plan(HlsStart::Live).unwrap();
-        assert_eq!((legacy.play_position, legacy.runway_end), (4.0, 12.0));
+        assert_eq!((legacy.play_position, legacy.runway_end), (4.0, 20.0));
         assert!(legacy.codec_bootstrap);
     }
 
     #[test]
     fn seek_and_restart_keep_codec_history_and_clip_only_finalized_runways() {
-        let mut legacy = dated_window(0, 24, None);
+        let mut legacy = dated_window(0, 40, None);
         for segment in &mut legacy.segments {
             segment.program_date_time = None;
         }
         let original = legacy.startup_plan(HlsStart::Live).unwrap();
         let live = original.at_position(20.0, f64::INFINITY, 8.0, false).unwrap();
-        assert_eq!((live.play_position, live.runway_end, live.duration), (20.0, 28.0, 12.0));
+        assert_eq!((live.play_position, live.runway_end, live.duration), (20.0, 28.0, 20.0));
         assert_eq!(live.bootstrap_position, original.bootstrap_position);
         assert!(live.codec_bootstrap);
         let ended = original.at_position(20.0, 24.0, 8.0, true).unwrap();

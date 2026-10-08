@@ -17,16 +17,12 @@ pub(crate) fn refreshment_due(balance: u64, last_refreshment: f64, payment_thres
         }
 }
 
-pub(crate) fn connection_dial_capacity_available(connected: u64, ongoing: u64, lost: u16) -> bool {
-    connection_population_deficit(connected, ongoing, lost) > 0
+pub(crate) fn connection_dial_capacity_available(connected: u64, ongoing: u64) -> bool {
+    connection_population_deficit(connected, ongoing) > 0
 }
 
-pub(crate) fn connection_population_deficit(connected: u64, ongoing: u64, lost: u16) -> u64 {
-    let mut target = CONNECTION_BUILDUP_LIMIT;
-    for _ in 0..lost / 100 {
-        target = (target * 4 / 5).max(30);
-    }
-    target.saturating_sub(connected.saturating_add(ongoing))
+pub(crate) fn connection_population_deficit(connected: u64, ongoing: u64) -> u64 {
+    CONNECTION_BUILDUP_LIMIT.saturating_sub(connected.saturating_add(ongoing))
 }
 
 pub(crate) fn bee_reconnect_delay_seconds(
@@ -53,21 +49,50 @@ pub(crate) fn bee_reconnect_delay_seconds(
 #[cfg(target_arch = "wasm32")]
 use crate::{conventions::PeerAccounting, mpsc};
 #[cfg(target_arch = "wasm32")]
-use async_std::sync::{Arc, Mutex};
+use async_std::sync::Arc;
+#[cfg(target_arch = "wasm32")]
+use std::cell::RefCell;
 #[cfg(target_arch = "wasm32")]
 use libp2p::{PeerId, swarm::ConnectionId};
 
 #[cfg(target_arch = "wasm32")]
-pub(crate) type RefreshmentInstruction = (PeerId, Arc<Mutex<PeerAccounting>>, ConnectionId);
+#[derive(PartialEq)]
+pub(crate) enum RefreshmentAction {
+    Refresh,
+    Retire,
+}
 
 #[cfg(target_arch = "wasm32")]
-pub(crate) async fn set_payment_threshold(
-    accounting: &Arc<Mutex<PeerAccounting>>,
+pub(crate) type RefreshmentInstruction =
+    (PeerId, Arc<RefCell<PeerAccounting>>, ConnectionId, RefreshmentAction);
+
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn retire_timed_out_session(
+    accounting: &Arc<RefCell<PeerAccounting>>,
+    connection_id: ConnectionId,
+    refreshments: &mpsc::Sender<RefreshmentInstruction>,
+) {
+    let mut account = accounting.borrow_mut();
+    // A queued or dispatched refresh retains sole ownership of settlement.
+    if account.connection_id != Some(connection_id) || account.refresh_scheduled {
+        return;
+    }
+    account.refresh_scheduled = true;
+    let instruction = (account.id, accounting.clone(), connection_id, RefreshmentAction::Retire);
+    drop(account);
+    if refreshments.try_send(instruction).is_err() {
+        accounting.borrow_mut().refresh_scheduled = false;
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn set_payment_threshold(
+    accounting: &Arc<RefCell<PeerAccounting>>,
     amount: u64,
     refreshments: &mpsc::Sender<RefreshmentInstruction>,
 ) {
     let (has_debt, increased) = {
-        let mut account = accounting.lock().await;
+        let mut account = accounting.borrow_mut();
         let increased = amount > account.threshold;
         account.threshold = amount;
         (account.balance > 0, increased)
@@ -76,16 +101,16 @@ pub(crate) async fn set_payment_threshold(
         crate::notify_credit_available();
     }
     if has_debt {
-        apply_credit(accounting, 0, refreshments).await;
+        apply_credit(accounting, 0, refreshments);
     }
 }
 
 #[cfg(target_arch = "wasm32")]
-pub(crate) async fn reserve(
-    accounting: &Mutex<PeerAccounting>,
+pub(crate) fn reserve(
+    accounting: &RefCell<PeerAccounting>,
     amount: u64,
 ) -> Option<ConnectionId> {
-    let mut account = accounting.lock().await;
+    let mut account = accounting.borrow_mut();
     let connection_id = account.connection_id?;
     let new_reserve = account.reserve.checked_add(amount)?;
     if account.balance.checked_add(new_reserve)? > account.threshold {
@@ -96,12 +121,12 @@ pub(crate) async fn reserve(
 }
 
 #[cfg(target_arch = "wasm32")]
-pub(crate) async fn apply_credit(
-    accounting: &Arc<Mutex<PeerAccounting>>,
+pub(crate) fn apply_credit(
+    accounting: &Arc<RefCell<PeerAccounting>>,
     amount: u64,
     refreshments: &mpsc::Sender<RefreshmentInstruction>,
 ) {
-    let mut account = accounting.lock().await;
+    let mut account = accounting.borrow_mut();
     let mut debt_increase = amount;
     account.reserve = account.reserve.saturating_sub(amount);
 
@@ -115,7 +140,7 @@ pub(crate) async fn apply_credit(
     {
         account.connection_id.map(|connection_id| {
             account.refresh_scheduled = true;
-            (account.id, accounting.clone(), connection_id)
+            (account.id, accounting.clone(), connection_id, RefreshmentAction::Refresh)
         })
     } else {
         None
@@ -132,16 +157,16 @@ pub(crate) async fn apply_credit(
     if let Some(instruction) = instruction
         && let Err(error) = refreshments.try_send(instruction)
     {
-        error.into_inner().1.lock().await.refresh_scheduled = false;
+        error.into_inner().1.borrow_mut().refresh_scheduled = false;
     }
 }
 
 #[cfg(target_arch = "wasm32")]
-pub(crate) async fn apply_refreshment(
-    accounting: &Mutex<PeerAccounting>,
+pub(crate) fn apply_refreshment(
+    accounting: &RefCell<PeerAccounting>,
     amount: u64,
 ) -> Option<(PeerId, u64, u64)> {
-    let mut account = accounting.lock().await;
+    let mut account = accounting.borrow_mut();
     if amount > 0 && account.balance > 0 {
         crate::notify_credit_available();
     }
@@ -159,8 +184,8 @@ pub(crate) async fn apply_refreshment(
 }
 
 #[cfg(target_arch = "wasm32")]
-pub(crate) async fn cancel_reserve(accounting: &Mutex<PeerAccounting>, amount: u64) {
-    let mut account = accounting.lock().await;
+pub(crate) fn cancel_reserve(accounting: &RefCell<PeerAccounting>, amount: u64) {
+    let mut account = accounting.borrow_mut();
     let released = amount > 0 && account.reserve > 0;
     account.reserve = account.reserve.saturating_sub(amount);
     let drained = account.reserve == 0;

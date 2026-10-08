@@ -1,5 +1,5 @@
 use crate::{
-    ChunkRetrieveSender, ConnectionId, Date, Duration, Mutex, OutboundProtocolSession, OverlayPeerMap,
+    ChunkRetrieveSender, ConnectionId, Date, Duration, OutboundProtocolSession, OverlayPeerMap,
     PeerAccounting, PeerAccountingMap, PeerId, PhysicalConnectionMap,
     RETRIEVE_CHECK_CONFIRMATION_PEERS, RefreshmentInstruction, RetrieveCancelToken, StreamControl,
     TransferPause, apply_credit, bee_replica_address, cancel_reserve, encryption_segment_key,
@@ -34,7 +34,7 @@ const RETRIEVE_HEDGE_AFTER_MS: u64 = 1_000;
 const RETRIEVE_RS_HEDGE_AFTER_MS: u64 = RETRIEVE_HEDGE_AFTER_MS * 2;
 const RETRIEVE_RECOVERY_EXTRA_SHARDS: usize = 2;
 const RETRIEVE_RECOVERY_PROGRESSIVE_BATCH: usize = 2;
-const RETRIEVE_ATTEMPT_TIMEOUT_MS: u64 = 10_000;
+const RETRIEVE_ATTEMPT_TIMEOUT_MS: u64 = 3_000;
 const RETRIEVE_CHUNK_MAX_ATTEMPT_ERRORS: usize = 20;
 const RETRIEVE_DATA_GROUP_CONCURRENCY: usize = 8;
 const RETRIEVE_DECODED_CHUNK_CACHE_ENTRIES: usize = 2048;
@@ -61,7 +61,7 @@ impl RetrieveAttemptResult {
 struct ReservedRetrievePeer {
     peer: PeerId,
     price: u64,
-    accounting: Arc<Mutex<PeerAccounting>>,
+    accounting: Arc<RefCell<PeerAccounting>>,
     session: OutboundProtocolSession,
 }
 
@@ -72,15 +72,15 @@ use libp2p::futures::{
     stream::FuturesUnordered,
 };
 
-async fn select_retrieve_peer(
+fn select_retrieve_peer(
     caddr: &[u8],
     peers: &OverlayPeerMap,
     accounting: &PeerAccountingMap,
     physical_connections: &PhysicalConnectionMap,
     skiplist: &mut HashMap<PeerId, Option<ConnectionId>>,
 ) -> (Option<ReservedRetrievePeer>, bool) {
-    let peers = peers.lock().await.clone();
-    let accounting = accounting.lock().await;
+    let accounting = accounting.borrow();
+    let peers = peers.borrow();
     let mut overdraft = false;
     for (&peer, proximity) in crate::closest_overlay_peers(&peers, caddr) {
         // None keeps in-flight and definitive responses excluded across reconnections.
@@ -93,13 +93,13 @@ async fn select_retrieve_peer(
             continue;
         };
         if let Some(Some(connection)) = previous
-            && accounting_peer.lock().await.connection_id
+            && accounting_peer.borrow().connection_id
                 .is_none_or(|id| id == *connection)
         {
             continue;
         }
         let req_price = price(proximity);
-        let Some(connection_id) = reserve(accounting_peer, req_price).await else {
+        let Some(connection_id) = reserve(accounting_peer, req_price) else {
             overdraft = true;
             continue;
         };
@@ -116,7 +116,7 @@ async fn select_retrieve_peer(
             return (Some(selected), false);
         }
         skiplist.insert(peer, Some(connection_id));
-        cancel_reserve(accounting_peer, req_price).await;
+        cancel_reserve(accounting_peer, req_price);
     }
     (None, overdraft)
 }
@@ -146,6 +146,7 @@ async fn retrieve_attempt(
     let retrieve_result = match retrieve_result {
         Ok(retrieve_result) => retrieve_result,
         Err(_) => {
+            crate::accounting::retire_timed_out_session(&accounting_peer, connection_id, &refresh_chan);
             if let Some(admission) = admission.as_ref() {
                 admission.record_physical_attempt_timeout();
             }
@@ -164,12 +165,12 @@ async fn retrieve_attempt(
     if let Some(chunk) = retrieve_result {
         let (chunk_valid, soc) = verify_chunk(&request.addr, &chunk);
         if chunk_valid {
-            apply_credit(&accounting_peer, req_price, &refresh_chan).await;
+            apply_credit(&accounting_peer, req_price, &refresh_chan);
             return RetrieveAttemptResult::Found(chunk, soc);
         }
     }
 
-    cancel_reserve(&accounting_peer, req_price).await;
+    cancel_reserve(&accounting_peer, req_price);
     if confirmed_empty {
         RetrieveAttemptResult::Empty
     } else {
@@ -201,7 +202,7 @@ fn decode_retrieved_chunk(
     }
 
     if soc && chunk.len() >= 97 + 8 {
-        return Bytes::copy_from_slice(&chunk[97..]);
+        return chunk.slice(97..);
     }
     chunk
 }
@@ -353,7 +354,7 @@ struct RawFetchResult {
 struct RawFetchKey {
     runtime_scope: usize,
     request_address: Bytes,
-    expected_cac: Bytes,
+    expected_cac: Option<Bytes>,
     cancel_scope: Option<(Arc<str>, u64)>,
 }
 
@@ -365,11 +366,8 @@ impl RawFetchKey {
         cancel: &Option<RetrieveCancelToken>,
     ) -> Self {
         let request_address = Bytes::copy_from_slice(request_address);
-        let expected_cac = if request_address.as_ref() == expected_cac {
-            request_address.clone()
-        } else {
-            Bytes::copy_from_slice(expected_cac)
-        };
+        let expected_cac = (request_address.as_ref() != expected_cac)
+            .then(|| Bytes::copy_from_slice(expected_cac));
         Self {
             runtime_scope,
             request_address,
@@ -597,9 +595,9 @@ fn complete_raw_fetch(key: &RawFetchKey, flight_id: u64, chunk: Bytes) -> bool {
     let usable = (erasure_coding::SPAN_SIZE..=CHUNK_WITH_SPAN_SIZE).contains(&chunk.len());
     let canonical_cac = usable
         && ((key.request_address.len() == HASH_SIZE
-            && key.request_address == key.expected_cac
+            && key.expected_cac.is_none()
             && flight.shared.admission.returned_cac())
-            || valid_cac(&chunk, &key.expected_cac));
+            || valid_cac(&chunk, key.expected_cac.as_deref().unwrap_or(&key.request_address)));
     let delivered = if usable { chunk } else { Bytes::new() };
 
     // Cache ownership belongs to the physical flight, not to its current
@@ -925,6 +923,7 @@ async fn fetch_data_group_indices_streaming(
         if !static_rolling_candidate && let Some(decoded) = cached_decoded_chunk(reference) {
             child_emitter.emit(index, decoded);
             requested_ready[index] = true;
+            unresolved_count -= 1;
             continue;
         }
         raw_fetches.queue_data_shard(index, reference, initial_hedge_demand);
@@ -981,14 +980,12 @@ async fn fetch_data_group_indices_streaming(
                 };
                 child_emitter.emit(index, chunk);
                 requested_ready[index] = true;
+                unresolved_count -= 1;
             }
         }
 
         // Re-evaluate terminal state before any replacement admission.
-        let all_requested_ready = requested_indices
-            .clone()
-            .all(|index| requested_ready[index]);
-        let terminal = all_requested_ready || (recovery_dispatched && successes >= data_count);
+        let terminal = unresolved_count == 0 || (recovery_dispatched && successes >= data_count);
         if terminal {
             raw_fetches.close();
             if !retrieve_cancel_token_current(&cancel) {
@@ -1426,8 +1423,7 @@ pub async fn retrieve_chunk(
                 accounting,
                 physical_connections,
                 &mut skiplist,
-            )
-            .await;
+            );
             if let Some(selected) = selected {
                 credit_changed = None;
                 let cancelled = !chunk_retrieve_admission_current(&cancel, &admission);
@@ -1438,7 +1434,7 @@ pub async fn retrieve_chunk(
                         .as_ref()
                         .is_some_and(|admission| !admission.try_claim_physical_attempt())
                 {
-                    cancel_reserve(&selected.accounting, selected.price).await;
+                    cancel_reserve(&selected.accounting, selected.price);
                     skiplist.remove(&selected.peer);
                     if !paused && in_flight == 0 {
                         break;
@@ -1473,7 +1469,6 @@ pub async fn retrieve_chunk(
                 }
                 if credit_changed.is_none() {
                     credit_changed = Some(crate::CREDIT_AVAILABLE.listen());
-                    continue; // Recheck after subscribing, without allocating on successful selection.
                 }
             }
         }
@@ -1544,7 +1539,6 @@ pub async fn retrieve_check_chunk(
     let max_error = 21 - RETRIEVE_CHECK_CONFIRMATION_PEERS;
 
     let mut retrieved = None;
-    let mut credit_changed = None;
 
     while error_count < max_error && successes < RETRIEVE_CHECK_CONFIRMATION_PEERS {
         if let Some(paused) = &transfer_paused {
@@ -1557,19 +1551,14 @@ pub async fn retrieve_check_chunk(
             accounting,
             physical_connections,
             &mut skiplist,
-        )
-        .await
-        else {
-            if let Some(changed) = credit_changed.take() {
-                changed.await;
-            }
-            credit_changed = Some(crate::CREDIT_AVAILABLE.listen());
+        ) else {
+            crate::CREDIT_AVAILABLE.listen().await;
             continue;
         };
-        credit_changed = None;
 
         if transfer_is_paused(&transfer_paused) {
-            cancel_reserve(&selected.accounting, selected.price).await;
+            cancel_reserve(&selected.accounting, selected.price);
+            skiplist.remove(&selected.peer);
             continue;
         }
 
@@ -1939,23 +1928,23 @@ mod raw_fetch_tests {
     }
 
     #[wasm_bindgen_test]
-    async fn selection_skips_only_permanent_peers_and_preserves_reserve_rollback() {
+    fn selection_skips_only_permanent_peers_and_preserves_reserve_rollback() {
         let ids = (0..200_u8)
             .map(|index| PeerId::from_bytes(&[0, 1, index]).unwrap())
             .collect::<Vec<_>>();
-        let peers: OverlayPeerMap = Arc::new(Mutex::new(Arc::new(
+        let peers: OverlayPeerMap = Arc::new(RefCell::new(
             ids.iter()
                 .enumerate()
                 .map(|(i, peer)| ([i as u8; 32], *peer))
                 .collect(),
-        )));
+        ));
         let accounting: PeerAccountingMap = Arc::default();
         let physical: PhysicalConnectionMap = Arc::default();
         for (index, &peer) in ids.iter().enumerate() {
             let connection_id = libp2p::swarm::ConnectionId::new_unchecked(index);
-            accounting.lock().await.insert(
+            accounting.borrow_mut().insert(
                 peer,
-                Arc::new(Mutex::new(PeerAccounting {
+                Arc::new(RefCell::new(PeerAccounting {
                     balance: 0,
                     surplus_balance: 0,
                     threshold: 0,
@@ -1968,20 +1957,39 @@ mod raw_fetch_tests {
             );
             crate::record_physical_connection_established(&physical, &peer, connection_id);
         }
+        // Publishing an eligible peer makes the next atomic selection reserve it.
+        let published = std::mem::take(&mut *peers.borrow_mut());
+        accounting.borrow()[&ids[0]].borrow_mut().threshold = u64::MAX;
         let mut skiplist = HashMap::new();
+        {
+            let (selected, retry) =
+                select_retrieve_peer(&[0; 32], &peers, &accounting, &physical, &mut skiplist);
+            assert!(selected.is_none() && !retry);
+            assert_eq!(accounting.borrow()[&ids[0]].borrow().reserve, 0);
+            *peers.borrow_mut() = published;
+            let (selected, retry) =
+                select_retrieve_peer(&[0; 32], &peers, &accounting, &physical, &mut skiplist);
+            let selected = selected.unwrap();
+            assert_eq!(selected.peer, ids[0]);
+            assert!(!retry);
+            cancel_reserve(&selected.accounting, selected.price);
+            assert_eq!(selected.accounting.borrow().reserve, 0);
+            selected.accounting.borrow_mut().threshold = 0;
+        }
+        skiplist = HashMap::new();
         let (selected, retry) =
-            select_retrieve_peer(&[0; 32], &peers, &accounting, &physical, &mut skiplist).await;
+            select_retrieve_peer(&[0; 32], &peers, &accounting, &physical, &mut skiplist);
         assert!(selected.is_none() && retry);
         assert_eq!(skiplist.capacity(), 0);
 
-        accounting.lock().await.remove(&ids[0]);
+        accounting.borrow_mut().remove(&ids[0]);
         physical.lock().unwrap().remove(&ids[1]);
         for index in [1, 3] {
-            accounting.lock().await[&ids[index]].lock().await.threshold = u64::MAX;
+            accounting.borrow()[&ids[index]].borrow_mut().threshold = u64::MAX;
         }
         for _ in 0..2 {
             let (selected, retry) =
-                select_retrieve_peer(&[0; 32], &peers, &accounting, &physical, &mut skiplist).await;
+                select_retrieve_peer(&[0; 32], &peers, &accounting, &physical, &mut skiplist);
             let selected = selected.unwrap();
             assert_eq!(selected.peer, ids[3]);
             assert!(!retry);
@@ -1990,43 +1998,43 @@ mod raw_fetch_tests {
                 (ids[1], Some(libp2p::swarm::ConnectionId::new_unchecked(1))),
                 (ids[3], None),
             ]));
-            cancel_reserve(&selected.accounting, selected.price).await;
-            assert_eq!(selected.accounting.lock().await.reserve, 0);
+            cancel_reserve(&selected.accounting, selected.price);
+            assert_eq!(selected.accounting.borrow().reserve, 0);
             skiplist.remove(&selected.peer);
         }
-        assert_eq!(accounting.lock().await[&ids[1]].lock().await.reserve, 0);
+        assert_eq!(accounting.borrow()[&ids[1]].borrow().reserve, 0);
         skiplist.insert(ids[3], None);
         for index in [2, 4] {
-            accounting.lock().await[&ids[index]].lock().await.threshold = u64::MAX;
+            accounting.borrow()[&ids[index]].borrow_mut().threshold = u64::MAX;
         }
         // Recovered nearer credit is eligible before the next unattempted farther peer.
         for index in [2, 4] {
             let (selected, retry) =
-                select_retrieve_peer(&[0; 32], &peers, &accounting, &physical, &mut skiplist).await;
+                select_retrieve_peer(&[0; 32], &peers, &accounting, &physical, &mut skiplist);
             let selected = selected.unwrap();
             assert_eq!(selected.peer, ids[index]);
             assert!(!retry);
-            cancel_reserve(&selected.accounting, selected.price).await;
+            cancel_reserve(&selected.accounting, selected.price);
         }
         let (selected, retry) =
-            select_retrieve_peer(&[0; 32], &peers, &accounting, &physical, &mut skiplist).await;
+            select_retrieve_peer(&[0; 32], &peers, &accounting, &physical, &mut skiplist);
         assert!(selected.is_none() && retry);
         assert_eq!(skiplist, ids[..5].iter().enumerate().map(|(index, peer)| {
             (*peer, (index == 1).then(|| libp2p::swarm::ConnectionId::new_unchecked(1)))
         }).collect());
-        Arc::make_mut(&mut *peers.lock().await).retain(|overlay, _| overlay[0] < 5);
+        peers.borrow_mut().retain(|overlay, _| overlay[0] < 5);
         let (selected, retry) =
-            select_retrieve_peer(&[0; 32], &peers, &accounting, &physical, &mut skiplist).await;
+            select_retrieve_peer(&[0; 32], &peers, &accounting, &physical, &mut skiplist);
         assert!(selected.is_none() && !retry);
         let peer = ids[1];
         let original = libp2p::swarm::ConnectionId::new_unchecked(1);
         crate::record_physical_connection_established(&physical, &peer, original);
-        assert!(select_retrieve_peer(&[0; 32], &peers, &accounting, &physical, &mut skiplist).await.0.is_none());
+        assert!(select_retrieve_peer(&[0; 32], &peers, &accounting, &physical, &mut skiplist).0.is_none());
         crate::record_physical_connection_closed(&physical, &peer, original);
-        let account = accounting.lock().await.remove(&peer).unwrap();
-        assert!(select_retrieve_peer(&[0; 32], &peers, &accounting, &physical, &mut skiplist).await.0.is_none());
+        let account = accounting.borrow_mut().remove(&peer).unwrap();
+        assert!(select_retrieve_peer(&[0; 32], &peers, &accounting, &physical, &mut skiplist).0.is_none());
         assert_eq!(skiplist[&peer], Some(original), "missing accounting must not make a transient exclusion permanent");
-        accounting.lock().await.insert(peer, account.clone());
+        accounting.borrow_mut().insert(peer, account.clone());
 
         // Each outcome starts an independent flight with the same failed original session.
         for (outcome, found) in [
@@ -2035,18 +2043,18 @@ mod raw_fetch_tests {
         ] {
             let mut exclusions = skiplist.clone();
             let first = libp2p::swarm::ConnectionId::new_unchecked(100);
-            account.lock().await.connection_id = Some(first);
+            account.borrow_mut().connection_id = Some(first);
             crate::record_physical_connection_established(&physical, &peer, first);
-            let selected = select_retrieve_peer(&[0; 32], &peers, &accounting, &physical, &mut exclusions).await.0.unwrap();
+            let selected = select_retrieve_peer(&[0; 32], &peers, &accounting, &physical, &mut exclusions).0.unwrap();
             assert_eq!(selected.peer, peer);
-            cancel_reserve(&selected.accounting, selected.price).await;
+            cancel_reserve(&selected.accounting, selected.price);
             assert_eq!(outcome.complete(&mut exclusions).is_some(), found);
             crate::record_physical_connection_closed(&physical, &peer, first);
             let later = libp2p::swarm::ConnectionId::new_unchecked(101);
-            account.lock().await.connection_id = Some(later);
+            account.borrow_mut().connection_id = Some(later);
             crate::record_physical_connection_established(&physical, &peer, later);
-            assert!(select_retrieve_peer(&[0; 32], &peers, &accounting, &physical, &mut exclusions).await.0.is_none());
-            assert_eq!(account.lock().await.reserve, 0);
+            assert!(select_retrieve_peer(&[0; 32], &peers, &accounting, &physical, &mut exclusions).0.is_none());
+            assert_eq!(account.borrow().reserve, 0);
             crate::record_physical_connection_closed(&physical, &peer, later);
         }
     }
@@ -2444,7 +2452,7 @@ mod raw_fetch_tests {
         let mut encrypted_reference = expected_cac.clone();
         encrypted_reference.extend_from_slice(&[0x5a; HASH_SIZE]);
         let key = RawFetchKey::new(usize::MAX - 17, &expected_cac, &expected_cac, &None);
-        assert_eq!(key.request_address.as_ptr(), key.expected_cac.as_ptr());
+        assert!(key.expected_cac.is_none());
         let (result_chan, _result_in) = mpsc::unbounded();
         let registration = RAW_FETCH_FLIGHTS.with(|flights| {
             flights.borrow_mut().register(

@@ -35,10 +35,10 @@ pub fn assert_excludes(source: &str, markers: &[&str]) {
 }
 
 #[track_caller]
-pub fn assert_first_in_order(source: &str, markers: &[(&str, &str)]) {
+pub fn assert_first_in_order(source: &str, markers: &[&str]) {
     let mut previous = None;
-    for &(marker, missing) in markers {
-        let position = source.find(marker).unwrap_or_else(|| panic!("{missing}: {marker:?}"));
+    for &marker in markers {
+        let position = source.find(marker).unwrap_or_else(|| panic!("missing source marker {marker:?}"));
         assert!(previous.is_none_or(|last| last < position), "out-of-order source marker {marker:?}");
         previous = Some(position);
     }

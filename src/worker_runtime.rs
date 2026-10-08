@@ -174,48 +174,30 @@ impl Weeb3WorkerRuntime {
                 );
                 Ok(response)
             }
-            "progressStart" => {
-                let kind = required_string(message, "kind")?;
-                let subject = required_string(message, "subject")?;
+            op @ ("progressStart" | "progressUpdate" | "progressFinish") => {
                 let phase = required_string(message, "phase")?;
+                let percent = percent_property(message);
+                let detail = string_property(message, "detail").unwrap_or_default();
+                let mut progress = self.inner.progress.lock().await;
                 let response = ok_response();
-                let percent = percent_property(message);
-                let detail = string_property(message, "detail").unwrap_or_default();
-                set_string(
-                    &response,
-                    "id",
-                    self.inner
-                        .progress
-                        .lock()
-                        .await
-                        .start(kind, subject, phase, percent, detail),
-                );
+                match op {
+                    "progressStart" => {
+                        let kind = required_string(message, "kind")?;
+                        let subject = required_string(message, "subject")?;
+                        set_string(&response, "id", progress.start(kind, subject, phase, percent, detail));
+                    }
+                    "progressUpdate" => {
+                        let id = required_string(message, "id")?;
+                        progress.update(&id, phase, percent, detail);
+                    }
+                    _ => {
+                        let id = required_string(message, "id")?;
+                        let ok = bool_property(message, "ok")
+                            .ok_or_else(|| error_response(400, "progressFinish requires ok"))?;
+                        progress.finish(&id, phase, detail, ok);
+                    }
+                }
                 Ok(response)
-            }
-            "progressUpdate" => {
-                let id = required_string(message, "id")?;
-                let phase = required_string(message, "phase")?;
-                let percent = percent_property(message);
-                let detail = string_property(message, "detail").unwrap_or_default();
-                self.inner
-                    .progress
-                    .lock()
-                    .await
-                    .update(&id, phase, percent, detail);
-                Ok(ok_response())
-            }
-            "progressFinish" => {
-                let id = required_string(message, "id")?;
-                let phase = required_string(message, "phase")?;
-                let ok = bool_property(message, "ok")
-                    .ok_or_else(|| error_response(400, "progressFinish requires ok"))?;
-                let detail = string_property(message, "detail").unwrap_or_default();
-                self.inner
-                    .progress
-                    .lock()
-                    .await
-                    .finish(&id, phase, detail, ok);
-                Ok(ok_response())
             }
             op @ ("acquire" | "retrieveBytes" | "retrieveChunk") => {
                 let address = required_string(message, "address")?;
